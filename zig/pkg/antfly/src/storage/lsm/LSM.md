@@ -324,6 +324,11 @@ Large-ingest guardrails:
      trigger/limit/background-IO policy knobs, and the comparator reports L0
      debt, level overflow, scheduler pressure, and background IO admission
      counters for before/after tuning.
+   - [x] Max compaction input bytes now behaves like a target for scheduled L0
+     maintenance: if no legal L0 compaction fits under the cap, the scheduler
+     can admit the minimum oversized job so soft L0 debt does not get stuck
+     permanently. Strict cap behavior remains available for tests and
+     diagnostics.
 7. [ ] Consider memtable structure changes after byte-budgeted WAL/flush and
    recovery allocation work are measured; the current active memtable appends
    plus hash-indexes writes and sorts on freeze/flush, so the main costs are

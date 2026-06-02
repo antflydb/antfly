@@ -106,6 +106,7 @@ pub const Options = struct {
     level_target_bytes_base: usize = 128 * 1024,
     level_target_bytes_multiplier: usize = 8,
     max_compaction_input_bytes: u64 = 0,
+    max_compaction_input_allow_oversized_single_job: bool = true,
     max_run_file_bytes: usize = 512 * 1024 * 1024,
     bloom: bloom.Config = lsm_table_file.default_filter_config,
     table_block_compression: lsm_table_file.CompressionPolicy = .snappy_adaptive,
@@ -5351,6 +5352,7 @@ test "lsm backend max compaction input bytes skips oversized scheduled plan" {
         .compact_threshold_runs = 1,
         .l0_hard_limit_runs = 100,
         .max_compaction_input_bytes = 1,
+        .max_compaction_input_allow_oversized_single_job = false,
     });
     defer backend.close();
 
@@ -5375,6 +5377,34 @@ test "lsm backend max compaction input bytes skips oversized scheduled plan" {
     backend.options.max_compaction_input_bytes = 1024 * 1024;
     try std.testing.expect(try backend.runMaintenanceStep());
     maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
+    try std.testing.expect(backend.compaction_stats.compactions > 0);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 3);
+}
+
+test "lsm backend max compaction input bytes allows oversized minimum L0 job" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .max_compaction_input_bytes = 1,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 64;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, value[0..]);
+        try txn.commit();
+    }
+
+    try backend.finalizeDeferredStorageWork();
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expect(try backend.runMaintenanceStep());
+    const maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
     try std.testing.expect(backend.compaction_stats.compactions > 0);
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 3);

@@ -51,6 +51,7 @@ const Config = struct {
     level_target_bytes_multiplier: usize = 8,
     max_run_file_bytes: usize = 512 * 1024 * 1024,
     max_compaction_input_bytes: u64 = 0,
+    max_compaction_input_allow_oversized_single_job: bool = true,
     background_io_budget_bytes: u64 = 0,
     background_io_allow_oversized_single_job: bool = true,
     bloom_bits_per_key: usize = 10,
@@ -423,6 +424,7 @@ const Scenario = struct {
             .level_target_bytes_multiplier = cfg.level_target_bytes_multiplier,
             .max_run_file_bytes = cfg.max_run_file_bytes,
             .max_compaction_input_bytes = cfg.max_compaction_input_bytes,
+            .max_compaction_input_allow_oversized_single_job = cfg.max_compaction_input_allow_oversized_single_job,
             .background_io_budget_bytes = cfg.background_io_budget_bytes,
             .background_io_allow_oversized_single_job = cfg.background_io_allow_oversized_single_job,
             .bloom = bloomConfig(cfg),
@@ -518,7 +520,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     try out.print(
-        "lsm write bench samples={d} keys={d} hot_keys={d} overwrite_rounds={d} value_size={d} value_pattern={s} batch_size={d} update_stride={d} delete_stride={d} flush_threshold={d} flush_threshold_bytes={d} compact_threshold_runs={d} l0_soft_limit_runs={d} l0_hard_limit_runs={d} l0_soft_limit_bytes={d} l0_hard_limit_bytes={d} max_run_file_bytes={d} max_compaction_input_bytes={d} background_io_budget_bytes={d} background_io_allow_oversized_single_job={} wal_sync_on_commit={} readers={d} storage={s} mode={s} workload_set={s}\n",
+        "lsm write bench samples={d} keys={d} hot_keys={d} overwrite_rounds={d} value_size={d} value_pattern={s} batch_size={d} update_stride={d} delete_stride={d} flush_threshold={d} flush_threshold_bytes={d} compact_threshold_runs={d} l0_soft_limit_runs={d} l0_hard_limit_runs={d} l0_soft_limit_bytes={d} l0_hard_limit_bytes={d} max_run_file_bytes={d} max_compaction_input_bytes={d} max_compaction_input_allow_oversized_single_job={} background_io_budget_bytes={d} background_io_allow_oversized_single_job={} wal_sync_on_commit={} readers={d} storage={s} mode={s} workload_set={s}\n",
         .{
             cfg.samples,
             cfg.keys,
@@ -538,6 +540,7 @@ pub fn main(init: std.process.Init) !void {
             cfg.l0_hard_limit_bytes,
             cfg.max_run_file_bytes,
             cfg.max_compaction_input_bytes,
+            cfg.max_compaction_input_allow_oversized_single_job,
             cfg.background_io_budget_bytes,
             cfg.background_io_allow_oversized_single_job,
             cfg.wal_sync_on_commit,
@@ -925,7 +928,7 @@ fn printResult(
     const writer_ns = ns - finalize_ns;
 
     try writer.print(
-        "{{\"scenario\":\"{s}\",\"storage\":\"{s}\",\"mode\":\"{s}\",\"sample\":{d},\"workload\":\"{s}\",\"ops\":{d},\"logical_value_write_bytes\":{d},\"ns\":{d},\"writer_ns\":{d},\"finalize_ns\":{d},\"ops_per_sec\":{d:.2},\"ns_per_op\":{d:.2},\"config_compact_threshold_runs\":{d},\"config_l0_soft_limit_runs\":{d},\"config_l0_hard_limit_runs\":{d},\"config_l0_soft_limit_bytes\":{d},\"config_l0_hard_limit_bytes\":{d},\"config_level_target_runs_base\":{d},\"config_level_target_runs_multiplier\":{d},\"config_level_target_bytes_base\":{d},\"config_level_target_bytes_multiplier\":{d},\"config_max_run_file_bytes\":{d},\"config_max_compaction_input_bytes\":{d},\"config_background_io_budget_bytes\":{d},\"config_background_io_allow_oversized_single_job\":{}",
+        "{{\"scenario\":\"{s}\",\"storage\":\"{s}\",\"mode\":\"{s}\",\"sample\":{d},\"workload\":\"{s}\",\"ops\":{d},\"logical_value_write_bytes\":{d},\"ns\":{d},\"writer_ns\":{d},\"finalize_ns\":{d},\"ops_per_sec\":{d:.2},\"ns_per_op\":{d:.2},\"config_compact_threshold_runs\":{d},\"config_l0_soft_limit_runs\":{d},\"config_l0_hard_limit_runs\":{d},\"config_l0_soft_limit_bytes\":{d},\"config_l0_hard_limit_bytes\":{d},\"config_level_target_runs_base\":{d},\"config_level_target_runs_multiplier\":{d},\"config_level_target_bytes_base\":{d},\"config_level_target_bytes_multiplier\":{d},\"config_max_run_file_bytes\":{d},\"config_max_compaction_input_bytes\":{d},\"config_max_compaction_input_allow_oversized_single_job\":{},\"config_background_io_budget_bytes\":{d},\"config_background_io_allow_oversized_single_job\":{}",
         .{
             scenario.label,
             @tagName(scenario.storage_kind),
@@ -950,6 +953,7 @@ fn printResult(
             scenario.cfg.level_target_bytes_multiplier,
             scenario.cfg.max_run_file_bytes,
             scenario.cfg.max_compaction_input_bytes,
+            scenario.cfg.max_compaction_input_allow_oversized_single_job,
             scenario.cfg.background_io_budget_bytes,
             scenario.cfg.background_io_allow_oversized_single_job,
         },
@@ -1207,6 +1211,8 @@ fn parseArgs(alloc: Allocator, proc_args: std.process.Args) !Config {
             cfg.max_run_file_bytes = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--max-compaction-input-bytes")) {
             cfg.max_compaction_input_bytes = try parseNextU64(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--strict-max-compaction-input-bytes")) {
+            cfg.max_compaction_input_allow_oversized_single_job = false;
         } else if (std.mem.eql(u8, arg, "--background-io-budget-bytes")) {
             cfg.background_io_budget_bytes = try parseNextU64(&args, arg);
         } else if (std.mem.eql(u8, arg, "--background-io-disallow-oversized-single-job")) {

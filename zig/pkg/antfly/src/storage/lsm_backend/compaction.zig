@@ -109,6 +109,7 @@ pub fn maybeCompactRuns(comptime BackendType: type, backend: *BackendType) !void
         backend.options.level_target_bytes_base,
         backend.options.level_target_bytes_multiplier,
         0,
+        false,
     )) |plan| {
         try compactPlanAt(BackendType, backend, plan);
     }
@@ -126,6 +127,7 @@ pub fn maybeCompactRunsScheduled(comptime BackendType: type, backend: *BackendTy
         backend.options.level_target_bytes_base,
         backend.options.level_target_bytes_multiplier,
         backend.options.max_compaction_input_bytes,
+        allowOversizedSingleCompactionInput(backend),
     ) orelse return false;
 
     const work = compactionWorkForPlan(backend.runs.items, plan, score);
@@ -139,19 +141,24 @@ pub fn maybeCompactRunsScheduled(comptime BackendType: type, backend: *BackendTy
 }
 
 pub fn compactOldestPair(comptime BackendType: type, backend: *BackendType) !void {
-    const plan = selectL0Compaction(backend.runs.items, 0, 0) orelse return;
+    const plan = selectL0Compaction(backend.runs.items, 0, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
 }
 
 pub fn compactL0ToLimit(comptime BackendType: type, backend: *BackendType, l0_limit: usize) !void {
-    const plan = selectL0Compaction(backend.runs.items, l0_limit, 0) orelse return;
+    const plan = selectL0Compaction(backend.runs.items, l0_limit, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
 }
 
 pub fn compactL0ToLimitScheduled(comptime BackendType: type, backend: *BackendType, l0_limit: usize, score: u64) !bool {
     if (try compactRememberedPlanIfValid(BackendType, backend)) return true;
 
-    const plan = selectL0Compaction(backend.runs.items, l0_limit, backend.options.max_compaction_input_bytes) orelse return false;
+    const plan = selectL0Compaction(
+        backend.runs.items,
+        l0_limit,
+        backend.options.max_compaction_input_bytes,
+        allowOversizedSingleCompactionInput(backend),
+    ) orelse return false;
     const work = compactionWorkForPlan(backend.runs.items, plan, score);
     var grant = backend.acquireCompactionGrant(work) orelse {
         rememberDeniedCompaction(BackendType, backend, plan, score);
@@ -174,7 +181,12 @@ pub fn compactL0ToLimitScheduledWithinBudget(
         if (option_limit > 0) @min(option_limit, explicit_limit) else explicit_limit
     else
         option_limit;
-    const plan = selectL0Compaction(backend.runs.items, l0_limit, effective_limit) orelse return false;
+    const plan = selectL0Compaction(
+        backend.runs.items,
+        l0_limit,
+        effective_limit,
+        max_input_bytes == null and allowOversizedSingleCompactionInput(backend),
+    ) orelse return false;
     const work = compactionWorkForPlan(backend.runs.items, plan, score);
     var grant = backend.acquireCompactionGrant(work) orelse {
         return false;
@@ -194,9 +206,16 @@ pub fn compactAllRuns(comptime BackendType: type, backend: *BackendType) !void {
         backend.options.level_target_bytes_base,
         backend.options.level_target_bytes_multiplier,
         0,
+        false,
     )) |plan| {
         try compactPlanAt(BackendType, backend, plan);
     }
+}
+
+fn allowOversizedSingleCompactionInput(backend: anytype) bool {
+    const OptionsType = @TypeOf(backend.options);
+    if (!@hasField(OptionsType, "max_compaction_input_allow_oversized_single_job")) return false;
+    return backend.options.max_compaction_input_allow_oversized_single_job;
 }
 
 fn compactionWorkForPlan(runs: []const Run, plan: CompactionPlan, score: u64) struct { score: u64, input_runs: usize, input_bytes: u64, io_bytes: u64 } {
@@ -307,7 +326,7 @@ fn planInBounds(runs: []const Run, plan: CompactionPlan) bool {
 
 pub fn compactOldestWindow(comptime BackendType: type, backend: *BackendType, window_len: usize) !void {
     _ = window_len;
-    const plan = selectL0Compaction(backend.runs.items, 0, 0) orelse return;
+    const plan = selectL0Compaction(backend.runs.items, 0, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
 }
 
@@ -680,10 +699,11 @@ fn selectCompactionPlan(
     level_target_bytes_base: usize,
     level_target_bytes_multiplier: usize,
     max_input_bytes: u64,
+    allow_oversized_single_job: bool,
 ) ?CompactionPlan {
     if (runs.len < 2) return null;
     if (selectL0OverlapCompaction(runs, l0_overlap_compact_threshold_runs, max_input_bytes)) |plan| return plan;
-    if (selectL0Compaction(runs, l0_limit, max_input_bytes)) |plan| return plan;
+    if (selectL0Compaction(runs, l0_limit, max_input_bytes, allow_oversized_single_job)) |plan| return plan;
     if (selectLowerLevelRepairCompaction(runs, max_input_bytes)) |plan| return plan;
     return selectLowerLevelPressureCompaction(
         runs,
@@ -751,18 +771,20 @@ fn countLeadingL0Runs(runs: []const Run) usize {
     return l0_count;
 }
 
-fn selectL0Compaction(runs: []const Run, l0_limit: usize, max_input_bytes: u64) ?CompactionPlan {
+fn selectL0Compaction(runs: []const Run, l0_limit: usize, max_input_bytes: u64, allow_oversized_single_job: bool) ?CompactionPlan {
     const l0_count = countLeadingL0Runs(runs);
     if (l0_count == 0 or l0_count <= l0_limit) return null;
     const target_l0_count = @max(@as(usize, 1), l0_limit / 2);
     const excess_len = @max(@as(usize, 1), l0_count - target_l0_count);
     const max_window_len = @max(@as(usize, 2), l0_limit / 2);
     var source_len = @min(excess_len, max_window_len);
+    var oversized_plan: ?CompactionPlan = null;
     while (source_len > 0) : (source_len -= 1) {
         const plan = buildPlanForSourceRange(runs, 0, l0_count - source_len, source_len) orelse continue;
         if (planWithinInputBudget(runs, plan, max_input_bytes)) return plan;
+        if (allow_oversized_single_job and max_input_bytes > 0) oversized_plan = plan;
     }
-    return null;
+    return oversized_plan;
 }
 
 fn selectLowerLevelRepairCompaction(runs: []const Run, max_input_bytes: u64) ?CompactionPlan {
