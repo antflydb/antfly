@@ -42,6 +42,10 @@ const Record = struct {
     read_level_hits: u64,
     read_cursor_block_loads: u64 = 0,
     read_cursor_block_reuses: u64 = 0,
+    read_cursor_value_borrows: u64 = 0,
+    read_cursor_value_copies: u64 = 0,
+    read_point_value_borrows: u64 = 0,
+    read_point_value_copies: u64 = 0,
     read_table_entry_parses: u64 = 0,
     read_table_entry_parse_ns: u64 = 0,
     read_table_index_loads: u64 = 0,
@@ -107,6 +111,10 @@ const GroupAgg = struct {
     read_bloom_negatives: MetricSeries = .{},
     read_cursor_block_loads: MetricSeries = .{},
     read_cursor_block_reuses: MetricSeries = .{},
+    read_cursor_value_borrows: MetricSeries = .{},
+    read_cursor_value_copies: MetricSeries = .{},
+    read_point_value_borrows: MetricSeries = .{},
+    read_point_value_copies: MetricSeries = .{},
     read_table_entry_parses: MetricSeries = .{},
     read_table_entry_parse_ns: MetricSeries = .{},
     read_table_index_loads: MetricSeries = .{},
@@ -144,6 +152,10 @@ const GroupAgg = struct {
         self.read_bloom_negatives.deinit(allocator);
         self.read_cursor_block_loads.deinit(allocator);
         self.read_cursor_block_reuses.deinit(allocator);
+        self.read_cursor_value_borrows.deinit(allocator);
+        self.read_cursor_value_copies.deinit(allocator);
+        self.read_point_value_borrows.deinit(allocator);
+        self.read_point_value_copies.deinit(allocator);
         self.read_table_entry_parses.deinit(allocator);
         self.read_table_entry_parse_ns.deinit(allocator);
         self.read_table_index_loads.deinit(allocator);
@@ -175,6 +187,10 @@ const GroupAgg = struct {
         try self.read_bloom_negatives.append(allocator, @floatFromInt(record.read_bloom_negatives));
         try self.read_cursor_block_loads.append(allocator, @floatFromInt(record.read_cursor_block_loads));
         try self.read_cursor_block_reuses.append(allocator, @floatFromInt(record.read_cursor_block_reuses));
+        try self.read_cursor_value_borrows.append(allocator, @floatFromInt(record.read_cursor_value_borrows));
+        try self.read_cursor_value_copies.append(allocator, @floatFromInt(record.read_cursor_value_copies));
+        try self.read_point_value_borrows.append(allocator, @floatFromInt(record.read_point_value_borrows));
+        try self.read_point_value_copies.append(allocator, @floatFromInt(record.read_point_value_copies));
         try self.read_table_entry_parses.append(allocator, @floatFromInt(record.read_table_entry_parses));
         try self.read_table_entry_parse_ns.append(allocator, @floatFromInt(record.read_table_entry_parse_ns));
         try self.read_table_index_loads.append(allocator, @floatFromInt(record.read_table_index_loads));
@@ -351,6 +367,14 @@ fn printComparison(
     const after_cursor_loads = try after.read_cursor_block_loads.median(allocator);
     const before_cursor_reuses = try before.read_cursor_block_reuses.median(allocator);
     const after_cursor_reuses = try after.read_cursor_block_reuses.median(allocator);
+    const before_cursor_borrows = try before.read_cursor_value_borrows.median(allocator);
+    const after_cursor_borrows = try after.read_cursor_value_borrows.median(allocator);
+    const before_cursor_copies = try before.read_cursor_value_copies.median(allocator);
+    const after_cursor_copies = try after.read_cursor_value_copies.median(allocator);
+    const before_point_borrows = try before.read_point_value_borrows.median(allocator);
+    const after_point_borrows = try after.read_point_value_borrows.median(allocator);
+    const before_point_copies = try before.read_point_value_copies.median(allocator);
+    const after_point_copies = try after.read_point_value_copies.median(allocator);
     const before_table_parses = try before.read_table_entry_parses.median(allocator);
     const after_table_parses = try after.read_table_entry_parses.median(allocator);
     const before_table_blocks = try before.read_table_block_loads.median(allocator);
@@ -444,6 +468,19 @@ fn printComparison(
             before_local_block_misses,
             after_local_block_hits,
             after_local_block_misses,
+        });
+    }
+
+    if (before_cursor_borrows > 0 or after_cursor_borrows > 0 or before_cursor_copies > 0 or after_cursor_copies > 0 or before_point_borrows > 0 or after_point_borrows > 0 or before_point_copies > 0 or after_point_copies > 0) {
+        try writer.print("  cursor value borrow/copy {d:.0}/{d:.0} -> {d:.0}/{d:.0}  point value borrow/copy {d:.0}/{d:.0} -> {d:.0}/{d:.0}\n", .{
+            before_cursor_borrows,
+            before_cursor_copies,
+            after_cursor_borrows,
+            after_cursor_copies,
+            before_point_borrows,
+            before_point_copies,
+            after_point_borrows,
+            after_point_copies,
         });
     }
 

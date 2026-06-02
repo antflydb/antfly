@@ -179,6 +179,9 @@ Large-ingest guardrails:
    negatives, and block loads.
    - [x] Surface existing table parse/block load and shared/local block-cache
      hit/miss counters in the read benchmark JSON and comparison output.
+   - [x] Surface cursor and point value borrow/copy counters in the read
+     benchmark JSON and comparator, so borrowed-value work can be measured
+     directly instead of inferred from allocator samples.
 3. [ ] Implement a block-window cursor for persisted scans in the shared-cache
    path, matching the no-shared-cache table-index/block-window shape.
    - Expected signal: full/short scan throughput improves and cache pollution
@@ -267,6 +270,8 @@ Large-ingest guardrails:
      handles for path-backed run hits when the transaction owns a held-block
      list; live mutable hits still copy until their generation lifetime is
      explicitly pinned.
+   - [x] Read benchmarks now emit and compare cursor/point value borrow and
+     copy counts, making the remaining mutable-hit copies visible in baselines.
 4. [ ] Make sorted `getManySorted` keep per-run cursor state across keys so
    batch reads resume inside the current block where possible.
    - [x] First slice: cached sorted-by-run reads now keep a per-run forward

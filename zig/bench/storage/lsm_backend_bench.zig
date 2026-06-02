@@ -871,7 +871,7 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"read_point_gets\":{d},\"read_run_probes\":{d},\"read_bloom_negatives\":{d},\"read_mutable_hits\":{d},\"read_l0_hits\":{d},\"read_level_hits\":{d},\"read_cursor_block_loads\":{d},\"read_cursor_block_reuses\":{d}",
+        ",\"read_point_gets\":{d},\"read_run_probes\":{d},\"read_bloom_negatives\":{d},\"read_mutable_hits\":{d},\"read_l0_hits\":{d},\"read_level_hits\":{d},\"read_cursor_block_loads\":{d},\"read_cursor_block_reuses\":{d},\"read_cursor_value_borrows\":{d},\"read_cursor_value_copies\":{d},\"read_point_value_borrows\":{d},\"read_point_value_copies\":{d}",
         .{
             read_delta.point_gets,
             read_delta.run_probes,
@@ -881,6 +881,10 @@ fn printResult(
             read_delta.level_hits,
             read_delta.cursor_block_loads,
             read_delta.cursor_block_reuses,
+            read_delta.cursor_value_borrows,
+            read_delta.cursor_value_copies,
+            read_delta.point_value_borrows,
+            read_delta.point_value_copies,
         },
     );
     try writer.print(
@@ -938,6 +942,10 @@ fn diffReadStats(after: ReadStats, before: ReadStats) ReadStats {
         .local_block_cache_misses = saturatingSub(after.local_block_cache_misses, before.local_block_cache_misses),
         .cursor_block_loads = saturatingSub(after.cursor_block_loads, before.cursor_block_loads),
         .cursor_block_reuses = saturatingSub(after.cursor_block_reuses, before.cursor_block_reuses),
+        .cursor_value_borrows = saturatingSub(after.cursor_value_borrows, before.cursor_value_borrows),
+        .cursor_value_copies = saturatingSub(after.cursor_value_copies, before.cursor_value_copies),
+        .point_value_borrows = saturatingSub(after.point_value_borrows, before.point_value_borrows),
+        .point_value_copies = saturatingSub(after.point_value_copies, before.point_value_copies),
     };
 }
 
@@ -963,6 +971,10 @@ fn addReadStats(total: *ReadStats, add: ReadStats) void {
     total.local_block_cache_misses += add.local_block_cache_misses;
     total.cursor_block_loads += add.cursor_block_loads;
     total.cursor_block_reuses += add.cursor_block_reuses;
+    total.cursor_value_borrows += add.cursor_value_borrows;
+    total.cursor_value_copies += add.cursor_value_copies;
+    total.point_value_borrows += add.point_value_borrows;
+    total.point_value_copies += add.point_value_copies;
 }
 
 fn diffCacheStats(after: CacheStats, before: CacheStats) CacheStats {
