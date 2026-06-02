@@ -357,6 +357,10 @@ Large-ingest guardrails:
      now report effective L0 soft/hard run limits, including derived hard
      limits when `l0_hard_limit_runs` is left at its default, plus foreground
      write-pressure and WAL-pressure counters.
+   - [x] WAL/working-set benchmark surface: write-bench JSON and comparator
+     now include mutable/immutable after-state bytes and full WAL checkpoint
+     coordinates: oldest retained segment, covered-through segment, current
+     segment, lag, and replay-current segment.
    - [x] L0-pressure benchmark slice: `lsm-write-bench --workload-set
      l0_pressure` repeatedly flushes small batches into L0, then times bounded
      maintenance separately so compaction trigger and write-stall policy changes

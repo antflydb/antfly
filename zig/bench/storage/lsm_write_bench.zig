@@ -1069,7 +1069,7 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"compactions\":{d},\"compaction_input_runs\":{d},\"compaction_input_bytes\":{d},\"compaction_output_bytes\":{d},\"compaction_ns\":{d},\"runs_after\":{d},\"l0_runs_after\":{d},\"overlapping_l0_runs_after\":{d},\"compactable_l0_runs_after\":{d},\"l0_bytes_after\":{d},\"level_overflow_runs_after\":{d},\"level_overflow_bytes_after\":{d},\"max_level_after\":{d},\"run_bytes_after\":{d},\"run_entries_after\":{d},\"obsolete_paths_after\":{d},\"mutable_entries_after\":{d}",
+        ",\"compactions\":{d},\"compaction_input_runs\":{d},\"compaction_input_bytes\":{d},\"compaction_output_bytes\":{d},\"compaction_ns\":{d},\"runs_after\":{d},\"l0_runs_after\":{d},\"overlapping_l0_runs_after\":{d},\"compactable_l0_runs_after\":{d},\"l0_bytes_after\":{d},\"level_overflow_runs_after\":{d},\"level_overflow_bytes_after\":{d},\"max_level_after\":{d},\"run_bytes_after\":{d},\"run_entries_after\":{d},\"obsolete_paths_after\":{d},\"mutable_entries_after\":{d},\"mutable_bytes_after\":{d},\"immutable_entries_after\":{d},\"immutable_bytes_after\":{d}",
         .{
             compaction_delta.compactions,
             compaction_delta.input_runs,
@@ -1088,17 +1088,23 @@ fn printResult(
             after.runs.entries,
             after.obsolete_paths,
             after.mutable_entries,
+            after.maintenance.mutable_bytes,
+            after.maintenance.immutable_entries,
+            after.maintenance.immutable_bytes,
         },
     );
     try writer.print(
-        ",\"wal_retained_segments_after\":{d},\"wal_retained_bytes_after\":{d},\"wal_checkpoint_covered_through_segment_after\":{d},\"wal_checkpoint_lag_segments_after\":{d},\"wal_replay_retained_segments_after\":{d},\"wal_replay_retained_bytes_after\":{d},\"compaction_scheduler_grants_after\":{d},\"compaction_scheduler_denied_capacity_after\":{d},\"compaction_scheduler_denied_resource_pressure_after\":{d},\"compaction_scheduler_remembered_pending_after\":{d},\"compaction_scheduler_remembered_candidates_after\":{d},\"compaction_scheduler_remembered_retries_after\":{d},\"compaction_scheduler_remembered_hits_after\":{d},\"compaction_scheduler_remembered_stale_after\":{d},\"compaction_scheduler_conflict_denials_after\":{d}",
+        ",\"wal_retained_segments_after\":{d},\"wal_retained_bytes_after\":{d},\"wal_checkpoint_oldest_retained_segment_after\":{d},\"wal_checkpoint_covered_through_segment_after\":{d},\"wal_checkpoint_current_segment_after\":{d},\"wal_checkpoint_lag_segments_after\":{d},\"wal_replay_retained_segments_after\":{d},\"wal_replay_retained_bytes_after\":{d},\"wal_replay_current_segment_after\":{d},\"compaction_scheduler_grants_after\":{d},\"compaction_scheduler_denied_capacity_after\":{d},\"compaction_scheduler_denied_resource_pressure_after\":{d},\"compaction_scheduler_remembered_pending_after\":{d},\"compaction_scheduler_remembered_candidates_after\":{d},\"compaction_scheduler_remembered_retries_after\":{d},\"compaction_scheduler_remembered_hits_after\":{d},\"compaction_scheduler_remembered_stale_after\":{d},\"compaction_scheduler_conflict_denials_after\":{d}",
         .{
             after.maintenance.wal_retained_segments,
             after.maintenance.wal_retained_bytes,
+            after.maintenance.wal_checkpoint_oldest_retained_segment,
             after.maintenance.wal_checkpoint_covered_through_segment,
+            after.maintenance.wal_checkpoint_current_segment,
             after.maintenance.wal_checkpoint_lag_segments,
             after.maintenance.wal_replay_retained_segments,
             after.maintenance.wal_replay_retained_bytes,
+            after.maintenance.wal_replay_current_segment,
             after.maintenance.compaction_scheduler_grants,
             after.maintenance.compaction_scheduler_denied_capacity,
             after.maintenance.compaction_scheduler_denied_resource_pressure,

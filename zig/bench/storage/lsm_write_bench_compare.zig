@@ -82,12 +82,18 @@ const Record = struct {
     run_entries_after: u64 = 0,
     obsolete_paths_after: u64 = 0,
     mutable_entries_after: u64 = 0,
+    mutable_bytes_after: u64 = 0,
+    immutable_entries_after: u64 = 0,
+    immutable_bytes_after: u64 = 0,
     wal_retained_segments_after: u64 = 0,
     wal_retained_bytes_after: u64 = 0,
+    wal_checkpoint_oldest_retained_segment_after: u64 = 0,
     wal_checkpoint_covered_through_segment_after: u64 = 0,
+    wal_checkpoint_current_segment_after: u64 = 0,
     wal_checkpoint_lag_segments_after: u64 = 0,
     wal_replay_retained_segments_after: u64 = 0,
     wal_replay_retained_bytes_after: u64 = 0,
+    wal_replay_current_segment_after: u64 = 0,
     compaction_scheduler_grants_after: u64 = 0,
     compaction_scheduler_denied_capacity_after: u64 = 0,
     compaction_scheduler_denied_resource_pressure_after: u64 = 0,
@@ -179,12 +185,19 @@ const GroupAgg = struct {
     level_overflow_bytes_after: MetricSeries = .{},
     run_bytes_after: MetricSeries = .{},
     obsolete_paths_after: MetricSeries = .{},
+    mutable_entries_after: MetricSeries = .{},
+    mutable_bytes_after: MetricSeries = .{},
+    immutable_entries_after: MetricSeries = .{},
+    immutable_bytes_after: MetricSeries = .{},
     wal_retained_segments_after: MetricSeries = .{},
     wal_retained_bytes_after: MetricSeries = .{},
+    wal_checkpoint_oldest_retained_segment_after: MetricSeries = .{},
     wal_checkpoint_covered_through_segment_after: MetricSeries = .{},
+    wal_checkpoint_current_segment_after: MetricSeries = .{},
     wal_checkpoint_lag_segments_after: MetricSeries = .{},
     wal_replay_retained_segments_after: MetricSeries = .{},
     wal_replay_retained_bytes_after: MetricSeries = .{},
+    wal_replay_current_segment_after: MetricSeries = .{},
     compaction_scheduler_grants_after: MetricSeries = .{},
     compaction_scheduler_denied_capacity_after: MetricSeries = .{},
     compaction_scheduler_denied_resource_pressure_after: MetricSeries = .{},
@@ -251,12 +264,19 @@ const GroupAgg = struct {
         self.level_overflow_bytes_after.deinit(allocator);
         self.run_bytes_after.deinit(allocator);
         self.obsolete_paths_after.deinit(allocator);
+        self.mutable_entries_after.deinit(allocator);
+        self.mutable_bytes_after.deinit(allocator);
+        self.immutable_entries_after.deinit(allocator);
+        self.immutable_bytes_after.deinit(allocator);
         self.wal_retained_segments_after.deinit(allocator);
         self.wal_retained_bytes_after.deinit(allocator);
+        self.wal_checkpoint_oldest_retained_segment_after.deinit(allocator);
         self.wal_checkpoint_covered_through_segment_after.deinit(allocator);
+        self.wal_checkpoint_current_segment_after.deinit(allocator);
         self.wal_checkpoint_lag_segments_after.deinit(allocator);
         self.wal_replay_retained_segments_after.deinit(allocator);
         self.wal_replay_retained_bytes_after.deinit(allocator);
+        self.wal_replay_current_segment_after.deinit(allocator);
         self.compaction_scheduler_grants_after.deinit(allocator);
         self.compaction_scheduler_denied_capacity_after.deinit(allocator);
         self.compaction_scheduler_denied_resource_pressure_after.deinit(allocator);
@@ -317,12 +337,19 @@ const GroupAgg = struct {
         try self.level_overflow_bytes_after.append(allocator, @floatFromInt(record.level_overflow_bytes_after));
         try self.run_bytes_after.append(allocator, @floatFromInt(record.run_bytes_after));
         try self.obsolete_paths_after.append(allocator, @floatFromInt(record.obsolete_paths_after));
+        try self.mutable_entries_after.append(allocator, @floatFromInt(record.mutable_entries_after));
+        try self.mutable_bytes_after.append(allocator, @floatFromInt(record.mutable_bytes_after));
+        try self.immutable_entries_after.append(allocator, @floatFromInt(record.immutable_entries_after));
+        try self.immutable_bytes_after.append(allocator, @floatFromInt(record.immutable_bytes_after));
         try self.wal_retained_segments_after.append(allocator, @floatFromInt(record.wal_retained_segments_after));
         try self.wal_retained_bytes_after.append(allocator, @floatFromInt(record.wal_retained_bytes_after));
+        try self.wal_checkpoint_oldest_retained_segment_after.append(allocator, @floatFromInt(record.wal_checkpoint_oldest_retained_segment_after));
         try self.wal_checkpoint_covered_through_segment_after.append(allocator, @floatFromInt(record.wal_checkpoint_covered_through_segment_after));
+        try self.wal_checkpoint_current_segment_after.append(allocator, @floatFromInt(record.wal_checkpoint_current_segment_after));
         try self.wal_checkpoint_lag_segments_after.append(allocator, @floatFromInt(record.wal_checkpoint_lag_segments_after));
         try self.wal_replay_retained_segments_after.append(allocator, @floatFromInt(record.wal_replay_retained_segments_after));
         try self.wal_replay_retained_bytes_after.append(allocator, @floatFromInt(record.wal_replay_retained_bytes_after));
+        try self.wal_replay_current_segment_after.append(allocator, @floatFromInt(record.wal_replay_current_segment_after));
         try self.compaction_scheduler_grants_after.append(allocator, @floatFromInt(record.compaction_scheduler_grants_after));
         try self.compaction_scheduler_denied_capacity_after.append(allocator, @floatFromInt(record.compaction_scheduler_denied_capacity_after));
         try self.compaction_scheduler_denied_resource_pressure_after.append(allocator, @floatFromInt(record.compaction_scheduler_denied_resource_pressure_after));
@@ -512,12 +539,19 @@ fn printComparison(
     try printMetric(writer, allocator, "  level_overflow_bytes_after", before.level_overflow_bytes_after, after.level_overflow_bytes_after);
     try printMetric(writer, allocator, "  run_bytes_after", before.run_bytes_after, after.run_bytes_after);
     try printMetric(writer, allocator, "  obsolete_paths_after", before.obsolete_paths_after, after.obsolete_paths_after);
+    try printMetric(writer, allocator, "  mutable_entries_after", before.mutable_entries_after, after.mutable_entries_after);
+    try printMetric(writer, allocator, "  mutable_bytes_after", before.mutable_bytes_after, after.mutable_bytes_after);
+    try printMetric(writer, allocator, "  immutable_entries_after", before.immutable_entries_after, after.immutable_entries_after);
+    try printMetric(writer, allocator, "  immutable_bytes_after", before.immutable_bytes_after, after.immutable_bytes_after);
     try printMetric(writer, allocator, "  wal_retained_segments_after", before.wal_retained_segments_after, after.wal_retained_segments_after);
     try printMetric(writer, allocator, "  wal_retained_bytes_after", before.wal_retained_bytes_after, after.wal_retained_bytes_after);
+    try printMetric(writer, allocator, "  wal_checkpoint_oldest_retained_segment_after", before.wal_checkpoint_oldest_retained_segment_after, after.wal_checkpoint_oldest_retained_segment_after);
     try printMetric(writer, allocator, "  wal_checkpoint_covered_through_segment_after", before.wal_checkpoint_covered_through_segment_after, after.wal_checkpoint_covered_through_segment_after);
+    try printMetric(writer, allocator, "  wal_checkpoint_current_segment_after", before.wal_checkpoint_current_segment_after, after.wal_checkpoint_current_segment_after);
     try printMetric(writer, allocator, "  wal_checkpoint_lag_segments_after", before.wal_checkpoint_lag_segments_after, after.wal_checkpoint_lag_segments_after);
     try printMetric(writer, allocator, "  wal_replay_retained_segments_after", before.wal_replay_retained_segments_after, after.wal_replay_retained_segments_after);
     try printMetric(writer, allocator, "  wal_replay_retained_bytes_after", before.wal_replay_retained_bytes_after, after.wal_replay_retained_bytes_after);
+    try printMetric(writer, allocator, "  wal_replay_current_segment_after", before.wal_replay_current_segment_after, after.wal_replay_current_segment_after);
     try printMetric(writer, allocator, "  compaction_scheduler_grants_after", before.compaction_scheduler_grants_after, after.compaction_scheduler_grants_after);
     try printMetric(writer, allocator, "  compaction_scheduler_denied_capacity_after", before.compaction_scheduler_denied_capacity_after, after.compaction_scheduler_denied_capacity_after);
     try printMetric(writer, allocator, "  compaction_scheduler_denied_resource_pressure_after", before.compaction_scheduler_denied_resource_pressure_after, after.compaction_scheduler_denied_resource_pressure_after);
