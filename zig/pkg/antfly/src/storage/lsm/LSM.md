@@ -310,6 +310,11 @@ Large-ingest guardrails:
      index LSM maintenance/write stats, including mutable/immutable bytes,
      run/L0 debt, WAL retention/checkpoint lag, WAL append/sync/replay/reset
      counters, and background-IO admission counters.
+   - [x] Metrics slice: the data-server Prometheus endpoint now exports the
+     same cached-write LSM pressure surface for alerting and benchmark
+     sampling, including mutable/immutable bytes, WAL retention/checkpoint
+     lag, WAL append/sync/replay/reset latency counters, compaction policy
+     debt, background-IO admission, and backend-lock waits.
 3. [ ] Replace recovery replay allocation churn with a bounded recovery
    allocation model that can release whole chunks after flush.
    - [x] First slice: state WAL recovery now reads segment chunks directly

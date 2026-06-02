@@ -4113,6 +4113,20 @@ pub const ProvisionedTableWriteSource = struct {
         return stats;
     }
 
+    pub fn lsmWriteStatsBestEffort(self: *ProvisionedTableWriteSource) lsm_backend.Backend.WriteStats {
+        if (!self.local_db_mutex.tryLock()) return .{};
+        defer self.local_db_mutex.unlock();
+        var stats = lsm_backend.Backend.WriteStats{};
+        if (self.write_cache) |cache| {
+            for (cache.entries.items) |entry| {
+                if (entry.db.trySnapshotLsmWriteStats()) |entry_stats| {
+                    lsm_backend.Backend.accumulateWriteStats(&stats, entry_stats);
+                }
+            }
+        }
+        return stats;
+    }
+
     pub fn lsmNativeStorageStatsBestEffort(self: *ProvisionedTableWriteSource) ?lsm_backend.NativeStorageStats {
         if (!self.local_db_mutex.tryLock()) return null;
         defer self.local_db_mutex.unlock();
