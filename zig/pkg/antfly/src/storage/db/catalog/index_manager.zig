@@ -428,6 +428,27 @@ const TextMergeScheduler = struct {
         }
     }
 
+    fn sourceInFlight(self: *const TextMergeScheduler, index_name: []const u8, source: []const IndexManager.TextMergeSourceSegment) bool {
+        for (self.in_flight.items) |merge| {
+            if (!std.mem.eql(u8, merge.index_name, index_name) or merge.segment_ids.len != source.len) continue;
+            if (sourceMatchesSegmentIds(source, merge.segment_ids)) return true;
+        }
+        return false;
+    }
+
+    fn supersedeInFlightForIndex(self: *TextMergeScheduler, alloc: Allocator, index_name: []const u8) void {
+        var i: usize = 0;
+        while (i < self.in_flight.items.len) {
+            const merge = &self.in_flight.items[i];
+            if (!std.mem.eql(u8, merge.index_name, index_name)) {
+                i += 1;
+                continue;
+            }
+            merge.deinit(alloc);
+            _ = self.in_flight.orderedRemove(i);
+        }
+    }
+
     fn pruneExpiredQuarantines(self: *TextMergeScheduler, alloc: Allocator, now_ns: u64) void {
         var i: usize = 0;
         while (i < self.quarantined.items.len) {
@@ -5993,6 +6014,15 @@ pub const IndexManager = struct {
         defer self.text_merge_scheduler.completeSource(self.alloc, task.index_name, task.source);
 
         const entry = self.textIndexEntry(task.index_name) orelse return false;
+        if (!self.text_merge_scheduler.sourceInFlight(task.index_name, task.source)) {
+            self.text_merge_scheduler.skipped_stale_merges += 1;
+            if (try self.textIndexNeedsMerge(&entry.persistent, default_merge_policy)) {
+                TextMergeScheduler.schedule(entry);
+            } else {
+                TextMergeScheduler.noteComplete(entry);
+            }
+            return false;
+        }
         if (!try self.textMergeSourceStillCurrent(entry, task)) {
             self.text_merge_scheduler.skipped_stale_merges += 1;
             TextMergeScheduler.schedule(entry);
@@ -6238,6 +6268,7 @@ pub const IndexManager = struct {
         entry: *TextIndex,
         options: ForceTextCompactOptions,
     ) !bool {
+        self.text_merge_scheduler.supersedeInFlightForIndex(self.alloc, entry.config.name);
         while (true) {
             const snap = entry.persistent.snapshot();
             if (snap.segments.len < 2) return true;
@@ -16409,6 +16440,75 @@ test "text merge task skips stale source after concurrent delete" {
     const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expect(entry.compaction_pending);
     try std.testing.expect(entry.persistent.snapshot().segments.len >= 12);
+}
+
+test "force text compaction supersedes in-flight scheduled merge" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        },
+    });
+
+    var key_buf: [64]u8 = undefined;
+    const opts: IndexBatchOptions = .{
+        .compact_text = false,
+        .compact_text_segment_threshold = 2,
+        .defer_text_compaction = true,
+    };
+    for (0..12) |i| {
+        const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
+        defer alloc.free(key);
+        const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"merge superseded {d}\"}}", .{i});
+        defer alloc.free(value);
+
+        try store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+        try manager.indexTextBatchByNameWithOptions(&store, "ft_v1", &.{.{ .key = key, .value = value }}, opts);
+    }
+
+    var task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+    defer task.deinit(alloc);
+    const in_flight_stats = manager.textMergeStats();
+    try std.testing.expectEqual(@as(u64, 1), in_flight_stats.in_flight_merges);
+
+    const stale_segment = &task.snapshot.segments[task.merge_indices[0]];
+    const stale_doc = stale_segment.reader.storedDoc(0) orelse return error.TestUnexpectedResult;
+    try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{stale_doc.id}, opts);
+
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+
+    try manager.forceCompactAllTextIndexes();
+    const after_force = manager.textMergeStats();
+    try std.testing.expectEqual(@as(u64, 0), after_force.in_flight_merges);
+    try std.testing.expectEqual(@as(u64, 0), after_force.in_flight_segments);
+
+    const applied = try manager.finishTextMergeTask(&task, &result);
+    try std.testing.expect(!applied);
+    const after_finish = manager.textMergeStats();
+    try std.testing.expectEqual(@as(u64, 1), after_finish.skipped_stale_merges);
+
+    const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+    const snapshot = entry.persistent.snapshot();
+    try std.testing.expect(snapshot.segments.len <= default_text_merge_max_segments_per_tier);
+    try std.testing.expectEqual(@as(u64, 11), snapshot.global_doc_count);
 }
 
 test "text merge task records input and output bytes" {
