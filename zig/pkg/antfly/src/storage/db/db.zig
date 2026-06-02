@@ -261,6 +261,8 @@ const AsyncContext = struct {
     dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
     stats: AsyncContentionStats = .{},
 
@@ -2697,6 +2699,7 @@ pub const DB = struct {
         append_ctx.resolution_runtime = runtime;
         self.resolution_append_context = append_ctx;
         self.resolution_runtime = runtime;
+        self.async_context.resolution_runtime = runtime;
         if (self.enrichment_append_context) |ctx| ctx.resolution_runtime = runtime;
     }
 
@@ -2721,6 +2724,7 @@ pub const DB = struct {
         );
         errdefer runtime.deinit();
         self.promotion_runtime = runtime;
+        self.async_context.promotion_runtime = runtime;
         // Patch the resolution stage's append context so journaling a resolution
         // artifact (tagged with the promotion hint) wakes the promoter.
         if (self.resolution_append_context) |ctx| ctx.promotion_runtime = runtime;
@@ -2887,6 +2891,7 @@ pub const DB = struct {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
+        self.async_context.resolution_runtime = null;
         // After the resolution runtime (its final catch-up may journal
         // resolution artifacts that notify the promoter) but before the
         // resolution append context the promoter is wired into is destroyed.
@@ -2894,6 +2899,7 @@ pub const DB = struct {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
+        self.async_context.promotion_runtime = null;
         if (self.resolution_append_context) |ctx| self.runtime_alloc.destroy(ctx);
         if (executor_ready) self.executor.deinit(self.runtime_alloc);
         self.runtime_alloc.destroy(self.executor);
@@ -5497,7 +5503,7 @@ pub const DB = struct {
     /// the existing corpus so the new resolver/scorer behavior applies to
     /// documents already ingested (the extraction artifacts did not change, so
     /// the incremental hint would not fire on its own).
-    pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+    pub fn upsertResolverWithResult(self: *DB, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
         const upsert_result = blk: {
             lockApply(self);
             defer self.core.unlockApply();
@@ -5515,6 +5521,11 @@ pub const DB = struct {
                 }
             },
         }
+        return upsert_result;
+    }
+
+    pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+        _ = try self.upsertResolverWithResult(cfg);
     }
 
     fn backfillResolverCorpus(self: *DB) !void {
@@ -5534,9 +5545,18 @@ pub const DB = struct {
     }
 
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
+        try self.retireResolverReplayBeforeCatalogRemoval();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.removeResolver(name);
+    }
+
+    fn retireResolverReplayBeforeCatalogRemoval(self: *DB) !void {
+        try self.runUntilIdle();
+        const resolution_stats = self.resolutionStageStats();
+        if (resolution_stats.catch_up_required or resolution_stats.blocked) return error.ResolverReplayPending;
+        const promotion_stats = self.promotionStageStats();
+        if (promotion_stats.catch_up_required or promotion_stats.blocked) return error.ResolverReplayPending;
     }
 
     /// The review queue: review-band mentions awaiting human curation. Empty
@@ -17393,19 +17413,34 @@ fn truncateReplayLogs(ctx: *const BatchExecutionContext, up_to_sequence: u64) !v
     ctx.executor.releaseBacklogThrough(up_to_sequence);
 }
 
+fn resolverReplayRetentionRequired(index_manager: *const index_manager_mod.IndexManager, stats: types.ReplayStageStats) bool {
+    if (!stats.catch_up_required and !stats.blocked) return false;
+    if (stats.blocked) return true;
+    return index_manager.resolvers.items.len > 0;
+}
+
+fn clampReplayTruncationForReplayStage(
+    effective: u64,
+    index_manager: *const index_manager_mod.IndexManager,
+    stats: types.ReplayStageStats,
+) u64 {
+    if (!resolverReplayRetentionRequired(index_manager, stats)) return effective;
+    return @min(effective, stats.applied_sequence);
+}
+
 fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     var effective = sequence;
-    // The resolution stage consumes the replay journal but is not an executor
-    // worker, so clamp truncation to its applied sequence (its records must
-    // survive until it processes them).
-    if (ctx.index_manager.resolvers.items.len > 0) {
-        const resolution_applied = enrichment_state.loadAppliedSequence(ctx.alloc, ctx.store, resolution_runtime_mod.scope_name) catch effective;
-        effective = @min(effective, resolution_applied);
-        // The promoter consumes the resolution-artifact records the resolution
-        // stage journals; hold the watermark back until it has promoted them.
-        const promotion_applied = enrichment_state.loadAppliedSequence(ctx.alloc, ctx.store, promotion_runtime_mod.scope_name) catch effective;
-        effective = @min(effective, promotion_applied);
+    // The resolution/promotion stages consume the replay journal but are not
+    // executor workers. Clamp truncation while a configured resolver pipeline is
+    // behind, or whenever a stage has reached a real blocked state. Resolver
+    // removal drains or refuses pending stage work before deleting catalog state,
+    // so a never-configured resolver pipeline does not pin generic replay hints.
+    if (ctx.resolution_runtime) |runtime| {
+        effective = clampReplayTruncationForReplayStage(effective, ctx.index_manager, runtime.stats());
+    }
+    if (ctx.promotion_runtime) |runtime| {
+        effective = clampReplayTruncationForReplayStage(effective, ctx.index_manager, runtime.stats());
     }
     try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
 }
@@ -17438,19 +17473,17 @@ fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
         );
         min_applied = @min(min_applied, enrichment_applied);
     }
-    if (ctx.index_manager.resolvers.items.len > 0) {
-        const resolution_applied = try enrichment_state.loadAppliedSequence(
-            ctx.alloc,
-            ctx.store,
-            resolution_runtime_mod.scope_name,
-        );
-        min_applied = @min(min_applied, resolution_applied);
-        const promotion_applied = try enrichment_state.loadAppliedSequence(
-            ctx.alloc,
-            ctx.store,
-            promotion_runtime_mod.scope_name,
-        );
-        min_applied = @min(min_applied, promotion_applied);
+    if (ctx.resolution_runtime) |runtime| {
+        const stats = runtime.stats();
+        if (resolverReplayRetentionRequired(ctx.index_manager, stats)) {
+            min_applied = @min(min_applied, stats.applied_sequence);
+        }
+    }
+    if (ctx.promotion_runtime) |runtime| {
+        const stats = runtime.stats();
+        if (resolverReplayRetentionRequired(ctx.index_manager, stats)) {
+            min_applied = @min(min_applied, stats.applied_sequence);
+        }
     }
     if (min_applied == 0 or min_applied == std.math.maxInt(u64)) return;
     try truncateReplayLogs(ctx, min_applied);
@@ -24230,6 +24263,52 @@ test "db drains pending resolver backfill when retrying a no-op upsertResolver" 
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
     try std.testing.expect(!try db.resolution_runtime.?.hasReresolveBacklog());
+}
+
+test "db refuses resolver removal while resolution or promotion replay is pending" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg_pending_remove",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_pending_remove_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+
+    // The default standalone DB has no entity sink and waits rather than
+    // advancing promotion replay. Removing the resolver here would otherwise
+    // erase the catalog signal that older retention logic used.
+    try std.testing.expectError(error.ResolverReplayPending, db.removeResolver("kg_pending_remove"));
+    try std.testing.expect(db.promotionStageStats().catch_up_required);
 }
 
 /// Thread-safe capturing entity sink for the promotion integration test.

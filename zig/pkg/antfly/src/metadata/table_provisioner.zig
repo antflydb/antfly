@@ -37,6 +37,15 @@ pub const ProvisionSummary = struct {
     indexes_added: usize = 0,
     indexes_removed: usize = 0,
     enrichments_added: usize = 0,
+    resolvers_added: usize = 0,
+    resolvers_updated: usize = 0,
+
+    pub fn indexManagerCatalogChanged(self: @This()) bool {
+        return self.indexes_added > 0 or
+            self.indexes_removed > 0 or
+            self.resolvers_added > 0 or
+            self.resolvers_updated > 0;
+    }
 };
 
 pub const ReconcileReplicaRootOptions = struct {
@@ -169,6 +178,8 @@ pub fn reconcileReplicaRootWithOptions(
         summary.indexes_removed += index_summary.indexes_removed;
         summary.indexes_added += index_summary.indexes_added;
         summary.enrichments_added += index_summary.enrichments_added;
+        summary.resolvers_added += index_summary.resolvers_added;
+        summary.resolvers_updated += index_summary.resolvers_updated;
     }
     return summary;
 }
@@ -189,9 +200,9 @@ pub fn reconcileDbIndexes(
 ) !ProvisionSummary {
     const removed = try removeMissingIndexes(alloc, db, indexes_json);
     const enrichments_added = try ensureEnrichments(alloc, db, indexes_json);
-    const resolvers_added = try ensureResolvers(alloc, db, indexes_json);
+    const resolver_summary = try ensureResolvers(alloc, db, indexes_json);
     const added = try ensureIndexes(alloc, db, indexes_json);
-    if (added > 0 or removed > 0 or enrichments_added > 0 or resolvers_added > 0) {
+    if (added > 0 or removed > 0 or enrichments_added > 0 or resolver_summary.changed()) {
         const pending = db.pendingWorkStats();
         if (pending.enrichment.error_count == 0) {
             try db.core.index_manager.syncAll(false);
@@ -203,6 +214,8 @@ pub fn reconcileDbIndexes(
         .indexes_added = added,
         .indexes_removed = removed,
         .enrichments_added = enrichments_added,
+        .resolvers_added = resolver_summary.added,
+        .resolvers_updated = resolver_summary.updated,
     };
 }
 
@@ -542,7 +555,17 @@ fn enrichmentExists(existing: []const db_mod.types.EnrichmentConfig, kind: db_mo
     return false;
 }
 
-pub fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !usize {
+pub const ResolverReconcileSummary = struct {
+    added: usize = 0,
+    updated: usize = 0,
+    unchanged: usize = 0,
+
+    fn changed(self: @This()) bool {
+        return self.added > 0 or self.updated > 0;
+    }
+};
+
+pub fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !ResolverReconcileSummary {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
 
@@ -553,21 +576,18 @@ pub fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: [
     }
     try collectDesiredResolvers(alloc, parsed.value, &desired);
 
-    if (desired.items.len == 0) return 0;
+    if (desired.items.len == 0) return .{};
 
-    const existing = try db.listResolvers(alloc);
-    defer {
-        for (existing) |*cfg| cfg.deinit(alloc);
-        alloc.free(existing);
-    }
-
-    var added: usize = 0;
+    var summary: ResolverReconcileSummary = .{};
     for (desired.items) |cfg| {
-        if (resolverExists(existing, cfg.name)) continue;
-        try db.addResolver(cfg);
-        added += 1;
+        const result = try db.upsertResolverWithResult(cfg);
+        switch (result) {
+            .inserted => summary.added += 1,
+            .updated_backfill_required => summary.updated += 1,
+            .updated_no_backfill => summary.unchanged += 1,
+        }
     }
-    return added;
+    return summary;
 }
 
 fn collectDesiredResolvers(
@@ -604,13 +624,6 @@ fn collectDesiredResolvers(
         },
         else => {},
     }
-}
-
-fn resolverExists(existing: []const db_mod.ResolverConfig, name: []const u8) bool {
-    for (existing) |cfg| {
-        if (std.mem.eql(u8, cfg.name, name)) return true;
-    }
-    return false;
 }
 
 fn localRangeHasSchemaVersionIndex(
@@ -941,26 +954,74 @@ test "table provisioner registers a resolver declared in the table index config"
     try std.testing.expectEqual(@as(usize, 1), summary.dbs_opened);
     // The graph index was added; the resolvers section was not treated as one.
     try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), summary.resolvers_added);
+    try std.testing.expectEqual(@as(usize, 0), summary.resolvers_updated);
 
     const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2001);
     defer std.testing.allocator.free(db_path);
-    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
-    defer db.close();
+    {
+        var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+        defer db.close();
 
-    try std.testing.expect(db.core.index_manager.has("relations_graph"));
-    try std.testing.expect(!db.core.index_manager.has("resolvers"));
+        try std.testing.expect(db.core.index_manager.has("relations_graph"));
+        try std.testing.expect(!db.core.index_manager.has("resolvers"));
 
-    const resolvers = try db.listResolvers(std.testing.allocator);
-    defer {
-        for (resolvers) |*cfg| cfg.deinit(std.testing.allocator);
-        std.testing.allocator.free(resolvers);
+        const resolvers = try db.listResolvers(std.testing.allocator);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(std.testing.allocator);
+            std.testing.allocator.free(resolvers);
+        }
+        try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+        try std.testing.expectEqualStrings("kg", resolvers[0].name);
+        try std.testing.expectEqualStrings("entities", resolvers[0].table);
+        try std.testing.expectEqualStrings("relations_v1", resolvers[0].source_artifact);
+        try std.testing.expectEqualStrings("prefix", resolvers[0].candidate_search);
+        try std.testing.expectEqual(@as(u64, 1), resolvers[0].config_generation);
     }
-    try std.testing.expectEqual(@as(usize, 1), resolvers.len);
-    try std.testing.expectEqualStrings("kg", resolvers[0].name);
-    try std.testing.expectEqualStrings("entities", resolvers[0].table);
-    try std.testing.expectEqualStrings("relations_v1", resolvers[0].source_artifact);
-    try std.testing.expectEqualStrings("prefix", resolvers[0].candidate_search);
-    try std.testing.expectEqual(@as(u64, 1), resolvers[0].config_generation);
+
+    const bumped_indexes_json =
+        \\{
+        \\  "relations_graph":{"type":"graph",
+        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\  "resolvers":[
+        \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":2}
+        \\  ]
+        \\}
+    ;
+
+    const bumped_summary = try reconcileReplicaRoot(
+        std.testing.allocator,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 9,
+            .name = "docs",
+            .indexes_json = bumped_indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 9,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 0), bumped_summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 0), bumped_summary.resolvers_added);
+    try std.testing.expectEqual(@as(usize, 1), bumped_summary.resolvers_updated);
+
+    var bumped_db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+    defer bumped_db.close();
+    const bumped_resolvers = try bumped_db.listResolvers(std.testing.allocator);
+    defer {
+        for (bumped_resolvers) |*cfg| cfg.deinit(std.testing.allocator);
+        std.testing.allocator.free(bumped_resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), bumped_resolvers.len);
+    try std.testing.expectEqualStrings("kg", bumped_resolvers[0].name);
+    try std.testing.expectEqual(@as(u64, 2), bumped_resolvers[0].config_generation);
 }
 
 test "table provisioner restores local shard data from metadata restore intent" {

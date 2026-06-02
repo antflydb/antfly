@@ -296,6 +296,23 @@ Resolver catalog/runtime invariants:
   the same resolver upsert is idempotent: if the material config no longer
   changes but a dirty cursor remains from a prior partial attempt, the retry
   drains that pending backlog before returning.
+- Declarative table provisioning is authoritative for resolver definitions.
+  Reconcile does not skip an existing resolver name; it calls the same durable
+  resolver upsert path as the API and reports whether the resolver was inserted,
+  materially updated, or unchanged. This keeps table metadata changes to
+  `config_generation`, scorer weights, candidate search, entity table, and
+  templates on the production backfill path instead of becoming add-only
+  bootstrap state.
+- Replay retention is based on resolver-backed stage state, not generic journal
+  hints. While a configured resolver pipeline is behind, or a resolution /
+  promotion stage has reached an actual blocked state, journal truncation is
+  clamped to that stage's applied sequence. A never-configured resolver pipeline
+  does not pin unrelated replay records. Removing a resolver first drains
+  bounded automatic work and then refuses catalog deletion with
+  `ResolverReplayPending` if resolution or promotion still has pending or
+  blocked replay. That prevents retiring the catalog entry a pending resolution,
+  promotion, or human-review continuation still needs to interpret durable
+  artifacts.
 
 ## Promoter
 
@@ -384,6 +401,14 @@ fail closed or omit unresolved/hydration-missing entity nodes by default, expose
 pending/review state where appropriate, and only add a future opt-in semantic
 wait mode for automatic-only stages. That future mode must return structured
 blocked status rather than waiting for human review.
+
+Resolver removal follows the same rule. It is not a synchronous semantic
+completion barrier and it must not discard catalog context that pending replay
+still needs. The production remove path drains what can run immediately, checks
+resolution and promotion status, and returns structured pending state when a
+stage is blocked or behind. Operators can then inspect the stage status, resolve
+the external blocker (for example leadership or a human-review decision), and
+retry the idempotent removal.
 
 ### DocRef endpoints
 

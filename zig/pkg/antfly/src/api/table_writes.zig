@@ -3333,6 +3333,8 @@ pub const ProvisionedTableWriteSource = struct {
                 summary.indexes_removed += index_summary.indexes_removed;
                 summary.indexes_added += index_summary.indexes_added;
                 summary.enrichments_added += index_summary.enrichments_added;
+                summary.resolvers_added += index_summary.resolvers_added;
+                summary.resolvers_updated += index_summary.resolvers_updated;
                 try cache.replaceTableMetadataLocked(table.name, table.indexes_json, table.schema_json);
                 continue;
             }
@@ -7484,7 +7486,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
     if (mode == .status_only) return db;
 
     const summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, &db, indexes_json);
-    if (summary.indexes_added > 0 or summary.indexes_removed > 0) {
+    if (summary.indexManagerCatalogChanged()) {
         // First-open provisioning can mutate the live index manager. Reopen so
         // request work runs against the stabilized post-reconcile state.
         db.close();

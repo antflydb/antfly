@@ -5350,10 +5350,10 @@ fn openProvisionedQueryDbForTableWithCache(
     try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
 
     const summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, &db, indexes_json);
-    if (summary.indexes_added > 0 or summary.indexes_removed > 0) {
+    if (summary.indexManagerCatalogChanged()) {
         // Query/status paths can be the first readers to observe a newly-added
-        // index from metadata. Reopen after reconcile so searches run against
-        // the stabilized post-reconcile index-manager state.
+        // index or resolver from metadata. Reopen after reconcile so searches
+        // run against the stabilized post-reconcile index-manager state.
         db.close();
         enrichments = try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
         db = if (enrichments.enabled()) blk: {

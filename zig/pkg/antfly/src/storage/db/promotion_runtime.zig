@@ -186,13 +186,28 @@ pub fn processRecordKeys(
     changed_artifact_keys: []const []const u8,
     sink: EntitySink,
 ) !void {
+    return try processRecordKeysMaybeSink(gpa, store, changed_artifact_keys, sink);
+}
+
+fn processRecordKeysMaybeSink(
+    gpa: std.mem.Allocator,
+    store: resolver_lib.ArtifactStore,
+    changed_artifact_keys: []const []const u8,
+    sink: ?EntitySink,
+) !void {
     for (changed_artifact_keys) |key| {
         if (!internal_keys.isResolutionArtifactKey(key)) continue;
-        _ = try processResolutionArtifact(gpa, store, key, sink);
+        const concrete_sink = sink orelse return error.PromotionSinkUnavailable;
+        _ = try processResolutionArtifact(gpa, store, key, concrete_sink);
     }
 }
 
 pub const default_max_records_per_window: usize = 1024;
+
+const CatchUpWindowResult = struct {
+    max_seen: u64,
+    blocked_missing_sink: bool = false,
+};
 
 /// Iterate replay records matching the promotion hint from `from_sequence`,
 /// promoting each record's changed resolution artifacts. Returns the highest
@@ -206,17 +221,29 @@ pub fn catchUpWindow(
     from_sequence: u64,
     max_records: usize,
 ) !u64 {
+    const result = try catchUpWindowMaybeSink(gpa, replay_source, store, sink, from_sequence, max_records);
+    return result.max_seen;
+}
+
+fn catchUpWindowMaybeSink(
+    gpa: Allocator,
+    replay_source: replay_source_mod.Source,
+    store: resolver_lib.ArtifactStore,
+    sink: ?EntitySink,
+    from_sequence: u64,
+    max_records: usize,
+) !CatchUpWindowResult {
     const Ctx = struct {
         gpa: Allocator,
         store: resolver_lib.ArtifactStore,
-        sink: EntitySink,
+        sink: ?EntitySink,
         max_seen: u64,
 
         fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var decoded = try change_journal_mod.decodeRecord(self.gpa, payload);
             defer decoded.deinit();
-            try processRecordKeys(self.gpa, self.store, decoded.record.changed_artifact_keys, self.sink);
+            try processRecordKeysMaybeSink(self.gpa, self.store, decoded.record.changed_artifact_keys, self.sink);
             if (sequence > self.max_seen) self.max_seen = sequence;
         }
     };
@@ -227,8 +254,14 @@ pub fn catchUpWindow(
         .sink = sink,
         .max_seen = from_sequence,
     };
-    _ = try replay_source.forEachMatchingRecord(gpa, from_sequence, .promotion, max_records, &ctx, Ctx.consume);
-    return ctx.max_seen;
+    _ = replay_source.forEachMatchingRecord(gpa, from_sequence, .promotion, max_records, &ctx, Ctx.consume) catch |err| switch (err) {
+        error.PromotionSinkUnavailable => return .{
+            .max_seen = ctx.max_seen,
+            .blocked_missing_sink = true,
+        },
+        else => return err,
+    };
+    return .{ .max_seen = ctx.max_seen };
 }
 
 /// Managed worker that catches the promoter up on changed resolution artifacts.
@@ -246,6 +279,7 @@ pub const PromotionRuntime = struct {
     /// `missing_sink_policy`. Must outlive the runtime.
     sink: ?EntitySink,
     sink_available: std.atomic.Value(bool),
+    missing_sink_blocked: std.atomic.Value(bool),
     missing_sink_policy: MissingSinkPolicy,
     applied_sequence: std.atomic.Value(u64),
     target_sequence: std.atomic.Value(u64),
@@ -274,6 +308,7 @@ pub const PromotionRuntime = struct {
             .owner = owner,
             .sink = sink,
             .sink_available = .init(sink != null),
+            .missing_sink_blocked = .init(false),
             .missing_sink_policy = missing_sink_policy,
             .applied_sequence = .init(applied),
             .target_sequence = .init(applied),
@@ -302,7 +337,11 @@ pub const PromotionRuntime = struct {
         const target = self.target_sequence.load(.acquire);
         const applied = self.applied_sequence.load(.acquire);
         const owner_blocked = applied < target and if (self.owner) |owner| !owner.isLocalOwner() else false;
-        const sink_blocked = applied < target and !owner_blocked and !self.sink_available.load(.acquire) and self.missing_sink_policy == .wait;
+        const sink_blocked = applied < target and
+            !owner_blocked and
+            !self.sink_available.load(.acquire) and
+            self.missing_sink_policy == .wait and
+            self.missing_sink_blocked.load(.acquire);
         const blocked = owner_blocked or sink_blocked;
         return .{
             .enabled = target > 0 or applied < target,
@@ -330,6 +369,7 @@ pub const PromotionRuntime = struct {
         defer self.catch_up_mutex.unlock();
         self.sink = sink;
         self.sink_available.store(sink != null, .release);
+        if (sink != null) self.missing_sink_blocked.store(false, .release);
     }
 
     pub fn start(self: *PromotionRuntime) !void {
@@ -359,33 +399,57 @@ pub const PromotionRuntime = struct {
         while (true) {
             const target = self.target_sequence.load(.acquire);
             const applied = self.applied_sequence.load(.acquire);
-            if (applied >= target) return;
+            if (applied >= target) {
+                self.missing_sink_blocked.store(false, .release);
+                return;
+            }
 
             if (self.owner) |owner| {
                 if (!owner.isLocalOwner()) return;
             }
 
-            // No sink is either an explicit disabled mode or a temporary wiring /
-            // routing gap. Only the disabled mode is allowed to mark work applied.
-            const sink = self.sink orelse {
-                if (self.missing_sink_policy == .wait) return;
-                try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
-                self.applied_sequence.store(target, .release);
-                return;
+            var das = resolution_runtime.DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
+            const result = if (self.sink) |sink| result: {
+                self.missing_sink_blocked.store(false, .release);
+                break :result try catchUpWindowMaybeSink(
+                    self.alloc,
+                    self.replay_source,
+                    das.artifactStore(),
+                    sink,
+                    // from_sequence is exclusive (records with seq > from), matching
+                    // the derived workers, which pass their applied_sequence.
+                    applied,
+                    default_max_records_per_window,
+                );
+            } else result: {
+                if (self.missing_sink_policy == .disabled) {
+                    self.missing_sink_blocked.store(false, .release);
+                    try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
+                    self.applied_sequence.store(target, .release);
+                    return;
+                }
+                break :result try catchUpWindowMaybeSink(
+                    self.alloc,
+                    self.replay_source,
+                    das.artifactStore(),
+                    null,
+                    applied,
+                    default_max_records_per_window,
+                );
             };
 
-            var das = resolution_runtime.DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
-            const max_seen = try catchUpWindow(
-                self.alloc,
-                self.replay_source,
-                das.artifactStore(),
-                sink,
-                // from_sequence is exclusive (records with seq > from), matching
-                // the derived workers, which pass their applied_sequence.
-                applied,
-                default_max_records_per_window,
-            );
+            if (result.blocked_missing_sink) {
+                if (result.max_seen > applied) {
+                    try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, result.max_seen);
+                    self.applied_sequence.store(result.max_seen, .release);
+                }
+                self.missing_sink_blocked.store(true, .release);
+                return;
+            }
+
+            const max_seen = result.max_seen;
             if (max_seen <= applied) {
+                self.missing_sink_blocked.store(false, .release);
                 try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
                 self.applied_sequence.store(target, .release);
                 return;
@@ -830,6 +894,7 @@ test "PromotionRuntime waits on source-shard leadership before promoting" {
         .owner = owner.owner(),
         .sink = capture.sink(),
         .sink_available = .init(true),
+        .missing_sink_blocked = .init(false),
         .missing_sink_policy = .wait,
         .applied_sequence = .init(1),
         .target_sequence = .init(9),
@@ -864,6 +929,7 @@ test "PromotionRuntime stats are nonblocking while catch-up owns the mutex" {
         .owner = null,
         .sink = null,
         .sink_available = .init(false),
+        .missing_sink_blocked = .init(false),
         .missing_sink_policy = .wait,
         .applied_sequence = .init(1),
         .target_sequence = .init(2),
@@ -877,8 +943,65 @@ test "PromotionRuntime stats are nonblocking while catch-up owns the mutex" {
 
     const stats_snapshot = runtime.stats();
     try testing.expect(stats_snapshot.catch_up_required);
-    try testing.expect(stats_snapshot.blocked);
+    try testing.expect(!stats_snapshot.blocked);
     try testing.expectEqual(@as(u64, 3), stats_snapshot.error_count);
+}
+
+test "PromotionRuntime missing sink blocks only on pending resolution artifacts" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const asset_key = try alloc.dupe(u8, "asset:doc:a:relations_v1");
+    defer alloc.free(asset_key);
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+
+    const no_op_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 3,
+        .changed_artifact_keys = &.{asset_key},
+        .target_hints = &.{.promotion},
+    });
+    defer alloc.free(no_op_payload);
+    const pending_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 9,
+        .changed_artifact_keys = &.{resolution_key},
+        .target_hints = &.{.promotion},
+    });
+    defer alloc.free(pending_payload);
+
+    var fake_source = FakeSource{ .records = &.{
+        .{ .sequence = 3, .payload = no_op_payload },
+        .{ .sequence = 9, .payload = pending_payload },
+    } };
+    var store_handle = try resolution_runtime.initRuntimeStore(alloc, map.backendStore());
+    defer store_handle.deinit();
+
+    var runtime = PromotionRuntime{
+        .alloc = alloc,
+        .store_handle = store_handle,
+        .replay_source = fake_source.source(),
+        .owner = null,
+        .sink = null,
+        .sink_available = .init(false),
+        .missing_sink_blocked = .init(false),
+        .missing_sink_policy = .wait,
+        .applied_sequence = .init(1),
+        .target_sequence = .init(9),
+        .error_count = .init(0),
+        .shutdown_flag = .init(false),
+        .io_impl = null,
+        .future = null,
+    };
+
+    try runtime.catchUp();
+    try testing.expectEqual(@as(u64, 3), runtime.applied_sequence.load(.acquire));
+    const stats_snapshot = runtime.stats();
+    try testing.expect(stats_snapshot.catch_up_required);
+    try testing.expect(stats_snapshot.blocked);
+    try testing.expectEqualStrings("missing_entity_sink", stats_snapshot.blocked_reason);
+
+    runtime.store_handle = undefined;
 }
 
 test "catchUpWindow with no matching records returns from_sequence" {
