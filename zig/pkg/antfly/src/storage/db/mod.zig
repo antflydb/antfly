@@ -74,6 +74,7 @@ pub const freePendingReviews = resolution_runtime.freePendingReviews;
 pub const promotion_runtime = @import("promotion_runtime.zig");
 pub const EntitySink = promotion_runtime.EntitySink;
 pub const EntityUpsert = promotion_runtime.EntityUpsert;
+pub const PromotionOwner = promotion_runtime.PromotionOwner;
 pub const DB = @import("db.zig").DB;
 pub const OpenOptions = @import("db.zig").OpenOptions;
 pub const OpenMode = @import("db.zig").OpenMode;

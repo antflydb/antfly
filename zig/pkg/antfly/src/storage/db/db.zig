@@ -174,6 +174,10 @@ pub const OpenOptions = struct {
     /// Optional cross-shard entity sink for the promoter, injected by the serving
     /// layer (see `api/distributed_entity_sink.zig`). Must outlive the DB.
     entity_sink: ?promotion_runtime_mod.EntitySink = null,
+    /// Optional ownership guard for promotion. Raft apply-side DBs set this so
+    /// only the source shard leader emits entity writes; standalone DBs leave it
+    /// null and are treated as local owners.
+    promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
     /// What the promoter does when no sink is currently available. The safe
     /// default holds replay so a later sink injection or routing repair can retry.
     entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
@@ -2265,6 +2269,7 @@ pub const DB = struct {
     resolution_embedder: ?embedder_mod.DenseEmbedder = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     entity_sink: ?promotion_runtime_mod.EntitySink = null,
+    promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
     entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
@@ -2451,6 +2456,7 @@ pub const DB = struct {
                 .resolution_candidate_source = opts.resolution_candidate_source,
                 .resolution_embedder = opts.resolution_embedder,
                 .entity_sink = opts.entity_sink,
+                .promotion_owner = opts.promotion_owner,
                 .entity_sink_missing_policy = opts.entity_sink_missing_policy,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
@@ -2704,6 +2710,7 @@ pub const DB = struct {
             self.core.batchExecutionResources().store,
             self.core.replaySource(),
             self.backend_runtime,
+            self.promotion_owner,
             // Cross-shard entity sink when the serving layer injected one (via
             // OpenOptions or setEntitySink); the missing-sink policy decides
             // whether null means wait or explicit no-op.
@@ -3859,6 +3866,14 @@ pub const DB = struct {
     pub fn setEntitySink(self: *DB, sink: ?promotion_runtime_mod.EntitySink) void {
         self.entity_sink = sink;
         if (self.promotion_runtime) |runtime| runtime.setSink(sink);
+    }
+
+    /// Inject (or clear) the source-shard promotion owner on an already-open DB.
+    /// Serving-layer managed DBs use this to keep follower raft apply from
+    /// turning replay into public entity-table writes.
+    pub fn setPromotionOwner(self: *DB, owner: ?promotion_runtime_mod.PromotionOwner) void {
+        self.promotion_owner = owner;
+        if (self.promotion_runtime) |runtime| runtime.setOwner(owner);
     }
 
     fn failIfIdentityOrdinalExhaustedForNewUpserts(self: *DB, doc_ids: []const []const u8) !void {

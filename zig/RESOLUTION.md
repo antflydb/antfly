@@ -284,6 +284,12 @@ The promoter turns resolution decisions into durable entity state.
   `DocumentTransform` (which `BatchRequest` already supports), so replaying the
   same promotion is a no-op and concurrent promotions union aliases instead of
   clobbering.
+- **Single promotion owner per source shard.** In raft deployments every replica
+  applies the same source-table write, but only the source shard's current local
+  leader may turn the resulting resolution replay into public entity-table writes.
+  Followers keep the `promotion` checkpoint unapplied and report
+  `blocked_reason="not_source_group_leader"` until leadership moves to them. This
+  keeps idempotent entity merges from multiplying raft proposals by replica count.
 - **Provenance is inbound mention edges**, not a `provenance: [...]` array on the
   entity doc. "Which documents mention this entity" = the doc->entity mention
   edges the materializer already writes, with replace-on-rerender and
@@ -552,12 +558,16 @@ Open/index/enrichment validation should reject:
          documents through an injected `EntitySink`. `DistributedEntitySink`
          implements the sink over the routing-aware `TableWriteSource` with an
          idempotent merge `DocumentTransform` (set entity_type/canonical_name,
-         add_to_set aliases, upsert) -- the decoupled cross-shard write. Wired
-         through `DataServer.initApiServer` + the managed write cache
-         (`adoptPreparedOpenLocked` and `seedCreatedDbLocked` ->
-         `DB.setEntitySink`). Verified end-to-end on a live multi-Raft swarm by
-         `e2e/antfly/test_resolution.py` (document -> extraction -> resolution ->
-         cross-shard entity upsert) plus db-test/lib-resolution-source-test.
+        add_to_set aliases, upsert) -- the decoupled cross-shard write. Wired
+        through `DataServer.initApiServer` + the managed write cache
+        (`getOrOpenLockedMode`, `adoptPreparedOpenLocked`, and
+        `seedCreatedDbLocked` -> `DB.setEntitySink`).
+        `DataServer` also injects a leadership-backed `PromotionOwner` so raft
+        followers do not emit duplicate entity-table proposals from apply replay;
+        non-owners wait without advancing their promotion checkpoint. Verified
+        end-to-end on a live multi-Raft swarm by
+        `e2e/antfly/test_resolution.py` (document -> extraction -> resolution ->
+        cross-shard entity upsert) plus db-test/lib-resolution-source-test.
    - [x] Resolvers declarable via table config: a `resolvers` section in the
          index config (top-level or nested in an index) is registered by the
          provisioner on both the reconcile and create-local paths.

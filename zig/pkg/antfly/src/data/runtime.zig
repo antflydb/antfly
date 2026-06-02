@@ -1645,6 +1645,11 @@ pub const DataServer = struct {
         self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
         self.write_source.setLocalChangeHook(self.localChangeHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+        const promotion_leadership = self.promotionLeadershipSource();
+        _ = self.write_source.withPromotionLeadershipSource(promotion_leadership);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withPromotionLeadershipSource(promotion_leadership);
+        }
 
         // Cross-shard entity-resolution blocking: wrap the routing-aware read
         // source so resolution workers fetch candidate entities from whichever
@@ -1656,7 +1661,6 @@ pub const DataServer = struct {
         _ = self.write_source.withResolutionCandidateSource(candidate_source);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withResolutionCandidateSource(candidate_source);
-            apply_sm.write_cache.resolution_candidate_source = candidate_source;
         }
 
         // The promoter's cross-shard entity sink: wrap the routing-aware write
@@ -1670,7 +1674,6 @@ pub const DataServer = struct {
         _ = self.write_source.withEntitySink(entity_sink);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withEntitySink(entity_sink);
-            apply_sm.write_cache.entity_sink = entity_sink;
         }
         self.http_server = antfly.public_api.ApiHttpServer.init(
             self.alloc,
@@ -2084,6 +2087,22 @@ pub const DataServer = struct {
             .vtable = &.{
                 .batch_group = localRaftBatchGroup,
                 .batch_group_local = localRaftBatchGroupLocal,
+            },
+        };
+    }
+
+    fn promotionLeadershipSource(self: *DataServer) ?antfly.public_api.table_writes.ProvisionedTableWriteCache.PromotionLeadershipSource {
+        if (self.group_leadership_source == null) return null;
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .is_local_leader = struct {
+                    fn isLocalLeader(ptr: *anyopaque, group_id: u64) bool {
+                        const server: *DataServer = @ptrCast(@alignCast(ptr));
+                        const source = server.group_leadership_source orelse return true;
+                        return source.isLocalLeader(group_id);
+                    }
+                }.isLocalLeader,
             },
         };
     }

@@ -215,6 +215,10 @@ pub const ProvisionedTableWriteCache = struct {
     /// Cross-shard entity sink for the promoter, applied to every managed DB
     /// this cache opens (set after open; see `setEntitySink`).
     entity_sink: ?db_mod.EntitySink = null,
+    /// Source-group leadership predicate for promotion ownership. When set, each
+    /// managed DB gets a group-specific `PromotionOwner` so only the local leader
+    /// promotes resolution replay into cross-shard entity writes.
+    promotion_leadership_source: ?PromotionLeadershipSource = null,
     open_mutex: std.atomic.Mutex = .unlocked,
     entry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     hit_count: std.atomic.Value(u64) = .init(0),
@@ -291,6 +295,7 @@ pub const ProvisionedTableWriteCache = struct {
         group_id: u64,
         lsm_root_generation: u64,
         table_name: []u8,
+        promotion_owner_state: PromotionOwnerState = .{},
         db: db_mod.DB,
         schema_json: ?[]u8 = null,
         active_leases: usize = 0,
@@ -340,6 +345,78 @@ pub const ProvisionedTableWriteCache = struct {
             self.* = undefined;
         }
     };
+
+    pub const PromotionLeadershipSource = struct {
+        ptr: *anyopaque,
+        vtable: *const VTable,
+
+        pub const VTable = struct {
+            is_local_leader: *const fn (ptr: *anyopaque, group_id: u64) bool,
+        };
+
+        pub fn isLocalLeader(self: PromotionLeadershipSource, group_id: u64) bool {
+            return self.vtable.is_local_leader(self.ptr, group_id);
+        }
+    };
+
+    const PromotionOwnerState = struct {
+        group_id: u64 = 0,
+        leadership_source: ?PromotionLeadershipSource = null,
+
+        fn owner(self: *PromotionOwnerState) ?db_mod.PromotionOwner {
+            if (self.leadership_source == null) return null;
+            return .{ .ptr = self, .vtable = &owner_vtable };
+        }
+
+        const owner_vtable = db_mod.PromotionOwner.VTable{ .is_local_owner = isLocalOwner };
+
+        fn isLocalOwner(ptr: *anyopaque) bool {
+            const self: *PromotionOwnerState = @ptrCast(@alignCast(ptr));
+            const source = self.leadership_source orelse return true;
+            return source.isLocalLeader(self.group_id);
+        }
+    };
+
+    fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, group_id: u64, owner_state: ?*PromotionOwnerState) void {
+        db.setResolutionCandidateSource(self.resolution_candidate_source);
+        db.setEntitySink(self.entity_sink);
+        if (owner_state) |state| {
+            state.* = .{
+                .group_id = group_id,
+                .leadership_source = self.promotion_leadership_source,
+            };
+            db.setPromotionOwner(state.owner());
+        } else {
+            db.setPromotionOwner(null);
+        }
+    }
+
+    fn refreshRuntimeHooksLocked(self: *ProvisionedTableWriteCache) void {
+        for (self.entries.items) |entry| {
+            self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
+        }
+    }
+
+    pub fn setResolutionCandidateSource(self: *ProvisionedTableWriteCache, source: ?db_mod.CandidateSource) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        self.resolution_candidate_source = source;
+        self.refreshRuntimeHooksLocked();
+    }
+
+    pub fn setEntitySink(self: *ProvisionedTableWriteCache, sink: ?db_mod.EntitySink) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        self.entity_sink = sink;
+        self.refreshRuntimeHooksLocked();
+    }
+
+    pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSource) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        self.promotion_leadership_source = source;
+        self.refreshRuntimeHooksLocked();
+    }
 
     const ActiveBulkIngestSession = struct {
         table_name: []u8,
@@ -548,6 +625,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
                 _ = self.hit_count.fetchAdd(1, .monotonic);
+                self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
                 lockAtomic(&self.entry_lifecycle_mutex);
                 defer self.entry_lifecycle_mutex.unlock();
                 entry.active_leases += 1;
@@ -595,6 +673,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
+        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         try self.entries.append(self.alloc, owned_entry);
         return .{
             .cache = self,
@@ -642,6 +721,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (!self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) continue;
             _ = self.hit_count.fetchAdd(1, .monotonic);
+            self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
             lockAtomic(&self.entry_lifecycle_mutex);
             defer self.entry_lifecycle_mutex.unlock();
             entry.active_leases += 1;
@@ -669,6 +749,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id != group_id) continue;
             if (entry.lsm_root_generation != lsm_root_generation) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
             lockAtomic(&self.entry_lifecycle_mutex);
             defer self.entry_lifecycle_mutex.unlock();
             entry.active_leases += 1;
@@ -683,6 +764,7 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     fn leaseEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) CachedDb {
+        self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
         lockAtomic(&self.entry_lifecycle_mutex);
         defer self.entry_lifecycle_mutex.unlock();
         entry.active_leases += 1;
@@ -709,6 +791,7 @@ pub const ProvisionedTableWriteCache = struct {
                 if (opened.*) |*db| db.close();
                 opened.* = null;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
+                self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
                 lockAtomic(&self.entry_lifecycle_mutex);
                 defer self.entry_lifecycle_mutex.unlock();
                 entry.active_leases += 1;
@@ -724,13 +807,6 @@ pub const ProvisionedTableWriteCache = struct {
         var db = opened.* orelse unreachable;
         opened.* = null;
         errdefer db.close();
-
-        // Hand the freshly-opened DB the cross-shard candidate source and entity
-        // sink (no-ops unless it has resolution/promotion runtimes). Done here,
-        // the single adoption chokepoint, because managed DBs open lazily and
-        // cannot thread these through OpenOptions.
-        if (self.resolution_candidate_source) |src| db.setResolutionCandidateSource(src);
-        if (self.entity_sink) |sink| db.setEntitySink(sink);
 
         const start_bulk_session = switch (mode) {
             .default, .default_async, .writer_no_replay => self.bulkIngestSessionActiveForTable(table_name),
@@ -755,6 +831,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
+        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc);
         try self.entries.append(self.alloc, owned_entry);
@@ -791,11 +868,6 @@ pub const ProvisionedTableWriteCache = struct {
         opened.* = null;
         errdefer db.close();
 
-        // Inject the cross-shard candidate source and entity sink, same as the
-        // adoptPreparedOpenLocked open path (this create-local seed bypasses it).
-        if (self.resolution_candidate_source) |src| db.setResolutionCandidateSource(src);
-        if (self.entity_sink) |sink| db.setEntitySink(sink);
-
         const owned_table_name = try self.alloc.dupe(u8, table_name);
         errdefer self.alloc.free(owned_table_name);
         const owned_schema_json = try self.alloc.dupe(u8, schema_json);
@@ -812,6 +884,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 0,
             .allow_generation_adoption = true,
         };
+        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         errdefer owned_entry.deinit(self.alloc);
 
         try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
@@ -2311,6 +2384,7 @@ pub const ProvisionedTableWriteSource = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     resolution_candidate_source: ?db_mod.CandidateSource = null,
     entity_sink: ?db_mod.EntitySink = null,
+    promotion_leadership_source: ?ProvisionedTableWriteCache.PromotionLeadershipSource = null,
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
     dirty_write_table_count: std.atomic.Value(u32) = .init(0),
     startup_catch_up_active: std.atomic.Value(bool) = .init(false),
@@ -2370,8 +2444,8 @@ pub const ProvisionedTableWriteSource = struct {
         resolution_candidate_source: ?db_mod.CandidateSource,
     ) *ProvisionedTableWriteSource {
         self.resolution_candidate_source = resolution_candidate_source;
-        if (self.write_cache) |cache| cache.resolution_candidate_source = resolution_candidate_source;
-        if (self.startup_write_cache) |cache| cache.resolution_candidate_source = resolution_candidate_source;
+        if (self.write_cache) |cache| cache.setResolutionCandidateSource(resolution_candidate_source);
+        if (self.startup_write_cache) |cache| cache.setResolutionCandidateSource(resolution_candidate_source);
         return self;
     }
 
@@ -2380,8 +2454,18 @@ pub const ProvisionedTableWriteSource = struct {
         entity_sink: ?db_mod.EntitySink,
     ) *ProvisionedTableWriteSource {
         self.entity_sink = entity_sink;
-        if (self.write_cache) |cache| cache.entity_sink = entity_sink;
-        if (self.startup_write_cache) |cache| cache.entity_sink = entity_sink;
+        if (self.write_cache) |cache| cache.setEntitySink(entity_sink);
+        if (self.startup_write_cache) |cache| cache.setEntitySink(entity_sink);
+        return self;
+    }
+
+    pub fn withPromotionLeadershipSource(
+        self: *ProvisionedTableWriteSource,
+        leadership_source: ?ProvisionedTableWriteCache.PromotionLeadershipSource,
+    ) *ProvisionedTableWriteSource {
+        self.promotion_leadership_source = leadership_source;
+        if (self.write_cache) |cache| cache.setPromotionLeadershipSource(leadership_source);
+        if (self.startup_write_cache) |cache| cache.setPromotionLeadershipSource(leadership_source);
         return self;
     }
 
@@ -2792,6 +2876,9 @@ pub const ProvisionedTableWriteSource = struct {
         if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
         cache.antfly_provider = self.antfly_provider;
         cache.remote_content = self.remote_content;
+        cache.resolution_candidate_source = self.resolution_candidate_source;
+        cache.entity_sink = self.entity_sink;
+        cache.promotion_leadership_source = self.promotion_leadership_source;
         const identity_namespace = try loadTableIdentityNamespaceForGroup(cache.alloc, self.catalog, table_name, group_id);
         const expected_identity_namespace = if (mode == .startup_catch_up or mode == .restore_repair)
             null

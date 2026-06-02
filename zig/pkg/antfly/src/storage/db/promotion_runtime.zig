@@ -20,8 +20,10 @@
 //! generally live on a *different* shard than the source document, so the actual
 //! write goes through an injected `EntitySink` (the write-side analog of the
 //! resolver's `CandidateSource`) which the api/serving layer implements over the
-//! routing-aware table write path. With no sink the stage is a no-op that simply
-//! advances its applied sequence so the replay journal can prune.
+//! routing-aware table write path. In raft deployments promotion is additionally
+//! guarded by an injected `PromotionOwner` so only the source shard's current
+//! leader turns replay into public entity writes. With no sink the stage waits by
+//! default; callers can explicitly disable promotion when that is intended.
 //!
 //! Replay stability: re-promoting the same resolution re-issues an idempotent
 //! upsert (the sink merges canonical fields and unions aliases), so replay is a
@@ -88,6 +90,23 @@ pub const EntitySink = struct {
     pub fn upsertBatch(self: EntitySink, allocator: std.mem.Allocator, entries: []const EntityUpsert) anyerror!void {
         if (self.vtable.upsert_batch) |f| return f(self.ptr, allocator, entries);
         for (entries) |e| try self.upsert(allocator, e.table, e.key, e.doc_json);
+    }
+};
+
+/// Dynamic ownership predicate for promotion work belonging to this DB's source
+/// shard. Standalone/local DBs leave this unset and are always owners; raft
+/// apply-side DBs inject a leadership-backed owner so followers keep the
+/// promotion checkpoint unapplied until they become leader.
+pub const PromotionOwner = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        is_local_owner: *const fn (ptr: *anyopaque) bool,
+    };
+
+    pub fn isLocalOwner(self: PromotionOwner) bool {
+        return self.vtable.is_local_owner(self.ptr);
     }
 };
 
@@ -221,6 +240,7 @@ pub const PromotionRuntime = struct {
     alloc: Allocator,
     store_handle: resolution_runtime.RuntimeStoreHandle,
     replay_source: replay_source_mod.Source,
+    owner: ?PromotionOwner,
     /// Cross-shard entity write sink injected by the api/serving layer; null
     /// means promotion waits or is explicitly disabled, depending on
     /// `missing_sink_policy`. Must outlive the runtime.
@@ -240,6 +260,7 @@ pub const PromotionRuntime = struct {
         store: anytype,
         replay_source: replay_source_mod.Source,
         backend_runtime: *background_runtime_mod.BackendRuntime,
+        owner: ?PromotionOwner,
         sink: ?EntitySink,
         missing_sink_policy: MissingSinkPolicy,
     ) !PromotionRuntime {
@@ -250,6 +271,7 @@ pub const PromotionRuntime = struct {
             .alloc = alloc,
             .store_handle = store_handle,
             .replay_source = replay_source,
+            .owner = owner,
             .sink = sink,
             .sink_available = .init(sink != null),
             .missing_sink_policy = missing_sink_policy,
@@ -279,16 +301,26 @@ pub const PromotionRuntime = struct {
     pub fn stats(self: *PromotionRuntime) types.ReplayStageStats {
         const target = self.target_sequence.load(.acquire);
         const applied = self.applied_sequence.load(.acquire);
-        const blocked = applied < target and !self.sink_available.load(.acquire) and self.missing_sink_policy == .wait;
+        const owner_blocked = applied < target and if (self.owner) |owner| !owner.isLocalOwner() else false;
+        const sink_blocked = applied < target and !owner_blocked and !self.sink_available.load(.acquire) and self.missing_sink_policy == .wait;
+        const blocked = owner_blocked or sink_blocked;
         return .{
             .enabled = target > 0 or applied < target,
             .target_sequence = target,
             .applied_sequence = applied,
             .catch_up_required = applied < target,
             .blocked = blocked,
-            .blocked_reason = if (blocked) "missing_entity_sink" else "",
+            .blocked_reason = if (owner_blocked) "not_source_group_leader" else if (sink_blocked) "missing_entity_sink" else "",
             .error_count = self.error_count.load(.monotonic),
         };
+    }
+
+    /// Inject (or clear) the source-shard promotion owner. Serialized with
+    /// catch-up so ownership cannot change midway through a promotion window.
+    pub fn setOwner(self: *PromotionRuntime, owner: ?PromotionOwner) void {
+        lockMutex(&self.catch_up_mutex);
+        defer self.catch_up_mutex.unlock();
+        self.owner = owner;
     }
 
     /// Inject (or clear) the entity sink after construction, taken under
@@ -328,6 +360,10 @@ pub const PromotionRuntime = struct {
             const target = self.target_sequence.load(.acquire);
             const applied = self.applied_sequence.load(.acquire);
             if (applied >= target) return;
+
+            if (self.owner) |owner| {
+                if (!owner.isLocalOwner()) return;
+            }
 
             // No sink is either an explicit disabled mode or a temporary wiring /
             // routing gap. Only the disabled mode is allowed to mark work applied.
@@ -477,6 +513,21 @@ const CaptureSink = struct {
         const self: *CaptureSink = @ptrCast(@alignCast(ptr));
         self.batch_calls += 1;
         for (entries) |e| try self.record(e.table, e.key, e.doc_json);
+    }
+};
+
+const ToggleOwner = struct {
+    local_owner: bool,
+
+    fn owner(self: *ToggleOwner) PromotionOwner {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = PromotionOwner.VTable{ .is_local_owner = isLocalOwner };
+
+    fn isLocalOwner(ptr: *anyopaque) bool {
+        const self: *ToggleOwner = @ptrCast(@alignCast(ptr));
+        return self.local_owner;
     }
 };
 
@@ -662,11 +713,68 @@ test "catchUpWindow leaves replay unapplied when a resolution artifact is malfor
     try testing.expectEqual(@as(usize, 0), capture.keys.items.len);
 }
 
+test "PromotionRuntime waits on source-shard leadership before promoting" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    try map.put(resolution_key, sample_resolution);
+
+    const payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 9,
+        .changed_artifact_keys = &.{resolution_key},
+        .target_hints = &.{.promotion},
+    });
+    defer alloc.free(payload);
+
+    var fake_source = FakeSource{ .records = &.{.{ .sequence = 9, .payload = payload }} };
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+    var owner = ToggleOwner{ .local_owner = false };
+    var store_handle = try resolution_runtime.initRuntimeStore(alloc, map.store());
+    defer store_handle.deinit();
+
+    var runtime = PromotionRuntime{
+        .alloc = alloc,
+        .store_handle = store_handle,
+        .replay_source = fake_source.source(),
+        .owner = owner.owner(),
+        .sink = capture.sink(),
+        .sink_available = .init(true),
+        .missing_sink_policy = .wait,
+        .applied_sequence = .init(1),
+        .target_sequence = .init(9),
+        .error_count = .init(0),
+        .shutdown_flag = .init(false),
+        .io_impl = null,
+        .future = null,
+    };
+
+    try runtime.catchUp();
+    try testing.expectEqual(@as(u64, 1), runtime.applied_sequence.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), capture.keys.items.len);
+    const follower_stats = runtime.stats();
+    try testing.expect(follower_stats.blocked);
+    try testing.expectEqualStrings("not_source_group_leader", follower_stats.blocked_reason);
+
+    owner.local_owner = true;
+    try runtime.catchUp();
+    try testing.expectEqual(@as(u64, 9), runtime.applied_sequence.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
+    const leader_stats = runtime.stats();
+    try testing.expect(!leader_stats.blocked);
+
+    runtime.store_handle = undefined;
+}
+
 test "PromotionRuntime stats are nonblocking while catch-up owns the mutex" {
     var runtime = PromotionRuntime{
         .alloc = testing.allocator,
         .store_handle = undefined,
         .replay_source = undefined,
+        .owner = null,
         .sink = null,
         .sink_available = .init(false),
         .missing_sink_policy = .wait,
