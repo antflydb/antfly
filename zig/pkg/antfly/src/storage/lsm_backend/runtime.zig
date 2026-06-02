@@ -2040,7 +2040,7 @@ fn getFromRunPointRetainedLocked(
         if (held_blocks) |blocks| {
             if (backend.options.cache != null) {
                 var read_hint: ?BorrowedReadHint = null;
-                const located = try getFromRunWithBlockCache(backend, run, run_index, &read_hint, blocks, namespace, key, true) orelse return null;
+                const located = try getFromRunWithBlockCache(backend, run, run_index, &read_hint, blocks, held_values, value_allocator, namespace, key, true) orelse return null;
                 if (located.entry.tombstone) return error.NotFound;
                 recordPointValueBorrow(backend);
                 if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
@@ -2156,7 +2156,7 @@ fn readManyCurrentSortedPointByRunLocked(
 
             if (run.path != null) {
                 const value = if (backend.options.cache != null) blk: {
-                    const located = try getFromRunWithBlockCacheBatch(backend, run, run_index, &read_hint, block_handles, namespace, keys[key_index], false, &batch_indexes) orelse break :blk null;
+                    const located = try getFromRunWithBlockCacheBatch(backend, run, run_index, &read_hint, block_handles, held_values, allocator, namespace, keys[key_index], false, &batch_indexes) orelse break :blk null;
                     read_hint = .{
                         .run_index = run_index,
                         .namespace_name = namespace.name,
@@ -3831,9 +3831,9 @@ fn readPointRunCandidate(
     const run = &runs[candidate.run_index];
     if (backend.options.cache != null) {
         const located = if (batch_run_indexes) |indexes|
-            try getFromRunWithBlockCacheBatch(backend, run, candidate.run_index, read_hint, held_blocks, namespace, key, true, indexes) orelse return null
+            try getFromRunWithBlockCacheBatch(backend, run, candidate.run_index, read_hint, held_blocks, held_values, value_allocator, namespace, key, true, indexes) orelse return null
         else
-            try getFromRunWithBlockCache(backend, run, candidate.run_index, read_hint, held_blocks, namespace, key, true) orelse return null;
+            try getFromRunWithBlockCache(backend, run, candidate.run_index, read_hint, held_blocks, held_values, value_allocator, namespace, key, true) orelse return null;
         if (located.entry.tombstone) return error.NotFound;
         read_hint.* = .{
             .run_index = candidate.run_index,
@@ -3967,9 +3967,9 @@ fn getFromRunIndices(
             if (run_filter_checked and !try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, backend_locked)) continue;
             if (backend.options.cache != null) {
                 const located = if (batch_run_indexes) |indexes|
-                    try getFromRunWithBlockCacheBatch(backend, run, run_index, read_hint, held_blocks, namespace, key, run_filter_checked, indexes) orelse continue
+                    try getFromRunWithBlockCacheBatch(backend, run, run_index, read_hint, held_blocks, held_values, value_allocator, namespace, key, run_filter_checked, indexes) orelse continue
                 else
-                    try getFromRunWithBlockCache(backend, run, run_index, read_hint, held_blocks, namespace, key, run_filter_checked) orelse continue;
+                    try getFromRunWithBlockCache(backend, run, run_index, read_hint, held_blocks, held_values, value_allocator, namespace, key, run_filter_checked) orelse continue;
                 if (located.entry.tombstone) return error.NotFound;
                 read_hint.* = .{
                     .run_index = run_index,
@@ -4031,7 +4031,7 @@ fn getFromRunIndices(
 const BlockLocatedEntry = struct {
     entry_index: usize,
     entry: lsm_table_file.Entry,
-    handle: cache_mod.Handle,
+    handle: ?cache_mod.Handle,
 };
 
 const LocatedTableEntry = struct {
@@ -4163,6 +4163,8 @@ fn getFromRunWithBlockCache(
     run_index: usize,
     read_hint: *?BorrowedReadHint,
     held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
     namespace: backend_types.Namespace,
     key: []const u8,
     run_filter_checked: bool,
@@ -4171,7 +4173,7 @@ fn getFromRunWithBlockCache(
 
     var index_handle = try loadRunTableIndexHandle(backend, run);
     defer index_handle.release();
-    return try getFromRunWithBlockCacheIndex(backend, run, run_index, index_handle.runTableIndex(), read_hint, held_blocks, namespace, key, run_filter_checked);
+    return try getFromRunWithBlockCacheIndex(backend, run, run_index, index_handle.runTableIndex(), read_hint, held_blocks, held_values, value_allocator, namespace, key, run_filter_checked);
 }
 
 fn getFromRunWithBlockCacheBatch(
@@ -4180,6 +4182,8 @@ fn getFromRunWithBlockCacheBatch(
     run_index: usize,
     read_hint: *?BorrowedReadHint,
     held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
     namespace: backend_types.Namespace,
     key: []const u8,
     run_filter_checked: bool,
@@ -4188,7 +4192,7 @@ fn getFromRunWithBlockCacheBatch(
     if (!runMayContain(run.*, namespace, key)) return null;
 
     const state = try batch_run_indexes.state(backend, run, run_index);
-    return try getFromRunWithBlockCacheBatchState(backend, run, run_index, state, read_hint, held_blocks, namespace, key, run_filter_checked);
+    return try getFromRunWithBlockCacheBatchState(backend, run, run_index, state, read_hint, held_blocks, held_values, value_allocator, namespace, key, run_filter_checked);
 }
 
 fn getFromRunWithBlockCacheIndex(
@@ -4198,6 +4202,8 @@ fn getFromRunWithBlockCacheIndex(
     index: *const lsm_table_file.TableIndex,
     read_hint: *?BorrowedReadHint,
     held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
     namespace: backend_types.Namespace,
     key: []const u8,
     run_filter_checked: bool,
@@ -4227,11 +4233,13 @@ fn getFromRunWithBlockCacheIndex(
         }
     }
     if (located == null) {
-        located = try findExactEntryInCachedBlocks(backend, run, index, namespace, key);
+        located = try findExactEntryInCachedBlocks(backend, run, index, held_values, value_allocator, namespace, key);
     }
     var pinned = located orelse return null;
-    errdefer pinned.handle.release();
-    try held_blocks.append(backend.allocator, pinned.handle);
+    errdefer if (pinned.handle) |*handle| handle.release();
+    if (pinned.handle) |handle| {
+        try held_blocks.append(backend.allocator, handle);
+    }
     return .{
         .entry_index = pinned.entry_index,
         .entry = pinned.entry,
@@ -4245,6 +4253,8 @@ fn getFromRunWithBlockCacheBatchState(
     state: *RunBatchIndexState,
     read_hint: *?BorrowedReadHint,
     held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
     namespace: backend_types.Namespace,
     key: []const u8,
     run_filter_checked: bool,
@@ -4289,7 +4299,7 @@ fn getFromRunWithBlockCacheBatchState(
         }
     }
     if (located == null) {
-        located = try findExactEntryInBatchBlocks(backend, run, index, state, held_blocks, namespace, key);
+        located = try findExactEntryInBatchBlocks(backend, run, index, state, held_blocks, held_values, value_allocator, namespace, key);
     }
     if (located) |entry| {
         state.last_entry_index = entry.entry_index;
@@ -4356,6 +4366,67 @@ fn loadRunTableBlockHandleAtOffset(
     }
 }
 
+fn loadRunTablePhysicalBlockHandleAtOffset(
+    backend: anytype,
+    run: *Run,
+    absolute_offset: u64,
+    physical_len: u32,
+) !cache_mod.Handle {
+    const cache = backend.options.cache orelse return error.RunStateUnavailable;
+    const path = run.path orelse return error.RunStateUnavailable;
+    const generation = backend.root_generation;
+    while (true) {
+        if (cache.retainRunTablePhysicalBlock(path, run.id, generation, absolute_offset, physical_len)) |retained| {
+            backend.recordSharedBlockCacheHit();
+            return retained;
+        }
+        try cache.beginLoadWithBlock(path, run.id, generation, .run_table_physical_block, absolute_offset, physical_len);
+        defer cache.finishLoadWithBlock(path, run.id, generation, .run_table_physical_block, absolute_offset, physical_len);
+        if (cache.retainRunTablePhysicalBlock(path, run.id, generation, absolute_offset, physical_len)) |retained| {
+            backend.recordSharedBlockCacheHit();
+            return retained;
+        }
+        backend.recordSharedBlockCacheMiss();
+        const block = try loadRunTableBlockWithStats(backend, cache.valueAllocator(), path, absolute_offset, physical_len);
+        return try cache.putRunTablePhysicalBlock(path, run.id, generation, absolute_offset, physical_len, block);
+    }
+}
+
+fn findExactEntryInCachedCompressedPrefixBlock(
+    backend: anytype,
+    run: *Run,
+    index: *const lsm_table_file.TableIndex,
+    block_index: usize,
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+) !?LocatedTableEntry {
+    const block = index.blocks[block_index];
+    const window = index.blockWindow(block_index);
+    switch (window.compression) {
+        .prefix, .prefix_snappy => {},
+        .none, .snappy => return null,
+    }
+    const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+    var handle = try loadRunTablePhysicalBlockHandleAtOffset(backend, run, absolute_offset, window.physicalLen());
+    defer handle.release();
+    const positioned = try lsm_table_file.findExactEntryInCompressedBlockPayloadAlloc(
+        value_allocator,
+        window.compression,
+        handle.runTablePhysicalBlock(),
+        block.first_entry_index,
+        namespace.name,
+        key,
+    ) orelse return null;
+    errdefer value_allocator.free(positioned.bytes);
+    try held_values.append(value_allocator, positioned.bytes);
+    return .{
+        .entry_index = positioned.index,
+        .entry = positioned.entry,
+    };
+}
+
 fn loadEntryFromCachedBlock(
     backend: anytype,
     run: *Run,
@@ -4378,6 +4449,8 @@ fn findExactEntryInCachedBlocks(
     backend: anytype,
     run: *Run,
     index: *const lsm_table_file.TableIndex,
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
     namespace: backend_types.Namespace,
     key: []const u8,
 ) !?BlockLocatedEntry {
@@ -4387,6 +4460,13 @@ fn findExactEntryInCachedBlocks(
         if (!block.maybeContains(namespace.name, key)) {
             backend.recordBloomNegative();
             return null;
+        }
+        if (try findExactEntryInCachedCompressedPrefixBlock(backend, run, index, block_index, held_values, value_allocator, namespace, key)) |entry| {
+            return .{
+                .entry_index = entry.entry_index,
+                .entry = entry.entry,
+                .handle = null,
+            };
         }
         const window = index.blockWindow(block_index);
         var handle = try loadRunTableBlockHandle(backend, run, index, window);
@@ -4410,7 +4490,7 @@ fn findExactEntryInCachedBlocks(
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
         var loaded = try loadEntryFromCachedBlock(backend, run, index, mid);
-        defer loaded.handle.release();
+        defer if (loaded.handle) |*handle| handle.release();
         const ord = compareTableEntryTo(loaded.entry, namespace, key);
         if (ord == .lt) {
             lo = mid + 1;
@@ -4422,7 +4502,7 @@ fn findExactEntryInCachedBlocks(
     var loaded = try loadEntryFromCachedBlock(backend, run, index, lo);
     const ord = compareTableEntryTo(loaded.entry, namespace, key);
     if (ord != .eq) {
-        loaded.handle.release();
+        if (loaded.handle) |*handle| handle.release();
         return null;
     }
     return loaded;
@@ -4456,8 +4536,10 @@ fn loadEntryFromBatchBlock(
 ) !LocatedTableEntry {
     const block_index = index.findBlockIndexForEntry(entry_index) orelse {
         var loaded = try loadEntryFromCachedBlock(backend, run, index, entry_index);
-        errdefer loaded.handle.release();
-        try held_blocks.append(backend.allocator, loaded.handle);
+        errdefer if (loaded.handle) |*handle| handle.release();
+        if (loaded.handle) |handle| {
+            try held_blocks.append(backend.allocator, handle);
+        }
         return .{
             .entry_index = loaded.entry_index,
             .entry = loaded.entry,
@@ -4477,6 +4559,8 @@ fn findExactEntryInBatchBlocks(
     index: *const lsm_table_file.TableIndex,
     state: *RunBatchIndexState,
     held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
     namespace: backend_types.Namespace,
     key: []const u8,
 ) !?LocatedTableEntry {
@@ -4486,6 +4570,9 @@ fn findExactEntryInBatchBlocks(
         if (!block.maybeContains(namespace.name, key)) {
             backend.recordBloomNegative();
             return null;
+        }
+        if (try findExactEntryInCachedCompressedPrefixBlock(backend, run, index, block_index, held_values, value_allocator, namespace, key)) |entry| {
+            return entry;
         }
         const block_bytes = try loadBatchBlock(backend, run, index, state, held_blocks, block_index);
         const positioned = try lsm_table_file.findExactEntryInBlock(
@@ -4533,11 +4620,11 @@ fn scanForExactEntryInCachedBlocks(
         var loaded = try loadEntryFromCachedBlock(backend, run, index, idx);
         const order = compareTableEntryTo(loaded.entry, namespace, key);
         if (order == .lt) {
-            loaded.handle.release();
+            if (loaded.handle) |*handle| handle.release();
             continue;
         }
         if (compareNamespace(.{ .name = loaded.entry.namespace_name }, namespace) != .eq or order != .eq) {
-            loaded.handle.release();
+            if (loaded.handle) |*handle| handle.release();
             return null;
         }
         return loaded;

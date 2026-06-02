@@ -948,6 +948,7 @@ fn writeLsmCacheKindMetricFamily(
     try appendLsmCacheKindSample(writer, name, "run_table_raw", stats.run_table_raw, field);
     try appendLsmCacheKindSample(writer, name, "run_table_index", stats.run_table_index, field);
     try appendLsmCacheKindSample(writer, name, "run_table_block", stats.run_table_block, field);
+    try appendLsmCacheKindSample(writer, name, "run_table_physical_block", stats.run_table_physical_block, field);
 }
 
 fn appendLsmCacheKindSample(

@@ -38802,10 +38802,14 @@ test "db merge-style cutover preserves text sparse and graph indexes across reop
 }
 
 fn cacheBlockHitsForBench(stats: anytype) u64 {
+    var hits: u64 = 0;
     if (@hasField(@TypeOf(stats), "run_table_block")) {
-        return stats.run_table_block.hits;
+        hits += stats.run_table_block.hits;
     }
-    return 0;
+    if (@hasField(@TypeOf(stats), "run_table_physical_block")) {
+        hits += stats.run_table_physical_block.hits;
+    }
+    return hits;
 }
 
 fn normalizedBenchSearchEffort(effort: ?f32) f32 {

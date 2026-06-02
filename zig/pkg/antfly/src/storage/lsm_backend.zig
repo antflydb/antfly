@@ -8032,6 +8032,67 @@ test "lsm backend prefix bloom skips bounded scan blocks" {
     try std.testing.expectEqual(@as(u64, 0), read_stats.table_block_loads);
 }
 
+test "lsm backend shared cache point reads search prefix-compressed physical blocks directly" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-shared-cache-prefix-physical-point";
+    const count = 96;
+    const keys = try alloc.alloc([]u8, count);
+    defer {
+        for (keys) |key| alloc.free(key);
+        alloc.free(keys);
+    }
+
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginWrite();
+        for (keys, 0..) |*key_slot, i| {
+            const key = try std.fmt.allocPrint(
+                alloc,
+                "tenant:docs:collection:very-long-shared-prefix:segment:{d:0>6}:field:dense-vector",
+                .{i},
+            );
+            key_slot.* = key;
+            try txn.put(key, "v");
+        }
+        try txn.commit();
+        try backend.sync(true);
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var txn = try runtime.beginRead();
+    defer txn.abort();
+    try std.testing.expectEqualStrings("v", try txn.get(keys[37]));
+
+    const stats = cache.snapshotStats();
+    try std.testing.expect(stats.run_table_index.inserts > 0);
+    try std.testing.expect(stats.run_table_physical_block.inserts > 0);
+    try std.testing.expectEqual(@as(u64, 0), stats.run_table_block.inserts);
+}
+
 test "lsm backend block filter avoids candidate block read on run-bloom false positive" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);

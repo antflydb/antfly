@@ -184,6 +184,10 @@ and maintenance that is always debt-driven.
    - [x] First runtime slice: local/no-shared-cache point reads now search
      prefix-compressed block payloads directly by restart point and return only
      the matched encoded entry instead of materializing the whole logical block.
+   - [x] Shared-cache point-read slice: exact point reads now cache compressed
+     physical block payloads under a separate `run_table_physical_block` cache
+     kind and direct-search restart windows from that payload. Decoded
+     `run_table_block` entries remain reserved for iterator/block-window paths.
    - Cache policy should distinguish compressed bytes, decoded block bytes, and
      direct-search payloads so mixed workloads do not evict useful hot blocks
      with transient decoded materialization.
@@ -592,6 +596,9 @@ Large-ingest guardrails:
      direct restart search for prefix-compressed blocks instead of decoding the
      full logical block before lookup. Shared-cache cursor/block policy remains
      a separate cache-shape follow-up.
+   - [x] Shared-cache exact reads now use a distinct physical-block cache for
+     prefix-compressed payloads, so repeated point probes can reuse compressed
+     bytes without populating the decoded iterator block cache.
 
 ### Comparison Rules
 
