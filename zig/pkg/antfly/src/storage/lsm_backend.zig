@@ -8273,6 +8273,63 @@ test "lsm backend sorted-by-run getManySorted advances within cached run blocks"
     try std.testing.expectEqual(@as(u64, 0), stats.cursor_block_loads);
 }
 
+test "lsm backend point getManySorted reuses cached run blocks below sorted threshold" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-point-batch-forward-cache";
+    const count = 64;
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .cache = &cache,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        var key_buf: [64]u8 = undefined;
+        var value_buf: [32]u8 = undefined;
+        for (0..count) |i| {
+            const key = try std.fmt.bufPrint(&key_buf, "artifact:{d:0>8}:dense", .{i * 10});
+            const value = try std.fmt.bufPrint(&value_buf, "value-{d}", .{i});
+            try txn.put(.{ .name = "docs" }, key, value);
+        }
+        try txn.commit();
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    const batch_count = 31;
+    var key_storage: [batch_count][64]u8 = undefined;
+    var keys: [batch_count][]const u8 = undefined;
+    var values: [batch_count]?[]const u8 = undefined;
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_storage[i], "artifact:{d:0>8}:dense", .{i * 10});
+    }
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try read.getManySorted(.{ .name = "docs" }, &keys, &values);
+    try std.testing.expectEqualStrings("value-0", values[0].?);
+    try std.testing.expectEqualStrings("value-30", values[batch_count - 1].?);
+
+    const stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_point);
+    try std.testing.expectEqual(@as(u64, 0), stats.get_many_sorted_plan_sorted_by_run);
+    try std.testing.expect(stats.read_hint_attempts > 0);
+    try std.testing.expect(stats.read_hint_hits > 0);
+    try std.testing.expectEqual(@as(u64, 0), stats.cursor_block_loads);
+}
+
 test "lsm backend probe getManySorted uses point path for large sparse batches" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1 });
     defer backend.close();

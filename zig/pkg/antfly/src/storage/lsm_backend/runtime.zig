@@ -1732,6 +1732,8 @@ fn readManySortedPointFromSnapshot(
     var local_held_blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
+    var batch_indexes = RunBatchIndexHandles{ .allocator = runtimeScratchAllocator(allocator) };
+    defer batch_indexes.deinit();
 
     var result: BatchCursorReadResult = .{};
     var last_l0_group_index: ?usize = null;
@@ -1753,7 +1755,7 @@ fn readManySortedPointFromSnapshot(
             namespace,
             key,
             backend_locked,
-            null,
+            &batch_indexes,
         ) catch |err| switch (err) {
             error.NotFound => {
                 result.misses += 1;
@@ -1771,6 +1773,7 @@ fn readManySortedPointFromSnapshot(
         }
         result.hits += 1;
     }
+    try batch_indexes.transferBlocks(backend.allocator, block_handles);
     return result;
 }
 
@@ -2123,6 +2126,8 @@ fn readManyCurrentSortedPointByRunLocked(
     var local_held_blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
+    var batch_indexes = RunBatchIndexHandles{ .allocator = metadata_allocator };
+    defer batch_indexes.deinit();
     var read_hint: ?BorrowedReadHint = null;
 
     for (backend.runs.items, 0..) |*run, run_index| {
@@ -2135,7 +2140,7 @@ fn readManyCurrentSortedPointByRunLocked(
 
             if (run.path != null) {
                 const value = if (backend.options.cache != null) blk: {
-                    const located = try getFromRunWithBlockCache(backend, run, run_index, &read_hint, block_handles, namespace, keys[key_index], false) orelse break :blk null;
+                    const located = try getFromRunWithBlockCacheBatch(backend, run, run_index, &read_hint, block_handles, namespace, keys[key_index], false, &batch_indexes) orelse break :blk null;
                     read_hint = .{
                         .run_index = run_index,
                         .namespace_name = namespace.name,
@@ -2220,6 +2225,7 @@ fn readManyCurrentSortedPointByRunLocked(
     for (resolved) |was_resolved| {
         if (!was_resolved) result.misses += 1;
     }
+    try batch_indexes.transferBlocks(backend.allocator, block_handles);
     return result;
 }
 

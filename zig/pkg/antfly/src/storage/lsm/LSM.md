@@ -303,6 +303,9 @@ Large-ingest guardrails:
    - [x] First slice: cached sorted-by-run reads now keep a per-run forward
      entry hint and bounded-scan from the previous hit before falling back to
      exact block lookup.
+   - [x] Point-batch slice: sorted point-plan batches now reuse per-run table
+     index and current-block state too, so sub-threshold exact batches can
+     advance inside cached blocks instead of reloading/reseeking each key.
 5. [x] Tune bloom defaults once the benchmark can show false-positive block
    loads.
    - Run-level and per-block LSM filters now default to 14 bits/key. The option
