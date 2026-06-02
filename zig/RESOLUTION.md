@@ -289,10 +289,13 @@ Resolver catalog/runtime invariants:
   contain asset artifacts without markers are repaired by a separate bounded
   legacy asset scan, which persists missing markers and then converges back to
   the marker index.
-- Adding a resolver or materially changing its resolver/scorer config marks a
-  persisted re-resolution cursor dirty. Existing source artifacts are replayed in
-  bounded windows through the normal resolution, promotion, and graph
-  materialization stages.
+- Adding a resolver or materially changing its resolver/scorer config persists
+  the catalog change and marks the re-resolution cursors dirty in one store
+  transaction. Existing source artifacts are replayed in bounded windows through
+  the normal resolution, promotion, and graph materialization stages. Retrying
+  the same resolver upsert is idempotent: if the material config no longer
+  changes but a dirty cursor remains from a prior partial attempt, the retry
+  drains that pending backlog before returning.
 
 ## Promoter
 
@@ -690,18 +693,21 @@ Open/index/enrichment validation should reject:
 3. **Merge/split (phase 3).**
    - [x] Entity `merged_into`: resolution follows a matched candidate's
          `merged_into` redirect to the surviving canonical entity (lazy merge).
-   - [x] Resolver backfill: `DB.addResolver` and `DB.upsertResolver` mark a
-         persisted re-resolution cursor dirty when a resolver is first registered
-         or when a material resolver/scorer config field changes.
-         `ResolutionRuntime.runReresolveBacklogWindow` scans the maintained
-         source-artifact index in bounded windows, appends matching extraction
-         artifacts as replay records, and repairs missing source-index markers
-         from upgraded stores with a second bounded cursor over legacy asset
-         keys. The normal resolution worker re-resolves queued artifacts
+   - [x] Resolver backfill: resolver catalog writes mark persisted
+         re-resolution cursors dirty in the same transaction when a resolver is
+         first registered or when a material resolver/scorer config field
+         changes. `ResolutionRuntime.runReresolveBacklogWindow` scans the
+         maintained source-artifact index in bounded windows, appends matching
+         extraction artifacts as replay records, and repairs missing source-index
+         markers from upgraded stores with a second bounded cursor over legacy
+         asset keys. The normal resolution worker re-resolves queued artifacts
          idempotently. Each window is drained through downstream promotion/graph
-         stages before the next window is queued. Verified by db-tests (inserted
-         resolver re-resolves an already-ingested document; bump gen 1 -> 2 does
-         the same; legacy asset markers are repaired and replayed).
+         stages before the next window is queued. A same-config retry of
+         `DB.upsertResolver` also drains any already-dirty cursor, covering
+         failures after the durable catalog update but before backlog drain.
+         Verified by db-tests (inserted resolver re-resolves an already-ingested
+         document; bump gen 1 -> 2 does the same; no-op retry drains pending
+         backfill; legacy asset markers are repaired and replayed).
    - [x] Eager edge rewrite on merge: `DB.rewriteEntityEdges` repoints every
          inbound edge of the merged-away entity at the survivor (preserving type,
          weight, metadata), so provenance mention edges -- which target the

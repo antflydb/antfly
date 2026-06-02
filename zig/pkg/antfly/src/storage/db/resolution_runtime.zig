@@ -1318,9 +1318,6 @@ pub const RuntimeStoreHandle = struct {
     }
 };
 
-const reresolve_resume_key = "\x00\x00__metadata__:resolution_reresolve_resume";
-const reresolve_repair_resume_key = "\x00\x00__metadata__:resolution_reresolve_repair_resume";
-
 fn loadReresolveCursor(alloc: Allocator, store: *backend_erased.Store, key: []const u8) !?[]u8 {
     var txn = try store.beginRead();
     defer txn.abort();
@@ -1346,6 +1343,16 @@ fn clearReresolveCursor(store: *backend_erased.Store, key: []const u8) !void {
         else => return err,
     };
     try txn.commit();
+}
+
+fn hasReresolveCursor(store: *backend_erased.Store, key: []const u8) !bool {
+    var txn = try store.beginRead();
+    defer txn.abort();
+    _ = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 pub fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
@@ -1539,16 +1546,25 @@ pub const ResolutionRuntime = struct {
     pub fn requestReresolveBacklog(self: *ResolutionRuntime) !void {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
-        const existing = try loadReresolveCursor(self.alloc, &self.store_handle.store, reresolve_resume_key);
+        const existing = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_resume_key);
         defer if (existing) |key| self.alloc.free(key);
         if (existing == null) {
-            try saveReresolveCursor(&self.store_handle.store, reresolve_resume_key, "");
+            try saveReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key, "");
         }
-        const repair_existing = try loadReresolveCursor(self.alloc, &self.store_handle.store, reresolve_repair_resume_key);
+        const repair_existing = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_repair_resume_key);
         defer if (repair_existing) |key| self.alloc.free(key);
         if (repair_existing == null) {
-            try saveReresolveCursor(&self.store_handle.store, reresolve_repair_resume_key, "");
+            try saveReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_repair_resume_key, "");
         }
+    }
+
+    /// True when a prior resolver catalog mutation has durably marked corpus
+    /// backfill dirty but the bounded reresolve backlog has not fully drained.
+    pub fn hasReresolveBacklog(self: *ResolutionRuntime) !bool {
+        lockMutex(&self.catch_up_mutex);
+        defer self.catch_up_mutex.unlock();
+        return (try hasReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key)) or
+            (try hasReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_repair_resume_key));
     }
 
     /// Enqueue one bounded window of existing extraction artifacts for
@@ -1558,9 +1574,9 @@ pub const ResolutionRuntime = struct {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
 
-        const resume_key_value = try loadReresolveCursor(self.alloc, &self.store_handle.store, reresolve_resume_key);
+        const resume_key_value = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_resume_key);
         defer if (resume_key_value) |key| self.alloc.free(key);
-        const repair_resume_key_value = try loadReresolveCursor(self.alloc, &self.store_handle.store, reresolve_repair_resume_key);
+        const repair_resume_key_value = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_repair_resume_key);
         defer if (repair_resume_key_value) |key| self.alloc.free(key);
         if (resume_key_value == null and repair_resume_key_value == null) return .{};
 
@@ -1570,8 +1586,8 @@ pub const ResolutionRuntime = struct {
             self.alloc.free(resolvers);
         }
         if (resolvers.len == 0) {
-            try clearReresolveCursor(&self.store_handle.store, reresolve_resume_key);
-            try clearReresolveCursor(&self.store_handle.store, reresolve_repair_resume_key);
+            try clearReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key);
+            try clearReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_repair_resume_key);
             return .{};
         }
 
@@ -1588,14 +1604,14 @@ pub const ResolutionRuntime = struct {
         );
         errdefer result.deinit(self.alloc);
         if (result.source_index_complete) {
-            try clearReresolveCursor(&self.store_handle.store, reresolve_resume_key);
+            try clearReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key);
         } else if (result.resume_after) |key| {
-            try saveReresolveCursor(&self.store_handle.store, reresolve_resume_key, key);
+            try saveReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key, key);
         }
         if (result.repair_complete) {
-            try clearReresolveCursor(&self.store_handle.store, reresolve_repair_resume_key);
+            try clearReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_repair_resume_key);
         } else if (result.repair_resume_after) |key| {
-            try saveReresolveCursor(&self.store_handle.store, reresolve_repair_resume_key, key);
+            try saveReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_repair_resume_key, key);
         }
         return result;
     }

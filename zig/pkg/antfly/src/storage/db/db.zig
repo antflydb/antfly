@@ -5507,7 +5507,13 @@ pub const DB = struct {
             .inserted, .updated_backfill_required => {
                 try self.backfillResolverCorpus();
             },
-            .updated_no_backfill => {},
+            .updated_no_backfill => {
+                if (self.resolution_runtime) |runtime| {
+                    if (try runtime.hasReresolveBacklog()) {
+                        try self.backfillResolverCorpus();
+                    }
+                }
+            },
         }
     }
 
@@ -24160,6 +24166,70 @@ test "db re-resolves existing corpus when upsertResolver inserts a new resolver"
     defer alloc.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+}
+
+test "db drains pending resolver backfill when retrying a no-op upsertResolver" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_retry_v1");
+    defer alloc.free(resolution_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+
+    const cfg: index_manager_mod.ResolverConfig = .{
+        .name = "kg_retry",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_retry_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    };
+
+    {
+        lockApply(&db);
+        defer db.core.unlockApply();
+        try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.inserted, try db.core.upsertResolver(cfg));
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+    try std.testing.expect(try db.resolution_runtime.?.hasReresolveBacklog());
+
+    // Retrying the same catalog config is a material no-op, but the durable
+    // dirty cursor from the first attempt must still be drained.
+    try db.upsertResolver(cfg);
+
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+    try std.testing.expect(!try db.resolution_runtime.?.hasReresolveBacklog());
 }
 
 /// Thread-safe capturing entity sink for the promotion integration test.

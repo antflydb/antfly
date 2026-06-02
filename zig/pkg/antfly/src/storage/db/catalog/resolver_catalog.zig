@@ -28,6 +28,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const matcher = @import("antfly_matcher");
 
+/// Durable resolver-backfill cursors. They live with the resolver catalog
+/// metadata so catalog mutations can mark backfill dirty in the same store
+/// transaction that publishes the catalog change.
+pub const reresolve_resume_key = "\x00\x00__metadata__:resolution_reresolve_resume";
+pub const reresolve_repair_resume_key = "\x00\x00__metadata__:resolution_reresolve_repair_resume";
+
 /// Map a `fusion_combine` config string to a matcher fusion strategy. `null`
 /// means either "" (fusion disabled) or an unrecognized value; callers that
 /// must distinguish (config validation) check `len == 0` first.
