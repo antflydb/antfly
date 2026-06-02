@@ -441,6 +441,10 @@ pub const Backend = struct {
         run_probes: u64 = 0,
         point_run_prechecks: u64 = 0,
         point_run_precheck_survivors: u64 = 0,
+        point_run_survivor_reads: u64 = 0,
+        point_run_survivor_hits: u64 = 0,
+        point_run_survivor_misses: u64 = 0,
+        point_run_survivor_tombstones: u64 = 0,
         bloom_negatives: u64 = 0,
         read_hint_attempts: u64 = 0,
         read_hint_hits: u64 = 0,
@@ -491,6 +495,10 @@ pub const Backend = struct {
         run_probes: CounterU64 = .init(0),
         point_run_prechecks: CounterU64 = .init(0),
         point_run_precheck_survivors: CounterU64 = .init(0),
+        point_run_survivor_reads: CounterU64 = .init(0),
+        point_run_survivor_hits: CounterU64 = .init(0),
+        point_run_survivor_misses: CounterU64 = .init(0),
+        point_run_survivor_tombstones: CounterU64 = .init(0),
         bloom_negatives: CounterU64 = .init(0),
         read_hint_attempts: CounterU64 = .init(0),
         read_hint_hits: CounterU64 = .init(0),
@@ -541,6 +549,10 @@ pub const Backend = struct {
                 .run_probes = self.run_probes.load(.monotonic),
                 .point_run_prechecks = self.point_run_prechecks.load(.monotonic),
                 .point_run_precheck_survivors = self.point_run_precheck_survivors.load(.monotonic),
+                .point_run_survivor_reads = self.point_run_survivor_reads.load(.monotonic),
+                .point_run_survivor_hits = self.point_run_survivor_hits.load(.monotonic),
+                .point_run_survivor_misses = self.point_run_survivor_misses.load(.monotonic),
+                .point_run_survivor_tombstones = self.point_run_survivor_tombstones.load(.monotonic),
                 .bloom_negatives = self.bloom_negatives.load(.monotonic),
                 .read_hint_attempts = self.read_hint_attempts.load(.monotonic),
                 .read_hint_hits = self.read_hint_hits.load(.monotonic),
@@ -2467,6 +2479,22 @@ pub const Backend = struct {
 
     pub fn recordPointRunPrecheckSurvivor(self: *Backend) void {
         _ = self.read_stats.point_run_precheck_survivors.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointRunSurvivorRead(self: *Backend) void {
+        _ = self.read_stats.point_run_survivor_reads.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointRunSurvivorHit(self: *Backend) void {
+        _ = self.read_stats.point_run_survivor_hits.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointRunSurvivorMiss(self: *Backend) void {
+        _ = self.read_stats.point_run_survivor_misses.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointRunSurvivorTombstone(self: *Backend) void {
+        _ = self.read_stats.point_run_survivor_tombstones.fetchAdd(1, .monotonic);
     }
 
     pub fn recordBloomNegative(self: *Backend) void {
@@ -7208,6 +7236,10 @@ test "lsm backend multi-block point read skips directly to one candidate block" 
         const read_stats = backend.snapshotReadStats();
         try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_prechecks);
         try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_precheck_survivors);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_survivor_reads);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_survivor_hits);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.point_run_survivor_misses);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.point_run_survivor_tombstones);
     }
 
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);
@@ -7783,6 +7815,10 @@ test "lsm backend block filter avoids candidate block read on run-bloom false po
         const read_stats = backend.snapshotReadStats();
         try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_prechecks);
         try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_precheck_survivors);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_survivor_reads);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.point_run_survivor_hits);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_survivor_misses);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.point_run_survivor_tombstones);
     }
 
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);

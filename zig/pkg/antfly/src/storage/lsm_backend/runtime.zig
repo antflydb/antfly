@@ -3866,12 +3866,41 @@ fn getFromPathRunIndicesPrechecked(
     }
 
     for (stack_candidates[0..stack_candidate_len]) |candidate| {
-        if (try readPointRunCandidate(backend, runs, candidate, read_hint, held_blocks, held_values, value_allocator, namespace, key, backend_locked, batch_run_indexes)) |value| return value;
+        if (try readPointRunCandidateWithStats(backend, runs, candidate, read_hint, held_blocks, held_values, value_allocator, namespace, key, backend_locked, batch_run_indexes)) |value| return value;
     }
 
     for (overflow_candidates.items) |candidate| {
-        if (try readPointRunCandidate(backend, runs, candidate, read_hint, held_blocks, held_values, value_allocator, namespace, key, backend_locked, batch_run_indexes)) |value| return value;
+        if (try readPointRunCandidateWithStats(backend, runs, candidate, read_hint, held_blocks, held_values, value_allocator, namespace, key, backend_locked, batch_run_indexes)) |value| return value;
     }
+    return null;
+}
+
+fn readPointRunCandidateWithStats(
+    backend: anytype,
+    runs: []Run,
+    candidate: PointRunCandidate,
+    read_hint: *?BorrowedReadHint,
+    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    backend_locked: bool,
+    batch_run_indexes: ?*RunBatchIndexHandles,
+) !?[]const u8 {
+    backend.recordPointRunSurvivorRead();
+    const maybe_value = readPointRunCandidate(backend, runs, candidate, read_hint, held_blocks, held_values, value_allocator, namespace, key, backend_locked, batch_run_indexes) catch |err| switch (err) {
+        error.NotFound => {
+            backend.recordPointRunSurvivorTombstone();
+            return error.NotFound;
+        },
+        else => return err,
+    };
+    if (maybe_value) |value| {
+        backend.recordPointRunSurvivorHit();
+        return value;
+    }
+    backend.recordPointRunSurvivorMiss();
     return null;
 }
 

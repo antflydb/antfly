@@ -263,11 +263,8 @@ Large-ingest guardrails:
 
 ### Point Read Work
 
-1. [ ] Split point lookup into a bloom/range precheck phase followed by a read
+1. [x] Split point lookup into a bloom/range precheck phase followed by a read
    phase for surviving runs.
-   - Existing run and block blooms are already consulted before block loads in
-     the block-index path; the missing piece is avoiding one synchronous
-     miss-at-a-time across candidate runs.
    - [x] First slice: point reads now consult the manifest-carried run bloom
      before loading a persisted run table index/block from `getFromRunIndices`.
    - [x] Persisted path-backed point reads now run a precheck pass over
@@ -276,10 +273,17 @@ Large-ingest guardrails:
      counters.
    - [x] The precheck survivor list is stack-backed for the normal small
      candidate set, with heap overflow only for unusually broad lookups.
+   - [x] The survivor read phase now records actual read, hit, miss, and
+     tombstone outcomes in `ReadStats`, `lsm-backend-bench` JSON, and the
+     comparator. This makes the remaining synchronous miss-at-a-time work
+     visible before changing storage IO semantics.
 2. [ ] Issue concurrent block reads for surviving point-read candidates where
    precedence allows it.
    - L0/tombstone semantics require resolving by source order, not by first
      completed read.
+   - Current storage APIs are synchronous. A RocksDB/Pebble-shaped follow-up
+     needs a future-style block read API so reads can be issued concurrently and
+     then consumed in source-precedence order.
 3. [ ] Add a borrowed-value point-read mode that can hold cache block handles
    until transaction end instead of duplicating every returned value.
    - [x] First slice: snapshot point-batch reads can return slices borrowed
