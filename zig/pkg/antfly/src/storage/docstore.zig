@@ -302,6 +302,13 @@ pub const OwnedKVPair = struct {
     value: []u8,
 };
 
+pub const ReplayIterationStats = struct {
+    scanned_entries: usize = 0,
+    matched_entries: usize = 0,
+    hint_filter_skips: usize = 0,
+    scan_batches: usize = 0,
+};
+
 // ============================================================================
 // ByteRange — shard ownership range
 // ============================================================================
@@ -1286,33 +1293,54 @@ pub const DocStore = struct {
         callback_ctx: *anyopaque,
         callback: backend_erased.Store.ReplayCallback,
     ) !void {
+        var stats = ReplayIterationStats{};
+        return try self.forEachReplayFromMatchingHintMaskWithStats(from_sequence, required_hint_mask, callback_ctx, callback, &stats);
+    }
+
+    pub fn forEachReplayFromMatchingHintMaskWithStats(
+        self: *DocStore,
+        from_sequence: u64,
+        required_hint_mask: u8,
+        callback_ctx: *anyopaque,
+        callback: backend_erased.Store.ReplayCallback,
+        stats: *ReplayIterationStats,
+    ) !void {
         const Context = struct {
             required_hint_mask: u8 = 0,
-            matched_entries: usize = 0,
+            stats: *ReplayIterationStats,
             callback_ctx: *anyopaque,
             callback: backend_erased.Store.ReplayCallback,
 
             fn pass(self_ctx: *@This(), sequence: u64, payload: []const u8) !void {
-                self_ctx.matched_entries += 1;
+                self_ctx.stats.scanned_entries += 1;
+                self_ctx.stats.matched_entries += 1;
                 try self_ctx.callback(self_ctx.callback_ctx, sequence, payload);
             }
 
             fn filter(self_ctx: *@This(), sequence: u64, payload: []const u8) !void {
-                if (self_ctx.required_hint_mask != 0 and !(try change_journal_mod.encodedRecordMatchesHintMask(payload, self_ctx.required_hint_mask))) return;
-                self_ctx.matched_entries += 1;
+                self_ctx.stats.scanned_entries += 1;
+                if (self_ctx.required_hint_mask != 0 and !(try change_journal_mod.encodedRecordMatchesHintMask(payload, self_ctx.required_hint_mask))) {
+                    self_ctx.stats.hint_filter_skips += 1;
+                    return;
+                }
+                self_ctx.stats.matched_entries += 1;
                 try self_ctx.callback(self_ctx.callback_ctx, sequence, payload);
             }
         };
 
         var ctx = Context{
             .required_hint_mask = required_hint_mask,
+            .stats = stats,
             .callback_ctx = callback_ctx,
             .callback = callback,
         };
         if (replayHintFromSingleMask(required_hint_mask)) |hint| {
+            stats.scan_batches += 1;
+            const matched_before = stats.matched_entries;
             try self.forEachReplayEntryFromOrdinal(from_sequence, replayHintOrdinal(hint), &ctx, Context.pass);
-            if (ctx.matched_entries > 0) return;
+            if (stats.matched_entries > matched_before) return;
         }
+        stats.scan_batches += 1;
         return try self.forEachReplayEntryFromOrdinal(from_sequence, internal_keys.replay_all_kind, &ctx, Context.filter);
     }
 
@@ -2715,13 +2743,19 @@ test "docstore runtime lsm hint replay iteration does not clone mutable snapshot
     try std.testing.expectEqual(@as(usize, 1), ctx.seen);
 
     var erased_ctx = Context{};
-    try store.forEachReplayFromMatchingHintMask(
+    var replay_stats = ReplayIterationStats{};
+    try store.forEachReplayFromMatchingHintMaskWithStats(
         1,
         change_journal_mod.singleHintMask(.full_text),
         &erased_ctx,
         Context.handleErased,
+        &replay_stats,
     );
     try std.testing.expectEqual(@as(usize, 1), erased_ctx.seen);
+    try std.testing.expectEqual(@as(usize, 1), replay_stats.scan_batches);
+    try std.testing.expectEqual(@as(usize, 1), replay_stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 1), replay_stats.matched_entries);
+    try std.testing.expectEqual(@as(usize, 0), replay_stats.hint_filter_skips);
     try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().mutable_snapshot_clone_calls);
 }
 

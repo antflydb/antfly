@@ -828,6 +828,10 @@ Near-term task list:
    - replay scan batches
    - replay hint-filter skips
    - replay clone bytes avoided
+   - [x] First slice: replay source stats now distinguish matched rows from
+     scanned rows, count replay scan batches, and count hint-filter skips.
+     Dense catch-up status JSON and Prometheus export scan batches and
+     hint-filter skips alongside the existing scanned/applied counters.
 
 Design target:
 

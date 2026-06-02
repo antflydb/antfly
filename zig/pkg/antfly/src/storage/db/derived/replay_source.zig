@@ -32,7 +32,18 @@ pub const StopReplayChunk = error{StopReplayChunk};
 
 pub const MatchingRecordStats = struct {
     matched_entries: usize = 0,
+    scanned_entries: usize = 0,
+    hint_filter_skips: usize = 0,
+    scan_batches: usize = 0,
     last_sequence: u64 = 0,
+
+    fn add(self: *MatchingRecordStats, other: MatchingRecordStats) void {
+        self.matched_entries += other.matched_entries;
+        self.scanned_entries += other.scanned_entries;
+        self.hint_filter_skips += other.hint_filter_skips;
+        self.scan_batches += other.scan_batches;
+        self.last_sequence = @max(self.last_sequence, other.last_sequence);
+    }
 };
 
 pub const MatchingCursor = struct {
@@ -251,8 +262,11 @@ fn journalMatchingCursorForEachNext(
     }
 
     var stats = MatchingRecordStats{};
+    stats.scan_batches = 1;
     for (entries) |entry| {
+        stats.scanned_entries += 1;
         if (!try change_journal_mod.encodedRecordHasHint(entry.payload, cursor.hint)) {
+            stats.hint_filter_skips += 1;
             cursor.next_sequence = entry.sequence;
             continue;
         }
@@ -280,6 +294,16 @@ fn primaryStoreMatchingCursorForEachNext(
         cursor.hint_exhausted = true;
         if (cursor.hint_scan) |*scan| scan.deinit();
         cursor.hint_scan = null;
+        if (cursor.fallback_exhausted) return hinted.stats;
+        const fallback = try primaryStoreAllLaneFallbackForEachNext(cursor, max_matched_entries, ctx, consume);
+        var combined = hinted.stats;
+        combined.add(fallback.stats);
+        if (!fallback.stopped_before_match and fallback.stats.matched_entries == 0) {
+            cursor.fallback_exhausted = true;
+            if (cursor.fallback_scan) |*scan| scan.deinit();
+            cursor.fallback_scan = null;
+        }
+        return combined;
     }
 
     if (cursor.fallback_exhausted) return .{};
@@ -305,9 +329,11 @@ fn primaryStoreHintLaneForEachNext(
     const upper = internal_keys.replayRangeUpper(cursor.kind_ordinal);
     var next_entry = try read_cursor.seekAtOrAfter(lower[0..]);
     var result = PrimaryStoreCursorScanResult{};
+    result.stats.scan_batches = 1;
     while (next_entry) |kv| {
         if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
         const sequence = internal_keys.parseReplayEntrySequence(kv.key, cursor.kind_ordinal) orelse break;
+        result.stats.scanned_entries += 1;
         consume(ctx, sequence, kv.value) catch |err| switch (err) {
             StopReplayChunk.StopReplayChunk => {
                 result.stopped_before_match = true;
@@ -338,10 +364,13 @@ fn primaryStoreAllLaneFallbackForEachNext(
     const upper = internal_keys.replayRangeUpper(internal_keys.replay_all_kind);
     var next_entry = try read_cursor.seekAtOrAfter(lower[0..]);
     var result = PrimaryStoreCursorScanResult{};
+    result.stats.scan_batches = 1;
     while (next_entry) |kv| {
         if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
         const sequence = internal_keys.parseReplayEntrySequence(kv.key, internal_keys.replay_all_kind) orelse break;
+        result.stats.scanned_entries += 1;
         if (!(try change_journal_mod.encodedRecordHasHint(kv.value, hint))) {
+            result.stats.hint_filter_skips += 1;
             cursor.next_sequence = sequence;
             next_entry = try read_cursor.next();
             continue;
@@ -499,15 +528,25 @@ fn primaryStoreForEachMatchingRecord(
         .consumer_ctx = ctx,
         .consume = consume,
     };
-    store.forEachReplayFromMatchingHintMask(
+    var replay_stats = docstore_mod.ReplayIterationStats{};
+    store.forEachReplayFromMatchingHintMaskWithStats(
         from_sequence + 1,
         change_journal_mod.singleHintMask(hint),
         &callback_ctx,
         Context.handleErased,
+        &replay_stats,
     ) catch |err| switch (err) {
-        StopReplayChunk.StopReplayChunk => return callback_ctx.stats,
+        StopReplayChunk.StopReplayChunk => {
+            callback_ctx.stats.scanned_entries += replay_stats.scanned_entries;
+            callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
+            callback_ctx.stats.scan_batches += replay_stats.scan_batches;
+            return callback_ctx.stats;
+        },
         else => return err,
     };
+    callback_ctx.stats.scanned_entries += replay_stats.scanned_entries;
+    callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
+    callback_ctx.stats.scan_batches += replay_stats.scan_batches;
     return callback_ctx.stats;
 }
 
@@ -1004,6 +1043,9 @@ test "replay source primary store hinted replay skips non-matching records befor
     try std.testing.expectEqual(@as(usize, 1), context.calls);
     try std.testing.expectEqual(@as(u64, 2), context.last_sequence);
     try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+    try std.testing.expectEqual(@as(usize, 1), stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 0), stats.hint_filter_skips);
+    try std.testing.expectEqual(@as(usize, 1), stats.scan_batches);
     try std.testing.expectEqual(@as(u64, 2), stats.last_sequence);
 }
 
@@ -1063,6 +1105,9 @@ test "replay source primary store falls back to all lane when hint lane is missi
     try std.testing.expectEqual(@as(usize, 1), context.calls);
     try std.testing.expectEqual(@as(u64, 2), context.last_sequence);
     try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+    try std.testing.expectEqual(@as(usize, 2), stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 1), stats.hint_filter_skips);
+    try std.testing.expectEqual(@as(usize, 2), stats.scan_batches);
     try std.testing.expectEqual(@as(u64, 2), stats.last_sequence);
 }
 

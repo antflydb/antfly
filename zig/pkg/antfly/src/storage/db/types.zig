@@ -1645,6 +1645,8 @@ pub const DenseCatchUpStats = struct {
     current_target_sequence: u64 = 0,
     current_scanned_entries: u64 = 0,
     current_applied_entries: u64 = 0,
+    replay_scan_batches: u64 = 0,
+    replay_hint_filter_skips: u64 = 0,
     progress_updates: u64 = 0,
     bulk_finish_windows: u64 = 0,
     bulk_finish_split_steps: u64 = 0,
@@ -1770,6 +1772,8 @@ pub fn accumulateDenseCatchUpStats(dst: *DenseCatchUpStats, src: DenseCatchUpSta
     dst.current_target_sequence = @max(dst.current_target_sequence, src.current_target_sequence);
     dst.current_scanned_entries += src.current_scanned_entries;
     dst.current_applied_entries += src.current_applied_entries;
+    dst.replay_scan_batches += src.replay_scan_batches;
+    dst.replay_hint_filter_skips += src.replay_hint_filter_skips;
     dst.progress_updates += src.progress_updates;
     dst.bulk_finish_windows += src.bulk_finish_windows;
     dst.bulk_finish_split_steps += src.bulk_finish_split_steps;

@@ -1388,6 +1388,10 @@ fn appendDenseCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanag
     try appendIntValue(alloc, out, stats.current_scanned_entries);
     try out.appendSlice(alloc, ",\"current_applied_entries\":");
     try appendIntValue(alloc, out, stats.current_applied_entries);
+    try out.appendSlice(alloc, ",\"replay_scan_batches\":");
+    try appendIntValue(alloc, out, stats.replay_scan_batches);
+    try out.appendSlice(alloc, ",\"replay_hint_filter_skips\":");
+    try appendIntValue(alloc, out, stats.replay_hint_filter_skips);
     try out.appendSlice(alloc, ",\"progress_updates\":");
     try appendIntValue(alloc, out, stats.progress_updates);
     try out.appendSlice(alloc, ",\"bulk_finish_windows\":");

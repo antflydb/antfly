@@ -171,6 +171,8 @@ pub const ReplayProgress = struct {
     target_sequence: u64 = 0,
     scanned_entries: u64 = 0,
     applied_entries: u64 = 0,
+    replay_scan_batches: u64 = 0,
+    replay_hint_filter_skips: u64 = 0,
     active: bool = false,
 };
 
@@ -456,6 +458,8 @@ const DenseCatchUpContentionStats = struct {
     current_target_sequence: AtomicU64 = .init(0),
     current_scanned_entries: AtomicU64 = .init(0),
     current_applied_entries: AtomicU64 = .init(0),
+    replay_scan_batches: AtomicU64 = .init(0),
+    replay_hint_filter_skips: AtomicU64 = .init(0),
     progress_updates: AtomicU64 = .init(0),
     bulk_finish_windows: AtomicU64 = .init(0),
     bulk_finish_split_steps: AtomicU64 = .init(0),
@@ -488,6 +492,8 @@ const DenseCatchUpContentionStats = struct {
             .current_target_sequence = self.current_target_sequence.load(.monotonic),
             .current_scanned_entries = self.current_scanned_entries.load(.monotonic),
             .current_applied_entries = self.current_applied_entries.load(.monotonic),
+            .replay_scan_batches = self.replay_scan_batches.load(.monotonic),
+            .replay_hint_filter_skips = self.replay_hint_filter_skips.load(.monotonic),
             .progress_updates = self.progress_updates.load(.monotonic),
             .bulk_finish_windows = self.bulk_finish_windows.load(.monotonic),
             .bulk_finish_split_steps = self.bulk_finish_split_steps.load(.monotonic),
@@ -1891,6 +1897,8 @@ fn setDenseCatchUpProgress(ctx: *AsyncContext, progress: ReplayProgress) void {
     ctx.stats.dense_catch_up.current_target_sequence.store(progress.target_sequence, .monotonic);
     ctx.stats.dense_catch_up.current_scanned_entries.store(progress.scanned_entries, .monotonic);
     ctx.stats.dense_catch_up.current_applied_entries.store(progress.applied_entries, .monotonic);
+    ctx.stats.dense_catch_up.replay_scan_batches.store(progress.replay_scan_batches, .monotonic);
+    ctx.stats.dense_catch_up.replay_hint_filter_skips.store(progress.replay_hint_filter_skips, .monotonic);
     _ = ctx.stats.dense_catch_up.progress_updates.fetchAdd(1, .monotonic);
 }
 
@@ -14550,6 +14558,8 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
         target_sequence: u64 = 0,
         scanned_entries: u64 = 0,
         applied_entries: u64 = 0,
+        replay_scan_batches: u64 = 0,
+        replay_hint_filter_skips: u64 = 0,
         active: bool = false,
 
         fn publish(state: *@This(), index_name: []const u8) !void {
@@ -14558,6 +14568,8 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
                 .target_sequence = state.target_sequence,
                 .scanned_entries = state.scanned_entries,
                 .applied_entries = state.applied_entries,
+                .replay_scan_batches = state.replay_scan_batches,
+                .replay_hint_filter_skips = state.replay_hint_filter_skips,
                 .active = state.active,
             };
             if (state.track_dense) setDenseCatchUpProgress(state.db.async_context, progress);
@@ -14628,11 +14640,15 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
             const replay: *@This() = @ptrCast(@alignCast(ctx));
             replay.persist.scanned_entries = progress.scanned_entries;
             replay.persist.applied_entries = progress.applied_entries;
+            replay.persist.replay_scan_batches = progress.replay_scan_batches;
+            replay.persist.replay_hint_filter_skips = progress.replay_hint_filter_skips;
             const snapshot: ReplayProgress = .{
                 .sequence = progress.sequence,
                 .target_sequence = replay.persist.target_sequence,
                 .scanned_entries = progress.scanned_entries,
                 .applied_entries = progress.applied_entries,
+                .replay_scan_batches = progress.replay_scan_batches,
+                .replay_hint_filter_skips = progress.replay_hint_filter_skips,
                 .active = replay.persist.active,
             };
             setDenseCatchUpProgress(replay.db.async_context, snapshot);
