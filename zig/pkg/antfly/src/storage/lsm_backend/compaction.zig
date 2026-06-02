@@ -35,6 +35,8 @@ pub const RememberedCompaction = struct {
     plan: CompactionPlan,
     run_ids: [max_remembered_compaction_run_ids]u64 = undefined,
     run_count: usize = 0,
+    input_runs: usize = 0,
+    input_bytes: u64 = 0,
     score: u64 = 0,
 };
 
@@ -301,21 +303,17 @@ fn rememberCompactionPlan(runs: []const Run, plan: CompactionPlan, score: u64) ?
     const total_runs = plan.source_len + plan.target_len;
     if (total_runs == 0 or total_runs > max_remembered_compaction_run_ids) return null;
     if (!planInBounds(runs, plan)) return null;
+    const work = compactionWorkForPlan(runs, plan, score);
+    if (work.run_count != total_runs) return null;
 
     var remembered = RememberedCompaction{
         .plan = plan,
         .run_count = total_runs,
+        .input_runs = work.input_runs,
+        .input_bytes = work.input_bytes,
         .score = score,
     };
-    var idx: usize = 0;
-    for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
-        remembered.run_ids[idx] = run.id;
-        idx += 1;
-    }
-    for (runs[plan.target_start .. plan.target_start + plan.target_len]) |run| {
-        remembered.run_ids[idx] = run.id;
-        idx += 1;
-    }
+    @memcpy(remembered.run_ids[0..total_runs], work.run_ids[0..total_runs]);
     return remembered;
 }
 

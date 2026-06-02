@@ -36,6 +36,7 @@ pub const Work = struct {
 pub const Stats = struct {
     active_jobs: u64 = 0,
     in_flight_input_bytes: u64 = 0,
+    active_oldest_age_ns: u64 = 0,
     grants: u64 = 0,
     completions: u64 = 0,
     denied_capacity: u64 = 0,
@@ -51,6 +52,7 @@ pub const Stats = struct {
 pub const Grant = struct {
     scheduler: *Scheduler,
     input_bytes: u64,
+    started_ns: u64 = 0,
     run_ids: [max_tracked_work_run_ids]u64 = undefined,
     run_count: usize = 0,
     reservation: ?resource_manager_mod.Reservation = null,
@@ -60,7 +62,7 @@ pub const Grant = struct {
         if (self.completed) return;
         self.completed = true;
         if (self.reservation) |*reservation| reservation.release();
-        self.scheduler.complete(self.input_bytes, self.run_ids[0..self.run_count]);
+        self.scheduler.complete(self.input_bytes, self.run_ids[0..self.run_count], self.started_ns);
     }
 };
 
@@ -70,6 +72,8 @@ pub const Scheduler = struct {
     in_flight_input_bytes: u64 = 0,
     in_flight_run_ids: [max_in_flight_run_ids]u64 = undefined,
     in_flight_run_count: usize = 0,
+    active_start_ns: [max_in_flight_run_ids]u64 = undefined,
+    active_start_count: usize = 0,
     grants: u64 = 0,
     completions: u64 = 0,
     denied_capacity: u64 = 0,
@@ -86,6 +90,10 @@ pub const Scheduler = struct {
     }
 
     pub fn tryAcquire(self: *Scheduler, work: Work, resource_manager: ?*resource_manager_mod.ResourceManager) ?Grant {
+        return self.tryAcquireAt(work, resource_manager, 0);
+    }
+
+    pub fn tryAcquireAt(self: *Scheduler, work: Work, resource_manager: ?*resource_manager_mod.ResourceManager, now_ns: u64) ?Grant {
         if (work.score == 0 or work.input_runs == 0) {
             self.denied_capacity += 1;
             return null;
@@ -100,6 +108,10 @@ pub const Scheduler = struct {
         }
         const max_jobs = @max(@as(usize, 1), self.options.max_concurrent_jobs);
         if (self.active_jobs >= max_jobs) {
+            self.denied_capacity += 1;
+            return null;
+        }
+        if (self.active_start_count >= self.active_start_ns.len) {
             self.denied_capacity += 1;
             return null;
         }
@@ -129,11 +141,13 @@ pub const Scheduler = struct {
         self.active_jobs += 1;
         self.in_flight_input_bytes = next_bytes;
         self.addInFlightRuns(work.run_ids[0..work.run_count]);
+        self.addActiveStart(now_ns);
         self.grants += 1;
         if (oversized) self.oversized_grants += 1;
         var grant = Grant{
             .scheduler = self,
             .input_bytes = work.input_bytes,
+            .started_ns = now_ns,
             .reservation = reservation,
         };
         grant.run_count = work.run_count;
@@ -143,10 +157,11 @@ pub const Scheduler = struct {
         return grant;
     }
 
-    fn complete(self: *Scheduler, input_bytes: u64, run_ids: []const u64) void {
+    fn complete(self: *Scheduler, input_bytes: u64, run_ids: []const u64, started_ns: u64) void {
         self.active_jobs -|= 1;
         self.in_flight_input_bytes -|= input_bytes;
         self.removeInFlightRuns(run_ids);
+        self.removeActiveStart(started_ns);
         self.completions += 1;
     }
 
@@ -180,6 +195,34 @@ pub const Scheduler = struct {
         }
     }
 
+    fn addActiveStart(self: *Scheduler, started_ns: u64) void {
+        self.active_start_ns[self.active_start_count] = started_ns;
+        self.active_start_count += 1;
+    }
+
+    fn removeActiveStart(self: *Scheduler, started_ns: u64) void {
+        var idx: usize = 0;
+        while (idx < self.active_start_count) : (idx += 1) {
+            if (self.active_start_ns[idx] != started_ns) continue;
+            const tail_len = self.active_start_count - idx - 1;
+            if (tail_len > 0) {
+                std.mem.copyForwards(u64, self.active_start_ns[idx .. idx + tail_len], self.active_start_ns[idx + 1 .. self.active_start_count]);
+            }
+            self.active_start_count -= 1;
+            return;
+        }
+        if (self.active_start_count > 0) self.active_start_count -= 1;
+    }
+
+    fn activeOldestAgeNs(self: *const Scheduler, now_ns: u64) u64 {
+        if (now_ns == 0 or self.active_start_count == 0) return 0;
+        var oldest = self.active_start_ns[0];
+        for (self.active_start_ns[1..self.active_start_count]) |started| {
+            oldest = @min(oldest, started);
+        }
+        return if (now_ns >= oldest) now_ns - oldest else 0;
+    }
+
     pub fn noteRememberedCandidate(self: *Scheduler) void {
         self.remembered_candidates += 1;
     }
@@ -201,9 +244,14 @@ pub const Scheduler = struct {
     }
 
     pub fn snapshot(self: *const Scheduler) Stats {
+        return self.snapshotAt(0);
+    }
+
+    pub fn snapshotAt(self: *const Scheduler, now_ns: u64) Stats {
         return .{
             .active_jobs = @intCast(self.active_jobs),
             .in_flight_input_bytes = self.in_flight_input_bytes,
+            .active_oldest_age_ns = self.activeOldestAgeNs(now_ns),
             .grants = self.grants,
             .completions = self.completions,
             .denied_capacity = self.denied_capacity,
@@ -280,4 +328,31 @@ test "lsm compaction scheduler admits non-overlapping concurrent run ids" {
     try std.testing.expectEqual(@as(u64, 0), stats.active_jobs);
     try std.testing.expectEqual(@as(u64, 0), stats.in_flight_input_bytes);
     try std.testing.expectEqual(@as(u64, 2), stats.completions);
+}
+
+test "lsm compaction scheduler reports oldest active job age" {
+    var scheduler = Scheduler.init(.{
+        .max_concurrent_jobs = 2,
+        .max_in_flight_input_bytes = 1024 * 1024,
+        .resource_reservation_bytes = 0,
+    });
+
+    var first = scheduler.tryAcquireAt(testWork(1, 10, &.{1}), null, 100) orelse return error.TestUnexpectedResult;
+    defer first.complete();
+    var second = scheduler.tryAcquireAt(testWork(1, 10, &.{2}), null, 175) orelse return error.TestUnexpectedResult;
+    defer second.complete();
+
+    var stats = scheduler.snapshotAt(250);
+    try std.testing.expectEqual(@as(u64, 2), stats.active_jobs);
+    try std.testing.expectEqual(@as(u64, 150), stats.active_oldest_age_ns);
+
+    first.complete();
+    stats = scheduler.snapshotAt(250);
+    try std.testing.expectEqual(@as(u64, 1), stats.active_jobs);
+    try std.testing.expectEqual(@as(u64, 75), stats.active_oldest_age_ns);
+
+    second.complete();
+    stats = scheduler.snapshotAt(250);
+    try std.testing.expectEqual(@as(u64, 0), stats.active_jobs);
+    try std.testing.expectEqual(@as(u64, 0), stats.active_oldest_age_ns);
 }

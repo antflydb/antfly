@@ -538,12 +538,15 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_manifest_dirty", "gauge", "Whether cached write LSM obsolete-file manifests have unflushed changes", if (stats.obsolete_manifest_dirty) 1 else 0);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_active_jobs", "gauge", "Cached write LSM compaction scheduler active jobs", stats.compaction_scheduler_active_jobs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_in_flight_input_bytes", "gauge", "Cached write LSM compaction scheduler in-flight input bytes", stats.compaction_scheduler_in_flight_input_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_active_oldest_age_ns", "gauge", "Oldest active cached write LSM compaction scheduler job age in nanoseconds", stats.compaction_scheduler_active_oldest_age_ns);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_grants_total", "counter", "Cached write LSM compaction scheduler grants", stats.compaction_scheduler_grants);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_completions_total", "counter", "Cached write LSM compaction scheduler completions", stats.compaction_scheduler_completions);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_denied_capacity_total", "counter", "Cached write LSM compaction scheduler capacity denials", stats.compaction_scheduler_denied_capacity);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_denied_resource_pressure_total", "counter", "Cached write LSM compaction scheduler resource-pressure denials", stats.compaction_scheduler_denied_resource_pressure);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_oversized_grants_total", "counter", "Cached write LSM compaction scheduler oversized single-job grants", stats.compaction_scheduler_oversized_grants);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_pending", "gauge", "Cached write LSM remembered compaction candidates pending retry", stats.compaction_scheduler_remembered_pending);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_pending_runs", "gauge", "Cached write LSM input runs in remembered compaction candidates pending retry", stats.compaction_scheduler_remembered_pending_runs);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_pending_bytes", "gauge", "Cached write LSM input bytes in remembered compaction candidates pending retry", stats.compaction_scheduler_remembered_pending_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_candidates_total", "counter", "Cached write LSM compaction candidates remembered after denied scheduling", stats.compaction_scheduler_remembered_candidates);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_retries_total", "counter", "Cached write LSM remembered compaction retry attempts", stats.compaction_scheduler_remembered_retries);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_hits_total", "counter", "Cached write LSM remembered compactions that were executed", stats.compaction_scheduler_remembered_hits);
@@ -12404,9 +12407,12 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .active_readers = 6,
         .manifest_dirty = true,
         .obsolete_manifest_dirty = true,
+        .compaction_scheduler_active_oldest_age_ns = 99,
         .compaction_scheduler_grants = 3,
         .compaction_scheduler_denied_capacity = 1,
         .compaction_scheduler_remembered_pending = 1,
+        .compaction_scheduler_remembered_pending_runs = 4,
+        .compaction_scheduler_remembered_pending_bytes = 8192,
         .compaction_scheduler_remembered_hits = 2,
         .background_io_budget_bytes = 1000,
         .background_io_reserved_bytes = 750,
@@ -12428,9 +12434,12 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers 6") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_manifest_dirty 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_active_oldest_age_ns 99") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_grants_total 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_denied_capacity_total 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_remembered_pending 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_remembered_pending_runs 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_remembered_pending_bytes 8192") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_remembered_hits_total 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_background_io_budget_bytes 1000") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_background_io_reserved_bytes_total 750") != null);

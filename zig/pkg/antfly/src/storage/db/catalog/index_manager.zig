@@ -9285,18 +9285,21 @@ pub const IndexManager = struct {
                 },
             );
             std.log.info(
-                "antfly_bench_hbc_lsm_scheduler phase={s} index={s} active_jobs={d} in_flight_input_bytes={d} grants={d} completions={d} denied_capacity={d} denied_resource_pressure={d} oversized_grants={d} remembered_pending={d} remembered_candidates={d} remembered_retries={d} remembered_hits={d} remembered_stale={d} conflict_denials={d}",
+                "antfly_bench_hbc_lsm_scheduler phase={s} index={s} active_jobs={d} in_flight_input_bytes={d} active_oldest_age_ns={d} grants={d} completions={d} denied_capacity={d} denied_resource_pressure={d} oversized_grants={d} remembered_pending={d} remembered_pending_runs={d} remembered_pending_bytes={d} remembered_candidates={d} remembered_retries={d} remembered_hits={d} remembered_stale={d} conflict_denials={d}",
                 .{
                     phase,
                     entry.config.name,
                     maintenance.compaction_scheduler_active_jobs,
                     maintenance.compaction_scheduler_in_flight_input_bytes,
+                    maintenance.compaction_scheduler_active_oldest_age_ns,
                     maintenance.compaction_scheduler_grants,
                     maintenance.compaction_scheduler_completions,
                     maintenance.compaction_scheduler_denied_capacity,
                     maintenance.compaction_scheduler_denied_resource_pressure,
                     maintenance.compaction_scheduler_oversized_grants,
                     maintenance.compaction_scheduler_remembered_pending,
+                    maintenance.compaction_scheduler_remembered_pending_runs,
+                    maintenance.compaction_scheduler_remembered_pending_bytes,
                     maintenance.compaction_scheduler_remembered_candidates,
                     maintenance.compaction_scheduler_remembered_retries,
                     maintenance.compaction_scheduler_remembered_hits,

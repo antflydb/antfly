@@ -328,6 +328,7 @@ pub const Backend = struct {
         obsolete_manifest_dirty: bool = false,
         compaction_scheduler_active_jobs: u64 = 0,
         compaction_scheduler_in_flight_input_bytes: u64 = 0,
+        compaction_scheduler_active_oldest_age_ns: u64 = 0,
         compaction_scheduler_grants: u64 = 0,
         compaction_scheduler_completions: u64 = 0,
         compaction_scheduler_denied_capacity: u64 = 0,
@@ -339,6 +340,8 @@ pub const Backend = struct {
         compaction_scheduler_remembered_stale: u64 = 0,
         compaction_scheduler_conflict_denials: u64 = 0,
         compaction_scheduler_remembered_pending: u64 = 0,
+        compaction_scheduler_remembered_pending_runs: u64 = 0,
+        compaction_scheduler_remembered_pending_bytes: u64 = 0,
         background_io_budget_bytes: u64 = 0,
         background_io_reserved_bytes: u64 = 0,
         background_io_denied_jobs: u64 = 0,
@@ -406,6 +409,7 @@ pub const Backend = struct {
         dst.obsolete_manifest_dirty = dst.obsolete_manifest_dirty or src.obsolete_manifest_dirty;
         dst.compaction_scheduler_active_jobs +|= src.compaction_scheduler_active_jobs;
         dst.compaction_scheduler_in_flight_input_bytes +|= src.compaction_scheduler_in_flight_input_bytes;
+        dst.compaction_scheduler_active_oldest_age_ns = @max(dst.compaction_scheduler_active_oldest_age_ns, src.compaction_scheduler_active_oldest_age_ns);
         dst.compaction_scheduler_grants +|= src.compaction_scheduler_grants;
         dst.compaction_scheduler_completions +|= src.compaction_scheduler_completions;
         dst.compaction_scheduler_denied_capacity +|= src.compaction_scheduler_denied_capacity;
@@ -417,6 +421,8 @@ pub const Backend = struct {
         dst.compaction_scheduler_remembered_stale +|= src.compaction_scheduler_remembered_stale;
         dst.compaction_scheduler_conflict_denials +|= src.compaction_scheduler_conflict_denials;
         dst.compaction_scheduler_remembered_pending +|= src.compaction_scheduler_remembered_pending;
+        dst.compaction_scheduler_remembered_pending_runs +|= src.compaction_scheduler_remembered_pending_runs;
+        dst.compaction_scheduler_remembered_pending_bytes +|= src.compaction_scheduler_remembered_pending_bytes;
         dst.background_io_budget_bytes +|= src.background_io_budget_bytes;
         dst.background_io_reserved_bytes +|= src.background_io_reserved_bytes;
         dst.background_io_denied_jobs +|= src.background_io_denied_jobs;
@@ -984,9 +990,10 @@ pub const Backend = struct {
             }
         }
 
-        const scheduler_stats = self.compaction_scheduler.snapshot();
+        const scheduler_stats = self.compaction_scheduler.snapshotAt(platform_time.monotonicNs());
         stats.compaction_scheduler_active_jobs = scheduler_stats.active_jobs;
         stats.compaction_scheduler_in_flight_input_bytes = scheduler_stats.in_flight_input_bytes;
+        stats.compaction_scheduler_active_oldest_age_ns = scheduler_stats.active_oldest_age_ns;
         stats.compaction_scheduler_grants = scheduler_stats.grants;
         stats.compaction_scheduler_completions = scheduler_stats.completions;
         stats.compaction_scheduler_denied_capacity = scheduler_stats.denied_capacity;
@@ -997,7 +1004,11 @@ pub const Backend = struct {
         stats.compaction_scheduler_remembered_hits = scheduler_stats.remembered_hits;
         stats.compaction_scheduler_remembered_stale = scheduler_stats.remembered_stale;
         stats.compaction_scheduler_conflict_denials = scheduler_stats.conflict_denials;
-        stats.compaction_scheduler_remembered_pending = if (self.remembered_compaction != null) 1 else 0;
+        if (self.remembered_compaction) |remembered| {
+            stats.compaction_scheduler_remembered_pending = 1;
+            stats.compaction_scheduler_remembered_pending_runs = @intCast(remembered.input_runs);
+            stats.compaction_scheduler_remembered_pending_bytes = remembered.input_bytes;
+        }
         stats.background_io_budget_bytes = self.options.background_io_budget_bytes;
         stats.background_io_reserved_bytes = self.background_io_reserved_bytes;
         stats.background_io_denied_jobs = self.background_io_denied_jobs;
@@ -1200,7 +1211,7 @@ pub const Backend = struct {
                 @memcpy(scheduler_work.run_ids[0..copied_run_count], work.run_ids[0..copied_run_count]);
             }
         }
-        const grant = self.compaction_scheduler.tryAcquire(scheduler_work, self.options.resource_manager) orelse return null;
+        const grant = self.compaction_scheduler.tryAcquireAt(scheduler_work, self.options.resource_manager, platform_time.monotonicNs()) orelse return null;
         self.reserveMaintenanceIoBudgetAssumeAdmitted(io_bytes);
         return grant;
     }
@@ -5959,6 +5970,8 @@ test "lsm backend compaction scheduler denies and later grants capacity" {
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
     try std.testing.expect(maintenance.compaction_scheduler_denied_capacity > 0);
     try std.testing.expectEqual(@as(u64, 1), maintenance.compaction_scheduler_remembered_pending);
+    try std.testing.expect(maintenance.compaction_scheduler_remembered_pending_runs > 0);
+    try std.testing.expect(maintenance.compaction_scheduler_remembered_pending_bytes > 0);
     try std.testing.expect(maintenance.compaction_scheduler_remembered_candidates > 0);
 
     backend.compaction_scheduler.options.max_in_flight_input_bytes = 1024 * 1024;
@@ -5967,6 +5980,8 @@ test "lsm backend compaction scheduler denies and later grants capacity" {
     try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
     try std.testing.expectEqual(maintenance.compaction_scheduler_grants, maintenance.compaction_scheduler_completions);
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_remembered_pending);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_remembered_pending_runs);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_remembered_pending_bytes);
     try std.testing.expect(maintenance.compaction_scheduler_remembered_hits > 0);
     try std.testing.expect(backend.compaction_stats.compactions > 0);
 }
@@ -6033,6 +6048,8 @@ test "lsm backend background io budget defers scheduled compaction" {
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
     try std.testing.expect(maintenance.background_io_denied_jobs > 0);
     try std.testing.expectEqual(@as(u64, 1), maintenance.compaction_scheduler_remembered_pending);
+    try std.testing.expect(maintenance.compaction_scheduler_remembered_pending_runs > 0);
+    try std.testing.expect(maintenance.compaction_scheduler_remembered_pending_bytes > 0);
     try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
 
     backend.options.background_io_budget_bytes = 1024 * 1024;

@@ -214,6 +214,10 @@ and maintenance that is always debt-driven.
      IDs/key ranges or otherwise proven safe by the scheduler.
    - Track pending bytes, write-stall debt, conflict denials, oversized-plan
      fallback, and elapsed compaction age in status/metrics.
+   - [x] Scheduler stats now expose oldest active compaction age plus remembered
+     pending input runs/bytes through maintenance stats, Prometheus, and HBC
+     benchmark logs, so deferred compaction debt is visible as size rather than
+     only as a boolean pending flag.
    - Keep foreground assists bounded and reserved for hard pressure.
 
 5. [ ] Make LSM memory pressure first-class.
