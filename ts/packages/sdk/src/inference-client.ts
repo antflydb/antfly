@@ -4,21 +4,24 @@
  */
 
 import createClient, { type Client } from "openapi-fetch";
-import type { paths } from "./public-api.js";
 import { deserializeEmbeddings } from "./inference-codec.js";
 import type {
   ChunkConfig,
   ChunkResponse,
+  ClassificationResult,
   EmbedInput,
   EmbedResponse,
+  EntityExtractionResult,
+  ExtractRequest,
   ExtractResponse,
+  InferenceConfig,
   ModelsResponse,
   RequestOptions,
   RerankResponse,
   RewriteResponse,
-  InferenceConfig,
   TranscribeResponse,
 } from "./inference-types.js";
+import type { paths } from "./public-api.js";
 
 export class InferenceClient {
   private client: Client<paths>;
@@ -251,22 +254,108 @@ export class InferenceClient {
       includeSpans?: boolean;
     }
   ): Promise<ExtractResponse> {
-    const { data, error } = await this.client.POST("/ai/v1/extract", {
-      body: {
-        model,
-        inputs: texts.map((content, index) => ({ id: String(index), content })),
-        schema: { structures: structureSchema(schema) },
-        options: {
-          threshold: options?.threshold,
-          flat_ner: options?.flatNer,
-          include_confidence: options?.includeConfidence,
-          include_spans: options?.includeSpans,
-        },
+    return this.extractRaw({
+      model,
+      inputs: texts.map((content, index) => ({ id: String(index), content })),
+      schema: { structures: structureSchema(schema) },
+      options: {
+        threshold: options?.threshold,
+        flat_ner: options?.flatNer,
+        include_confidence: options?.includeConfidence,
+        include_spans: options?.includeSpans,
       },
+    });
+  }
+
+  /**
+   * Run the canonical schema-driven extraction API.
+   */
+  async extractRaw(request: ExtractRequest): Promise<ExtractResponse> {
+    const { data, error } = await this.client.POST("/ai/v1/extract", {
+      body: request,
     });
     if (error) throw new Error(`Extract failed: ${error.error}`);
     if (!data) throw new Error("Extract failed: unexpected empty response");
     return data;
+  }
+
+  /**
+   * Classify text through the canonical /ai/v1/extract endpoint.
+   */
+  async classify(
+    model: string,
+    texts: string[],
+    labels: string[],
+    options?: {
+      multiLabel?: boolean;
+      threshold?: number;
+      includeConfidence?: boolean;
+    }
+  ): Promise<ClassificationResult[]> {
+    const response = await this.extractRaw({
+      model,
+      inputs: texts.map((content, index) => ({ id: String(index), content })),
+      schema: {
+        classifications: [
+          {
+            name: "classification",
+            labels,
+            multi_label: options?.multiLabel,
+          },
+        ],
+      },
+      options: {
+        threshold: options?.threshold,
+        include_confidence: options?.includeConfidence ?? true,
+      },
+    });
+
+    return response.data.map((item, index) => ({
+      index,
+      classifications: (item.classifications ?? []).map((classification) => ({
+        label: classification.label,
+        score: classification.score,
+      })),
+    }));
+  }
+
+  /**
+   * Extract named entities through the canonical /ai/v1/extract endpoint.
+   */
+  async recognize(
+    model: string,
+    texts: string[],
+    labels: string[],
+    options?: {
+      threshold?: number;
+      includeConfidence?: boolean;
+      includeSpans?: boolean;
+    }
+  ): Promise<EntityExtractionResult[]> {
+    const response = await this.extractRaw({
+      model,
+      inputs: texts.map((content, index) => ({ id: String(index), content })),
+      schema: {
+        entities: labels,
+      },
+      options: {
+        threshold: options?.threshold,
+        flat_ner: true,
+        include_confidence: options?.includeConfidence ?? true,
+        include_spans: options?.includeSpans ?? true,
+      },
+    });
+
+    return response.data.map((item, index) => ({
+      index,
+      entities: (item.entities ?? []).map((entity) => ({
+        text: entity.text,
+        label: entity.label,
+        score: entity.score,
+        start: entity.start,
+        end: entity.end,
+      })),
+    }));
   }
 
   /**

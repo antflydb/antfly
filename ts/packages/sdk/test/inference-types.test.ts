@@ -6,9 +6,9 @@ import type {
   ContentPart,
   EmbedInput,
   EmbedResponse,
+  InferenceConfig,
   ModelsResponse,
   RerankResponse,
-  InferenceConfig,
 } from "../src/index.js";
 import { logLevels, logStyles } from "../src/index.js";
 
