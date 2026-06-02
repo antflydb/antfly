@@ -32967,7 +32967,9 @@ test "db force compacts text index to searchable merge tier" {
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -33020,7 +33022,9 @@ test "db text compaction preserves ordinal filters across reopen" {
 
     const expected_ordinal: doc_set.DocOrdinal = 9;
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{});
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+        });
         defer db.close();
 
         try db.addIndex(.{
@@ -33079,7 +33083,9 @@ test "db text compaction preserves ordinal filters across reopen" {
     }
 
     {
-        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+        });
         defer reopened.close();
 
         var include = try reopened.resolveDocSetForIdsAlloc(alloc, &.{"doc:8"});
