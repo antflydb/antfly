@@ -777,7 +777,10 @@ fn selectL0Compaction(runs: []const Run, l0_limit: usize, max_input_bytes: u64, 
     if (l0_count == 0 or l0_count <= l0_limit) return null;
     const target_l0_count = @max(@as(usize, 1), l0_limit / 2);
     const excess_len = @max(@as(usize, 1), l0_count - target_l0_count);
-    const max_window_len = @max(@as(usize, 2), l0_limit / 2);
+    const max_window_len = if (l0_limit == 0)
+        @as(usize, 2)
+    else
+        std.math.mul(usize, @max(@as(usize, 1), l0_limit), 2) catch std.math.maxInt(usize);
     var source_len = @min(excess_len, max_window_len);
     var oversized_plan: ?CompactionPlan = null;
     while (source_len > 0) : (source_len -= 1) {
@@ -1078,6 +1081,30 @@ test "lsm compaction lower-level pressure can exceed input target for minimum jo
     try std.testing.expectEqual(@as(u32, 1), plan.source_level);
     try std.testing.expectEqual(@as(usize, 1), plan.source_len);
     try std.testing.expectEqual(@as(u32, 2), plan.output_level);
+}
+
+test "lsm compaction L0 pressure selects a wider assist window" {
+    const runs = [_]Run{
+        testRun(9, 0, "doc:009", "doc:009", 10),
+        testRun(8, 0, "doc:008", "doc:008", 10),
+        testRun(7, 0, "doc:007", "doc:007", 10),
+        testRun(6, 0, "doc:006", "doc:006", 10),
+        testRun(5, 0, "doc:005", "doc:005", 10),
+        testRun(4, 0, "doc:004", "doc:004", 10),
+        testRun(3, 0, "doc:003", "doc:003", 10),
+        testRun(2, 0, "doc:002", "doc:002", 10),
+        testRun(1, 0, "doc:001", "doc:001", 10),
+    };
+
+    const plan = selectL0Compaction(&runs, 4, 0, false) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 0), plan.source_level);
+    try std.testing.expectEqual(@as(usize, 2), plan.source_start);
+    try std.testing.expectEqual(@as(usize, 7), plan.source_len);
+    try std.testing.expectEqual(@as(u32, 1), plan.output_level);
+
+    const oldest_pair = selectL0Compaction(&runs, 0, 0, false) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 7), oldest_pair.source_start);
+    try std.testing.expectEqual(@as(usize, 2), oldest_pair.source_len);
 }
 
 fn rangesOverlapRun(lhs: Run, rhs: Run) bool {

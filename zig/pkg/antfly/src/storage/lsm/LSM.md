@@ -188,6 +188,12 @@ Collected on 2026-06-02 from this worktree with 3 samples and 20k keys:
 - L0 maintenance median: `ns/op=4711000.00`, compactions `3`,
   `l0_runs_after=4`, `compactable_l0_runs_after=0`,
   `level_overflow_runs_after=0`, `wal_retained_bytes_after=0`.
+- After widening nonzero L0 pressure assist windows to compact up to
+  `2 * l0_limit`, the same 3-sample L0-pressure run produced load
+  `ns/op=1546.75`, write-pressure compactions `28`, `l0_runs_after=4`,
+  `compactable_l0_runs_after=0`, `level_overflow_runs_after=24`, and
+  `wal_retained_bytes_after=0`. Follow-up maintenance dropped to
+  `ns/op=1504125.00` with `1` compaction.
 
 The next compaction-policy slice should target the foreground compaction cost
 and post-load lower-level overflow shown by the L0-pressure load phase, while
@@ -431,6 +437,13 @@ Large-ingest guardrails:
      post-load L0 runs from 16 to 8 and reduced follow-up maintenance
      compactions from 7 to 3, while median load ns/op moved from 1513.25 to
      1499.25.
+   - [x] Nonzero L0 pressure assist now uses a wider window, up to
+     `2 * l0_limit`, while preserving the `l0_limit=0` oldest-pair fallback.
+     On the 20k-key L0-pressure benchmark, load median moved from
+     `1954.05 ns/op` to `1546.75 ns/op`, foreground write-pressure
+     compactions from `96` to `28`, post-load L0 runs from `8` to `4`,
+     compactable L0 runs from `4` to `0`, lower-level overflow runs from `92`
+     to `24`, and follow-up maintenance compactions from `3` to `1`.
    - [x] Max compaction input bytes now behaves like a target for scheduled L0
      maintenance: if no legal L0 compaction fits under the cap, the scheduler
      can admit the minimum oversized job so soft L0 debt does not get stuck

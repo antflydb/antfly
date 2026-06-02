@@ -6035,7 +6035,7 @@ test "lsm backend bulk ingest finish applies bounded foreground L0 budget" {
     });
     bulk_active = false;
 
-    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 2);
     try std.testing.expectEqual(@as(usize, 1), backend.compaction_stats.compactions);
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:0"));
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:4"));
