@@ -422,11 +422,52 @@ pub const IndexStatus = struct {
     status: antfly_indexes_openapi.IndexStats,
 };
 
+/// LSM backend maintenance and WAL pressure counters.
+pub const LsmStorageStatus = struct {
+    mutable_bytes: ?i64 = null,
+    immutable_bytes: ?i64 = null,
+    immutable_memtables: ?i64 = null,
+    total_runs: ?i64 = null,
+    total_run_bytes: ?i64 = null,
+    l0_runs: ?i64 = null,
+    l0_bytes: ?i64 = null,
+    lower_level_runs: ?i64 = null,
+    lower_level_bytes: ?i64 = null,
+    compactable_l0_runs: ?i64 = null,
+    level_overflow_runs: ?i64 = null,
+    level_overflow_bytes: ?i64 = null,
+    obsolete_paths: ?i64 = null,
+    active_readers: ?i64 = null,
+    wal_retained_segments: ?i64 = null,
+    wal_retained_bytes: ?i64 = null,
+    wal_checkpoint_oldest_retained_segment: ?i64 = null,
+    wal_checkpoint_covered_through_segment: ?i64 = null,
+    wal_checkpoint_current_segment: ?i64 = null,
+    wal_checkpoint_lag_segments: ?i64 = null,
+    wal_replay_retained_segments: ?i64 = null,
+    wal_replay_retained_bytes: ?i64 = null,
+    wal_append_records: ?i64 = null,
+    wal_append_bytes: ?i64 = null,
+    wal_append_ns: ?i64 = null,
+    wal_sync_records: ?i64 = null,
+    wal_sync_ns: ?i64 = null,
+    wal_replay_records: ?i64 = null,
+    wal_replay_bytes: ?i64 = null,
+    wal_replay_ns: ?i64 = null,
+    wal_resets: ?i64 = null,
+    wal_reset_ns: ?i64 = null,
+    background_io_budget_bytes: ?i64 = null,
+    background_io_reserved_bytes: ?i64 = null,
+    background_io_denied_jobs: ?i64 = null,
+    background_io_oversized_jobs: ?i64 = null,
+};
+
 pub const StorageStatus = struct {
     /// Disk usage in bytes.
     disk_usage: ?i64 = null,
     /// Whether the table has received data.
     empty: ?bool = null,
+    lsm: ?LsmStorageStatus = null,
 };
 
 /// MongoDB-style update operator

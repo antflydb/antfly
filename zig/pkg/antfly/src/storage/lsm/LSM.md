@@ -305,6 +305,11 @@ Large-ingest guardrails:
    - [x] Bench slice: `lsm-write-bench` and `lsm-write-bench-compare` now emit
      and compare WAL append/sync/reset deltas plus retained-WAL after-state,
      with a `--wal-sync-on-commit` workload flag.
+   - [x] Status slice: public table status can now include a compact
+     `storage_status.lsm` object populated from aggregate local DB primary and
+     index LSM maintenance/write stats, including mutable/immutable bytes,
+     run/L0 debt, WAL retention/checkpoint lag, WAL append/sync/replay/reset
+     counters, and background-IO admission counters.
 3. [ ] Replace recovery replay allocation churn with a bounded recovery
    allocation model that can release whole chunks after flush.
    - [x] First slice: state WAL recovery now reads segment chunks directly

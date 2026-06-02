@@ -413,6 +413,16 @@ pub const Backend = struct {
         dst.backend_lock_max_wait_ns = @max(dst.backend_lock_max_wait_ns, src.backend_lock_max_wait_ns);
     }
 
+    pub fn accumulateWriteStats(dst: *WriteStats, src: WriteStats) void {
+        inline for (@typeInfo(WriteStats).@"struct".fields) |field| {
+            if (comptime std.mem.eql(u8, field.name, "table_file_compression_codec_mask")) {
+                @field(dst, field.name) |= @field(src, field.name);
+            } else {
+                @field(dst, field.name) +|= @field(src, field.name);
+            }
+        }
+    }
+
     pub const ReadStats = struct {
         point_gets: u64 = 0,
         get_many_sorted_calls: u64 = 0,

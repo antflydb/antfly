@@ -1405,7 +1405,14 @@ pub const ApiHttpServer = struct {
         return .{
             .table_name = table_name,
             .empty = doc_count == 0,
+            .lsm = try self.bestEffortLsmStorageStatus(table_name),
         };
+    }
+
+    fn bestEffortLsmStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.LsmStorageStatus {
+        const source = self.table_reads orelse return null;
+        const stats = (try source.lsmStorageStats(table_name)) orelse return null;
+        return tables_api.lsmStorageStatusFromBackendStats(stats.maintenance, stats.write);
     }
 
     pub fn bestEffortSingleTableStorageStatuses(
@@ -3463,6 +3470,7 @@ pub const ApiHttpServer = struct {
         return .{
             .table_name = table_name,
             .empty = result.ndjson.len == 0,
+            .lsm = try self.bestEffortLsmStorageStatus(table_name),
         };
     }
 

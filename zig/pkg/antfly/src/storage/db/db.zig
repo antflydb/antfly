@@ -3086,6 +3086,27 @@ pub const DB = struct {
         return maintenance_stats;
     }
 
+    pub fn snapshotLsmWriteStats(self: *DB) lsm_backend_mod.Backend.WriteStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return self.snapshotLsmWriteStatsLocked();
+    }
+
+    pub fn trySnapshotLsmWriteStats(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.snapshotLsmWriteStatsLocked();
+    }
+
+    fn snapshotLsmWriteStatsLocked(self: *DB) lsm_backend_mod.Backend.WriteStats {
+        var write_stats = lsm_backend_mod.Backend.WriteStats{};
+        if (self.core.primary_store_owner.snapshotLsmWriteStats()) |primary_stats| {
+            lsm_backend_mod.Backend.accumulateWriteStats(&write_stats, primary_stats);
+        }
+        lsm_backend_mod.Backend.accumulateWriteStats(&write_stats, self.core.index_manager.snapshotLsmWriteStats());
+        return write_stats;
+    }
+
     pub fn snapshotTextMemoryAttributionStats(self: *DB) index_manager_mod.TextMemoryAttributionStats {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
