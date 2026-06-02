@@ -803,7 +803,11 @@ pub const DBCore = struct {
     }
 
     pub fn setSchema(self: *DBCore, table_schema: schema_mod.TableSchema) !void {
-        try schema_mod.saveSchema(self.store, self.alloc, table_schema);
+        try self.setSchemaWithMetadata(table_schema, &.{});
+    }
+
+    pub fn setSchemaWithMetadata(self: *DBCore, table_schema: schema_mod.TableSchema, metadata_puts: []const schema_mod.SchemaMetadataPut) !void {
+        try schema_mod.saveSchemaWithMetadata(self.store, self.alloc, table_schema, metadata_puts);
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
         self.schema = try schema_mod.loadSchema(self.store, self.alloc);
         self.index_manager.setRelationalBaseRows(schemaUsesRelationalBaseRows(self.schema));

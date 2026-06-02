@@ -4897,6 +4897,10 @@ pub const DB = struct {
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
         try self.core.setSchema(table_schema);
+        self.refreshSchemaRuntimeSideEffects();
+    }
+
+    fn refreshSchemaRuntimeSideEffects(self: *DB) void {
         const relational_base_rows = self.relationalColumnsForStore() != null;
         self.async_context.relational_base_rows = relational_base_rows;
         if (self.ttl_cleanup_context) |ctx| ctx.batch.relational_base_rows = relational_base_rows;
@@ -4930,12 +4934,16 @@ pub const DB = struct {
         const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
         defer schema_mod.freeSchema(alloc, runtime_schema);
 
-        try self.setSchema(runtime_schema);
         if (options.reload_algebraic_schema_configs) {
-            try self.reloadAlgebraicSchemaConfigs(schema_json);
+            try self.stageAlgebraicSchemaConfigsPending(schema_json);
         }
         if (options.persist_local_schema_json) {
-            try self.core.store.put(local_schema_json_key, schema_json);
+            try self.setSchemaWithLocalSchemaJson(runtime_schema, schema_json);
+        } else {
+            try self.setSchema(runtime_schema);
+        }
+        if (options.reload_algebraic_schema_configs) {
+            try self.completePendingAlgebraicSchemaRebuilds();
         }
     }
 
@@ -4958,6 +4966,23 @@ pub const DB = struct {
     /// change applies to a running DB without a reopen.
     pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
         try self.core.index_manager.reloadAlgebraicSchemaConfigs(self.core.store, schema_json);
+    }
+
+    fn stageAlgebraicSchemaConfigsPending(self: *DB, schema_json: []const u8) !void {
+        try self.core.index_manager.stageAlgebraicSchemaConfigsPending(self.core.store, schema_json);
+    }
+
+    fn completePendingAlgebraicSchemaRebuilds(self: *DB) !void {
+        try self.core.index_manager.completePendingAlgebraicSchemaRebuilds(self.core.store);
+    }
+
+    fn setSchemaWithLocalSchemaJson(self: *DB, table_schema: schema_mod.TableSchema, schema_json: []const u8) !void {
+        const metadata_puts = [_]schema_mod.SchemaMetadataPut{.{
+            .key = local_schema_json_key,
+            .value = schema_json,
+        }};
+        try self.core.setSchemaWithMetadata(table_schema, metadata_puts[0..]);
+        self.refreshSchemaRuntimeSideEffects();
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
@@ -19025,6 +19050,16 @@ fn cleanupTempDir(path: [*:0]const u8) void {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
 
+fn testStoreHasAlgebraicDocFactScalarKeyContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !bool {
+    const rows = try store.scanRange(alloc, "", "");
+    defer docstore_mod.DocStore.freeResults(alloc, rows);
+    for (rows) |row| {
+        if (std.mem.indexOf(u8, row.key, "docfact_scalar") != null and
+            std.mem.indexOf(u8, row.key, needle) != null) return true;
+    }
+    return false;
+}
+
 const default_test_wait_attempts: usize = 100;
 const slow_test_wait_attempts: usize = 500;
 
@@ -20617,6 +20652,164 @@ test "db open wires algebraic HLL maintenance lane and adaptively backfills sket
         const reopened = (try index.approxCardinalityTotalForFieldAlloc(db.core.store, "product", &.{}, null)) orelse
             return error.TestUnexpectedResult;
         try std.testing.expect(@max(reopened, 3) - @min(reopened, 3) <= 1);
+    }
+}
+
+test "db table schema apply stages algebraic pending before durable schema swap" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const schema_v1 =
+        \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+
+        var parsed_v1 = try schema_api_mod.parseValidatedTableSchema(alloc, schema_v1);
+        defer parsed_v1.deinit(alloc);
+        const runtime_v1 = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_v1);
+        defer schema_mod.freeSchema(alloc, runtime_v1);
+        try db.setSchema(runtime_v1);
+
+        const config_v1 = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_v1);
+        defer alloc.free(config_v1);
+        try db.addIndex(.{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = config_v1,
+        });
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:1", .value = "{\"old_field\":\"legacy\",\"new_field\":\"fresh\"}" }},
+            .sync_level = .full_index,
+        });
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, db.core.store, "old_field"));
+
+        // Simulate a crash after the algebraic catalog has been marked pending
+        // for schema v2, but before the runtime schema is durably swapped from
+        // v1 to v2.
+        try db.stageAlgebraicSchemaConfigsPending(schema_v2);
+        const staged = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 2), staged.index.config().schema_version);
+        try std.testing.expectEqualStrings("rebuild_required", staged.index.config().capability_lifecycle_status);
+
+        const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+        defer schema_mod.freeSchema(alloc, durable_schema);
+        try std.testing.expectEqual(@as(u32, 1), durable_schema.version);
+    }
+
+    {
+        var readonly = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+        });
+        defer readonly.close();
+
+        const entry = readonly.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 2), entry.index.config().schema_version);
+        try std.testing.expectEqualStrings("rebuild_required", entry.index.config().capability_lifecycle_status);
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, readonly.core.store, "old_field"));
+    }
+
+    {
+        var writer = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer writer.close();
+
+        // The writable open sees durable schema v1 and pending algebraic config
+        // v2, so it must leave the rebuild pending until the schema write lands.
+        const pending = writer.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("rebuild_required", pending.index.config().capability_lifecycle_status);
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
+
+        try writer.applyTableSchemaJson(alloc, schema_v2, .{});
+        const current = writer.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 2), current.index.config().schema_version);
+        try std.testing.expectEqualStrings("current", current.index.config().capability_lifecycle_status);
+        try std.testing.expect(!try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "new_field"));
+
+        const durable_schema = (try schema_mod.loadSchema(writer.core.store, alloc)) orelse return error.TestUnexpectedResult;
+        defer schema_mod.freeSchema(alloc, durable_schema);
+        try std.testing.expectEqual(@as(u32, 2), durable_schema.version);
+
+        const local_schema_json = try writer.core.store.get(alloc, local_schema_json_key);
+        defer alloc.free(local_schema_json);
+        try std.testing.expectEqualStrings(schema_v2, local_schema_json);
+    }
+}
+
+test "db staged algebraic pending waits for first durable schema" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const schema_v1 =
+        \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+
+        const config_v1 = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_v1);
+        defer alloc.free(config_v1);
+        try db.addIndex(.{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = config_v1,
+        });
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:1", .value = "{\"old_field\":\"legacy\",\"new_field\":\"fresh\"}" }},
+            .sync_level = .full_index,
+        });
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, db.core.store, "old_field"));
+
+        try db.stageAlgebraicSchemaConfigsPending(schema_v2);
+        const staged = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 2), staged.index.config().schema_version);
+        try std.testing.expectEqualStrings("rebuild_required", staged.index.config().capability_lifecycle_status);
+        const missing_schema = try schema_mod.loadSchema(db.core.store, alloc);
+        defer if (missing_schema) |schema| schema_mod.freeSchema(alloc, schema);
+        try std.testing.expect(missing_schema == null);
+    }
+
+    {
+        var writer = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer writer.close();
+
+        const pending = writer.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 2), pending.index.config().schema_version);
+        try std.testing.expectEqualStrings("rebuild_required", pending.index.config().capability_lifecycle_status);
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
+
+        try writer.applyTableSchemaJson(alloc, schema_v2, .{});
+        const current = writer.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 2), current.index.config().schema_version);
+        try std.testing.expectEqualStrings("current", current.index.config().capability_lifecycle_status);
+        try std.testing.expect(!try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "new_field"));
+
+        const durable_schema = (try schema_mod.loadSchema(writer.core.store, alloc)) orelse return error.TestUnexpectedResult;
+        defer schema_mod.freeSchema(alloc, durable_schema);
+        try std.testing.expectEqual(@as(u32, 2), durable_schema.version);
+
+        const local_schema_json = try writer.core.store.get(alloc, local_schema_json_key);
+        defer alloc.free(local_schema_json);
+        try std.testing.expectEqualStrings(schema_v2, local_schema_json);
     }
 }
 

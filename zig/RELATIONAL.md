@@ -338,7 +338,10 @@ the `attrs` cell is interpreted for derived indexing.
 Schema-derived algebraic configs record each JSON column as a
 `json_subdocument_domains` entry with a capability fingerprint and lifecycle
 status. When that fingerprint changes, durable schema regeneration and live
-reload mark the affected domain `rebuild_required`, and algebraic query
+reload stage the affected domain as `rebuild_required` before the runtime schema
+is durably exposed. Rebuild completion is gated on the durable schema version
+matching the staged algebraic capability; schema-versioned domains remain
+pending when no durable runtime schema has been adopted yet. Algebraic query
 planning withholds fields below that JSON column until the sidecar is rebuilt
 from committed rows. Successful local rebuild clears the domain back to
 `current`. Full-text JSON projection follows the existing schema-versioned index

@@ -587,8 +587,19 @@ fn freeFullTextDocumentsSlice(alloc: Allocator, docs: []const FullTextDocument) 
     if (docs.len > 0) alloc.free(docs);
 }
 
+pub const SchemaMetadataPut = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 /// Save a schema to DocStore.
 pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !void {
+    try saveSchemaWithMetadata(store, alloc, schema, &.{});
+}
+
+/// Save a schema and schema-scoped metadata to DocStore in one durable
+/// transaction so every local schema surface advances together.
+pub fn saveSchemaWithMetadata(store: anytype, alloc: Allocator, schema: TableSchema, metadata_puts: []const SchemaMetadataPut) !void {
     const data = try serializeSchema(alloc, schema);
     defer alloc.free(data);
     const versioned_key = try schemaVersionKeyAlloc(alloc, schema.version);
@@ -619,6 +630,9 @@ pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !void {
     }
     try txn.put(schema_key, data);
     try txn.put(versioned_key, data);
+    for (metadata_puts) |entry| {
+        try txn.put(entry.key, entry.value);
+    }
     try txn.commit();
 }
 

@@ -39,6 +39,7 @@ const resource_manager_mod = @import("../../resource_manager.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
+const schema_api_mod = @import("../../../schema/mod.zig");
 const ttl_mod = @import("../../ttl.zig");
 const lmdb = @import("../../lmdb.zig");
 const mapper = @import("../document_mapper.zig");
@@ -1224,11 +1225,10 @@ pub const IndexManager = struct {
     }
 
     /// Regenerate every algebraic index's schema-derived config from `schema_json`
-    /// and rebuild the persisted algebraic sidecar when the schema-derived
-    /// capability changed or is already marked pending. The pending config is
-    /// persisted before clearing rows so reopen stays in fallback if replay fails;
-    /// a successful replay persists a current config.
-    pub fn reloadAlgebraicSchemaConfigs(self: *IndexManager, store: *docstore_mod.DocStore, schema_json: []const u8) !void {
+    /// and persist a pending lifecycle config before the owning table schema is
+    /// durably exposed. This makes crash/reopen conservative even if the process
+    /// dies before local schema application reaches the sidecar rebuild step.
+    pub fn stageAlgebraicSchemaConfigsPending(self: *IndexManager, store: *docstore_mod.DocStore, schema_json: []const u8) !void {
         if (schema_json.len == 0) return;
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
@@ -1279,17 +1279,40 @@ pub const IndexManager = struct {
             defer self.alloc.free(pending_json);
             try self.replaceAlgebraicConfigJson(entry, pending_json);
             try self.persistCatalog(store);
-
-            try self.completePendingAlgebraicRebuild(store, entry);
         }
     }
 
+    /// Rebuild and mark current any algebraic configs already staged pending.
+    /// Call after the table runtime schema has been applied locally.
+    pub fn completePendingAlgebraicSchemaRebuilds(self: *IndexManager, store: *docstore_mod.DocStore) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        self.bindPrimaryStore(store);
+        try self.resumePendingAlgebraicRebuilds(store);
+    }
+
+    /// Regenerate schema-derived configs and rebuild sidecars for callers that
+    /// already have the runtime schema applied. `DB.applyTableSchemaJson` uses the
+    /// safer staged ordering instead.
+    pub fn reloadAlgebraicSchemaConfigs(self: *IndexManager, store: *docstore_mod.DocStore, schema_json: []const u8) !void {
+        try self.stageAlgebraicSchemaConfigsPending(store, schema_json);
+        try self.completePendingAlgebraicSchemaRebuilds(store);
+    }
+
     fn resumePendingAlgebraicRebuilds(self: *IndexManager, store: *docstore_mod.DocStore) !void {
+        const active_schema = try schema_mod.loadSchema(store, self.alloc);
+        defer if (active_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
+
         for (self.algebraic_indexes.items) |*entry| {
             const cur = entry.index.config();
             if (!algebraicLifecyclePending(cur.capability_lifecycle_status) and
                 !cur.dynamic_rules_backfill_pending and
                 !anyJsonSubdocumentDomainLifecyclePending(cur)) continue;
+            if (active_schema) |schema| {
+                if (cur.schema_version != 0 and cur.schema_version != schema.version) continue;
+            } else if (cur.schema_version != 0) {
+                continue;
+            }
 
             try self.completePendingAlgebraicRebuild(store, entry);
         }
@@ -11377,9 +11400,11 @@ test "index manager algebraic schema reload preserves HLL cardinalities" {
     try manager.algebraic_indexes.append(alloc, entry);
     entry_owned = false;
 
-    try manager.reloadAlgebraicSchemaConfigs(&store,
+    const schema_v2 =
         \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}},"dynamic_templates":[{"name":"ext","match":"ext_*","mapping":{"type":"numeric"}}]}
-    );
+    ;
+    try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v2);
+    try manager.reloadAlgebraicSchemaConfigs(&store, schema_v2);
 
     const reloaded = manager.algebraic_indexes.items[0].index.config();
     try std.testing.expectEqual(@as(usize, 1), reloaded.hll_cardinalities.len);
@@ -11437,6 +11462,7 @@ test "index manager algebraic schema reload marks changed json subdocument domai
     try manager.algebraic_indexes.append(alloc, entry);
     entry_owned = false;
 
+    try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v2);
     try manager.reloadAlgebraicSchemaConfigs(&store, schema_v2);
 
     const reloaded = manager.algebraic_indexes.items[0].index.config();
@@ -11483,6 +11509,7 @@ test "index manager algebraic schema reload rebuilds stale persisted rows" {
     }, .{ .mode = .bulk_ingest });
 
     try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
+    try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v2);
     try manager.reloadAlgebraicSchemaConfigs(&store, schema_v2);
 
     const reloaded = manager.algebraic_indexes.items[0].index.config();
@@ -11536,6 +11563,7 @@ test "index manager writable open resumes pending algebraic schema rebuild" {
         defer alloc.free(pending_json);
         try manager.replaceAlgebraicConfigJson(&manager.algebraic_indexes.items[0], pending_json);
         try manager.persistCatalog(&store);
+        try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v2);
     }
 
     {
@@ -11549,6 +11577,14 @@ test "index manager writable open resumes pending algebraic schema rebuild" {
         try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "new_field"));
         try std.testing.expect(std.mem.indexOf(u8, reopened.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") == null);
     }
+}
+
+fn saveRuntimeSchemaJsonForIndexManagerTest(alloc: Allocator, store: *docstore_mod.DocStore, schema_json: []const u8) !void {
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try schema_mod.saveSchema(store, alloc, runtime_schema);
 }
 
 fn storeHasDocFactScalarKeyContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !bool {

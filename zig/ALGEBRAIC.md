@@ -1991,11 +1991,19 @@ kind-qualified plans, explicit coercion policy, or fallback.
 
 Schema lifecycle drift marks the algebraic capability stale or rebuild-required
 while migration is in progress. Durable regeneration records
-`capability_lifecycle_status: "rebuild_required"` for crash safety, and local
-live reload persists that pending state before clearing algebraic rows. The
-index manager then replays committed base rows through the refreshed config and
-persists `capability_lifecycle_status: "current"` after success. While pending,
-the planner declines schema-derived algebraic execution, favoring correct scan
+`capability_lifecycle_status: "rebuild_required"` for crash safety. The local
+table-schema apply path persists that pending algebraic state before durably
+exposing the new runtime schema. The runtime schema and the local schema JSON
+mirror used by public write validation commit in the same transaction, and the
+sidecar rebuild runs after that schema save. Reopen completion is schema-version
+gated: if a process dies after the pending catalog write but before the runtime
+schema save, writable reopen leaves the algebraic capability pending instead of
+publishing sidecar facts for a schema version the table has not durably adopted.
+Schema-versioned pending capabilities also stay pending when no durable runtime
+schema exists yet. Once the durable schema version matches, the index manager
+replays committed base rows through the refreshed config and persists
+`capability_lifecycle_status: "current"` after success. While pending, the
+planner declines schema-derived algebraic execution, favoring correct scan
 fallback over reading facts that only cover the post-change subset.
 
 Relational embedded JSON domains apply that lifecycle per column path. Durable
