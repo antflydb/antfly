@@ -2268,12 +2268,6 @@ components:
         memory_bytes:
           type: integer
           format: uint64
-        mutable_bytes:
-          type: integer
-          format: uint64
-        immutable_bytes:
-          type: integer
-          format: uint64
         run_count:
           type: integer
           format: uint64
@@ -2293,9 +2287,6 @@ components:
           type: integer
           format: uint64
         active_readers:
-          type: integer
-          format: uint64
-        write_pressure_overloads:
           type: integer
           format: uint64
     StorageStatus: # common.StorageStats

@@ -46,8 +46,6 @@ pub const LsmStorageStatus = struct {
     // Table status intentionally exposes a compact operational snapshot. Full
     // low-level WAL and scheduler counters remain available through metrics.
     memory_bytes: u64 = 0,
-    mutable_bytes: u64 = 0,
-    immutable_bytes: u64 = 0,
     run_count: u64 = 0,
     run_bytes: u64 = 0,
     l0_run_count: u64 = 0,
@@ -55,7 +53,6 @@ pub const LsmStorageStatus = struct {
     wal_retained_bytes: u64 = 0,
     compaction_backlog_bytes: u64 = 0,
     active_readers: u64 = 0,
-    write_pressure_overloads: u64 = 0,
 };
 
 pub const TableStorageStatus = struct {
@@ -64,14 +61,9 @@ pub const TableStorageStatus = struct {
     lsm: ?LsmStorageStatus = null,
 };
 
-pub fn lsmStorageStatusFromBackendStats(
-    maintenance: lsm_backend.Backend.MaintenanceStats,
-    write: lsm_backend.Backend.WriteStats,
-) LsmStorageStatus {
+pub fn lsmStorageStatusFromBackendStats(maintenance: lsm_backend.Backend.MaintenanceStats) LsmStorageStatus {
     return .{
         .memory_bytes = maintenance.mutable_bytes +| maintenance.immutable_bytes,
-        .mutable_bytes = maintenance.mutable_bytes,
-        .immutable_bytes = maintenance.immutable_bytes,
         .run_count = maintenance.total_runs,
         .run_bytes = maintenance.total_run_bytes,
         .l0_run_count = maintenance.l0_runs,
@@ -79,15 +71,12 @@ pub fn lsmStorageStatusFromBackendStats(
         .wal_retained_bytes = maintenance.wal_retained_bytes,
         .compaction_backlog_bytes = maintenance.compaction_scheduler_remembered_pending_bytes,
         .active_readers = maintenance.active_readers,
-        .write_pressure_overloads = write.write_pressure_overloads,
     };
 }
 
 fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStorageStatus {
     return .{
         .memory_bytes = u64ToI64(status.memory_bytes),
-        .mutable_bytes = u64ToI64(status.mutable_bytes),
-        .immutable_bytes = u64ToI64(status.immutable_bytes),
         .run_count = u64ToI64(status.run_count),
         .run_bytes = u64ToI64(status.run_bytes),
         .l0_run_count = u64ToI64(status.l0_run_count),
@@ -95,7 +84,6 @@ fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStora
         .wal_retained_bytes = u64ToI64(status.wal_retained_bytes),
         .compaction_backlog_bytes = u64ToI64(status.compaction_backlog_bytes),
         .active_readers = u64ToI64(status.active_readers),
-        .write_pressure_overloads = u64ToI64(status.write_pressure_overloads),
     };
 }
 
@@ -1917,8 +1905,6 @@ test "metadata.table status encoder honors storage status overrides" {
         .empty = true,
         .lsm = .{
             .memory_bytes = 33,
-            .mutable_bytes = 11,
-            .immutable_bytes = 22,
             .run_count = 3,
             .run_bytes = 44,
             .l0_run_count = 1,
@@ -1926,7 +1912,6 @@ test "metadata.table status encoder honors storage status overrides" {
             .wal_retained_bytes = 55,
             .compaction_backlog_bytes = 10,
             .active_readers = 2,
-            .write_pressure_overloads = 88,
         },
     }};
 
@@ -1934,16 +1919,17 @@ test "metadata.table status encoder honors storage status overrides" {
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true,\"lsm\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"memory_bytes\":33") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mutable_bytes\":11") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"run_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"l0_bytes\":33") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":55") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_backlog_bytes\":10") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_readers\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_overloads\":88") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mutable_bytes\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_bytes\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_memtables\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_denied_jobs\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"background_io_denied_jobs\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_overloads\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_sync_records\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_current_segment\"") == null);
 }
