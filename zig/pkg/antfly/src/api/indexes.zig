@@ -1428,16 +1428,8 @@ fn appendDenseCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanag
     try appendIntValue(alloc, out, stats.manifest_writes);
     try out.appendSlice(alloc, ",\"manifest_ns\":");
     try appendIntValue(alloc, out, stats.manifest_ns);
-    try out.appendSlice(alloc, ",\"write_pressure_events\":");
-    try appendIntValue(alloc, out, stats.write_pressure_events);
     try out.appendSlice(alloc, ",\"write_pressure_compactions\":");
     try appendIntValue(alloc, out, stats.write_pressure_compactions);
-    try out.appendSlice(alloc, ",\"write_pressure_compaction_steps\":");
-    try appendIntValue(alloc, out, stats.write_pressure_compaction_steps);
-    try out.appendSlice(alloc, ",\"write_pressure_overloads\":");
-    try appendIntValue(alloc, out, stats.write_pressure_overloads);
-    try out.appendSlice(alloc, ",\"write_pressure_rejections\":");
-    try appendIntValue(alloc, out, stats.write_pressure_rejections);
     try out.appendSlice(alloc, ",\"write_pressure_ns\":");
     try appendIntValue(alloc, out, stats.write_pressure_ns);
     try out.append(alloc, '}');

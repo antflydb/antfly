@@ -264,8 +264,8 @@ fn journalMatchingCursorForEachNext(
     var stats = MatchingRecordStats{};
     stats.scan_batches = 1;
     for (entries) |entry| {
-        stats.scanned_entries += 1;
         if (!try change_journal_mod.encodedRecordHasHint(entry.payload, cursor.hint)) {
+            stats.scanned_entries += 1;
             stats.hint_filter_skips += 1;
             cursor.next_sequence = entry.sequence;
             continue;
@@ -274,6 +274,7 @@ fn journalMatchingCursorForEachNext(
             StopReplayChunk.StopReplayChunk => return stats,
             else => return err,
         };
+        stats.scanned_entries += 1;
         cursor.next_sequence = entry.sequence;
         stats.matched_entries += 1;
         stats.last_sequence = entry.sequence;
@@ -333,7 +334,6 @@ fn primaryStoreHintLaneForEachNext(
     while (next_entry) |kv| {
         if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
         const sequence = internal_keys.parseReplayEntrySequence(kv.key, cursor.kind_ordinal) orelse break;
-        result.stats.scanned_entries += 1;
         consume(ctx, sequence, kv.value) catch |err| switch (err) {
             StopReplayChunk.StopReplayChunk => {
                 result.stopped_before_match = true;
@@ -341,6 +341,7 @@ fn primaryStoreHintLaneForEachNext(
             },
             else => return err,
         };
+        result.stats.scanned_entries += 1;
         next_entry = try read_cursor.next();
         cursor.next_sequence = sequence;
         result.stats.matched_entries += 1;
@@ -368,8 +369,8 @@ fn primaryStoreAllLaneFallbackForEachNext(
     while (next_entry) |kv| {
         if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
         const sequence = internal_keys.parseReplayEntrySequence(kv.key, internal_keys.replay_all_kind) orelse break;
-        result.stats.scanned_entries += 1;
         if (!(try change_journal_mod.encodedRecordHasHint(kv.value, hint))) {
+            result.stats.scanned_entries += 1;
             result.stats.hint_filter_skips += 1;
             cursor.next_sequence = sequence;
             next_entry = try read_cursor.next();
@@ -383,6 +384,7 @@ fn primaryStoreAllLaneFallbackForEachNext(
             },
             else => return err,
         };
+        result.stats.scanned_entries += 1;
         cursor.next_sequence = sequence;
         result.stats.matched_entries += 1;
         result.stats.last_sequence = sequence;

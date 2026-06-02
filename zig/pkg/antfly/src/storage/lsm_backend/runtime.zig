@@ -2972,7 +2972,9 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 }
                 if ((mutated or direct_ingested_bulk_appends) and @hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
-                try self.backend.maybeFlushMutable();
+                if (!self.batch_options.defer_commit_flush) {
+                    try self.backend.maybeFlushMutable();
+                }
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
             } else {
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
@@ -5516,7 +5518,9 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 }
                 if (mutated and @hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
-                try self.backend.maybeFlushMutable();
+                if (!self.batch_options.defer_commit_flush) {
+                    try self.backend.maybeFlushMutable();
+                }
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
             } else {
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();

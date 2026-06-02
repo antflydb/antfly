@@ -1616,8 +1616,15 @@ pub const HBCIndex = struct {
                 });
             };
         }
+        var finish_options = options;
+        if (finishing_outermost) {
+            // HBC publishes deferred roots and metadata through normal mutable
+            // batches so repeated rewrites coalesce. Make the final published
+            // state durable before exposing the completed bulk session.
+            finish_options.flush = true;
+        }
         switch (self.env_owner) {
-            .lsm => |handle| try handle.backend.finishBulkIngestSessionWithOptions(options),
+            .lsm => |handle| try handle.backend.finishBulkIngestSessionWithOptions(finish_options),
             .lmdb => {},
         }
         if (self.bulk_ingest_session_depth > 0) self.bulk_ingest_session_depth -= 1;
@@ -2696,6 +2703,7 @@ pub const HBCIndex = struct {
         // stale internal rewrite becomes durable table bytes during large loads.
         return try self.store.beginBatchWithOptions(.{
             .mode = .default,
+            .defer_commit_flush = self.bulk_ingest_session_depth > 0,
         });
     }
 

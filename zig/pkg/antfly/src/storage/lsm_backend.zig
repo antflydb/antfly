@@ -5703,6 +5703,124 @@ test "lsm backend direct bulk ingest cursor hides older overlapping l0 values" {
     try std.testing.expectEqualStrings("A2", try visible.get(.{ .name = "docs" }, "doc:a"));
 }
 
+test "lsm backend reopens overlapping direct ingest l0 runs with newest values visible" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "direct-ingest-overlap-reopen");
+    defer repository_mod.cleanupTmp(path);
+
+    var packed_node_key: [12]u8 = undefined;
+    packed_node_key[0] = 'n';
+    packed_node_key[1] = ':';
+    std.mem.writeInt(u64, packed_node_key[2..10], 1, .big);
+    packed_node_key[10] = ':';
+    packed_node_key[11] = 'p';
+    var node_range_key = packed_node_key;
+    node_range_key[11] = 'r';
+    var node_posting_key = packed_node_key;
+    node_posting_key[11] = 'o';
+    var vec_meta_keys: [4][10]u8 = undefined;
+    for (&vec_meta_keys, 0..) |*key, i| {
+        key[0] = 'm';
+        key[1] = ':';
+        std.mem.writeInt(u64, key[2..10], @as(u64, @intCast(i + 1)), .big);
+    }
+
+    {
+        var backend = try Backend.open(std.testing.allocator, std.mem.span(path), .{
+            .flush_threshold = 1,
+            .bulk_ingest_flush_threshold_multiplier = 1,
+            .compact_threshold_runs = 999,
+            .foreground_soft_compaction = false,
+        });
+        defer backend.close();
+
+        {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            try txn.put(.{ .name = "docs" }, "doc:a", "A1");
+            try txn.put(.{ .name = "docs" }, "doc:b", "B1");
+            try txn.put(.{ .name = "hbc_nodes" }, packed_node_key[0..], "old-packed-node");
+            try txn.put(.{ .name = "hbc_nodes" }, node_range_key[0..], "old-range");
+            try txn.put(.{ .name = "hbc_nodes" }, node_posting_key[0..], "old-posting");
+            for (&vec_meta_keys, 0..) |*key, i| {
+                const value = switch (i) {
+                    0 => "meta-1",
+                    1 => "meta-2",
+                    2 => "meta-3",
+                    else => "meta-4",
+                };
+                try txn.put(.{ .name = "hbc_vecs" }, key[0..], value);
+            }
+            try txn.commit();
+        }
+        {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            try txn.put(.{ .name = "docs" }, "doc:a", "A2");
+            try txn.put(.{ .name = "docs" }, "doc:c", "C2");
+            try txn.put(.{ .name = "hbc_nodes" }, packed_node_key[0..], "new-packed-node");
+            try txn.put(.{ .name = "hbc_nodes" }, node_range_key[0..], "new-range");
+            try txn.put(.{ .name = "hbc_nodes" }, node_posting_key[0..], "new-posting");
+            for (&vec_meta_keys, 0..) |*key, i| {
+                const value = switch (i) {
+                    0 => "meta-1b",
+                    1 => "meta-2b",
+                    2 => "meta-3b",
+                    else => "meta-4b",
+                };
+                try txn.put(.{ .name = "hbc_vecs" }, key[0..], value);
+            }
+            try txn.commit();
+        }
+
+        try std.testing.expect(backend.runs.items.len >= 2);
+        try backend.persistManifest();
+    }
+
+    {
+        var reopened = try Backend.open(std.testing.allocator, std.mem.span(path), .{
+            .flush_threshold = 1,
+            .bulk_ingest_flush_threshold_multiplier = 1,
+            .compact_threshold_runs = 999,
+            .foreground_soft_compaction = false,
+        });
+        defer reopened.close();
+
+        var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+        var read = try runtime.beginRead();
+        defer read.abort();
+
+        try std.testing.expectEqualStrings("A2", try read.get("doc:a"));
+        {
+            var namespace_read = try reopened.beginRead();
+            defer namespace_read.abort();
+            try std.testing.expectEqualStrings("new-packed-node", try namespace_read.get(.{ .name = "hbc_nodes" }, packed_node_key[0..]));
+            try std.testing.expectEqualStrings("new-range", try namespace_read.get(.{ .name = "hbc_nodes" }, node_range_key[0..]));
+            try std.testing.expectEqualStrings("meta-4b", try namespace_read.get(.{ .name = "hbc_vecs" }, vec_meta_keys[3][0..]));
+        }
+
+        var cur = try read.openCursor();
+        defer cur.close();
+
+        const first = (try cur.first()).?;
+        try std.testing.expectEqualStrings("doc:a", first.key);
+        try std.testing.expectEqualStrings("A2", first.value);
+        const second = (try cur.next()).?;
+        try std.testing.expectEqualStrings("doc:b", second.key);
+        try std.testing.expectEqualStrings("B1", second.value);
+        const third = (try cur.next()).?;
+        try std.testing.expectEqualStrings("doc:c", third.key);
+        try std.testing.expectEqualStrings("C2", third.value);
+        try std.testing.expect((try cur.next()) == null);
+
+        var visible = try reopened.materializeVisibleState();
+        defer visible.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("A2", try visible.get(.{ .name = "docs" }, "doc:a"));
+        try std.testing.expectEqualStrings("new-packed-node", try visible.get(.{ .name = "hbc_nodes" }, packed_node_key[0..]));
+        try std.testing.expectEqualStrings("new-range", try visible.get(.{ .name = "hbc_nodes" }, node_range_key[0..]));
+        try std.testing.expectEqualStrings("meta-4b", try visible.get(.{ .name = "hbc_vecs" }, vec_meta_keys[3][0..]));
+    }
+}
+
 test "lsm backend can disable direct bulk ingest for overwrite-heavy stores" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1,

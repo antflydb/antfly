@@ -96,6 +96,7 @@ pub const BatchMode = enum {
 
 pub const BatchOptions = struct {
     mode: BatchMode = .default,
+    defer_commit_flush: bool = false,
 };
 
 pub const BulkIngestFinishOptions = struct {

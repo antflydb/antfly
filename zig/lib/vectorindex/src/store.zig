@@ -34,6 +34,7 @@ pub const BatchMode = enum {
 
 pub const BatchOptions = struct {
     mode: BatchMode = .default,
+    defer_commit_flush: bool = false,
 };
 
 fn entryFrom(value: anytype) Entry {
@@ -581,6 +582,7 @@ pub fn namespaceStoreFrom(
                             .default => .default,
                             .bulk_ingest => .bulk_ingest,
                         },
+                        .defer_commit_flush = options.defer_commit_flush,
                     }),
                     LocalNamespace,
                     mapNamespace,
