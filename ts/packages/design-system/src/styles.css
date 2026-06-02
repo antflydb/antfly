@@ -184,7 +184,12 @@
   }
 
   /* Highlight — amber-fill inline marker for accent words inside headlines.
-     Amber is a FILL with ink-on-amber text, not amber text on paper. */
+     Amber is a FILL with ink-on-amber text, not amber text on paper.
+
+     The inline fill box is sized by the font's content area (~1.2em), not by
+     line-height, so we keep no vertical padding to hold the chip as short as
+     possible. Wrapped/stacked highlights are kept from colliding by the
+     headline-leading rule at the end of this file (see `:has(.highlight)`). */
   .highlight {
     background: var(--primary);
     color: var(--primary-foreground);
@@ -230,4 +235,21 @@
 }
 [data-density="comfortable"] {
   --spacing: 0.3rem;
+}
+
+/* ============================================================================
+   Highlight leading
+   The `.highlight` chip's fill box is font-content-area tall (~1.25em) and
+   can't be shrunk per-span, so a highlighted headline needs enough leading
+   that wrapped lines — and a highlight that wraps onto itself — clear each
+   other's gutters. Display headings ship `line-height: 1`, which collides;
+   scope the extra leading to headings that actually contain a Highlight.
+   Unlayered so it wins over Tailwind's `leading-*` / text-size line-heights.
+   1.3 is the tightest leading that still clears the ~1.2em chip; below ~1.25
+   the box is taller than the line advance and collides again.
+   (Forward-looking: `text-box-trim` will let the chip hug the glyphs directly
+   once browser support is broad enough to drop the leading bump.)
+   ============================================================================ */
+:is(h1, h2, h3):has(.highlight) {
+  line-height: 1.3;
 }
