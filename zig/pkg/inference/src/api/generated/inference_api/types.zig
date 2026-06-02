@@ -78,35 +78,6 @@ pub const RerankObject = struct {
     score: f32,
 };
 
-pub const RecognizeEntity = struct {
-    /// The entity text
-    text: []const u8,
-    /// Entity type (PER, ORG, LOC, MISC)
-    label: []const u8,
-    /// Character offset where entity begins
-    start: i64,
-    /// Character offset where entity ends (exclusive)
-    end: i64,
-    /// Confidence score (0.0 to 1.0)
-    score: f32,
-};
-
-/// Configuration for entity resolution. When present in a RecognizeRequest, the response entities and relations are deduplicated via entity resolution (e.g., "Elon Musk" and "Musk" are merged into a single entity).
-pub const ResolverConfig = struct {
-    /// Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
-    similarity_threshold: ?f32 = null,
-    /// Whether entity types must match for merging
-    type_must_match: ?bool = null,
-    /// Minimum confidence score for entities to be included
-    min_entity_confidence: ?f32 = null,
-    /// Minimum confidence score for relations to be included
-    min_relation_confidence: ?f32 = null,
-    /// Whether to deduplicate relations after entity resolution
-    deduplicate_relations: ?bool = null,
-    /// Whether to track mention provenance for resolved entities
-    track_provenance: ?bool = null,
-};
-
 pub const RewriteRequest = struct {
     /// Name of Seq2Seq rewriter model from models_dir/rewriters/
     model: []const u8,
@@ -120,26 +91,6 @@ pub const RewriteObject = struct {
     index: i64,
     /// Rewritten texts for this input, one per beam.
     texts: []const []const u8,
-};
-
-pub const ClassifyRequest = struct {
-    /// Name of classifier model from models_dir/classifiers/
-    model: []const u8,
-    /// Texts to classify
-    texts: []const []const u8,
-    /// Candidate labels for zero-shot classification. The model will predict which label(s) best describe each text.
-    labels: []const []const u8,
-    /// Custom hypothesis template for NLI-based classification. Use "{}" as placeholder for the label. Default: "This example is {}."
-    hypothesis_template: ?[]const u8 = null,
-    /// If true, allows multiple labels per text (independent scoring). If false (default), scores are normalized across labels.
-    multi_label: ?bool = null,
-};
-
-pub const ClassifyResult = struct {
-    /// The predicted class/category
-    label: []const u8,
-    /// Confidence score (0.0 to 1.0)
-    score: f32,
 };
 
 pub const DocumentClassificationRequest = struct {
@@ -549,37 +500,6 @@ pub const RerankMultimodalRequest = struct {
     documents: []const RerankMultimodalDocument,
 };
 
-pub const Relation = struct {
-    /// The subject/head entity in the relationship
-    head: RecognizeEntity,
-    /// The object/tail entity in the relationship
-    tail: RecognizeEntity,
-    /// The relationship type
-    label: []const u8,
-    /// Confidence score for the relation (0.0 to 1.0)
-    score: f32,
-};
-
-pub const RecognizeRequest = struct {
-    /// Name of recognizer model from models_dir/recognizers/
-    model: []const u8,
-    /// Texts to extract entities from
-    texts: []const []const u8,
-    /// Custom entity labels to extract (GLiNER models only). When using a GLiNER model, you can specify any entity types to extract, enabling zero-shot NER without model retraining. If not provided, the model's default labels are used.
-    labels: ?[]const []const u8 = null,
-    /// Relation types to extract (for models with 'relations' capability). Only used when the model supports relation extraction (GLiNER multitask, REBEL). Relation extraction runs only when this array is provided and non-empty. GLiNER labels may be relation names (works_for), head-qualified labels (person::works_for), or head/tail-qualified labels (person::works_for::organization).
-    relation_labels: ?[]const []const u8 = null,
-    resolver: ?ResolverConfig = null,
-};
-
-pub const ClassifyObject = struct {
-    object: []const u8,
-    /// Original input text index.
-    index: i64,
-    /// Classification results for this input text.
-    classifications: []const ClassifyResult,
-};
-
 pub const DocumentClassificationObject = struct {
     object: []const u8,
     index: i64,
@@ -784,26 +704,6 @@ pub const ChunkConfig = struct {
     audio: ?AudioChunkConfig = null,
 };
 
-pub const RecognizeObject = struct {
-    object: []const u8,
-    /// Original input text index.
-    index: i64,
-    /// Entities recognized for this input text.
-    entities: []const RecognizeEntity,
-    /// Relations recognized for this input text. Only present when using a model with 'relations' capability (GLiNER multitask, REBEL).
-    relations: ?[]const Relation = null,
-};
-
-pub const ClassifyResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Classification result objects, one per input text.
-    data: []const ClassifyObject,
-    /// Name of model used for classification
-    model: []const u8,
-    usage: GenerateUsage,
-};
-
 pub const DocumentClassificationResponse = struct {
     /// Object type, always "list"
     object: []const u8,
@@ -818,7 +718,7 @@ pub const DocumentTokenClassificationObject = struct {
     checkpoint_path: []const u8,
     prefix: []const u8,
     num_tokens: i64,
-    /// Each result is an array of ClassifyResult sorted by score descending.
+    /// Token classification predictions sorted by score descending.
     predictions: []const DocumentTokenClassificationPrediction,
 };
 
@@ -968,16 +868,6 @@ pub const ChunkRequest = struct {
     /// DEPRECATED: Use 'input' instead. Text to chunk.
     text: ?[]const u8 = null,
     config: ?ChunkConfig = null,
-};
-
-pub const RecognizeResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Recognition result objects, one per input text.
-    data: []const RecognizeObject,
-    /// Name of model used for NER
-    model: []const u8,
-    usage: GenerateUsage,
 };
 
 pub const DocumentTokenClassificationResponse = struct {

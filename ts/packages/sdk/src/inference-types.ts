@@ -23,6 +23,25 @@ export type ExtractEntity = components["schemas"]["ExtractionEntity"];
 export type ExtractRelation = components["schemas"]["ExtractionRelation"];
 export type ExtractClassification = components["schemas"]["ExtractionClassification"];
 
+export interface ClassificationResult {
+  index: number;
+  classifications: Array<{
+    label: string;
+    score?: number;
+  }>;
+}
+
+export interface EntityExtractionResult {
+  index: number;
+  entities: Array<{
+    text: string;
+    label: string;
+    score?: number;
+    start?: number;
+    end?: number;
+  }>;
+}
+
 export type RewriteRequest = components["schemas"]["InferenceRewriteRequest"];
 export type RewriteResponse = components["schemas"]["InferenceRewriteResponse"];
 

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { serializeEmbeddings, InferenceClient } from "../src/index.js";
+import { InferenceClient, serializeEmbeddings } from "../src/index.js";
 
 describe("InferenceClient", () => {
   it("should create a client with base config", () => {
@@ -30,6 +30,9 @@ describe("InferenceClient", () => {
     expect(typeof client.chunk).toBe("function");
     expect(typeof client.rerank).toBe("function");
     expect(typeof client.extract).toBe("function");
+    expect(typeof client.extractRaw).toBe("function");
+    expect(typeof client.classify).toBe("function");
+    expect(typeof client.recognize).toBe("function");
     expect(typeof client.rewrite).toBe("function");
     expect(typeof client.transcribe).toBe("function");
     expect(typeof client.listModels).toBe("function");
@@ -79,6 +82,17 @@ describe("InferenceClient with mock fetch", () => {
   afterEach(() => {
     vi.stubGlobal("fetch", originalFetch);
   });
+
+  async function lastFetchJSONBody(): Promise<Record<string, unknown>> {
+    const [input, init] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
+    if (input instanceof Request) {
+      return (await input.clone().json()) as Record<string, unknown>;
+    }
+    if (typeof init?.body === "string") {
+      return JSON.parse(init.body) as Record<string, unknown>;
+    }
+    throw new Error("fetch call did not include a JSON request body");
+  }
 
   describe("embed (JSON response)", () => {
     it("should request JSON format and parse response", async () => {
@@ -351,6 +365,117 @@ describe("InferenceClient with mock fetch", () => {
 
       expect(fetch).toHaveBeenCalled();
       expect(result.model).toBe("gliner2-base-v1");
+    });
+
+    it("should classify through the canonical extract endpoint", async () => {
+      const mockResponse = {
+        object: "extraction",
+        model: "gliner2-base-v1",
+        data: [
+          {
+            classifications: [
+              { name: "classification", label: "positive", score: 0.91 },
+              { name: "classification", label: "negative", score: 0.09 },
+            ],
+          },
+        ],
+      };
+
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(mockResponse),
+        text: () => Promise.resolve(JSON.stringify(mockResponse)),
+        headers: new Headers({ "Content-Type": "application/json" }),
+      } as Response);
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
+      const result = await client.classify(
+        "gliner2-base-v1",
+        ["This product is excellent."],
+        ["positive", "negative"],
+        { multiLabel: true }
+      );
+
+      expect(result).toEqual([
+        {
+          index: 0,
+          classifications: [
+            { label: "positive", score: 0.91 },
+            { label: "negative", score: 0.09 },
+          ],
+        },
+      ]);
+      const body = await lastFetchJSONBody();
+      expect(body).toMatchObject({
+        model: "gliner2-base-v1",
+        inputs: [{ id: "0", content: "This product is excellent." }],
+        schema: {
+          classifications: [
+            {
+              name: "classification",
+              labels: ["positive", "negative"],
+              multi_label: true,
+            },
+          ],
+        },
+        options: {
+          include_confidence: true,
+        },
+      });
+    });
+
+    it("should recognize entities through the canonical extract endpoint", async () => {
+      const mockResponse = {
+        object: "extraction",
+        model: "gliner2-base-v1",
+        data: [
+          {
+            entities: [
+              { text: "John Smith", label: "person", start: 0, end: 10, score: 0.95 },
+              { text: "Google", label: "company", start: 20, end: 26, score: 0.9 },
+            ],
+          },
+        ],
+      };
+
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(mockResponse),
+        text: () => Promise.resolve(JSON.stringify(mockResponse)),
+        headers: new Headers({ "Content-Type": "application/json" }),
+      } as Response);
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
+      const result = await client.recognize(
+        "gliner2-base-v1",
+        ["John Smith works at Google."],
+        ["person", "company"]
+      );
+
+      expect(result).toEqual([
+        {
+          index: 0,
+          entities: [
+            { text: "John Smith", label: "person", start: 0, end: 10, score: 0.95 },
+            { text: "Google", label: "company", start: 20, end: 26, score: 0.9 },
+          ],
+        },
+      ]);
+      const body = await lastFetchJSONBody();
+      expect(body).toMatchObject({
+        model: "gliner2-base-v1",
+        inputs: [{ id: "0", content: "John Smith works at Google." }],
+        schema: {
+          entities: ["person", "company"],
+        },
+        options: {
+          flat_ner: true,
+          include_confidence: true,
+          include_spans: true,
+        },
+      });
     });
   });
 
