@@ -182,13 +182,16 @@ Large-ingest guardrails:
    - [x] Surface cursor and point value borrow/copy counters in the read
      benchmark JSON and comparator, so borrowed-value work can be measured
      directly instead of inferred from allocator samples.
-3. [ ] Implement a block-window cursor for persisted scans in the shared-cache
+3. [x] Implement a block-window cursor for persisted scans in the shared-cache
    path, matching the no-shared-cache table-index/block-window shape.
    - Expected signal: full/short scan throughput improves and cache pollution
      drops because scans stop pinning or materializing whole tables.
    - [x] First slice: when the shared block cache is configured, merge cursors
      now hold one cache block handle per source instead of duplicating cached
      block bytes into cursor-owned memory.
+   - [x] Forward and reverse persisted cursor paths now have regression coverage
+     proving they stay on table-index/block-window reads instead of loading
+     whole run tables.
 4. [x] Replace linear forward winner selection with heap-backed source
    selection for merge cursors.
    - Expected signal: scans with many sources improve in rows/sec and CPU per

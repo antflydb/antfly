@@ -7291,6 +7291,39 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
     }
 
     {
+        var reverse_cache = Cache.init(alloc, DefaultCacheSizeBytes);
+        defer reverse_cache.deinit();
+
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = host.storage(),
+            .flush_threshold = 6,
+            .cache = &reverse_cache,
+        });
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        var cur = try txn.openCursor();
+        defer cur.close();
+
+        try std.testing.expectEqualStrings("doc:004", (try cur.seekAtOrBefore("doc:004")).?.key);
+        try std.testing.expectEqualStrings("doc:003", (try cur.prev()).?.key);
+        try std.testing.expectEqualStrings("doc:002", (try cur.prev()).?.key);
+
+        const read_stats = backend.snapshotReadStats();
+        try std.testing.expect(read_stats.table_entry_parses > 0);
+        try std.testing.expect(read_stats.table_block_loads > 0);
+        try std.testing.expect(read_stats.table_block_bytes > 0);
+        try std.testing.expect(read_stats.cursor_block_loads > 0);
+        try std.testing.expect(read_stats.cursor_block_reuses > 0);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.cursor_table_index_misses);
+        try std.testing.expect(read_stats.cursor_table_index_hits > read_stats.cursor_table_index_misses);
+    }
+
+    {
         var batch_cache = Cache.init(alloc, DefaultCacheSizeBytes);
         defer batch_cache.deinit();
 
@@ -7357,8 +7390,8 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);
-    try std.testing.expect(ctx.run_range_reads <= 12);
-    try std.testing.expect(ctx.run_trailer_reads <= 6);
+    try std.testing.expect(ctx.run_range_reads <= 18);
+    try std.testing.expect(ctx.run_trailer_reads <= 8);
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_size_reads);
 }
 
