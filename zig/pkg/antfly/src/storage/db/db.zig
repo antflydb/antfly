@@ -4927,12 +4927,16 @@ pub const DB = struct {
         options: ApplyTableSchemaOptions,
     ) !void {
         if (schema_json.len == 0) return;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
 
         var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
 
         const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
         defer schema_mod.freeSchema(alloc, runtime_schema);
+
+        lockApply(self);
+        defer self.core.unlockApply();
 
         if (options.reload_algebraic_schema_configs) {
             try self.stageAlgebraicSchemaConfigsPending(schema_json);
@@ -4961,10 +4965,17 @@ pub const DB = struct {
         return relational_store_mod.ColumnIndexPolicy.fromColumns(columns);
     }
 
-    /// Refresh schema-derived algebraic index configs (notably dynamic-template
-    /// rules) in place from the given table schema JSON, so a dynamic-template
-    /// change applies to a running DB without a reopen.
+    /// Refresh schema-derived algebraic index configs for callers that have
+    /// already applied the runtime schema. This remains a structural mutation:
+    /// config swaps, sidecar clears, and rebuild replay are serialized with
+    /// normal apply work just like `applyTableSchemaJson`.
     pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
+        if (schema_json.len == 0) return;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+
+        lockApply(self);
+        defer self.core.unlockApply();
+
         try self.core.index_manager.reloadAlgebraicSchemaConfigs(self.core.store, schema_json);
     }
 

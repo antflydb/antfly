@@ -2995,12 +2995,13 @@ pub const Index = struct {
             .name = try alloc.dupe(u8, name),
             .parsed = parsed,
         };
-        errdefer self.freeHllRegistry();
+        errdefer {
+            self.freeHllRegistry();
+            alloc.free(self.name);
+        }
         // Seed the runtime registry from the static config; adaptive promotions
         // append to it later. Owned copies so the registry's lifetime is uniform.
-        for (parsed.value.hll_cardinalities) |hcfg| {
-            try self.appendHllRegistryEntry(hcfg.name, hcfg.group_by, hcfg.value_field, hcfg.precision);
-        }
+        try self.appendConfigHllRegistryEntries(parsed.value);
         return self;
     }
 
@@ -3008,8 +3009,15 @@ pub const Index = struct {
         self.relational_base_rows = enabled;
     }
 
-    // Appends an owned copy of an HLL sketch config to the runtime registry.
-    fn appendHllRegistryEntry(self: *Index, name: []const u8, group_by: []const []const u8, value_field: []const u8, precision: u8) !void {
+    // Appends an owned copy of an HLL sketch config to the given runtime registry.
+    fn appendHllRegistryEntryTo(
+        self: *Index,
+        registry: *std.ArrayListUnmanaged(HllCardinalityConfig),
+        name: []const u8,
+        group_by: []const []const u8,
+        value_field: []const u8,
+        precision: u8,
+    ) !void {
         const name_copy = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(name_copy);
         const value_copy = try self.alloc.dupe(u8, value_field);
@@ -3024,7 +3032,7 @@ pub const Index = struct {
             group_copy[i] = try self.alloc.dupe(u8, g);
             filled = i + 1;
         }
-        try self.hll_registry.append(self.alloc, .{
+        try registry.append(self.alloc, .{
             .name = name_copy,
             .group_by = group_copy,
             .value_field = value_copy,
@@ -3032,15 +3040,39 @@ pub const Index = struct {
         });
     }
 
-    fn freeHllRegistry(self: *Index) void {
-        for (self.hll_registry.items) |hcfg| {
+    // Appends an owned copy of an HLL sketch config to the runtime registry.
+    fn appendHllRegistryEntry(self: *Index, name: []const u8, group_by: []const []const u8, value_field: []const u8, precision: u8) !void {
+        try self.appendHllRegistryEntryTo(&self.hll_registry, name, group_by, value_field, precision);
+    }
+
+    fn freeHllRegistryEntries(self: *Index, registry: *std.ArrayListUnmanaged(HllCardinalityConfig)) void {
+        for (registry.items) |hcfg| {
             self.alloc.free(@constCast(hcfg.name));
             self.alloc.free(@constCast(hcfg.value_field));
             for (hcfg.group_by) |g| self.alloc.free(@constCast(g));
             self.alloc.free(@constCast(hcfg.group_by));
         }
-        self.hll_registry.deinit(self.alloc);
-        self.hll_registry = .empty;
+        registry.deinit(self.alloc);
+        registry.* = .empty;
+    }
+
+    fn freeHllRegistry(self: *Index) void {
+        self.freeHllRegistryEntries(&self.hll_registry);
+    }
+
+    fn appendConfigHllRegistryEntries(self: *Index, cfg: Config) !void {
+        for (cfg.hll_cardinalities) |hcfg| {
+            try self.appendHllRegistryEntry(hcfg.name, hcfg.group_by, hcfg.value_field, hcfg.precision);
+        }
+    }
+
+    fn configHllRegistryClone(self: *Index, cfg: Config) !std.ArrayListUnmanaged(HllCardinalityConfig) {
+        var registry = std.ArrayListUnmanaged(HllCardinalityConfig).empty;
+        errdefer self.freeHllRegistryEntries(&registry);
+        for (cfg.hll_cardinalities) |hcfg| {
+            try self.appendHllRegistryEntryTo(&registry, hcfg.name, hcfg.group_by, hcfg.value_field, hcfg.precision);
+        }
+        return registry;
     }
 
     // The set of HLL sketches the engine maintains and reads (config-seeded plus
@@ -3057,23 +3089,26 @@ pub const Index = struct {
     /// Concurrency: this frees the old parsed Config (whose slices back the
     /// FieldConfig/DynamicRule values returned by `config()`/`fieldConfig`). It
     /// is only safe to call with no concurrent reader of this index. That holds
-    /// today: the sole caller (`IndexManager.reloadAlgebraicSchemaConfigs` via
-    /// `applyLocalTableSchemaJson`) runs under the provisioned write source's
-    /// exclusive structural-mutation lock on a freshly-opened, unshared DB handle
-    /// — query threads read separate read-cache DB handles. This mirrors the
-    /// adjacent `core.setSchema` swap in the same code path. If the index ever
-    /// becomes shared with live readers, this swap must be guarded (e.g. by the
-    /// index apply_mutex with readers taking it too).
+    /// today: production callers enter through `DB.applyTableSchemaJson` or
+    /// `DB.reloadAlgebraicSchemaConfigs`, both of which take the DB apply lock
+    /// before reaching the index manager. Direct index-manager test helpers only
+    /// operate on unshared fixtures. If the index ever becomes shared with live
+    /// readers, this swap must be guarded (e.g. by the index apply_mutex with
+    /// readers taking it too).
     pub fn reloadConfigJson(self: *Index, config_json: []const u8) !void {
         var parsed = try std.json.parseFromSlice(Config, self.alloc, config_json, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         try validateConfig(parsed.value);
+        var next_hll_registry = try self.configHllRegistryClone(parsed.value);
+        errdefer self.freeHllRegistryEntries(&next_hll_registry);
         // Cached adaptive specs are derived from the old config; drop them so
         // they are recomputed lazily against the new one.
         self.invalidateAdaptiveReadySpecCache();
         const old = self.parsed;
         self.parsed = parsed;
         old.deinit();
+        self.freeHllRegistry();
+        self.hll_registry = next_hll_registry;
     }
 
     /// Delete every persisted row owned by this algebraic index. Used by
@@ -3095,6 +3130,14 @@ pub const Index = struct {
         self.invalidateAdaptiveReadySpecCache();
         self.clearObservedQueryState();
         self.clearBulkDirtyPathPromotionDictionaries();
+        // Clearing the algebraic keyspace also drops persisted adaptive HLL
+        // promotion markers. Keep the runtime registry in the same state by
+        // retaining only static config-owned sketches; future observations can
+        // promote adaptive sketches again.
+        var static_registry = try self.configHllRegistryClone(self.config());
+        errdefer self.freeHllRegistryEntries(&static_registry);
+        self.freeHllRegistry();
+        self.hll_registry = static_registry;
         return deleted;
     }
 
@@ -20455,6 +20498,50 @@ test "algebraic HLL cardinality is adaptively promoted from a recurring query sh
     try std.testing.expect(!idx2.hllRegistryContains(adaptive_name));
     try idx2.loadAdaptiveHllCardinalities(&store);
     try std.testing.expect(idx2.hllRegistryContains(adaptive_name));
+}
+
+test "algebraic clear persisted rows drops adaptive HLL runtime registry entries" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"static_customers","group_by":["region"],"value_field":"customer","precision":12}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+
+    const adaptive_name = try idx.hllAdaptiveNameAlloc("region", "customer");
+    defer alloc.free(adaptive_name);
+    var txn = try store.beginWriteTxn();
+    errdefer txn.abort();
+    try idx.promoteAdaptiveHllTxn(&txn, adaptive_name, "region", "customer");
+    try txn.commit();
+    try std.testing.expect(idx.hllRegistryContains("static_customers"));
+    try std.testing.expect(idx.hllRegistryContains(adaptive_name));
+
+    _ = try idx.clearPersistedRows(&store);
+    try std.testing.expect(idx.hllRegistryContains("static_customers"));
+    try std.testing.expect(!idx.hllRegistryContains(adaptive_name));
+
+    var reopened = try Index.open(alloc, "alg", cfg);
+    defer reopened.close();
+    try reopened.loadAdaptiveHllCardinalities(&store);
+    try std.testing.expect(reopened.hllRegistryContains("static_customers"));
+    try std.testing.expect(!reopened.hllRegistryContains(adaptive_name));
 }
 
 test "algebraic HLL cardinality rebuilds after deletes via maintenance lane" {

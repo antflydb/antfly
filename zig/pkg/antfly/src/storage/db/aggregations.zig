@@ -10710,6 +10710,7 @@ test "algebraic aggregation planner answers unfiltered terms with nested metric"
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -10791,6 +10792,7 @@ test "algebraic aggregation planner answers multi field composite terms" {
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -10885,6 +10887,7 @@ test "algebraic multi field composite terms sort ties by public key json" {
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -11060,6 +11063,7 @@ test "algebraic aggregation planner answers schemaless structural path terms" {
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -11168,6 +11172,7 @@ test "algebraic aggregation planner applies pathfact predicate constraints" {
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -11256,6 +11261,7 @@ test "algebraic aggregation planner answers exact cardinality from fact rows" {
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -11345,6 +11351,7 @@ test "algebraic aggregation planner constrains root cardinality by document role
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -11584,6 +11591,7 @@ test "algebraic terms aggregation answers nested exact cardinality from fact row
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -11661,6 +11669,7 @@ test "algebraic terms aggregation answers path terms with nested exact cardinali
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -11740,6 +11749,7 @@ test "algebraic terms aggregation answers array path terms with nested exact car
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -11825,6 +11835,7 @@ test "algebraic histogram aggregation answers nested exact cardinality from fact
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -12502,6 +12513,7 @@ test "algebraic aggregation planner can use configured implicit join materializa
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
     const index = &manager.algebraic_indexes.items[0].index;
@@ -12714,6 +12726,7 @@ test "cardinality over a join with guaranteed fanout blowup fails fast, not a jo
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
     const index = &manager.algebraic_indexes.items[0].index;
@@ -12781,6 +12794,7 @@ test "metric over a join with zero matched pairs folds to the identity, not an e
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
     const index = &manager.algebraic_indexes.items[0].index;
@@ -13136,6 +13150,7 @@ test "algebraic aggregation public request can execute explicit derived join met
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
     const index = &manager.algebraic_indexes.items[0].index;
@@ -13220,6 +13235,7 @@ test "algebraic aggregation public request can execute explicit derived join ter
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
     const index = &manager.algebraic_indexes.items[0].index;
@@ -13296,7 +13312,7 @@ test "algebraic terms over a join answers per-bucket cardinality from HLL folds"
     mutex.* = .unlocked;
     const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
     const alg_index = try algebraic_mod.index.Index.open(alloc, "alg_join_terms_card", cfg);
-    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
+    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .rebuild_root_path = try alloc.dupe(u8, "."), .index = alg_index });
     const index = &manager.algebraic_indexes.items[0].index;
 
     const docs = [_]@import("derived/derived_types.zig").DerivedDocument{
@@ -13382,6 +13398,7 @@ test "algebraic aggregation public request can execute explicit derived join dat
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
     const index = &manager.algebraic_indexes.items[0].index;
@@ -13470,6 +13487,7 @@ test "algebraic aggregation public request can execute explicit derived join his
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
     const index = &manager.algebraic_indexes.items[0].index;
@@ -13559,6 +13577,7 @@ test "algebraic aggregation public request can execute explicit derived join ran
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
     const index = &manager.algebraic_indexes.items[0].index;
@@ -13652,6 +13671,7 @@ test "algebraic aggregation public request can execute explicit derived join dat
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
     const index = &manager.algebraic_indexes.items[0].index;
@@ -13745,6 +13765,7 @@ test "algebraic aggregation planner answers constrained root and terms metrics" 
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -13841,6 +13862,7 @@ test "algebraic aggregation planner answers constrained stats from law folds" {
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -13927,6 +13949,7 @@ test "algebraic aggregation planner answers terms with nested stats from law fol
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -14006,6 +14029,7 @@ test "algebraic aggregation planner falls back when rollup scan budget is exceed
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -14093,6 +14117,7 @@ test "algebraic aggregation planner applies typed numeric constraints" {
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -14163,6 +14188,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -14475,7 +14501,7 @@ test "algebraic aggregation planner answers cardinality from HLL materialization
     mutex.* = .unlocked;
     const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
     const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
-    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
+    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .rebuild_root_path = try alloc.dupe(u8, "."), .index = alg_index });
 
     const docs = [_]derived_types.DerivedDocument{
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
@@ -14620,7 +14646,7 @@ test "recurring terms query adaptively promotes an ungrouped NDV sketch" {
     mutex.* = .unlocked;
     const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
     const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
-    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
+    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .rebuild_root_path = try alloc.dupe(u8, "."), .index = alg_index });
 
     const docs = [_]derived_types.DerivedDocument{
         .{ .key = "i1", .action = .upsert, .cleaned_value = "{\"category\":\"a\"}" },
@@ -14686,7 +14712,7 @@ test "cardinality_mode approximate errors when no sketch applies" {
     mutex.* = .unlocked;
     const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
     const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
-    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
+    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .rebuild_root_path = try alloc.dupe(u8, "."), .index = alg_index });
 
     const docs = [_]derived_types.DerivedDocument{
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"a\"}" },
@@ -14746,6 +14772,7 @@ test "algebraic bucket aggregations fall back when nested metrics are unsupporte
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -14884,6 +14911,7 @@ test "algebraic aggregation planner rolls up date cylinders across extra dimensi
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -15027,6 +15055,7 @@ test "algebraic aggregation planner reads ready adaptive tensor materializations
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
     const index = &manager.algebraic_indexes.items[0].index;

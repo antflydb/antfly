@@ -1995,16 +1995,23 @@ while migration is in progress. Durable regeneration records
 table-schema apply path persists that pending algebraic state before durably
 exposing the new runtime schema. The runtime schema and the local schema JSON
 mirror used by public write validation commit in the same transaction, and the
-sidecar rebuild runs after that schema save. Reopen completion is schema-version
-gated: if a process dies after the pending catalog write but before the runtime
-schema save, writable reopen leaves the algebraic capability pending instead of
-publishing sidecar facts for a schema version the table has not durably adopted.
+sidecar rebuild runs after that schema save. Schema application is a DB-level
+structural mutation: it is serialized with normal apply work before staging the
+pending algebraic config, saving the runtime schema, and completing the sidecar
+rebuild. Reopen completion is schema-version gated: if a process dies after the
+pending catalog write but before the runtime schema save, writable reopen leaves
+the algebraic capability pending instead of publishing sidecar facts for a
+schema version the table has not durably adopted.
 Schema-versioned pending capabilities also stay pending when no durable runtime
 schema exists yet. Once the durable schema version matches, the index manager
-replays committed base rows through the refreshed config and persists
-`capability_lifecycle_status: "current"` after success. While pending, the
-planner declines schema-derived algebraic execution, favoring correct scan
-fallback over reading facts that only cover the post-change subset.
+replays committed base rows through the refreshed config using bounded cursor
+batches and a durable `rebuild.state` cursor. A crash or injected failure resumes
+from the last applied base-row key instead of materializing the whole table range
+in memory or restarting from zero. Only after replay, bulk-ingest finish, and
+catalog persistence succeed does it clear the rebuild state and persist
+`capability_lifecycle_status: "current"`. While pending, the planner declines
+schema-derived algebraic execution, favoring correct scan fallback over reading
+facts that only cover the post-change subset.
 
 Relational embedded JSON domains apply that lifecycle per column path. Durable
 schema regeneration and local schema reload preserve user-owned knobs, compare
@@ -2433,4 +2440,9 @@ Cardinality sketches can also be promoted adaptively. Repeated cardinality
 queries are observed in the same adaptive-materialization stream; once a
 leader-gated candidate crosses the promotion threshold, the index records an HLL
 configuration for that shape, backfills the sketch, and then maintains it with
-the same dirty-group rebuild path used by static `hll_cardinalities`.
+the same dirty-group rebuild path used by static `hll_cardinalities`. Adaptive
+HLL promotions are derived runtime state, not user configuration. A destructive
+schema sidecar rebuild clears persisted adaptive HLL markers together with the
+old algebraic keyspace and resets the in-memory HLL registry back to static
+`hll_cardinalities`; recurring queries can promote the adaptive sketches again
+under the refreshed schema.

@@ -98,6 +98,8 @@ const sparse_backfill_batch_size: usize = 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
 const algebraic_backfill_batch_size: usize = 1024;
+pub var test_algebraic_backfill_batch_size: ?usize = null;
+pub var test_abort_algebraic_backfill_after_batches: ?usize = null;
 
 pub const ManagedIndexRef = struct {
     name: []const u8,
@@ -591,6 +593,7 @@ pub const IndexManager = struct {
     pub const AlgebraicIndex = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
+        rebuild_root_path: []u8,
         index: algebraic_mod.index.Index,
     };
 
@@ -1343,74 +1346,134 @@ pub const IndexManager = struct {
     }
 
     fn rebuildAlgebraicIndexFromBaseRows(self: *IndexManager, store: *docstore_mod.DocStore, entry: *AlgebraicIndex) !usize {
-        _ = try entry.index.clearPersistedRows(store);
-
         const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
         defer self.alloc.free(lower);
         const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
         defer if (upper) |buf| self.alloc.free(buf);
 
-        const rows = try store.scanRange(self.alloc, lower, if (upper) |buf| buf else "");
-        defer docstore_mod.DocStore.freeResults(self.alloc, rows);
-        try self.materializeScannedDocumentRows(rows);
+        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        const resume_from = try rebuild_state.check(self.alloc);
+        defer if (resume_from) |buf| self.alloc.free(buf);
+        if (resume_from == null) {
+            _ = try entry.index.clearPersistedRows(store);
+            try rebuild_state.update("");
+        }
 
         try entry.index.beginBulkIngestSession();
         var bulk_session_open = true;
         errdefer if (bulk_session_open) entry.index.abortBulkIngestSession();
 
-        var docs = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
-        defer docs.deinit(self.alloc);
-        var owned_doc_ids = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (owned_doc_ids.items) |doc_id| self.alloc.free(doc_id);
-            owned_doc_ids.deinit(self.alloc);
-        }
-
+        var scan_after = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else try self.alloc.dupe(u8, "");
+        defer self.alloc.free(scan_after);
         var rebuilt: usize = 0;
-        const flush_batch = struct {
-            fn run(
-                manager: *IndexManager,
-                doc_store: *docstore_mod.DocStore,
-                algebraic_entry: *AlgebraicIndex,
-                docs_buf: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
-                owned_keys: *std.ArrayListUnmanaged([]u8),
-            ) !void {
-                if (docs_buf.items.len == 0) return;
-                try algebraic_entry.index.applyBatchWithOptions(doc_store, .{ .documents = docs_buf.items }, .{ .batch_options = .{ .mode = .bulk_ingest } });
-                for (owned_keys.items) |doc_id| manager.alloc.free(doc_id);
-                owned_keys.clearRetainingCapacity();
-                docs_buf.clearRetainingCapacity();
-            }
-        }.run;
+        var flushed_batches: usize = 0;
+        var completed = false;
+        const configured_batch_size: usize = if (builtin.is_test) test_algebraic_backfill_batch_size orelse algebraic_backfill_batch_size else algebraic_backfill_batch_size;
+        const batch_size: usize = @max(configured_batch_size, 1);
+        const scan_window: usize = if (batch_size > std.math.maxInt(usize) / 4) batch_size else batch_size * 4;
 
-        for (rows) |row| {
-            if (isMetadataKey(row.key)) continue;
-            if (!self.visibleBaseDocumentRowKey(row.key)) continue;
-            const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, row.key)) orelse continue;
-            if (!self.keyInRange(doc_id)) {
-                self.alloc.free(doc_id);
-                continue;
+        while (true) {
+            var docs = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
+            defer docs.deinit(self.alloc);
+            var owned_doc_ids = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (owned_doc_ids.items) |doc_id| self.alloc.free(doc_id);
+                owned_doc_ids.deinit(self.alloc);
+            }
+            var owned_values = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (owned_values.items) |value| self.alloc.free(value);
+                owned_values.deinit(self.alloc);
             }
 
-            docs.append(self.alloc, .{
-                .key = doc_id,
-                .cleaned_value = row.value,
-            }) catch |err| {
-                self.alloc.free(doc_id);
-                return err;
-            };
-            owned_doc_ids.append(self.alloc, doc_id) catch |err| {
-                docs.items.len -= 1;
-                self.alloc.free(doc_id);
-                return err;
-            };
-            rebuilt += 1;
-            if (docs.items.len >= algebraic_backfill_batch_size) try flush_batch(self, store, entry, &docs, &owned_doc_ids);
+            var last_seen_key: ?[]u8 = null;
+            defer if (last_seen_key) |key| self.alloc.free(key);
+            var exhausted = true;
+            var scanned: usize = 0;
+
+            {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                cursor.setUpperBound(if (upper) |buf| buf else null);
+
+                const start = if (scan_after.len > 0) scan_after else lower;
+                var row_opt = try cursor.seekAtOrAfter(start);
+                while (row_opt) |row| : (row_opt = try cursor.next()) {
+                    if (upper) |buf| {
+                        if (std.mem.order(u8, row.key, buf) != .lt) break;
+                    }
+                    if (scan_after.len > 0 and std.mem.order(u8, row.key, scan_after) != .gt) continue;
+                    scanned += 1;
+                    if (last_seen_key) |old| self.alloc.free(old);
+                    last_seen_key = try self.alloc.dupe(u8, row.key);
+
+                    if (!isMetadataKey(row.key) and self.visibleBaseDocumentRowKey(row.key)) {
+                        const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, row.key)) orelse {
+                            if (scanned >= scan_window) {
+                                exhausted = false;
+                                break;
+                            }
+                            continue;
+                        };
+                        var doc_id_owned = true;
+                        errdefer if (doc_id_owned) self.alloc.free(doc_id);
+                        if (self.keyInRange(doc_id)) {
+                            const doc_value = if (self.relational_base_rows)
+                                try mapper.materializeRelationalRowValueAlloc(self.alloc, row.value)
+                            else
+                                try self.alloc.dupe(u8, row.value);
+                            var doc_value_owned = true;
+                            errdefer if (doc_value_owned) self.alloc.free(doc_value);
+                            try owned_values.append(self.alloc, doc_value);
+                            doc_value_owned = false;
+                            try owned_doc_ids.append(self.alloc, doc_id);
+                            doc_id_owned = false;
+                            try docs.append(self.alloc, .{
+                                .key = doc_id,
+                                .cleaned_value = doc_value,
+                            });
+                        } else {
+                            self.alloc.free(doc_id);
+                        }
+                    }
+
+                    if (docs.items.len >= batch_size or scanned >= scan_window) {
+                        exhausted = false;
+                        break;
+                    }
+                }
+            }
+
+            if (docs.items.len > 0) {
+                try entry.index.applyBatchWithOptions(store, .{ .documents = docs.items }, .{ .batch_options = .{ .mode = .bulk_ingest } });
+                rebuilt += docs.items.len;
+                flushed_batches += 1;
+            }
+            if (last_seen_key) |key| {
+                try rebuild_state.update(key);
+                self.alloc.free(scan_after);
+                scan_after = try self.alloc.dupe(u8, key);
+            }
+            if (docs.items.len > 0 and @import("builtin").is_test) {
+                if (test_abort_algebraic_backfill_after_batches) |limit| {
+                    if (flushed_batches >= limit) return error.TestInjectedBackfillFailure;
+                }
+            }
+            if (exhausted) {
+                completed = true;
+                break;
+            }
+            if (last_seen_key == null) {
+                completed = true;
+                break;
+            }
         }
-        try flush_batch(self, store, entry, &docs, &owned_doc_ids);
 
         try entry.index.finishBulkIngestSessionWithOptions(store, .{});
         bulk_session_open = false;
+        if (completed) try rebuild_state.clear();
         return rebuilt;
     }
 
@@ -1459,6 +1522,7 @@ pub const IndexManager = struct {
     fn freeAlgebraicIndexEntry(self: *IndexManager, entry: *AlgebraicIndex) void {
         entry.index.close();
         self.destroyIndexApplyMutex(entry.apply_mutex);
+        self.alloc.free(entry.rebuild_root_path);
         entry.config.deinit(self.alloc);
         entry.* = undefined;
     }
@@ -5486,6 +5550,11 @@ pub const IndexManager = struct {
                 return .{ .graph = entry };
             },
             .algebraic => {
+                const path = try self.indexPath(cfg.name);
+                defer self.alloc.free(path);
+                const rebuild_root_path = try self.alloc.dupe(u8, path);
+                var rebuild_root_path_owned = true;
+                errdefer if (rebuild_root_path_owned) self.alloc.free(rebuild_root_path);
                 var index = try algebraic_mod.index.Index.open(self.alloc, cfg.name, cfg.config_json);
                 var index_moved = false;
                 errdefer if (!index_moved) {
@@ -5507,8 +5576,10 @@ pub const IndexManager = struct {
                 var entry = AlgebraicIndex{
                     .apply_mutex = apply_mutex,
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
+                    .rebuild_root_path = rebuild_root_path,
                     .index = index,
                 };
+                rebuild_root_path_owned = false;
                 apply_mutex_owned = false;
                 index_moved = true;
                 errdefer self.freeAlgebraicIndexEntry(&entry);
@@ -11382,6 +11453,9 @@ test "index manager algebraic schema reload preserves HLL cardinalities" {
     const apply_mutex = try manager.allocIndexApplyMutex();
     var apply_mutex_owned = true;
     errdefer if (apply_mutex_owned) manager.destroyIndexApplyMutex(apply_mutex);
+    const rebuild_root_path = try manager.indexPath("alg");
+    var rebuild_root_path_owned = true;
+    errdefer if (rebuild_root_path_owned) alloc.free(rebuild_root_path);
 
     var entry = IndexManager.AlgebraicIndex{
         .apply_mutex = apply_mutex,
@@ -11390,9 +11464,11 @@ test "index manager algebraic schema reload preserves HLL cardinalities" {
             .kind = .algebraic,
             .config_json = config_json,
         }),
+        .rebuild_root_path = rebuild_root_path,
         .index = index,
     };
     apply_mutex_owned = false;
+    rebuild_root_path_owned = false;
     index_owned = false;
     var entry_owned = true;
     errdefer if (entry_owned) manager.freeAlgebraicIndexEntry(&entry);
@@ -11444,6 +11520,9 @@ test "index manager algebraic schema reload marks changed json subdocument domai
     const apply_mutex = try manager.allocIndexApplyMutex();
     var apply_mutex_owned = true;
     errdefer if (apply_mutex_owned) manager.destroyIndexApplyMutex(apply_mutex);
+    const rebuild_root_path = try manager.indexPath("alg");
+    var rebuild_root_path_owned = true;
+    errdefer if (rebuild_root_path_owned) alloc.free(rebuild_root_path);
 
     var entry = IndexManager.AlgebraicIndex{
         .apply_mutex = apply_mutex,
@@ -11452,9 +11531,11 @@ test "index manager algebraic schema reload marks changed json subdocument domai
             .kind = .algebraic,
             .config_json = config_json,
         }),
+        .rebuild_root_path = rebuild_root_path,
         .index = index,
     };
     apply_mutex_owned = false;
+    rebuild_root_path_owned = false;
     index_owned = false;
     var entry_owned = true;
     errdefer if (entry_owned) manager.freeAlgebraicIndexEntry(&entry);
@@ -11517,6 +11598,77 @@ test "index manager algebraic schema reload rebuilds stale persisted rows" {
     try std.testing.expect(!reloaded.dynamic_rules_backfill_pending);
     try std.testing.expect(!try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
     try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "new_field"));
+}
+
+test "index manager algebraic schema reload resumes interrupted bounded rebuild" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "schema-reload-resume-bounded");
+    defer cleanupIndexManagerDir(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+    defer manager.deinit();
+
+    const previous_batch_size = test_algebraic_backfill_batch_size;
+    const previous_abort = test_abort_algebraic_backfill_after_batches;
+    defer {
+        test_algebraic_backfill_batch_size = previous_batch_size;
+        test_abort_algebraic_backfill_after_batches = previous_abort;
+    }
+
+    const schema_v1 =
+        \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
+    ;
+    const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_v1);
+    defer alloc.free(config_json);
+
+    try manager.add(&store, .{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json = config_json,
+    });
+
+    const docs = [_]struct { key: []const u8, value: []const u8 }{
+        .{ .key = "doc:1", .value = "{\"old_field\":\"legacy1\",\"new_field\":\"fresh1\"}" },
+        .{ .key = "doc:2", .value = "{\"old_field\":\"legacy2\",\"new_field\":\"fresh2\"}" },
+    };
+    for (docs) |doc| {
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, doc.key);
+        defer alloc.free(stored_key);
+        try store.put(stored_key, doc.value);
+    }
+    try manager.applyAlgebraicBatchByNameWithOptions(&store, "alg", .{
+        .documents = &.{
+            .{ .key = docs[0].key, .cleaned_value = docs[0].value },
+            .{ .key = docs[1].key, .cleaned_value = docs[1].value },
+        },
+    }, .{ .mode = .bulk_ingest });
+    try std.testing.expectEqual(@as(usize, 2), try countDocFactScalarKeysContaining(alloc, &store, "old_field"));
+
+    try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v2);
+    test_algebraic_backfill_batch_size = 1;
+    test_abort_algebraic_backfill_after_batches = 1;
+    try std.testing.expectError(error.TestInjectedBackfillFailure, manager.reloadAlgebraicSchemaConfigs(&store, schema_v2));
+
+    const rebuild_state = backfill_state_mod.RebuildState.init(manager.algebraic_indexes.items[0].rebuild_root_path);
+    const resume_key = try rebuild_state.check(alloc);
+    defer if (resume_key) |key| alloc.free(key);
+    try std.testing.expect(resume_key != null);
+    try std.testing.expectEqual(@as(usize, 1), try countDocFactScalarKeysContaining(alloc, &store, "new_field"));
+
+    test_abort_algebraic_backfill_after_batches = null;
+    try manager.reloadAlgebraicSchemaConfigs(&store, schema_v2);
+
+    try std.testing.expectEqual(@as(usize, 0), try countDocFactScalarKeysContaining(alloc, &store, "old_field"));
+    try std.testing.expectEqual(@as(usize, 2), try countDocFactScalarKeysContaining(alloc, &store, "new_field"));
+    const cleared_resume_key = try rebuild_state.check(alloc);
+    defer if (cleared_resume_key) |key| alloc.free(key);
+    try std.testing.expect(cleared_resume_key == null);
 }
 
 test "index manager writable open resumes pending algebraic schema rebuild" {
@@ -11588,13 +11740,18 @@ fn saveRuntimeSchemaJsonForIndexManagerTest(alloc: Allocator, store: *docstore_m
 }
 
 fn storeHasDocFactScalarKeyContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !bool {
+    return (try countDocFactScalarKeysContaining(alloc, store, needle)) > 0;
+}
+
+fn countDocFactScalarKeysContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !usize {
     const rows = try store.scanRange(alloc, "", "");
     defer docstore_mod.DocStore.freeResults(alloc, rows);
+    var count: usize = 0;
     for (rows) |row| {
         if (std.mem.indexOf(u8, row.key, "docfact_scalar") != null and
-            std.mem.indexOf(u8, row.key, needle) != null) return true;
+            std.mem.indexOf(u8, row.key, needle) != null) count += 1;
     }
-    return false;
+    return count;
 }
 
 fn parseMetric(raw: []const u8) !vector_mod.DistanceMetric {

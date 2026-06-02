@@ -343,9 +343,13 @@ is durably exposed. Rebuild completion is gated on the durable schema version
 matching the staged algebraic capability; schema-versioned domains remain
 pending when no durable runtime schema has been adopted yet. Algebraic query
 planning withholds fields below that JSON column until the sidecar is rebuilt
-from committed rows. Successful local rebuild clears the domain back to
-`current`. Full-text JSON projection follows the existing schema-versioned index
-handoff.
+from committed rows. The local rebuild is serialized with DB apply work and
+replays relational base rows in bounded, resumable batches using the same
+`rebuild.state` cursor as other algebraic schema rebuilds, so large relational
+tables do not require whole-range materialization and interrupted rebuilds
+continue from the last applied row. Successful local rebuild clears the domain
+back to `current`. Full-text JSON projection follows the existing
+schema-versioned index handoff.
 
 By contrast, changing the relational base-column catalog is a storage migration.
 Schema updates that switch storage mode or add, remove, rename, retag, or change

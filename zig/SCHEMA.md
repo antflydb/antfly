@@ -225,14 +225,18 @@ Capability changes (detected by a differing capability fingerprint) first set
 `capability_lifecycle_status: "rebuild_required"` on the algebraic config so a
 crash or reopen during migration falls back instead of reading schema-derived
 facts that may only cover the post-change subset. The local table-schema apply
-path stages that pending algebraic config before durably saving the runtime
-schema and the local schema JSON mirror in one transaction, then clears the
-algebraic sidecar and replays existing committed base rows through the refreshed
-config. Pending rebuild completion is schema-version gated: a writable reopen
-only clears `rebuild_required` when the durable runtime schema version matches
-the pending algebraic capability version, and schema-versioned capabilities stay
-pending if no durable runtime schema has been adopted yet. After a successful
-rebuild, the catalog persists `capability_lifecycle_status: "current"`.
+path is a structural mutation serialized with normal DB apply work. It stages
+that pending algebraic config before durably saving the runtime schema and the
+local schema JSON mirror in one transaction, then clears the algebraic sidecar
+and replays existing committed base rows through the refreshed config. Replay is
+bounded and resumable: the index manager scans base rows with a cursor, flushes
+bulk-ingest batches, and advances a durable `rebuild.state` cursor only after a
+batch has been applied. Pending rebuild completion is schema-version gated: a
+writable reopen only clears `rebuild_required` when the durable runtime schema
+version matches the pending algebraic capability version, and schema-versioned
+capabilities stay pending if no durable runtime schema has been adopted yet.
+After a successful replay and bulk-ingest finish, the catalog persists
+`capability_lifecycle_status: "current"` and clears the rebuild cursor.
 Dynamic-template changes also use the narrower `dynamic_rules_backfill_pending`
 diagnostic/field guard while the rebuild is pending. Tables created with a
 template (rather than updated) take the fingerprint-equality fast path and are
