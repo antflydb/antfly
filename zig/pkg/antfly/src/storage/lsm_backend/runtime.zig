@@ -58,6 +58,11 @@ fn recordPointValueCopy(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointValueCopy")) backend.recordPointValueCopy();
 }
 
+fn canBorrowReaderRetainedState(backend: anytype) bool {
+    const BackendType = @TypeOf(backend.*);
+    return @hasField(BackendType, "active_readers") and backend.active_readers > 0;
+}
+
 fn recordCursorBlockReadahead(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorBlockReadahead")) backend.recordCursorBlockReadahead();
 }
@@ -1905,6 +1910,11 @@ fn getCurrentPointRetainedLocked(
         if (immutable.findIndex(namespace, key)) |idx| {
             const entry = immutable.entries.items[idx];
             if (entry.tombstone) return error.NotFound;
+            if (canBorrowReaderRetainedState(backend)) {
+                recordPointValueBorrow(backend);
+                backend.recordMutableHit();
+                return entry.value;
+            }
             const owned = try allocator.dupe(u8, entry.value);
             errdefer allocator.free(owned);
             try held_values.append(allocator, owned);
@@ -1964,6 +1974,11 @@ fn getFromRunPointRetainedLocked(
     if (state.findIndex(namespace, key)) |idx| {
         const entry = state.entries.items[idx];
         if (entry.tombstone) return error.NotFound;
+        if (canBorrowReaderRetainedState(backend)) {
+            recordPointValueBorrow(backend);
+            if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
+            return entry.value;
+        }
         const owned = try value_allocator.dupe(u8, entry.value);
         errdefer value_allocator.free(owned);
         try held_values.append(value_allocator, owned);
@@ -2022,6 +2037,13 @@ fn readManyCurrentSortedPointByRunLocked(
                 if (entry.tombstone) {
                     result.misses += 1;
                 } else {
+                    if (canBorrowReaderRetainedState(backend)) {
+                        values[i] = entry.value;
+                        recordPointValueBorrow(backend);
+                        result.hits += 1;
+                        backend.recordMutableHit();
+                        continue;
+                    }
                     const owned = try allocator.dupe(u8, entry.value);
                     errdefer allocator.free(owned);
                     try held_values.append(allocator, owned);
@@ -2110,6 +2132,13 @@ fn readManyCurrentSortedPointByRunLocked(
                     if (entry.tombstone) {
                         result.misses += 1;
                     } else {
+                        if (canBorrowReaderRetainedState(backend)) {
+                            values[key_index] = entry.value;
+                            recordPointValueBorrow(backend);
+                            result.hits += 1;
+                            if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
+                            continue;
+                        }
                         const owned = try allocator.dupe(u8, entry.value);
                         errdefer allocator.free(owned);
                         try held_values.append(allocator, owned);

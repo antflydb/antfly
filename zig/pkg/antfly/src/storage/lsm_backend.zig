@@ -4743,6 +4743,46 @@ test "lsm backend byte flush threshold controls mutable flushes" {
     try std.testing.expectEqualStrings(value[0..], try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 }
 
+test "lsm backend probe borrows immutable point values until reader release" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-immutable-probe-borrow", .{
+        .flush_threshold = 1000,
+        .flush_threshold_bytes = 256,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 300;
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+
+    const borrowed = try probe.get("doc:a");
+    try std.testing.expectEqualStrings(value[0..], borrowed);
+
+    var read_stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), read_stats.point_value_borrows);
+    try std.testing.expectEqual(@as(u64, 0), read_stats.point_value_copies);
+
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 1), backend.retired_immutable_memtables.items.len);
+    try std.testing.expectEqualStrings(value[0..], borrowed);
+
+    read_stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), read_stats.point_value_borrows);
+    try std.testing.expectEqual(@as(u64, 0), read_stats.point_value_copies);
+}
+
 test "lsm backend wal backed entry threshold defers commit flush to maintenance" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();

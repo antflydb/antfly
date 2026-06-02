@@ -272,6 +272,10 @@ Large-ingest guardrails:
      explicitly pinned.
    - [x] Read benchmarks now emit and compare cursor/point value borrow and
      copy counts, making the remaining mutable-hit copies visible in baselines.
+   - [x] Current/probe point reads now also borrow values from immutable
+     memtables and in-memory run state while a reader is retained. Active mutable
+     hits still copy because they can be updated without an explicit generation
+     pin.
 4. [ ] Make sorted `getManySorted` keep per-run cursor state across keys so
    batch reads resume inside the current block where possible.
    - [x] First slice: cached sorted-by-run reads now keep a per-run forward
