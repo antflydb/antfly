@@ -279,11 +279,21 @@ pub const Destination = struct {
             for (deletes.items) |key| alloc.free(@constCast(key));
             deletes.deinit(alloc);
         }
+        var seen_doc_keys = std.StringHashMapUnmanaged(void).empty;
+        defer seen_doc_keys.deinit(alloc);
 
         for (docs) |kv| {
-            const doc_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
-            errdefer alloc.free(doc_key);
+            const doc_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, kv.key)) orelse continue;
+            var doc_key_owned = true;
+            errdefer if (doc_key_owned) alloc.free(doc_key);
+            const gop = try seen_doc_keys.getOrPut(alloc, doc_key);
+            if (gop.found_existing) {
+                alloc.free(doc_key);
+                doc_key_owned = false;
+                continue;
+            }
             try deletes.append(alloc, doc_key);
+            doc_key_owned = false;
         }
 
         if (deletes.items.len > 0) {
@@ -291,6 +301,7 @@ pub const Destination = struct {
                 .deletes = deletes.items,
             });
         }
+        try relational_store_mod.deleteColumnIndexesByDocRange(alloc, self.db.core.store, byte_range.start, byte_range.end);
     }
 
     pub fn applyMergeReplay(
@@ -1713,6 +1724,31 @@ pub fn testMergeCoordinatorBootstrapsRelationalRowsAndColumnEntries() !void {
         defer relational_store_mod.freeColumnValues(alloc, replayed_amounts);
         try std.testing.expectEqual(@as(usize, 1), replayed_amounts.len);
         try std.testing.expectEqual(@as(f64, 95), replayed_amounts[0].value.f64_val);
+    }
+
+    try std.testing.expect(try coord.rollbackMerge());
+    {
+        const status = try coord.status();
+        try std.testing.expectEqual(range_transition.TransitionPhase.rolled_back, status.phase);
+        try std.testing.expectEqualStrings("row:a", coord.receiver.getRange().start);
+        try std.testing.expectEqualStrings("row:m", coord.receiver.getRange().end);
+
+        try std.testing.expect((try coord.receiver.get(alloc, "row:x")) == null);
+        try std.testing.expect((try coord.receiver.get(alloc, "row:y")) == null);
+        try std.testing.expect((try coord.receiver.get(alloc, "row:t")) == null);
+
+        const receiver_doc = (try coord.receiver.get(alloc, "row:b")) orelse return error.TestExpectedEqual;
+        defer alloc.free(receiver_doc);
+        try std.testing.expect(std.mem.indexOf(u8, receiver_doc, "\"title\":\"beta\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, receiver_doc, "\"amount\":10") != null);
+
+        const replayed_after_rollback = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:x", "row:x");
+        defer relational_store_mod.freeColumnValues(alloc, replayed_after_rollback);
+        try std.testing.expectEqual(@as(usize, 0), replayed_after_rollback.len);
+
+        const bootstrapped_after_rollback = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:y", "row:y");
+        defer relational_store_mod.freeColumnValues(alloc, bootstrapped_after_rollback);
+        try std.testing.expectEqual(@as(usize, 0), bootstrapped_after_rollback.len);
     }
 }
 

@@ -428,7 +428,10 @@ candidate document id, then hydrate the returned value from the current base
 relational row. Merge-style range cutover replays donor logical writes into the
 receiver's active range, where the relational participant regenerates receiver
 rows and column entries through the normal commit boundary; donor fencing rejects
-post-cutover writes outside the donor's remaining range.
+post-cutover writes outside the donor's remaining range. Rollback deletes donor
+logical ids decoded from every stored row key kind and purges relational
+column-scan entries for the donor range before restoring the receiver's base
+range.
 
 Physical data movement uses the internal table-data classifier rather than
 assuming every table datum lives under the document-range `0x01` namespace.
@@ -513,7 +516,7 @@ round-trip, document-mode passthrough, relational point reads, full-text
 base-row `stored_data`, scalar filters over column scan entries, transaction
 commit/abort/transform behavior, stale generic-primary cleanup, split movement,
 stale secondary scan-entry hydration from current base rows, and merge-style
-range cutover for relational row and column entries across reopen.
+range cutover plus rollback for relational row and column entries across reopen.
 
 ## Related docs
 
