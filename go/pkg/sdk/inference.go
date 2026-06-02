@@ -451,6 +451,133 @@ func (c *InferenceClient) Extract(ctx context.Context, req oapi.ExtractionReques
 	return resp.JSON200, nil
 }
 
+// Classification is one label score returned by ExtractClassifications.
+type Classification struct {
+	Name  string
+	Label string
+	Score float32
+}
+
+// ClassificationResult contains classification results for one input text.
+type ClassificationResult struct {
+	Index           int
+	Classifications []Classification
+}
+
+// ExtractedEntity is one named entity returned by ExtractEntities.
+type ExtractedEntity struct {
+	Text  string
+	Label string
+	Score float32
+	Start int
+	End   int
+}
+
+// EntityExtractionResult contains named entities for one input text.
+type EntityExtractionResult struct {
+	Index    int
+	Entities []ExtractedEntity
+}
+
+// ExtractClassifications performs zero-shot classification through the
+// canonical extraction endpoint.
+func (c *InferenceClient) ExtractClassifications(ctx context.Context, model string, texts []string, labels []string) ([]ClassificationResult, error) {
+	inputs, err := newTextExtractionInputs(texts)
+	if err != nil {
+		return nil, err
+	}
+	extracted, err := c.Extract(ctx, oapi.ExtractionRequest{
+		Model:  model,
+		Inputs: inputs,
+		Schema: oapi.ExtractionSchema{
+			Classifications: []oapi.ExtractionClassificationSchema{{
+				Name:   "classification",
+				Labels: labels,
+			}},
+		},
+		Options: oapi.ExtractionOptions{
+			IncludeConfidence: true,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]ClassificationResult, len(extracted.Data))
+	for i, item := range extracted.Data {
+		classifications := make([]Classification, 0, len(item.Classifications))
+		for _, classification := range item.Classifications {
+			classifications = append(classifications, Classification{
+				Name:  classification.Name,
+				Label: classification.Label,
+				Score: classification.Score,
+			})
+		}
+		out[i] = ClassificationResult{
+			Index:           i,
+			Classifications: classifications,
+		}
+	}
+	return out, nil
+}
+
+// ExtractEntities extracts named entities through the canonical extraction
+// endpoint.
+func (c *InferenceClient) ExtractEntities(ctx context.Context, model string, texts []string, labels []string) ([]EntityExtractionResult, error) {
+	inputs, err := newTextExtractionInputs(texts)
+	if err != nil {
+		return nil, err
+	}
+	extracted, err := c.Extract(ctx, oapi.ExtractionRequest{
+		Model:  model,
+		Inputs: inputs,
+		Schema: oapi.ExtractionSchema{
+			Entities: labels,
+		},
+		Options: oapi.ExtractionOptions{
+			FlatNer:           true,
+			IncludeConfidence: true,
+			IncludeSpans:      true,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]EntityExtractionResult, len(extracted.Data))
+	for i, item := range extracted.Data {
+		entities := make([]ExtractedEntity, 0, len(item.Entities))
+		for _, entity := range item.Entities {
+			entities = append(entities, ExtractedEntity{
+				Text:  entity.Text,
+				Label: entity.Label,
+				Score: entity.Score,
+				Start: entity.Start,
+				End:   entity.End,
+			})
+		}
+		out[i] = EntityExtractionResult{
+			Index:    i,
+			Entities: entities,
+		}
+	}
+	return out, nil
+}
+
+func newTextExtractionInputs(texts []string) ([]oapi.ExtractionInput, error) {
+	inputs := make([]oapi.ExtractionInput, len(texts))
+	for i, text := range texts {
+		raw, err := json.Marshal(text)
+		if err != nil {
+			return nil, err
+		}
+		inputs[i] = oapi.ExtractionInput{
+			Content: oapi.ChatMessageContent(raw),
+		}
+	}
+	return inputs, nil
+}
+
 // RewriteText rewrites input texts using a Seq2Seq rewriter model.
 func (c *InferenceClient) RewriteText(ctx context.Context, model string, inputs []string) (*oapi.InferenceRewriteResponse, error) {
 	req := oapi.InferenceRewriteRequest{

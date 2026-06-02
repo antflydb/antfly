@@ -30,6 +30,8 @@ import (
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
+const maxErrorResponseBytes int64 = 1 << 20
+
 // Config configures the consolidated Antfly SDK.
 type Config struct {
 	// BaseURL is the Antfly server URL without a product prefix, for example
@@ -153,8 +155,24 @@ func (e *APIError) Error() string {
 	return e.Message
 }
 
+func readLimitedBody(r io.Reader, maxBytes int64) ([]byte, bool, error) {
+	if maxBytes <= 0 {
+		body, err := io.ReadAll(r)
+		return body, false, err
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(body)) <= maxBytes {
+		return body, false, nil
+	}
+	return body[:maxBytes], true, nil
+}
+
 func readErrorResponse(resp *http.Response) error {
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, truncated, err := readLimitedBody(resp.Body, maxErrorResponseBytes)
 	if err != nil {
 		return fmt.Errorf("reading http response: %w", err)
 	}
@@ -171,8 +189,12 @@ func readErrorResponse(resp *http.Response) error {
 	}
 
 	// Fallback for non-JSON responses
+	message := string(respBody)
+	if truncated {
+		message = fmt.Sprintf("%s (response body exceeded %d bytes)", message, maxErrorResponseBytes)
+	}
 	return &APIError{
 		StatusCode: resp.StatusCode,
-		Message:    string(respBody),
+		Message:    message,
 	}
 }
