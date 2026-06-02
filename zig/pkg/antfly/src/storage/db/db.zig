@@ -2204,6 +2204,19 @@ fn makeLsmBackgroundExecutor(runtime: *background_runtime_mod.BackendRuntime, ow
     return lsm_backend_mod.BackgroundExecutor.init(runtime, owner_id);
 }
 
+fn installLsmReadRuntime(options: *lsm_backend_mod.Options, runtime: *background_runtime_mod.BackendRuntime) void {
+    if (options.read_runtime != null) return;
+    if (runtime.io()) |io| options.read_runtime = lsm_backend_mod.storage_io.ReadRuntime.init(io);
+}
+
+fn installIndexLsmReadRuntime(index_backends: anytype, runtime: *background_runtime_mod.BackendRuntime) void {
+    installLsmReadRuntime(&index_backends.text_main_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.text_wal_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.dense_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.sparse_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.graph_reverse_lsm_options, runtime);
+}
+
 fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpenOptions) !db_core.OpenedPrimaryStore {
     const zpath = try alloc.dupeZ(u8, path);
     defer alloc.free(zpath);
@@ -2388,17 +2401,20 @@ pub const DB = struct {
                 .lsm => |*lsm_opts| {
                     lsm_opts.cache = opts.lsm_cache orelse lsm_opts.cache;
                     lsm_opts.root_generation = opts.lsm_root_generation;
+                    installLsmReadRuntime(lsm_opts, backend_runtime);
                     primary_lsm_background_executor = makeLsmBackgroundExecutor(backend_runtime, backend_owner_id);
                     lsm_opts.background_executor = &primary_lsm_background_executor;
                 },
                 .lsm_memory => |*lsm_opts| {
                     lsm_opts.cache = opts.lsm_cache orelse lsm_opts.cache;
                     lsm_opts.root_generation = opts.lsm_root_generation;
+                    installLsmReadRuntime(lsm_opts, backend_runtime);
                     primary_lsm_background_executor = makeLsmBackgroundExecutor(backend_runtime, backend_owner_id);
                     lsm_opts.background_executor = &primary_lsm_background_executor;
                 },
                 .lmdb, .mem => {},
             }
+            installIndexLsmReadRuntime(&effective_index_backends, backend_runtime);
             const core_opts: db_config.CoreOpenOptions = .{
                 .map_size = opts.map_size,
                 .no_sync = opts.no_sync,

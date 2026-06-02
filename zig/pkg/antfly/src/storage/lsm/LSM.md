@@ -188,7 +188,7 @@ and maintenance that is always debt-driven.
    - ResourceManager should account table-builder bytes, compaction scratch,
      and publish scratch separately from long-lived cache/memtable bytes.
 
-2. [ ] Finish direct prefix-compressed block reader integration.
+2. [x] Finish direct prefix-compressed block reader integration.
    - The codec already has restart-point search primitives; runtime readers
      should use them before expanding a full logical block.
    - [x] First runtime slice: local/no-shared-cache point reads now search
@@ -198,19 +198,30 @@ and maintenance that is always debt-driven.
      physical block payloads under a separate `run_table_physical_block` cache
      kind and direct-search restart windows from that payload. Decoded
      `run_table_block` entries remain reserved for iterator/block-window paths.
-   - Cache policy should distinguish compressed bytes, decoded block bytes, and
-     direct-search payloads so mixed workloads do not evict useful hot blocks
-     with transient decoded materialization.
-   - After integration, remove compatibility-only expansion paths for the new
-     format where the caller does not require a decoded block.
+   - [x] Cache policy now distinguishes compressed physical block payloads from
+     decoded iterator/window blocks: physical point-read payloads use
+     `run_table_physical_block`, decoded full blocks stay in `run_table_block`,
+     and direct-search matched entries remain transaction-held scratch instead
+     of cache entries.
+   - [x] Exact point reads on prefix-compressed blocks no longer populate the
+     decoded block cache. Compatibility expansion remains only for callers that
+     need decoded iterator/window blocks or non-prefix block materialization.
 
-3. [ ] Add async/future-style block reads for point-read survivors.
-   - Keep source-precedence semantics: completion order must not decide the
+3. [x] Add async/future-style block reads for point-read survivors.
+   - [x] Storage now exposes a one-shot range-read future API plus a neutral
+     `ReadRuntime` handle. Native storage uses the supplied runtime's
+     `std.Io.concurrent` lane; storage without a runtime keeps a completed
+     synchronous future fallback.
+   - [x] `BackendHandle` and DB-owned LSM options install the shared
+     `backend_runtime` read runtime, so point-read IO uses the existing backend
+     runtime abstraction instead of spawning ad hoc read threads.
+   - [x] Persisted path-backed exact point reads issue independent survivor
+     block reads up to `max_concurrent_point_block_reads`, then consume results
+     in run/source-precedence order. Completion order does not decide the
      visible value.
-   - Issue independent persisted-run block reads concurrently when bloom/range
-     precheck leaves multiple legal survivors.
-   - Consume results in run precedence order and cancel/drop lower-priority
-     work once a visible value or tombstone is proven.
+   - [x] Higher-precedence hits and tombstones cancel/drop lower-priority
+     futures, and read stats expose async point batches, reads issued, canceled
+     reads, and wait time.
 
 4. [ ] Make compaction scheduling fully score- and overlap-driven.
    - Raise compaction concurrency only when selected jobs are disjoint by run
@@ -443,13 +454,20 @@ Large-ingest guardrails:
      tombstone outcomes in `ReadStats`, `lsm-backend-bench` JSON, and the
      comparator. This makes the remaining synchronous miss-at-a-time work
      visible before changing storage IO semantics.
-2. [ ] Issue concurrent block reads for surviving point-read candidates where
+2. [x] Issue concurrent block reads for surviving point-read candidates where
    precedence allows it.
-   - L0/tombstone semantics require resolving by source order, not by first
-     completed read.
-   - Current storage APIs are synchronous. A RocksDB/Pebble-shaped follow-up
-     needs a future-style block read API so reads can be issued concurrently and
-     then consumed in source-precedence order.
+   - [x] L0/tombstone semantics are preserved by consuming issued reads in
+     source order; completion order never determines the visible value.
+   - [x] Storage now has a future-style range-read API with a neutral
+     `ReadRuntime`, and native range futures use the shared backend runtime
+     when one is supplied.
+   - [x] The survivor read phase issues persisted-run block reads concurrently
+     where bloom/range/table-index precheck leaves multiple legal block
+     candidates, then cancels/drops lower-priority work after a decisive hit or
+     tombstone.
+   - [ ] Extend the same future path into sorted-by-run/batch point-read state
+     once those paths can share issued reads without disturbing their current
+     block/index reuse.
 3. [x] Add a borrowed-value point-read mode that can hold cache block handles
    until transaction end instead of duplicating every returned value.
    - [x] First slice: snapshot point-batch reads can return slices borrowed

@@ -122,9 +122,11 @@ pub const Options = struct {
     bloom: bloom.Config = lsm_table_file.default_filter_config,
     table_block_compression: lsm_table_file.CompressionPolicy = .snappy_adaptive,
     io_runtime: storage_io.RuntimeKind = .threaded,
+    read_runtime: ?storage_io.ReadRuntime = null,
     storage: ?storage_io.Storage = null,
     cache: ?*cache_mod.Cache = null,
     local_block_cache_enabled: bool = true,
+    max_concurrent_point_block_reads: usize = 4,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     background_executor: ?*const BackgroundExecutor = null,
     maintenance_waker: ?MaintenanceWaker = null,
@@ -478,6 +480,10 @@ pub const Backend = struct {
         point_run_survivor_hits: u64 = 0,
         point_run_survivor_misses: u64 = 0,
         point_run_survivor_tombstones: u64 = 0,
+        point_run_async_batches: u64 = 0,
+        point_run_async_reads_issued: u64 = 0,
+        point_run_async_reads_canceled: u64 = 0,
+        point_run_async_wait_ns: u64 = 0,
         bloom_negatives: u64 = 0,
         prefix_bloom_negatives: u64 = 0,
         block_prefix_bloom_negatives: u64 = 0,
@@ -534,6 +540,10 @@ pub const Backend = struct {
         point_run_survivor_hits: CounterU64 = .init(0),
         point_run_survivor_misses: CounterU64 = .init(0),
         point_run_survivor_tombstones: CounterU64 = .init(0),
+        point_run_async_batches: CounterU64 = .init(0),
+        point_run_async_reads_issued: CounterU64 = .init(0),
+        point_run_async_reads_canceled: CounterU64 = .init(0),
+        point_run_async_wait_ns: CounterU64 = .init(0),
         bloom_negatives: CounterU64 = .init(0),
         prefix_bloom_negatives: CounterU64 = .init(0),
         block_prefix_bloom_negatives: CounterU64 = .init(0),
@@ -590,6 +600,10 @@ pub const Backend = struct {
                 .point_run_survivor_hits = self.point_run_survivor_hits.load(.monotonic),
                 .point_run_survivor_misses = self.point_run_survivor_misses.load(.monotonic),
                 .point_run_survivor_tombstones = self.point_run_survivor_tombstones.load(.monotonic),
+                .point_run_async_batches = self.point_run_async_batches.load(.monotonic),
+                .point_run_async_reads_issued = self.point_run_async_reads_issued.load(.monotonic),
+                .point_run_async_reads_canceled = self.point_run_async_reads_canceled.load(.monotonic),
+                .point_run_async_wait_ns = self.point_run_async_wait_ns.load(.monotonic),
                 .bloom_negatives = self.bloom_negatives.load(.monotonic),
                 .prefix_bloom_negatives = self.prefix_bloom_negatives.load(.monotonic),
                 .block_prefix_bloom_negatives = self.block_prefix_bloom_negatives.load(.monotonic),
@@ -2647,6 +2661,19 @@ pub const Backend = struct {
         _ = self.read_stats.point_run_survivor_tombstones.fetchAdd(1, .monotonic);
     }
 
+    pub fn recordPointRunAsyncBatch(self: *Backend, reads_issued: usize) void {
+        _ = self.read_stats.point_run_async_batches.fetchAdd(1, .monotonic);
+        _ = self.read_stats.point_run_async_reads_issued.fetchAdd(@intCast(reads_issued), .monotonic);
+    }
+
+    pub fn recordPointRunAsyncCancel(self: *Backend) void {
+        _ = self.read_stats.point_run_async_reads_canceled.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointRunAsyncWait(self: *Backend, elapsed_ns: u64) void {
+        _ = self.read_stats.point_run_async_wait_ns.fetchAdd(elapsed_ns, .monotonic);
+    }
+
     pub fn recordBloomNegative(self: *Backend) void {
         _ = self.read_stats.bloom_negatives.fetchAdd(1, .monotonic);
     }
@@ -3717,6 +3744,9 @@ pub const BackendHandle = struct {
             const runtime = owned_runtime.?.ptr();
             const executor = BackgroundExecutor.init(runtime, runtime.allocOwnerId());
             resolved_options.background_executor = &executor;
+            if (resolved_options.read_runtime == null) {
+                if (runtime.io()) |io| resolved_options.read_runtime = storage_io.ReadRuntime.init(io);
+            }
         }
 
         backend.* = Backend.init(allocator, resolved_options);
@@ -3754,6 +3784,9 @@ pub const BackendHandle = struct {
             const runtime = owned_runtime.?.ptr();
             const executor = BackgroundExecutor.init(runtime, runtime.allocOwnerId());
             resolved_options.background_executor = &executor;
+            if (resolved_options.read_runtime == null) {
+                if (runtime.io()) |io| resolved_options.read_runtime = storage_io.ReadRuntime.init(io);
+            }
         }
 
         try backend.openInto(allocator, root_dir, resolved_options);
@@ -8839,6 +8872,65 @@ test "lsm backend shared cache point reads search prefix-compressed physical blo
     try std.testing.expect(stats.run_table_index.inserts > 0);
     try std.testing.expect(stats.run_table_physical_block.inserts > 0);
     try std.testing.expectEqual(@as(u64, 0), stats.run_table_block.inserts);
+}
+
+test "lsm backend async point reads issue overlapping survivors in source order" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-async-point-survivors";
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        {
+            var txn = try runtime.beginWrite();
+            try txn.put("tenant:collection:shared-prefix:doc:000001", "older");
+            try txn.commit();
+            try backend.sync(true);
+        }
+        {
+            var txn = try runtime.beginWrite();
+            try txn.put("tenant:collection:shared-prefix:doc:000001", "newer");
+            try txn.commit();
+            try backend.sync(true);
+        }
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+        .max_concurrent_point_block_reads = 4,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var txn = try runtime.beginRead();
+    defer txn.abort();
+    try std.testing.expectEqualStrings("newer", try txn.get("tenant:collection:shared-prefix:doc:000001"));
+
+    const read_stats = backend.snapshotReadStats();
+    try std.testing.expect(read_stats.point_run_async_batches > 0);
+    try std.testing.expect(read_stats.point_run_async_reads_issued >= 2);
+    try std.testing.expect(read_stats.point_run_async_reads_canceled > 0);
+
+    const cache_stats = cache.snapshotStats();
+    try std.testing.expect(cache_stats.run_table_physical_block.inserts > 0);
+    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
 }
 
 test "lsm backend block filter avoids candidate block read on run-bloom false positive" {

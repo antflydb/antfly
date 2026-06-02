@@ -24,6 +24,7 @@ const lsm_table_file = @import("../lsm/table_file.zig");
 const cache_mod = @import("cache.zig");
 const repository_mod = @import("repository.zig");
 const state_mod = @import("state.zig");
+const storage_io = @import("storage_io.zig");
 const platform_time = @import("../../platform/time.zig");
 
 const Run = repository_mod.Run;
@@ -3805,6 +3806,7 @@ const PointRunCandidate = struct {
 };
 
 const max_stack_point_run_candidates = 16;
+const max_point_async_stack_reads = 16;
 
 fn runIndicesUsePathBackedPointPrecheck(backend: anytype, runs: []Run, run_indices: []const usize) bool {
     for (run_indices) |run_index| {
@@ -3920,6 +3922,45 @@ fn getFromPathRunIndicesPrechecked(
         recordPointRunPrecheckSurvivor(backend);
     }
 
+    const candidate_count = stack_candidate_len + overflow_candidates.items.len;
+    if (candidate_count > 1 and batch_run_indexes == null and backend.options.cache != null and backend.options.max_concurrent_point_block_reads > 1) {
+        if (overflow_candidates.items.len == 0) {
+            if (try tryReadPointRunCandidatesAsync(
+                backend,
+                runs,
+                stack_candidates[0..stack_candidate_len],
+                read_hint,
+                held_values,
+                value_allocator,
+                namespace,
+                key,
+            )) |result| switch (result) {
+                .hit => |value| return value,
+                .miss => return null,
+                .tombstone => return error.NotFound,
+            };
+        } else {
+            var all_candidates = std.ArrayListUnmanaged(PointRunCandidate).empty;
+            defer all_candidates.deinit(value_allocator);
+            try all_candidates.appendSlice(value_allocator, stack_candidates[0..stack_candidate_len]);
+            try all_candidates.appendSlice(value_allocator, overflow_candidates.items);
+            if (try tryReadPointRunCandidatesAsync(
+                backend,
+                runs,
+                all_candidates.items,
+                read_hint,
+                held_values,
+                value_allocator,
+                namespace,
+                key,
+            )) |result| switch (result) {
+                .hit => |value| return value,
+                .miss => return null,
+                .tombstone => return error.NotFound,
+            };
+        }
+    }
+
     for (stack_candidates[0..stack_candidate_len]) |candidate| {
         if (try readPointRunCandidateWithStats(backend, runs, candidate, read_hint, held_blocks, held_values, value_allocator, namespace, key, backend_locked, batch_run_indexes)) |value| return value;
     }
@@ -3957,6 +3998,279 @@ fn readPointRunCandidateWithStats(
     }
     backend.recordPointRunSurvivorMiss();
     return null;
+}
+
+const AsyncPointLookupResult = union(enum) {
+    hit: []const u8,
+    miss,
+    tombstone,
+};
+
+const AsyncPointBlockRead = struct {
+    const Status = enum {
+        known_miss,
+        ready_handle,
+        future,
+    };
+
+    candidate: PointRunCandidate,
+    path: []const u8,
+    run_id: u64,
+    generation: u64,
+    index_handle: cache_mod.Handle,
+    block_index: usize,
+    absolute_offset: u64,
+    physical_len: u32,
+    logical_len: u32,
+    compression: lsm_table_file.BlockCompression,
+    status: Status,
+    physical_handle: ?cache_mod.Handle = null,
+    future: ?storage_io.RangeReadFuture = null,
+
+    fn release(self: *AsyncPointBlockRead) void {
+        if (self.future) |*future| {
+            future.cancel();
+            self.future = null;
+        }
+        if (self.physical_handle) |*handle| {
+            handle.release();
+            self.physical_handle = null;
+        }
+        self.index_handle.release();
+    }
+};
+
+fn cleanupAsyncPointReads(reads: []AsyncPointBlockRead) void {
+    for (reads) |*read| read.release();
+}
+
+fn cancelAsyncPointReads(backend: anytype, reads: []AsyncPointBlockRead) void {
+    for (reads) |*read| {
+        if (read.future) |*future| {
+            future.cancel();
+            read.future = null;
+            backend.recordPointRunAsyncCancel();
+        }
+        if (read.physical_handle) |*handle| {
+            handle.release();
+            read.physical_handle = null;
+        }
+        read.index_handle.release();
+    }
+}
+
+fn prepareAsyncPointBlockRead(
+    backend: anytype,
+    runs: []Run,
+    candidate: PointRunCandidate,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+) !?AsyncPointBlockRead {
+    const cache = backend.options.cache orelse return null;
+    const run = &runs[candidate.run_index];
+    const path = run.path orelse return null;
+    var index_handle = try loadRunTableIndexHandle(backend, run);
+    errdefer index_handle.release();
+    const index = index_handle.runTableIndex();
+    const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
+    const block = index.blocks[block_index];
+    if (!block.mayContainKeyByBounds(namespace.name, key) or !block.maybeContains(namespace.name, key)) {
+        return .{
+            .candidate = candidate,
+            .path = path,
+            .run_id = run.id,
+            .generation = backend.root_generation,
+            .index_handle = index_handle,
+            .block_index = block_index,
+            .absolute_offset = 0,
+            .physical_len = 0,
+            .logical_len = 0,
+            .compression = .none,
+            .status = .known_miss,
+        };
+    }
+
+    const window = index.blockWindow(block_index);
+    const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+    const physical_len = window.physicalLen();
+    if (cache.retainRunTablePhysicalBlock(path, run.id, backend.root_generation, absolute_offset, physical_len)) |handle| {
+        backend.recordSharedBlockCacheHit();
+        return .{
+            .candidate = candidate,
+            .path = path,
+            .run_id = run.id,
+            .generation = backend.root_generation,
+            .index_handle = index_handle,
+            .block_index = block_index,
+            .absolute_offset = absolute_offset,
+            .physical_len = physical_len,
+            .logical_len = window.len,
+            .compression = window.compression,
+            .status = .ready_handle,
+            .physical_handle = handle,
+        };
+    }
+
+    backend.recordSharedBlockCacheMiss();
+    var future = try backend.storage.?.beginReadFileRangeAllocWithRuntime(backend.options.read_runtime, cache.valueAllocator(), path, absolute_offset, physical_len);
+    errdefer future.cancel();
+    return .{
+        .candidate = candidate,
+        .path = path,
+        .run_id = run.id,
+        .generation = backend.root_generation,
+        .index_handle = index_handle,
+        .block_index = block_index,
+        .absolute_offset = absolute_offset,
+        .physical_len = physical_len,
+        .logical_len = window.len,
+        .compression = window.compression,
+        .status = .future,
+        .future = future,
+    };
+}
+
+fn payloadForAsyncPointRead(
+    backend: anytype,
+    read: *AsyncPointBlockRead,
+) ![]const u8 {
+    if (read.physical_handle) |*handle| return handle.runTablePhysicalBlock();
+    const cache = backend.options.cache orelse return error.RunStateUnavailable;
+    var future = read.future orelse return error.RunStateUnavailable;
+    read.future = null;
+    const start_ns = backend.readStatsNowNs();
+    const bytes = future.wait() catch |err| {
+        backend.recordPointRunAsyncWait(backend.readStatsElapsedNs(start_ns));
+        return err;
+    };
+    const elapsed_ns = backend.readStatsElapsedNs(start_ns);
+    backend.recordPointRunAsyncWait(elapsed_ns);
+    backend.recordTableBlockLoad(bytes.len, elapsed_ns);
+    read.physical_handle = try cache.putRunTablePhysicalBlock(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes);
+    return read.physical_handle.?.runTablePhysicalBlock();
+}
+
+fn consumeAsyncPointRead(
+    backend: anytype,
+    read: *AsyncPointBlockRead,
+    read_hint: *?BorrowedReadHint,
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+) !?AsyncPointLookupResult {
+    backend.recordPointRunSurvivorRead();
+    if (read.status == .known_miss) {
+        backend.recordPointRunSurvivorMiss();
+        return null;
+    }
+
+    const index = read.index_handle.runTableIndex();
+    const block = index.blocks[read.block_index];
+    const payload = try payloadForAsyncPointRead(backend, read);
+    switch (read.compression) {
+        .prefix, .prefix_snappy => {
+            const positioned = try lsm_table_file.findExactEntryInCompressedBlockPayloadAlloc(
+                value_allocator,
+                read.compression,
+                payload,
+                block.first_entry_index,
+                namespace.name,
+                key,
+            ) orelse {
+                backend.recordPointRunSurvivorMiss();
+                return null;
+            };
+            errdefer value_allocator.free(positioned.bytes);
+            if (positioned.entry.tombstone) {
+                value_allocator.free(positioned.bytes);
+                backend.recordPointRunSurvivorTombstone();
+                return .tombstone;
+            }
+            try held_values.append(value_allocator, positioned.bytes);
+            read_hint.* = .{
+                .run_index = read.candidate.run_index,
+                .namespace_name = namespace.name,
+                .key = positioned.entry.key,
+                .entry_index = positioned.index,
+            };
+            backend.recordPointRunSurvivorHit();
+            return .{ .hit = positioned.entry.value };
+        },
+        .none, .snappy => {
+            const decoded = try lsm_table_file.decodeBlockPayloadAlloc(value_allocator, read.compression, payload, read.logical_len);
+            errdefer value_allocator.free(decoded);
+            const positioned = try lsm_table_file.findExactEntryInBlock(
+                index,
+                decoded,
+                read.block_index,
+                namespace.name,
+                key,
+            ) orelse {
+                value_allocator.free(decoded);
+                backend.recordPointRunSurvivorMiss();
+                return null;
+            };
+            if (positioned.entry.tombstone) {
+                value_allocator.free(decoded);
+                backend.recordPointRunSurvivorTombstone();
+                return .tombstone;
+            }
+            try held_values.append(value_allocator, decoded);
+            read_hint.* = .{
+                .run_index = read.candidate.run_index,
+                .namespace_name = namespace.name,
+                .key = positioned.entry.key,
+                .entry_index = positioned.index,
+            };
+            backend.recordPointRunSurvivorHit();
+            return .{ .hit = positioned.entry.value };
+        },
+    }
+}
+
+fn tryReadPointRunCandidatesAsync(
+    backend: anytype,
+    runs: []Run,
+    candidates: []const PointRunCandidate,
+    read_hint: *?BorrowedReadHint,
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+) !?AsyncPointLookupResult {
+    if (backend.storage == null) return null;
+    var stack_reads: [max_point_async_stack_reads]AsyncPointBlockRead = undefined;
+    const configured_limit = @min(backend.options.max_concurrent_point_block_reads, max_point_async_stack_reads);
+    const batch_limit = @max(@as(usize, 1), configured_limit);
+    var offset: usize = 0;
+    while (offset < candidates.len) {
+        const end = @min(candidates.len, offset + batch_limit);
+        var read_count: usize = 0;
+        var issued_count: usize = 0;
+        errdefer cleanupAsyncPointReads(stack_reads[0..read_count]);
+        for (candidates[offset..end]) |candidate| {
+            const prepared = try prepareAsyncPointBlockRead(backend, runs, candidate, namespace, key) orelse {
+                cleanupAsyncPointReads(stack_reads[0..read_count]);
+                return null;
+            };
+            if (prepared.status == .future) issued_count += 1;
+            stack_reads[read_count] = prepared;
+            read_count += 1;
+        }
+        backend.recordPointRunAsyncBatch(issued_count);
+        var consumed: usize = 0;
+        while (consumed < read_count) : (consumed += 1) {
+            if (try consumeAsyncPointRead(backend, &stack_reads[consumed], read_hint, held_values, value_allocator, namespace, key)) |result| {
+                cancelAsyncPointReads(backend, stack_reads[consumed + 1 .. read_count]);
+                stack_reads[consumed].release();
+                return result;
+            }
+            stack_reads[consumed].release();
+        }
+        offset = end;
+    }
+    return .miss;
 }
 
 fn getFromRunIndices(

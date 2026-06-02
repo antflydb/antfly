@@ -886,8 +886,8 @@ fn hashKey(path: []const u8, run_id: u64, generation: u64, kind: Kind, block_off
 fn evictionPriority(kind: Kind) u8 {
     return switch (kind) {
         .run_table_raw => 0,
+        .run_table_block => 0,
         .run_table_physical_block => 1,
-        .run_table_block => 1,
         .run_state => 2,
         .run_table_index => 3,
     };
