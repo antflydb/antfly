@@ -700,6 +700,13 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_active", "gauge", "Whether startup catch-up is actively opening or catching up a local index", if (stats.startup.active) 1 else 0);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_retained_segments", "gauge", "Retained WAL segments reported by the active startup catch-up snapshot", stats.startup.wal_retained_segments);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_retained_bytes", "gauge", "Retained WAL bytes reported by the active startup catch-up snapshot", stats.startup.wal_retained_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_checkpoint_oldest_retained_segment", "gauge", "Oldest WAL segment still retained by the active startup catch-up checkpoint snapshot", stats.startup.wal_checkpoint_oldest_retained_segment);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_checkpoint_covered_through_segment", "gauge", "Last WAL segment covered by the active startup catch-up checkpoint snapshot", stats.startup.wal_checkpoint_covered_through_segment);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_checkpoint_current_segment", "gauge", "Current WAL segment in the active startup catch-up checkpoint snapshot", stats.startup.wal_checkpoint_current_segment);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_checkpoint_lag_segments", "gauge", "Sealed WAL segments retained before the active segment in the startup catch-up snapshot", stats.startup.wal_checkpoint_lag_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_retained_segments", "gauge", "Dedicated replay WAL segments retained by the active startup catch-up snapshot", stats.startup.wal_replay_retained_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_retained_bytes", "gauge", "Dedicated replay WAL bytes retained by the active startup catch-up snapshot", stats.startup.wal_replay_retained_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_current_segment", "gauge", "Current dedicated replay WAL segment in the startup catch-up snapshot", stats.startup.wal_replay_current_segment);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_configured_indexes", "gauge", "Configured indexes on the table currently being opened or caught up", stats.startup.configured_indexes);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_opened_indexes", "gauge", "Configured indexes already opened for the active startup catch-up table", stats.startup.opened_indexes);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_db_open_ns", "gauge", "Observed DB.open duration for the active startup catch-up table", stats.startup.db_open_ns);
@@ -12576,6 +12583,13 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
                     .phase = .opening_db,
                     .wal_retained_segments = 4,
                     .wal_retained_bytes = 99,
+                    .wal_checkpoint_oldest_retained_segment = 2,
+                    .wal_checkpoint_covered_through_segment = 3,
+                    .wal_checkpoint_current_segment = 5,
+                    .wal_checkpoint_lag_segments = 2,
+                    .wal_replay_retained_segments = 1,
+                    .wal_replay_retained_bytes = 44,
+                    .wal_replay_current_segment = 6,
                     .lsm_open_stores = 3,
                     .lsm_open_completed = 2,
                     .lsm_open_total_ns = 1000,
@@ -12742,6 +12756,13 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_active 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_retained_segments 4") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_retained_bytes 99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_checkpoint_oldest_retained_segment 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_checkpoint_covered_through_segment 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_checkpoint_current_segment 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_checkpoint_lag_segments 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_retained_segments 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_retained_bytes 44") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_current_segment 6") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_stores 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_completed 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_total_ns 1000") != null);

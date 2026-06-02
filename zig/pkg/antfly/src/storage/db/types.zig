@@ -1680,6 +1680,13 @@ pub const StartupCatchUpStats = struct {
     wal_retention_known: bool = false,
     wal_retained_segments: u64 = 0,
     wal_retained_bytes: u64 = 0,
+    wal_checkpoint_oldest_retained_segment: u64 = 0,
+    wal_checkpoint_covered_through_segment: u64 = 0,
+    wal_checkpoint_current_segment: u64 = 0,
+    wal_checkpoint_lag_segments: u64 = 0,
+    wal_replay_retained_segments: u64 = 0,
+    wal_replay_retained_bytes: u64 = 0,
+    wal_replay_current_segment: u64 = 0,
     configured_indexes: u32 = 0,
     configured_dense_indexes: u32 = 0,
     configured_sparse_indexes: u32 = 0,
@@ -1791,6 +1798,13 @@ pub fn accumulateStartupCatchUpStats(dst: *StartupCatchUpStats, src: StartupCatc
     dst.wal_retention_known = dst.wal_retention_known or src.wal_retention_known;
     dst.wal_retained_segments += src.wal_retained_segments;
     dst.wal_retained_bytes += src.wal_retained_bytes;
+    dst.wal_checkpoint_oldest_retained_segment = minNonZeroU64(dst.wal_checkpoint_oldest_retained_segment, src.wal_checkpoint_oldest_retained_segment);
+    dst.wal_checkpoint_covered_through_segment = @max(dst.wal_checkpoint_covered_through_segment, src.wal_checkpoint_covered_through_segment);
+    dst.wal_checkpoint_current_segment = @max(dst.wal_checkpoint_current_segment, src.wal_checkpoint_current_segment);
+    dst.wal_checkpoint_lag_segments += src.wal_checkpoint_lag_segments;
+    dst.wal_replay_retained_segments += src.wal_replay_retained_segments;
+    dst.wal_replay_retained_bytes += src.wal_replay_retained_bytes;
+    dst.wal_replay_current_segment = @max(dst.wal_replay_current_segment, src.wal_replay_current_segment);
     dst.configured_indexes = @max(dst.configured_indexes, src.configured_indexes);
     dst.configured_dense_indexes = @max(dst.configured_dense_indexes, src.configured_dense_indexes);
     dst.configured_sparse_indexes = @max(dst.configured_sparse_indexes, src.configured_sparse_indexes);
@@ -1816,6 +1830,12 @@ pub fn accumulateStartupCatchUpStats(dst: *StartupCatchUpStats, src: StartupCatc
     dst.wal_replay_entries += src.wal_replay_entries;
     dst.wal_replay_bytes += src.wal_replay_bytes;
     dst.wal_replay_ns += src.wal_replay_ns;
+}
+
+fn minNonZeroU64(lhs: u64, rhs: u64) u64 {
+    if (lhs == 0) return rhs;
+    if (rhs == 0) return lhs;
+    return @min(lhs, rhs);
 }
 
 pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexingStats) void {

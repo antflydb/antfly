@@ -334,6 +334,10 @@ Large-ingest guardrails:
      sampling, including mutable/immutable bytes, WAL retention/checkpoint
      lag, WAL append/sync/replay/reset latency counters, compaction policy
      debt, background-IO admission, and backend-lock waits.
+   - [x] Startup metrics slice: async startup catch-up metrics now retain the
+     WAL checkpoint coordinates captured after DB open, including oldest
+     retained/current/covered segments, lag, replay retained bytes, and replay
+     current segment.
 3. [ ] Replace recovery replay allocation churn with a bounded recovery
    allocation model that can release whole chunks after flush.
    - [x] First slice: state WAL recovery now reads segment chunks directly

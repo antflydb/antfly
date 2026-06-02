@@ -513,6 +513,16 @@ const DenseCatchUpContentionStats = struct {
 };
 
 const StartupOpenStats = struct {
+    wal_retention_known: std.atomic.Value(bool) = .init(false),
+    wal_retained_segments: AtomicU64 = .init(0),
+    wal_retained_bytes: AtomicU64 = .init(0),
+    wal_checkpoint_oldest_retained_segment: AtomicU64 = .init(0),
+    wal_checkpoint_covered_through_segment: AtomicU64 = .init(0),
+    wal_checkpoint_current_segment: AtomicU64 = .init(0),
+    wal_checkpoint_lag_segments: AtomicU64 = .init(0),
+    wal_replay_retained_segments: AtomicU64 = .init(0),
+    wal_replay_retained_bytes: AtomicU64 = .init(0),
+    wal_replay_current_segment: AtomicU64 = .init(0),
     configured_indexes: std.atomic.Value(u32) = .init(0),
     configured_dense_indexes: std.atomic.Value(u32) = .init(0),
     configured_sparse_indexes: std.atomic.Value(u32) = .init(0),
@@ -541,6 +551,16 @@ const StartupOpenStats = struct {
 
     fn snapshot(self: *const @This()) types.StartupCatchUpStats {
         return .{
+            .wal_retention_known = self.wal_retention_known.load(.monotonic),
+            .wal_retained_segments = self.wal_retained_segments.load(.monotonic),
+            .wal_retained_bytes = self.wal_retained_bytes.load(.monotonic),
+            .wal_checkpoint_oldest_retained_segment = self.wal_checkpoint_oldest_retained_segment.load(.monotonic),
+            .wal_checkpoint_covered_through_segment = self.wal_checkpoint_covered_through_segment.load(.monotonic),
+            .wal_checkpoint_current_segment = self.wal_checkpoint_current_segment.load(.monotonic),
+            .wal_checkpoint_lag_segments = self.wal_checkpoint_lag_segments.load(.monotonic),
+            .wal_replay_retained_segments = self.wal_replay_retained_segments.load(.monotonic),
+            .wal_replay_retained_bytes = self.wal_replay_retained_bytes.load(.monotonic),
+            .wal_replay_current_segment = self.wal_replay_current_segment.load(.monotonic),
             .configured_indexes = self.configured_indexes.load(.monotonic),
             .configured_dense_indexes = self.configured_dense_indexes.load(.monotonic),
             .configured_sparse_indexes = self.configured_sparse_indexes.load(.monotonic),
@@ -3063,6 +3083,18 @@ pub const DB = struct {
         self.async_context.stats.startup.wal_replay_entries.store(lsm_open_stats.wal_replay_entries, .monotonic);
         self.async_context.stats.startup.wal_replay_bytes.store(lsm_open_stats.wal_replay_bytes, .monotonic);
         self.async_context.stats.startup.wal_replay_ns.store(lsm_open_stats.replaying_wal_ns, .monotonic);
+
+        const lsm_maintenance_stats = self.snapshotLsmMaintenanceStatsLocked();
+        self.async_context.stats.startup.wal_retention_known.store(true, .monotonic);
+        self.async_context.stats.startup.wal_retained_segments.store(lsm_maintenance_stats.wal_retained_segments, .monotonic);
+        self.async_context.stats.startup.wal_retained_bytes.store(lsm_maintenance_stats.wal_retained_bytes, .monotonic);
+        self.async_context.stats.startup.wal_checkpoint_oldest_retained_segment.store(lsm_maintenance_stats.wal_checkpoint_oldest_retained_segment, .monotonic);
+        self.async_context.stats.startup.wal_checkpoint_covered_through_segment.store(lsm_maintenance_stats.wal_checkpoint_covered_through_segment, .monotonic);
+        self.async_context.stats.startup.wal_checkpoint_current_segment.store(lsm_maintenance_stats.wal_checkpoint_current_segment, .monotonic);
+        self.async_context.stats.startup.wal_checkpoint_lag_segments.store(lsm_maintenance_stats.wal_checkpoint_lag_segments, .monotonic);
+        self.async_context.stats.startup.wal_replay_retained_segments.store(lsm_maintenance_stats.wal_replay_retained_segments, .monotonic);
+        self.async_context.stats.startup.wal_replay_retained_bytes.store(lsm_maintenance_stats.wal_replay_retained_bytes, .monotonic);
+        self.async_context.stats.startup.wal_replay_current_segment.store(lsm_maintenance_stats.wal_replay_current_segment, .monotonic);
     }
 
     pub fn snapshotLsmMaintenanceStats(self: *DB) lsm_backend_mod.Backend.MaintenanceStats {
