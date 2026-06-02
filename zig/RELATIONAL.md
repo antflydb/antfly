@@ -428,10 +428,13 @@ candidate document id, then hydrate the returned value from the current base
 relational row. Merge-style range cutover replays donor logical writes into the
 receiver's active range, where the relational participant regenerates receiver
 rows and column entries through the normal commit boundary; donor fencing rejects
-post-cutover writes outside the donor's remaining range. Rollback deletes donor
-logical ids decoded from every stored row key kind and purges relational
-column-scan entries for the donor range before restoring the receiver's base
-range.
+post-cutover writes outside the donor's remaining range. Rollback first persists
+a `rolling_back` marker that fences off any further bootstrap or replay work,
+then deletes donor logical ids decoded from every stored row key kind, purges
+relational column-scan entries for the donor range, restores the receiver's base
+range, and clears donor replay progress. The `rolling_back` path is
+intentionally idempotent so a crash or failed cleanup step can be retried after
+reopen until the receiver persists `rolled_back`.
 
 Physical data movement uses the internal table-data classifier rather than
 assuming every table datum lives under the document-range `0x01` namespace.
@@ -512,11 +515,12 @@ The coverage expected for this feature set is:
 
 Current tests cover mapper projection, runtime-schema round-trip, row-codec
 round-trip, document-mode passthrough, relational point reads, full-text
-`include_stored` hydration from base rows, scan-based aggregations over
-base-row `stored_data`, scalar filters over column scan entries, transaction
+`include_stored` hydration from base rows, scan-based aggregations over base-row
+`stored_data`, scalar filters over column scan entries, transaction
 commit/abort/transform behavior, stale generic-primary cleanup, split movement,
 stale secondary scan-entry hydration from current base rows, and merge-style
-range cutover plus rollback for relational row and column entries across reopen.
+range cutover plus resumable rollback for relational row and column entries
+across reopen.
 
 ## Related docs
 

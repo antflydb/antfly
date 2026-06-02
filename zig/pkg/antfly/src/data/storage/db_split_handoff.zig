@@ -683,7 +683,7 @@ pub const MergeCoordinator = struct {
 
     pub fn ensureReceiverBootstrapped(self: *MergeCoordinator) !bool {
         try self.requireConfiguredReceiverIdentityReassignmentOptIn();
-        if (!self.receiver_accepts_donor_range or self.merge_phase == .rolled_back) return false;
+        if (!self.receiver_accepts_donor_range or self.merge_phase != .accepting) return false;
         const donor_range = try self.donor.currentRange(self.alloc, self.donor_group_id);
         defer range_state.freeRange(self.alloc, donor_range);
 
@@ -792,12 +792,14 @@ pub const MergeCoordinator = struct {
         if (self.allow_doc_identity_reassignment) try self.requireConfiguredReceiverIdentityReassignmentOptIn();
         const transition_status = try self.status();
         switch (transition_status.phase) {
-            .prepare, .bootstrap_peer, .replay_deltas, .cutover_ready => {},
+            .prepare, .bootstrap_peer, .replay_deltas, .cutover_ready, .rolling_back => {},
             else => return false,
         }
 
-        self.merge_phase = .rolling_back;
-        try self.persistMergeState();
+        if (self.merge_phase != .rolling_back) {
+            self.merge_phase = .rolling_back;
+            try self.persistMergeState();
+        }
 
         const donor_range = try self.donor.currentRange(self.alloc, self.donor_group_id);
         defer range_state.freeRange(self.alloc, donor_range);
@@ -1672,62 +1674,93 @@ pub fn testMergeCoordinatorBootstrapsRelationalRowsAndColumnEntries() !void {
         });
     }
 
-    var coord = try MergeCoordinator.init(alloc, .{
-        .donor_root_dir = donor_root,
-        .receiver_root_dir = receiver_root,
-        .donor_group_id = 171,
-        .receiver_group_id = 172,
-    });
-    defer coord.deinit();
-
-    try coord.acceptDonorRange();
     {
-        const status = try coord.syncOnce();
-        try std.testing.expectEqual(range_transition.TransitionPhase.cutover_ready, status.phase);
-        try std.testing.expectEqualStrings("row:a", coord.receiver.getRange().start);
-        try std.testing.expectEqualStrings("row:z", coord.receiver.getRange().end);
+        var coord = try MergeCoordinator.init(alloc, .{
+            .donor_root_dir = donor_root,
+            .receiver_root_dir = receiver_root,
+            .donor_group_id = 171,
+            .receiver_group_id = 172,
+        });
+        defer coord.deinit();
 
-        const donor_doc = (try coord.receiver.get(alloc, "row:t")) orelse return error.TestExpectedEqual;
-        defer alloc.free(donor_doc);
-        try std.testing.expect(std.mem.indexOf(u8, donor_doc, "\"title\":\"theta\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, donor_doc, "\"status\":\"closed\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, donor_doc, "\"amount\":90") != null);
+        try coord.acceptDonorRange();
+        {
+            const status = try coord.syncOnce();
+            try std.testing.expectEqual(range_transition.TransitionPhase.cutover_ready, status.phase);
+            try std.testing.expectEqualStrings("row:a", coord.receiver.getRange().start);
+            try std.testing.expectEqualStrings("row:z", coord.receiver.getRange().end);
 
-        const bootstrapped_amounts = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:t", "row:t");
-        defer relational_store_mod.freeColumnValues(alloc, bootstrapped_amounts);
-        try std.testing.expectEqual(@as(usize, 1), bootstrapped_amounts.len);
-        try std.testing.expectEqual(.f64_val, bootstrapped_amounts[0].value_type);
-        try std.testing.expectEqual(@as(f64, 90), bootstrapped_amounts[0].value.f64_val);
+            const donor_doc = (try coord.receiver.get(alloc, "row:t")) orelse return error.TestExpectedEqual;
+            defer alloc.free(donor_doc);
+            try std.testing.expect(std.mem.indexOf(u8, donor_doc, "\"title\":\"theta\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, donor_doc, "\"status\":\"closed\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, donor_doc, "\"amount\":90") != null);
+
+            const bootstrapped_amounts = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:t", "row:t");
+            defer relational_store_mod.freeColumnValues(alloc, bootstrapped_amounts);
+            try std.testing.expectEqual(@as(usize, 1), bootstrapped_amounts.len);
+            try std.testing.expectEqual(.f64_val, bootstrapped_amounts[0].value_type);
+            try std.testing.expectEqual(@as(f64, 90), bootstrapped_amounts[0].value.f64_val);
+        }
+
+        const catchup = try raft_state_machine.encodeCommittedEntries(alloc, &.{
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("put:row:x={\"title\":\"xi\",\"status\":\"closed\",\"amount\":95}") },
+            .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("del:row:t") },
+        });
+        defer alloc.free(catchup);
+        try coord.donor.snapshotBuilder().applyBatch(.{
+            .group_id = 171,
+            .commit_index = 5,
+            .entries_bytes = catchup,
+        });
+
+        {
+            const status = try coord.syncOnce();
+            try std.testing.expectEqual(range_transition.TransitionPhase.cutover_ready, status.phase);
+            try std.testing.expect((try coord.receiver.get(alloc, "row:t")) == null);
+
+            const removed_amounts = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:t", "row:t");
+            defer relational_store_mod.freeColumnValues(alloc, removed_amounts);
+            try std.testing.expectEqual(@as(usize, 0), removed_amounts.len);
+
+            const replayed_amounts = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:x", "row:x");
+            defer relational_store_mod.freeColumnValues(alloc, replayed_amounts);
+            try std.testing.expectEqual(@as(usize, 1), replayed_amounts.len);
+            try std.testing.expectEqual(@as(f64, 95), replayed_amounts[0].value.f64_val);
+        }
+
+        coord.merge_phase = .rolling_back;
+        try coord.persistMergeState();
+
+        const donor_range = try coord.donor.currentRange(alloc, coord.donor_group_id);
+        defer range_state.freeRange(alloc, donor_range);
+        try coord.receiver.deleteDocsInRange(alloc, .{
+            .start = donor_range.start,
+            .end = donor_range.end,
+        });
+        try coord.receiver.db.updateRange(.{
+            .start = coord.receiver_base_range.start,
+            .end = coord.receiver_base_range.end,
+        });
+        try coord.receiver.db.clearSplitDeltaFinalSeq();
     }
 
-    const catchup = try raft_state_machine.encodeCommittedEntries(alloc, &.{
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("put:row:x={\"title\":\"xi\",\"status\":\"closed\",\"amount\":95}") },
-        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("del:row:t") },
-    });
-    defer alloc.free(catchup);
-    try coord.donor.snapshotBuilder().applyBatch(.{
-        .group_id = 171,
-        .commit_index = 5,
-        .entries_bytes = catchup,
-    });
-
     {
-        const status = try coord.syncOnce();
-        try std.testing.expectEqual(range_transition.TransitionPhase.cutover_ready, status.phase);
-        try std.testing.expect((try coord.receiver.get(alloc, "row:t")) == null);
+        var coord = try MergeCoordinator.init(alloc, .{
+            .donor_root_dir = donor_root,
+            .receiver_root_dir = receiver_root,
+            .donor_group_id = 171,
+            .receiver_group_id = 172,
+        });
+        defer coord.deinit();
 
-        const removed_amounts = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:t", "row:t");
-        defer relational_store_mod.freeColumnValues(alloc, removed_amounts);
-        try std.testing.expectEqual(@as(usize, 0), removed_amounts.len);
+        const resumed = try coord.status();
+        try std.testing.expectEqual(range_transition.TransitionPhase.rolling_back, resumed.phase);
+        _ = try coord.syncOnce();
+        try std.testing.expect((try coord.receiver.get(alloc, "row:x")) == null);
+        try std.testing.expectEqual(@as(u64, 0), try coord.receiver.db.getSplitDeltaFinalSeq(alloc));
 
-        const replayed_amounts = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:x", "row:x");
-        defer relational_store_mod.freeColumnValues(alloc, replayed_amounts);
-        try std.testing.expectEqual(@as(usize, 1), replayed_amounts.len);
-        try std.testing.expectEqual(@as(f64, 95), replayed_amounts[0].value.f64_val);
-    }
-
-    try std.testing.expect(try coord.rollbackMerge());
-    {
+        try std.testing.expect(try coord.rollbackMerge());
         const status = try coord.status();
         try std.testing.expectEqual(range_transition.TransitionPhase.rolled_back, status.phase);
         try std.testing.expectEqualStrings("row:a", coord.receiver.getRange().start);
