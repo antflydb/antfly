@@ -316,7 +316,7 @@ Large-ingest guardrails:
 
 1. [x] Add explicit WAL checkpoint/retention metadata and retire covered
    segments incrementally instead of relying on clean full resets.
-2. [ ] Export retained WAL bytes, oldest uncheckpointed segment, WAL truncation
+2. [x] Export retained WAL bytes, oldest uncheckpointed segment, WAL truncation
    lag, immutable-memtable bytes, and WAL sync latency through status/metrics.
    - [x] First slice: backend write stats now expose WAL sync latency alongside
      sync record counts, while maintenance stats expose retained WAL segments,
@@ -493,10 +493,10 @@ Task list:
    durable runs from the manifest, replay WAL records after the last checkpoint
    into mutable/immutable memory state, and safely truncate or recycle WAL files
    only after a published flush checkpoint.
-10. [ ] Add WAL metrics and pressure hooks: bytes appended, sync latency,
+10. [x] Add WAL metrics and pressure hooks: bytes appended, sync latency,
    records replayed, oldest uncheckpointed LSN, immutable-memtable bytes, and
    WAL truncation lag.
-11. [ ] Add incremental WAL checkpoints and segment retirement. Durable flush +
+11. [x] Add incremental WAL checkpoints and segment retirement. Durable flush +
    manifest publication should retire covered WAL segments without waiting for
    a full backend reset.
 12. [ ] Export startup open phases and retained-WAL debt. LSM-backed stores
@@ -1095,6 +1095,10 @@ startup replay tax if it retains large WAL segments between runs.
      and immutable state before retiring covered WAL. Derived replay catch-up
      paths now call it after successful dense bulk-window finalization and
      after applied sequence publication for indexes that advanced.
+   - [x] Default policy slice: primary and index LSM profiles now configure
+     bounded WAL-retention pressure by default. Soft limits feed background
+     maintenance/checkpointing; hard limits force bounded foreground
+     flush/checkpoint work before retained WAL can grow without limit.
 
 3. Re-benchmark loaded-root restart behavior.
    - Measure time to:
