@@ -68,12 +68,15 @@ pub const CandidateSource = struct {
         embedding: []const f32,
         k: usize,
     };
+    pub const ScanOptions = struct {
+        limit: usize = 0,
+    };
 
     pub const VTable = struct {
         /// Fetch the entity doc for `key` in `table` (owned bytes or null).
         get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8,
         /// Scan `table` for entities whose key starts with `prefix`.
-        scan_prefix: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, prefix: []const u8, ctx: *anyopaque, consume: Consume) anyerror!void = null,
+        scan_prefix: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, prefix: []const u8, opts: ScanOptions, ctx: *anyopaque, consume: Consume) anyerror!void = null,
         /// The nearest entities in `table` for a named dense index.
         nearest: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, query: NearestQuery, ctx: *anyopaque, consume: Consume) anyerror!void = null,
     };
@@ -81,9 +84,9 @@ pub const CandidateSource = struct {
     pub fn get(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8 {
         return self.vtable.get(self.ptr, allocator, table, key);
     }
-    pub fn scanPrefix(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, prefix: []const u8, ctx: *anyopaque, consume: Consume) anyerror!void {
+    pub fn scanPrefix(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, prefix: []const u8, opts: ScanOptions, ctx: *anyopaque, consume: Consume) anyerror!void {
         const f = self.vtable.scan_prefix orelse return error.ScanUnsupported;
-        return f(self.ptr, allocator, table, prefix, ctx, consume);
+        return f(self.ptr, allocator, table, prefix, opts, ctx, consume);
     }
     pub fn nearest(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, query: NearestQuery, ctx: *anyopaque, consume: Consume) anyerror!void {
         const f = self.vtable.nearest orelse return error.NearestUnsupported;
@@ -186,7 +189,7 @@ pub fn processChangedExtraction(
     // look up the rendered canonical key as a candidate so the scorer can link
     // to an existing entity instead of always minting.
     var exact_provider = ExactKeyCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table };
-    var prefix_provider = PrefixCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table };
+    var prefix_provider = PrefixCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table, .candidate_limit = candidateLimit(cfg) };
     var source_provider: SourceCandidateProvider = undefined;
     const effective_provider = provider orelse blk: {
         // A cross-shard source (injected by the api layer) wins over the local
@@ -521,13 +524,17 @@ const SourceCandidateProvider = struct {
         table: []const u8,
         source: CandidateSource,
         out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
+        limit: usize,
+        seen: usize = 0,
         fn consume(ptr: *anyopaque, entity_key: []const u8, value: []const u8) anyerror!void {
             const self: *ScanCtx = @ptrCast(@alignCast(ptr));
+            if (self.limit > 0 and self.seen >= self.limit) return error.CandidateLimitReached;
             const resolved_key = try jsonStringFieldAlloc(self.allocator, value, "merged_into");
             defer if (resolved_key) |rk| self.allocator.free(rk);
             const resolved_raw = if (resolved_key) |rk| try self.source.get(self.allocator, self.table, rk) else null;
             defer if (resolved_raw) |raw| self.allocator.free(raw);
             try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, value, resolved_key, resolved_raw, self.out);
+            self.seen += 1;
         }
     };
 
@@ -555,15 +562,16 @@ const SourceCandidateProvider = struct {
                 defer allocator.free(@constCast(key));
                 const slash = std.mem.indexOfScalar(u8, key, '/');
                 const prefix = if (slash) |i| key[0 .. i + 1] else key;
-                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .source = self.source, .out = out };
-                self.source.scanPrefix(allocator, self.table, prefix, &ctx, ScanCtx.consume) catch |e| switch (e) {
+                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .source = self.source, .out = out, .limit = self.candidate_limit };
+                self.source.scanPrefix(allocator, self.table, prefix, .{ .limit = self.candidate_limit }, &ctx, ScanCtx.consume) catch |e| switch (e) {
                     error.ScanUnsupported => return,
+                    error.CandidateLimitReached => return,
                     else => return e,
                 };
             },
             .ann => {
                 const emb = entity.embedding orelse return;
-                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .source = self.source, .out = out };
+                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .source = self.source, .out = out, .limit = self.candidate_limit };
                 self.source.nearest(allocator, self.table, .{
                     .index_name = self.ann_index_name,
                     .embedding = emb,
@@ -625,6 +633,7 @@ const PrefixCandidateProvider = struct {
     store: resolver_lib.ArtifactStore,
     resolver: *const resolver_lib.Resolver,
     table: []const u8,
+    candidate_limit: usize = default_candidate_limit,
 
     fn provider(self: *PrefixCandidateProvider) resolver_lib.CandidateProvider {
         return .{ .ptr = self, .vtable = &vtable };
@@ -636,9 +645,12 @@ const PrefixCandidateProvider = struct {
         table: []const u8,
         store: resolver_lib.ArtifactStore,
         out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
+        limit: usize,
+        seen: usize = 0,
 
         fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
             const self: *ScanCtx = @ptrCast(@alignCast(ptr));
+            if (self.limit > 0 and self.seen >= self.limit) return error.CandidateLimitReached;
             const entity_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.allocator, key)) orelse return;
             defer self.allocator.free(entity_key);
             const resolved_key = try jsonStringFieldAlloc(self.allocator, value, "merged_into");
@@ -646,6 +658,7 @@ const PrefixCandidateProvider = struct {
             const resolved_raw = if (resolved_key) |rk| try entityRawFromStore(self.allocator, self.store, rk) else null;
             defer if (resolved_raw) |rv| self.allocator.free(rv);
             try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, value, resolved_key, resolved_raw, self.out);
+            self.seen += 1;
         }
     };
 
@@ -666,9 +679,10 @@ const PrefixCandidateProvider = struct {
         const upper = (try internal_keys.documentRangeUpperAlloc(allocator, prefix)) orelse return;
         defer allocator.free(upper);
 
-        var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .store = self.store, .out = out };
+        var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .store = self.store, .out = out, .limit = self.candidate_limit };
         self.store.scanPrefix(lower, upper, &ctx, ScanCtx.consume) catch |e| switch (e) {
             error.ScanUnsupported => return,
+            error.CandidateLimitReached => return,
             else => return e,
         };
     }
@@ -713,15 +727,78 @@ pub fn processRecordKeys(
     }
 }
 
-/// Re-resolve every stored extraction artifact a configured resolver consumes,
-/// re-journaling the resolution keys that change. Used for config-generation
-/// re-resolution: when a resolver's scorer / key_template / `config_generation`
-/// changes, the incremental hint won't fire (the extraction artifacts didn't
-/// change), so this backfill re-runs resolution over the existing corpus. The
-/// stage is idempotent, so artifacts whose bytes are unchanged are skipped.
-/// Scans the user-key namespace once and processes matches after the scan so no
-/// write happens under an open read cursor.
-pub fn reresolveAll(
+pub const ReresolveEnqueueResult = struct {
+    queued: usize = 0,
+    complete: bool = true,
+    /// Last artifact key enqueued; caller owns it and may persist it as the
+    /// exclusive resume point for the next bounded window.
+    resume_after: ?[]u8 = null,
+
+    pub fn deinit(self: *ReresolveEnqueueResult, alloc: std.mem.Allocator) void {
+        if (self.resume_after) |key| alloc.free(key);
+        self.* = undefined;
+    }
+};
+
+pub const default_max_reresolve_records_per_window: usize = 256;
+
+fn appendUniqueBorrowedString(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u8), value: []const u8) !void {
+    if (value.len == 0) return;
+    for (list.items) |existing| {
+        if (std.mem.eql(u8, existing, value)) return;
+    }
+    try list.append(alloc, value);
+}
+
+fn enqueueChangedArtifactKeys(
+    keys: *std.ArrayListUnmanaged([]const u8),
+    write_ctx: *anyopaque,
+    write_fn: DerivedRecordWriter,
+) !u64 {
+    if (keys.items.len == 0) return 0;
+    return try write_fn(write_ctx, .{ .changed_artifact_keys = keys.items });
+}
+
+/// Record a review decision and enqueue the source extraction artifact(s) for
+/// normal replay-driven re-resolution. This keeps human curation durable without
+/// doing resolver/promotion work inline with the curation write.
+pub fn recordReviewDecisionAndEnqueue(
+    gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
+    store: resolver_lib.ArtifactStore,
+    doc_key: []const u8,
+    local_id: []const u8,
+    decision: resolver_lib.Decision,
+    table: []const u8,
+    key: []const u8,
+    write_ctx: *anyopaque,
+    write_fn: DerivedRecordWriter,
+) !u64 {
+    try recordReviewDecision(gpa, store, doc_key, local_id, decision, table, key);
+
+    var journal_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (journal_keys.items) |k| gpa.free(@constCast(k));
+        journal_keys.deinit(gpa);
+    }
+    var seen_sources = std.ArrayListUnmanaged([]const u8).empty;
+    defer seen_sources.deinit(gpa);
+
+    for (resolvers) |cfg| {
+        for (seen_sources.items) |seen| {
+            if (std.mem.eql(u8, seen, cfg.source_artifact)) break;
+        } else {
+            try appendUniqueBorrowedString(gpa, &seen_sources, cfg.source_artifact);
+            try journal_keys.append(gpa, try internal_keys.artifactNamedPrefixAlloc(gpa, doc_key, "asset", cfg.source_artifact));
+        }
+    }
+    return try enqueueChangedArtifactKeys(&journal_keys, write_ctx, write_fn);
+}
+
+/// Legacy unit-test helper for direct full-corpus re-resolution. Production
+/// config-generation backfills must use `enqueueReresolveBacklogWindow` so work
+/// stays bounded and flows through the replay pipeline.
+fn reresolveAll(
     gpa: std.mem.Allocator,
     store: resolver_lib.ArtifactStore,
     resolvers: []const ResolverConfig,
@@ -780,6 +857,77 @@ pub fn reresolveAll(
         _ = try write_fn(write_ctx, .{ .changed_artifact_keys = journal_keys.items });
     }
     return reresolved;
+}
+
+/// Enqueue one bounded window of existing extraction artifacts for re-resolution.
+/// The actual resolver work then flows through the normal replay stage, preserving
+/// ordering, checkpointing, promotion, and graph materialization semantics.
+pub fn enqueueReresolveBacklogWindow(
+    gpa: std.mem.Allocator,
+    store: resolver_lib.ArtifactStore,
+    resolvers: []const ResolverConfig,
+    resume_after: ?[]const u8,
+    max_records: usize,
+    write_ctx: *anyopaque,
+    write_fn: DerivedRecordWriter,
+) !ReresolveEnqueueResult {
+    const limit = if (max_records > 0) max_records else default_max_reresolve_records_per_window;
+    var asset_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (asset_keys.items) |k| gpa.free(@constCast(k));
+        asset_keys.deinit(gpa);
+    }
+
+    const Collector = struct {
+        gpa: std.mem.Allocator,
+        resolvers: []const ResolverConfig,
+        resume_after: ?[]const u8,
+        limit: usize,
+        out: *std.ArrayListUnmanaged([]const u8),
+        limit_reached: bool = false,
+
+        fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+            _ = value;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.resume_after) |resume_key_value| {
+                if (std.mem.order(u8, key, resume_key_value) != .gt) return;
+            }
+            if (!internal_keys.isAssetArtifactKey(key)) return;
+            const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(self.gpa, key)) orelse return;
+            defer self.gpa.free(parsed.doc_key);
+            defer self.gpa.free(parsed.artifact_name);
+            if (resolverForArtifact(self.resolvers, parsed.artifact_name) == null) return;
+            if (self.out.items.len >= self.limit) {
+                self.limit_reached = true;
+                return error.ReresolveWindowFull;
+            }
+            try self.out.append(self.gpa, try self.gpa.dupe(u8, key));
+        }
+    };
+
+    var collector = Collector{
+        .gpa = gpa,
+        .resolvers = resolvers,
+        .resume_after = resume_after,
+        .limit = limit,
+        .out = &asset_keys,
+    };
+    const lower_user = [_]u8{internal_keys.user_namespace};
+    const upper = [_]u8{internal_keys.user_namespace + 1};
+    const lower = if (resume_after) |resume_key_value| resume_key_value else lower_user[0..];
+    store.scanPrefix(lower, upper[0..], &collector, Collector.consume) catch |err| switch (err) {
+        error.ScanUnsupported => return .{},
+        error.ReresolveWindowFull => {},
+        else => return err,
+    };
+
+    _ = try enqueueChangedArtifactKeys(&asset_keys, write_ctx, write_fn);
+    if (asset_keys.items.len == 0) return .{ .queued = 0, .complete = true };
+    return .{
+        .queued = asset_keys.items.len,
+        .complete = !collector.limit_reached and asset_keys.items.len < limit,
+        .resume_after = try gpa.dupe(u8, asset_keys.items[asset_keys.items.len - 1]),
+    };
 }
 
 /// A mention whose resolution landed in the review band, awaiting human
@@ -937,6 +1085,35 @@ pub const RuntimeStoreHandle = struct {
         if (self.owned) self.store.deinit();
     }
 };
+
+const reresolve_resume_key = "\x00\x00__metadata__:resolution_reresolve_resume";
+
+fn loadReresolveResumeKey(alloc: Allocator, store: *backend_erased.Store) !?[]u8 {
+    var txn = try store.beginRead();
+    defer txn.abort();
+    const raw = txn.get(reresolve_resume_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try alloc.dupe(u8, raw);
+}
+
+fn saveReresolveResumeKey(store: *backend_erased.Store, key: []const u8) !void {
+    var txn = try store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(reresolve_resume_key, key);
+    try txn.commit();
+}
+
+fn clearReresolveResumeKey(store: *backend_erased.Store) !void {
+    var txn = try store.beginWrite();
+    errdefer txn.abort();
+    txn.delete(reresolve_resume_key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+    try txn.commit();
+}
 
 pub fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
     const T = @TypeOf(store);
@@ -1124,31 +1301,68 @@ pub const ResolutionRuntime = struct {
         }
     }
 
-    /// Re-resolve the whole stored corpus for the configured resolvers (used
-    /// when a resolver's config generation bumps). Serialized with catch-up so
-    /// the worker and this pass cannot write the same resolution at once.
-    /// Returns the number of extraction artifacts re-processed.
-    pub fn reresolveBacklog(self: *ResolutionRuntime) !usize {
+    /// Mark the resolver backfill dirty. `runReresolveBacklogWindow` then enqueues
+    /// extraction artifacts in bounded windows into the normal replay pipeline.
+    pub fn requestReresolveBacklog(self: *ResolutionRuntime) !void {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        const existing = try loadReresolveResumeKey(self.alloc, &self.store_handle.store);
+        defer if (existing) |key| self.alloc.free(key);
+        if (existing == null) {
+            try saveReresolveResumeKey(&self.store_handle.store, "");
+        }
+    }
+
+    /// Enqueue one bounded window of existing extraction artifacts for
+    /// re-resolution. This does not run resolver work inline; it appends a replay
+    /// record and lets `catchUp` process it through the normal stage.
+    pub fn runReresolveBacklogWindow(self: *ResolutionRuntime) !ReresolveEnqueueResult {
+        lockMutex(&self.catch_up_mutex);
+        defer self.catch_up_mutex.unlock();
+
+        const resume_key_value = (try loadReresolveResumeKey(self.alloc, &self.store_handle.store)) orelse return .{};
+        defer self.alloc.free(resume_key_value);
 
         const resolvers = try self.index_manager.listResolvers(self.alloc);
         defer {
             for (resolvers) |*cfg| cfg.deinit(self.alloc);
             self.alloc.free(resolvers);
         }
-        if (resolvers.len == 0) return 0;
+        if (resolvers.len == 0) {
+            try clearReresolveResumeKey(&self.store_handle.store);
+            return .{};
+        }
 
         var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
-        return reresolveAll(
+        var result = try enqueueReresolveBacklogWindow(
             self.alloc,
             das.artifactStore(),
             resolvers,
-            self.candidate_source,
-            self.embedder,
+            resume_key_value,
+            default_max_reresolve_records_per_window,
             self.write_ctx,
             self.write_fn,
         );
+        errdefer result.deinit(self.alloc);
+        if (result.complete) {
+            try clearReresolveResumeKey(&self.store_handle.store);
+        } else if (result.resume_after) |key| {
+            try saveReresolveResumeKey(&self.store_handle.store, key);
+        }
+        return result;
+    }
+
+    /// Compatibility wrapper for callers that need to synchronously enqueue the
+    /// full backlog. Work is still queued as bounded replay windows.
+    fn reresolveBacklog(self: *ResolutionRuntime) !usize {
+        try self.requestReresolveBacklog();
+        var total: usize = 0;
+        while (true) {
+            var tick = try self.runReresolveBacklogWindow();
+            defer tick.deinit(self.alloc);
+            total += tick.queued;
+            if (tick.complete) return total;
+        }
     }
 
     /// The review queue: every stored review-band mention awaiting curation.
@@ -1158,6 +1372,39 @@ pub const ResolutionRuntime = struct {
         defer self.catch_up_mutex.unlock();
         var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
         return listPendingReviews(alloc, das.artifactStore());
+    }
+
+    /// Persist a curator override and enqueue this document for ordinary
+    /// replay-driven re-resolution.
+    pub fn recordReviewDecision(
+        self: *ResolutionRuntime,
+        doc_key: []const u8,
+        local_id: []const u8,
+        decision: resolver_lib.Decision,
+        table: []const u8,
+        key: []const u8,
+    ) !u64 {
+        lockMutex(&self.catch_up_mutex);
+        defer self.catch_up_mutex.unlock();
+
+        const resolvers = try self.index_manager.listResolvers(self.alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(self.alloc);
+            self.alloc.free(resolvers);
+        }
+        var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
+        return try recordReviewDecisionAndEnqueue(
+            self.alloc,
+            resolvers,
+            das.artifactStore(),
+            doc_key,
+            local_id,
+            decision,
+            table,
+            key,
+            self.write_ctx,
+            self.write_fn,
+        );
     }
 
     fn workerMain(self: *ResolutionRuntime) void {
@@ -1333,12 +1580,23 @@ const MapStore = struct {
         consume: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
     ) anyerror!void {
         const self: *MapStore = @ptrCast(@alignCast(ptr));
+        var keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer keys.deinit(self.alloc);
         var it = self.map.iterator();
         while (it.next()) |e| {
             const k = e.key_ptr.*;
             if (std.mem.order(u8, k, lower) == .lt) continue;
             if (std.mem.order(u8, k, upper) != .lt) continue;
-            try consume(ctx, k, e.value_ptr.*);
+            try keys.append(self.alloc, k);
+        }
+        std.mem.sort([]const u8, keys.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        for (keys.items) |k| {
+            const value = self.map.get(k) orelse continue;
+            try consume(ctx, k, value);
         }
     }
     fn put(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
@@ -1785,6 +2043,7 @@ test "prefix blocking links a typo'd mention to an existing entity with a differ
         .resolution_artifact = "resolution_v1",
         .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
         .candidate_search = "prefix",
+        .candidate_limit = 3,
         .scorer_json =
         \\{ "comparisons": [ { "name": "n", "left": "canonical_text", "right": "canonical_name",
         \\  "levels": [ { "when": "jaro_winkler > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
@@ -1889,6 +2148,56 @@ test "reresolveAll re-resolves the corpus when a resolver config generation bump
     try testing.expectEqual(@as(u64, 0), writer.calls);
 }
 
+test "enqueueReresolveBacklogWindow queues bounded extraction artifact windows" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ slug _entity.text }}",
+        .config_generation = 2,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+
+    const extraction_a = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(extraction_a);
+    const extraction_b = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:b", "asset", "relations_v1");
+    defer alloc.free(extraction_b);
+    const extraction_c = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:c", "asset", "relations_v1");
+    defer alloc.free(extraction_c);
+    const unrelated = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:x", "asset", "other_v1");
+    defer alloc.free(unrelated);
+    try store.put(extraction_a, "{\"entities\":[]}");
+    try store.put(extraction_b, "{\"entities\":[]}");
+    try store.put(extraction_c, "{\"entities\":[]}");
+    try store.put(unrelated, "{\"entities\":[]}");
+
+    var writer = CaptureWriter{ .alloc = alloc };
+    defer writer.deinit();
+
+    var first = try enqueueReresolveBacklogWindow(alloc, store, &resolvers, null, 2, &writer, CaptureWriter.writeFn);
+    defer first.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), first.queued);
+    try testing.expect(!first.complete);
+    try testing.expect(first.resume_after != null);
+    try testing.expectEqual(@as(u64, 1), writer.calls);
+    try testing.expectEqual(@as(usize, 2), writer.keys.items.len);
+    try testing.expectEqualStrings(extraction_a, writer.keys.items[0]);
+    try testing.expectEqualStrings(extraction_b, writer.keys.items[1]);
+
+    var second = try enqueueReresolveBacklogWindow(alloc, store, &resolvers, first.resume_after, 2, &writer, CaptureWriter.writeFn);
+    defer second.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), second.queued);
+    try testing.expect(second.complete);
+    try testing.expectEqual(@as(u64, 2), writer.calls);
+    try testing.expectEqual(@as(usize, 3), writer.keys.items.len);
+    try testing.expectEqualStrings(extraction_c, writer.keys.items[2]);
+}
+
 test "recordReviewDecision makes re-resolution honor a curated override" {
     const alloc = testing.allocator;
     const resolvers = [_]ResolverConfig{.{
@@ -1923,7 +2232,23 @@ test "recordReviewDecision makes re-resolution honor a curated override" {
     }
 
     // A curator links the mention to an existing canonical entity.
-    try recordReviewDecision(alloc, store, "doc:a", "e0", .match, "entities", "person/ada_canonical");
+    var writer = CaptureWriter{ .alloc = alloc };
+    defer writer.deinit();
+    _ = try recordReviewDecisionAndEnqueue(
+        alloc,
+        &resolvers,
+        store,
+        "doc:a",
+        "e0",
+        .match,
+        "entities",
+        "person/ada_canonical",
+        &writer,
+        CaptureWriter.writeFn,
+    );
+    try testing.expectEqual(@as(u64, 1), writer.calls);
+    try testing.expectEqual(@as(usize, 1), writer.keys.items.len);
+    try testing.expectEqualStrings(extraction_key, writer.keys.items[0]);
 
     // Re-resolution now honors the override.
     {
@@ -2146,6 +2471,7 @@ const FakeCandidateSource = struct {
     last_table: []const u8 = "",
     last_ann_index: []const u8 = "",
     last_ann_k: usize = 0,
+    last_scan_limit: usize = 0,
 
     fn deinit(self: *FakeCandidateSource) void {
         var it = self.map.iterator();
@@ -2190,16 +2516,21 @@ const FakeCandidateSource = struct {
         allocator: std.mem.Allocator,
         table: []const u8,
         prefix: []const u8,
+        opts: CandidateSource.ScanOptions,
         ctx: *anyopaque,
         consume: CandidateSource.Consume,
     ) anyerror!void {
         _ = allocator;
         const self: *FakeCandidateSource = @ptrCast(@alignCast(ptr));
         self.last_table = table;
+        self.last_scan_limit = opts.limit;
+        var emitted: usize = 0;
         var it = self.map.iterator();
         while (it.next()) |e| {
             if (!std.mem.startsWith(u8, e.key_ptr.*, prefix)) continue;
+            if (opts.limit > 0 and emitted >= opts.limit) return;
             try consume(ctx, e.key_ptr.*, e.value_ptr.*);
+            emitted += 1;
         }
     }
 
@@ -2287,6 +2618,7 @@ test "SourceCandidateProvider prefix blocking scans a cross-shard label namespac
         .resolution_artifact = "resolution_v1",
         .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
         .candidate_search = "prefix",
+        .candidate_limit = 3,
         .scorer_json =
         \\{ "comparisons": [ { "name": "n", "left": "canonical_text", "right": "canonical_name",
         \\  "levels": [ { "when": "jaro_winkler > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
@@ -2327,6 +2659,7 @@ test "SourceCandidateProvider prefix blocking scans a cross-shard label namespac
     const ent = parsed.value.object.get("entities").?.array.items[0].object;
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+    try testing.expectEqual(@as(usize, 3), remote.last_scan_limit);
 }
 
 test "SourceCandidateProvider ann blocking links via cross-shard nearest neighbours" {

@@ -5491,10 +5491,17 @@ pub const DB = struct {
         };
         if (needs_reresolve) {
             if (self.resolution_runtime) |runtime| {
-                _ = try runtime.reresolveBacklog();
-                // Drive the resolution writes the backfill journaled through the
-                // downstream promotion/graph stages.
-                try self.runUntilIdle();
+                try runtime.requestReresolveBacklog();
+                while (true) {
+                    var tick = try runtime.runReresolveBacklogWindow();
+                    const queued = tick.queued;
+                    const complete = tick.complete;
+                    tick.deinit(self.runtime_alloc);
+                    // Drive the enqueued extraction artifacts through resolution,
+                    // promotion, and graph materialization before queuing more.
+                    if (queued > 0) try self.runUntilIdle();
+                    if (complete) break;
+                }
             }
         }
     }
@@ -5511,6 +5518,20 @@ pub const DB = struct {
     pub fn listPendingReviews(self: *DB, alloc: Allocator) ![]resolution_runtime_mod.PendingReview {
         const runtime = self.resolution_runtime orelse return try alloc.alloc(resolution_runtime_mod.PendingReview, 0);
         return try runtime.pendingReviews(alloc);
+    }
+
+    /// Persist a human curation decision for one review-band mention and enqueue
+    /// the document for ordinary replay-driven resolution/promotion.
+    pub fn recordReviewDecision(
+        self: *DB,
+        doc_key: []const u8,
+        local_id: []const u8,
+        decision: resolver_lib.Decision,
+        table: []const u8,
+        key: []const u8,
+    ) !u64 {
+        const runtime = self.resolution_runtime orelse return error.ResolutionRuntimeUnavailable;
+        return try runtime.recordReviewDecision(doc_key, local_id, decision, table, key);
     }
 
     /// Eager edge rewrite for an entity merge: repoint every inbound edge of
@@ -24198,6 +24219,22 @@ test "db does not materialize review-band resolution as canonical mention edges"
     const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, out);
     try std.testing.expectEqual(@as(usize, 0), out.len);
+
+    _ = try db.recordReviewDecision("doc:a", "e0", .match, "entities", "person/ada_lovelace");
+    try db.runUntilIdle();
+
+    const curated_raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(curated_raw);
+    var curated = try std.json.parseFromSlice(std.json.Value, alloc, curated_raw, .{});
+    defer curated.deinit();
+    const curated_ent = curated.value.object.get("entities").?.array.items[0].object;
+    try std.testing.expectEqualStrings("match", curated_ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", curated_ent.get("doc_ref").?.object.get("key").?.string);
+
+    const curated_edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, curated_edges);
+    try std.testing.expectEqual(@as(usize, 1), curated_edges.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", curated_edges[0].target);
 }
 
 test "db mention edge weight is fused from extractor trust and mention confidence" {

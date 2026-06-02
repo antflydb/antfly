@@ -70,6 +70,7 @@ pub const DistributedCandidateSource = struct {
         allocator: std.mem.Allocator,
         table: []const u8,
         prefix: []const u8,
+        opts: CandidateSource.ScanOptions,
         ctx: *anyopaque,
         consume: CandidateSource.Consume,
     ) anyerror!void {
@@ -82,6 +83,7 @@ pub const DistributedCandidateSource = struct {
             .inclusive_from = true,
             .exclusive_to = true,
             .include_documents = true,
+            .limit = @intCast(@min(opts.limit, std.math.maxInt(u32))),
         }, self.consistency)) orelse return;
         defer resp.deinit(allocator);
 
@@ -364,7 +366,7 @@ test "DistributedCandidateSource scan_prefix returns only keys under the prefix"
 
     var ctx = CollectCtx{ .alloc = alloc };
     defer ctx.deinit();
-    try src.scanPrefix(alloc, "entities", "person/", &ctx, CollectCtx.consume);
+    try src.scanPrefix(alloc, "entities", "person/", .{}, &ctx, CollectCtx.consume);
 
     try testing.expectEqual(@as(usize, 2), ctx.keys.items.len);
     for (ctx.keys.items) |k| try testing.expect(std.mem.startsWith(u8, k, "person/"));
