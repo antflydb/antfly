@@ -15769,7 +15769,7 @@ components:
           type: integer
         predictions:
           type: array
-          description: Each result is an array of ClassifyResult sorted by score descending.
+          description: Token classification predictions sorted by score descending.
           items:
             $ref: '#/components/schemas/InferenceDocumentTokenClassificationPrediction'
     InferenceExtractRequest:

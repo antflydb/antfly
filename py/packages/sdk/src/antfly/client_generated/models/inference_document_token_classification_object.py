@@ -28,8 +28,8 @@ class InferenceDocumentTokenClassificationObject:
         checkpoint_path (str):
         prefix (str):
         num_tokens (int):
-        predictions (list[InferenceDocumentTokenClassificationPrediction]): Each result is an array of ClassifyResult
-            sorted by score descending.
+        predictions (list[InferenceDocumentTokenClassificationPrediction]): Token classification predictions sorted by
+            score descending.
     """
 
     object_: InferenceDocumentTokenClassificationObjectObject

@@ -33,6 +33,7 @@ const BackendChoice = enum {
     native,
     metal,
     mlx,
+    onnx,
 };
 
 const OutputFormat = enum {
@@ -383,6 +384,7 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
         .native => &.{backends.BackendType.native},
         .metal => &.{backends.BackendType.metal},
         .mlx => &.{backends.BackendType.mlx},
+        .onnx => &.{backends.BackendType.onnx},
     };
 }
 
@@ -442,6 +444,7 @@ fn parseBackend(value: []const u8) ?BackendChoice {
     if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
     if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
     if (std.ascii.eqlIgnoreCase(value, "mlx")) return .mlx;
+    if (std.ascii.eqlIgnoreCase(value, "onnx")) return .onnx;
     return null;
 }
 
@@ -523,7 +526,7 @@ fn printCsv(opts: Options, result: Result) void {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT] [--text-repeat N] [--batch-size N] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|mlx] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
+        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT] [--text-repeat N] [--batch-size N] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|mlx|onnx] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
         \\
     , .{});
 }

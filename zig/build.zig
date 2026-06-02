@@ -75,6 +75,14 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
+fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag != .macos) return;
+    const sdk_root = std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
+    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
+    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
+    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+}
+
 fn mlxRootAvailable(b: *std.Build, target: std.Build.ResolvedTarget, root: []const u8) bool {
     if (target.result.os.tag != .macos) return false;
     const header = b.fmt("{s}/include/mlx/c/mlx.h", .{root});
@@ -1311,6 +1319,7 @@ pub fn build(b: *std.Build) void {
     vectorindex_mod.addImport("antfly_vector", vector_mod);
     vectorindex_mod.addImport("antfly_platform", platform_mod);
     if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, vectorindex_mod, target);
         vectorindex_mod.linkFramework("Foundation", .{});
         vectorindex_mod.linkFramework("Metal", .{});
         vectorindex_mod.addCSourceFile(.{ .file = b.path("lib/vectorindex/src/kmeans_metal.m"), .flags = &.{"-fobjc-arc"} });
@@ -2764,6 +2773,7 @@ pub fn build(b: *std.Build) void {
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
+        "data public API listener uses public API request body limit",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
     };
@@ -3235,6 +3245,7 @@ pub fn build(b: *std.Build) void {
         "api http server lists cluster backups through public route",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
+        "public API request body limit matches Go linear merge contract",
         "public api smoke e2e creates table inserts and queries documents",
         "public api e2e recreates managed embeddings index after corrupt artifact",
         "public api split e2e uses distributed global text stats for bm25 and significant_terms",
@@ -3929,6 +3940,7 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts canonical host port and models dir flags",
             "termite config uses cli override before common config",
             "swarm public api caps keep alive request reuse",
+            "swarm public HTTP server uses public API request body limit",
             "parse cli accepts termite budget overrides",
             "termite config falls back to common config",
             "swarm runtime resolves paths from common storage base dir",
@@ -6072,6 +6084,14 @@ pub fn build(b: *std.Build) void {
         .name = "antfly",
         .root_module = antfly_main_mod,
     });
+    const antfly_main_tests = b.addTest(.{
+        .root_module = antfly_main_mod,
+    });
+    const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);
+    const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");
+    antfly_main_test_step.dependOn(&run_antfly_main_tests.step);
+    unit_test_step.dependOn(&run_antfly_main_tests.step);
+
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
     const install_antfarm_assets = b.addInstallDirectory(.{
         .source_dir = b.path("../go/pkg/antfly/src/metadata/antfarm"),

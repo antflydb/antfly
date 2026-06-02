@@ -409,6 +409,124 @@ func TestClient_Chunk_EmptyText(t *testing.T) {
 	assert.Contains(t, err.Error(), "bad request")
 }
 
+func TestClient_ExtractClassifications(t *testing.T) {
+	var gotPath string
+	var gotReq struct {
+		Model  string `json:"model"`
+		Inputs []struct {
+			Content string `json:"content"`
+		} `json:"inputs"`
+		Schema struct {
+			Classifications []struct {
+				Name   string   `json:"name"`
+				Labels []string `json:"labels"`
+			} `json:"classifications"`
+		} `json:"schema"`
+		Options struct {
+			IncludeConfidence bool `json:"include_confidence"`
+		} `json:"options"`
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]any{
+			"object": "extraction",
+			"model":  "intent-model",
+			"data": []map[string]any{{
+				"classifications": []map[string]any{{
+					"name": "classification", "label": "visual", "score": 0.9,
+				}},
+			}},
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(resp))
+	}))
+	defer server.Close()
+
+	inferenceClient, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+
+	got, err := inferenceClient.ExtractClassifications(
+		context.Background(),
+		"intent-model",
+		[]string{"find images"},
+		[]string{"filename", "visual"},
+	)
+	require.NoError(t, err)
+
+	assert.Equal(t, "/ai/v1/extract", gotPath)
+	assert.Equal(t, "intent-model", gotReq.Model)
+	require.Len(t, gotReq.Inputs, 1)
+	assert.Equal(t, "find images", gotReq.Inputs[0].Content)
+	require.Len(t, gotReq.Schema.Classifications, 1)
+	assert.Equal(t, "classification", gotReq.Schema.Classifications[0].Name)
+	assert.Equal(t, []string{"filename", "visual"}, gotReq.Schema.Classifications[0].Labels)
+	assert.True(t, gotReq.Options.IncludeConfidence)
+
+	require.Len(t, got, 1)
+	require.Len(t, got[0].Classifications, 1)
+	assert.Equal(t, Classification{Name: "classification", Label: "visual", Score: 0.9}, got[0].Classifications[0])
+}
+
+func TestClient_ExtractEntities(t *testing.T) {
+	var gotPath string
+	var gotReq struct {
+		Model  string `json:"model"`
+		Schema struct {
+			Entities []string `json:"entities"`
+		} `json:"schema"`
+		Options struct {
+			FlatNer           bool `json:"flat_ner"`
+			IncludeConfidence bool `json:"include_confidence"`
+			IncludeSpans      bool `json:"include_spans"`
+		} `json:"options"`
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]any{
+			"object": "extraction",
+			"model":  "ner-model",
+			"data": []map[string]any{{
+				"entities": []map[string]any{{
+					"text": "Antfly", "label": "company", "score": 0.95, "start": 0, "end": 6,
+				}},
+			}},
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(resp))
+	}))
+	defer server.Close()
+
+	inferenceClient, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+
+	got, err := inferenceClient.ExtractEntities(
+		context.Background(),
+		"ner-model",
+		[]string{"Antfly ships SearchAF."},
+		[]string{"company"},
+	)
+	require.NoError(t, err)
+
+	assert.Equal(t, "/ai/v1/extract", gotPath)
+	assert.Equal(t, "ner-model", gotReq.Model)
+	assert.Equal(t, []string{"company"}, gotReq.Schema.Entities)
+	assert.True(t, gotReq.Options.FlatNer)
+	assert.True(t, gotReq.Options.IncludeConfidence)
+	assert.True(t, gotReq.Options.IncludeSpans)
+
+	require.Len(t, got, 1)
+	require.Len(t, got[0].Entities, 1)
+	assert.Equal(t, ExtractedEntity{
+		Text: "Antfly", Label: "company", Score: 0.95, Start: 0, End: 6,
+	}, got[0].Entities[0])
+}
+
 func TestClient_Rerank(t *testing.T) {
 	expectedScores := []float32{0.95, 0.72, 0.45}
 
