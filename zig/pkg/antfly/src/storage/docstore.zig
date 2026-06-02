@@ -68,6 +68,14 @@ fn replayHintOrdinal(hint: change_journal_mod.TargetHint) u8 {
     return @intCast(@intFromEnum(hint));
 }
 
+fn replayHintFromSingleMask(mask: u8) ?change_journal_mod.TargetHint {
+    if (mask == 0 or (mask & (mask - 1)) != 0) return null;
+    inline for (std.meta.fields(change_journal_mod.TargetHint)) |field| {
+        if (mask == (@as(u8, 1) << @intCast(field.value))) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
 fn encodeReplayNextSequence(sequence: u64) [8]u8 {
     var raw: [8]u8 = undefined;
     std.mem.writeInt(u64, &raw, sequence, .little);
@@ -1269,6 +1277,43 @@ pub const DocStore = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !void {
         return try self.forEachReplayEntryFromOrdinal(from_sequence, internal_keys.replay_all_kind, ctx, callback);
+    }
+
+    pub fn forEachReplayFromMatchingHintMask(
+        self: *DocStore,
+        from_sequence: u64,
+        required_hint_mask: u8,
+        callback_ctx: *anyopaque,
+        callback: backend_erased.Store.ReplayCallback,
+    ) !void {
+        const Context = struct {
+            required_hint_mask: u8 = 0,
+            matched_entries: usize = 0,
+            callback_ctx: *anyopaque,
+            callback: backend_erased.Store.ReplayCallback,
+
+            fn pass(self_ctx: *@This(), sequence: u64, payload: []const u8) !void {
+                self_ctx.matched_entries += 1;
+                try self_ctx.callback(self_ctx.callback_ctx, sequence, payload);
+            }
+
+            fn filter(self_ctx: *@This(), sequence: u64, payload: []const u8) !void {
+                if (self_ctx.required_hint_mask != 0 and !(try change_journal_mod.encodedRecordMatchesHintMask(payload, self_ctx.required_hint_mask))) return;
+                self_ctx.matched_entries += 1;
+                try self_ctx.callback(self_ctx.callback_ctx, sequence, payload);
+            }
+        };
+
+        var ctx = Context{
+            .required_hint_mask = required_hint_mask,
+            .callback_ctx = callback_ctx,
+            .callback = callback,
+        };
+        if (replayHintFromSingleMask(required_hint_mask)) |hint| {
+            try self.forEachReplayEntryFromOrdinal(from_sequence, replayHintOrdinal(hint), &ctx, Context.pass);
+            if (ctx.matched_entries > 0) return;
+        }
+        return try self.forEachReplayEntryFromOrdinal(from_sequence, internal_keys.replay_all_kind, &ctx, Context.filter);
     }
 
     pub fn forEachReplayFromMatchingHint(
@@ -2659,10 +2704,24 @@ test "docstore runtime lsm hint replay iteration does not clone mutable snapshot
             try std.testing.expect(entry_payload.len > 0);
             self.seen += 1;
         }
+
+        fn handleErased(ptr: *anyopaque, sequence: u64, entry_payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.handle(sequence, entry_payload);
+        }
     };
     var ctx = Context{};
     try store.forEachReplayEntryFromHint(1, .full_text, &ctx, Context.handle);
     try std.testing.expectEqual(@as(usize, 1), ctx.seen);
+
+    var erased_ctx = Context{};
+    try store.forEachReplayFromMatchingHintMask(
+        1,
+        change_journal_mod.singleHintMask(.full_text),
+        &erased_ctx,
+        Context.handleErased,
+    );
+    try std.testing.expectEqual(@as(usize, 1), erased_ctx.seen);
     try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().mutable_snapshot_clone_calls);
 }
 

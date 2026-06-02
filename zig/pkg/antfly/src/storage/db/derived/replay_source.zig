@@ -469,9 +469,46 @@ fn primaryStoreForEachMatchingRecord(
     ctx: *anyopaque,
     consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
 ) !MatchingRecordStats {
-    var cursor = try primaryStoreOpenMatchingCursor(ptr, alloc, from_sequence, hint);
-    defer cursor.deinit(alloc);
-    return try cursor.forEachNext(max_matched_entries, ctx, consume);
+    _ = alloc;
+    const store: *docstore_mod.DocStore = @ptrCast(@alignCast(ptr));
+    const Context = struct {
+        max_matched_entries: usize,
+        consumer_ctx: *anyopaque,
+        consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+        stats: MatchingRecordStats = .{},
+
+        fn handle(self: *@This(), sequence: u64, payload: []const u8) !void {
+            if (self.max_matched_entries != 0 and self.stats.matched_entries >= self.max_matched_entries) return StopReplayChunk.StopReplayChunk;
+            self.consume(self.consumer_ctx, sequence, payload) catch |err| switch (err) {
+                StopReplayChunk.StopReplayChunk => return err,
+                else => return err,
+            };
+            self.stats.matched_entries += 1;
+            self.stats.last_sequence = sequence;
+            if (self.max_matched_entries != 0 and self.stats.matched_entries >= self.max_matched_entries) return StopReplayChunk.StopReplayChunk;
+        }
+
+        fn handleErased(erased_ctx: *anyopaque, sequence: u64, payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(erased_ctx));
+            return try self.handle(sequence, payload);
+        }
+    };
+
+    var callback_ctx = Context{
+        .max_matched_entries = max_matched_entries,
+        .consumer_ctx = ctx,
+        .consume = consume,
+    };
+    store.forEachReplayFromMatchingHintMask(
+        from_sequence + 1,
+        change_journal_mod.singleHintMask(hint),
+        &callback_ctx,
+        Context.handleErased,
+    ) catch |err| switch (err) {
+        StopReplayChunk.StopReplayChunk => return callback_ctx.stats,
+        else => return err,
+    };
+    return callback_ctx.stats;
 }
 
 fn primaryStoreLatestMatchingSequence(

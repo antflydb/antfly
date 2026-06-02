@@ -18,6 +18,7 @@ const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_types = @import("backend_types.zig");
+const change_journal_mod = @import("db/derived/change_journal.zig");
 
 pub const types = backend_types;
 
@@ -603,6 +604,34 @@ pub const Store = struct {
             self.allocator.free(entries);
         }
         for (entries) |entry| try callback(ctx, entry.sequence, entry.payload);
+    }
+
+    pub fn forEachReplayFromMatchingHintMask(
+        self: *Store,
+        from_sequence: u64,
+        required_hint_mask: u8,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
+    ) !void {
+        if (self.vtable.for_each_replay_from_matching_hint_mask) |f| {
+            const Adapter = struct {
+                fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
+                    const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
+                    return try callback(typed_ctx, sequence, payload);
+                }
+            };
+            return try f(self.ptr, from_sequence, required_hint_mask, ctx, Adapter.call);
+        }
+
+        const entries = try self.iterateReplayFrom(self.allocator, from_sequence);
+        defer {
+            for (entries) |*entry| entry.deinit(self.allocator);
+            self.allocator.free(entries);
+        }
+        for (entries) |entry| {
+            if (required_hint_mask != 0 and !(try change_journal_mod.encodedRecordMatchesHintMask(entry.payload, required_hint_mask))) continue;
+            try callback(ctx, entry.sequence, entry.payload);
+        }
     }
 
     pub fn truncateReplayUpTo(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {

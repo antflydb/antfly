@@ -818,6 +818,11 @@ Near-term task list:
    dedicated current-scan contract.
 6. [ ] Add native LSM/runtime replay-lane iteration so replay workers no longer
    scan the replay-all lane and decode hint masks in userland.
+   - [x] First slice: `DocStore` and the erased store API now expose streaming
+     replay iteration by hint mask. Single-hint scans use the per-hint replay
+     lane directly, with an all-lane fallback only for older stores missing
+     hint-lane rows, and derived replay source uses this streaming API for
+     chunk collection.
 7. [ ] Export replay-live scan metrics so we can compare:
    - replay sequences scanned
    - replay scan batches
