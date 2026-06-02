@@ -1977,7 +1977,7 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_used_bytes={d} lsm_wal_retention_peak_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d} rss_after_lsm_resource_gap_bytes={d} footprint_after_lsm_resource_gap_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_physical_block_bytes={d}",
+            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_used_bytes={d} lsm_wal_retention_peak_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d} rss_after_lsm_resource_gap_bytes={d} footprint_after_lsm_resource_gap_bytes={d}",
             .{
                 label,
                 ft_pending_used,
@@ -2004,6 +2004,12 @@ pub const IndexManager = struct {
                 lsm_resource_peak,
                 rss_after_lsm_resource_gap,
                 footprint_after_lsm_resource_gap,
+            },
+        );
+        std.log.info(
+            "antfly_bench_memory_lsm_tables label={s} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_physical_block_bytes={d}",
+            .{
+                label,
                 lsm_stats.mutable_bytes,
                 lsm_stats.immutable_bytes,
                 lsm_stats.immutable_memtables,
@@ -7353,7 +7359,7 @@ pub const IndexManager = struct {
                 const lsm_resource_used = lsm_cache.used_bytes +| lsm_compaction.used_bytes +| lsm_table_builder.used_bytes +| lsm_state.used_bytes +| lsm_wal_write.used_bytes +| lsm_wal_retention.used_bytes +| lsm_recovery.used_bytes;
                 const lsm_resource_peak = lsm_cache.peak_bytes +| lsm_compaction.peak_bytes +| lsm_table_builder.peak_bytes +| lsm_state.peak_bytes +| lsm_wal_write.peak_bytes +| lsm_wal_retention.peak_bytes +| lsm_recovery.peak_bytes;
                 std.log.info(
-                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_used_bytes={d} lsm_wal_retention_peak_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_block_inserts={d} lsm_cache_block_evictions={d} lsm_cache_physical_block_bytes={d} lsm_cache_physical_block_inserts={d} lsm_cache_physical_block_evictions={d}",
+                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_used_bytes={d} lsm_wal_retention_peak_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d}",
                     .{
                         entry.config.name,
                         source_docs.len,
@@ -7379,6 +7385,15 @@ pub const IndexManager = struct {
                         lsm_recovery.peak_bytes,
                         lsm_resource_used,
                         lsm_resource_peak,
+                    },
+                );
+                std.log.info(
+                    "antfly_bench_text_lsm_tables index={s} source_docs={d} projection_docs={d} segments={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_block_inserts={d} lsm_cache_block_evictions={d} lsm_cache_physical_block_bytes={d} lsm_cache_physical_block_inserts={d} lsm_cache_physical_block_evictions={d}",
+                    .{
+                        entry.config.name,
+                        source_docs.len,
+                        projection_doc_count,
+                        segment_count,
                         lsm_stats.mutable_bytes,
                         lsm_stats.immutable_bytes,
                         lsm_stats.immutable_memtables,
@@ -9347,7 +9362,7 @@ pub const IndexManager = struct {
         }
         if (after_lsm_maintenance) |maintenance| {
             std.log.info(
-                "antfly_bench_hbc_lsm_maintenance phase={s} index={s} mutable_entries={d} mutable_bytes={d} mutable_snapshot_clone_calls={d} mutable_snapshot_clone_bytes_total={d} mutable_snapshot_clone_peak_bytes={d} total_runs={d} total_run_bytes={d} total_run_logical_entry_bytes={d} total_run_physical_entry_bytes={d} total_run_compressed_blocks={d} total_run_raw_blocks={d} total_run_compression_codec_mask={d} l0_runs={d} l0_bytes={d} overlapping_l0_runs={d} lower_level_runs={d} lower_level_bytes={d} max_level={d} compactable_l0_runs={d} soft_limit_l0_runs={d} hard_limit_l0_runs={d} write_stall_l0_run_debt={d} soft_limit_l0_bytes={d} hard_limit_l0_bytes={d} write_stall_l0_byte_debt={d} level_overflow_runs={d} level_overflow_bytes={d} obsolete_paths={d} active_readers={d} active_bulk_ingest_batches={d} manifest_dirty={any} obsolete_manifest_dirty={any}",
+                "antfly_bench_hbc_lsm_maintenance phase={s} index={s} mutable_entries={d} mutable_bytes={d} mutable_snapshot_clone_calls={d} mutable_snapshot_clone_bytes_total={d} mutable_snapshot_clone_peak_bytes={d} total_runs={d} total_run_bytes={d} total_run_logical_entry_bytes={d} total_run_physical_entry_bytes={d} total_run_compressed_blocks={d} total_run_raw_blocks={d} total_run_compression_codec_mask={d} l0_runs={d} l0_bytes={d} overlapping_l0_runs={d} lower_level_runs={d} lower_level_bytes={d} max_level={d}",
                 .{
                     phase,
                     entry.config.name,
@@ -9369,6 +9384,13 @@ pub const IndexManager = struct {
                     maintenance.lower_level_runs,
                     maintenance.lower_level_bytes,
                     maintenance.max_level,
+                },
+            );
+            std.log.info(
+                "antfly_bench_hbc_lsm_pressure phase={s} index={s} compactable_l0_runs={d} soft_limit_l0_runs={d} hard_limit_l0_runs={d} write_stall_l0_run_debt={d} soft_limit_l0_bytes={d} hard_limit_l0_bytes={d} write_stall_l0_byte_debt={d} level_overflow_runs={d} level_overflow_bytes={d} obsolete_paths={d} active_readers={d} active_bulk_ingest_batches={d} manifest_dirty={any} obsolete_manifest_dirty={any}",
+                .{
+                    phase,
+                    entry.config.name,
                     maintenance.compactable_l0_runs,
                     maintenance.soft_limit_l0_runs,
                     maintenance.hard_limit_l0_runs,
