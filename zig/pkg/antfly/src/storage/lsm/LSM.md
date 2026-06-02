@@ -892,7 +892,7 @@ That means there are still two independent problems to fix:
    against the earlier multi-GB replay runs.
 6. [ ] Verify the second restart cost drops further once a run reaches a clean
    post-recovery checkpoint, rather than replaying the same retained bytes.
-7. [ ] Replace recovery's general-allocator entry churn with a bounded recovery
+7. [x] Replace recovery's general-allocator entry churn with a bounded recovery
    allocation model.
    - Current evidence from `vmmap` on the live `1M` root:
      - physical footprint can reach about `14.1G`
@@ -901,9 +901,10 @@ That means there are still two independent problems to fix:
      - malloc zones account for about `13.0G` allocated / `13.8G` swapped
    - This means the remaining memory problem is process-private heap growth and
      allocator retention during recovery, not primarily mapped-file residency.
-   - The target fix is recovery-specific chunk/arena allocation for replayed
-     state so flush can drop whole chunks instead of retaining millions of
-     medium/small heap objects.
+   - Recovery replay now creates a mutable-memtable recovery arena and keeps
+     replayed namespace/key/value bytes arena-owned, while mutable hash-index
+     metadata stays on the normal allocator. A regression covers both the
+     replay ownership and arena release after deferred flush.
 8. [ ] Add a distinct startup/recovery working-set slice for higher-level dense
    rebuild/catch-up transient buffers if physical footprint still materially
    exceeds the new bounded recovery heap plus tracked caches.

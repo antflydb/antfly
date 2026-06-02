@@ -2195,6 +2195,8 @@ pub const Backend = struct {
 
     fn replayWalEntryAllocatorHook(ctx: *anyopaque, default_allocator: Allocator) anyerror!Allocator {
         const self: *Backend = @ptrCast(@alignCast(ctx));
+        // ActiveMemTable keeps structural containers on the normal allocator, but
+        // routes entry byte copies through its recovery arena while this is set.
         _ = try self.mutable.ensureRecoveryAllocator(default_allocator);
         return default_allocator;
     }
@@ -9740,6 +9742,48 @@ test "lsm backend recovery replay flushes incrementally and retires covered wal 
         try std.testing.expectEqual(@as(u64, 0), write_stats.wal_replay_bytes);
         try std.testing.expectEqual(@as(u64, 0), write_stats.wal_replay_records);
     }
+}
+
+test "lsm backend recovery replay stores mutable entries in a flush-scoped arena" {
+    var memory_storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer memory_storage.deinit();
+
+    const root_dir = "/memory/recovery-replay-arena";
+    try memory_storage.storage().createDirPath(root_dir);
+
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    try state.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:a", "alpha", false);
+    try state.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:b", "bravo", false);
+    _ = try wal_mod.appendStateWithOptions(
+        memory_storage.storage(),
+        std.testing.allocator,
+        root_dir,
+        &state,
+        false,
+        .{ .segment_bytes = 512 },
+    );
+
+    var reopened = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold = 1024,
+        .storage = memory_storage.storage(),
+    });
+    defer reopened.close();
+
+    try std.testing.expect(reopened.mutable.arena_owner != null);
+    try std.testing.expectEqual(@as(usize, 2), reopened.mutable.entries.items.len);
+    for (reopened.mutable.entries.items) |entry| {
+        try std.testing.expect(entry.namespace_from_arena);
+        try std.testing.expect(entry.key_from_arena);
+        try std.testing.expect(entry.value_from_arena);
+    }
+    try std.testing.expectEqualStrings("alpha", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:a"));
+
+    try reopened.finalizeDeferredStorageWork();
+    try std.testing.expect(reopened.mutable.arena_owner == null);
+    try std.testing.expectEqual(@as(usize, 0), reopened.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), reopened.activeImmutableMemtableCount());
+    try std.testing.expect(reopened.runs.items.len > 0);
 }
 
 test "lsm backend reloads persisted manifest and run files over host storage" {
