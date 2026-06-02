@@ -143,6 +143,9 @@ pub const CacheKindStats = cache_mod.KindStats;
 pub const DefaultCacheSizeBytes = cache_mod.DefaultCacheSizeBytes;
 pub const TableEntry = lsm_table_file.Entry;
 pub const BackgroundExecutor = lsm_background_mod.Executor;
+pub const BackendHandleConfig = struct {
+    background_runtime: ?background_runtime_mod.Config = null,
+};
 const max_local_cached_run_blocks: usize = 64;
 
 pub const Backend = struct {
@@ -3449,35 +3452,77 @@ pub const Backend = struct {
 pub const BackendHandle = struct {
     allocator: Allocator,
     backend: *Backend,
+    background_runtime: ?background_runtime_mod.BackendRuntimeHandle = null,
 
     pub fn init(allocator: Allocator, options: Options) !BackendHandle {
+        return try initWithConfig(allocator, options, .{});
+    }
+
+    pub fn initWithConfig(allocator: Allocator, options: Options, config: BackendHandleConfig) !BackendHandle {
         const backend = try allocator.create(Backend);
         errdefer allocator.destroy(backend);
-        backend.* = Backend.init(allocator, options);
+
+        var owned_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
+        errdefer if (owned_runtime) |*runtime| runtime.deinit();
+
+        var resolved_options = options;
+        if (config.background_runtime) |runtime_config| {
+            if (resolved_options.background_executor != null) return error.BackgroundExecutorAlreadyConfigured;
+            owned_runtime = try background_runtime_mod.BackendRuntimeHandle.init(allocator, runtime_config);
+            const runtime = owned_runtime.?.ptr();
+            const executor = BackgroundExecutor.init(runtime, runtime.allocOwnerId());
+            resolved_options.background_executor = &executor;
+        }
+
+        backend.* = Backend.init(allocator, resolved_options);
         return .{
             .allocator = allocator,
             .backend = backend,
+            .background_runtime = owned_runtime,
         };
     }
 
     pub fn open(allocator: Allocator, root_dir: []const u8, options: Options) !BackendHandle {
+        return try openWithConfig(allocator, root_dir, options, .{});
+    }
+
+    pub fn openWithConfig(allocator: Allocator, root_dir: []const u8, options: Options, config: BackendHandleConfig) !BackendHandle {
         const backend = try allocator.create(Backend);
         errdefer allocator.destroy(backend);
-        try backend.openInto(allocator, root_dir, options);
+
+        var owned_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
+        errdefer if (owned_runtime) |*runtime| runtime.deinit();
+
+        var resolved_options = options;
+        if (config.background_runtime) |runtime_config| {
+            if (resolved_options.background_executor != null) return error.BackgroundExecutorAlreadyConfigured;
+            owned_runtime = try background_runtime_mod.BackendRuntimeHandle.init(allocator, runtime_config);
+            const runtime = owned_runtime.?.ptr();
+            const executor = BackgroundExecutor.init(runtime, runtime.allocOwnerId());
+            resolved_options.background_executor = &executor;
+        }
+
+        try backend.openInto(allocator, root_dir, resolved_options);
         return .{
             .allocator = allocator,
             .backend = backend,
+            .background_runtime = owned_runtime,
         };
     }
 
     pub fn close(self: *BackendHandle) void {
         self.backend.close();
         self.allocator.destroy(self.backend);
+        if (self.background_runtime) |*runtime| runtime.deinit();
         self.* = undefined;
     }
 
     pub fn ptr(self: *BackendHandle) *Backend {
         return self.backend;
+    }
+
+    pub fn ownedBackgroundRuntime(self: *BackendHandle) ?*background_runtime_mod.BackendRuntime {
+        return if (self.background_runtime) |*runtime| runtime.ptr() else null;
     }
 };
 
@@ -3737,6 +3782,19 @@ fn countRunEntriesForTest(backend: *Backend) !usize {
     return count;
 }
 
+fn sleepForTest(duration_ns: u64) void {
+    if (comptime builtin.os.tag == .freestanding) return;
+    var req = std.posix.timespec{
+        .sec = @intCast(duration_ns / std.time.ns_per_s),
+        .nsec = @intCast(duration_ns % std.time.ns_per_s),
+    };
+    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => return,
+    };
+}
+
 test "lsm backend runtime erases namespace store handles" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 2 });
     defer backend.close();
@@ -3784,6 +3842,66 @@ test "lsm backend heap handle owns a stable backend pointer" {
     var read = try runtime.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("value", try read.get("doc:1"));
+}
+
+test "lsm backend heap handle can own a detached background runtime" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var handle = try BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-handle-owned-runtime-install-test",
+        .{ .storage = storage.storage() },
+        .{ .background_runtime = .{ .backend = .io_threaded } },
+    );
+    defer handle.close();
+
+    const backend = handle.ptr();
+    try std.testing.expect(handle.ownedBackgroundRuntime() != null);
+    try std.testing.expect(backend.background_executor.canRunDetached());
+    try std.testing.expect(backend.background_executor.jobs != null);
+    try std.testing.expect(backend.background_executor.owner_id != 0);
+}
+
+test "lsm backend heap handle owned runtime wakes deferred immutable flush" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var handle = try BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-handle-owned-runtime-flush-test",
+        .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .defer_flush_on_commit = true,
+        },
+        .{ .background_runtime = .{ .backend = .io_threaded } },
+    );
+    defer handle.close();
+
+    const backend = handle.ptr();
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key", "value");
+        try txn.commit();
+    }
+
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        _ = try backend.background_executor.poll(8);
+        const maintenance = backend.snapshotMaintenanceStats();
+        if (maintenance.immutable_memtables == 0 and maintenance.total_runs > 0) break;
+        sleepForTest(5 * std.time.ns_per_ms);
+    }
+
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.immutable_memtables);
+    try std.testing.expect(maintenance.total_runs > 0);
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
 }
 
 test "lsm backend defaults background executor to inline mode" {

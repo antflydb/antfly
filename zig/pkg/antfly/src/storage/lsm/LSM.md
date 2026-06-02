@@ -695,9 +695,12 @@ Task list:
    - [x] Migrated runtime DB/store LSM owner construction to `BackendHandle`
      across persistent indexes, HBC, DB primary stores, WAL-backed stores,
      graph reverse stores, raft apply stores, and auth stores.
-   - [ ] A dedicated internal flush thread can now be built on `BackendHandle`
-     and enabled after its stop/join, wakeup, and write-pressure behavior is
-     covered by tests.
+   - [x] `BackendHandle` can now own an internal backend runtime and install a
+     handle-scoped detached background executor, so standalone WAL-backed
+     handles can wake immutable flush work without an external DB runtime.
+     Tests cover executor installation and wake/drain of deferred immutable
+     flush work through the owned threaded runtime; shared DB runtimes remain
+     the default for DB-managed stores.
 9. [x] Add WAL-aware recovery and manifest checkpoints. Recovery should load
    durable runs from the manifest, replay WAL records after the last checkpoint
    into mutable/immutable memory state, and safely truncate or recycle WAL files
