@@ -2573,6 +2573,8 @@ pub fn build(b: *std.Build) void {
         ".test_0",
         "module compiles",
         "batch parser preserves oversized value errors",
+        "batch parser accepts raw payload value under public request cap",
+        "linear merge request parser accepts raw payload value under public request cap",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
     };

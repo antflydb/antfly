@@ -46,6 +46,7 @@ const table_writes = @import("table_writes.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
+const public_limits = @import("public_limits.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
 const distributed_graph = @import("distributed_graph.zig");
@@ -203,7 +204,7 @@ fn parseSseEventsAlloc(alloc: std.mem.Allocator, body: []const u8) ![]TestSseEve
     return try events.toOwnedSlice(alloc);
 }
 
-pub const public_api_max_request_body_bytes: usize = 64 * 1024 * 1024;
+pub const public_api_max_request_body_bytes: usize = public_limits.max_request_body_bytes;
 
 test "public API request body limit matches Go linear merge contract" {
     try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), public_api_max_request_body_bytes);
@@ -3340,6 +3341,7 @@ pub const ApiHttpServer = struct {
                 if (!(try self.tableExists(merge_route.table_name))) return try textResponse(self.alloc, 404, "not found");
 
                 var merge_req = linear_merge_api.parseRequest(self.alloc, req.body) catch |err| switch (err) {
+                    error.ValueTooLong => return try textResponse(self.alloc, 413, "value too large"),
                     error.InvalidLinearMergeRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
                     else => return err,
                 };
