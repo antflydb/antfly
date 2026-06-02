@@ -968,9 +968,11 @@ fn printResult(
     const read_delta = ReadStats.delta(after.read, before.read);
     const finalize_ns = @min(scenario.last_finalize_ns, ns);
     const writer_ns = ns - finalize_ns;
+    const effective_l0_soft_limit_runs = effectiveL0SoftLimitRuns(scenario.cfg);
+    const effective_l0_hard_limit_runs = effectiveL0HardLimitRuns(scenario.cfg);
 
     try writer.print(
-        "{{\"scenario\":\"{s}\",\"storage\":\"{s}\",\"mode\":\"{s}\",\"sample\":{d},\"workload\":\"{s}\",\"ops\":{d},\"logical_value_write_bytes\":{d},\"ns\":{d},\"writer_ns\":{d},\"finalize_ns\":{d},\"ops_per_sec\":{d:.2},\"ns_per_op\":{d:.2},\"config_compact_threshold_runs\":{d},\"config_l0_soft_limit_runs\":{d},\"config_l0_hard_limit_runs\":{d},\"config_l0_soft_limit_bytes\":{d},\"config_l0_hard_limit_bytes\":{d},\"config_level_target_runs_base\":{d},\"config_level_target_runs_multiplier\":{d},\"config_level_target_bytes_base\":{d},\"config_level_target_bytes_multiplier\":{d},\"config_max_run_file_bytes\":{d},\"config_max_compaction_input_bytes\":{d},\"config_max_compaction_input_allow_oversized_single_job\":{},\"config_background_io_budget_bytes\":{d},\"config_background_io_allow_oversized_single_job\":{}",
+        "{{\"scenario\":\"{s}\",\"storage\":\"{s}\",\"mode\":\"{s}\",\"sample\":{d},\"workload\":\"{s}\",\"ops\":{d},\"logical_value_write_bytes\":{d},\"ns\":{d},\"writer_ns\":{d},\"finalize_ns\":{d},\"ops_per_sec\":{d:.2},\"ns_per_op\":{d:.2},\"config_compact_threshold_runs\":{d},\"config_l0_soft_limit_runs\":{d},\"config_l0_hard_limit_runs\":{d},\"config_effective_l0_soft_limit_runs\":{d},\"config_effective_l0_hard_limit_runs\":{d},\"config_l0_soft_limit_bytes\":{d},\"config_l0_hard_limit_bytes\":{d},\"config_level_target_runs_base\":{d},\"config_level_target_runs_multiplier\":{d},\"config_level_target_bytes_base\":{d},\"config_level_target_bytes_multiplier\":{d},\"config_max_run_file_bytes\":{d},\"config_max_compaction_input_bytes\":{d},\"config_max_compaction_input_allow_oversized_single_job\":{},\"config_background_io_budget_bytes\":{d},\"config_background_io_allow_oversized_single_job\":{}",
         .{
             scenario.label,
             @tagName(scenario.storage_kind),
@@ -987,6 +989,8 @@ fn printResult(
             scenario.cfg.compact_threshold_runs,
             scenario.cfg.l0_soft_limit_runs,
             scenario.cfg.l0_hard_limit_runs,
+            effective_l0_soft_limit_runs,
+            effective_l0_hard_limit_runs,
             scenario.cfg.l0_soft_limit_bytes,
             scenario.cfg.l0_hard_limit_bytes,
             scenario.cfg.level_target_runs_base,
@@ -1117,12 +1121,24 @@ fn logicalValueWriteBytes(workload: []const u8, ops: usize, value_size: usize) u
     if (std.mem.eql(u8, workload, "load_sorted") or
         std.mem.eql(u8, workload, "load_random") or
         std.mem.eql(u8, workload, "load_base") or
+        std.mem.eql(u8, workload, "load_l0_runs") or
         std.mem.eql(u8, workload, "overwrite_strided") or
         std.mem.eql(u8, workload, "overwrite_hotset"))
     {
         return ops * value_size;
     }
     return 0;
+}
+
+fn effectiveL0SoftLimitRuns(cfg: Config) usize {
+    if (cfg.l0_soft_limit_runs != 0) return cfg.l0_soft_limit_runs;
+    return cfg.compact_threshold_runs;
+}
+
+fn effectiveL0HardLimitRuns(cfg: Config) usize {
+    if (cfg.l0_hard_limit_runs != 0) return cfg.l0_hard_limit_runs;
+    const soft = effectiveL0SoftLimitRuns(cfg);
+    return std.math.mul(usize, @max(@as(usize, 1), soft), 4) catch std.math.maxInt(usize);
 }
 
 fn summarizeRuns(backend: *const antfly.lsm_backend.Backend) RunSummary {

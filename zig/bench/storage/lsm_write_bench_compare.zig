@@ -27,6 +27,8 @@ const Record = struct {
     ns: u64 = 0,
     ops_per_sec: f64 = 0,
     ns_per_op: f64 = 0,
+    config_effective_l0_soft_limit_runs: u64 = 0,
+    config_effective_l0_hard_limit_runs: u64 = 0,
     storage_write_file: u64 = 0,
     storage_write_bytes: u64 = 0,
     storage_manifest_write_file: u64 = 0,
@@ -132,6 +134,8 @@ const GroupAgg = struct {
     sample_count: usize = 0,
     ns_per_op: MetricSeries = .{},
     ops_per_sec: MetricSeries = .{},
+    config_effective_l0_soft_limit_runs: MetricSeries = .{},
+    config_effective_l0_hard_limit_runs: MetricSeries = .{},
     storage_write_bytes: MetricSeries = .{},
     storage_manifest_write_bytes: MetricSeries = .{},
     storage_rename: MetricSeries = .{},
@@ -198,6 +202,8 @@ const GroupAgg = struct {
         allocator.free(self.workload);
         self.ns_per_op.deinit(allocator);
         self.ops_per_sec.deinit(allocator);
+        self.config_effective_l0_soft_limit_runs.deinit(allocator);
+        self.config_effective_l0_hard_limit_runs.deinit(allocator);
         self.storage_write_bytes.deinit(allocator);
         self.storage_manifest_write_bytes.deinit(allocator);
         self.storage_rename.deinit(allocator);
@@ -258,6 +264,8 @@ const GroupAgg = struct {
         self.sample_count += 1;
         try self.ns_per_op.append(allocator, record.ns_per_op);
         try self.ops_per_sec.append(allocator, record.ops_per_sec);
+        try self.config_effective_l0_soft_limit_runs.append(allocator, @floatFromInt(record.config_effective_l0_soft_limit_runs));
+        try self.config_effective_l0_hard_limit_runs.append(allocator, @floatFromInt(record.config_effective_l0_hard_limit_runs));
         try self.storage_write_bytes.append(allocator, @floatFromInt(record.storage_write_bytes));
         try self.storage_manifest_write_bytes.append(allocator, @floatFromInt(record.storage_manifest_write_bytes));
         try self.storage_rename.append(allocator, @floatFromInt(record.storage_rename));
@@ -447,6 +455,8 @@ fn printComparison(
     });
     try printMetric(writer, allocator, "  ns/op", before.ns_per_op, after.ns_per_op);
     try printMetric(writer, allocator, "  ops/sec", before.ops_per_sec, after.ops_per_sec);
+    try printMetric(writer, allocator, "  effective_l0_soft_limit_runs", before.config_effective_l0_soft_limit_runs, after.config_effective_l0_soft_limit_runs);
+    try printMetric(writer, allocator, "  effective_l0_hard_limit_runs", before.config_effective_l0_hard_limit_runs, after.config_effective_l0_hard_limit_runs);
     try printMetric(writer, allocator, "  storage_write_bytes", before.storage_write_bytes, after.storage_write_bytes);
     try printMetric(writer, allocator, "  storage_manifest_write_bytes", before.storage_manifest_write_bytes, after.storage_manifest_write_bytes);
     try printMetric(writer, allocator, "  storage_rename", before.storage_rename, after.storage_rename);

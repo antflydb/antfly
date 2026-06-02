@@ -353,6 +353,9 @@ Large-ingest guardrails:
      trigger/limit/background-IO policy knobs, and the comparator reports L0
      debt, level overflow, scheduler pressure, and background IO admission
      counters for before/after tuning.
+   - [x] Write-stall threshold observability: write-bench JSON and comparator
+     now report effective L0 soft/hard run limits, including derived hard
+     limits when `l0_hard_limit_runs` is left at its default.
    - [x] L0-pressure benchmark slice: `lsm-write-bench --workload-set
      l0_pressure` repeatedly flushes small batches into L0, then times bounded
      maintenance separately so compaction trigger and write-stall policy changes
