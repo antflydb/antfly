@@ -378,9 +378,13 @@ Large-ingest guardrails:
      l0_pressure` repeatedly flushes small batches into L0, then times bounded
      maintenance separately so compaction trigger and write-stall policy changes
      can be compared against real L0 debt.
-   - [x] Default L0 compaction trigger now uses a RocksDB-like 4-run target;
-     the existing fallback hard limit remains four times the soft trigger, so
-     foreground write-pressure assist starts at 16 L0 runs unless overridden.
+   - [x] Default L0 compaction trigger now uses a RocksDB-like 4-run target.
+     The fallback hard limit is now two times the soft trigger, so foreground
+     write-pressure assist starts at 8 L0 runs unless overridden. A 3-sample
+     `lsm-write-bench --workload-set l0_pressure` comparison on 20k keys cut
+     post-load L0 runs from 16 to 8 and reduced follow-up maintenance
+     compactions from 7 to 3, while median load ns/op moved from 1513.25 to
+     1499.25.
    - [x] Max compaction input bytes now behaves like a target for scheduled L0
      maintenance: if no legal L0 compaction fits under the cap, the scheduler
      can admit the minimum oversized job so soft L0 debt does not get stuck

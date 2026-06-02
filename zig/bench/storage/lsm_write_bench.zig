@@ -1148,7 +1148,7 @@ fn effectiveL0SoftLimitRuns(cfg: Config) usize {
 fn effectiveL0HardLimitRuns(cfg: Config) usize {
     if (cfg.l0_hard_limit_runs != 0) return cfg.l0_hard_limit_runs;
     const soft = effectiveL0SoftLimitRuns(cfg);
-    return std.math.mul(usize, @max(@as(usize, 1), soft), 4) catch std.math.maxInt(usize);
+    return std.math.mul(usize, @max(@as(usize, 1), soft), 2) catch std.math.maxInt(usize);
 }
 
 fn summarizeRuns(backend: *const antfly.lsm_backend.Backend) RunSummary {

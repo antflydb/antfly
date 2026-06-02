@@ -2960,7 +2960,7 @@ pub const Backend = struct {
     fn effectiveL0HardLimitRuns(self: *const Backend) usize {
         if (self.options.l0_hard_limit_runs != 0) return self.options.l0_hard_limit_runs;
         const soft = self.effectiveL0SoftLimitRuns();
-        return std.math.mul(usize, @max(@as(usize, 1), soft), 4) catch std.math.maxInt(usize);
+        return std.math.mul(usize, @max(@as(usize, 1), soft), 2) catch std.math.maxInt(usize);
     }
 
     fn enforceWritePressure(self: *Backend) anyerror!void {
