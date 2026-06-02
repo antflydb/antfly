@@ -725,6 +725,12 @@ debt before returning.
      work.
    - Hard-limit enforcement should be visible in metrics; it should not appear
      as a mysterious multi-minute publish window.
+   - [x] Foreground hard-pressure enforcement now runs a configurable bounded
+     number of L0 compaction steps before accepting more work. Write stats,
+     write-bench JSON, index status, and Prometheus expose pressure events,
+     compaction steps, overloads, rejections, and elapsed pressure time. A
+     default-off rejection option can fail writes with `WritePressureExceeded`
+     when the backend remains above hard limits after the foreground budget.
 
 5. [x] Checkpoint WAL independently from compaction.
    - After a successful flush + manifest publication, advance WAL coverage for

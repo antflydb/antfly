@@ -54,7 +54,11 @@ const Record = struct {
     lsm_manifest_writes: u64 = 0,
     lsm_manifest_bytes: u64 = 0,
     lsm_manifest_ns: u64 = 0,
+    lsm_write_pressure_events: u64 = 0,
     lsm_write_pressure_compactions: u64 = 0,
+    lsm_write_pressure_compaction_steps: u64 = 0,
+    lsm_write_pressure_overloads: u64 = 0,
+    lsm_write_pressure_rejections: u64 = 0,
     lsm_write_pressure_ns: u64 = 0,
     lsm_wal_pressure_flushes: u64 = 0,
     lsm_wal_pressure_ns: u64 = 0,
@@ -162,7 +166,11 @@ const GroupAgg = struct {
     lsm_sorted_ingest_ns: MetricSeries = .{},
     lsm_manifest_writes: MetricSeries = .{},
     lsm_manifest_bytes: MetricSeries = .{},
+    lsm_write_pressure_events: MetricSeries = .{},
     lsm_write_pressure_compactions: MetricSeries = .{},
+    lsm_write_pressure_compaction_steps: MetricSeries = .{},
+    lsm_write_pressure_overloads: MetricSeries = .{},
+    lsm_write_pressure_rejections: MetricSeries = .{},
     lsm_write_pressure_ns: MetricSeries = .{},
     lsm_wal_pressure_flushes: MetricSeries = .{},
     lsm_wal_pressure_ns: MetricSeries = .{},
@@ -241,7 +249,11 @@ const GroupAgg = struct {
         self.lsm_sorted_ingest_ns.deinit(allocator);
         self.lsm_manifest_writes.deinit(allocator);
         self.lsm_manifest_bytes.deinit(allocator);
+        self.lsm_write_pressure_events.deinit(allocator);
         self.lsm_write_pressure_compactions.deinit(allocator);
+        self.lsm_write_pressure_compaction_steps.deinit(allocator);
+        self.lsm_write_pressure_overloads.deinit(allocator);
+        self.lsm_write_pressure_rejections.deinit(allocator);
         self.lsm_write_pressure_ns.deinit(allocator);
         self.lsm_wal_pressure_flushes.deinit(allocator);
         self.lsm_wal_pressure_ns.deinit(allocator);
@@ -314,7 +326,11 @@ const GroupAgg = struct {
         try self.lsm_sorted_ingest_ns.append(allocator, @floatFromInt(record.lsm_sorted_ingest_ns));
         try self.lsm_manifest_writes.append(allocator, @floatFromInt(record.lsm_manifest_writes));
         try self.lsm_manifest_bytes.append(allocator, @floatFromInt(record.lsm_manifest_bytes));
+        try self.lsm_write_pressure_events.append(allocator, @floatFromInt(record.lsm_write_pressure_events));
         try self.lsm_write_pressure_compactions.append(allocator, @floatFromInt(record.lsm_write_pressure_compactions));
+        try self.lsm_write_pressure_compaction_steps.append(allocator, @floatFromInt(record.lsm_write_pressure_compaction_steps));
+        try self.lsm_write_pressure_overloads.append(allocator, @floatFromInt(record.lsm_write_pressure_overloads));
+        try self.lsm_write_pressure_rejections.append(allocator, @floatFromInt(record.lsm_write_pressure_rejections));
         try self.lsm_write_pressure_ns.append(allocator, @floatFromInt(record.lsm_write_pressure_ns));
         try self.lsm_wal_pressure_flushes.append(allocator, @floatFromInt(record.lsm_wal_pressure_flushes));
         try self.lsm_wal_pressure_ns.append(allocator, @floatFromInt(record.lsm_wal_pressure_ns));
@@ -516,7 +532,11 @@ fn printComparison(
     try printMetric(writer, allocator, "  lsm_sorted_ingest_ns", before.lsm_sorted_ingest_ns, after.lsm_sorted_ingest_ns);
     try printMetric(writer, allocator, "  lsm_manifest_writes", before.lsm_manifest_writes, after.lsm_manifest_writes);
     try printMetric(writer, allocator, "  lsm_manifest_bytes", before.lsm_manifest_bytes, after.lsm_manifest_bytes);
+    try printMetric(writer, allocator, "  lsm_write_pressure_events", before.lsm_write_pressure_events, after.lsm_write_pressure_events);
     try printMetric(writer, allocator, "  lsm_write_pressure_compactions", before.lsm_write_pressure_compactions, after.lsm_write_pressure_compactions);
+    try printMetric(writer, allocator, "  lsm_write_pressure_compaction_steps", before.lsm_write_pressure_compaction_steps, after.lsm_write_pressure_compaction_steps);
+    try printMetric(writer, allocator, "  lsm_write_pressure_overloads", before.lsm_write_pressure_overloads, after.lsm_write_pressure_overloads);
+    try printMetric(writer, allocator, "  lsm_write_pressure_rejections", before.lsm_write_pressure_rejections, after.lsm_write_pressure_rejections);
     try printMetric(writer, allocator, "  lsm_write_pressure_ns", before.lsm_write_pressure_ns, after.lsm_write_pressure_ns);
     try printMetric(writer, allocator, "  lsm_wal_pressure_flushes", before.lsm_wal_pressure_flushes, after.lsm_wal_pressure_flushes);
     try printMetric(writer, allocator, "  lsm_wal_pressure_ns", before.lsm_wal_pressure_ns, after.lsm_wal_pressure_ns);

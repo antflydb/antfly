@@ -97,6 +97,8 @@ pub const Options = struct {
     l0_hard_limit_runs: usize = 0,
     l0_soft_limit_bytes: u64 = 0,
     l0_hard_limit_bytes: u64 = 0,
+    write_pressure_max_compaction_steps: usize = 8,
+    write_pressure_reject_on_overload: bool = false,
     foreground_soft_compaction: bool = false,
     defer_flush_on_commit: bool = false,
     max_deferred_immutable_memtables: usize = 8,
@@ -228,7 +230,11 @@ pub const Backend = struct {
         manifest_writes: u64 = 0,
         manifest_bytes: u64 = 0,
         manifest_ns: u64 = 0,
+        write_pressure_events: u64 = 0,
         write_pressure_compactions: u64 = 0,
+        write_pressure_compaction_steps: u64 = 0,
+        write_pressure_overloads: u64 = 0,
+        write_pressure_rejections: u64 = 0,
         write_pressure_ns: u64 = 0,
         wal_pressure_flushes: u64 = 0,
         wal_pressure_ns: u64 = 0,
@@ -3058,6 +3064,24 @@ pub const Backend = struct {
         return std.math.mul(usize, @max(@as(usize, 1), soft), 2) catch std.math.maxInt(usize);
     }
 
+    const L0Pressure = struct {
+        runs: usize = 0,
+        bytes: u64 = 0,
+
+        fn overHardLimit(self: @This(), hard_runs: usize, hard_bytes: u64) bool {
+            return (hard_runs > 0 and self.runs > hard_runs) or
+                (hard_bytes > 0 and self.bytes > hard_bytes);
+        }
+    };
+
+    fn snapshotL0PressureLocked(self: *const Backend) L0Pressure {
+        var pressure = L0Pressure{};
+        while (pressure.runs < self.runs.items.len and self.runs.items[pressure.runs].level == 0) : (pressure.runs += 1) {
+            pressure.bytes += self.runs.items[pressure.runs].size_bytes;
+        }
+        return pressure;
+    }
+
     fn enforceWritePressure(self: *Backend) anyerror!void {
         if (self.bulkIngestActive()) return;
         if (self.write_pressure_enforcing) return;
@@ -3070,22 +3094,34 @@ pub const Backend = struct {
         const hard_bytes = self.options.l0_hard_limit_bytes;
         if (hard_runs == 0 and hard_bytes == 0) return;
 
-        var l0_runs: usize = 0;
-        var l0_bytes: u64 = 0;
-        while (l0_runs < self.runs.items.len and self.runs.items[l0_runs].level == 0) : (l0_runs += 1) {
-            l0_bytes += self.runs.items[l0_runs].size_bytes;
-        }
-        const over_runs = hard_runs > 0 and l0_runs > hard_runs;
-        const over_bytes = hard_bytes > 0 and l0_bytes > hard_bytes;
-        if (!over_runs and !over_bytes) return;
+        var pressure = self.snapshotL0PressureLocked();
+        if (!pressure.overHardLimit(hard_runs, hard_bytes)) return;
 
         const start_ns = self.writeStatsNowNs();
+        self.write_stats.write_pressure_events += 1;
         const target_runs = if (self.options.l0_soft_limit_runs != 0) self.options.l0_soft_limit_runs else self.options.compact_threshold_runs;
         const before_compactions = self.compaction_stats.compactions;
-        try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
-        if (self.compaction_stats.compactions != before_compactions) {
-            self.write_stats.write_pressure_compactions += 1;
-            self.write_stats.write_pressure_ns += self.writeStatsElapsedNs(start_ns);
+        const max_steps = @max(@as(usize, 1), self.options.write_pressure_max_compaction_steps);
+        var steps: usize = 0;
+        while (pressure.overHardLimit(hard_runs, hard_bytes) and steps < max_steps) {
+            const before_step_compactions = self.compaction_stats.compactions;
+            try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
+            if (self.compaction_stats.compactions == before_step_compactions) break;
+            steps += self.compaction_stats.compactions - before_step_compactions;
+            pressure = self.snapshotL0PressureLocked();
+        }
+
+        const compaction_delta = self.compaction_stats.compactions - before_compactions;
+        self.write_stats.write_pressure_compactions += @intCast(compaction_delta);
+        self.write_stats.write_pressure_compaction_steps += @intCast(steps);
+        self.write_stats.write_pressure_ns += self.writeStatsElapsedNs(start_ns);
+
+        if (pressure.overHardLimit(hard_runs, hard_bytes)) {
+            self.write_stats.write_pressure_overloads += 1;
+            if (self.options.write_pressure_reject_on_overload) {
+                self.write_stats.write_pressure_rejections += 1;
+                return error.WritePressureExceeded;
+            }
         }
     }
 
@@ -5390,6 +5426,63 @@ test "lsm backend write pressure compacts hard L0 debt" {
     try std.testing.expect(stats.write_pressure_compactions > 0);
 }
 
+test "lsm backend write pressure records bounded overload after max foreground steps" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .write_pressure_max_compaction_steps = 1,
+    });
+    defer backend.close();
+
+    for (0..10) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+
+    backend.options.l0_hard_limit_runs = 2;
+    try backend.finalizeDeferredStorageWork();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_events);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_compaction_steps);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_overloads);
+    try std.testing.expectEqual(@as(u64, 0), stats.write_pressure_rejections);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 2);
+}
+
+test "lsm backend write pressure can reject when overload remains after budget" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .write_pressure_max_compaction_steps = 1,
+        .write_pressure_reject_on_overload = true,
+    });
+    defer backend.close();
+
+    for (0..10) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+
+    backend.options.l0_hard_limit_runs = 2;
+    try std.testing.expectError(error.WritePressureExceeded, backend.finalizeDeferredStorageWork());
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_events);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_overloads);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_rejections);
+}
+
 test "lsm backend maintenance step compacts soft L0 debt" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1,
@@ -6325,6 +6418,7 @@ test "lsm backend hard L0 pressure applies bounded step after publish not inside
         .bulk_ingest_flush_threshold_multiplier = 1,
         .compact_threshold_runs = 1,
         .l0_hard_limit_runs = 2,
+        .write_pressure_max_compaction_steps = 1,
     });
     defer backend.close();
 
