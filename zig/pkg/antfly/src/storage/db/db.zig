@@ -2694,8 +2694,10 @@ pub const DB = struct {
             self.resolution_embedder,
         );
         errdefer runtime.deinit();
+        append_ctx.resolution_runtime = runtime;
         self.resolution_append_context = append_ctx;
         self.resolution_runtime = runtime;
+        if (self.enrichment_append_context) |ctx| ctx.resolution_runtime = runtime;
     }
 
     fn initPromotionRuntime(self: *DB) !void {
@@ -5483,9 +5485,12 @@ pub const DB = struct {
     }
 
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
-        lockApply(self);
-        defer self.core.unlockApply();
-        try self.core.addResolver(cfg);
+        {
+            lockApply(self);
+            defer self.core.unlockApply();
+            try self.core.addResolver(cfg);
+        }
+        try self.backfillResolverCorpus();
     }
 
     /// Add or replace a resolver. When the replacement bumps `config_generation`,
@@ -5493,24 +5498,31 @@ pub const DB = struct {
     /// documents already ingested (the extraction artifacts did not change, so
     /// the incremental hint would not fire on its own).
     pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
-        const needs_reresolve = blk: {
+        const upsert_result = blk: {
             lockApply(self);
             defer self.core.unlockApply();
             break :blk try self.core.upsertResolver(cfg);
         };
-        if (needs_reresolve) {
-            if (self.resolution_runtime) |runtime| {
-                try runtime.requestReresolveBacklog();
-                while (true) {
-                    var tick = try runtime.runReresolveBacklogWindow();
-                    const queued = tick.queued;
-                    const complete = tick.complete;
-                    tick.deinit(self.runtime_alloc);
-                    // Drive the enqueued extraction artifacts through resolution,
-                    // promotion, and graph materialization before queuing more.
-                    if (queued > 0) try self.runUntilIdle();
-                    if (complete) break;
-                }
+        switch (upsert_result) {
+            .inserted, .updated_backfill_required => {
+                try self.backfillResolverCorpus();
+            },
+            .updated_no_backfill => {},
+        }
+    }
+
+    fn backfillResolverCorpus(self: *DB) !void {
+        if (self.resolution_runtime) |runtime| {
+            try runtime.requestReresolveBacklog();
+            while (true) {
+                var tick = try runtime.runReresolveBacklogWindow();
+                const queued = tick.queued;
+                const complete = tick.complete;
+                tick.deinit(self.runtime_alloc);
+                // Drive the enqueued extraction artifacts through resolution,
+                // promotion, and graph materialization before queuing more.
+                if (queued > 0) try self.runUntilIdle();
+                if (complete) break;
             }
         }
     }
@@ -24084,6 +24096,72 @@ test "db re-resolves the corpus when upsertResolver bumps the config generation"
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":2") != null);
 }
 
+test "db re-resolves existing corpus when upsertResolver inserts a new resolver" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    {
+        const asset_raw = try db.core.store.get(alloc, asset_key);
+        defer alloc.free(asset_raw);
+        try std.testing.expect(std.mem.indexOf(u8, asset_raw, "Ada Lovelace") != null);
+    }
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, "relations_v1", "doc:a");
+    defer alloc.free(marker_key);
+    {
+        const marker_raw = try db.core.store.get(alloc, marker_key);
+        defer alloc.free(marker_raw);
+        try std.testing.expectEqualStrings(asset_key, marker_raw);
+    }
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_inserted_v1");
+    defer alloc.free(resolution_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+
+    try db.upsertResolver(.{
+        .name = "kg_inserted",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_inserted_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+}
+
 /// Thread-safe capturing entity sink for the promotion integration test.
 const FakePromotionSink = struct {
     const Upsert = struct { table: []u8, key: []u8, doc: []u8 };
@@ -24884,6 +24962,27 @@ test "db resolver catalog persists across reopen" {
             .resolution_artifact = "resolution_v1",
             .key_template = "x",
         }));
+        try std.testing.expectError(error.ResolverArtifactAlreadyExists, db.addResolver(.{
+            .name = "duplicate_output",
+            .table = "entities",
+            .source_artifact = "other_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "x",
+        }));
+        try std.testing.expectError(error.ResolverSourceArtifactImmutable, db.upsertResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "other_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "x",
+        }));
+        try std.testing.expectError(error.ResolverArtifactImmutable, db.upsertResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "other_resolution_v1",
+            .key_template = "x",
+        }));
     }
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -25563,10 +25662,15 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
 
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "generated_title_v1");
     defer alloc.free(asset_key);
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, "generated_title_v1", "doc:a");
+    defer alloc.free(marker_key);
     const state_key = try assetStateKeyAlloc(alloc, "doc:a", "generated_title_v1");
     defer alloc.free(state_key);
     const stored_asset = try db.core.store.get(alloc, asset_key);
     alloc.free(stored_asset);
+    const stored_marker = try db.core.store.get(alloc, marker_key);
+    defer alloc.free(stored_marker);
+    try std.testing.expectEqualStrings(asset_key, stored_marker);
     const stored_state = try db.core.store.get(alloc, state_key);
     alloc.free(stored_state);
 
@@ -25575,6 +25679,7 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
         .sync_level = .write,
     });
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, asset_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
 }
 

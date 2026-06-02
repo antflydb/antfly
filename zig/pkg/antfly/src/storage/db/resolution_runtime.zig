@@ -101,8 +101,10 @@ pub const ResolutionOutput = struct {
     bytes: []u8,
 };
 
-/// Returns the resolver whose `source_artifact` matches `artifact_name`, or
-/// null. The first match wins; V1 expects one resolver per source artifact.
+/// Returns the first resolver whose `source_artifact` matches `artifact_name`,
+/// or null. Production replay fans a source artifact out to every matching
+/// resolver; this helper remains for single-output tests and compatibility
+/// paths.
 pub fn resolverForArtifact(
     resolvers: []const ResolverConfig,
     artifact_name: []const u8,
@@ -111,6 +113,10 @@ pub fn resolverForArtifact(
         if (std.mem.eql(u8, cfg.source_artifact, artifact_name)) return cfg;
     }
     return null;
+}
+
+fn resolverConsumesArtifact(resolvers: []const ResolverConfig, artifact_name: []const u8) bool {
+    return resolverForArtifact(resolvers, artifact_name) != null;
 }
 
 pub fn resolverForResolutionArtifact(
@@ -182,6 +188,22 @@ pub fn processChangedExtraction(
     defer gpa.free(parsed.artifact_name);
 
     const cfg = resolverForArtifact(resolvers, parsed.artifact_name) orelse return null;
+    return try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder);
+}
+
+fn processChangedExtractionWithConfig(
+    gpa: std.mem.Allocator,
+    cfg: *const ResolverConfig,
+    store: resolver_lib.ArtifactStore,
+    provider: ?resolver_lib.CandidateProvider,
+    changed_key: []const u8,
+    candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
+) !?ProcessOutcome {
+    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(gpa, changed_key)) orelse return null;
+    defer gpa.free(parsed.doc_key);
+    defer gpa.free(parsed.artifact_name);
+    if (!std.mem.eql(u8, parsed.artifact_name, cfg.source_artifact)) return null;
 
     var resolver = try resolver_lib.Resolver.initFromParts(
         gpa,
@@ -261,6 +283,33 @@ pub fn processChangedExtraction(
     };
     const result = try stage.run(gpa, store, effective_provider, changed_key, resolution_key);
     return .{ .result = result, .resolution_key = resolution_key };
+}
+
+fn processChangedExtractionForAllResolvers(
+    gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
+    store: resolver_lib.ArtifactStore,
+    provider: ?resolver_lib.CandidateProvider,
+    changed_key: []const u8,
+    candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
+    journal_keys: *std.ArrayListUnmanaged([]const u8),
+) !usize {
+    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(gpa, changed_key)) orelse return 0;
+    defer gpa.free(parsed.doc_key);
+    defer gpa.free(parsed.artifact_name);
+
+    var processed: usize = 0;
+    for (resolvers) |*cfg| {
+        if (!std.mem.eql(u8, cfg.source_artifact, parsed.artifact_name)) continue;
+        const outcome = (try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder)) orelse continue;
+        processed += 1;
+        switch (outcome.result) {
+            .written, .cleared => try journal_keys.append(gpa, outcome.resolution_key),
+            else => gpa.free(outcome.resolution_key),
+        }
+    }
+    return processed;
 }
 
 /// Named asset artifact holding a document's review overrides:
@@ -759,11 +808,7 @@ pub fn processRecordKeys(
     }
 
     for (changed_artifact_keys) |key| {
-        const outcome = (try processChangedExtraction(gpa, resolvers, store, provider, key, candidate_source, embedder)) orelse continue;
-        switch (outcome.result) {
-            .written, .cleared => try journal_keys.append(gpa, outcome.resolution_key),
-            else => gpa.free(outcome.resolution_key),
-        }
+        _ = try processChangedExtractionForAllResolvers(gpa, resolvers, store, provider, key, candidate_source, embedder, &journal_keys);
     }
 
     if (journal_keys.items.len > 0) {
@@ -860,7 +905,7 @@ fn reresolveAll(
             const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(self.gpa, key)) orelse return;
             defer self.gpa.free(parsed.doc_key);
             defer self.gpa.free(parsed.artifact_name);
-            if (resolverForArtifact(self.resolvers, parsed.artifact_name) == null) return;
+            if (!resolverConsumesArtifact(self.resolvers, parsed.artifact_name)) return;
             try self.out.append(self.gpa, try self.gpa.dupe(u8, key));
         }
     };
@@ -881,12 +926,8 @@ fn reresolveAll(
     }
     var reresolved: usize = 0;
     for (asset_keys.items) |key| {
-        const outcome = (try processChangedExtraction(gpa, resolvers, store, null, key, candidate_source, embedder)) orelse continue;
-        reresolved += 1;
-        switch (outcome.result) {
-            .written, .cleared => try journal_keys.append(gpa, outcome.resolution_key),
-            else => gpa.free(outcome.resolution_key),
-        }
+        const processed = try processChangedExtractionForAllResolvers(gpa, resolvers, store, null, key, candidate_source, embedder, &journal_keys);
+        if (processed > 0) reresolved += 1;
     }
     if (journal_keys.items.len > 0) {
         _ = try write_fn(write_ctx, .{ .changed_artifact_keys = journal_keys.items });
@@ -1891,6 +1932,50 @@ test "processRecordKeys resolves changed asset keys and journals resolution keys
     try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null, null);
     try testing.expectEqual(@as(usize, 1), writer.keys.items.len);
     try testing.expectEqual(@as(u64, 0), writer.calls);
+}
+
+test "processRecordKeys fans one source artifact out to all consuming resolvers" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{
+        .{
+            .name = "people",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "people_resolution_v1",
+            .key_template = "people/{{ slug _entity.text }}",
+            .config_generation = 1,
+        },
+        .{
+            .name = "orgs",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "org_resolution_v1",
+            .key_template = "orgs/{{ slug _entity.text }}",
+            .config_generation = 1,
+        },
+    };
+
+    var fake = FakeStore{ .alloc = alloc };
+    defer fake.deinit();
+    var das = DbArtifactStore(FakeStore){ .store = &fake };
+    const store = das.artifactStore();
+
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:fanout", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key, test_extraction);
+
+    var writer = CaptureWriter{ .alloc = alloc };
+    defer writer.deinit();
+    const changed = [_][]const u8{extraction_key};
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null, null);
+
+    const people_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:fanout", "people_resolution_v1");
+    defer alloc.free(people_key);
+    const org_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:fanout", "org_resolution_v1");
+    defer alloc.free(org_key);
+    try testing.expectEqual(@as(usize, 2), writer.keys.items.len);
+    try testing.expectEqualSlices(u8, people_key, writer.keys.items[0]);
+    try testing.expectEqualSlices(u8, org_key, writer.keys.items[1]);
 }
 
 /// Minimal replay Source for tests: replays a fixed list of encoded records.

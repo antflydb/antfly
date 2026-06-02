@@ -499,9 +499,9 @@ pub const DBCore = struct {
         try self.index_manager.addResolver(self.store, cfg);
     }
 
-    /// Add or replace a resolver; returns true if its config_generation bumped
-    /// (the caller should re-resolve the corpus).
-    pub fn upsertResolver(self: *DBCore, cfg: index_manager_mod.ResolverConfig) !bool {
+    /// Add or replace a resolver; tells the caller whether existing extraction
+    /// artifacts need replay-driven re-resolution.
+    pub fn upsertResolver(self: *DBCore, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
         try cfg.validate();
         return try self.index_manager.upsertResolver(self.store, cfg);
     }

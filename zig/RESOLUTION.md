@@ -242,7 +242,7 @@ the stale resolution artifact (`RunResult.cleared`). This is the same
 read/recompute/skip shape the embedding and graph stages already use, which is
 what keeps replay cheap and crash-safe.
 
-Driving it in the DB (the integration adapter, not yet landed):
+Driving it in the DB:
 
 1. **TargetHint.** Add `resolution` to `change_journal.zig`'s `TargetHint`
    (bit 6; the `u3`/`u8` hint mask already has room). In
@@ -271,6 +271,25 @@ Driving it in the DB (the integration adapter, not yet landed):
 No new recovery protocol: a crash before the durable write leaves the extraction
 artifact key replayable; the worker re-runs `ResolutionStage.run`, which is
 idempotent.
+
+Resolver catalog/runtime invariants:
+
+- Source artifacts are a fanout boundary. Multiple resolvers may consume the
+  same `source_artifact`, and the resolution worker runs every matching resolver
+  for a changed source artifact.
+- `resolution_artifact` names are unique across the resolver catalog. This gives
+  each resolver an unambiguous durable output stream and lets review/promotion
+  scopes use `(source_artifact, resolution_artifact)`.
+- For an existing resolver name, `source_artifact` and `resolution_artifact` are
+  immutable stream bindings. A new source/output stream is a new resolver, not an
+  in-place upsert that would orphan old resolution artifacts.
+- Asset source-index markers are maintained by the storage paths that write or
+  delete asset artifacts, including async enrichment runtime writes. Resolver
+  backfills depend on that marker index instead of scanning all user artifacts.
+- Adding a resolver or materially changing its resolver/scorer config marks a
+  persisted re-resolution cursor dirty. Existing source artifacts are replayed in
+  bounded windows through the normal resolution, promotion, and graph
+  materialization stages.
 
 ## Promoter
 
@@ -668,14 +687,16 @@ Open/index/enrichment validation should reject:
 3. **Merge/split (phase 3).**
    - [x] Entity `merged_into`: resolution follows a matched candidate's
          `merged_into` redirect to the surviving canonical entity (lazy merge).
-   - [x] config-generation re-resolution: `DB.upsertResolver` marks a persisted
-         re-resolution cursor dirty when a resolver's `config_generation` bumps.
+   - [x] Resolver backfill: `DB.addResolver` and `DB.upsertResolver` mark a
+         persisted re-resolution cursor dirty when a resolver is first registered
+         or when a material resolver/scorer config field changes.
          `ResolutionRuntime.runReresolveBacklogWindow` scans the maintained
          source-artifact index in bounded windows, appends matching extraction
          artifacts as replay records, and lets the normal resolution worker
          re-resolve them idempotently. Each window is drained through downstream
          promotion/graph stages before the next window is queued. Verified by
-         db-tests (bump gen 1 -> 2 re-resolves an already-ingested document).
+         db-tests (inserted resolver re-resolves an already-ingested document;
+         bump gen 1 -> 2 does the same).
    - [x] Eager edge rewrite on merge: `DB.rewriteEntityEdges` repoints every
          inbound edge of the merged-away entity at the survivor (preserving type,
          weight, metadata), so provenance mention edges -- which target the

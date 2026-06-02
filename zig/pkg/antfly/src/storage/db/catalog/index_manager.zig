@@ -1999,10 +1999,44 @@ pub const IndexManager = struct {
         return null;
     }
 
+    fn resolverResolutionArtifactInUse(self: *const IndexManager, resolution_artifact: []const u8, except_name: ?[]const u8) bool {
+        for (self.resolvers.items) |entry| {
+            if (except_name) |name| {
+                if (std.mem.eql(u8, entry.name, name)) continue;
+            }
+            if (std.mem.eql(u8, entry.resolution_artifact, resolution_artifact)) return true;
+        }
+        return false;
+    }
+
+    pub const ResolverUpsertResult = enum {
+        inserted,
+        updated_backfill_required,
+        updated_no_backfill,
+    };
+
+    fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
+        return !std.mem.eql(u8, existing.table, next.table) or
+            !std.mem.eql(u8, existing.key_template, next.key_template) or
+            existing.type_must_match != next.type_must_match or
+            !std.mem.eql(u8, existing.scorer_json, next.scorer_json) or
+            !std.mem.eql(u8, existing.candidate_search, next.candidate_search) or
+            !std.mem.eql(u8, existing.candidate_ann_index, next.candidate_ann_index) or
+            existing.candidate_limit != next.candidate_limit or
+            !std.mem.eql(u8, existing.name_embedding, next.name_embedding) or
+            existing.name_embedding_dims != next.name_embedding_dims or
+            !std.mem.eql(u8, existing.fusion_combine, next.fusion_combine) or
+            existing.fusion_trust != next.fusion_trust or
+            existing.fusion_prior != next.fusion_prior or
+            existing.fusion_prior_weight != next.fusion_prior_weight or
+            existing.config_generation != next.config_generation;
+    }
+
     pub fn addResolver(self: *IndexManager, store: anytype, cfg: resolver_catalog.ResolverConfig) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         if (self.getResolver(cfg.name) != null) return error.ResolverAlreadyExists;
+        if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
 
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
@@ -2014,24 +2048,28 @@ pub const IndexManager = struct {
     /// was replaced by one with a strictly higher `config_generation` -- the
     /// signal that the corpus should be re-resolved (the extraction artifacts did
     /// not change, so the incremental hint will not fire).
-    pub fn upsertResolver(self: *IndexManager, store: anytype, cfg: resolver_catalog.ResolverConfig) !bool {
+    pub fn upsertResolver(self: *IndexManager, store: anytype, cfg: resolver_catalog.ResolverConfig) !ResolverUpsertResult {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         for (self.resolvers.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
-            const bumped = cfg.config_generation > entry.config_generation;
+            if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) return error.ResolverSourceArtifactImmutable;
+            if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
+            if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
+            const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
             var replacement = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
             errdefer replacement.deinit(self.alloc);
             entry.deinit(self.alloc);
             entry.* = replacement;
             try self.persistResolverCatalog(store);
-            return bumped;
+            return if (material_changed) .updated_backfill_required else .updated_no_backfill;
         }
+        if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
         try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
         try self.persistResolverCatalog(store);
-        return false;
+        return .inserted;
     }
 
     pub fn removeResolver(self: *IndexManager, store: anytype, name: []const u8) !bool {

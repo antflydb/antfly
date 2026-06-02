@@ -3575,6 +3575,15 @@ fn derivedEmbeddingBelongsToDesiredChunk(key: []const u8, desired_chunk_keys: []
     return false;
 }
 
+fn assetSourceIndexKeyForArtifactAlloc(alloc: Allocator, artifact_key: []const u8) !?[]u8 {
+    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, artifact_key)) orelse return null;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.artifact_name);
+    }
+    return try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, parsed.artifact_name, parsed.doc_key);
+}
+
 fn storePutWithRetry(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
@@ -3706,18 +3715,40 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
     try txn.put(key, value);
+    if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, key)) |marker_key| {
+        defer runtime.alloc.free(marker_key);
+        try txn.put(marker_key, key);
+    }
     try txn.commit();
 }
 
 fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
     var batch = try runtime.store.beginBatch();
     errdefer batch.abort();
-    for (writes) |write| try batch.put(write.key, write.value);
+    var marker_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (marker_keys.items) |key| runtime.alloc.free(key);
+        marker_keys.deinit(runtime.alloc);
+    }
+    for (writes) |write| {
+        try batch.put(write.key, write.value);
+        if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, write.key)) |marker_key| {
+            try marker_keys.append(runtime.alloc, marker_key);
+            try batch.put(marker_key, write.key);
+        }
+    }
     for (deletes) |key| {
         batch.delete(key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
         };
+        if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, key)) |marker_key| {
+            try marker_keys.append(runtime.alloc, marker_key);
+            batch.delete(marker_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
     }
     try batch.commit();
 }
