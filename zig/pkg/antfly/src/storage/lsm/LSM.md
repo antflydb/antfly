@@ -229,7 +229,7 @@ Large-ingest guardrails:
    - [x] Current scans now freeze the active mutable memtable into a retained
      immutable generation at open, so visible mutable rows are borrowed from
      stable reader-pinned state instead of copied into cursor scratch.
-6. [ ] Cache per-cursor source layout (`runs`, L0 groups, lower levels, and
+6. [x] Cache per-cursor source layout (`runs`, L0 groups, lower levels, and
    immutable pointer slice) across repeated seeks while the cursor snapshot is
    valid.
    - [x] Current-live probe and large write-batch `getManySorted` now build
@@ -239,7 +239,10 @@ Large-ingest guardrails:
    - [x] Persisted scan cursors now cache each run source's table index pointer
      inside the cursor, so block-window movement no longer reacquires the table
      index through the backend cache on every `next()`.
-7. [ ] Add table block smallest-key metadata and use block min/max bounds to
+   - [x] Repeated persisted cursor seeks now have regression coverage proving
+     the cursor does not rebuild run groups and does not reacquire table-index
+     pointers after the first seek within the same snapshot.
+7. [x] Add table block smallest-key metadata and use block min/max bounds to
    skip non-overlapping range-scan blocks.
    - [x] First slice: table footer metadata now records per-block smallest
      key/namespace and exact point reads reject out-of-block candidates by
@@ -247,7 +250,7 @@ Large-ingest guardrails:
    - [x] Bounded forward scans can now pass an upper bound into erased cursors;
      persisted LSM merge cursors stop before that bound and skip later table
      blocks whose smallest key is already outside the scan range.
-8. [ ] Add sequential scan readahead/prefetch hints for full-run scans.
+8. [x] Add sequential scan readahead/prefetch hints for full-run scans.
    - [x] First slice: persisted merge cursors warm the next table block in
      the shared cache after loading the current block, while respecting scan
      upper bounds.

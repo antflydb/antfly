@@ -7392,6 +7392,11 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         try std.testing.expectEqualStrings("doc:005", (try cur.next()).?.key);
         try std.testing.expect((try cur.next()) == null);
 
+        const after_forward_scan = backend.snapshotReadStats();
+        try std.testing.expectEqualStrings("doc:002", (try cur.seekAtOrAfter("doc:002")).?.key);
+        try std.testing.expectEqualStrings("doc:004", (try cur.seekAtOrAfter("doc:004")).?.key);
+        try std.testing.expectEqualStrings("doc:003", (try cur.seekAtOrAfter("doc:003")).?.key);
+
         const read_stats = backend.snapshotReadStats();
         try std.testing.expect(read_stats.table_entry_parses > 0);
         try std.testing.expect(read_stats.table_block_loads > 0);
@@ -7400,6 +7405,9 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         try std.testing.expect(read_stats.cursor_block_reuses > 0);
         try std.testing.expect(read_stats.cursor_block_readaheads > 0);
         try std.testing.expectEqual(@as(u64, 1), read_stats.cursor_table_index_misses);
+        try std.testing.expectEqual(after_forward_scan.run_group_builds, read_stats.run_group_builds);
+        try std.testing.expectEqual(after_forward_scan.cursor_table_index_misses, read_stats.cursor_table_index_misses);
+        try std.testing.expect(read_stats.cursor_table_index_hits > after_forward_scan.cursor_table_index_hits);
         try std.testing.expect(read_stats.cursor_table_index_hits > read_stats.cursor_table_index_misses);
         try std.testing.expect(read_stats.cursor_value_borrows > 0);
         try std.testing.expectEqual(@as(u64, 0), read_stats.cursor_value_copies);
