@@ -74,6 +74,14 @@ fn recordPointValueCopy(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointValueCopy")) backend.recordPointValueCopy();
 }
 
+fn recordPointRunPrecheck(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "recordPointRunPrecheck")) backend.recordPointRunPrecheck();
+}
+
+fn recordPointRunPrecheckSurvivor(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "recordPointRunPrecheckSurvivor")) backend.recordPointRunPrecheckSurvivor();
+}
+
 fn canBorrowReaderRetainedState(backend: anytype) bool {
     const BackendType = @TypeOf(backend.*);
     return @hasField(BackendType, "active_readers") and backend.active_readers > 0;
@@ -3731,6 +3739,106 @@ fn findRunIndexInLevel(runs: []const Run, level: RunLevel, namespace: backend_ty
     return run_index;
 }
 
+const PointRunCandidate = struct {
+    run_index: usize,
+};
+
+fn runIndicesUsePathBackedPointPrecheck(backend: anytype, runs: []Run, run_indices: []const usize) bool {
+    for (run_indices) |run_index| {
+        const run = &runs[run_index];
+        if (run.state != null or run.path == null) return false;
+        if (run.cached_state_index) |index| {
+            if (@hasDecl(@TypeOf(backend.*), "cachedRunStateIndexMatches") and
+                backend.cachedRunStateIndexMatches(index, run.path.?, run.id)) return false;
+        }
+    }
+    return true;
+}
+
+fn pathRunSurvivesPointPrecheck(
+    backend: anytype,
+    run: *Run,
+    run_index: usize,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    backend_locked: bool,
+    batch_run_indexes: ?*RunBatchIndexHandles,
+) !bool {
+    if (!runMayContain(run.*, namespace, key)) return false;
+
+    const filter = try ensureRunBloomFilterForReadMaybeLocked(backend, run, backend_locked);
+    if (filter) |present_filter| {
+        const present = lsm_table_file.maybeContains(present_filter, namespace.name, key);
+        if (!present) {
+            backend.recordBloomNegative();
+            return false;
+        }
+    }
+
+    const present = if (backend.options.cache != null) blk: {
+        if (batch_run_indexes) |indexes| {
+            const state = try indexes.state(backend, run, run_index);
+            break :blk lsm_table_file.maybeContains(state.handle.runTableIndex().borrowFilter(), namespace.name, key);
+        }
+        var handle = try loadRunTableIndexHandle(backend, run);
+        defer handle.release();
+        break :blk lsm_table_file.maybeContains(handle.runTableIndex().borrowFilter(), namespace.name, key);
+    } else blk: {
+        const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
+        break :blk lsm_table_file.maybeContains(index.borrowFilter(), namespace.name, key);
+    };
+    if (!present) backend.recordBloomNegative();
+    return present;
+}
+
+fn getFromPathRunIndicesPrechecked(
+    backend: anytype,
+    runs: []Run,
+    run_indices: []const usize,
+    read_hint: *?BorrowedReadHint,
+    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    backend_locked: bool,
+    batch_run_indexes: ?*RunBatchIndexHandles,
+) !?[]const u8 {
+    var candidates = std.ArrayListUnmanaged(PointRunCandidate).empty;
+    defer candidates.deinit(value_allocator);
+
+    for (run_indices) |run_index| {
+        backend.recordRunProbe();
+        recordPointRunPrecheck(backend);
+        if (!try pathRunSurvivesPointPrecheck(backend, &runs[run_index], run_index, namespace, key, backend_locked, batch_run_indexes)) continue;
+        try candidates.append(value_allocator, .{ .run_index = run_index });
+        recordPointRunPrecheckSurvivor(backend);
+    }
+
+    for (candidates.items) |candidate| {
+        const run = &runs[candidate.run_index];
+        if (backend.options.cache != null) {
+            const located = if (batch_run_indexes) |indexes|
+                try getFromRunWithBlockCacheBatch(backend, run, candidate.run_index, read_hint, held_blocks, namespace, key, true, indexes) orelse continue
+            else
+                try getFromRunWithBlockCache(backend, run, candidate.run_index, read_hint, held_blocks, namespace, key, true) orelse continue;
+            if (located.entry.tombstone) return error.NotFound;
+            read_hint.* = .{
+                .run_index = candidate.run_index,
+                .namespace_name = namespace.name,
+                .key = located.entry.key,
+                .entry_index = located.entry_index,
+            };
+            return located.entry.value;
+        }
+        if (try getFromRunWithLocalIndex(backend, run, held_values, value_allocator, namespace, key, backend_locked)) |value| {
+            read_hint.* = null;
+            return value;
+        }
+    }
+    return null;
+}
+
 fn getFromRunIndices(
     backend: anytype,
     runs: []Run,
@@ -3744,6 +3852,10 @@ fn getFromRunIndices(
     backend_locked: bool,
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) !?[]const u8 {
+    if (runIndicesUsePathBackedPointPrecheck(backend, runs, run_indices)) {
+        return try getFromPathRunIndicesPrechecked(backend, runs, run_indices, read_hint, held_blocks, held_values, value_allocator, namespace, key, backend_locked, batch_run_indexes);
+    }
+
     for (run_indices) |run_index| {
         backend.recordRunProbe();
         const run = &runs[run_index];

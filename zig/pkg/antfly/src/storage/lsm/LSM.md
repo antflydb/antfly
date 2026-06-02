@@ -262,6 +262,10 @@ Large-ingest guardrails:
      miss-at-a-time across candidate runs.
    - [x] First slice: point reads now consult the manifest-carried run bloom
      before loading a persisted run table index/block from `getFromRunIndices`.
+   - [x] Persisted path-backed point reads now run a precheck pass over
+     candidate runs using run bounds, run bloom, and table filter metadata
+     before loading surviving blocks; `ReadStats` exposes precheck and survivor
+     counters.
 2. [ ] Issue concurrent block reads for surviving point-read candidates where
    precedence allows it.
    - L0/tombstone semantics require resolving by source order, not by first
