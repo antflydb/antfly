@@ -391,6 +391,28 @@ pub const ProvisionedTableWriteCache = struct {
         }
     }
 
+    fn prepareFailedOpenRetirementLocked(self: *ProvisionedTableWriteCache, cached: CachedDb) !void {
+        if (cached.entry == null) return;
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, 1);
+    }
+
+    fn retireFailedOpenLocked(self: *ProvisionedTableWriteCache, cached: *CachedDb) void {
+        const entry = cached.entry orelse {
+            cached.deinit(self.alloc);
+            return;
+        };
+
+        var i: usize = 0;
+        while (i < self.entries.items.len) : (i += 1) {
+            if (self.entries.items[i] != entry) continue;
+            _ = self.entries.orderedRemove(i);
+            break;
+        }
+
+        if (!entry.retired) self.retireEntryLocked(entry);
+        cached.deinit(self.alloc);
+    }
+
     fn refreshRuntimeHooksLocked(self: *ProvisionedTableWriteCache) void {
         for (self.entries.items) |entry| {
             self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
@@ -725,7 +747,7 @@ pub const ProvisionedTableWriteCache = struct {
             .db = &owned_entry.db,
             .schema_json = metadata.schema_json,
         };
-        errdefer cached.deinit(self.alloc);
+        errdefer self.retireFailedOpenLocked(&cached);
         try owned_entry.db.drainResolverBackfill();
         return cached;
     }
@@ -2512,6 +2534,21 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    fn applyRuntimeHooksToUncachedDb(
+        self: *ProvisionedTableWriteSource,
+        db: *db_mod.DB,
+        group_id: u64,
+        owner_state: *ProvisionedTableWriteCache.PromotionOwnerState,
+    ) void {
+        db.setResolutionCandidateSource(self.resolution_candidate_source);
+        db.setEntitySink(self.entity_sink);
+        owner_state.* = .{
+            .group_id = group_id,
+            .leadership_source = self.promotion_leadership_source,
+        };
+        db.setPromotionOwner(owner_state.owner());
+    }
+
     pub fn withRaftBatcher(self: *ProvisionedTableWriteSource, batcher: ?RaftBatcher) *ProvisionedTableWriteSource {
         self.raft_batcher = batcher;
         return self;
@@ -3045,7 +3082,10 @@ pub const ProvisionedTableWriteSource = struct {
             if (ensure_auto_bulk_now_ns) |now_ns| try cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns);
             break :blk adopted;
         };
-        errdefer cached.deinit(cache.alloc);
+        var retire_cached_on_error = false;
+        errdefer if (retire_cached_on_error) cache.retireFailedOpenLocked(&cached) else cached.deinit(cache.alloc);
+        try cache.prepareFailedOpenRetirementLocked(cached);
+        retire_cached_on_error = true;
         try cached.db.drainResolverBackfill();
         return cached;
     }
@@ -3575,6 +3615,7 @@ pub const ProvisionedTableWriteSource = struct {
         var cached_db: ?ProvisionedTableWriteCache.CachedDb = null;
         defer if (cached_db) |*cached| cached.deinit(alloc);
         var uncached_db: ?db_mod.DB = null;
+        var uncached_promotion_owner_state: ProvisionedTableWriteCache.PromotionOwnerState = .{};
         const db = db_blk: {
             if (startup_cache) |cache| {
                 cached_db = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, startup_open_mode, null, null);
@@ -3586,7 +3627,22 @@ pub const ProvisionedTableWriteSource = struct {
             else
                 null;
             uncached_db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(alloc, path, value, null, null, lsm_root_generation, null, startup_open_mode, self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, identity_namespace)
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+                    alloc,
+                    path,
+                    value,
+                    null,
+                    null,
+                    lsm_root_generation,
+                    null,
+                    startup_open_mode,
+                    self.backend_runtime,
+                    self.antfly_provider,
+                    self.secret_store,
+                    self.remote_content,
+                    identity_namespace,
+                    .{ .drain_resolver_backfill = false },
+                )
             else
                 try db_mod.DB.open(alloc, path, .{
                     .open_mode = .writer_no_replay,
@@ -3601,6 +3657,8 @@ pub const ProvisionedTableWriteSource = struct {
                 });
             errdefer if (uncached_db) |*owned| owned.close();
             try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &uncached_db.?);
+            self.applyRuntimeHooksToUncachedDb(&uncached_db.?, group_id, &uncached_promotion_owner_state);
+            try uncached_db.?.drainResolverBackfill();
             break :db_blk &uncached_db.?;
         };
         defer if (uncached_db) |*owned| owned.close();
@@ -5870,7 +5928,10 @@ pub const HostedProvisionedTableWriteSource = struct {
             defer cache.mutex.unlock();
             break :blk try cache.write_cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
         };
-        errdefer cached.deinit(cache.write_cache.alloc);
+        var retire_cached_on_error = false;
+        errdefer if (retire_cached_on_error) cache.write_cache.retireFailedOpenLocked(&cached) else cached.deinit(cache.write_cache.alloc);
+        try cache.write_cache.prepareFailedOpenRetirementLocked(cached);
+        retire_cached_on_error = true;
         try cached.db.drainResolverBackfill();
         return cached;
     }

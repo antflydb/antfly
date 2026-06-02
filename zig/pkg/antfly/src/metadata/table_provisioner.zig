@@ -214,11 +214,11 @@ pub fn reconcileDbIndexesWithOptions(
     indexes_json: []const u8,
     options: ReconcileDbIndexOptions,
 ) !ProvisionSummary {
-    const removed = try removeMissingIndexes(alloc, db, indexes_json);
     const enrichments_added = try ensureEnrichments(alloc, db, indexes_json);
     const resolver_summary = try ensureResolversWithOptions(alloc, db, indexes_json, .{
         .drain_backfill = options.drain_resolver_backfill,
     });
+    const removed = try removeMissingIndexes(alloc, db, indexes_json);
     const added = try ensureIndexes(alloc, db, indexes_json);
     if (added > 0 or removed > 0 or enrichments_added > 0 or resolver_summary.changed()) {
         const pending = db.pendingWorkStats();
