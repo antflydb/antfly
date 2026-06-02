@@ -450,6 +450,8 @@ pub const Backend = struct {
         point_run_survivor_misses: u64 = 0,
         point_run_survivor_tombstones: u64 = 0,
         bloom_negatives: u64 = 0,
+        prefix_bloom_negatives: u64 = 0,
+        block_prefix_bloom_negatives: u64 = 0,
         read_hint_attempts: u64 = 0,
         read_hint_hits: u64 = 0,
         read_hint_misses: u64 = 0,
@@ -504,6 +506,8 @@ pub const Backend = struct {
         point_run_survivor_misses: CounterU64 = .init(0),
         point_run_survivor_tombstones: CounterU64 = .init(0),
         bloom_negatives: CounterU64 = .init(0),
+        prefix_bloom_negatives: CounterU64 = .init(0),
+        block_prefix_bloom_negatives: CounterU64 = .init(0),
         read_hint_attempts: CounterU64 = .init(0),
         read_hint_hits: CounterU64 = .init(0),
         read_hint_misses: CounterU64 = .init(0),
@@ -558,6 +562,8 @@ pub const Backend = struct {
                 .point_run_survivor_misses = self.point_run_survivor_misses.load(.monotonic),
                 .point_run_survivor_tombstones = self.point_run_survivor_tombstones.load(.monotonic),
                 .bloom_negatives = self.bloom_negatives.load(.monotonic),
+                .prefix_bloom_negatives = self.prefix_bloom_negatives.load(.monotonic),
+                .block_prefix_bloom_negatives = self.block_prefix_bloom_negatives.load(.monotonic),
                 .read_hint_attempts = self.read_hint_attempts.load(.monotonic),
                 .read_hint_hits = self.read_hint_hits.load(.monotonic),
                 .read_hint_misses = self.read_hint_misses.load(.monotonic),
@@ -2513,6 +2519,16 @@ pub const Backend = struct {
 
     pub fn recordBloomNegative(self: *Backend) void {
         _ = self.read_stats.bloom_negatives.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPrefixBloomNegative(self: *Backend) void {
+        _ = self.read_stats.bloom_negatives.fetchAdd(1, .monotonic);
+        _ = self.read_stats.prefix_bloom_negatives.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordBlockPrefixBloomNegative(self: *Backend) void {
+        _ = self.read_stats.bloom_negatives.fetchAdd(1, .monotonic);
+        _ = self.read_stats.block_prefix_bloom_negatives.fetchAdd(1, .monotonic);
     }
 
     pub fn recordReadHintAttempt(self: *Backend) void {
@@ -7638,6 +7654,8 @@ test "lsm backend prefix bloom skips bounded scan blocks" {
 
     const read_stats = backend.snapshotReadStats();
     try std.testing.expect(read_stats.bloom_negatives > 0);
+    try std.testing.expectEqual(read_stats.bloom_negatives, read_stats.prefix_bloom_negatives + read_stats.block_prefix_bloom_negatives);
+    try std.testing.expect(read_stats.prefix_bloom_negatives > 0 or read_stats.block_prefix_bloom_negatives > 0);
     try std.testing.expectEqual(@as(u64, 0), read_stats.cursor_block_loads);
     try std.testing.expectEqual(@as(u64, 0), read_stats.table_block_loads);
 }

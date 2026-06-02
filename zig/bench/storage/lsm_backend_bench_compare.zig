@@ -42,7 +42,9 @@ const Record = struct {
     read_point_run_survivor_hits: u64 = 0,
     read_point_run_survivor_misses: u64 = 0,
     read_point_run_survivor_tombstones: u64 = 0,
-    read_bloom_negatives: u64,
+    read_bloom_negatives: u64 = 0,
+    read_prefix_bloom_negatives: u64 = 0,
+    read_block_prefix_bloom_negatives: u64 = 0,
     read_mutable_hits: u64,
     read_l0_hits: u64,
     read_level_hits: u64,
@@ -121,6 +123,8 @@ const GroupAgg = struct {
     read_point_run_survivor_misses: MetricSeries = .{},
     read_point_run_survivor_tombstones: MetricSeries = .{},
     read_bloom_negatives: MetricSeries = .{},
+    read_prefix_bloom_negatives: MetricSeries = .{},
+    read_block_prefix_bloom_negatives: MetricSeries = .{},
     read_cursor_block_loads: MetricSeries = .{},
     read_cursor_block_reuses: MetricSeries = .{},
     read_cursor_value_borrows: MetricSeries = .{},
@@ -168,6 +172,8 @@ const GroupAgg = struct {
         self.read_point_run_survivor_misses.deinit(allocator);
         self.read_point_run_survivor_tombstones.deinit(allocator);
         self.read_bloom_negatives.deinit(allocator);
+        self.read_prefix_bloom_negatives.deinit(allocator);
+        self.read_block_prefix_bloom_negatives.deinit(allocator);
         self.read_cursor_block_loads.deinit(allocator);
         self.read_cursor_block_reuses.deinit(allocator);
         self.read_cursor_value_borrows.deinit(allocator);
@@ -209,6 +215,8 @@ const GroupAgg = struct {
         try self.read_point_run_survivor_misses.append(allocator, @floatFromInt(record.read_point_run_survivor_misses));
         try self.read_point_run_survivor_tombstones.append(allocator, @floatFromInt(record.read_point_run_survivor_tombstones));
         try self.read_bloom_negatives.append(allocator, @floatFromInt(record.read_bloom_negatives));
+        try self.read_prefix_bloom_negatives.append(allocator, @floatFromInt(record.read_prefix_bloom_negatives));
+        try self.read_block_prefix_bloom_negatives.append(allocator, @floatFromInt(record.read_block_prefix_bloom_negatives));
         try self.read_cursor_block_loads.append(allocator, @floatFromInt(record.read_cursor_block_loads));
         try self.read_cursor_block_reuses.append(allocator, @floatFromInt(record.read_cursor_block_reuses));
         try self.read_cursor_value_borrows.append(allocator, @floatFromInt(record.read_cursor_value_borrows));
@@ -399,6 +407,10 @@ fn printComparison(
     const after_survivor_tombstones = try after.read_point_run_survivor_tombstones.median(allocator);
     const before_bloom = try before.read_bloom_negatives.median(allocator);
     const after_bloom = try after.read_bloom_negatives.median(allocator);
+    const before_prefix_bloom = try before.read_prefix_bloom_negatives.median(allocator);
+    const after_prefix_bloom = try after.read_prefix_bloom_negatives.median(allocator);
+    const before_block_prefix_bloom = try before.read_block_prefix_bloom_negatives.median(allocator);
+    const after_block_prefix_bloom = try after.read_block_prefix_bloom_negatives.median(allocator);
     const before_cursor_loads = try before.read_cursor_block_loads.median(allocator);
     const after_cursor_loads = try after.read_cursor_block_loads.median(allocator);
     const before_cursor_reuses = try before.read_cursor_block_reuses.median(allocator);
@@ -466,6 +478,15 @@ fn printComparison(
     try writePercentDelta(writer, after_probes, before_probes);
     try writer.print(")  bloom_neg {d:.0} -> {d:.0} (", .{ before_bloom, after_bloom });
     try writePercentDelta(writer, after_bloom, before_bloom);
+    if (before_prefix_bloom > 0 or after_prefix_bloom > 0 or before_block_prefix_bloom > 0 or after_block_prefix_bloom > 0) {
+        try writer.print(")  prefix/block_prefix_neg {d:.0}/{d:.0} -> {d:.0}/{d:.0} (", .{
+            before_prefix_bloom,
+            before_block_prefix_bloom,
+            after_prefix_bloom,
+            after_block_prefix_bloom,
+        });
+        try writePercentDelta(writer, after_prefix_bloom + after_block_prefix_bloom, before_prefix_bloom + before_block_prefix_bloom);
+    }
     if (before_prechecks > 0 or after_prechecks > 0 or before_precheck_survivors > 0 or after_precheck_survivors > 0) {
         try writer.print(")  precheck/survive {d:.0}/{d:.0} -> {d:.0}/{d:.0} (", .{
             before_prechecks,

@@ -260,6 +260,9 @@ Large-ingest guardrails:
      run-level prefix bloom, and per-block prefix blooms.
    - Persisted forward scans use prefix blooms to skip block loads when the
      scan upper bound proves the cursor cannot leave the extracted prefix.
+   - Read stats and read-bench JSON now split whole-run prefix-bloom negatives
+     from block-level prefix-bloom negatives, so before/after comparisons can
+     verify useful prefix skips separately from exact-key bloom negatives.
 
 ### Point Read Work
 
@@ -1436,7 +1439,9 @@ The harness emits JSONL with:
 - reopen-heavy open/get/miss/short-scan timings
 - mixed read/write timings
 - storage read counters (`read_file`, `read_range`, `read_trailer`, `file_size`)
-- backend read-stat deltas (`point_gets`, `run_probes`, `bloom_negatives`, etc.)
+- backend read-stat deltas (`read_point_gets`, `read_run_probes`,
+  `read_bloom_negatives`, `read_prefix_bloom_negatives`,
+  `read_block_prefix_bloom_negatives`, etc.)
 - shared-cache hit/miss deltas when cache is enabled
 
 Run the same command on two revisions and diff the JSON lines by `scenario + workload`.

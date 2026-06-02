@@ -121,6 +121,22 @@ fn recordCursorTableIndexMiss(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorTableIndexMiss")) backend.recordCursorTableIndexMiss();
 }
 
+fn recordPrefixBloomNegative(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "recordPrefixBloomNegative")) {
+        backend.recordPrefixBloomNegative();
+    } else if (@hasDecl(@TypeOf(backend.*), "recordBloomNegative")) {
+        backend.recordBloomNegative();
+    }
+}
+
+fn recordBlockPrefixBloomNegative(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "recordBlockPrefixBloomNegative")) {
+        backend.recordBlockPrefixBloomNegative();
+    } else if (@hasDecl(@TypeOf(backend.*), "recordBloomNegative")) {
+        backend.recordBloomNegative();
+    }
+}
+
 fn compareTableEntryTo(entry: lsm_table_file.Entry, namespace: backend_types.Namespace, key: []const u8) std.math.Order {
     const namespace_order = compareNamespace(.{ .name = entry.namespace_name }, namespace);
     if (namespace_order != .eq) return namespace_order;
@@ -1442,7 +1458,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const scan_prefix = self.boundedScanPrefix(index, target);
             if (scan_prefix) |prefix| {
                 if (!index.maybeContainsPrefix(self.namespace.name, prefix)) {
-                    self.backend.recordBloomNegative();
+                    recordPrefixBloomNegative(self.backend);
                     return null;
                 }
             }
@@ -1454,7 +1470,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     if (self.blockStartsAtOrPastUpper(block)) return null;
                     if (scan_prefix) |prefix| {
                         if (!block.maybeContainsPrefix(self.namespace.name, prefix)) {
-                            self.backend.recordBloomNegative();
+                            recordBlockPrefixBloomNegative(self.backend);
                             continue;
                         }
                     }
@@ -1542,7 +1558,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 if (self.blockStartsAtOrPastUpper(block)) return null;
                 if (scan_prefix) |prefix| {
                     if (!block.maybeContainsPrefix(self.namespace.name, prefix)) {
-                        self.backend.recordBloomNegative();
+                        recordBlockPrefixBloomNegative(self.backend);
                         idx = block.lastEntryIndex() + 1;
                         continue;
                     }
