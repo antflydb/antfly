@@ -134,6 +134,18 @@ pub const RelationalColumn = struct {
     indexed: bool = true,
 };
 
+pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []const RelationalColumn) bool {
+    if (current.len != next.len) return false;
+    for (current, next) |a, b| {
+        if (!std.mem.eql(u8, a.name, b.name)) return false;
+        if (!std.mem.eql(u8, a.path, b.path)) return false;
+        if (a.field_type != b.field_type) return false;
+        if (a.nullable != b.nullable) return false;
+        if (a.indexed != b.indexed) return false;
+    }
+    return true;
+}
+
 pub const TableSchema = struct {
     version: u32 = 0,
     default_type: []const u8 = "_default",

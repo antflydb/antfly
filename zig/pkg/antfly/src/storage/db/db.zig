@@ -4938,6 +4938,7 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
 
+        try self.validateTableSchemaCompatibilityLocked(alloc, runtime_schema);
         if (options.reload_algebraic_schema_configs) {
             try self.stageAlgebraicSchemaConfigsPending(schema_json);
         }
@@ -4949,6 +4950,67 @@ pub const DB = struct {
         if (options.reload_algebraic_schema_configs) {
             try self.completePendingAlgebraicSchemaRebuilds();
         }
+    }
+
+    fn validateTableSchemaCompatibilityLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
+        if (self.core.schema) |current_schema| {
+            return validateRuntimeTableSchemaTransition(current_schema, next_schema);
+        }
+
+        const durable_schema = try schema_mod.loadSchema(self.core.store, alloc);
+        defer if (durable_schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+        if (durable_schema) |current_schema| {
+            return validateRuntimeTableSchemaTransition(current_schema, next_schema);
+        }
+
+        try self.validateFirstTableSchemaApplyAgainstExistingRows(alloc, next_schema);
+    }
+
+    fn validateRuntimeTableSchemaTransition(current_schema: schema_mod.TableSchema, next_schema: schema_mod.TableSchema) !void {
+        if (current_schema.storage_mode != next_schema.storage_mode) return error.InvalidSchemaUpdateRequest;
+        if (next_schema.storage_mode != .relational) return;
+        if (!schema_mod.relationalColumnCatalogsEqual(current_schema.relational_columns, next_schema.relational_columns)) {
+            return error.InvalidSchemaUpdateRequest;
+        }
+    }
+
+    const ExistingPhysicalStorageMode = enum {
+        empty,
+        document,
+        relational,
+        mixed,
+    };
+
+    fn validateFirstTableSchemaApplyAgainstExistingRows(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
+        const existing_mode = try self.detectExistingPhysicalStorageMode(alloc);
+        switch (existing_mode) {
+            .empty => return,
+            .document => if (next_schema.storage_mode != .document) return error.InvalidSchemaUpdateRequest,
+            .relational => if (next_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest,
+            .mixed => return error.InvalidSchemaUpdateRequest,
+        }
+    }
+
+    fn detectExistingPhysicalStorageMode(self: *DB, alloc: Allocator) !ExistingPhysicalStorageMode {
+        const lower = [_]u8{internal_keys.user_namespace};
+        const upper = [_]u8{internal_keys.user_namespace + 1};
+        const rows = try self.core.store.scanRange(alloc, lower[0..], upper[0..]);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+
+        var saw_document = false;
+        var saw_relational = false;
+        for (rows) |entry| {
+            if (internal_keys.isPrimaryDocumentKey(entry.key)) {
+                saw_document = true;
+            } else if (internal_keys.isRelationalRowKey(entry.key)) {
+                saw_relational = true;
+            }
+            if (saw_document and saw_relational) return .mixed;
+        }
+
+        if (saw_document) return .document;
+        if (saw_relational) return .relational;
+        return .empty;
     }
 
     /// Returns the relational column catalog when the table is in relational
@@ -20822,6 +20884,81 @@ test "db staged algebraic pending waits for first durable schema" {
         defer alloc.free(local_schema_json);
         try std.testing.expectEqualStrings(schema_v2, local_schema_json);
     }
+}
+
+test "db direct schema apply rejects storage mode switches" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const document_schema =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}}}
+    ;
+    const relational_schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, document_schema, .{});
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, relational_schema, .{}));
+
+    const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+    defer schema_mod.freeSchema(alloc, durable_schema);
+    try std.testing.expectEqual(schema_mod.StorageMode.document, durable_schema.storage_mode);
+}
+
+test "db direct schema apply rejects relational base column changes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const relational_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    const changed_columns_schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"keyword"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, relational_schema, .{});
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, changed_columns_schema, .{}));
+
+    const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+    defer schema_mod.freeSchema(alloc, durable_schema);
+    try std.testing.expectEqual(schema_mod.StorageMode.relational, durable_schema.storage_mode);
+    try std.testing.expectEqual(schema_mod.AntflyType.numeric, durable_schema.relational_columns[1].field_type);
+}
+
+test "db first relational schema apply rejects existing document rows" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:existing", .value = "{\"title\":\"already document mode\"}" }},
+    });
+
+    const relational_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, relational_schema, .{}));
+    const schema = try schema_mod.loadSchema(db.core.store, alloc);
+    defer if (schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+    try std.testing.expect(schema == null);
 }
 
 test "db text merge enabled requires backend runtime io" {

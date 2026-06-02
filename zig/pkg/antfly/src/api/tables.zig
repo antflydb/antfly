@@ -879,24 +879,9 @@ fn validateRelationalStorageModeUpdateAlloc(
     const next_runtime = try schema_mod.deriveRuntimeTableSchema(alloc, next_parsed);
     defer runtime_schema_mod.freeSchema(alloc, next_runtime);
 
-    if (!relationalColumnCatalogsEqual(current_runtime.relational_columns, next_runtime.relational_columns)) {
+    if (!runtime_schema_mod.relationalColumnCatalogsEqual(current_runtime.relational_columns, next_runtime.relational_columns)) {
         return error.InvalidSchemaUpdateRequest;
     }
-}
-
-fn relationalColumnCatalogsEqual(
-    current: []const runtime_schema_mod.RelationalColumn,
-    next: []const runtime_schema_mod.RelationalColumn,
-) bool {
-    if (current.len != next.len) return false;
-    for (current, next) |a, b| {
-        if (!std.mem.eql(u8, a.name, b.name)) return false;
-        if (!std.mem.eql(u8, a.path, b.path)) return false;
-        if (a.field_type != b.field_type) return false;
-        if (a.nullable != b.nullable) return false;
-        if (a.indexed != b.indexed) return false;
-    }
-    return true;
 }
 
 pub fn routeQueryRequestToActiveReadIndex(
