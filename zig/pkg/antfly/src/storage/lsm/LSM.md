@@ -180,6 +180,9 @@ and maintenance that is always debt-driven.
      into the ResourceManager `lsm.table_builder_working_set` slice and
      release it after finish/abort, so builder peaks are visible separately
      from block cache, memtables, WAL retention, and compaction scheduler work.
+   - [x] State-backed run publication now streams directly from `State` entries
+     through `StreamingRunFileWriter`, instead of first materializing one
+     whole-run `[]TableEntry` scratch array before writing the table file.
    - Peak memory should be the active builder block/window plus bounded scratch,
      not the whole run, whole merge output, or whole artifact.
    - ResourceManager should account table-builder bytes, compaction scratch,

@@ -1620,7 +1620,14 @@ pub fn makeRunAtLevel(comptime BackendType: type, backend: *BackendType, state: 
     errdefer if (run.bloom_filter) |*filter| filter.deinit(backend.allocator);
 
     if (backend.root_dir != null) {
-        run.path = try repository_mod.persistRunFileWithStorage(backend.storage.?, backend.allocator, backend.root_dir.?, &run, backend.options.table_block_compression);
+        run.path = try repository_mod.persistRunFileWithStorageAccounted(
+            backend.storage.?,
+            backend.allocator,
+            backend.root_dir.?,
+            &run,
+            backend.options.table_block_compression,
+            backend.options.resource_manager,
+        );
         if (run.state) |*persisted_state| persisted_state.deinit(backend.allocator);
         run.state = null;
     }
