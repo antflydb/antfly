@@ -1315,10 +1315,20 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
         for i in range(48)
     }
     _insert_docs(cluster, table_name, docs, min_group_count=1)
-    cluster.trigger_reallocate()
+
+    last_reallocate_at = 0.0
+
+    def maybe_trigger_reallocate() -> None:
+        nonlocal last_reallocate_at
+        now = time.monotonic()
+        if now - last_reallocate_at < 5.0:
+            return
+        cluster.trigger_reallocate()
+        last_reallocate_at = now
 
     def split_completed() -> set[int] | None:
         try:
+            maybe_trigger_reallocate()
             group_ids = _table_group_ids(cluster, table_name)
         except (AssertionError, requests.RequestException):
             return None
