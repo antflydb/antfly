@@ -65,6 +65,7 @@ pub const ReplayStats = struct {
 pub const ReplayHooks = struct {
     ctx: *anyopaque,
     entry_allocator: ?*const fn (ctx: *anyopaque, default_allocator: Allocator) anyerror!Allocator = null,
+    on_applied_entry: ?*const fn (ctx: *anyopaque, segment: u64) anyerror!void = null,
     on_applied_record: *const fn (ctx: *anyopaque, segment: u64, entries: u64) anyerror!void,
 };
 
@@ -1086,7 +1087,7 @@ fn consumeCompleteRecords(
                     allocator
             else
                 allocator;
-            const applied = decodePayloadIntoMutable(apply_allocator, payload, mutable) catch |err| switch (err) {
+            const applied = decodePayloadIntoMutableWithHooks(apply_allocator, payload, mutable, hooks, segment) catch |err| switch (err) {
                 error.CorruptLsmWal => {
                     logCorruptWalDetail("record_decode", segment, pos, pending.items.len, "state record payload decode failed");
                     return err;
@@ -1599,6 +1600,16 @@ fn encodedPayloadLen(state: anytype) usize {
 }
 
 fn decodePayloadIntoMutable(allocator: Allocator, payload: []const u8, mutable: anytype) !u64 {
+    return try decodePayloadIntoMutableWithHooks(allocator, payload, mutable, null, 0);
+}
+
+fn decodePayloadIntoMutableWithHooks(
+    allocator: Allocator,
+    payload: []const u8,
+    mutable: anytype,
+    hooks: ?ReplayHooks,
+    segment: u64,
+) !u64 {
     var pos: usize = 0;
     const entry_count = try readInt(payload, &pos, u32);
     var applied: u64 = 0;
@@ -1623,6 +1634,11 @@ fn decodePayloadIntoMutable(allocator: Allocator, payload: []const u8, mutable: 
         const namespace = backend_types.Namespace{ .name = if ((flags & 0x02) != 0) ns else null };
         try mutable.upsert(allocator, namespace, key, value, (flags & 0x01) != 0);
         applied += 1;
+        if (hooks) |active_hooks| {
+            if (active_hooks.on_applied_entry) |on_applied_entry| {
+                try on_applied_entry(active_hooks.ctx, segment);
+            }
+        }
     }
     if (pos != payload.len) return error.CorruptLsmWal;
     return applied;

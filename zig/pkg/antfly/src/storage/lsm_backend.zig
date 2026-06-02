@@ -2167,6 +2167,7 @@ pub const Backend = struct {
             .{
                 .ctx = @ptrCast(self),
                 .entry_allocator = replayWalEntryAllocatorHook,
+                .on_applied_entry = replayWalAppliedEntryHook,
                 .on_applied_record = replayWalAppliedRecordHook,
             }
         else
@@ -2196,6 +2197,13 @@ pub const Backend = struct {
         self.write_stats.wal_replay_bytes += stats.bytes;
         self.write_stats.wal_replay_ns += self.writeStatsElapsedNs(start_ns);
         self.write_stats.wal_replay_truncated_tail_bytes += stats.truncated_tail_bytes;
+    }
+
+    fn replayWalAppliedEntryHook(ctx: *anyopaque, segment: u64) anyerror!void {
+        const self: *Backend = @ptrCast(@alignCast(ctx));
+        if (segment != 0) self.noteMutableWalSegment(segment);
+        if (!self.shouldFlushMutable()) return;
+        try self.flushMutable();
     }
 
     fn replayWalAppliedRecordHook(ctx: *anyopaque, segment: u64, _: u64) anyerror!void {
@@ -9828,6 +9836,56 @@ test "lsm backend recovery replay stores mutable entries in a flush-scoped arena
     try std.testing.expectEqual(@as(usize, 0), reopened.mutable.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), reopened.activeImmutableMemtableCount());
     try std.testing.expect(reopened.runs.items.len > 0);
+}
+
+test "lsm backend recovery replay byte threshold flushes within a large wal record" {
+    const alloc = std.testing.allocator;
+    var memory_storage = storage_io.MemoryStorage.init(alloc);
+    defer memory_storage.deinit();
+
+    const root_dir = "/memory/recovery-replay-byte-flush-inside-record";
+    try memory_storage.storage().createDirPath(root_dir);
+
+    const large_value = try alloc.alloc(u8, 128);
+    defer alloc.free(large_value);
+    @memset(large_value, 'v');
+
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.upsert(alloc, .{ .name = "docs" }, "doc:a", large_value, false);
+    try state.upsert(alloc, .{ .name = "docs" }, "doc:b", large_value, false);
+    try state.upsert(alloc, .{ .name = "docs" }, "doc:c", large_value, false);
+    _ = try wal_mod.appendStateWithOptions(
+        memory_storage.storage(),
+        alloc,
+        root_dir,
+        &state,
+        false,
+        .{ .segment_bytes = 4096 },
+    );
+
+    var reopened = try Backend.open(alloc, root_dir, .{
+        .flush_threshold = 1024,
+        .flush_threshold_bytes = 96,
+        .storage = memory_storage.storage(),
+    });
+    defer reopened.close();
+
+    const maintenance = reopened.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_entries);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.immutable_memtables);
+    try std.testing.expect(reopened.runs.items.len >= 2);
+
+    const write_stats = reopened.snapshotWriteStats();
+    try std.testing.expect(write_stats.immutable_flushes >= 2);
+
+    var runtime = try reopened.runtimeNamespaceStore(alloc);
+    defer runtime.deinit();
+    var txn = try runtime.beginRead();
+    defer txn.abort();
+    try std.testing.expectEqualStrings(large_value, try txn.get(.{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings(large_value, try txn.get(.{ .name = "docs" }, "doc:b"));
+    try std.testing.expectEqualStrings(large_value, try txn.get(.{ .name = "docs" }, "doc:c"));
 }
 
 test "lsm backend reloads persisted manifest and run files over host storage" {

@@ -358,6 +358,10 @@ Large-ingest guardrails:
      is released once the unconsumed tail is back inside the normal chunk
      window. The shared scratch path now grows and frees this buffer with the
      same scratch allocator.
+   - [x] Recovery replay now checks the mutable byte threshold after each
+     decoded WAL entry, so one large state record can flush incrementally
+     instead of materializing the whole record in the active mutable arena
+     before the first recovery flush.
 4. [ ] Add final-state HBC bulk publication for sustained ingest so large loads
    avoid persisting every intermediate online mutation.
 5. [x] Add background IO admission budgeting for maintenance work.
