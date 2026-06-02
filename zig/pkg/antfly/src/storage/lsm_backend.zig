@@ -726,6 +726,7 @@ pub const Backend = struct {
     background_executor: BackgroundExecutor = BackgroundExecutor.initInline(0),
     immutable_flush_job_in_flight: bool = false,
     immutable_flush_build_in_flight: bool = false,
+    maintenance_job_in_flight: bool = false,
     maintenance_io_budget_remaining: ?u64 = null,
     background_io_reserved_bytes: u64 = 0,
     background_io_denied_jobs: u64 = 0,
@@ -1537,6 +1538,7 @@ pub const Backend = struct {
             }
         }
         try self.enforceWalRetentionHardPressureGuarded();
+        self.scheduleMaintenanceJobIfNeededLocked();
     }
 
     fn shouldDeferCommitFlush(self: *const Backend) bool {
@@ -1783,6 +1785,31 @@ pub const Backend = struct {
     }
 
     fn deinitImmutableFlushJob(_: *anyopaque) void {}
+
+    fn scheduleMaintenanceJobIfNeededLocked(self: *Backend) void {
+        if (self.options.backend.read_only or self.bulkIngestActive()) return;
+        if (self.maintenance_job_in_flight) return;
+        if (self.immutable_flush_job_in_flight or self.immutable_flush_build_in_flight) return;
+        if (self.activeImmutableMemtableCount() > 0) return;
+        if (!self.background_executor.canRunDetached()) return;
+        if (self.maintenanceScoreLocked() == 0) return;
+
+        self.maintenance_job_in_flight = true;
+        self.background_executor.submit(.maintenance, self, runMaintenanceJob, deinitMaintenanceJob) catch |err| {
+            self.maintenance_job_in_flight = false;
+            std.log.warn("lsm maintenance background scheduling failed root={?s} err={}", .{ self.root_dir, err });
+        };
+    }
+
+    fn runMaintenanceJob(ptr: *anyopaque) !void {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        defer self.maintenance_job_in_flight = false;
+        _ = try self.runMaintenanceStepLocked();
+    }
+
+    fn deinitMaintenanceJob(_: *anyopaque) void {}
 
     fn flushOldestImmutableMemtable(self: *Backend) !bool {
         if (self.activeImmutableMemtableCount() == 0) return false;
@@ -4123,6 +4150,80 @@ test "lsm backend manual runtime flush progress does not require threads" {
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
     try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
+}
+
+test "lsm backend schedules detached maintenance job for compaction debt" {
+    const FakeLane = struct {
+        submitted_job: ?background_runtime_mod.Job = null,
+
+        fn lane(self: *@This()) background_runtime_mod.DurableJobLane {
+            return .{
+                .ptr = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.submitted_job == null);
+            self.submitted_job = job;
+        }
+
+        fn drainOwner(_: *anyopaque, _: u64) void {}
+
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+
+        const vtable = background_runtime_mod.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drainOwner,
+            .poll = poll,
+        };
+    };
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var lane = FakeLane{};
+    const executor = BackgroundExecutor.initLane(lane.lane(), 782);
+    var backend = try Backend.open(std.testing.allocator, "/lsm-background-maintenance-job-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .background_executor = &executor,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:a", "a");
+        try txn.commit();
+    }
+    try std.testing.expect(lane.submitted_job == null);
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:b", "b");
+        try txn.commit();
+    }
+    try std.testing.expect(lane.submitted_job != null);
+    try std.testing.expect(backend.maintenance_job_in_flight);
+    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
+
+    var job = lane.submitted_job.?;
+    lane.submitted_job = null;
+    try job.run(job.ptr);
+    job.deinit(job.ptr);
+
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expect(backend.compaction_stats.compactions > 0);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+    try std.testing.expectEqualStrings("a", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:a"));
+    try std.testing.expectEqualStrings("b", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
 }
 
 test "lsm backends share one threaded runtime durable lane" {

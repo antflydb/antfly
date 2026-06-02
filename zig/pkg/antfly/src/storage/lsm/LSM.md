@@ -416,6 +416,12 @@ Large-ingest guardrails:
      non-overlapping candidates when job and byte budgets allow. This does not
      raise concurrency by itself, but it establishes the required admission
      invariant before enabling parallel background compaction.
+   - [x] Detached maintenance slice: backends with a detached background
+     executor now enqueue one `.maintenance` job when post-write flush/compaction
+     debt is visible and no immutable flush job is already responsible for the
+     same work. The job runs a bounded maintenance step off the foreground path,
+     so soft L0 debt can make progress without waiting for a later writer to
+     call maintenance explicitly.
    - [x] Policy slice: scheduled maintenance now has a default-off
      `max_compaction_input_bytes` cap. Plan selection can skip oversized
      compactions and choose eligible smaller work instead of repeatedly
