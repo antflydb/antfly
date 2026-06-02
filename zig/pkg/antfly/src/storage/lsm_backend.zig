@@ -103,9 +103,9 @@ pub const Options = struct {
     defer_flush_on_commit: bool = false,
     max_deferred_immutable_memtables: usize = 8,
     direct_bulk_ingest: bool = true,
-    level_target_runs_base: usize = 4,
+    level_target_runs_base: usize = 32,
     level_target_runs_multiplier: usize = 4,
-    level_target_bytes_base: usize = 128 * 1024,
+    level_target_bytes_base: usize = 1024 * 1024,
     level_target_bytes_multiplier: usize = 8,
     max_compaction_input_bytes: u64 = 0,
     max_compaction_input_allow_oversized_single_job: bool = true,
@@ -3793,6 +3793,26 @@ fn countRunEntriesForTest(backend: *Backend) !usize {
     return count;
 }
 
+fn appendSyntheticLevelRunsForTest(backend: *Backend, level: u32, count: usize, size_bytes: u64) !void {
+    for (0..count) |idx| {
+        try backend.runs.append(backend.allocator, .{
+            .id = @intCast(idx + 1),
+            .level = level,
+            .size_bytes = size_bytes,
+            .path = null,
+            .smallest_namespace_name = null,
+            .smallest_key = &.{},
+            .largest_namespace_name = null,
+            .largest_key = &.{},
+            .entry_count = 1,
+            .bloom_filter = null,
+            .encoded_bloom_filter = null,
+            .owns_metadata = false,
+            .state = null,
+        });
+    }
+}
+
 fn sleepForTest(duration_ns: u64) void {
     if (comptime builtin.os.tag == .freestanding) return;
     var req = std.posix.timespec{
@@ -3804,6 +3824,30 @@ fn sleepForTest(duration_ns: u64) void {
         .INTR => continue,
         else => return,
     };
+}
+
+test "lsm backend default base level target absorbs L0 pressure output" {
+    var backend = Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    try appendSyntheticLevelRunsForTest(&backend, 1, 28, 20 * 1024);
+
+    const stats = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.level_overflow_runs);
+    try std.testing.expectEqual(@as(u64, 0), stats.level_overflow_bytes);
+    try std.testing.expectEqual(@as(u64, 28), stats.lower_level_runs);
+}
+
+test "lsm backend tight base level target reports lower-level overflow" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .level_target_runs_base = 4,
+        .level_target_bytes_base = 128 * 1024,
+    });
+    defer backend.close();
+    try appendSyntheticLevelRunsForTest(&backend, 1, 28, 20 * 1024);
+
+    const stats = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 24), stats.level_overflow_runs);
+    try std.testing.expect(stats.level_overflow_bytes > 0);
 }
 
 test "lsm backend runtime erases namespace store handles" {

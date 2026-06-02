@@ -294,12 +294,13 @@ Collected on 2026-06-02 from this worktree with 3 samples and 20k keys:
   and shared block hit/miss `59986/14`.
 - L0-pressure command: `zig build lsm-write-bench -- --samples 3 --keys 20000 --batch-size 100 --flush-threshold 100 --storage host --mode default --workload-set l0_pressure > /tmp/lsm-write-l0-current.jsonl`
 - L0-pressure comparator smoke: `zig build lsm-write-bench-compare -- --before /tmp/lsm-write-l0-current.jsonl --after /tmp/lsm-write-l0-current.jsonl`
-- L0-pressure load median: `ns/op=1954.05`, effective L0 soft/hard
-  `4/8`, foreground write-pressure compactions `96`, `l0_runs_after=8`,
-  `compactable_l0_runs_after=4`, `level_overflow_runs_after=92`,
+- L0-pressure load median after the 2026-06-02 base-level target tuning:
+  `ns/op=1449.60`, effective L0 soft/hard `4/8`, foreground write-pressure
+  compactions `28`, `l0_runs_after=4`, `compactable_l0_runs_after=0`,
+  `level_overflow_runs_after=0`, `level_overflow_bytes_after=0`,
   `wal_retained_bytes_after=0`.
-- L0 maintenance median: `ns/op=4711000.00`, compactions `3`,
-  `l0_runs_after=4`, `compactable_l0_runs_after=0`,
+- L0 maintenance median after the same tuning: `ns/op=250.00`,
+  compactions `0`, `l0_runs_after=4`, `compactable_l0_runs_after=0`,
   `level_overflow_runs_after=0`, `wal_retained_bytes_after=0`.
 - After widening nonzero L0 pressure assist windows to compact up to
   `2 * l0_limit`, the same 3-sample L0-pressure run produced load
@@ -307,10 +308,15 @@ Collected on 2026-06-02 from this worktree with 3 samples and 20k keys:
   `compactable_l0_runs_after=0`, `level_overflow_runs_after=24`, and
   `wal_retained_bytes_after=0`. Follow-up maintenance dropped to
   `ns/op=1504125.00` with `1` compaction.
+- Before the base-level target tuning, the same current run still left
+  `level_overflow_runs_after=24` and required one follow-up maintenance
+  compaction. Raising the default base-level target from 4 runs/128 KiB to
+  32 runs/1 MiB removes that immediate L1 overflow while preserving bounded L0
+  and zero retained WAL.
 
-The next compaction-policy slice should target the foreground compaction cost
-and post-load lower-level overflow shown by the L0-pressure load phase, while
-preserving the zero retained-WAL after-state and bounded maintenance cleanup.
+The next compaction-policy slice should target the remaining foreground
+compaction cost shown by the L0-pressure load phase, while preserving the zero
+retained-WAL after-state and bounded maintenance cleanup.
 
 Large-ingest guardrails:
 
@@ -573,9 +579,14 @@ Large-ingest guardrails:
      `2 * l0_limit`, while preserving the `l0_limit=0` oldest-pair fallback.
      On the 20k-key L0-pressure benchmark, load median moved from
      `1954.05 ns/op` to `1546.75 ns/op`, foreground write-pressure
-     compactions from `96` to `28`, post-load L0 runs from `8` to `4`,
-     compactable L0 runs from `4` to `0`, lower-level overflow runs from `92`
-     to `24`, and follow-up maintenance compactions from `3` to `1`.
+     compactions stayed at `28`, L0 stayed at `4`, and follow-up maintenance
+     dropped to one compaction.
+   - [x] Base-level target tuning: default lower-level targets now start at
+     32 runs and 1 MiB instead of 4 runs and 128 KiB. On the same 20k-key
+     L0-pressure harness, median load moved from `1518.05 ns/op` to
+     `1449.60 ns/op`, post-load `level_overflow_runs_after` fell from `24` to
+     `0`, and follow-up maintenance compactions fell from `1` to `0`, while
+     `l0_runs_after=4` and `wal_retained_bytes_after=0` were preserved.
    - [x] Max compaction input bytes now behaves like a target for scheduled L0
      maintenance: if no legal L0 compaction fits under the cap, the scheduler
      can admit the minimum oversized job so soft L0 debt does not get stuck

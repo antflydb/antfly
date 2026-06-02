@@ -45,9 +45,9 @@ const Config = struct {
     l0_hard_limit_runs: usize = 0,
     l0_soft_limit_bytes: u64 = 0,
     l0_hard_limit_bytes: u64 = 0,
-    level_target_runs_base: usize = 4,
+    level_target_runs_base: usize = 32,
     level_target_runs_multiplier: usize = 4,
-    level_target_bytes_base: usize = 128 * 1024,
+    level_target_bytes_base: usize = 1024 * 1024,
     level_target_bytes_multiplier: usize = 8,
     max_run_file_bytes: usize = 512 * 1024 * 1024,
     max_compaction_input_bytes: u64 = 0,
@@ -521,7 +521,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     try out.print(
-        "lsm write bench samples={d} keys={d} hot_keys={d} overwrite_rounds={d} value_size={d} value_pattern={s} batch_size={d} update_stride={d} delete_stride={d} flush_threshold={d} flush_threshold_bytes={d} compact_threshold_runs={d} l0_soft_limit_runs={d} l0_hard_limit_runs={d} l0_soft_limit_bytes={d} l0_hard_limit_bytes={d} max_run_file_bytes={d} max_compaction_input_bytes={d} max_compaction_input_allow_oversized_single_job={} background_io_budget_bytes={d} background_io_allow_oversized_single_job={} wal_sync_on_commit={} readers={d} storage={s} mode={s} workload_set={s}\n",
+        "lsm write bench samples={d} keys={d} hot_keys={d} overwrite_rounds={d} value_size={d} value_pattern={s} batch_size={d} update_stride={d} delete_stride={d} flush_threshold={d} flush_threshold_bytes={d} compact_threshold_runs={d} l0_soft_limit_runs={d} l0_hard_limit_runs={d} l0_soft_limit_bytes={d} l0_hard_limit_bytes={d} level_target_runs_base={d} level_target_runs_multiplier={d} level_target_bytes_base={d} level_target_bytes_multiplier={d} max_run_file_bytes={d} max_compaction_input_bytes={d} max_compaction_input_allow_oversized_single_job={} background_io_budget_bytes={d} background_io_allow_oversized_single_job={} wal_sync_on_commit={} readers={d} storage={s} mode={s} workload_set={s}\n",
         .{
             cfg.samples,
             cfg.keys,
@@ -539,6 +539,10 @@ pub fn main(init: std.process.Init) !void {
             cfg.l0_hard_limit_runs,
             cfg.l0_soft_limit_bytes,
             cfg.l0_hard_limit_bytes,
+            cfg.level_target_runs_base,
+            cfg.level_target_runs_multiplier,
+            cfg.level_target_bytes_base,
+            cfg.level_target_bytes_multiplier,
             cfg.max_run_file_bytes,
             cfg.max_compaction_input_bytes,
             cfg.max_compaction_input_allow_oversized_single_job,
