@@ -78,6 +78,7 @@ const Record = struct {
     mutable_entries_after: u64 = 0,
     wal_retained_segments_after: u64 = 0,
     wal_retained_bytes_after: u64 = 0,
+    wal_checkpoint_covered_through_segment_after: u64 = 0,
     wal_checkpoint_lag_segments_after: u64 = 0,
     wal_replay_retained_segments_after: u64 = 0,
     wal_replay_retained_bytes_after: u64 = 0,
@@ -168,6 +169,7 @@ const GroupAgg = struct {
     obsolete_paths_after: MetricSeries = .{},
     wal_retained_segments_after: MetricSeries = .{},
     wal_retained_bytes_after: MetricSeries = .{},
+    wal_checkpoint_covered_through_segment_after: MetricSeries = .{},
     wal_checkpoint_lag_segments_after: MetricSeries = .{},
     wal_replay_retained_segments_after: MetricSeries = .{},
     wal_replay_retained_bytes_after: MetricSeries = .{},
@@ -233,6 +235,7 @@ const GroupAgg = struct {
         self.obsolete_paths_after.deinit(allocator);
         self.wal_retained_segments_after.deinit(allocator);
         self.wal_retained_bytes_after.deinit(allocator);
+        self.wal_checkpoint_covered_through_segment_after.deinit(allocator);
         self.wal_checkpoint_lag_segments_after.deinit(allocator);
         self.wal_replay_retained_segments_after.deinit(allocator);
         self.wal_replay_retained_bytes_after.deinit(allocator);
@@ -292,6 +295,7 @@ const GroupAgg = struct {
         try self.obsolete_paths_after.append(allocator, @floatFromInt(record.obsolete_paths_after));
         try self.wal_retained_segments_after.append(allocator, @floatFromInt(record.wal_retained_segments_after));
         try self.wal_retained_bytes_after.append(allocator, @floatFromInt(record.wal_retained_bytes_after));
+        try self.wal_checkpoint_covered_through_segment_after.append(allocator, @floatFromInt(record.wal_checkpoint_covered_through_segment_after));
         try self.wal_checkpoint_lag_segments_after.append(allocator, @floatFromInt(record.wal_checkpoint_lag_segments_after));
         try self.wal_replay_retained_segments_after.append(allocator, @floatFromInt(record.wal_replay_retained_segments_after));
         try self.wal_replay_retained_bytes_after.append(allocator, @floatFromInt(record.wal_replay_retained_bytes_after));
@@ -480,6 +484,7 @@ fn printComparison(
     try printMetric(writer, allocator, "  obsolete_paths_after", before.obsolete_paths_after, after.obsolete_paths_after);
     try printMetric(writer, allocator, "  wal_retained_segments_after", before.wal_retained_segments_after, after.wal_retained_segments_after);
     try printMetric(writer, allocator, "  wal_retained_bytes_after", before.wal_retained_bytes_after, after.wal_retained_bytes_after);
+    try printMetric(writer, allocator, "  wal_checkpoint_covered_through_segment_after", before.wal_checkpoint_covered_through_segment_after, after.wal_checkpoint_covered_through_segment_after);
     try printMetric(writer, allocator, "  wal_checkpoint_lag_segments_after", before.wal_checkpoint_lag_segments_after, after.wal_checkpoint_lag_segments_after);
     try printMetric(writer, allocator, "  wal_replay_retained_segments_after", before.wal_replay_retained_segments_after, after.wal_replay_retained_segments_after);
     try printMetric(writer, allocator, "  wal_replay_retained_bytes_after", before.wal_replay_retained_bytes_after, after.wal_replay_retained_bytes_after);

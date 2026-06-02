@@ -72,6 +72,7 @@ pub const RetentionStats = struct {
     bytes: u64 = 0,
     oldest_retained_segment: u64 = 0,
     current_segment: u64 = 0,
+    checkpoint_covered_through_segment: u64 = 0,
 };
 
 pub const ReplayStreamStats = struct {
@@ -162,7 +163,10 @@ pub fn appendStateWithOptions(
     var current_size = current.size;
     if (!current.index_exists) {
         try writeCurrentSegment(storage, allocator, root_dir, segment, current_size);
-        try writeCheckpointIndex(storage, allocator, root_dir, 1);
+        try writeCheckpointIndex(storage, allocator, root_dir, .{
+            .oldest_retained_segment = 1,
+            .covered_through_segment = 0,
+        });
     }
     var segment_path = try segmentPathAlloc(allocator, root_dir, segment);
     var segment_path_owned = true;
@@ -264,7 +268,10 @@ pub fn reset(storage: storage_io.Storage, allocator: Allocator, root_dir: []cons
         else => return err,
     }).segment;
     try writeCurrentSegment(storage, allocator, root_dir, 1, 0);
-    try writeCheckpointIndex(storage, allocator, root_dir, 1);
+    try writeCheckpointIndex(storage, allocator, root_dir, .{
+        .oldest_retained_segment = 1,
+        .covered_through_segment = 0,
+    });
     const first_segment = try segmentPathAlloc(allocator, root_dir, 1);
     defer allocator.free(first_segment);
     try storage.writeFileAbsolute(first_segment, "");
@@ -320,6 +327,7 @@ pub fn snapshotRetention(
     }).segment;
     const checkpoint = try readCheckpointIndex(storage, allocator, root_dir);
     stats.oldest_retained_segment = checkpoint.oldest_retained_segment;
+    stats.checkpoint_covered_through_segment = checkpoint.covered_through_segment;
     stats.current_segment = current_segment;
 
     var segment: u64 = checkpoint.oldest_retained_segment;
@@ -398,7 +406,10 @@ pub fn retireCoveredSegments(
         allocator.free(segment_path);
     }
 
-    try writeCheckpointIndex(storage, allocator, root_dir, max_covered + 1);
+    try writeCheckpointIndex(storage, allocator, root_dir, .{
+        .oldest_retained_segment = max_covered + 1,
+        .covered_through_segment = max_covered,
+    });
 }
 
 const ReplayIndex = struct {
@@ -1383,7 +1394,13 @@ const CurrentSegment = struct {
 
 const ReadCheckpoint = struct {
     oldest_retained_segment: u64 = 1,
+    covered_through_segment: u64 = 0,
     exists: bool = false,
+};
+
+const CheckpointIndex = struct {
+    oldest_retained_segment: u64,
+    covered_through_segment: u64,
 };
 
 fn readCurrentSegment(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !CurrentSegment {
@@ -1434,21 +1451,27 @@ fn readCheckpointIndex(storage: storage_io.Storage, allocator: Allocator, root_d
         error.FileNotFound => return .{},
         else => return err,
     };
-    if (index_size != 8) return error.CorruptLsmWalIndex;
-    const raw = try storage.readFileRangeAlloc(temp_allocator, checkpoint_path, 0, 8);
+    if (index_size != 16) return error.CorruptLsmWalIndex;
+    const raw = try storage.readFileRangeAlloc(temp_allocator, checkpoint_path, 0, 16);
     defer temp_allocator.free(raw);
-    if (raw.len != 8) return error.CorruptLsmWalIndex;
+    if (raw.len != 16) return error.CorruptLsmWalIndex;
     const oldest_retained_segment = std.mem.readInt(u64, raw[0..8], .little);
+    const covered_through_segment = std.mem.readInt(u64, raw[8..16], .little);
     if (oldest_retained_segment == 0) return error.CorruptLsmWalIndex;
+    if (covered_through_segment + 1 < oldest_retained_segment) return error.CorruptLsmWalIndex;
     return .{
         .oldest_retained_segment = oldest_retained_segment,
+        .covered_through_segment = covered_through_segment,
         .exists = true,
     };
 }
 
-fn writeCheckpointIndex(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, oldest_retained_segment: u64) !void {
-    var raw: [8]u8 = undefined;
-    std.mem.writeInt(u64, &raw, oldest_retained_segment, .little);
+fn writeCheckpointIndex(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, index: CheckpointIndex) !void {
+    if (index.oldest_retained_segment == 0) return error.CorruptLsmWalIndex;
+    if (index.covered_through_segment + 1 < index.oldest_retained_segment) return error.CorruptLsmWalIndex;
+    var raw: [16]u8 = undefined;
+    std.mem.writeInt(u64, raw[0..8], index.oldest_retained_segment, .little);
+    std.mem.writeInt(u64, raw[8..16], index.covered_through_segment, .little);
     const temp_allocator = allocator;
     const checkpoint_path = try checkpointPathAlloc(temp_allocator, root_dir);
     defer temp_allocator.free(checkpoint_path);
@@ -1854,6 +1877,7 @@ test "lsm wal checkpoint retires covered segments and replay starts at retained 
 
     const retained = try snapshotRetention(storage.storage(), std.testing.allocator, root_dir);
     try std.testing.expectEqual(@as(u64, 3), retained.oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 2), retained.checkpoint_covered_through_segment);
     try std.testing.expectEqual(@as(u64, 3), retained.current_segment);
     try std.testing.expectEqual(@as(u64, 1), retained.segments);
     try std.testing.expect(retained.bytes > 0);

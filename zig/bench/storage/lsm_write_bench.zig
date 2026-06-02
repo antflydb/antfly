@@ -1037,10 +1037,11 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"wal_retained_segments_after\":{d},\"wal_retained_bytes_after\":{d},\"wal_checkpoint_lag_segments_after\":{d},\"wal_replay_retained_segments_after\":{d},\"wal_replay_retained_bytes_after\":{d},\"compaction_scheduler_grants_after\":{d},\"compaction_scheduler_denied_capacity_after\":{d},\"compaction_scheduler_denied_resource_pressure_after\":{d},\"compaction_scheduler_remembered_pending_after\":{d},\"compaction_scheduler_remembered_candidates_after\":{d},\"compaction_scheduler_remembered_retries_after\":{d},\"compaction_scheduler_remembered_hits_after\":{d},\"compaction_scheduler_remembered_stale_after\":{d},\"compaction_scheduler_conflict_denials_after\":{d}",
+        ",\"wal_retained_segments_after\":{d},\"wal_retained_bytes_after\":{d},\"wal_checkpoint_covered_through_segment_after\":{d},\"wal_checkpoint_lag_segments_after\":{d},\"wal_replay_retained_segments_after\":{d},\"wal_replay_retained_bytes_after\":{d},\"compaction_scheduler_grants_after\":{d},\"compaction_scheduler_denied_capacity_after\":{d},\"compaction_scheduler_denied_resource_pressure_after\":{d},\"compaction_scheduler_remembered_pending_after\":{d},\"compaction_scheduler_remembered_candidates_after\":{d},\"compaction_scheduler_remembered_retries_after\":{d},\"compaction_scheduler_remembered_hits_after\":{d},\"compaction_scheduler_remembered_stale_after\":{d},\"compaction_scheduler_conflict_denials_after\":{d}",
         .{
             after.maintenance.wal_retained_segments,
             after.maintenance.wal_retained_bytes,
+            after.maintenance.wal_checkpoint_covered_through_segment,
             after.maintenance.wal_checkpoint_lag_segments,
             after.maintenance.wal_replay_retained_segments,
             after.maintenance.wal_replay_retained_bytes,

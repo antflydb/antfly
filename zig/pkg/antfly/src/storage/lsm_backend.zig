@@ -304,6 +304,7 @@ pub const Backend = struct {
         wal_retained_segments: u64 = 0,
         wal_retained_bytes: u64 = 0,
         wal_checkpoint_oldest_retained_segment: u64 = 0,
+        wal_checkpoint_covered_through_segment: u64 = 0,
         wal_checkpoint_current_segment: u64 = 0,
         wal_checkpoint_lag_segments: u64 = 0,
         wal_replay_retained_segments: u64 = 0,
@@ -382,6 +383,7 @@ pub const Backend = struct {
         else
             @min(dst.wal_checkpoint_oldest_retained_segment, src.wal_checkpoint_oldest_retained_segment);
         dst.wal_checkpoint_current_segment = @max(dst.wal_checkpoint_current_segment, src.wal_checkpoint_current_segment);
+        dst.wal_checkpoint_covered_through_segment = @max(dst.wal_checkpoint_covered_through_segment, src.wal_checkpoint_covered_through_segment);
         dst.wal_checkpoint_lag_segments +|= src.wal_checkpoint_lag_segments;
         dst.wal_replay_retained_segments +|= src.wal_replay_retained_segments;
         dst.wal_replay_retained_bytes +|= src.wal_replay_retained_bytes;
@@ -956,6 +958,7 @@ pub const Backend = struct {
             stats.wal_retained_segments = wal_retention.segments;
             stats.wal_retained_bytes = wal_retention.bytes;
             stats.wal_checkpoint_oldest_retained_segment = wal_retention.oldest_retained_segment;
+            stats.wal_checkpoint_covered_through_segment = wal_retention.checkpoint_covered_through_segment;
             stats.wal_checkpoint_current_segment = wal_retention.current_segment;
             if (wal_retention.current_segment > wal_retention.oldest_retained_segment) {
                 stats.wal_checkpoint_lag_segments = wal_retention.current_segment - wal_retention.oldest_retained_segment;
@@ -4092,6 +4095,7 @@ test "lsm backend maintenance stats report retained wal debt across reopen and r
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
     try std.testing.expect(maintenance.wal_retained_bytes > 0);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
 
@@ -4104,6 +4108,7 @@ test "lsm backend maintenance stats report retained wal debt across reopen and r
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
     try std.testing.expect(maintenance.wal_retained_bytes > 0);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
     try std.testing.expect(backend.write_stats.wal_replay_records > 0);
@@ -4113,6 +4118,7 @@ test "lsm backend maintenance stats report retained wal debt across reopen and r
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
 }
@@ -4296,6 +4302,7 @@ test "lsm backend retires covered wal segments after durable manifest publish" {
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
     try std.testing.expect(maintenance.wal_retained_bytes > 0);
     try std.testing.expectEqual(@as(u64, 3), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 2), maintenance.wal_checkpoint_covered_through_segment);
     try std.testing.expectEqual(@as(u64, 3), maintenance.wal_checkpoint_current_segment);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
 
@@ -4307,6 +4314,7 @@ test "lsm backend retires covered wal segments after durable manifest publish" {
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
     try std.testing.expectEqual(@as(u64, 3), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 2), maintenance.wal_checkpoint_covered_through_segment);
     try std.testing.expectEqual(@as(u64, 3), maintenance.wal_checkpoint_current_segment);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
     try std.testing.expect(backend.write_stats.wal_replay_records <= 1);
@@ -4350,6 +4358,7 @@ test "lsm backend wal pressure maintenance flushes and checkpoints retained segm
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 2), maintenance.wal_retained_segments);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
     try std.testing.expectEqual(@as(u64, 2), maintenance.wal_checkpoint_current_segment);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_lag_segments);
     try std.testing.expect(backend.maintenanceScore() > 0);
@@ -4362,6 +4371,7 @@ test "lsm backend wal pressure maintenance flushes and checkpoints retained segm
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
 
@@ -4410,6 +4420,7 @@ test "lsm backend hard wal pressure forces foreground checkpoint on commit" {
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
 

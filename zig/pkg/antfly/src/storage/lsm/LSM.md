@@ -280,7 +280,7 @@ Large-ingest guardrails:
 
 ### Write And Maintenance Work
 
-1. [ ] Add explicit WAL checkpoint/retention metadata and retire covered
+1. [x] Add explicit WAL checkpoint/retention metadata and retire covered
    segments incrementally instead of relying on clean full resets.
 2. [ ] Export retained WAL bytes, oldest uncheckpointed segment, WAL truncation
    lag, immutable-memtable bytes, and WAL sync latency through status/metrics.
@@ -951,9 +951,11 @@ startup replay tax if it retains large WAL segments between runs.
      - oldest uncheckpointed segment
      - retained WAL bytes/segments
      - checkpoint lag in sealed segments before the active WAL segment
+     - last durably covered WAL segment
    - Surfaced through backend maintenance stats and Prometheus metrics.
-   - Remaining:
-     - last checkpointed mutation sequence or equivalent durable flush marker
+   - The durable flush marker is segment-granular because the state WAL is
+     segment-framed rather than mutation-sequenced; dedicated replay WALs keep
+     their own sequence watermarks.
 
 2. Add incremental segment retirement after durable publication.
    - Implemented: when a flush + manifest publication durably covers WAL through
