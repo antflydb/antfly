@@ -1089,6 +1089,8 @@ fn freeTxnTransforms(alloc: std.mem.Allocator, transforms: []const db_mod.types.
 
 fn parseTransformOpType(text: []const u8) ?db_mod.types.TransformOpType {
     if (std.mem.eql(u8, text, "$set")) return .set;
+    if (std.mem.eql(u8, text, "$setOnInsert")) return .set_on_insert;
+    if (std.mem.eql(u8, text, "$set_on_insert")) return .set_on_insert;
     if (std.mem.eql(u8, text, "$unset")) return .unset;
     if (std.mem.eql(u8, text, "$inc")) return .inc;
     if (std.mem.eql(u8, text, "$push")) return .push;

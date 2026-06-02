@@ -87,6 +87,7 @@ pub const BatchWrite = struct {
 
 pub const TransformOpType = enum {
     set,
+    set_on_insert,
     unset,
     inc,
     push,

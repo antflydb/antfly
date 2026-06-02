@@ -161,8 +161,9 @@ pub const DistributedEntitySink = struct {
 };
 
 /// Build the merge operations from a canonical entity document
-/// (`{entity_type, canonical_name, aliases:[...]}`): `set` the scalar fields and
-/// `add_to_set` each alias so concurrent promotions union rather than clobber.
+/// (`{entity_type, canonical_name, aliases:[...]}`): seed scalar fields only on
+/// insert and `add_to_set` each alias so replay does not clobber curated entity
+/// fields while concurrent promotions still union aliases.
 fn buildMergeOps(a: std.mem.Allocator, doc_json: []const u8) ![]db_mod.types.TransformOp {
     var parsed = std.json.parseFromSlice(std.json.Value, a, doc_json, .{}) catch return &.{};
     defer parsed.deinit();
@@ -172,10 +173,10 @@ fn buildMergeOps(a: std.mem.Allocator, doc_json: []const u8) ![]db_mod.types.Tra
     var ops = std.ArrayListUnmanaged(db_mod.types.TransformOp).empty;
 
     if (obj.get("entity_type")) |v| {
-        if (v == .string) try ops.append(a, .{ .op = .set, .path = "entity_type", .value_json = try jsonStringAlloc(a, v.string) });
+        if (v == .string) try ops.append(a, .{ .op = .set_on_insert, .path = "entity_type", .value_json = try jsonStringAlloc(a, v.string) });
     }
     if (obj.get("canonical_name")) |v| {
-        if (v == .string) try ops.append(a, .{ .op = .set, .path = "canonical_name", .value_json = try jsonStringAlloc(a, v.string) });
+        if (v == .string) try ops.append(a, .{ .op = .set_on_insert, .path = "canonical_name", .value_json = try jsonStringAlloc(a, v.string) });
     }
     if (obj.get("aliases")) |v| {
         if (v == .array) {
@@ -297,24 +298,53 @@ test "DistributedEntitySink upserts a merge transform per entity" {
     try testing.expectEqual(@as(usize, 1), fake.keys.items.len);
     try testing.expectEqualStrings("person/ada_lovelace", fake.keys.items[0]);
     const ops = fake.transforms_json.items[0];
-    // Sets the scalar fields and unions the alias.
-    try testing.expect(std.mem.indexOf(u8, ops, "set entity_type=\"person\"") != null);
-    try testing.expect(std.mem.indexOf(u8, ops, "set canonical_name=\"Ada Lovelace\"") != null);
+    // Seeds scalar fields only when creating the entity and unions the alias.
+    try testing.expect(std.mem.indexOf(u8, ops, "set_on_insert entity_type=\"person\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ops, "set_on_insert canonical_name=\"Ada Lovelace\"") != null);
     try testing.expect(std.mem.indexOf(u8, ops, "add_to_set aliases=\"Ada Lovelace\"") != null);
 }
 
-test "DistributedEntitySink ignores an unknown table" {
+test "DistributedEntitySink fails closed on an unknown table" {
     const alloc = testing.allocator;
     var fake = FakeTableWriteSource{ .alloc = alloc, .table = "entities" };
     defer fake.deinit();
     var sink_impl = DistributedEntitySink{ .writes = fake.source() };
     const sink = sink_impl.entitySink();
 
-    // Routed to a table this source does not serve -> dropped, no transform.
-    try sink.upsert(alloc, "other", "person/x",
+    // Routed to a table this source does not serve -> keep promotion unapplied so
+    // replay can retry after metadata/routing catches up.
+    try testing.expectError(error.EntityPromotionUnavailable, sink.upsert(alloc, "other", "person/x",
         \\{"entity_type":"person","canonical_name":"X","aliases":["X"]}
-    );
+    ));
     try testing.expectEqual(@as(usize, 0), fake.keys.items.len);
+}
+
+test "DistributedEntitySink merge ops preserve curated canonical fields" {
+    const alloc = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ops = try buildMergeOps(a,
+        \\{"entity_type":"person","canonical_name":"Ada Lovelace","aliases":["Ada Lovelace"]}
+    );
+    const transform = db_mod.types.DocumentTransform{
+        .key = "person/ada_lovelace",
+        .operations = ops,
+        .upsert = true,
+    };
+    const resolved = try db_mod.transform.resolveDocumentTransform(
+        alloc,
+        "{\"entity_type\":\"human\",\"canonical_name\":\"Countess of Lovelace\",\"aliases\":[\"A. A. L.\"]}",
+        transform,
+    );
+    defer alloc.free(resolved.?);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, resolved.?, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("human", parsed.value.object.get("entity_type").?.string);
+    try testing.expectEqualStrings("Countess of Lovelace", parsed.value.object.get("canonical_name").?.string);
+    try testing.expectEqual(@as(usize, 2), parsed.value.object.get("aliases").?.array.items.len);
 }
 
 test "DistributedEntitySink skips a malformed document" {

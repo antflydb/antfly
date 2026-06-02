@@ -22,6 +22,7 @@ pub fn resolveDocumentTransform(
     transform: types.DocumentTransform,
 ) !?[]u8 {
     if (existing_json == null and !transform.upsert) return null;
+    const is_insert = existing_json == null;
 
     var root = if (existing_json) |body| blk: {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -32,7 +33,7 @@ pub fn resolveDocumentTransform(
     defer freeJsonValue(alloc, &root);
 
     for (transform.operations) |op| {
-        applyTransformOp(alloc, &root, op) catch continue;
+        applyTransformOp(alloc, &root, op, is_insert) catch continue;
     }
 
     return try std.json.Stringify.valueAlloc(alloc, root, .{});
@@ -41,6 +42,7 @@ pub fn resolveDocumentTransform(
 pub fn transformOpText(op: types.TransformOpType) []const u8 {
     return switch (op) {
         .set => "$set",
+        .set_on_insert => "$setOnInsert",
         .unset => "$unset",
         .inc => "$inc",
         .push => "$push",
@@ -55,10 +57,11 @@ pub fn transformOpText(op: types.TransformOpType) []const u8 {
     };
 }
 
-fn applyTransformOp(alloc: Allocator, root: *std.json.Value, op: types.TransformOp) !void {
+fn applyTransformOp(alloc: Allocator, root: *std.json.Value, op: types.TransformOp, is_insert: bool) !void {
     if (root.* != .object) return error.InvalidArgument;
     switch (op.op) {
         .set => try setOp(alloc, &root.object, op.path, op.value_json),
+        .set_on_insert => if (is_insert) try setOp(alloc, &root.object, op.path, op.value_json),
         .unset => try unsetOp(alloc, &root.object, op.path),
         .inc => try incOp(alloc, &root.object, op.path, op.value_json orelse return error.InvalidArgument),
         .add_to_set => try addToSetOp(alloc, &root.object, op.path, op.value_json orelse return error.InvalidArgument),
@@ -363,13 +366,14 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
     }
 }
 
-test "resolve document transform supports set max inc and addToSet" {
+test "resolve document transform supports set setOnInsert max inc and addToSet" {
     const alloc = std.testing.allocator;
 
     const transform: types.DocumentTransform = .{
         .key = "doc:1",
         .upsert = false,
         .operations = &.{
+            .{ .op = .set_on_insert, .path = "owner", .value_json = "\"system\"" },
             .{ .op = .max, .path = "version", .value_json = "10" },
             .{ .op = .set, .path = "status", .value_json = "\"updated\"" },
             .{ .op = .inc, .path = "views", .value_json = "2" },
@@ -389,7 +393,33 @@ test "resolve document transform supports set max inc and addToSet" {
     try std.testing.expectEqual(@as(f64, 10), try jsonNumberFromValue(parsed.value.object.get("version").?));
     try std.testing.expectEqual(@as(f64, 3), try jsonNumberFromValue(parsed.value.object.get("views").?));
     try std.testing.expectEqualStrings("updated", parsed.value.object.get("status").?.string);
+    try std.testing.expect(parsed.value.object.get("owner") == null);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("tags").?.array.items.len);
+}
+
+test "resolve document transform applies setOnInsert only when upsert inserts" {
+    const alloc = std.testing.allocator;
+    const transform: types.DocumentTransform = .{
+        .key = "doc:new",
+        .upsert = true,
+        .operations = &.{
+            .{ .op = .set_on_insert, .path = "canonical_name", .value_json = "\"Ada Lovelace\"" },
+            .{ .op = .add_to_set, .path = "aliases", .value_json = "\"Ada\"" },
+        },
+    };
+
+    const inserted = try resolveDocumentTransform(alloc, null, transform);
+    defer alloc.free(inserted.?);
+    var inserted_parsed = try std.json.parseFromSlice(std.json.Value, alloc, inserted.?, .{});
+    defer inserted_parsed.deinit();
+    try std.testing.expectEqualStrings("Ada Lovelace", inserted_parsed.value.object.get("canonical_name").?.string);
+
+    const existing = try resolveDocumentTransform(alloc, "{\"canonical_name\":\"Countess of Lovelace\",\"aliases\":[\"A. A. L.\"]}", transform);
+    defer alloc.free(existing.?);
+    var existing_parsed = try std.json.parseFromSlice(std.json.Value, alloc, existing.?, .{});
+    defer existing_parsed.deinit();
+    try std.testing.expectEqualStrings("Countess of Lovelace", existing_parsed.value.object.get("canonical_name").?.string);
+    try std.testing.expectEqual(@as(usize, 2), existing_parsed.value.object.get("aliases").?.array.items.len);
 }
 
 test "resolve document transform skips missing document without upsert" {
