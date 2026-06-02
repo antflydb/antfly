@@ -163,6 +163,36 @@ Write path:
   `--max-compaction-input-bytes`, and `--background-io-budget-bytes`
   when measuring RocksDB-like compaction and write-stall policy changes.
 
+### Current Sampled Baseline
+
+Collected on 2026-06-02 from this worktree with 3 samples and 20k keys:
+
+- Read command: `zig build lsm-backend-bench -- --samples 3 --keys 20000 --value-size 128 --storage host --cache both > /tmp/lsm-read-current.jsonl`
+- Read comparator smoke: `zig build lsm-backend-bench-compare -- --before /tmp/lsm-read-current.jsonl --after /tmp/lsm-read-current.jsonl`
+- Cached warm hit path: median `ns/op=702.60`, `read_table_block_loads=6`,
+  shared block hit/miss `99994/6`.
+- Cached warm full scan: median `ns/op=88.51`, `cursor_block_loads=485`,
+  `cursor_block_reuses=199515`, `read_table_block_loads=0`, and cursor
+  value borrow/copy `100000/0`.
+- Uncached warm full scan: median `ns/op=139.50`, `read_table_block_loads=450`,
+  `read_table_block_bytes=798655`, and cursor value borrow/copy `100000/0`.
+- Mixed read/write cache mode: median `ns/op=656.63`, bloom negatives
+  `56205`, survivor reads/hits/misses/tombstones `60111/60000/111/0`,
+  and shared block hit/miss `59986/14`.
+- L0-pressure command: `zig build lsm-write-bench -- --samples 3 --keys 20000 --batch-size 100 --flush-threshold 100 --storage host --mode default --workload-set l0_pressure > /tmp/lsm-write-l0-current.jsonl`
+- L0-pressure comparator smoke: `zig build lsm-write-bench-compare -- --before /tmp/lsm-write-l0-current.jsonl --after /tmp/lsm-write-l0-current.jsonl`
+- L0-pressure load median: `ns/op=1954.05`, effective L0 soft/hard
+  `4/8`, foreground write-pressure compactions `96`, `l0_runs_after=8`,
+  `compactable_l0_runs_after=4`, `level_overflow_runs_after=92`,
+  `wal_retained_bytes_after=0`.
+- L0 maintenance median: `ns/op=4711000.00`, compactions `3`,
+  `l0_runs_after=4`, `compactable_l0_runs_after=0`,
+  `level_overflow_runs_after=0`, `wal_retained_bytes_after=0`.
+
+The next compaction-policy slice should target the foreground compaction cost
+and post-load lower-level overflow shown by the L0-pressure load phase, while
+preserving the zero retained-WAL after-state and bounded maintenance cleanup.
+
 Large-ingest guardrails:
 
 - Run the 50k and 1M dense public/provisioned guardrails after any change that
