@@ -985,6 +985,7 @@ pub const IndexManager = struct {
 
         fn getManySorted(self: *@This(), store: *docstore_mod.DocStore, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidArgument;
+            @memset(values, null);
             if (keys.len == 0) return;
             self.recycleRawReadStateIfNeeded();
 
@@ -1012,6 +1013,7 @@ pub const IndexManager = struct {
 
             const miss_values = try self.context.manager.alloc.alloc(?[]const u8, miss_count);
             defer self.context.manager.alloc.free(miss_values);
+            @memset(miss_values, null);
             const debug_timing = getenv("ANTFLY_DEBUG_DENSE_VECTOR_LOAD_SESSION") != null;
             const txn_start_ns = if (debug_timing) platform_time.monotonicNs() else 0;
             var txn_opened = false;
@@ -9531,6 +9533,19 @@ pub const IndexManager = struct {
             var txn = try runtime_store.store.beginRead();
             defer txn.abort();
             try txn.getManySorted(artifact_keys, raw_values);
+
+            for (raw_values, 0..) |maybe_raw, key_index| {
+                const slot = artifact_reads[key_index].position;
+                const raw = maybe_raw orelse continue;
+                const scratch = batch_scratch[slot * dims ..][0..dims];
+                const vector = enrichment_artifact_codec.decodeDenseEmbeddingInto(raw, scratch) catch |err| {
+                    if (isRecoverableEmbeddingArtifactError(err)) continue;
+                    return err;
+                };
+                if (vector.len != dims) return error.InvalidVectorDimensions;
+                vector_views[slot] = vector;
+            }
+            return;
         }
 
         for (raw_values, 0..) |maybe_raw, key_index| {
@@ -9628,6 +9643,22 @@ pub const IndexManager = struct {
             var txn = try runtime_store.store.beginRead();
             defer txn.abort();
             try txn.getManySorted(artifact_keys, raw_values);
+
+            for (raw_values, 0..) |maybe_raw, key_index| {
+                const slot = artifact_reads[key_index].position;
+                const raw = maybe_raw orelse return error.NotFound;
+                const vector = enrichment_artifact_codec.decodeDenseEmbeddingViewOrInto(raw, scratch) catch |err| {
+                    if (isRecoverableEmbeddingArtifactError(err)) return error.NotFound;
+                    return err;
+                };
+                if (vector.len != dims) return error.InvalidVectorDimensions;
+                const matrix_pos = matrix_positions[slot];
+                const matrix_start = std.math.mul(usize, matrix_pos, dims) catch return error.BufferTooSmall;
+                const matrix_end = std.math.add(usize, matrix_start, dims) catch return error.BufferTooSmall;
+                if (matrix_end > matrix.len) return error.BufferTooSmall;
+                _ = transform(index, vector, matrix[matrix_start..matrix_end]);
+            }
+            return;
         }
 
         for (raw_values, 0..) |maybe_raw, key_index| {
@@ -9740,6 +9771,48 @@ pub const IndexManager = struct {
             var txn = try runtime_store.store.beginRead();
             defer txn.abort();
             try txn.getManySorted(artifact_keys, raw_values);
+            if (profile) |p| {
+                p.rerank_artifact_read_ns += platform_time.monotonicNs() - read_start;
+                if (manager.lsm_cache) |cache| {
+                    if (cache_before) |before| {
+                        const after = cache.snapshotStats();
+                        const before_hits = before.run_table_index.hits + before.run_table_block.hits + before.run_table_physical_block.hits;
+                        const after_hits = after.run_table_index.hits + after.run_table_block.hits + after.run_table_physical_block.hits;
+                        const before_misses = before.run_table_index.misses + before.run_table_block.misses + before.run_table_physical_block.misses;
+                        const after_misses = after.run_table_index.misses + after.run_table_block.misses + after.run_table_physical_block.misses;
+                        p.rerank_lsm_cache_hits += after_hits -| before_hits;
+                        p.rerank_lsm_cache_misses += after_misses -| before_misses;
+                    }
+                }
+            }
+
+            for (raw_values, 0..) |maybe_raw, key_index| {
+                const slot = artifact_reads[key_index].position;
+                const raw = maybe_raw orelse {
+                    distances[slot] = std.math.inf(f32);
+                    continue;
+                };
+                const vector_scratch = batch_scratch[0..dims];
+                const decode_start = platform_time.monotonicNs();
+                const vector = enrichment_artifact_codec.decodeDenseEmbeddingViewOrInto(raw, vector_scratch) catch |err| {
+                    if (isRecoverableEmbeddingArtifactError(err)) {
+                        distances[slot] = std.math.inf(f32);
+                        continue;
+                    }
+                    return err;
+                };
+                if (profile) |p| p.rerank_artifact_decode_ns += platform_time.monotonicNs() - decode_start;
+                if (vector.len != dims) return error.InvalidVectorDimensions;
+                _ = entry.index.cacheVector(vector_ids[slot], vector) catch {};
+                const distance_start = platform_time.monotonicNs();
+                distances[slot] = exactStoredVectorDistance(query, query_measure, vector, metric);
+                if (profile) |p| {
+                    const elapsed = platform_time.monotonicNs() - distance_start;
+                    p.rerank_artifact_distance_ns += elapsed;
+                    p.rerank_distance_ns += elapsed;
+                }
+            }
+            return;
         }
         if (profile) |p| {
             p.rerank_artifact_read_ns += platform_time.monotonicNs() - read_start;
@@ -15940,6 +16013,7 @@ test "dense artifact preload batches sorted reads through getManySorted" {
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
             self.shared.get_many_calls += 1;
+            @memset(values, null);
             for (keys, 0..) |key, i| {
                 if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) self.shared.saw_sorted_keys = false;
                 values[i] = self.shared.lookup(key, self.payload_a, self.payload_b);

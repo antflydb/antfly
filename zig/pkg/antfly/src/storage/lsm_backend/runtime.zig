@@ -2501,6 +2501,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidBatch;
+            @memset(values, null);
             self.backend.recordGetManySorted(keys.len);
             self.backend.recordGetManySortedLocality(keys);
             const plan = chooseMultiGetPlan(keys, .snapshot);
@@ -2656,6 +2657,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidBatch;
+            @memset(values, null);
             self.backend.recordGetManySorted(keys.len);
             self.backend.recordGetManySortedLocality(keys);
 
@@ -3470,6 +3472,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
 
         pub fn getManySorted(self: *@This(), namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidBatch;
+            @memset(values, null);
             self.backend.recordGetManySorted(keys.len);
             self.backend.recordGetManySortedLocality(keys);
             const plan = chooseMultiGetPlan(keys, .snapshot);

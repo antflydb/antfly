@@ -263,6 +263,9 @@ pub const Backend = struct {
         wal_replay_bytes: u64 = 0,
         wal_replay_ns: u64 = 0,
         wal_replay_truncated_tail_bytes: u64 = 0,
+        wal_replay_recovery_flushes: u64 = 0,
+        wal_replay_recovery_entry_bytes: u64 = 0,
+        wal_replay_recovery_window_peak_bytes: u64 = 0,
         wal_resets: u64 = 0,
         wal_reset_ns: u64 = 0,
         immutable_rotations: u64 = 0,
@@ -784,6 +787,7 @@ pub const Backend = struct {
     immutable_head: usize = 0,
     retired_immutable_memtables: std.ArrayListUnmanaged(*State) = .empty,
     retired_mutable_snapshots: std.ArrayListUnmanaged(*State) = .empty,
+    closing: std.atomic.Value(bool) = .init(false),
     recovery_replaying_wal: bool = false,
     runs: std.ArrayListUnmanaged(repository_mod.Run) = .empty,
 
@@ -821,6 +825,7 @@ pub const Backend = struct {
     }
 
     pub fn close(self: *Backend) void {
+        self.closing.store(true, .release);
         self.background_executor.drain();
         self.releaseTrackedResourceUsage();
         recovery_mod.close(Backend, self);
@@ -1800,6 +1805,7 @@ pub const Backend = struct {
 
     fn scheduleImmutableFlushJob(self: *Backend) void {
         if (self.activeImmutableMemtableCount() == 0) return;
+        if (self.closing.load(.acquire)) return;
         if (self.options.maintenance_waker != null) {
             self.wakeMaintenanceWorker();
             return;
@@ -1810,6 +1816,7 @@ pub const Backend = struct {
         self.immutable_flush_job_in_flight = true;
         self.background_executor.submit(.commit_durable, self, runImmutableFlushJob, deinitImmutableFlushJob) catch |err| {
             self.immutable_flush_job_in_flight = false;
+            if (err == error.BackgroundOwnerClosing) return;
             std.log.warn("lsm immutable flush background scheduling failed root={?s} err={}", .{ self.root_dir, err });
         };
     }
@@ -1827,6 +1834,7 @@ pub const Backend = struct {
     fn deinitImmutableFlushJob(_: *anyopaque) void {}
 
     fn scheduleMaintenanceJobIfNeededLocked(self: *Backend) void {
+        if (self.closing.load(.acquire)) return;
         if (self.options.backend.read_only or self.bulkIngestActive()) return;
         if (self.options.maintenance_waker != null) {
             if (self.maintenanceScoreLocked() != 0) self.wakeMaintenanceWorker();
@@ -1841,6 +1849,7 @@ pub const Backend = struct {
         self.maintenance_job_in_flight = true;
         self.background_executor.submit(.maintenance, self, runMaintenanceJob, deinitMaintenanceJob) catch |err| {
             self.maintenance_job_in_flight = false;
+            if (err == error.BackgroundOwnerClosing) return;
             std.log.warn("lsm maintenance background scheduling failed root={?s} err={}", .{ self.root_dir, err });
         };
     }
@@ -1850,9 +1859,13 @@ pub const Backend = struct {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
         errdefer self.maintenance_job_in_flight = false;
+        if (self.closing.load(.acquire)) {
+            self.maintenance_job_in_flight = false;
+            return;
+        }
         const progressed = try self.runMaintenanceStepLocked();
         self.maintenance_job_in_flight = false;
-        if (progressed) self.scheduleMaintenanceJobIfNeededLocked();
+        if (progressed and !self.closing.load(.acquire)) self.scheduleMaintenanceJobIfNeededLocked();
     }
 
     fn deinitMaintenanceJob(_: *anyopaque) void {}
@@ -2256,9 +2269,10 @@ pub const Backend = struct {
         const before_manifest_writes = self.write_stats.manifest_writes;
         self.recovery_replaying_wal = true;
         errdefer self.recovery_replaying_wal = false;
+        var recovery_session = RecoveryReplaySession{ .backend = self };
         const replay_hooks: ?wal_mod.ReplayHooks = if (!self.options.backend.read_only)
             .{
-                .ctx = @ptrCast(self),
+                .ctx = @ptrCast(&recovery_session),
                 .entry_allocator = replayWalEntryAllocatorHook,
                 .on_applied_entry = replayWalAppliedEntryHook,
                 .on_applied_record = replayWalAppliedRecordHook,
@@ -2290,28 +2304,63 @@ pub const Backend = struct {
         self.write_stats.wal_replay_bytes += stats.bytes;
         self.write_stats.wal_replay_ns += self.writeStatsElapsedNs(start_ns);
         self.write_stats.wal_replay_truncated_tail_bytes += stats.truncated_tail_bytes;
+        self.write_stats.wal_replay_recovery_flushes += recovery_session.flushes;
+        self.write_stats.wal_replay_recovery_entry_bytes += recovery_session.total_entry_bytes;
+        self.write_stats.wal_replay_recovery_window_peak_bytes = @max(
+            self.write_stats.wal_replay_recovery_window_peak_bytes,
+            recovery_session.peak_window_bytes,
+        );
     }
 
-    fn replayWalAppliedEntryHook(ctx: *anyopaque, segment: u64) anyerror!void {
-        const self: *Backend = @ptrCast(@alignCast(ctx));
-        if (segment != 0) self.noteMutableWalSegment(segment);
-        if (!self.shouldFlushMutable()) return;
-        try self.flushMutable();
+    const RecoveryReplaySession = struct {
+        backend: *Backend,
+        active_window_bytes: u64 = 0,
+        peak_window_bytes: u64 = 0,
+        total_entry_bytes: u64 = 0,
+        flushes: u64 = 0,
+
+        fn noteEntry(self: *@This(), segment: u64, entry_bytes: u64) !void {
+            if (segment != 0) self.backend.noteMutableWalSegment(segment);
+            self.active_window_bytes +|= entry_bytes;
+            self.total_entry_bytes +|= entry_bytes;
+            self.peak_window_bytes = @max(self.peak_window_bytes, self.active_window_bytes);
+            if (!self.backend.shouldFlushMutable()) return;
+            try self.backend.flushMutable();
+            self.flushes += 1;
+            self.active_window_bytes = 0;
+        }
+
+        fn noteRecord(self: *@This(), segment: u64) !void {
+            if (segment != 0) self.backend.noteMutableWalSegment(segment);
+            if (!self.backend.shouldFlushMutable()) return;
+            try self.backend.flushMutable();
+            self.flushes += 1;
+            self.active_window_bytes = 0;
+        }
+
+        fn entryAllocator(self: *@This(), default_allocator: Allocator) !Allocator {
+            // ActiveMemTable owns structural containers on the backend allocator.
+            // During recovery, entry byte copies live in the current mutable
+            // arena, which is transferred to the immutable flush window and
+            // released wholesale when that flush retires.
+            _ = try self.backend.mutable.ensureRecoveryAllocator(default_allocator);
+            return default_allocator;
+        }
+    };
+
+    fn replayWalAppliedEntryHook(ctx: *anyopaque, segment: u64, entry_bytes: u64) anyerror!void {
+        const session: *RecoveryReplaySession = @ptrCast(@alignCast(ctx));
+        try session.noteEntry(segment, entry_bytes);
     }
 
     fn replayWalAppliedRecordHook(ctx: *anyopaque, segment: u64, _: u64) anyerror!void {
-        const self: *Backend = @ptrCast(@alignCast(ctx));
-        if (segment != 0) self.noteMutableWalSegment(segment);
-        if (!self.shouldFlushMutable()) return;
-        try self.flushMutable();
+        const session: *RecoveryReplaySession = @ptrCast(@alignCast(ctx));
+        try session.noteRecord(segment);
     }
 
     fn replayWalEntryAllocatorHook(ctx: *anyopaque, default_allocator: Allocator) anyerror!Allocator {
-        const self: *Backend = @ptrCast(@alignCast(ctx));
-        // ActiveMemTable keeps structural containers on the normal allocator, but
-        // routes entry byte copies through its recovery arena while this is set.
-        _ = try self.mutable.ensureRecoveryAllocator(default_allocator);
-        return default_allocator;
+        const session: *RecoveryReplaySession = @ptrCast(@alignCast(ctx));
+        return try session.entryAllocator(default_allocator);
     }
 
     fn resetWalAfterManifestCheckpoint(self: *Backend) !void {
@@ -4371,6 +4420,7 @@ test "lsm backend copies configured background executor" {
         const vtable = background_runtime_mod.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };
@@ -4421,6 +4471,7 @@ test "lsm backend schedules deferred immutable flush on configured background ex
         const vtable = background_runtime_mod.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };
@@ -4499,6 +4550,7 @@ test "lsm backend close drains scheduled immutable flush before destroying backe
         const vtable = background_runtime_mod.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };
@@ -4558,6 +4610,7 @@ test "lsm backend deferred immutable queue enforces per-backend limit" {
         const vtable = background_runtime_mod.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };
@@ -4634,6 +4687,7 @@ test "lsm backend deferred immutable backpressure does not spin behind in-flight
         const vtable = background_runtime_mod.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };
@@ -4743,6 +4797,7 @@ test "lsm backend schedules detached maintenance job for compaction debt" {
         const vtable = background_runtime_mod.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };
@@ -4830,6 +4885,7 @@ test "lsm backend detached maintenance jobs reschedule while debt remains" {
         const vtable = background_runtime_mod.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };
@@ -10921,6 +10977,10 @@ test "lsm backend recovery replay flushes incrementally and retires covered wal 
         try std.testing.expectEqual(@as(u64, 0), stats.mutable_entries);
         try std.testing.expectEqual(@as(u64, 0), stats.immutable_memtables);
         try std.testing.expect(reopened.runs.items.len > 0);
+        const write_stats = reopened.snapshotWriteStats();
+        try std.testing.expect(write_stats.wal_replay_recovery_flushes > 0);
+        try std.testing.expect(write_stats.wal_replay_recovery_entry_bytes > 0);
+        try std.testing.expect(write_stats.wal_replay_recovery_window_peak_bytes > 0);
 
         var runtime = try reopened.runtimeNamespaceStore(std.testing.allocator);
         defer runtime.deinit();
@@ -11029,6 +11089,9 @@ test "lsm backend recovery replay byte threshold flushes within a large wal reco
 
     const write_stats = reopened.snapshotWriteStats();
     try std.testing.expect(write_stats.immutable_flushes >= 2);
+    try std.testing.expect(write_stats.wal_replay_recovery_flushes >= 2);
+    try std.testing.expect(write_stats.wal_replay_recovery_entry_bytes >= large_value.len * 3);
+    try std.testing.expect(write_stats.wal_replay_recovery_window_peak_bytes >= large_value.len);
 
     var runtime = try reopened.runtimeNamespaceStore(alloc);
     defer runtime.deinit();

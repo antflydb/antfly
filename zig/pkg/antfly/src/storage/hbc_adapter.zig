@@ -4524,6 +4524,57 @@ pub const HBCIndex = struct {
         return true;
     }
 
+    pub fn scoreExternalVectorsSortedWithScratch(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        query: []const f32,
+        query_measure: f32,
+        distances: []f32,
+        metadata_storage: []?[]const u8,
+        lookup_storage: []FixedKeyLookup,
+        key_views_storage: [][]const u8,
+        values_storage: []?[]const u8,
+        batch_scratch: []f32,
+    ) !bool {
+        const loader = self.external_vector_batch_distance_loader orelse return false;
+        const ctx = self.external_vector_ctx orelse return false;
+        if (distances.len < vector_ids.len) return error.InvalidArgument;
+        if (metadata_storage.len < vector_ids.len) return error.InvalidArgument;
+        if (vector_ids.len == 0) return true;
+
+        for (distances[0..vector_ids.len]) |*distance| distance.* = std.math.inf(f32);
+        const metadata = metadata_storage[0..vector_ids.len];
+        try self.getMetadataManySortedInTxnWithScratch(
+            txn,
+            vector_ids,
+            metadata,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+        );
+        loader(
+            ctx,
+            vector_ids,
+            metadata,
+            query,
+            query_measure,
+            self.config.metric,
+            distances[0..vector_ids.len],
+            batch_scratch,
+            @intCast(self.config.dims),
+            .{
+                .artifact_keys = key_views_storage,
+                .raw_values = values_storage,
+            },
+            null,
+        ) catch |err| switch (err) {
+            error.Unsupported => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     pub fn getVectorScratch(self: *HBCIndex, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
         return vectorindex_hbc_index.getVectorScratch(self, txn, vector_id, scratch) catch |err| {
             if (!isNotFound(err)) return err;

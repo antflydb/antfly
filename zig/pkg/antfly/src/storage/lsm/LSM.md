@@ -521,7 +521,7 @@ Large-ingest guardrails:
      WAL checkpoint coordinates captured after DB open, including oldest
      retained/current/covered segments, lag, replay retained bytes, and replay
      current segment.
-3. [ ] Replace recovery replay allocation churn with a bounded recovery
+3. [x] Replace recovery replay allocation churn with a bounded recovery
    allocation model that can release whole chunks after flush.
    - [x] First slice: state WAL recovery now reads segment chunks directly
      into the reusable pending replay buffer instead of allocating one chunk
@@ -535,6 +535,11 @@ Large-ingest guardrails:
      decoded WAL entry, so one large state record can flush incrementally
      instead of materializing the whole record in the active mutable arena
      before the first recovery flush.
+   - [x] Recovery replay now tracks a flush-scoped active byte window and
+     publishes recovery flush, entry-byte, and peak-window counters. Replayed
+     entry bytes live in the current mutable recovery arena, which moves as a
+     unit into the immutable flush window and is released when that flush
+     retires.
 4. [ ] Add final-state HBC bulk publication for sustained ingest so large loads
    avoid persisting every intermediate online mutation.
 5. [x] Add background IO admission budgeting for maintenance work.
@@ -686,6 +691,12 @@ Current symptoms:
   hot ingest. On the Zig LSM backend, `beginReadTxn()` clones the active mutable
   memtable, so replay workers could drive multi-GB Activity Monitor footprint
   even on 50k vector runs.
+- Broad storage verification can still stall in `DB.close()` while draining a
+  durable LSM background runtime. A sample during `lib-storage-test` showed the
+  main thread waiting in `Backend.close() -> background.Executor.drain()` while
+  runtime worker threads contended in `reapCompleted`/`submit`. That is separate
+  from replay-lane filtering, but it is still a RocksDB/Pebble-shaped lifecycle
+  issue: background work must have a non-reentrant stop/drain protocol.
 
 Task list:
 
@@ -758,16 +769,34 @@ Task list:
    - Primary and index LSM profiles now configure bounded WAL-retention pressure
      by default; soft pressure schedules checkpoint maintenance and hard
      pressure forces bounded foreground flush/checkpoint work.
-14. [ ] Add final-state HBC bulk publication for empty or sustained ingest so
+14. [x] Fix background-runtime close/drain behavior so maintenance workers cannot
+   enqueue or recursively schedule new work while a backend owner is draining.
+   - `Backend.close()` now publishes a stopping state before drain, the durable
+     runtime marks the owner closing, and same-owner submissions fail with
+     `BackgroundOwnerClosing`.
+   - Already-accepted owner jobs still drain deterministically, but maintenance
+     callbacks cannot recursively schedule new work while close is draining the
+     owner.
+   - Verification: `lib-storage-test --test-timeout 600s` advanced past the
+     prior `Backend.close() -> background.Executor.drain()` stall and the new
+     owner-close runtime tests passed; that long-suite run later timed out in a
+     focused shared-embedding wait that passes independently.
+15. [ ] Add final-state HBC bulk publication for empty or sustained ingest so
    large loads do not persist every intermediate online mutation.
-15. [x] Add LSM table-block compression. Start with adaptive per-block Snappy
+16. [x] Add LSM table-block compression. Start with adaptive per-block Snappy
    because the repo has a pure Zig codec today, keep the policy configurable per
    backend/store, and store blocks uncompressed when the compressed payload does
    not clear a savings threshold. Add zstd/lz4 policies later when encoder
    support is available and benchmarked.
-16. [ ] Keep dense/sparse embeddings in their binary artifact format rather
+17. [x] Keep dense/sparse embeddings in their binary artifact format rather
    than relying on table compression to shrink JSON float arrays.
-17. [ ] Re-run 50k and 1M VectorDBBench with samples and compare:
+   - Dense and sparse embedding artifacts are encoded by
+     `storage/db/enrichment/artifact_codec.zig` as binary `dense_embedding` and
+     `sparse_embedding` payloads with little-endian `f32`/`u32` arrays. The DB
+     vector-field-backed index path strips source JSON vector fields from
+     stored documents and persists the vectors as embedding artifacts, so table
+     compression is only a secondary storage win.
+18. [ ] Re-run 50k and 1M VectorDBBench with samples and compare:
    `logical_bytes`, `table_file_bytes`, `l0_runs`, `compaction_debt`,
    `flush_ms`, `compaction_ms`, `wal_append_ms`, `wal_sync_ms`, and search
    p95/p99.
@@ -1085,6 +1114,10 @@ Near-term task list:
      lane-bounded replay scan, and `DocStore` delegates runtime replay
      iteration through that API instead of opening a generic current-scan
      cursor.
+   - [x] Derived replay source now calls the native lane iterator directly for
+     primary-store catch-up and cursor windows, preserving max-entry chunking
+     and `StopReplayChunk` behavior without constructing a generic erased
+     current-scan cursor.
    - [x] Compatibility cleanup: hinted replay no longer falls back to the
      replay-all lane. Missing hint-lane rows produce no hinted work; the
      replay-all lane remains for unhinted/all-lane consumers.

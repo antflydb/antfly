@@ -442,6 +442,7 @@ pub const DocStore = struct {
 
         pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidArgument;
+            @memset(values, null);
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     for (keys, 0..) |key, i| {
@@ -545,6 +546,7 @@ pub const DocStore = struct {
 
             pub fn getManySorted(self: @This(), keys: []const []const u8, values: []?[]const u8) !void {
                 if (keys.len != values.len) return error.InvalidArgument;
+                @memset(values, null);
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
                         for (keys, 0..) |key, i| {

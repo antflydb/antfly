@@ -65,7 +65,7 @@ pub const ReplayStats = struct {
 pub const ReplayHooks = struct {
     ctx: *anyopaque,
     entry_allocator: ?*const fn (ctx: *anyopaque, default_allocator: Allocator) anyerror!Allocator = null,
-    on_applied_entry: ?*const fn (ctx: *anyopaque, segment: u64) anyerror!void = null,
+    on_applied_entry: ?*const fn (ctx: *anyopaque, segment: u64, entry_bytes: u64) anyerror!void = null,
     on_applied_record: *const fn (ctx: *anyopaque, segment: u64, entries: u64) anyerror!void,
 };
 
@@ -1636,7 +1636,7 @@ fn decodePayloadIntoMutableWithHooks(
         applied += 1;
         if (hooks) |active_hooks| {
             if (active_hooks.on_applied_entry) |on_applied_entry| {
-                try on_applied_entry(active_hooks.ctx, segment);
+                try on_applied_entry(active_hooks.ctx, segment, @intCast(ns.len + key.len + value.len));
             }
         }
     }

@@ -137,6 +137,7 @@ pub const ReadTxn = struct {
 
     pub fn getManySorted(self: *ReadTxn, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
             return try get_many_sorted(self.ptr, keys, values);
         }
@@ -175,6 +176,7 @@ pub const ProbeTxn = struct {
 
     pub fn getManySorted(self: *ProbeTxn, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
             return try get_many_sorted(self.ptr, keys, values);
         }
@@ -230,6 +232,7 @@ pub const NamespaceReadTxn = struct {
 
     pub fn getManySorted(self: *NamespaceReadTxn, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
             return try get_many_sorted(self.ptr, namespace, keys, values);
         }
@@ -278,6 +281,7 @@ pub const WriteTxn = struct {
 
     pub fn getManySorted(self: *WriteTxn, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
             return try get_many_sorted(self.ptr, keys, values);
         }
@@ -383,6 +387,7 @@ pub const Batch = struct {
 
     pub fn getManySorted(self: *Batch, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
             return try get_many_sorted(self.ptr, keys, values);
         }

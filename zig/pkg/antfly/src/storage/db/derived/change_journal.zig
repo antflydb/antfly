@@ -240,8 +240,6 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
     if (batch.generated_enrichment_refs.len > 0) try appendUniqueHintAlloc(alloc, &target_hints, .enrichment);
     for (batch.generated_enrichment_refs) |ref| {
         try appendUniqueString(alloc, &changed_doc_keys, ref.doc_key);
-        if (ref.kind == .dense_embedding) try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
-        if (ref.kind == .sparse_embedding) try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
     }
 
     return .{

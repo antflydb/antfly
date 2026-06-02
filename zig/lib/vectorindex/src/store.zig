@@ -125,6 +125,7 @@ pub const NamespaceReadTxn = struct {
 
     pub fn getManySorted(self: *NamespaceReadTxn, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
             return try get_many_sorted(self.ptr, namespace, keys, values);
         }
@@ -377,6 +378,7 @@ pub fn namespaceReadTxnFrom(
 
         fn getManySorted(ptr: *anyopaque, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (keys.len != values.len) return error.InvalidBatch;
+            @memset(values, null);
             if (@hasDecl(Handle, "getManySorted")) {
                 return try unbox(ptr).handle.getManySorted(try mapNamespace(namespace), keys, values);
             }
