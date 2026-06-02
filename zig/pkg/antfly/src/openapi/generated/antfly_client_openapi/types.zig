@@ -4907,7 +4907,7 @@ pub const InferenceDocumentTokenClassificationObject = struct {
     checkpoint_path: []const u8,
     prefix: []const u8,
     num_tokens: i64,
-    /// Each result is an array of ClassifyResult sorted by score descending.
+    /// Token classification predictions sorted by score descending.
     predictions: []const InferenceDocumentTokenClassificationPrediction,
 };
 

@@ -15093,6 +15093,202 @@ components:
           type: number
           format: float
           description: Relevance score for this prompt.
+    InferenceRecognizeEntity:
+      type: object
+      required:
+        - text
+        - label
+        - start
+        - end
+        - score
+      properties:
+        text:
+          type: string
+          description: The entity text
+          example: John Smith
+        label:
+          type: string
+          description: Entity type (PER, ORG, LOC, MISC)
+          example: PER
+        start:
+          type: integer
+          description: Character offset where entity begins
+          example: 0
+        end:
+          type: integer
+          description: Character offset where entity ends (exclusive)
+          example: 10
+        score:
+          type: number
+          format: float
+          description: Confidence score (0.0 to 1.0)
+          example: 0.99
+    InferenceRecognizeRequest:
+      type: object
+      required:
+        - model
+        - texts
+      properties:
+        model:
+          type: string
+          description: Name of recognizer model from models_dir/recognizers/
+          example: dslim/bert-base-NER
+        texts:
+          type: array
+          items:
+            type: string
+          description: Texts to extract entities from
+          example:
+            - John Smith works at Google.
+            - Apple Inc. is in Cupertino.
+        labels:
+          type: array
+          items:
+            type: string
+          description: >
+            Custom entity labels to extract (GLiNER models only).
+
+            When using a GLiNER model, you can specify any entity types to extract,
+
+            enabling zero-shot NER without model retraining.
+
+            If not provided, the model's default labels are used.
+          example:
+            - person
+            - company
+            - product
+            - date
+        relation_labels:
+          type: array
+          items:
+            type: string
+          description: >
+            Relation types to extract (for models with 'relations' capability).
+
+            Only used when the model supports relation extraction (GLiNER multitask, REBEL).
+
+            Relation extraction runs only when this array is provided and non-empty.
+
+            GLiNER labels may be relation names (works_for), head-qualified
+
+            labels (person::works_for), or head/tail-qualified labels
+
+            (person::works_for::organization).
+          example:
+            - founded
+            - works_at
+            - located_in
+        resolver:
+          $ref: '#/components/schemas/InferenceResolverConfig'
+    InferenceResolverConfig:
+      type: object
+      description: >
+        Configuration for entity resolution. When present in a RecognizeRequest,
+
+        the response entities and relations are deduplicated via entity resolution
+
+        (e.g., "Elon Musk" and "Musk" are merged into a single entity).
+      properties:
+        similarity_threshold:
+          type: number
+          format: float
+          default: 0.85
+          description: Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
+        type_must_match:
+          type: boolean
+          default: true
+          description: Whether entity types must match for merging
+        min_entity_confidence:
+          type: number
+          format: float
+          default: 0
+          description: Minimum confidence score for entities to be included
+        min_relation_confidence:
+          type: number
+          format: float
+          default: 0
+          description: Minimum confidence score for relations to be included
+        deduplicate_relations:
+          type: boolean
+          default: true
+          description: Whether to deduplicate relations after entity resolution
+        track_provenance:
+          type: boolean
+          default: true
+          description: Whether to track mention provenance for resolved entities
+    InferenceRelation:
+      type: object
+      required:
+        - head
+        - tail
+        - label
+        - score
+      properties:
+        head:
+          $ref: '#/components/schemas/InferenceRecognizeEntity'
+          description: The subject/head entity in the relationship
+        tail:
+          $ref: '#/components/schemas/InferenceRecognizeEntity'
+          description: The object/tail entity in the relationship
+        label:
+          type: string
+          description: The relationship type
+          example: founded
+        score:
+          type: number
+          format: float
+          description: Confidence score for the relation (0.0 to 1.0)
+          example: 0.95
+    InferenceRecognizeResponse:
+      type: object
+      required:
+        - object
+        - data
+        - model
+        - usage
+      properties:
+        object:
+          type: string
+          enum:
+            - list
+          description: Object type, always "list"
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceRecognizeObject'
+          description: Recognition result objects, one per input text.
+        model:
+          type: string
+          description: Name of model used for NER
+        usage:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceRecognizeObject:
+      type: object
+      required:
+        - object
+        - index
+        - entities
+      properties:
+        object:
+          type: string
+          enum:
+            - recognition
+        index:
+          type: integer
+          description: Original input text index.
+        entities:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceRecognizeEntity'
+          description: Entities recognized for this input text.
+        relations:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceRelation'
+          description: >
+            Relations recognized for this input text. Only present when using
+
+            a model with 'relations' capability (GLiNER multitask, REBEL).
     InferenceRewriteRequest:
       type: object
       required:
@@ -15152,6 +15348,111 @@ components:
           items:
             type: string
           description: Rewritten texts for this input, one per beam.
+    InferenceClassifyRequest:
+      type: object
+      required:
+        - model
+        - texts
+        - labels
+      properties:
+        model:
+          type: string
+          description: Name of classifier model from models_dir/classifiers/
+          example: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
+        texts:
+          type: array
+          items:
+            type: string
+          description: Texts to classify
+          example:
+            - I love this product!
+            - The service was terrible.
+        labels:
+          type: array
+          items:
+            type: string
+          description: >
+            Candidate labels for zero-shot classification.
+
+            The model will predict which label(s) best describe each text.
+          example:
+            - positive
+            - negative
+            - neutral
+        hypothesis_template:
+          type: string
+          description: >
+            Custom hypothesis template for NLI-based classification.
+
+            Use "{}" as placeholder for the label.
+
+            Default: "This example is {}."
+          example: This text expresses a {} sentiment.
+        multi_label:
+          type: boolean
+          default: false
+          description: >
+            If true, allows multiple labels per text (independent scoring).
+
+            If false (default), scores are normalized across labels.
+    InferenceClassifyResult:
+      type: object
+      required:
+        - label
+        - score
+      properties:
+        label:
+          type: string
+          description: The predicted class/category
+          example: positive
+        score:
+          type: number
+          format: float
+          description: Confidence score (0.0 to 1.0)
+          example: 0.95
+    InferenceClassifyResponse:
+      type: object
+      required:
+        - object
+        - data
+        - model
+        - usage
+      properties:
+        object:
+          type: string
+          enum:
+            - list
+          description: Object type, always "list"
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceClassifyObject'
+          description: Classification result objects, one per input text.
+        model:
+          type: string
+          description: Name of model used for classification
+        usage:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceClassifyObject:
+      type: object
+      required:
+        - object
+        - index
+        - classifications
+      properties:
+        object:
+          type: string
+          enum:
+            - classification
+        index:
+          type: integer
+          description: Original input text index.
+        classifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceClassifyResult'
+          description: >
+            Classification results for this input text.
     InferenceDocumentClassificationRequest:
       type: object
       required:
