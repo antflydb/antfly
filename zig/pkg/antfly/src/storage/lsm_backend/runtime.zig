@@ -4906,6 +4906,44 @@ fn loadOwnedBlockForWindowMaybeLocked(
     return try loadOwnedBlockForWindowAllocMaybeLocked(backend, backend.allocator, run, index, window, backend_locked);
 }
 
+fn findExactEntryInCompressedPrefixBlock(
+    backend: anytype,
+    run: *Run,
+    index: *const lsm_table_file.TableIndex,
+    block_index: usize,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+) !?OwnedTableEntry {
+    const block = index.blocks[block_index];
+    const window = index.blockWindow(block_index);
+    switch (window.compression) {
+        .prefix, .prefix_snappy => {},
+        .none, .snappy => return null,
+    }
+    const path = run.path orelse return error.RunStateUnavailable;
+    const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+    const payload = try loadRunTableBlockWithStats(
+        backend,
+        backend.allocator,
+        path,
+        absolute_offset,
+        window.physicalLen(),
+    );
+    defer backend.allocator.free(payload);
+    const positioned = try lsm_table_file.findExactEntryInCompressedBlockPayloadAlloc(
+        backend.allocator,
+        window.compression,
+        payload,
+        block.first_entry_index,
+        namespace.name,
+        key,
+    ) orelse return null;
+    return .{
+        .entry = positioned.entry,
+        .bytes = positioned.bytes,
+    };
+}
+
 fn findExactEntryWithLocalIndexBlockMeta(
     backend: anytype,
     run: *Run,
@@ -4919,6 +4957,9 @@ fn findExactEntryWithLocalIndexBlockMeta(
     if (!block.maybeContains(namespace.name, key)) {
         backend.recordBloomNegative();
         return null;
+    }
+    if (try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key)) |entry| {
+        return entry;
     }
     const window = index.blockWindow(block_index);
     const bytes = try loadOwnedBlockForWindow(
@@ -4960,6 +5001,9 @@ fn findExactEntryWithLocalIndexBlockMetaMaybeLocked(
     if (!block.maybeContains(namespace.name, key)) {
         backend.recordBloomNegative();
         return null;
+    }
+    if (try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key)) |entry| {
+        return entry;
     }
     const window = index.blockWindow(block_index);
     const bytes = try loadOwnedBlockForWindowMaybeLocked(

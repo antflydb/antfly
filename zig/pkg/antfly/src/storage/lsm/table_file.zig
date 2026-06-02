@@ -16,12 +16,12 @@ const std = @import("std");
 const bloom = @import("bloom");
 const snappy = @import("../../encoding/snappy.zig");
 
-pub const magic = "ALSMTBL1";
-pub const footer_magic = "ALSMIDX1";
+pub const magic = "ALSMTBL2";
+pub const footer_magic = "ALSMIDX2";
 pub const header_len = magic.len + 12;
 pub const footer_len = footer_magic.len + @sizeOf(u64) * 2 + @sizeOf(u32) * 2;
 pub const default_block_size: usize = 32 * 1024;
-pub const version: u32 = 8;
+pub const version: u32 = 9;
 pub const max_entry_data_len: usize = std.math.maxInt(u32);
 pub const max_entry_count: usize = std.math.maxInt(u32);
 pub const default_filter_config: bloom.Config = .{ .bits_per_key = 14 };
@@ -1949,9 +1949,7 @@ pub fn decodeIndexAlloc(allocator: std.mem.Allocator, raw: []const u8) !TableInd
     var cursor: usize = 0;
     const header = try decodeHeader(raw, &cursor);
     return switch (header.version) {
-        2 => decodeV2IndexAlloc(allocator, raw, cursor, header.entry_count),
-        3 => decodeV3IndexAlloc(allocator, raw, cursor, header),
-        4, 5, 6, 7, 8 => decodeV4IndexAlloc(allocator, raw, header),
+        version => decodeV9IndexAlloc(allocator, raw, header),
         else => error.UnsupportedVersion,
     };
 }
@@ -1964,25 +1962,7 @@ pub fn decodeHeader(raw: []const u8, cursor: *usize) !Header {
     const found_version = try readU32(raw, cursor);
     const entry_count: usize = @intCast(try readU32(raw, cursor));
     return switch (found_version) {
-        2 => .{
-            .version = found_version,
-            .entry_count = entry_count,
-            .entry_data_len = 0,
-            .entry_offsets_start = cursor.*,
-            .entry_data_start = cursor.*,
-        },
-        3 => blk: {
-            const entry_data_len: usize = @intCast(try readU32(raw, cursor));
-            const entry_offsets_start = cursor.*;
-            break :blk .{
-                .version = found_version,
-                .entry_count = entry_count,
-                .entry_data_len = entry_data_len,
-                .entry_offsets_start = entry_offsets_start,
-                .entry_data_start = entry_offsets_start + entry_count * @sizeOf(u32),
-            };
-        },
-        4, 5, 6, 7, 8 => blk: {
+        version => blk: {
             const entry_data_len: usize = @intCast(try readU32(raw, cursor));
             const entry_data_start = cursor.*;
             break :blk .{
@@ -2150,69 +2130,14 @@ fn readSlice(raw: []const u8, cursor: *usize, len: usize) ![]const u8 {
     return out;
 }
 
-const DecodedOffsets = struct {
-    offsets: []u32,
-    entry_data_start: usize,
-};
-
-fn decodeV2IndexAlloc(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    cursor: usize,
-    entry_count: usize,
-) !TableIndex {
-    var local_cursor = cursor;
-    const entry_offsets = try decodeV2EntryOffsets(allocator, raw, &local_cursor, entry_count);
-    errdefer allocator.free(entry_offsets.offsets);
-
-    const bloom_len: usize = @intCast(try readU32(raw, &local_cursor));
-    const encoded_filter = try readSlice(raw, &local_cursor, bloom_len);
-    var filter = try bloom.OwnedFilter.decodeAlloc(allocator, encoded_filter);
-    errdefer filter.deinit(allocator);
-
-    if (local_cursor != raw.len) return error.InvalidTableFile;
-    return .{
-        .entry_offsets = entry_offsets.offsets,
-        .entry_data_start = entry_offsets.entry_data_start,
-        .entry_data_len = 0,
-        .filter = filter,
-    };
-}
-
-fn decodeV3IndexAlloc(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    cursor: usize,
-    header: Header,
-) !TableIndex {
-    var local_cursor = cursor;
-    const entry_offsets = try decodeV3EntryOffsets(allocator, raw, &local_cursor, header.entry_count, header.entry_data_len);
-    errdefer allocator.free(entry_offsets.offsets);
-
-    const bloom_len: usize = @intCast(try readU32(raw, &local_cursor));
-    const encoded_filter = try readSlice(raw, &local_cursor, bloom_len);
-    var filter = try bloom.OwnedFilter.decodeAlloc(allocator, encoded_filter);
-    errdefer filter.deinit(allocator);
-
-    if (local_cursor != raw.len) return error.InvalidTableFile;
-    return .{
-        .entry_offsets = entry_offsets.offsets,
-        .entry_data_start = entry_offsets.entry_data_start,
-        .entry_data_len = header.entry_data_len,
-        .filter = filter,
-    };
-}
-
-fn decodeV4IndexAlloc(
+fn decodeV9IndexAlloc(
     allocator: std.mem.Allocator,
     raw: []const u8,
     header: Header,
 ) !TableIndex {
     const footer = try decodeFooter(raw);
     if (footer.entry_count != header.entry_count) return error.InvalidTableFile;
-    if (header.version < 7 and footer.entry_data_len != header.entry_data_len) return error.InvalidTableFile;
-    if (header.version < 7 and footer.metadata_offset != header.entry_offsets_start) return error.InvalidTableFile;
-    if (header.version >= 7 and footer.metadata_offset != header.entry_data_start + header.entry_data_len) return error.InvalidTableFile;
+    if (footer.metadata_offset != header.entry_data_start + header.entry_data_len) return error.InvalidTableFile;
     const footer_offset = raw.len - footer_len;
     if (footer.metadata_offset + footer.metadata_len != footer_offset) return error.InvalidTableFile;
     const metadata = raw[footer.metadata_offset..footer_offset];
@@ -2459,49 +2384,6 @@ fn decodeBlockPrefixFiltersAlloc(
     }
 }
 
-fn decodeV3EntryOffsets(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    cursor: *usize,
-    entry_count: usize,
-    entry_data_len: usize,
-) !DecodedOffsets {
-    const offsets = try allocator.alloc(u32, entry_count);
-    errdefer allocator.free(offsets);
-    for (offsets) |*offset| offset.* = try readU32(raw, cursor);
-    const entry_data_start = cursor.*;
-    if (entry_data_start + entry_data_len > raw.len) return error.InvalidTableFile;
-    cursor.* += entry_data_len;
-    return .{ .offsets = offsets, .entry_data_start = entry_data_start };
-}
-
-fn decodeV2EntryOffsets(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    cursor: *usize,
-    entry_count: usize,
-) !DecodedOffsets {
-    const entry_data_start = cursor.*;
-    const offsets = try allocator.alloc(u32, entry_count);
-    errdefer allocator.free(offsets);
-    for (offsets, 0..) |*offset, i| {
-        offset.* = @intCast(cursor.* - entry_data_start);
-        _ = try parseEntryAt(raw, cursor.*);
-        var local = cursor.*;
-        const _tombstone = try readByte(raw, &local);
-        _ = _tombstone;
-        const namespace_len: usize = @intCast(try readU32(raw, &local));
-        const key_len: usize = @intCast(try readU32(raw, &local));
-        const value_len: usize = @intCast(try readU32(raw, &local));
-        _ = try readSlice(raw, &local, namespace_len);
-        _ = try readSlice(raw, &local, key_len);
-        _ = try readSlice(raw, &local, value_len);
-        cursor.* = local;
-        _ = i;
-    }
-    return .{ .offsets = offsets, .entry_data_start = entry_data_start };
-}
-
 pub fn parseEntryAt(raw: []const u8, absolute_offset: usize) !Entry {
     var cursor = absolute_offset;
     const tombstone = switch (try readByte(raw, &cursor)) {
@@ -2651,7 +2533,7 @@ test "table file codec round trips namespaced entries" {
     try std.testing.expect(maybeContains(decoded.filter, "docs", "doc:b"));
 }
 
-test "table file v4 footer metadata decodes through footer" {
+test "table file v9 footer metadata decodes through footer" {
     const entries = [_]Entry{
         .{ .namespace_name = "docs", .key = "doc:a", .value = "A" },
         .{ .namespace_name = "docs", .key = "doc:b", .value = "B" },
@@ -2950,7 +2832,7 @@ test "table file compression can be disabled per encode options" {
     }
 }
 
-test "table file v3 index decoder remains supported" {
+test "table file legacy v3 index decoder is rejected" {
     const entries = [_]Entry{
         .{ .key = "a", .value = "1" },
         .{ .namespace_name = "docs", .key = "doc:a", .value = "A" },
@@ -2959,13 +2841,7 @@ test "table file v3 index decoder remains supported" {
     const encoded = try encodeV3ForTest(std.testing.allocator, &entries);
     defer std.testing.allocator.free(encoded);
 
-    var index = try decodeIndexAlloc(std.testing.allocator, encoded);
-    defer index.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, entries.len), index.entry_offsets.len);
-    try std.testing.expectEqual(@as(usize, header_len + entries.len * @sizeOf(u32)), index.entry_data_start);
-    try std.testing.expect(maybeContains(index.borrowFilter(), null, "a"));
-    try std.testing.expect(maybeContains(index.borrowFilter(), "docs", "doc:a"));
+    try std.testing.expectError(error.UnsupportedVersion, decodeIndexAlloc(std.testing.allocator, encoded));
 }
 
 test "table file codec rejects invalid header" {

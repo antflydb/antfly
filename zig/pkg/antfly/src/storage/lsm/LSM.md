@@ -7,7 +7,10 @@ This document tracks the near-term LSM backend performance work derived from the
 - `pkg/antfly/src/storage/lsm_backend/recovery.zig`
 - `pkg/antfly/src/storage/lsm_backend/storage_io.zig`
 
-The goal is to pull in the highest-leverage lessons from RocksDB and Pebble without forcing an immediate table-format rewrite.
+The goal is to pull in the highest-leverage lessons from RocksDB and Pebble. The
+project is still unreleased, so clean table/WAL codec breaks are preferable to
+carrying compatibility shims when a format change materially improves the
+long-term shape.
 
 ## Preferred Design
 
@@ -132,6 +135,98 @@ ResourceManager pressure:
 - Treat table metadata and block skipping as a separate phase because they touch the table format and reader contract.
 - Treat compaction as background debt management, not as an all-or-nothing foreground write tax.
 - Measure L0/run debt directly so write stalls, compaction scheduling, and bulk-ingest policy can be tuned from metrics instead of inferred from disk growth.
+- Keep transient heap growth tied to explicit owners: mutable/immutable
+  memtables, block cache, WAL retention, table builders, compaction scratch, and
+  higher-level index rebuild buffers.
+- Prefer streaming or disk-backed builders for flush, compaction, and artifact
+  publication so peak memory is bounded by active blocks/windows rather than by
+  a whole run or whole artifact.
+
+## RocksDB/Pebble-Shaped LSM Roadmap
+
+Status: active
+
+The LSM is now past the first large architectural step: WAL-backed foreground
+writes, immutable memtables, bounded maintenance, WAL checkpoints, prefix
+blooms, block-window scans, sharded caches, and table-block compression are all
+represented in the implementation. The remaining work is less about adding one
+missing feature and more about tightening the engine around RocksDB/Pebble
+invariants: bounded working set, table-local skipping, explicit write stalls,
+and maintenance that is always debt-driven.
+
+### Already landed
+
+- WAL-backed commit path with segmented WAL, checksummed records, replay, and
+  checkpoint/retirement metadata.
+- Immutable memtable queue and background flush/maintenance path.
+- Bounded hard-pressure foreground assists instead of unbounded publish-time
+  compaction.
+- Sharded/blocking block-cache miss coordination and sharded native fd cache.
+- Borrowed scan and point-read values where the transaction owns the lifetime.
+- Block-window scans, table index caching, per-block bloom/hash metadata,
+  prefix blooms, and adaptive table-block compression.
+- Startup/open, retained-WAL, write-pressure, and maintenance debt metrics in
+  benchmark/status/Prometheus surfaces.
+
+### Next priorities
+
+1. [ ] Finish no-heap table-artifact publication and disk-backed merge output.
+   - Flush, compaction, and HBC final artifact publication should write through
+     bounded block builders and output sinks.
+   - Peak memory should be the active builder block/window plus bounded scratch,
+     not the whole run, whole merge output, or whole artifact.
+   - ResourceManager should account table-builder bytes, compaction scratch,
+     and publish scratch separately from long-lived cache/memtable bytes.
+
+2. [ ] Finish direct prefix-compressed block reader integration.
+   - The codec already has restart-point search primitives; runtime readers
+     should use them before expanding a full logical block.
+   - [x] First runtime slice: local/no-shared-cache point reads now search
+     prefix-compressed block payloads directly by restart point and return only
+     the matched encoded entry instead of materializing the whole logical block.
+   - Cache policy should distinguish compressed bytes, decoded block bytes, and
+     direct-search payloads so mixed workloads do not evict useful hot blocks
+     with transient decoded materialization.
+   - After integration, remove compatibility-only expansion paths for the new
+     format where the caller does not require a decoded block.
+
+3. [ ] Add async/future-style block reads for point-read survivors.
+   - Keep source-precedence semantics: completion order must not decide the
+     visible value.
+   - Issue independent persisted-run block reads concurrently when bloom/range
+     precheck leaves multiple legal survivors.
+   - Consume results in run precedence order and cancel/drop lower-priority
+     work once a visible value or tombstone is proven.
+
+4. [ ] Make compaction scheduling fully score- and overlap-driven.
+   - Raise compaction concurrency only when selected jobs are disjoint by run
+     IDs/key ranges or otherwise proven safe by the scheduler.
+   - Track pending bytes, write-stall debt, conflict denials, oversized-plan
+     fallback, and elapsed compaction age in status/metrics.
+   - Keep foreground assists bounded and reserved for hard pressure.
+
+5. [ ] Make LSM memory pressure first-class.
+   - Account mutable arena bytes, immutable pinned bytes, block-cache bytes,
+     WAL retention, recovery scratch, table-builder scratch, and compaction
+     scratch in ResourceManager.
+   - Compare those slices against RSS/physical footprint in the large-root
+     benchmarks; any remaining gap is allocator retention or higher-level
+     dense/docstore working set, not hidden LSM cache.
+   - Add retained-cap policies for reusable scratch so one large row/block does
+     not permanently raise steady-state memory.
+
+6. [ ] Keep prefix/filter policy store-aware.
+   - Preserve the default first-separator prefix extractor for structured LSM
+     keys, but make per-store extractors explicit where dense, sparse,
+     full-text, graph, and primary stores diverge.
+   - Track prefix-bloom usefulness separately from exact bloom usefulness so bad
+     extractors can be detected from benchmark/status counters.
+
+7. [ ] Keep WAL retention aggressive for all index stores.
+   - Dense, sparse, full-text, graph, and primary stores should checkpoint after
+     successful durable boundaries, startup repair/rebuild, and large catch-up
+     windows.
+   - Reopen should replay only uncovered tails, not historical retained WAL.
 
 ## Current Performance Checklist
 
@@ -292,7 +387,7 @@ Large-ingest guardrails:
      upper bounds.
 9. [x] Add prefix extractor and prefix bloom metadata for structured key
    families.
-   - Table codec version 8 now records a first-separator prefix extractor,
+   - Table codec version 9 now records a first-separator prefix extractor,
      run-level prefix bloom, and per-block prefix blooms.
    - Persisted forward scans use prefix blooms to skip block loads when the
      scan upper bound proves the cursor cannot leave the extracted prefix.
@@ -344,7 +439,7 @@ Large-ingest guardrails:
      rotate a pinned mutable memtable before applying later foreground writes,
      so active mutable hits can be borrowed without making the probe a stale
      open-time snapshot.
-4. [ ] Make sorted `getManySorted` keep per-run cursor state across keys so
+4. [x] Make sorted `getManySorted` keep per-run cursor state across keys so
    batch reads resume inside the current block where possible.
    - [x] First slice: cached sorted-by-run reads now keep a per-run forward
      entry hint and bounded-scan from the previous hit before falling back to
@@ -352,6 +447,9 @@ Large-ingest guardrails:
    - [x] Point-batch slice: sorted point-plan batches now reuse per-run table
      index and current-block state too, so sub-threshold exact batches can
      advance inside cached blocks instead of reloading/reseeking each key.
+   - [x] Current implementation note: sorted-by-run batches and point-plan
+     batches both use `RunBatchIndexHandles` to retain per-run table-index and
+     current-block state across keys.
 5. [x] Tune bloom defaults once the benchmark can show false-positive block
    loads.
    - Run-level and per-block LSM filters now default to 14 bits/key. The option
@@ -479,17 +577,21 @@ Large-ingest guardrails:
    - [x] Active-to-active mutable merge now copies arena-backed source entries
      into the target arena before releasing the source arena, preserving batch
      commit safety.
-8. [ ] Add table key-prefix compression with restart points after the scan and
+8. [x] Add table key-prefix compression with restart points after the scan and
    WAL/flush bottlenecks are under control, because it is a table-format change.
    - [x] First slice: table blocks can now be stored as prefix-compressed key
-     deltas with restart offsets, optionally followed by Snappy. The current
-     reader expands blocks back to the existing full-entry layout before search.
+     deltas with restart offsets, optionally followed by Snappy.
    - [x] Decode cleanup: prefix-block materialization reuses key scratch while
      expanding entries, avoiding one temporary key allocation per entry.
    - [x] Direct-search primitive: prefix-compressed block payloads can be
      searched by restart point and scanned within the restart window without
-     expanding the full logical block. Runtime integration needs a cache policy
-     that does not displace hot decoded blocks on mixed workloads.
+     expanding the full logical block.
+   - [x] Breaking codec slice: run tables now use v9 table/footer magic and the
+     production decoder no longer accepts legacy v2-v8 table files.
+   - [x] Runtime point-read slice: local/no-shared-cache exact reads use the
+     direct restart search for prefix-compressed blocks instead of decoding the
+     full logical block before lookup. Shared-cache cursor/block policy remains
+     a separate cache-shape follow-up.
 
 ### Comparison Rules
 
@@ -589,13 +691,20 @@ Task list:
 11. [x] Add incremental WAL checkpoints and segment retirement. Durable flush +
    manifest publication should retire covered WAL segments without waiting for
    a full backend reset.
-12. [ ] Export startup open phases and retained-WAL debt. LSM-backed stores
+12. [x] Export startup open phases and retained-WAL debt. LSM-backed stores
    should report whether they are opening the manifest, replaying WAL, mounting
    runs/indexes, or doing higher-level catch-up/rebuild work.
-13. [ ] Add per-backend WAL retention policy for index stores. Dense, sparse,
+   - Backend open stats now track manifest, WAL replay, run mounting, replay
+     bytes/records, and loaded run counts.
+   - DB startup/status aggregates LSM open stats across primary and index stores
+     and exposes retained-WAL coordinates through JSON status and Prometheus.
+13. [x] Add per-backend WAL retention policy for index stores. Dense, sparse,
    and graph backends should checkpoint aggressively after successful bulk
    finalize, startup recovery, and large catch-up sessions so retained WAL stays
    bounded across restarts.
+   - Primary and index LSM profiles now configure bounded WAL-retention pressure
+     by default; soft pressure schedules checkpoint maintenance and hard
+     pressure forces bounded foreground flush/checkpoint work.
 14. [ ] Add final-state HBC bulk publication for empty or sustained ingest so
    large loads do not persist every intermediate online mutation.
 15. [x] Add LSM table-block compression. Start with adaptive per-block Snappy
@@ -1402,12 +1511,14 @@ Implemented in this pass:
 
 - The block-read index path now reuses cached full-table raw bytes when they are already present, decoding the index from cached raw data instead of falling back to the fragmented `readFileRangeAlloc` sequence.
 - This does not eliminate the multi-read metadata path when raw bytes are not cached, but it removes redundant metadata I/O when range/full-table reads have already populated the raw-table cache.
-- Added `fileSize` to the storage abstraction and switched the v3 index loader to derive bloom length from EOF, reducing the uncached v3 metadata path from four reads to two range reads plus one size lookup.
-- Added a new v4 run-table format with a fixed footer at EOF. The footer points to one contiguous metadata bundle containing entry offsets and bloom bytes.
+- Removed the legacy v3 index fallback after the v9 codec break; production
+  run tables now require footer-backed metadata.
+- The current run-table format uses a fixed footer at EOF. The footer points to
+  one contiguous metadata bundle containing entry offsets, bloom bytes, block
+  bounds, hash slots, compression metadata, and prefix filters.
 - New table files now load indexes via:
   - one fixed-size footer trailer read
   - one contiguous metadata read
-- Legacy v2/v3 table files remain readable through the older decode path.
 - Bloom-negative reads now require and use manifest-carried `encoded_bloom_filter` bytes, avoiding whole-table I/O on common negative probes after reopen.
 - Once a manifest bloom has been decoded for a live run, later read snapshots now borrow that decoded filter instead of re-decoding it per transaction.
 - Added a backend-local `TableIndex` cache for no-shared-cache readers, and point reads now use `footer metadata + one data block read` instead of loading the full table on first access after reopen.
@@ -1426,7 +1537,8 @@ Implemented in this pass:
 Candidate implementation options:
 
 1. Add a native-only table metadata cache keyed by `(path, run_id, generation)`.
-2. Extend native or host storage with a direct trailer read helper so the v4 footer can be fetched without an explicit `fileSize` round trip.
+2. Keep direct trailer reads as the required index-open path for v9 footer
+   metadata.
 3. Optionally move more reader-open metadata into the footer bundle if future table properties are added.
 
 Why this is not in Phase 1:
@@ -1483,18 +1595,18 @@ Expected cost:
 ## Suggested Order From Here
 
 1. Keep the current Phase 1-3 changes and benchmark them under miss-heavy point-lookups and reopen-heavy workloads.
-2. Benchmark the v4 footer path against the v3 fallback path under reopen-heavy point-lookups.
-3. Only after measuring Phase 4, decide whether the next format revision should add:
-   - a trailer read helper in the storage layer
-   - a block hash index
-   - block property collectors
+2. Benchmark v9 footer metadata and prefix-compressed direct point lookup under
+   reopen-heavy point-lookups.
+3. Use the measurements to decide whether the next format revision should add
+   richer block property collectors or a shared-cache physical-block policy.
 
 ## What Landed In This Pass
 
 - Pending load coordination is now keyed and blocking instead of scan-plus-yield.
 - The native fd cache is now sharded and hashed, and it no longer holds the hot lock across `openat`.
 - The block cache now evicts from maintained shard-local LRU state instead of globally rescanning the cache.
-- New run tables now use a footer-backed v4 metadata layout, while legacy table versions still decode through the compatibility path.
+- New run tables now use a footer-backed v9 metadata layout and legacy table
+  versions are intentionally rejected.
 
 ## Validation
 

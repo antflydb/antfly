@@ -558,50 +558,7 @@ pub fn loadRunTableIndexAllocWithStorage(
             return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
         }
     }
-
-    const header_bytes = try storage.readFileRangeAlloc(allocator, path, 0, lsm_table_file.magic.len + 12);
-    defer allocator.free(header_bytes);
-
-    var cursor: usize = 0;
-    const header = try lsm_table_file.decodeHeader(header_bytes, &cursor);
-    if (header.version != 3) {
-        const raw_table = storage.readFileAlloc(allocator, path, max_run_file_read_bytes) catch |err| {
-            logReadFileFailure(storage, path, max_run_file_read_bytes, "loadRunTableIndexAllocWithStorage.legacy", err);
-            return err;
-        };
-        defer allocator.free(raw_table);
-        return try lsm_table_file.decodeIndexAlloc(allocator, raw_table);
-    }
-
-    const offsets_offset: u64 = @intCast(header.entry_offsets_start);
-    const offsets_len = header.entry_count * @sizeOf(u32);
-    const offsets_bytes = try storage.readFileRangeAlloc(allocator, path, offsets_offset, offsets_len);
-    defer allocator.free(offsets_bytes);
-
-    const offsets = try allocator.alloc(u32, header.entry_count);
-    errdefer allocator.free(offsets);
-    for (offsets, 0..) |*offset, i| {
-        const start = i * @sizeOf(u32);
-        offset.* = std.mem.readInt(u32, std.mem.bytesAsValue([4]u8, offsets_bytes[start .. start + @sizeOf(u32)]), .little);
-    }
-
-    const bloom_len_offset = header.entry_data_start + header.entry_data_len;
-    const file_size = try storage.fileSize(path);
-    const bloom_bytes_offset = bloom_len_offset + @sizeOf(u32);
-    if (file_size < bloom_bytes_offset) return error.InvalidTableFile;
-    const bloom_len: usize = @intCast(file_size - bloom_bytes_offset);
-    const encoded_filter = try storage.readFileRangeAlloc(allocator, path, bloom_bytes_offset, bloom_len);
-    defer allocator.free(encoded_filter);
-
-    var filter = try bloom.OwnedFilter.decodeAlloc(allocator, encoded_filter);
-    errdefer filter.deinit(allocator);
-
-    return .{
-        .entry_offsets = offsets,
-        .entry_data_start = header.entry_data_start,
-        .entry_data_len = header.entry_data_len,
-        .filter = filter,
-    };
+    return error.UnsupportedVersion;
 }
 
 pub fn deleteFileAbsolute(path: []const u8) !void {
