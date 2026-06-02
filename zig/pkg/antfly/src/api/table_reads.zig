@@ -5349,7 +5349,9 @@ fn openProvisionedQueryDbForTableWithCache(
     errdefer db.close();
     try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
 
-    const summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, &db, indexes_json);
+    const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+        .drain_resolver_backfill = false,
+    });
     if (summary.indexManagerCatalogChanged()) {
         // Query/status paths can be the first readers to observe a newly-added
         // index or resolver from metadata. Reopen after reconcile so searches

@@ -594,7 +594,7 @@ pub const ProvisionedTableWriteCache = struct {
                 identity_namespace: ?doc_identity.Namespace,
             ) !OpenedDb {
                 var db = if (indexes_json) |managed_indexes_json|
-                    try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+                    try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                         allocator,
                         db_path,
                         managed_indexes_json,
@@ -608,6 +608,7 @@ pub const ProvisionedTableWriteCache = struct {
                         secret_store,
                         null,
                         identity_namespace,
+                        .{ .drain_resolver_backfill = false },
                     )
                 else
                     try db_mod.DB.open(allocator, db_path, .{
@@ -718,12 +719,15 @@ pub const ProvisionedTableWriteCache = struct {
         };
         self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         try self.entries.append(self.alloc, owned_entry);
-        return .{
+        var cached = CachedDb{
             .cache = self,
             .entry = owned_entry,
             .db = &owned_entry.db,
             .schema_json = metadata.schema_json,
         };
+        errdefer cached.deinit(self.alloc);
+        try owned_entry.db.drainResolverBackfill();
+        return cached;
     }
 
     fn adoptSeededEntryGenerationLocked(self: *ProvisionedTableWriteCache, entry: *Entry, lsm_root_generation: u64) bool {
@@ -2991,7 +2995,22 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
-            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(cache.alloc, path, value, cache.lsm_cache, cache.hbc_cache, lsm_root_generation, cache.resource_manager, mode, cache.backend_runtime, self.antfly_provider, self.secret_store, cache.remote_content, identity_namespace)
+            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+                cache.alloc,
+                path,
+                value,
+                cache.lsm_cache,
+                cache.hbc_cache,
+                lsm_root_generation,
+                cache.resource_manager,
+                mode,
+                cache.backend_runtime,
+                self.antfly_provider,
+                self.secret_store,
+                cache.remote_content,
+                identity_namespace,
+                .{ .drain_resolver_backfill = false },
+            )
         else
             try db_mod.DB.open(cache.alloc, path, .{
                 .lsm_cache = cache.lsm_cache,
@@ -3016,13 +3035,18 @@ pub const ProvisionedTableWriteSource = struct {
         defer if (opened) |*db| db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &opened.?);
 
-        lockAtomic(&self.local_db_mutex);
-        defer self.local_db_mutex.unlock();
-        const cached = try cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
-        if (mode == .default or mode == .default_async) {
-            cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
-        }
-        if (ensure_auto_bulk_now_ns) |now_ns| try cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns);
+        var cached = blk: {
+            lockAtomic(&self.local_db_mutex);
+            defer self.local_db_mutex.unlock();
+            const adopted = try cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
+            if (mode == .default or mode == .default_async) {
+                adopted.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(adopted.entry.?.table_name, group_id, adopted.db));
+            }
+            if (ensure_auto_bulk_now_ns) |now_ns| try cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns);
+            break :blk adopted;
+        };
+        errdefer cached.deinit(cache.alloc);
+        try cached.db.drainResolverBackfill();
         return cached;
     }
 
@@ -3335,6 +3359,7 @@ pub const ProvisionedTableWriteSource = struct {
                 summary.enrichments_added += index_summary.enrichments_added;
                 summary.resolvers_added += index_summary.resolvers_added;
                 summary.resolvers_updated += index_summary.resolvers_updated;
+                summary.resolvers_removed += index_summary.resolvers_removed;
                 try cache.replaceTableMetadataLocked(table.name, table.indexes_json, table.schema_json);
                 continue;
             }
@@ -5801,7 +5826,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
 
         var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
-            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 cache.write_cache.alloc,
                 path,
                 value,
@@ -5815,6 +5840,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 cache.write_cache.secret_store,
                 cache.write_cache.remote_content,
                 identity_namespace,
+                .{ .drain_resolver_backfill = false },
             )
         else
             try db_mod.DB.open(cache.write_cache.alloc, path, .{
@@ -5839,9 +5865,14 @@ pub const HostedProvisionedTableWriteSource = struct {
         defer if (opened) |*db| db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &opened.?);
 
-        lockAtomic(&cache.mutex);
-        defer cache.mutex.unlock();
-        return try cache.write_cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
+        var cached = blk: {
+            lockAtomic(&cache.mutex);
+            defer cache.mutex.unlock();
+            break :blk try cache.write_cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
+        };
+        errdefer cached.deinit(cache.write_cache.alloc);
+        try cached.db.drainResolverBackfill();
+        return cached;
     }
 
     fn reconcileCachedIndexCreate(
@@ -7242,6 +7273,44 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
     remote_content: ?*const scraping.RemoteContentConfig,
     identity_namespace: ?doc_identity.Namespace,
 ) !db_mod.DB {
+    return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+        alloc,
+        path,
+        indexes_json,
+        lsm_cache,
+        hbc_cache,
+        lsm_root_generation,
+        resource_manager,
+        mode,
+        backend_runtime,
+        antfly_provider,
+        secret_store,
+        remote_content,
+        identity_namespace,
+        .{},
+    );
+}
+
+const ManagedDbOpenOptions = struct {
+    drain_resolver_backfill: bool = true,
+};
+
+fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    indexes_json: []const u8,
+    lsm_cache: ?*lsm_backend.Cache,
+    hbc_cache: ?*hbc_mod.Cache,
+    lsm_root_generation: u64,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+    mode: ManagedDbOpenMode,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    antfly_provider: ?managed_embedder.AntflyProvider,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+    identity_namespace: ?doc_identity.Namespace,
+    options: ManagedDbOpenOptions,
+) !db_mod.DB {
     const EnrichmentSet = struct {
         dense: ?db_embedder.DenseEmbedder = null,
         sparse: ?db_embedder.SparseEmbedder = null,
@@ -7485,7 +7554,9 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
     try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
     if (mode == .status_only) return db;
 
-    const summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, &db, indexes_json);
+    const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+        .drain_resolver_backfill = options.drain_resolver_backfill,
+    });
     if (summary.indexManagerCatalogChanged()) {
         // First-open provisioning can mutate the live index manager. Reopen so
         // request work runs against the stabilized post-reconcile state.

@@ -5499,11 +5499,23 @@ pub const DB = struct {
         try self.backfillResolverCorpus();
     }
 
+    pub const ResolverUpsertOptions = struct {
+        /// When false, persist the catalog mutation and mark the resolver backlog
+        /// dirty, but leave the actual re-resolution drain to the caller. Managed
+        /// table opens use this so DB runtime hooks are installed before
+        /// cross-shard candidate blocking or promotion can run.
+        drain_backfill: bool = true,
+    };
+
     /// Add or replace a resolver. Inserts and material config changes re-resolve
     /// the existing corpus so the new resolver/scorer behavior applies to
     /// documents already ingested (the extraction artifacts did not change, so
     /// the incremental hint would not fire on its own).
-    pub fn upsertResolverWithResult(self: *DB, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
+    pub fn upsertResolverWithResultOptions(
+        self: *DB,
+        cfg: index_manager_mod.ResolverConfig,
+        options: ResolverUpsertOptions,
+    ) !index_manager_mod.IndexManager.ResolverUpsertResult {
         const upsert_result = blk: {
             lockApply(self);
             defer self.core.unlockApply();
@@ -5511,10 +5523,15 @@ pub const DB = struct {
         };
         switch (upsert_result) {
             .inserted, .updated_backfill_required => {
-                try self.backfillResolverCorpus();
+                if (options.drain_backfill) {
+                    try self.backfillResolverCorpus();
+                } else if (self.resolution_runtime) |runtime| {
+                    try runtime.requestReresolveBacklog();
+                }
             },
             .updated_no_backfill => {
-                if (self.resolution_runtime) |runtime| {
+                if (options.drain_backfill and self.resolution_runtime != null) {
+                    const runtime = self.resolution_runtime.?;
                     if (try runtime.hasReresolveBacklog()) {
                         try self.backfillResolverCorpus();
                     }
@@ -5524,8 +5541,16 @@ pub const DB = struct {
         return upsert_result;
     }
 
+    pub fn upsertResolverWithResult(self: *DB, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
+        return try self.upsertResolverWithResultOptions(cfg, .{});
+    }
+
     pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
         _ = try self.upsertResolverWithResult(cfg);
+    }
+
+    pub fn drainResolverBackfill(self: *DB) !void {
+        try self.backfillResolverCorpus();
     }
 
     fn backfillResolverCorpus(self: *DB) !void {
@@ -5546,9 +5571,141 @@ pub const DB = struct {
 
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
         try self.retireResolverReplayBeforeCatalogRemoval();
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.core.removeResolver(name);
+
+        var removed = false;
+        const retirement_sequence = blk: {
+            lockApply(self);
+            defer self.core.unlockApply();
+
+            const cfg = (try self.resolverConfigByNameAlloc(name)) orelse break :blk null;
+            defer {
+                var owned = cfg;
+                owned.deinit(self.alloc);
+            }
+
+            const sequence = try self.retireResolverArtifactsLocked(cfg);
+            if (!try self.core.removeResolver(name)) return false;
+            removed = true;
+            break :blk sequence;
+        };
+
+        if (!removed) return false;
+        if (retirement_sequence) |sequence| {
+            self.executor.notifySequence(sequence);
+            if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
+            if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+            try self.runUntilIdle();
+        }
+        return true;
+    }
+
+    fn resolverConfigByNameAlloc(self: *DB, name: []const u8) !?index_manager_mod.ResolverConfig {
+        const resolvers = try self.core.listResolvers(self.alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(self.alloc);
+            if (resolvers.len > 0) self.alloc.free(resolvers);
+        }
+        for (resolvers) |cfg| {
+            if (std.mem.eql(u8, cfg.name, name)) {
+                return try index_manager_mod.ResolverConfig.clone(self.alloc, cfg);
+            }
+        }
+        return null;
+    }
+
+    fn retireResolverArtifactsLocked(self: *DB, cfg: index_manager_mod.ResolverConfig) !?u64 {
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (deletes.items) |key| self.alloc.free(@constCast(key));
+            deletes.deinit(self.alloc);
+        }
+        var changed = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (changed.items) |key| self.alloc.free(key);
+            changed.deinit(self.alloc);
+        }
+
+        const marker_prefix = try internal_keys.assetArtifactSourceIndexPrefixAlloc(self.alloc, cfg.source_artifact);
+        defer self.alloc.free(marker_prefix);
+        const markers = try self.core.store.scanPrefix(self.alloc, marker_prefix);
+        defer docstore_mod.DocStore.freeResults(self.alloc, markers);
+
+        for (markers) |marker| {
+            const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(self.alloc, marker.value)) orelse continue;
+            defer {
+                self.alloc.free(parsed.doc_key);
+                self.alloc.free(parsed.artifact_name);
+            }
+            if (!std.mem.eql(u8, parsed.artifact_name, cfg.source_artifact)) continue;
+
+            const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(self.alloc, parsed.doc_key, cfg.resolution_artifact);
+            var resolution_key_owned = true;
+            errdefer if (resolution_key_owned) self.alloc.free(resolution_key);
+            if (!containsDeleteKey(deletes.items, resolution_key)) {
+                try deletes.append(self.alloc, resolution_key);
+                resolution_key_owned = false;
+                try appendUniqueOwnedKey(self.alloc, &changed, resolution_key);
+            } else {
+                self.alloc.free(resolution_key);
+                resolution_key_owned = false;
+            }
+
+            try self.collectResolverMentionArtifactsForDocLocked(cfg, parsed.doc_key, &deletes, &changed);
+        }
+
+        if (deletes.items.len == 0 and changed.items.len == 0) return null;
+
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
+            .sequence = sequence,
+            .changed_artifact_keys = changed.items,
+        }, sequence);
+        defer self.alloc.free(replay_payload);
+
+        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), &.{}, deletes.items, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        return sequence;
+    }
+
+    fn collectResolverMentionArtifactsForDocLocked(
+        self: *DB,
+        cfg: index_manager_mod.ResolverConfig,
+        doc_key: []const u8,
+        deletes: *std.ArrayListUnmanaged([]const u8),
+        changed: *std.ArrayListUnmanaged([]u8),
+    ) !void {
+        for (self.core.graphIndexes()) |graph_entry| {
+            const source = graph_entry.artifact_source orelse continue;
+            if (source.mention_edge_type.len == 0) continue;
+            if (!std.mem.eql(u8, source.artifact_name, cfg.source_artifact)) continue;
+
+            const state_name = try mentionGraphStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
+            defer self.alloc.free(state_name);
+            const state_key = try graphAssetStateKeyAlloc(self.alloc, doc_key, graph_entry.config.name, state_name);
+            var state_key_owned = true;
+            errdefer if (state_key_owned) self.alloc.free(state_key);
+
+            if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
+                defer freeOwnedConstKeySlice(self.alloc, previous_keys);
+                for (previous_keys) |previous_key| {
+                    if (containsDeleteKey(deletes.items, previous_key)) continue;
+                    const owned_key = try self.alloc.dupe(u8, previous_key);
+                    try deletes.append(self.alloc, owned_key);
+                    try appendUniqueOwnedKey(self.alloc, changed, previous_key);
+                }
+            }
+
+            if (!containsDeleteKey(deletes.items, state_key)) {
+                try deletes.append(self.alloc, state_key);
+                state_key_owned = false;
+            } else {
+                self.alloc.free(state_key);
+                state_key_owned = false;
+            }
+        }
     }
 
     fn retireResolverReplayBeforeCatalogRemoval(self: *DB) !void {
@@ -11680,6 +11837,13 @@ fn strippedStoredDocumentValueAlloc(
 }
 
 fn containsOwnedKey(list: []const []u8, key: []const u8) bool {
+    for (list) |existing| {
+        if (std.mem.eql(u8, existing, key)) return true;
+    }
+    return false;
+}
+
+fn containsDeleteKey(list: []const []const u8, key: []const u8) bool {
     for (list) |existing| {
         if (std.mem.eql(u8, existing, key)) return true;
     }
@@ -24543,6 +24707,105 @@ test "db materializes doc->entity mention edges as provenance and clears them on
         const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 0), inbound.len);
+    }
+}
+
+test "db resolver removal retires resolution artifacts and mention graph state" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var sink = FakePromotionSink{ .alloc = alloc };
+    defer sink.deinit();
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    {
+        const raw = try db.core.store.get(alloc, asset_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "Ada Lovelace") != null);
+    }
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    {
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+    }
+
+    const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
+    defer alloc.free(graph_edge_key);
+    {
+        const raw = try db.core.store.get(alloc, graph_edge_key);
+        defer alloc.free(raw);
+        try std.testing.expect(raw.len > 0);
+    }
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    }
+
+    try std.testing.expect(try db.removeResolver("kg"));
+
+    const resolvers = try db.listResolvers(alloc);
+    defer {
+        for (resolvers) |*cfg| cfg.deinit(alloc);
+        alloc.free(resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 0), resolvers.len);
+
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, graph_edge_key));
+    {
+        const raw = try db.core.store.get(alloc, asset_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "Ada Lovelace") != null);
+    }
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 0), inbound.len);
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
     }
 }
 

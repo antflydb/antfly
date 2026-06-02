@@ -39,12 +39,14 @@ pub const ProvisionSummary = struct {
     enrichments_added: usize = 0,
     resolvers_added: usize = 0,
     resolvers_updated: usize = 0,
+    resolvers_removed: usize = 0,
 
     pub fn indexManagerCatalogChanged(self: @This()) bool {
         return self.indexes_added > 0 or
             self.indexes_removed > 0 or
             self.resolvers_added > 0 or
-            self.resolvers_updated > 0;
+            self.resolvers_updated > 0 or
+            self.resolvers_removed > 0;
     }
 };
 
@@ -180,6 +182,7 @@ pub fn reconcileReplicaRootWithOptions(
         summary.enrichments_added += index_summary.enrichments_added;
         summary.resolvers_added += index_summary.resolvers_added;
         summary.resolvers_updated += index_summary.resolvers_updated;
+        summary.resolvers_removed += index_summary.resolvers_removed;
     }
     return summary;
 }
@@ -198,9 +201,24 @@ pub fn reconcileDbIndexes(
     db: *db_mod.DB,
     indexes_json: []const u8,
 ) !ProvisionSummary {
+    return try reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{});
+}
+
+pub const ReconcileDbIndexOptions = struct {
+    drain_resolver_backfill: bool = true,
+};
+
+pub fn reconcileDbIndexesWithOptions(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    options: ReconcileDbIndexOptions,
+) !ProvisionSummary {
     const removed = try removeMissingIndexes(alloc, db, indexes_json);
     const enrichments_added = try ensureEnrichments(alloc, db, indexes_json);
-    const resolver_summary = try ensureResolvers(alloc, db, indexes_json);
+    const resolver_summary = try ensureResolversWithOptions(alloc, db, indexes_json, .{
+        .drain_backfill = options.drain_resolver_backfill,
+    });
     const added = try ensureIndexes(alloc, db, indexes_json);
     if (added > 0 or removed > 0 or enrichments_added > 0 or resolver_summary.changed()) {
         const pending = db.pendingWorkStats();
@@ -216,6 +234,7 @@ pub fn reconcileDbIndexes(
         .enrichments_added = enrichments_added,
         .resolvers_added = resolver_summary.added,
         .resolvers_updated = resolver_summary.updated,
+        .resolvers_removed = resolver_summary.removed,
     };
 }
 
@@ -558,14 +577,28 @@ fn enrichmentExists(existing: []const db_mod.types.EnrichmentConfig, kind: db_mo
 pub const ResolverReconcileSummary = struct {
     added: usize = 0,
     updated: usize = 0,
+    removed: usize = 0,
     unchanged: usize = 0,
 
     fn changed(self: @This()) bool {
-        return self.added > 0 or self.updated > 0;
+        return self.added > 0 or self.updated > 0 or self.removed > 0;
     }
 };
 
 pub fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !ResolverReconcileSummary {
+    return try ensureResolversWithOptions(alloc, db, indexes_json, .{});
+}
+
+pub const EnsureResolverOptions = struct {
+    drain_backfill: bool = true,
+};
+
+pub fn ensureResolversWithOptions(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    options: EnsureResolverOptions,
+) !ResolverReconcileSummary {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
 
@@ -576,18 +609,35 @@ pub fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: [
     }
     try collectDesiredResolvers(alloc, parsed.value, &desired);
 
-    if (desired.items.len == 0) return .{};
-
     var summary: ResolverReconcileSummary = .{};
     for (desired.items) |cfg| {
-        const result = try db.upsertResolverWithResult(cfg);
+        const result = try db.upsertResolverWithResultOptions(cfg, .{
+            .drain_backfill = options.drain_backfill,
+        });
         switch (result) {
             .inserted => summary.added += 1,
             .updated_backfill_required => summary.updated += 1,
             .updated_no_backfill => summary.unchanged += 1,
         }
     }
+
+    const existing = try db.listResolvers(alloc);
+    defer {
+        for (existing) |*cfg| cfg.deinit(alloc);
+        alloc.free(existing);
+    }
+    for (existing) |cfg| {
+        if (desiredResolverContains(desired.items, cfg.name)) continue;
+        if (try db.removeResolver(cfg.name)) summary.removed += 1;
+    }
     return summary;
+}
+
+fn desiredResolverContains(desired: []const db_mod.ResolverConfig, name: []const u8) bool {
+    for (desired) |cfg| {
+        if (std.mem.eql(u8, cfg.name, name)) return true;
+    }
+    return false;
 }
 
 fn collectDesiredResolvers(
@@ -1012,16 +1062,58 @@ test "table provisioner registers a resolver declared in the table index config"
     try std.testing.expectEqual(@as(usize, 0), bumped_summary.resolvers_added);
     try std.testing.expectEqual(@as(usize, 1), bumped_summary.resolvers_updated);
 
-    var bumped_db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
-    defer bumped_db.close();
-    const bumped_resolvers = try bumped_db.listResolvers(std.testing.allocator);
-    defer {
-        for (bumped_resolvers) |*cfg| cfg.deinit(std.testing.allocator);
-        std.testing.allocator.free(bumped_resolvers);
+    {
+        var bumped_db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+        defer bumped_db.close();
+        const bumped_resolvers = try bumped_db.listResolvers(std.testing.allocator);
+        defer {
+            for (bumped_resolvers) |*cfg| cfg.deinit(std.testing.allocator);
+            std.testing.allocator.free(bumped_resolvers);
+        }
+        try std.testing.expectEqual(@as(usize, 1), bumped_resolvers.len);
+        try std.testing.expectEqualStrings("kg", bumped_resolvers[0].name);
+        try std.testing.expectEqual(@as(u64, 2), bumped_resolvers[0].config_generation);
     }
-    try std.testing.expectEqual(@as(usize, 1), bumped_resolvers.len);
-    try std.testing.expectEqualStrings("kg", bumped_resolvers[0].name);
-    try std.testing.expectEqual(@as(u64, 2), bumped_resolvers[0].config_generation);
+
+    const removed_indexes_json =
+        \\{
+        \\  "relations_graph":{"type":"graph",
+        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\  "resolvers":[]
+        \\}
+    ;
+
+    const removed_summary = try reconcileReplicaRoot(
+        std.testing.allocator,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 9,
+            .name = "docs",
+            .indexes_json = removed_indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 9,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 0), removed_summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 0), removed_summary.resolvers_added);
+    try std.testing.expectEqual(@as(usize, 0), removed_summary.resolvers_updated);
+    try std.testing.expectEqual(@as(usize, 1), removed_summary.resolvers_removed);
+
+    var removed_db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+    defer removed_db.close();
+    const removed_resolvers = try removed_db.listResolvers(std.testing.allocator);
+    defer {
+        for (removed_resolvers) |*cfg| cfg.deinit(std.testing.allocator);
+        std.testing.allocator.free(removed_resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 0), removed_resolvers.len);
 }
 
 test "table provisioner restores local shard data from metadata restore intent" {
