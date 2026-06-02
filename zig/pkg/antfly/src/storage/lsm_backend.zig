@@ -1267,6 +1267,17 @@ pub const Backend = struct {
         self.notePotentialMaintenanceDebt();
     }
 
+    pub fn prepareCurrentScanSnapshot(self: *Backend) !void {
+        if (self.mutable.entries.items.len == 0) return;
+        const mutable_bytes = estimateStateBytes(&self.mutable);
+        try self.rotateMutableToImmutable();
+        self.read_snapshot_mutable_rotations +|= 1;
+        self.read_snapshot_mutable_rotation_bytes_total +|= mutable_bytes;
+        self.read_snapshot_mutable_rotation_peak_bytes = @max(self.read_snapshot_mutable_rotation_peak_bytes, mutable_bytes);
+        if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
+        self.notePotentialMaintenanceDebt();
+    }
+
     pub fn snapshotMutableState(self: *Backend) !*const State {
         return try self.snapshotMutableStateWithReason(.other);
     }
@@ -7785,7 +7796,7 @@ test "lsm backend current scan reuses run grouping across cursor movement" {
     try std.testing.expectEqual(after_open.run_group_l0_runs, after_scan.run_group_l0_runs);
 }
 
-test "lsm backend current scan counts active mutable value copies" {
+test "lsm backend current scan borrows frozen mutable values" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1024,
         .wal_enabled = false,
@@ -7816,8 +7827,8 @@ test "lsm backend current scan counts active mutable value copies" {
     try std.testing.expectEqual(@as(usize, 2), count);
 
     const after_scan = backend.snapshotReadStats();
-    try std.testing.expectEqual(@as(u64, 0), after_scan.cursor_value_borrows - before_scan.cursor_value_borrows);
-    try std.testing.expectEqual(@as(u64, 2), after_scan.cursor_value_copies - before_scan.cursor_value_copies);
+    try std.testing.expectEqual(@as(u64, 2), after_scan.cursor_value_borrows - before_scan.cursor_value_borrows);
+    try std.testing.expectEqual(@as(u64, 0), after_scan.cursor_value_copies - before_scan.cursor_value_copies);
 }
 
 test "lsm backend current probe getManySorted reuses source layout across chunks" {
@@ -7863,7 +7874,7 @@ test "lsm backend current probe getManySorted reuses source layout across chunks
     try std.testing.expectEqualStrings("value-159", values[159].?);
 }
 
-test "lsm backend current scan does not rotate or clone mutable writer generation" {
+test "lsm backend current scan freezes mutable generation without cloning it" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
     defer backend.close();
 
@@ -7884,8 +7895,8 @@ test "lsm backend current scan does not rotate or clone mutable writer generatio
     defer scan.abort();
 
     const after_open = backend.snapshotMaintenanceStats();
-    try std.testing.expectEqual(before_writes.immutable_rotations, backend.snapshotWriteStats().immutable_rotations);
-    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(before_writes.immutable_rotations + 1, backend.snapshotWriteStats().immutable_rotations);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
     try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls, after_open.mutable_snapshot_clone_calls);
 
     var cursor = try scan.openCursor();
@@ -7952,7 +7963,7 @@ test "lsm backend current scan helpers do not clone mutable writer generation" {
     try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
 }
 
-test "lsm backend current scan survives mutable rotation after positioning active source" {
+test "lsm backend current scan keeps frozen mutable values across later writes" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
     defer backend.close();
 
@@ -7975,9 +7986,14 @@ test "lsm backend current scan survives mutable rotation after positioning activ
     const first = try cursor.seekAtOrAfter("doc:a") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("doc:a", first.key);
 
-    try backend.rotateMutableToImmutable();
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:b", "B");
+        try write.commit();
+    }
 
-    _ = try cursor.next();
+    const second = try cursor.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc:c", second.key);
 }
 
 test "lsm backend read txn getManySorted uses sorted-by-run path for leaf-sized sparse batches" {

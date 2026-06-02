@@ -198,7 +198,7 @@ Large-ingest guardrails:
      row; correctness must preserve tombstone/source precedence.
    - The existing loser-tree helper is integer-keyed, so the first production
      slice uses cursor-owned byte-slice heap state with the same ordering.
-5. [ ] Return borrowed scan values until `next()` instead of allocating and
+5. [x] Return borrowed scan values until `next()` instead of allocating and
    copying every visible row.
    - Expected signal: scan CPU and allocator traffic fall, especially for wide
      rows.
@@ -221,6 +221,9 @@ Large-ingest guardrails:
    - [x] Normal forward scan cursors now expose whether visible values are
      borrowed from stable persisted/immutable storage or copied from active
      mutable scratch, so benchmark counters reflect the remaining copy sources.
+   - [x] Current scans now freeze the active mutable memtable into a retained
+     immutable generation at open, so visible mutable rows are borrowed from
+     stable reader-pinned state instead of copied into cursor scratch.
 6. [ ] Cache per-cursor source layout (`runs`, L0 groups, lower levels, and
    immutable pointer slice) across repeated seeks while the cursor snapshot is
    valid.

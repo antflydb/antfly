@@ -2669,7 +2669,11 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             errdefer metadata_allocator.free(levels);
             backend.retainReader();
             errdefer releaseReadReader(BackendType, backend);
-            if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
+            if (@hasDecl(BackendType, "prepareCurrentScanSnapshot")) {
+                try backend.prepareCurrentScanSnapshot();
+            } else if (@hasDecl(BackendType, "prepareReadSnapshot")) {
+                try backend.prepareReadSnapshot();
+            }
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else
