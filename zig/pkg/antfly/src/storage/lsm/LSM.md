@@ -455,6 +455,14 @@ Large-ingest guardrails:
    plus hash-indexes writes and sorts on freeze/flush, so the main costs are
    flush sort, range iteration, immutable lookup, and memory layout rather than
    ordered-insert shifts.
+   - [x] First slice: normal active memtable key/value/namespace payloads now
+     allocate from a memtable-owned arena, matching the recovery replay arena
+     path. Structural entry arrays and hash-index buckets still use the backend
+     allocator, but foreground payload churn is reclaimed at memtable
+     rotation/flush instead of per overwritten value.
+   - [x] Active-to-active mutable merge now copies arena-backed source entries
+     into the target arena before releasing the source arena, preserving batch
+     commit safety.
 8. [ ] Add table key-prefix compression with restart points after the scan and
    WAL/flush bottlenecks are under control, because it is a table-format change.
    - [x] First slice: table blocks can now be stored as prefix-compressed key
