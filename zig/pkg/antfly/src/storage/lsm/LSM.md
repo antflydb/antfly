@@ -243,11 +243,16 @@ and maintenance that is always debt-driven.
    - Track prefix-bloom usefulness separately from exact bloom usefulness so bad
      extractors can be detected from benchmark/status counters.
 
-7. [ ] Keep WAL retention aggressive for all index stores.
+7. [x] Keep WAL retention aggressive for all index stores.
    - Dense, sparse, full-text, graph, and primary stores should checkpoint after
      successful durable boundaries, startup repair/rebuild, and large catch-up
      windows.
    - Reopen should replay only uncovered tails, not historical retained WAL.
+   - Sparse and graph LSM-backed stores now expose the same durable-boundary
+     WAL checkpoint hook as primary, full-text, and dense/HBC stores. Full-text
+     and sparse startup backfill paths checkpoint after successful flushed
+     rebuild batches, and graph reverse rebuild checkpoints after publishing
+     rebuilt reverse edges.
 
 ## Current Performance Checklist
 
@@ -1246,7 +1251,7 @@ Implemented next slice:
 
 ## WAL Retention And Startup Replay
 
-Status: planned
+Status: implemented; keep benchmarked
 
 Recent 1M loaded-root runs showed the next backend-level gap clearly:
 
@@ -1351,6 +1356,10 @@ startup replay tax if it retains large WAL segments between runs.
      bounded WAL-retention pressure by default. Soft limits feed background
      maintenance/checkpointing; hard limits force bounded foreground
      flush/checkpoint work before retained WAL can grow without limit.
+   - [x] Sparse and graph LSM-backed stores now expose durable-boundary
+     checkpoint hooks. The managed-index dispatcher handles sparse and graph
+     refs, and full-text, sparse, and graph startup rebuild/backfill boundaries
+     explicitly checkpoint retained WAL after successful publication.
 
 3. Re-benchmark loaded-root restart behavior.
    - Measure time to:

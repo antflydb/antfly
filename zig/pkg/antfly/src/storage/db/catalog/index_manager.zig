@@ -1754,6 +1754,14 @@ pub const IndexManager = struct {
                 const entry = self.denseIndex(index_ref.name) orelse return error.IndexNotFound;
                 try entry.index.checkpointLsmWalAfterDurableBoundary();
             },
+            .sparse_vector => {
+                const entry = self.sparseIndex(index_ref.name) orelse return error.IndexNotFound;
+                try entry.index.checkpointLsmWalAfterDurableBoundary();
+            },
+            .graph => {
+                const entry = self.graphIndex(index_ref.name) orelse return error.IndexNotFound;
+                try entry.index.checkpointLsmWalAfterDurableBoundary();
+            },
             else => {},
         }
     }
@@ -5104,6 +5112,7 @@ pub const IndexManager = struct {
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
+        if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
     }
 
     fn indexPath(self: *const IndexManager, name: []const u8) ![]u8 {
@@ -6451,6 +6460,7 @@ pub const IndexManager = struct {
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
+        if (flushed_batches > 0) try entry.index.checkpointLsmWalAfterDurableBoundary();
     }
 
     fn denseVectorIdHasExistingMetadata(
