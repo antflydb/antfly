@@ -218,12 +218,6 @@ from .inference_chunk_object_object import InferenceChunkObjectObject
 from .inference_chunk_request import InferenceChunkRequest
 from .inference_chunk_response import InferenceChunkResponse
 from .inference_chunk_response_object import InferenceChunkResponseObject
-from .inference_classify_object import InferenceClassifyObject
-from .inference_classify_object_object import InferenceClassifyObjectObject
-from .inference_classify_request import InferenceClassifyRequest
-from .inference_classify_response import InferenceClassifyResponse
-from .inference_classify_response_object import InferenceClassifyResponseObject
-from .inference_classify_result import InferenceClassifyResult
 from .inference_config import InferenceConfig
 from .inference_config_model_strategies import InferenceConfigModelStrategies
 from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
@@ -316,13 +310,6 @@ from .inference_read_response import InferenceReadResponse
 from .inference_read_response_object import InferenceReadResponseObject
 from .inference_read_result import InferenceReadResult
 from .inference_read_result_fields import InferenceReadResultFields
-from .inference_recognize_entity import InferenceRecognizeEntity
-from .inference_recognize_object import InferenceRecognizeObject
-from .inference_recognize_object_object import InferenceRecognizeObjectObject
-from .inference_recognize_request import InferenceRecognizeRequest
-from .inference_recognize_response import InferenceRecognizeResponse
-from .inference_recognize_response_object import InferenceRecognizeResponseObject
-from .inference_relation import InferenceRelation
 from .inference_rerank_multimodal_document import InferenceRerankMultimodalDocument
 from .inference_rerank_multimodal_request import InferenceRerankMultimodalRequest
 from .inference_rerank_object import InferenceRerankObject
@@ -330,7 +317,6 @@ from .inference_rerank_object_object import InferenceRerankObjectObject
 from .inference_rerank_request import InferenceRerankRequest
 from .inference_rerank_response import InferenceRerankResponse
 from .inference_rerank_response_object import InferenceRerankResponseObject
-from .inference_resolver_config import InferenceResolverConfig
 from .inference_rewrite_object import InferenceRewriteObject
 from .inference_rewrite_object_object import InferenceRewriteObjectObject
 from .inference_rewrite_request import InferenceRewriteRequest
@@ -761,12 +747,6 @@ __all__ = (
     "InferenceChunkRequest",
     "InferenceChunkResponse",
     "InferenceChunkResponseObject",
-    "InferenceClassifyObject",
-    "InferenceClassifyObjectObject",
-    "InferenceClassifyRequest",
-    "InferenceClassifyResponse",
-    "InferenceClassifyResponseObject",
-    "InferenceClassifyResult",
     "InferenceConfig",
     "InferenceConfigModelStrategies",
     "InferenceConfigModelStrategiesAdditionalProperty",
@@ -857,13 +837,6 @@ __all__ = (
     "InferenceReadResponseObject",
     "InferenceReadResult",
     "InferenceReadResultFields",
-    "InferenceRecognizeEntity",
-    "InferenceRecognizeObject",
-    "InferenceRecognizeObjectObject",
-    "InferenceRecognizeRequest",
-    "InferenceRecognizeResponse",
-    "InferenceRecognizeResponseObject",
-    "InferenceRelation",
     "InferenceRerankMultimodalDocument",
     "InferenceRerankMultimodalRequest",
     "InferenceRerankObject",
@@ -871,7 +844,6 @@ __all__ = (
     "InferenceRerankRequest",
     "InferenceRerankResponse",
     "InferenceRerankResponseObject",
-    "InferenceResolverConfig",
     "InferenceRewriteObject",
     "InferenceRewriteObjectObject",
     "InferenceRewriteRequest",

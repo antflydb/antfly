@@ -1107,12 +1107,7 @@ fn serveUnifiedInner(
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
 
-    var server = httpx.Server.initWithConfig(alloc, io_impl.io(), .{
-        .host = bind_host,
-        .port = bind_port,
-        .request_timeout_ms = 300_000,
-        .max_requests_per_connection = public_api_max_requests_per_connection,
-    });
+    var server = httpx.Server.initWithConfig(alloc, io_impl.io(), publicHttpServerConfig(bind_host, bind_port));
     defer server.deinit();
 
     // Register antfly routes under /ai/v1
@@ -1146,6 +1141,16 @@ fn serveUnifiedInner(
     }
 
     try server.listen();
+}
+
+fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerConfig {
+    return .{
+        .host = bind_host,
+        .port = bind_port,
+        .max_body_size = antfly.public_api.http_server.public_api_max_request_body_bytes,
+        .request_timeout_ms = 300_000,
+        .max_requests_per_connection = public_api_max_requests_per_connection,
+    };
 }
 
 fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
@@ -2012,6 +2017,11 @@ test "swarm runtime defaults public listener to antfarm port" {
     const listener = resolvePublicListener(.{});
     try std.testing.expectEqualStrings("127.0.0.1", listener.bind_host);
     try std.testing.expectEqual(@as(u16, default_public_port), listener.bind_port);
+}
+
+test "swarm public HTTP server uses public API request body limit" {
+    const cfg = publicHttpServerConfig("127.0.0.1", 8080);
+    try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
 }
 
 test "antfly config uses cli override before common config" {

@@ -18,6 +18,7 @@ package cmd
 ////go:generate sh -c "echo 'package cmd\n\nconst Version = \"'$(git describe --always --long --tags 2>/dev/null || echo 'dev')'\"' > version.go"
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -55,6 +56,10 @@ func Execute() {
 	rootCmd.Version = Version
 	err := rootCmd.Execute()
 	if err != nil {
+		var exitErr interface{ ExitCode() int }
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.ExitCode())
+		}
 		os.Exit(1)
 	}
 }

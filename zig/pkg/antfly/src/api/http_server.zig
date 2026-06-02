@@ -203,6 +203,12 @@ fn parseSseEventsAlloc(alloc: std.mem.Allocator, body: []const u8) ![]TestSseEve
     return try events.toOwnedSlice(alloc);
 }
 
+pub const public_api_max_request_body_bytes: usize = 64 * 1024 * 1024;
+
+test "public API request body limit matches Go linear merge contract" {
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), public_api_max_request_body_bytes);
+}
+
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     swarm_mode: bool = false,
