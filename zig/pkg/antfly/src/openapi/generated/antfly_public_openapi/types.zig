@@ -423,7 +423,7 @@ pub const IndexStatus = struct {
     status: antfly_indexes_openapi.IndexStats,
 };
 
-/// LSM backend maintenance and WAL pressure counters.
+/// Curated LSM backend operational status. Detailed low-level counters are available through metrics.
 pub const LsmStorageStatus = struct {
     mutable_bytes: ?i64 = null,
     immutable_bytes: ?i64 = null,
@@ -441,27 +441,19 @@ pub const LsmStorageStatus = struct {
     active_readers: ?i64 = null,
     wal_retained_segments: ?i64 = null,
     wal_retained_bytes: ?i64 = null,
-    wal_checkpoint_oldest_retained_segment: ?i64 = null,
-    wal_checkpoint_covered_through_segment: ?i64 = null,
-    wal_checkpoint_current_segment: ?i64 = null,
     wal_checkpoint_lag_segments: ?i64 = null,
-    wal_replay_retained_segments: ?i64 = null,
-    wal_replay_retained_bytes: ?i64 = null,
-    wal_replay_current_segment: ?i64 = null,
-    wal_append_records: ?i64 = null,
-    wal_append_bytes: ?i64 = null,
-    wal_append_ns: ?i64 = null,
-    wal_sync_records: ?i64 = null,
-    wal_sync_ns: ?i64 = null,
-    wal_replay_records: ?i64 = null,
-    wal_replay_bytes: ?i64 = null,
-    wal_replay_ns: ?i64 = null,
-    wal_resets: ?i64 = null,
-    wal_reset_ns: ?i64 = null,
+    compaction_active_jobs: ?i64 = null,
+    compaction_pending_runs: ?i64 = null,
+    compaction_pending_bytes: ?i64 = null,
+    compaction_oldest_active_age_ns: ?i64 = null,
+    compaction_denied_jobs: ?i64 = null,
+    compaction_conflict_denials: ?i64 = null,
+    compaction_oversized_skips: ?i64 = null,
     background_io_budget_bytes: ?i64 = null,
     background_io_reserved_bytes: ?i64 = null,
     background_io_denied_jobs: ?i64 = null,
-    background_io_oversized_jobs: ?i64 = null,
+    write_pressure_events: ?i64 = null,
+    write_pressure_overloads: ?i64 = null,
 };
 
 /// MongoDB-style update operator

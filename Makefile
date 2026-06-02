@@ -36,13 +36,14 @@ help:
 	@echo "  build-go           Build the legacy Go antfly binary"
 	@echo "  build-antfarm      Build the antfarm frontend (React admin UI)"
 	@echo "  build-docs         Join OpenAPI specifications"
-	@echo "  generate           Generate code, client SDKs, and all website documentation (API, config, changelog)"
+	@echo "  generate           Generate Zig OpenAPI modules, Go code, client SDKs, and website documentation"
 	@echo "  lint               Run golangci-lint with auto-fix"
 	@echo "  tidy               Run go mod tidy across root and Go submodules"
 	@echo "  tidy-check         Verify go.mod/go.sum are tidy across root and Go submodules"
 	@echo "  zig-build          Build the migrated Zig runtime"
 	@echo "  zig-test           Run the migrated Zig test aggregate"
 	@echo "  zig-generate       Regenerate migrated Zig generated sources"
+	@echo "  zig-openapi-generate  Regenerate migrated Zig OpenAPI modules"
 	@echo "  zig-generated-check  Verify migrated Zig generated sources"
 	@echo "  install-git-hooks  Configure Git to use the repository hooks in .githooks/"
 	@echo "  update-deps        Update Go dependencies"
@@ -86,7 +87,7 @@ help:
 # ====================================================================================
 
 .PHONY: build build-go build-docs generate lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm sim-validate sim-validate-repo sim-soak
-.PHONY: zig-build zig-test zig-unit-test zig-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
+.PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
 
@@ -108,6 +109,7 @@ build-docs:
 	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
 
 generate: build-docs tidy
+	$(MAKE) zig-openapi-generate
 	(cd $(ANTFLY_GO_MODULE) && $(GO) generate ./...)
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Generating in $$mod"; \
@@ -133,6 +135,9 @@ zig-unit-test:
 
 zig-generate:
 	$(ZIG_MAKE) generate
+
+zig-openapi-generate:
+	$(ZIG_MAKE) openapi-generate
 
 zig-generated-check:
 	$(ZIG_MAKE) generated-check

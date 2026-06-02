@@ -197,10 +197,11 @@ make generate
 
 This runs:
 1. Redocly join + lint on OpenAPI specs
-2. `go generate ./...` across root and all submodules (oapi-codegen)
-3. Inference runtime code generation
-4. TypeScript SDK generation (`@antfly/sdk`)
-5. Python SDK generation
+2. Zig OpenAPI modules (`make zig-openapi-generate`)
+3. `go generate ./...` across root and all submodules (oapi-codegen)
+4. Inference runtime code generation
+5. TypeScript SDK generation (`@antfly/sdk`)
+6. Python SDK generation
 
 Look for `cfg.yaml` next to any `openapi.yaml` for oapi-codegen settings. Key convention: optional fields use `omitzero` instead of pointers.
 

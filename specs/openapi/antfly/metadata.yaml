@@ -2263,7 +2263,7 @@ components:
           $ref: "indexes.yaml#/components/schemas/IndexStats"
     LsmStorageStatus:
       type: object
-      description: LSM backend maintenance and WAL pressure counters.
+      description: Curated LSM backend operational status. Detailed low-level counters are available through metrics.
       properties:
         mutable_bytes:
           type: integer
@@ -2313,55 +2313,28 @@ components:
         wal_retained_bytes:
           type: integer
           format: uint64
-        wal_checkpoint_oldest_retained_segment:
-          type: integer
-          format: uint64
-        wal_checkpoint_covered_through_segment:
-          type: integer
-          format: uint64
-        wal_checkpoint_current_segment:
-          type: integer
-          format: uint64
         wal_checkpoint_lag_segments:
           type: integer
           format: uint64
-        wal_replay_retained_segments:
+        compaction_active_jobs:
           type: integer
           format: uint64
-        wal_replay_retained_bytes:
+        compaction_pending_runs:
           type: integer
           format: uint64
-        wal_replay_current_segment:
+        compaction_pending_bytes:
           type: integer
           format: uint64
-        wal_append_records:
+        compaction_oldest_active_age_ns:
           type: integer
           format: uint64
-        wal_append_bytes:
+        compaction_denied_jobs:
           type: integer
           format: uint64
-        wal_append_ns:
+        compaction_conflict_denials:
           type: integer
           format: uint64
-        wal_sync_records:
-          type: integer
-          format: uint64
-        wal_sync_ns:
-          type: integer
-          format: uint64
-        wal_replay_records:
-          type: integer
-          format: uint64
-        wal_replay_bytes:
-          type: integer
-          format: uint64
-        wal_replay_ns:
-          type: integer
-          format: uint64
-        wal_resets:
-          type: integer
-          format: uint64
-        wal_reset_ns:
+        compaction_oversized_skips:
           type: integer
           format: uint64
         background_io_budget_bytes:
@@ -2373,7 +2346,10 @@ components:
         background_io_denied_jobs:
           type: integer
           format: uint64
-        background_io_oversized_jobs:
+        write_pressure_events:
+          type: integer
+          format: uint64
+        write_pressure_overloads:
           type: integer
           format: uint64
     StorageStatus: # common.StorageStats
