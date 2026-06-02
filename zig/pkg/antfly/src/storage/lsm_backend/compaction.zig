@@ -704,7 +704,7 @@ fn selectCompactionPlan(
     if (runs.len < 2) return null;
     if (selectL0OverlapCompaction(runs, l0_overlap_compact_threshold_runs, max_input_bytes)) |plan| return plan;
     if (selectL0Compaction(runs, l0_limit, max_input_bytes, allow_oversized_single_job)) |plan| return plan;
-    if (selectLowerLevelRepairCompaction(runs, max_input_bytes)) |plan| return plan;
+    if (selectLowerLevelRepairCompaction(runs, max_input_bytes, allow_oversized_single_job)) |plan| return plan;
     return selectLowerLevelPressureCompaction(
         runs,
         level_target_runs_base,
@@ -712,6 +712,7 @@ fn selectCompactionPlan(
         level_target_bytes_base,
         level_target_bytes_multiplier,
         max_input_bytes,
+        allow_oversized_single_job,
     );
 }
 
@@ -787,7 +788,8 @@ fn selectL0Compaction(runs: []const Run, l0_limit: usize, max_input_bytes: u64, 
     return oversized_plan;
 }
 
-fn selectLowerLevelRepairCompaction(runs: []const Run, max_input_bytes: u64) ?CompactionPlan {
+fn selectLowerLevelRepairCompaction(runs: []const Run, max_input_bytes: u64, allow_oversized_single_job: bool) ?CompactionPlan {
+    var oversized_plan: ?CompactionPlan = null;
     var i: usize = 0;
     while (i + 1 < runs.len) : (i += 1) {
         const level = runs[i].level;
@@ -823,8 +825,9 @@ fn selectLowerLevelRepairCompaction(runs: []const Run, max_input_bytes: u64) ?Co
         }
         const plan = buildPlanForSourceRange(runs, level, start, end - start) orelse continue;
         if (planWithinInputBudget(runs, plan, max_input_bytes)) return plan;
+        if (allow_oversized_single_job and max_input_bytes > 0 and oversized_plan == null) oversized_plan = plan;
     }
-    return null;
+    return oversized_plan;
 }
 
 fn selectLowerLevelPressureCompaction(
@@ -834,6 +837,7 @@ fn selectLowerLevelPressureCompaction(
     level_target_bytes_base: usize,
     level_target_bytes_multiplier: usize,
     max_input_bytes: u64,
+    allow_oversized_single_job: bool,
 ) ?CompactionPlan {
     var i: usize = 0;
     while (i < runs.len) {
@@ -855,7 +859,16 @@ fn selectLowerLevelPressureCompaction(
 
         const source_len = if (need_runs) @max(@as(usize, 1), level_len - target_runs) else 1;
         const source_bytes = if (need_bytes) @max(@as(u64, 1), level_bytes - target_bytes) else 0;
-        if (selectLowestOverlapWindow(runs, level, level_start, level_len, source_len, source_bytes, max_input_bytes)) |plan| return plan;
+        if (selectLowestOverlapWindow(
+            runs,
+            level,
+            level_start,
+            level_len,
+            source_len,
+            source_bytes,
+            max_input_bytes,
+            allow_oversized_single_job,
+        )) |plan| return plan;
     }
     return null;
 }
@@ -868,10 +881,13 @@ fn selectLowestOverlapWindow(
     source_len: usize,
     source_bytes: u64,
     max_input_bytes: u64,
+    allow_oversized_single_job: bool,
 ) ?CompactionPlan {
     std.debug.assert(level_len >= source_len);
     var best_plan: ?CompactionPlan = null;
     var best_score: ?PlanScore = null;
+    var oversized_plan: ?CompactionPlan = null;
+    var oversized_score: ?PlanScore = null;
 
     var offset: usize = 0;
     while (offset < level_len) : (offset += 1) {
@@ -884,7 +900,6 @@ fn selectLowestOverlapWindow(
             if (selected_bytes < source_bytes) continue;
             const final_len = selected_len + 1;
             const plan = buildPlanForSourceRange(runs, level, source_start, final_len) orelse continue;
-            if (!planWithinInputBudget(runs, plan, max_input_bytes)) continue;
             const target_bytes = sumRunBytes(runs[plan.target_start .. plan.target_start + plan.target_len]);
             const score: PlanScore = .{
                 .rewrite_bytes = selected_bytes +| target_bytes,
@@ -894,6 +909,13 @@ fn selectLowestOverlapWindow(
                 .target_len = plan.target_len,
                 .source_start = source_start,
             };
+            if (!planWithinInputBudget(runs, plan, max_input_bytes)) {
+                if (allow_oversized_single_job and max_input_bytes > 0 and (oversized_score == null or score.betterThan(oversized_score.?))) {
+                    oversized_plan = plan;
+                    oversized_score = score;
+                }
+                break;
+            }
             if (best_score == null or score.betterThan(best_score.?)) {
                 best_plan = plan;
                 best_score = score;
@@ -901,7 +923,7 @@ fn selectLowestOverlapWindow(
             break;
         }
     }
-    return best_plan;
+    return best_plan orelse oversized_plan;
 }
 
 fn levelRunTarget(level: u32, base: usize, multiplier: usize) usize {
@@ -1010,6 +1032,52 @@ fn rangesOverlap(
 ) bool {
     return compareRunBound(lhs_smallest_namespace_name, lhs_smallest_key, rhs_largest_namespace_name, rhs_largest_key) != .gt and
         compareRunBound(lhs_largest_namespace_name, lhs_largest_key, rhs_smallest_namespace_name, rhs_smallest_key) != .lt;
+}
+
+fn testRun(id: u64, level: u32, smallest_key: []const u8, largest_key: []const u8, size_bytes: u64) Run {
+    return .{
+        .id = id,
+        .level = level,
+        .size_bytes = size_bytes,
+        .path = null,
+        .smallest_namespace_name = @constCast("docs"),
+        .smallest_key = @constCast(smallest_key),
+        .largest_namespace_name = @constCast("docs"),
+        .largest_key = @constCast(largest_key),
+        .entry_count = 1,
+        .bloom_filter = null,
+        .encoded_bloom_filter = null,
+        .owns_metadata = false,
+        .owns_bloom_filter = false,
+        .state = null,
+    };
+}
+
+test "lsm compaction lower-level repair can exceed input target for minimum job" {
+    const runs = [_]Run{
+        testRun(1, 1, "doc:a", "doc:m", 100),
+        testRun(2, 1, "doc:h", "doc:z", 100),
+    };
+
+    try std.testing.expect(selectLowerLevelRepairCompaction(&runs, 1, false) == null);
+    const plan = selectLowerLevelRepairCompaction(&runs, 1, true) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), plan.source_level);
+    try std.testing.expectEqual(@as(usize, 0), plan.source_start);
+    try std.testing.expectEqual(@as(usize, 2), plan.source_len);
+    try std.testing.expectEqual(@as(u32, 2), plan.output_level);
+}
+
+test "lsm compaction lower-level pressure can exceed input target for minimum job" {
+    const runs = [_]Run{
+        testRun(1, 1, "doc:a", "doc:b", 100),
+        testRun(2, 1, "doc:c", "doc:d", 100),
+    };
+
+    try std.testing.expect(selectLowerLevelPressureCompaction(&runs, 1, 1, 0, 8, 1, false) == null);
+    const plan = selectLowerLevelPressureCompaction(&runs, 1, 1, 0, 8, 1, true) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), plan.source_level);
+    try std.testing.expectEqual(@as(usize, 1), plan.source_len);
+    try std.testing.expectEqual(@as(u32, 2), plan.output_level);
 }
 
 fn rangesOverlapRun(lhs: Run, rhs: Run) bool {
