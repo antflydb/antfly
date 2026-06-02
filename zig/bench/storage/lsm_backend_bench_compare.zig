@@ -36,6 +36,8 @@ const Record = struct {
     storage_file_size: u64,
     read_point_gets: u64,
     read_run_probes: u64,
+    read_point_run_prechecks: u64 = 0,
+    read_point_run_precheck_survivors: u64 = 0,
     read_bloom_negatives: u64,
     read_mutable_hits: u64,
     read_l0_hits: u64,
@@ -108,6 +110,8 @@ const GroupAgg = struct {
     storage_read_trailer: MetricSeries = .{},
     storage_file_size: MetricSeries = .{},
     read_run_probes: MetricSeries = .{},
+    read_point_run_prechecks: MetricSeries = .{},
+    read_point_run_precheck_survivors: MetricSeries = .{},
     read_bloom_negatives: MetricSeries = .{},
     read_cursor_block_loads: MetricSeries = .{},
     read_cursor_block_reuses: MetricSeries = .{},
@@ -149,6 +153,8 @@ const GroupAgg = struct {
         self.storage_read_trailer.deinit(allocator);
         self.storage_file_size.deinit(allocator);
         self.read_run_probes.deinit(allocator);
+        self.read_point_run_prechecks.deinit(allocator);
+        self.read_point_run_precheck_survivors.deinit(allocator);
         self.read_bloom_negatives.deinit(allocator);
         self.read_cursor_block_loads.deinit(allocator);
         self.read_cursor_block_reuses.deinit(allocator);
@@ -184,6 +190,8 @@ const GroupAgg = struct {
         try self.storage_read_trailer.append(allocator, @floatFromInt(record.storage_read_trailer));
         try self.storage_file_size.append(allocator, @floatFromInt(record.storage_file_size));
         try self.read_run_probes.append(allocator, @floatFromInt(record.read_run_probes));
+        try self.read_point_run_prechecks.append(allocator, @floatFromInt(record.read_point_run_prechecks));
+        try self.read_point_run_precheck_survivors.append(allocator, @floatFromInt(record.read_point_run_precheck_survivors));
         try self.read_bloom_negatives.append(allocator, @floatFromInt(record.read_bloom_negatives));
         try self.read_cursor_block_loads.append(allocator, @floatFromInt(record.read_cursor_block_loads));
         try self.read_cursor_block_reuses.append(allocator, @floatFromInt(record.read_cursor_block_reuses));
@@ -361,6 +369,10 @@ fn printComparison(
     const after_size = try after.storage_file_size.median(allocator);
     const before_probes = try before.read_run_probes.median(allocator);
     const after_probes = try after.read_run_probes.median(allocator);
+    const before_prechecks = try before.read_point_run_prechecks.median(allocator);
+    const after_prechecks = try after.read_point_run_prechecks.median(allocator);
+    const before_precheck_survivors = try before.read_point_run_precheck_survivors.median(allocator);
+    const after_precheck_survivors = try after.read_point_run_precheck_survivors.median(allocator);
     const before_bloom = try before.read_bloom_negatives.median(allocator);
     const after_bloom = try after.read_bloom_negatives.median(allocator);
     const before_cursor_loads = try before.read_cursor_block_loads.median(allocator);
@@ -430,6 +442,15 @@ fn printComparison(
     try writePercentDelta(writer, after_probes, before_probes);
     try writer.print(")  bloom_neg {d:.0} -> {d:.0} (", .{ before_bloom, after_bloom });
     try writePercentDelta(writer, after_bloom, before_bloom);
+    if (before_prechecks > 0 or after_prechecks > 0 or before_precheck_survivors > 0 or after_precheck_survivors > 0) {
+        try writer.print(")  precheck/survive {d:.0}/{d:.0} -> {d:.0}/{d:.0} (", .{
+            before_prechecks,
+            before_precheck_survivors,
+            after_prechecks,
+            after_precheck_survivors,
+        });
+        try writePercentDelta(writer, after_precheck_survivors, before_precheck_survivors);
+    }
     try writer.print(")  cursor_loads {d:.0} -> {d:.0} (", .{ before_cursor_loads, after_cursor_loads });
     try writePercentDelta(writer, after_cursor_loads, before_cursor_loads);
     try writer.print(")  cursor_reuses {d:.0} -> {d:.0} (", .{ before_cursor_reuses, after_cursor_reuses });

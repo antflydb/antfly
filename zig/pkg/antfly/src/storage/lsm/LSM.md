@@ -182,6 +182,9 @@ Large-ingest guardrails:
    - [x] Surface cursor and point value borrow/copy counters in the read
      benchmark JSON and comparator, so borrowed-value work can be measured
      directly instead of inferred from allocator samples.
+   - [x] Surface point-run precheck/survivor counters in the read benchmark
+     JSON and comparator, so the precheck phase can be evaluated for selectivity
+     and overhead.
 3. [x] Implement a block-window cursor for persisted scans in the shared-cache
    path, matching the no-shared-cache table-index/block-window shape.
    - Expected signal: full/short scan throughput improves and cache pollution
