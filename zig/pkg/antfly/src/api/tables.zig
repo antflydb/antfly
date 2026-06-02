@@ -65,6 +65,7 @@ pub const LsmStorageStatus = struct {
     wal_checkpoint_lag_segments: u64 = 0,
     wal_replay_retained_segments: u64 = 0,
     wal_replay_retained_bytes: u64 = 0,
+    wal_replay_current_segment: u64 = 0,
     wal_append_records: u64 = 0,
     wal_append_bytes: u64 = 0,
     wal_append_ns: u64 = 0,
@@ -114,6 +115,7 @@ pub fn lsmStorageStatusFromBackendStats(
         .wal_checkpoint_lag_segments = maintenance.wal_checkpoint_lag_segments,
         .wal_replay_retained_segments = maintenance.wal_replay_retained_segments,
         .wal_replay_retained_bytes = maintenance.wal_replay_retained_bytes,
+        .wal_replay_current_segment = maintenance.wal_replay_current_segment,
         .wal_append_records = write.wal_append_records,
         .wal_append_bytes = write.wal_append_bytes,
         .wal_append_ns = write.wal_append_ns,
@@ -155,6 +157,7 @@ fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStora
         .wal_checkpoint_lag_segments = u64ToI64(status.wal_checkpoint_lag_segments),
         .wal_replay_retained_segments = u64ToI64(status.wal_replay_retained_segments),
         .wal_replay_retained_bytes = u64ToI64(status.wal_replay_retained_bytes),
+        .wal_replay_current_segment = u64ToI64(status.wal_replay_current_segment),
         .wal_append_records = u64ToI64(status.wal_append_records),
         .wal_append_bytes = u64ToI64(status.wal_append_bytes),
         .wal_append_ns = u64ToI64(status.wal_append_ns),
@@ -1999,6 +2002,7 @@ test "metadata.table status encoder honors storage status overrides" {
             .wal_retained_segments = 4,
             .wal_retained_bytes = 55,
             .wal_checkpoint_lag_segments = 6,
+            .wal_replay_current_segment = 10,
             .wal_sync_records = 7,
             .wal_sync_ns = 88,
             .background_io_denied_jobs = 9,
@@ -2014,6 +2018,7 @@ test "metadata.table status encoder honors storage status overrides" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"l0_bytes\":33") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":55") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_lag_segments\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_current_segment\":10") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_sync_records\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_sync_ns\":88") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"background_io_denied_jobs\":9") != null);

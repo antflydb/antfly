@@ -326,6 +326,9 @@ Large-ingest guardrails:
      index LSM maintenance/write stats, including mutable/immutable bytes,
      run/L0 debt, WAL retention/checkpoint lag, WAL append/sync/replay/reset
      counters, and background-IO admission counters.
+   - [x] API schema slice: `storage_status.lsm` now carries the dedicated
+     replay WAL current segment as well, matching the backend maintenance stats
+     and Prometheus WAL checkpoint surface.
    - [x] Metrics slice: the data-server Prometheus endpoint now exports the
      same cached-write LSM pressure surface for alerting and benchmark
      sampling, including mutable/immutable bytes, WAL retention/checkpoint

@@ -446,6 +446,7 @@ pub const LsmStorageStatus = struct {
     wal_checkpoint_lag_segments: ?i64 = null,
     wal_replay_retained_segments: ?i64 = null,
     wal_replay_retained_bytes: ?i64 = null,
+    wal_replay_current_segment: ?i64 = null,
     wal_append_records: ?i64 = null,
     wal_append_bytes: ?i64 = null,
     wal_append_ns: ?i64 = null,

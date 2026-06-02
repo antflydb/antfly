@@ -2331,6 +2331,9 @@ components:
         wal_replay_retained_bytes:
           type: integer
           format: uint64
+        wal_replay_current_segment:
+          type: integer
+          format: uint64
         wal_append_records:
           type: integer
           format: uint64
