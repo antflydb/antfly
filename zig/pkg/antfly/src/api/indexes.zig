@@ -608,6 +608,7 @@ fn appendIndexRuntimeStatus(
 }
 
 const AggregatedIndexStatus = struct {
+    kind: ?db_mod.types.IndexKind = null,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     table_doc_count: u64 = 0,
@@ -717,6 +718,7 @@ fn aggregateIndexStatus(
         if (!expectedGroupAllowsStatus(expected_group_ids, runtime.group_id)) continue;
         const item = findIndexStatus(runtime.stats.indexes, index_name) orelse continue;
         found = true;
+        if (aggregate.kind == null) aggregate.kind = item.kind;
         const runtime_present = runtime_status.statusHasRuntimeFacts(runtime);
         if (!runtime_present) continue;
         runtime_count += 1;
@@ -803,7 +805,21 @@ fn aggregateIndexStatus(
     }
     if (!found and expected_group_ids.len == 0) return null;
     if (active_count > 0) aggregate.backfill_progress = active_progress_sum / @as(f64, @floatFromInt(active_count));
+    normalizeReadyFullTextAggregate(&aggregate);
     return aggregate;
+}
+
+fn normalizeReadyFullTextAggregate(aggregate: *AggregatedIndexStatus) void {
+    const kind = aggregate.kind orelse return;
+    if (kind != .full_text) return;
+    if (aggregate.reported_group_count == 0 or aggregate.missing_group_count > 0 or aggregate.remote_unknown_group_count > 0) return;
+    if (aggregate.replay_target_sequence == 0 or aggregate.replay_applied_sequence < aggregate.replay_target_sequence) return;
+    if (aggregate.table_doc_count == 0 or aggregate.doc_count < aggregate.table_doc_count) return;
+
+    aggregate.replay_catch_up_required = false;
+    aggregate.catch_up_active = false;
+    aggregate.backfill_active = false;
+    aggregate.backfill_progress = 1.0;
 }
 
 fn algebraicProgressSummaryRanksHigher(
@@ -2257,6 +2273,41 @@ test "index encoders aggregate replay debt across local shards" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.400") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"8\":{") != null);
+}
+
+test "full text aggregate clears stale completed replay backfill flag" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = try std.testing.allocator.dupe(u8, "full_text_index_v1"),
+        .kind = .full_text,
+        .doc_count = 1000,
+        .term_count = 0,
+        .backfill_active = true,
+        .backfill_progress = 0.0,
+        .replay_applied_sequence = 1,
+        .replay_target_sequence = 1,
+        .replay_catch_up_required = true,
+        .catch_up_applied_sequence = 1,
+        .catch_up_target_sequence = 1,
+    }};
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .stale },
+        .stats = .{
+            .doc_count = 1000,
+            .index_count = 1,
+            .indexes = indexes[0..],
+        },
+    }};
+
+    const aggregate = aggregateIndexStatus(runtimes[0..], "full_text_index_v1", &.{7}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), aggregate.stale_group_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.replay_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.replay_target_sequence);
+    try std.testing.expect(!aggregate.replay_catch_up_required);
+    try std.testing.expect(!aggregate.backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), aggregate.backfill_progress);
 }
 
 test "index status keeps generic catch-up lag pending when replay sequence is equal" {
