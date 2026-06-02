@@ -1058,6 +1058,25 @@ pub const StreamingEncoder = struct {
         self.* = undefined;
     }
 
+    pub fn workingSetBytes(self: *const StreamingEncoder) u64 {
+        var bytes: u64 = 0;
+        if (self.filter_builder_active) bytes +|= self.filter_builder.bytes.len;
+        if (self.prefix_filter_builder_active) bytes +|= self.prefix_filter_builder.bytes.len;
+        bytes +|= capacityBytes(u32, self.entry_offsets.capacity);
+        bytes +|= capacityBytes(OwnedEncodedBlockMeta, self.blocks.capacity);
+        bytes +|= capacityBytes(u8, self.block_bytes.capacity);
+        bytes +|= capacityBytes(u8, self.compression_bytes.capacity);
+        bytes +|= capacityBytes(u8, self.encoded_filter_bytes.capacity);
+        bytes +|= capacityBytes([2]u64, self.block_hashes.capacity);
+        bytes +|= capacityBytes([2]u64, self.block_prefix_hashes.capacity);
+        for (self.blocks.items) |block| bytes +|= ownedEncodedBlockMetaHeapBytes(block);
+        if (self.block_smallest_namespace_name) |name| bytes +|= name.len;
+        bytes +|= self.block_smallest_key.len;
+        if (self.block_largest_namespace_name) |name| bytes +|= name.len;
+        bytes +|= self.block_largest_key.len;
+        return bytes;
+    }
+
     pub fn appendEntry(self: *StreamingEncoder, entry: Entry) !void {
         if (self.finished) return error.InvalidTableFile;
         if (self.entry_count >= max_entry_count) return error.TableFileTooLarge;
@@ -1269,6 +1288,22 @@ pub const StreamingEncoder = struct {
         self.block_entry_count = 0;
     }
 };
+
+fn capacityBytes(comptime T: type, capacity: usize) u64 {
+    return @as(u64, @intCast(capacity)) *| @as(u64, @intCast(@sizeOf(T)));
+}
+
+fn ownedEncodedBlockMetaHeapBytes(block: OwnedEncodedBlockMeta) u64 {
+    var bytes: u64 = 0;
+    if (block.smallest_namespace_name) |name| bytes +|= name.len;
+    bytes +|= block.smallest_key.len;
+    if (block.largest_namespace_name) |name| bytes +|= name.len;
+    bytes +|= block.largest_key.len;
+    bytes +|= block.filter.bytes.len;
+    if (block.prefix_filter) |filter| bytes +|= filter.bytes.len;
+    bytes +|= @as(u64, @intCast(block.hash_slots.len)) *| @sizeOf(u32);
+    return bytes;
+}
 
 fn summarizeCompressionStats(logical_entry_data_len: usize, physical_entry_data_len: usize, blocks: []const EncodedBlockMeta) CompressionStats {
     var stats = CompressionStats{

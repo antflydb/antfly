@@ -17,12 +17,14 @@ const Allocator = std.mem.Allocator;
 const bloom = @import("bloom");
 const lsm_manifest = @import("../lsm/manifest.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 const state_mod = @import("state.zig");
 const storage_io = @import("storage_io.zig");
 
 const max_run_file_read_bytes = 512 * 1024 * 1024;
 const max_manifest_read_bytes = 128 * 1024 * 1024;
 const table_write_buffer_size = 256 * 1024;
+const table_builder_accounting_step_bytes: u64 = 64 * 1024;
 
 pub fn maxRunFileReadBytes() usize {
     return max_run_file_read_bytes;
@@ -842,6 +844,9 @@ pub const StreamingRunFileWriter = struct {
     sink: lsm_table_file.TableSink = undefined,
     encoder: lsm_table_file.StreamingEncoder = undefined,
     encoder_active: bool = false,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    tracked_builder_bytes: u64 = 0,
+    last_reported_builder_bytes: u64 = 0,
 
     pub fn initInPlace(
         self: *StreamingRunFileWriter,
@@ -852,8 +857,9 @@ pub const StreamingRunFileWriter = struct {
         expected_entries: usize,
         bloom_config: bloom.Config,
         compression_policy: lsm_table_file.CompressionPolicy,
+        resource_manager: ?*resource_manager_mod.ResourceManager,
     ) !void {
-        self.* = .{ .allocator = allocator };
+        self.* = .{ .allocator = allocator, .resource_manager = resource_manager };
         try ensureOpenDirsWithStorage(storage, root_dir);
         self.path = try runPath(allocator, root_dir, run_id);
         errdefer {
@@ -881,9 +887,11 @@ pub const StreamingRunFileWriter = struct {
             .bloom_config = bloom_config,
         });
         self.encoder_active = true;
+        self.observeBuilderWorkingSet(true);
     }
 
     pub fn deinit(self: *StreamingRunFileWriter) void {
+        self.releaseBuilderWorkingSet();
         if (self.encoder_active) {
             self.encoder.deinit();
             self.encoder_active = false;
@@ -905,18 +913,23 @@ pub const StreamingRunFileWriter = struct {
 
     pub fn appendEntry(self: *StreamingRunFileWriter, entry: lsm_table_file.Entry) !void {
         try self.encoder.appendEntry(entry);
+        self.observeBuilderWorkingSet(false);
     }
 
     pub fn finish(self: *StreamingRunFileWriter) !PersistedStreamingRunFile {
+        self.observeBuilderWorkingSet(true);
         var encoded = try self.encoder.finish();
         errdefer encoded.filter.deinit(self.allocator);
+        self.observeBuilderWorkingSet(true);
         self.encoder_active = false;
         self.encoder.deinit();
+        self.observeBuilderWorkingSet(true);
         try self.adapter.flush();
         self.writer_active = false;
         try self.writer.finish();
         self.adapter.deinit();
         self.adapter_active = false;
+        self.releaseBuilderWorkingSet();
 
         const path = self.path;
         self.path = &.{};
@@ -927,6 +940,33 @@ pub const StreamingRunFileWriter = struct {
             .compression_stats = encoded.compression_stats,
             .filter = encoded.filter,
         };
+    }
+
+    fn observeBuilderWorkingSet(self: *StreamingRunFileWriter, force: bool) void {
+        if (self.resource_manager == null) return;
+        const next = self.builderWorkingSetBytes();
+        const grew_enough = next >= self.last_reported_builder_bytes +| table_builder_accounting_step_bytes;
+        const shrank_enough = self.last_reported_builder_bytes >= next +| table_builder_accounting_step_bytes;
+        if (!force and !grew_enough and !shrank_enough) return;
+        self.observeTrackedBuilderBytes(next);
+        self.last_reported_builder_bytes = next;
+    }
+
+    fn builderWorkingSetBytes(self: *const StreamingRunFileWriter) u64 {
+        var bytes: u64 = 0;
+        if (self.adapter_active) bytes +|= self.adapter.buffer.len;
+        if (self.encoder_active) bytes +|= self.encoder.workingSetBytes();
+        return bytes;
+    }
+
+    fn releaseBuilderWorkingSet(self: *StreamingRunFileWriter) void {
+        self.observeTrackedBuilderBytes(0);
+        self.last_reported_builder_bytes = 0;
+    }
+
+    fn observeTrackedBuilderBytes(self: *StreamingRunFileWriter, next: u64) void {
+        const manager = self.resource_manager orelse return;
+        manager.observeUsage(.lsm_table_builder_working_set, &self.tracked_builder_bytes, next);
     }
 };
 

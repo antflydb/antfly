@@ -1273,6 +1273,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 expected_entries,
                 backend.options.bloom,
                 backend.options.table_block_compression,
+                backend.options.resource_manager,
             );
             self.writer_active = true;
         }
@@ -1661,18 +1662,26 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
     const largest_key = try backend.allocator.dupe(u8, last.key);
     errdefer backend.allocator.free(largest_key);
 
-    var filter = try lsm_table_file.buildFilterAlloc(backend.allocator, entries, backend.options.bloom);
-    errdefer filter.deinit(backend.allocator);
-    const persisted = try repository_mod.persistTableEntriesAsRunFile(
+    var writer: repository_mod.StreamingRunFileWriter = undefined;
+    try writer.initInPlace(
         backend.storage.?,
         backend.allocator,
         backend.root_dir.?,
         run_id,
-        entries,
-        filter,
+        entries.len,
+        backend.options.bloom,
         backend.options.table_block_compression,
+        backend.options.resource_manager,
     );
-    errdefer backend.allocator.free(persisted.path);
+    var writer_active = true;
+    errdefer if (writer_active) writer.deinit();
+    for (entries) |entry| try writer.appendEntry(entry);
+    var persisted = try writer.finish();
+    writer_active = false;
+    errdefer {
+        backend.allocator.free(persisted.path);
+        persisted.filter.deinit(backend.allocator);
+    }
 
     return Run{
         .id = run_id,
@@ -1684,8 +1693,8 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
         .smallest_key = smallest_key,
         .largest_namespace_name = largest_namespace_name,
         .largest_key = largest_key,
-        .entry_count = @intCast(entries.len),
-        .bloom_filter = filter,
+        .entry_count = @intCast(persisted.entry_count),
+        .bloom_filter = persisted.filter,
         .encoded_bloom_filter = null,
         .state = null,
     };

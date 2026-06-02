@@ -173,6 +173,13 @@ and maintenance that is always debt-driven.
 1. [ ] Finish no-heap table-artifact publication and disk-backed merge output.
    - Flush, compaction, and HBC final artifact publication should write through
      bounded block builders and output sinks.
+   - [x] LSM persisted flushes, sorted ingest, and compaction output now use
+     the streaming table writer instead of the non-streaming sorted-entry
+     table encoder on the hot persisted paths.
+   - [x] Streaming table writers publish active encoder/write-buffer scratch
+     into the ResourceManager `lsm.table_builder_working_set` slice and
+     release it after finish/abort, so builder peaks are visible separately
+     from block cache, memtables, WAL retention, and compaction scheduler work.
    - Peak memory should be the active builder block/window plus bounded scratch,
      not the whole run, whole merge output, or whole artifact.
    - ResourceManager should account table-builder bytes, compaction scratch,
@@ -213,6 +220,9 @@ and maintenance that is always debt-driven.
    - Account mutable arena bytes, immutable pinned bytes, block-cache bytes,
      WAL retention, recovery scratch, table-builder scratch, and compaction
      scratch in ResourceManager.
+   - [x] Table-builder scratch is now a separate ResourceManager and
+     Prometheus slice (`lsm.table_builder_working_set`) for persisted
+     flush/sorted-ingest/compaction table writers.
    - Compare those slices against RSS/physical footprint in the large-root
      benchmarks; any remaining gap is allocator retention or higher-level
      dense/docstore working set, not hidden LSM cache.

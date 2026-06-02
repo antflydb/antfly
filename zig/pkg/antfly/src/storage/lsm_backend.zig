@@ -4576,6 +4576,47 @@ test "lsm backend eagerly accounts mutable state and wal write working set" {
     try std.testing.expect(wal_stats.peak_bytes > 0);
 }
 
+test "lsm backend accounts table builder working set during persisted flush" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    const root_dir = "/lsm-table-builder-resource-accounting";
+    const options = Options{
+        .flush_threshold = 1024,
+        .storage = storage.storage(),
+        .resource_manager = &manager,
+    };
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    defer backend.close();
+
+    var value_buf: [512]u8 = undefined;
+    @memset(&value_buf, 'v');
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        var i: usize = 0;
+        while (i < 64) : (i += 1) {
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>4}", .{i});
+            try txn.put(.{ .name = "docs" }, key, &value_buf);
+        }
+        try txn.commit();
+    }
+
+    {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        try backend.flushMutable();
+    }
+    const builder_stats = manager.sliceStats(.lsm_table_builder_working_set);
+    try std.testing.expectEqual(@as(u64, 0), builder_stats.used_bytes);
+    try std.testing.expect(builder_stats.peak_bytes >= 256 * 1024);
+    try std.testing.expect(backend.runs.items.len > 0);
+    try std.testing.expect(backend.runs.items[0].path != null);
+}
+
 test "lsm backend accounts retained wal bytes in the resource manager" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();

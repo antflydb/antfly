@@ -864,6 +864,7 @@ fn writeResourceMetricFamily(
     inline for (.{
         resource_manager_mod.Slice.lsm_block_table_cache,
         resource_manager_mod.Slice.lsm_compaction_work,
+        resource_manager_mod.Slice.lsm_table_builder_working_set,
         resource_manager_mod.Slice.lsm_in_memory_state,
         resource_manager_mod.Slice.lsm_wal_write_working_set,
         resource_manager_mod.Slice.hbc_node_metadata_cache,

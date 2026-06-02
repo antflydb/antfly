@@ -27,6 +27,8 @@ const MinSmartLsmCacheBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartLsmCacheBytes: u64 = 1024 * 1024 * 1024;
 const MinSmartLsmCompactionBytes: u64 = 128 * 1024 * 1024;
 const MaxSmartLsmCompactionBytes: u64 = 1024 * 1024 * 1024;
+const MinSmartLsmTableBuilderBytes: u64 = 64 * 1024 * 1024;
+const MaxSmartLsmTableBuilderBytes: u64 = 512 * 1024 * 1024;
 const MinSmartLsmInMemoryStateBytes: u64 = 256 * 1024 * 1024;
 const MaxSmartLsmInMemoryStateBytes: u64 = 2 * 1024 * 1024 * 1024;
 const MinSmartHbcCacheBytes: u64 = 128 * 1024 * 1024;
@@ -115,6 +117,7 @@ fn smartResourceBudgets() SmartResourceBudgets {
 
     const lsm_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCacheBytes, MaxSmartLsmCacheBytes);
     const lsm_compaction_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCompactionBytes, MaxSmartLsmCompactionBytes);
+    const lsm_table_builder_hard = adaptiveSliceHardLimit(total, 32, MinSmartLsmTableBuilderBytes, MaxSmartLsmTableBuilderBytes);
     const lsm_in_memory_state_hard = adaptiveSliceHardLimit(total, 8, MinSmartLsmInMemoryStateBytes, MaxSmartLsmInMemoryStateBytes);
     const lsm_wal_write_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmInMemoryStateBytes, MaxSmartLsmInMemoryStateBytes);
     const hbc_hard = adaptiveSliceHardLimit(total, 12, MinSmartHbcCacheBytes, MaxSmartHbcCacheBytes);
@@ -129,6 +132,7 @@ fn smartResourceBudgets() SmartResourceBudgets {
 
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, lsm_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = resourceBudget(3, lsm_table_builder_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = resourceBudget(3, lsm_in_memory_state_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)] = resourceBudget(3, lsm_wal_write_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = resourceBudget(3, hbc_hard);
@@ -313,6 +317,7 @@ test "provisioned group storage derives all resource budgets" {
     inline for (.{
         resource_manager_mod.Slice.lsm_block_table_cache,
         resource_manager_mod.Slice.lsm_compaction_work,
+        resource_manager_mod.Slice.lsm_table_builder_working_set,
         resource_manager_mod.Slice.lsm_in_memory_state,
         resource_manager_mod.Slice.lsm_wal_write_working_set,
         resource_manager_mod.Slice.hbc_node_metadata_cache,
