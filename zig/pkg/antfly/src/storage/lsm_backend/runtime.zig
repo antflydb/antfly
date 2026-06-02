@@ -465,7 +465,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             @max(@alignOf(?usize), @alignOf(?SourceEntry)),
             @max(@max(@alignOf(?[]const u8), @alignOf(?cache_mod.Handle)), @max(@alignOf(?*const lsm_table_file.TableIndex), @alignOf(usize))),
         );
-        const max_retained_mutable_source_entry_scratch: usize = 1 * 1024 * 1024;
+        const default_max_retained_mutable_source_entry_scratch: usize = 1 * 1024 * 1024;
         const min_retained_mutable_source_entry_scratch: usize = 4096;
 
         allocator: Allocator,
@@ -1196,31 +1196,40 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn mutableSourceEntryScratch(self: *@This(), needed: usize) ![]u8 {
+            const retained_cap = self.maxRetainedMutableSourceEntryScratch();
             var current_capacity: usize = 0;
             if (self.mutable_source_entry_bytes) |bytes| {
                 if (bytes.len >= needed) {
-                    if (bytes.len <= max_retained_mutable_source_entry_scratch or needed > max_retained_mutable_source_entry_scratch) {
+                    if (bytes.len <= retained_cap or needed > retained_cap) {
                         return bytes[0..needed];
                     }
                 }
-                current_capacity = if (bytes.len <= max_retained_mutable_source_entry_scratch) bytes.len else 0;
+                current_capacity = if (bytes.len <= retained_cap) bytes.len else 0;
                 self.allocator.free(bytes);
                 self.mutable_source_entry_bytes = null;
             }
-            const bytes = try self.allocator.alloc(u8, mutableSourceEntryScratchCapacity(current_capacity, needed));
+            const bytes = try self.allocator.alloc(u8, self.mutableSourceEntryScratchCapacity(current_capacity, needed));
             self.mutable_source_entry_bytes = bytes;
             return bytes[0..needed];
         }
 
-        fn mutableSourceEntryScratchCapacity(current_capacity: usize, needed: usize) usize {
-            if (needed > max_retained_mutable_source_entry_scratch) return needed;
+        fn mutableSourceEntryScratchCapacity(self: *@This(), current_capacity: usize, needed: usize) usize {
+            const retained_cap = self.maxRetainedMutableSourceEntryScratch();
+            if (needed > retained_cap) return needed;
             var capacity = @max(current_capacity, min_retained_mutable_source_entry_scratch);
             while (capacity < needed) {
                 const next_capacity = capacity * 2;
-                if (next_capacity >= max_retained_mutable_source_entry_scratch) return max_retained_mutable_source_entry_scratch;
+                if (next_capacity >= retained_cap) return retained_cap;
                 capacity = next_capacity;
             }
             return capacity;
+        }
+
+        fn maxRetainedMutableSourceEntryScratch(self: *const @This()) usize {
+            if (@hasField(BackendType, "options") and @hasField(@TypeOf(self.backend.options), "cursor_scratch_retained_cap_bytes")) {
+                return @max(self.backend.options.cursor_scratch_retained_cap_bytes, min_retained_mutable_source_entry_scratch);
+            }
+            return default_max_retained_mutable_source_entry_scratch;
         }
 
         fn mutableSourceLock(self: *@This()) bool {
@@ -1352,12 +1361,9 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             index: *const lsm_table_file.TableIndex,
             entry_index: usize,
         ) !SourceEntry {
-            const maybe_block_index = index.findBlockIndexForEntry(entry_index);
-            const window = if (maybe_block_index) |block_index|
-                index.blockWindow(block_index)
-            else
-                index.entryDataWindow(entry_index, cache_mod.DefaultTableBlockSize);
-            const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, maybe_block_index);
+            const block_index = index.findBlockIndexForEntry(entry_index) orelse return error.InvalidTableFile;
+            const window = index.blockWindow(block_index);
+            const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, block_index);
             const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
             const entry = try parseEntryAtWithStats(self.backend, bytes, relative_offset);
             return .{
@@ -1374,7 +1380,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             run: *Run,
             index: *const lsm_table_file.TableIndex,
             window: lsm_table_file.EntryDataWindow,
-            maybe_block_index: ?usize,
+            block_index: usize,
         ) ![]const u8 {
             if (self.source_block_indices[source_index]) |loaded_index| {
                 if (loaded_index == window.relative_offset) {
@@ -1400,7 +1406,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             );
             self.source_block_bytes[source_index] = bytes;
             self.source_block_indices[source_index] = window.relative_offset;
-            if (maybe_block_index) |block_index| try self.prefetchNextSourceBlock(source_index, run, index, block_index);
+            try self.prefetchNextSourceBlock(source_index, run, index, block_index);
             return bytes;
         }
 
@@ -1412,7 +1418,6 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             block_index: usize,
         ) !void {
             if (self.backend.options.cache == null) return;
-            if (index.blockCount() == 0) return;
 
             const next_block_index = block_index + 1;
             if (next_block_index >= index.blockCount()) return;
@@ -1497,64 +1502,34 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     return null;
                 }
             }
-            if (index.blockCount() > 0) {
-                var block_index = index.findBlockIndex(self.namespace.name, target) orelse return null;
-                while (block_index < index.blockCount()) : (block_index += 1) {
-                    const block = index.blocks[block_index];
-                    if (blockBeforeScanLower(block, self.namespace, target)) continue;
-                    if (self.blockStartsAtOrPastUpper(block)) return null;
-                    if (scan_prefix) |prefix| {
-                        if (!block.maybeContainsPrefix(self.namespace.name, prefix)) {
-                            recordBlockPrefixBloomNegative(self.backend);
-                            continue;
-                        }
-                    }
-                    const window = index.blockWindow(block_index);
-                    const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, block_index);
-                    if (try lsm_table_file.lowerBoundPositionInBlock(
-                        index,
-                        bytes,
-                        block_index,
-                        self.namespace.name,
-                        target,
-                        inclusive,
-                    )) |positioned| {
-                        return positioned.index;
-                    }
-
-                    if (compareNamespace(.{ .name = block.largest_namespace_name }, self.namespace) == .gt) {
-                        return null;
+            try requireTableBlocks(index);
+            var block_index = index.findBlockIndex(self.namespace.name, target) orelse return null;
+            while (block_index < index.blockCount()) : (block_index += 1) {
+                const block = index.blocks[block_index];
+                if (blockBeforeScanLower(block, self.namespace, target)) continue;
+                if (self.blockStartsAtOrPastUpper(block)) return null;
+                if (scan_prefix) |prefix| {
+                    if (!block.maybeContainsPrefix(self.namespace.name, prefix)) {
+                        recordBlockPrefixBloomNegative(self.backend);
+                        continue;
                     }
                 }
-                return null;
-            }
-
-            var lo: usize = 0;
-            var hi: usize = index.entryCount();
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                const entry = try self.sourceEntryAtFromLocalIndex(source_index, run, index, mid);
-                const ord = compareTableEntryTo(.{
-                    .namespace_name = entry.namespace_name,
-                    .key = entry.key,
-                    .value = entry.value,
-                    .tombstone = entry.tombstone,
-                }, self.namespace, target);
-                if (ord == .lt) {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
+                const window = index.blockWindow(block_index);
+                const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, block_index);
+                if (try lsm_table_file.lowerBoundPositionInBlock(
+                    index,
+                    bytes,
+                    block_index,
+                    self.namespace.name,
+                    target,
+                    inclusive,
+                )) |positioned| {
+                    return positioned.index;
                 }
-            }
 
-            var idx = lo;
-            while (idx < index.entryCount()) : (idx += 1) {
-                const entry = try self.sourceEntryAtFromLocalIndex(source_index, run, index, idx);
-                const order = compareNamespace(.{ .name = entry.namespace_name }, self.namespace);
-                if (order != .eq) return null;
-                if (!self.keyBeforeUpper(entry.key)) return null;
-                if (!inclusive and std.mem.eql(u8, entry.key, target)) continue;
-                return idx;
+                if (compareNamespace(.{ .name = block.largest_namespace_name }, self.namespace) == .gt) {
+                    return null;
+                }
             }
             return null;
         }
@@ -1572,17 +1547,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             else
                 null;
 
-            if (index.blockCount() == 0) {
-                var idx = current + 1;
-                while (idx < index.entryCount()) : (idx += 1) {
-                    const entry = try self.sourceEntryAtFromLocalIndex(source_index, run, index, idx);
-                    const order = compareNamespace(.{ .name = entry.namespace_name }, self.namespace);
-                    if (order == .eq) return idx;
-                    if (order == .gt) return null;
-                }
-                return null;
-            }
-
+            try requireTableBlocks(index);
             var block_index = index.findBlockIndexForEntry(current) orelse return error.RunStateUnavailable;
             var idx = current + 1;
             while (block_index < index.blockCount()) : (block_index += 1) {
@@ -1834,7 +1799,6 @@ const RunBatchIndexState = struct {
     block_index: ?usize = null,
     block_handle: ?cache_mod.Handle = null,
     block_has_values: bool = false,
-    last_entry_index: ?usize = null,
 
     fn deinit(self: *@This()) void {
         self.handle.release();
@@ -1857,12 +1821,6 @@ const RunBatchIndexState = struct {
         }
         self.block_has_values = false;
     }
-};
-
-const BatchForwardScanResult = union(enum) {
-    found: LocatedTableEntry,
-    not_found,
-    fallback,
 };
 
 const RunBatchIndexHandles = struct {
@@ -4474,6 +4432,10 @@ fn parseEntryAtWithStats(backend: anytype, bytes: []const u8, relative_offset: u
     return try parsed;
 }
 
+fn requireTableBlocks(index: *const lsm_table_file.TableIndex) !void {
+    if (index.entryCount() > 0 and index.blockCount() == 0) return error.InvalidTableFile;
+}
+
 fn decodeRunTableIndexWithStats(backend: anytype, allocator: Allocator, bytes: []const u8) !lsm_table_file.TableIndex {
     const start_ns = backend.readStatsNowNs();
     const decoded = lsm_table_file.decodeIndexAlloc(allocator, bytes);
@@ -4569,25 +4531,9 @@ fn getFromRunWithBlockCacheIndex(
         }
     }
 
-    var located: ?BlockLocatedEntry = null;
-    if (index.blockCount() == 0 and read_hint.* != null) {
-        const hint = (read_hint.*).?;
-        if (hint.run_index == run_index and
-            compareNamespace(namespace, .{ .name = hint.namespace_name }) == .eq and
-            std.mem.order(u8, key, hint.key) != .lt)
-        {
-            backend.recordReadHintAttempt();
-            located = try scanForExactEntryInCachedBlocks(backend, run, index, hint.entry_index, namespace, key);
-            if (located != null) {
-                backend.recordReadHintHit();
-            } else {
-                backend.recordReadHintMiss();
-            }
-        }
-    }
-    if (located == null) {
-        located = try findExactEntryInCachedBlocks(backend, run, index, held_values, value_allocator, namespace, key);
-    }
+    _ = run_index;
+    _ = read_hint;
+    const located = try findExactEntryInCachedBlocks(backend, run, index, held_values, value_allocator, namespace, key);
     var pinned = located orelse return null;
     errdefer if (pinned.handle) |*handle| handle.release();
     if (pinned.handle) |handle| {
@@ -4621,41 +4567,10 @@ fn getFromRunWithBlockCacheBatchState(
         }
     }
 
-    var located: ?LocatedTableEntry = null;
-    if (state.last_entry_index) |last_entry_index| {
-        backend.recordReadHintAttempt();
-        switch (try scanForExactEntryInBatchBlocksBounded(backend, run, index, state, held_blocks, last_entry_index + 1, namespace, key, 64)) {
-            .found => |entry| {
-                backend.recordReadHintHit();
-                located = entry;
-            },
-            .not_found => {
-                backend.recordReadHintHit();
-                return null;
-            },
-            .fallback => backend.recordReadHintMiss(),
-        }
-    }
-    if (located == null and index.blockCount() == 0 and read_hint.* != null) {
-        const hint = (read_hint.*).?;
-        if (hint.run_index == run_index and
-            compareNamespace(namespace, .{ .name = hint.namespace_name }) == .eq and
-            std.mem.order(u8, key, hint.key) != .lt)
-        {
-            backend.recordReadHintAttempt();
-            located = try scanForExactEntryInBatchBlocks(backend, run, index, state, held_blocks, hint.entry_index, namespace, key);
-            if (located != null) {
-                backend.recordReadHintHit();
-            } else {
-                backend.recordReadHintMiss();
-            }
-        }
-    }
-    if (located == null) {
-        located = try findExactEntryInBatchBlocks(backend, run, index, state, held_blocks, held_values, value_allocator, namespace, key);
-    }
+    _ = run_index;
+    _ = read_hint;
+    const located = try findExactEntryInBatchBlocks(backend, run, index, state, held_blocks, held_values, value_allocator, namespace, key);
     if (located) |entry| {
-        state.last_entry_index = entry.entry_index;
         if (!entry.entry.tombstone) state.block_has_values = true;
     }
     return located;
@@ -4780,24 +4695,6 @@ fn findExactEntryInCachedCompressedPrefixBlock(
     };
 }
 
-fn loadEntryFromCachedBlock(
-    backend: anytype,
-    run: *Run,
-    index: *const lsm_table_file.TableIndex,
-    entry_index: usize,
-) !BlockLocatedEntry {
-    const window = index.entryDataWindow(entry_index, cache_mod.DefaultTableBlockSize);
-    var handle = try loadRunTableBlockHandle(backend, run, index, window);
-    errdefer handle.release();
-    const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
-    const entry = try parseEntryAtWithStats(backend, handle.runTableBlock(), relative_offset);
-    return .{
-        .entry_index = entry_index,
-        .entry = entry,
-        .handle = handle,
-    };
-}
-
 fn findExactEntryInCachedBlocks(
     backend: anytype,
     run: *Run,
@@ -4807,58 +4704,36 @@ fn findExactEntryInCachedBlocks(
     namespace: backend_types.Namespace,
     key: []const u8,
 ) !?BlockLocatedEntry {
-    if (index.findBlockIndex(namespace.name, key)) |block_index| {
-        const block = index.blocks[block_index];
-        if (!block.mayContainKeyByBounds(namespace.name, key)) return null;
-        if (!block.maybeContains(namespace.name, key)) {
-            backend.recordBloomNegative();
-            return null;
-        }
-        if (try findExactEntryInCachedCompressedPrefixBlock(backend, run, index, block_index, held_values, value_allocator, namespace, key)) |entry| {
-            return .{
-                .entry_index = entry.entry_index,
-                .entry = entry.entry,
-                .handle = null,
-            };
-        }
-        const window = index.blockWindow(block_index);
-        var handle = try loadRunTableBlockHandle(backend, run, index, window);
-        errdefer handle.release();
-        const positioned = try lsm_table_file.findExactEntryInBlock(
-            index,
-            handle.runTableBlock(),
-            block_index,
-            namespace.name,
-            key,
-        ) orelse return null;
-        return .{
-            .entry_index = positioned.index,
-            .entry = positioned.entry,
-            .handle = handle,
-        };
-    }
-
-    var lo: usize = 0;
-    var hi: usize = index.entryCount();
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        var loaded = try loadEntryFromCachedBlock(backend, run, index, mid);
-        defer if (loaded.handle) |*handle| handle.release();
-        const ord = compareTableEntryTo(loaded.entry, namespace, key);
-        if (ord == .lt) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    if (lo >= index.entryCount()) return null;
-    var loaded = try loadEntryFromCachedBlock(backend, run, index, lo);
-    const ord = compareTableEntryTo(loaded.entry, namespace, key);
-    if (ord != .eq) {
-        if (loaded.handle) |*handle| handle.release();
+    try requireTableBlocks(index);
+    const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
+    const block = index.blocks[block_index];
+    if (!block.mayContainKeyByBounds(namespace.name, key)) return null;
+    if (!block.maybeContains(namespace.name, key)) {
+        backend.recordBloomNegative();
         return null;
     }
-    return loaded;
+    if (try findExactEntryInCachedCompressedPrefixBlock(backend, run, index, block_index, held_values, value_allocator, namespace, key)) |entry| {
+        return .{
+            .entry_index = entry.entry_index,
+            .entry = entry.entry,
+            .handle = null,
+        };
+    }
+    const window = index.blockWindow(block_index);
+    var handle = try loadRunTableBlockHandle(backend, run, index, window);
+    errdefer handle.release();
+    const positioned = try lsm_table_file.findExactEntryInBlock(
+        index,
+        handle.runTableBlock(),
+        block_index,
+        namespace.name,
+        key,
+    ) orelse return null;
+    return .{
+        .entry_index = positioned.index,
+        .entry = positioned.entry,
+        .handle = handle,
+    };
 }
 
 fn loadBatchBlock(
@@ -4879,33 +4754,6 @@ fn loadBatchBlock(
     return state.block_handle.?.runTableBlock();
 }
 
-fn loadEntryFromBatchBlock(
-    backend: anytype,
-    run: *Run,
-    index: *const lsm_table_file.TableIndex,
-    state: *RunBatchIndexState,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
-    entry_index: usize,
-) !LocatedTableEntry {
-    const block_index = index.findBlockIndexForEntry(entry_index) orelse {
-        var loaded = try loadEntryFromCachedBlock(backend, run, index, entry_index);
-        errdefer if (loaded.handle) |*handle| handle.release();
-        if (loaded.handle) |handle| {
-            try held_blocks.append(backend.allocator, handle);
-        }
-        return .{
-            .entry_index = loaded.entry_index,
-            .entry = loaded.entry,
-        };
-    };
-    const block_bytes = try loadBatchBlock(backend, run, index, state, held_blocks, block_index);
-    const relative_offset: usize = @intCast(index.entryStart(entry_index) - index.blockWindow(block_index).relative_offset);
-    return .{
-        .entry_index = entry_index,
-        .entry = try parseEntryAtWithStats(backend, block_bytes, relative_offset),
-    };
-}
-
 fn findExactEntryInBatchBlocks(
     backend: anytype,
     run: *Run,
@@ -4917,120 +4765,29 @@ fn findExactEntryInBatchBlocks(
     namespace: backend_types.Namespace,
     key: []const u8,
 ) !?LocatedTableEntry {
-    if (index.findBlockIndex(namespace.name, key)) |block_index| {
-        const block = index.blocks[block_index];
-        if (!block.mayContainKeyByBounds(namespace.name, key)) return null;
-        if (!block.maybeContains(namespace.name, key)) {
-            backend.recordBloomNegative();
-            return null;
-        }
-        if (try findExactEntryInCachedCompressedPrefixBlock(backend, run, index, block_index, held_values, value_allocator, namespace, key)) |entry| {
-            return entry;
-        }
-        const block_bytes = try loadBatchBlock(backend, run, index, state, held_blocks, block_index);
-        const positioned = try lsm_table_file.findExactEntryInBlock(
-            index,
-            block_bytes,
-            block_index,
-            namespace.name,
-            key,
-        ) orelse return null;
-        return .{
-            .entry_index = positioned.index,
-            .entry = positioned.entry,
-        };
+    try requireTableBlocks(index);
+    const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
+    const block = index.blocks[block_index];
+    if (!block.mayContainKeyByBounds(namespace.name, key)) return null;
+    if (!block.maybeContains(namespace.name, key)) {
+        backend.recordBloomNegative();
+        return null;
     }
-
-    var lo: usize = 0;
-    var hi: usize = index.entryCount();
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const loaded = try loadEntryFromBatchBlock(backend, run, index, state, held_blocks, mid);
-        const ord = compareTableEntryTo(loaded.entry, namespace, key);
-        if (ord == .lt) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
+    if (try findExactEntryInCachedCompressedPrefixBlock(backend, run, index, block_index, held_values, value_allocator, namespace, key)) |entry| {
+        return entry;
     }
-    if (lo >= index.entryCount()) return null;
-    const loaded = try loadEntryFromBatchBlock(backend, run, index, state, held_blocks, lo);
-    const ord = compareTableEntryTo(loaded.entry, namespace, key);
-    if (ord != .eq) return null;
-    return loaded;
-}
-
-fn scanForExactEntryInCachedBlocks(
-    backend: anytype,
-    run: *Run,
-    index: *const lsm_table_file.TableIndex,
-    start_index: usize,
-    namespace: backend_types.Namespace,
-    key: []const u8,
-) !?BlockLocatedEntry {
-    var idx = start_index;
-    while (idx < index.entryCount()) : (idx += 1) {
-        var loaded = try loadEntryFromCachedBlock(backend, run, index, idx);
-        const order = compareTableEntryTo(loaded.entry, namespace, key);
-        if (order == .lt) {
-            if (loaded.handle) |*handle| handle.release();
-            continue;
-        }
-        if (compareNamespace(.{ .name = loaded.entry.namespace_name }, namespace) != .eq or order != .eq) {
-            if (loaded.handle) |*handle| handle.release();
-            return null;
-        }
-        return loaded;
-    }
-    return null;
-}
-
-fn scanForExactEntryInBatchBlocks(
-    backend: anytype,
-    run: *Run,
-    index: *const lsm_table_file.TableIndex,
-    state: *RunBatchIndexState,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
-    start_index: usize,
-    namespace: backend_types.Namespace,
-    key: []const u8,
-) !?LocatedTableEntry {
-    var idx = start_index;
-    while (idx < index.entryCount()) : (idx += 1) {
-        const loaded = try loadEntryFromBatchBlock(backend, run, index, state, held_blocks, idx);
-        const order = compareTableEntryTo(loaded.entry, namespace, key);
-        if (order == .lt) continue;
-        if (compareNamespace(.{ .name = loaded.entry.namespace_name }, namespace) != .eq or order != .eq) return null;
-        return loaded;
-    }
-    return null;
-}
-
-fn scanForExactEntryInBatchBlocksBounded(
-    backend: anytype,
-    run: *Run,
-    index: *const lsm_table_file.TableIndex,
-    state: *RunBatchIndexState,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
-    start_index: usize,
-    namespace: backend_types.Namespace,
-    key: []const u8,
-    max_steps: usize,
-) !BatchForwardScanResult {
-    var idx = start_index;
-    var steps: usize = 0;
-    while (idx < index.entryCount() and steps < max_steps) : ({
-        idx += 1;
-        steps += 1;
-    }) {
-        const loaded = try loadEntryFromBatchBlock(backend, run, index, state, held_blocks, idx);
-        const order = compareTableEntryTo(loaded.entry, namespace, key);
-        if (order == .lt) continue;
-        if (compareNamespace(.{ .name = loaded.entry.namespace_name }, namespace) != .eq or order != .eq) return .not_found;
-        return .{ .found = loaded };
-    }
-    if (idx >= index.entryCount()) return .not_found;
-    return .fallback;
+    const block_bytes = try loadBatchBlock(backend, run, index, state, held_blocks, block_index);
+    const positioned = try lsm_table_file.findExactEntryInBlock(
+        index,
+        block_bytes,
+        block_index,
+        namespace.name,
+        key,
+    ) orelse return null;
+    return .{
+        .entry_index = positioned.index,
+        .entry = positioned.entry,
+    };
 }
 
 fn visibleEntryFromRunIndices(
@@ -5169,83 +4926,8 @@ fn findExactEntryWithLocalIndex(
     key: []const u8,
 ) !?OwnedTableEntry {
     const index = try indexForRunNoCache(backend, run);
-    if (index.blockCount() > 0) {
-        return try findExactEntryWithLocalIndexBlockMeta(backend, run, index, namespace, key);
-    }
-
-    var lo: usize = 0;
-    var hi: usize = index.entryCount();
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const loaded = try loadOwnedEntryFromStorageWindow(backend, run, index, mid);
-        const ord = compareTableEntryTo(loaded.entry, namespace, key);
-        backend.allocator.free(loaded.bytes);
-        if (ord == .lt) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-
-    if (lo >= index.entryCount()) return null;
-    const loaded = try loadOwnedEntryFromStorageWindow(backend, run, index, lo);
-    errdefer backend.allocator.free(loaded.bytes);
-    if (compareTableEntryTo(loaded.entry, namespace, key) != .eq) {
-        backend.allocator.free(loaded.bytes);
-        return null;
-    }
-    return loaded;
-}
-
-fn loadOwnedEntryFromStorageWindow(
-    backend: anytype,
-    run: *Run,
-    index: *const lsm_table_file.TableIndex,
-    entry_index: usize,
-) !OwnedTableEntry {
-    const window = index.entryDataWindow(entry_index, cache_mod.DefaultTableBlockSize);
-    const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
-    const bytes = try loadOwnedBlockForWindow(
-        backend,
-        run,
-        index,
-        window,
-    );
-    errdefer backend.allocator.free(bytes);
-    const entry = try parseEntryAtWithStats(backend, bytes, relative_offset);
-
-    return .{
-        .entry = entry,
-        .bytes = bytes,
-    };
-}
-
-fn loadOwnedEntryFromStorageWindowMaybeLocked(
-    backend: anytype,
-    run: *Run,
-    index: *const lsm_table_file.TableIndex,
-    entry_index: usize,
-    backend_locked: bool,
-) !OwnedTableEntry {
-    if (!backend_locked) return try loadOwnedEntryFromStorageWindow(backend, run, index, entry_index);
-
-    const window = index.entryDataWindow(entry_index, cache_mod.DefaultTableBlockSize);
-    const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
-    const bytes = try loadOwnedBlockForWindowAllocMaybeLocked(
-        backend,
-        backend.allocator,
-        run,
-        index,
-        window,
-        true,
-    );
-    errdefer backend.allocator.free(bytes);
-    const entry = try parseEntryAtWithStats(backend, bytes, relative_offset);
-
-    return .{
-        .entry = entry,
-        .bytes = bytes,
-    };
+    try requireTableBlocks(index);
+    return try findExactEntryWithLocalIndexBlockMeta(backend, run, index, namespace, key);
 }
 
 fn loadOwnedBlockForWindowAlloc(
@@ -5489,32 +5171,8 @@ fn findExactEntryWithLocalIndexMaybeLocked(
     if (!backend_locked) return try findExactEntryWithLocalIndex(backend, run, namespace, key);
 
     const index = try indexForRunNoCacheMaybeLocked(backend, run, true);
-    if (index.blockCount() > 0) {
-        return try findExactEntryWithLocalIndexBlockMetaMaybeLocked(backend, run, index, namespace, key, true);
-    }
-
-    var lo: usize = 0;
-    var hi: usize = index.entryCount();
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const loaded = try loadOwnedEntryFromStorageWindowMaybeLocked(backend, run, index, mid, true);
-        const ord = compareTableEntryTo(loaded.entry, namespace, key);
-        backend.allocator.free(loaded.bytes);
-        if (ord == .lt) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-
-    if (lo >= index.entryCount()) return null;
-    const loaded = try loadOwnedEntryFromStorageWindowMaybeLocked(backend, run, index, lo, true);
-    errdefer backend.allocator.free(loaded.bytes);
-    if (compareTableEntryTo(loaded.entry, namespace, key) != .eq) {
-        backend.allocator.free(loaded.bytes);
-        return null;
-    }
-    return loaded;
+    try requireTableBlocks(index);
+    return try findExactEntryWithLocalIndexBlockMetaMaybeLocked(backend, run, index, namespace, key, true);
 }
 
 fn loadVisibleEntryFromPathRunMaybeLocked(
@@ -6258,7 +5916,7 @@ test "lsm merge cursor caps retained mutable source scratch" {
     );
     defer cursor.close();
 
-    const oversized_needed = Cursor.max_retained_mutable_source_entry_scratch + 128;
+    const oversized_needed = Cursor.default_max_retained_mutable_source_entry_scratch + 128;
     _ = try cursor.mutableSourceEntryScratch(oversized_needed);
     try std.testing.expectEqual(oversized_needed, cursor.mutable_source_entry_bytes.?.len);
 

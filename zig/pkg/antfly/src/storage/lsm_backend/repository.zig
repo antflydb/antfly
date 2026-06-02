@@ -291,7 +291,7 @@ pub fn loadManifestIfPresentWithStorage(
 pub fn persistRunFile(allocator: Allocator, root_dir: []const u8, run: *Run) ![]u8 {
     var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
     defer native.deinit();
-    return try persistRunFileWithStorage(native.storage(), allocator, root_dir, run, .snappy_adaptive);
+    return try persistRunFileWithStorage(native.storage(), allocator, root_dir, run, .snappy_adaptive, lsm_table_file.default_prefix_extractor);
 }
 
 pub fn persistRunFileWithStorage(
@@ -300,8 +300,9 @@ pub fn persistRunFileWithStorage(
     root_dir: []const u8,
     run: *Run,
     compression_policy: lsm_table_file.CompressionPolicy,
+    prefix_extractor: lsm_table_file.PrefixExtractor,
 ) ![]u8 {
-    return try persistRunFileWithStorageAccounted(storage, allocator, root_dir, run, compression_policy, null);
+    return try persistRunFileWithStorageAccounted(storage, allocator, root_dir, run, compression_policy, prefix_extractor, null);
 }
 
 pub fn persistRunFileWithStorageAccounted(
@@ -310,6 +311,7 @@ pub fn persistRunFileWithStorageAccounted(
     root_dir: []const u8,
     run: *Run,
     compression_policy: lsm_table_file.CompressionPolicy,
+    prefix_extractor: lsm_table_file.PrefixExtractor,
     resource_manager: ?*resource_manager_mod.ResourceManager,
 ) ![]u8 {
     const state = run.state orelse return error.RunStateUnavailable;
@@ -322,6 +324,7 @@ pub fn persistRunFileWithStorageAccounted(
         state.entries.items.len,
         lsm_table_file.default_filter_config,
         compression_policy,
+        prefix_extractor,
         resource_manager,
     );
     var writer_active = true;
@@ -495,54 +498,26 @@ pub fn loadRunStateAllocWithStorage(storage: storage_io.Storage, allocator: Allo
     var state: state_mod.State = .{};
     errdefer state.deinit(allocator);
     try state.entries.ensureTotalCapacity(allocator, index.entryCount());
+    if (index.entryCount() > 0 and index.blockCount() == 0) return error.InvalidTableFile;
 
-    if (index.blockCount() > 0) {
-        for (index.blocks, 0..) |block, block_index| {
-            const window = index.blockWindow(block_index);
-            const payload = try storage.readFileRangeAlloc(
-                allocator,
-                path,
-                @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(),
-                window.physicalLen(),
-            );
-            defer allocator.free(payload);
-            const bytes = try lsm_table_file.decodeBlockPayloadAlloc(allocator, window.compression, payload, window.len);
-            defer allocator.free(bytes);
+    for (index.blocks, 0..) |block, block_index| {
+        const window = index.blockWindow(block_index);
+        const payload = try storage.readFileRangeAlloc(
+            allocator,
+            path,
+            @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(),
+            window.physicalLen(),
+        );
+        defer allocator.free(payload);
+        const bytes = try lsm_table_file.decodeBlockPayloadAlloc(allocator, window.compression, payload, window.len);
+        defer allocator.free(bytes);
 
-            const end = block.first_entry_index + block.entry_count;
-            for (block.first_entry_index..end) |entry_index| {
-                const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
-                const entry = try lsm_table_file.parseEntryAt(bytes, relative_offset);
-                try appendStateEntryClone(allocator, &state, entry);
-            }
+        const end = block.first_entry_index + block.entry_count;
+        for (block.first_entry_index..end) |entry_index| {
+            const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
+            const entry = try lsm_table_file.parseEntryAt(bytes, relative_offset);
+            try appendStateEntryClone(allocator, &state, entry);
         }
-        return state;
-    }
-
-    var loaded_window: ?lsm_table_file.EntryDataWindow = null;
-    var loaded_bytes: ?[]u8 = null;
-    defer if (loaded_bytes) |bytes| allocator.free(bytes);
-
-    for (0..index.entryCount()) |entry_index| {
-        const window = index.entryDataWindow(entry_index, lsm_table_file.default_block_size);
-        if (loaded_window == null or
-            loaded_window.?.relative_offset != window.relative_offset or
-            loaded_window.?.len != window.len)
-        {
-            if (loaded_bytes) |bytes| allocator.free(bytes);
-            const payload = try storage.readFileRangeAlloc(
-                allocator,
-                path,
-                @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(),
-                window.physicalLen(),
-            );
-            defer allocator.free(payload);
-            loaded_bytes = try lsm_table_file.decodeBlockPayloadAlloc(allocator, window.compression, payload, window.len);
-            loaded_window = window;
-        }
-        const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
-        const entry = try lsm_table_file.parseEntryAt(loaded_bytes.?, relative_offset);
-        try appendStateEntryClone(allocator, &state, entry);
     }
     return state;
 }
@@ -897,6 +872,7 @@ pub const StreamingRunFileWriter = struct {
         expected_entries: usize,
         bloom_config: bloom.Config,
         compression_policy: lsm_table_file.CompressionPolicy,
+        prefix_extractor: lsm_table_file.PrefixExtractor,
         resource_manager: ?*resource_manager_mod.ResourceManager,
     ) !void {
         self.* = .{ .allocator = allocator, .resource_manager = resource_manager };
@@ -924,6 +900,7 @@ pub const StreamingRunFileWriter = struct {
         self.sink = self.adapter.sink();
         self.encoder = try lsm_table_file.StreamingEncoder.init(allocator, &self.sink, expected_entries, .{
             .block_compression = compression_policy,
+            .prefix_extractor = prefix_extractor,
             .bloom_config = bloom_config,
         });
         self.encoder_active = true;
@@ -1070,6 +1047,7 @@ test "repository streams state run publication through table builder accounting"
         "/repository-stream-state-run",
         &run,
         .snappy_adaptive,
+        .none,
         &manager,
     );
 
@@ -1080,6 +1058,10 @@ test "repository streams state run publication through table builder accounting"
     try std.testing.expectEqual(@as(u64, 0), compaction_work_stats.peak_bytes);
     try std.testing.expect(run.size_bytes > 0);
     try std.testing.expect(run.bloom_filter != null);
+
+    var index = try loadRunTableIndexAllocWithStorage(storage.storage(), allocator, run.path.?);
+    defer index.deinit(allocator);
+    try std.testing.expectEqual(lsm_table_file.PrefixExtractor.none, index.prefix_extractor);
 
     var loaded = try loadRunStateAllocWithStorage(storage.storage(), allocator, run.path.?);
     defer loaded.deinit(allocator);

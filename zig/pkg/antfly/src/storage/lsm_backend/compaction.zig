@@ -1271,6 +1271,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 expected_entries,
                 backend.options.bloom,
                 backend.options.table_block_compression,
+                backend.options.table_prefix_extractor,
                 backend.options.resource_manager,
             );
             self.writer_active = true;
@@ -1393,7 +1394,8 @@ const PersistedRunCursor = struct {
     }
 
     fn ensureWindowForPosition(self: *PersistedRunCursor, pos: usize) !void {
-        const window = self.index.entryDataWindow(pos, lsm_table_file.default_block_size);
+        const block_index = self.index.findBlockIndexForEntry(pos) orelse return error.InvalidTableFile;
+        const window = self.index.blockWindow(block_index);
         if (self.loaded_window) |loaded| {
             if (loaded.relative_offset == window.relative_offset and
                 loaded.len == window.len and
@@ -1626,6 +1628,7 @@ pub fn makeRunAtLevel(comptime BackendType: type, backend: *BackendType, state: 
             backend.root_dir.?,
             &run,
             backend.options.table_block_compression,
+            backend.options.table_prefix_extractor,
             backend.options.resource_manager,
         );
         if (run.state) |*persisted_state| persisted_state.deinit(backend.allocator);
@@ -1676,6 +1679,7 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
         entries.len,
         backend.options.bloom,
         backend.options.table_block_compression,
+        backend.options.table_prefix_extractor,
         backend.options.resource_manager,
     );
     var writer_active = true;

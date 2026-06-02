@@ -363,22 +363,6 @@ pub const TableIndex = struct {
         if (index + 1 < self.entry_offsets.len) return self.entry_offsets[index + 1];
         return @intCast(self.entry_data_len);
     }
-
-    pub fn entryDataWindow(self: *const TableIndex, entry_index: usize, block_size: usize) EntryDataWindow {
-        if (self.findBlockIndexForEntry(entry_index)) |block_index| return self.blockWindow(block_index);
-        const entry_start: usize = self.entryStart(entry_index);
-        const entry_end: usize = self.entryEnd(entry_index);
-        const block_start = (entry_start / block_size) * block_size;
-        const min_block_end = block_start + block_size;
-        const block_end = @min(@max(min_block_end, entry_end), self.entry_data_len);
-        return .{
-            .relative_offset = @intCast(block_start),
-            .len = @intCast(block_end - block_start),
-            .physical_relative_offset = @intCast(block_start),
-            .physical_len = @intCast(block_end - block_start),
-            .compression = .none,
-        };
-    }
 };
 
 pub const Header = struct {

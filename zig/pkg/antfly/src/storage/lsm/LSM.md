@@ -204,8 +204,10 @@ and maintenance that is always debt-driven.
      and direct-search matched entries remain transaction-held scratch instead
      of cache entries.
    - [x] Exact point reads on prefix-compressed blocks no longer populate the
-     decoded block cache. Compatibility expansion remains only for callers that
-     need decoded iterator/window blocks or non-prefix block materialization.
+     decoded block cache. Runtime readers now require persisted block metadata
+     for populated tables; decoded block materialization remains only for
+     iterator/window paths and non-prefix block reads after block metadata has
+     selected the physical block.
 
 3. [x] Add async/future-style block reads for point-read survivors.
    - [x] Storage now exposes a one-shot range-read future API plus a neutral
@@ -241,16 +243,30 @@ and maintenance that is always debt-driven.
    - [x] Table-builder scratch is now a separate ResourceManager and
      Prometheus slice (`lsm.table_builder_working_set`) for persisted
      flush/sorted-ingest/compaction table writers.
+   - [x] Recovery replay scratch is now reported under
+     `lsm.recovery_working_set` during WAL replay/open and released when replay
+     completes, separate from `lsm.in_memory_state`.
+   - [x] Large-root benchmark resource logs now include LSM recovery
+     working-set used/peak bytes alongside cache, compaction, and state bytes.
+   - [x] LSM options now expose retained-cap knobs for recovery replay,
+     merge-cursor mutable-entry scratch, and compaction scratch; the merge
+     cursor uses the configured cap instead of a hard-coded retained size.
    - Compare those slices against RSS/physical footprint in the large-root
      benchmarks; any remaining gap is allocator retention or higher-level
      dense/docstore working set, not hidden LSM cache.
-   - Add retained-cap policies for reusable scratch so one large row/block does
+   - [x] Add retained-cap policies for reusable scratch so one large row/block does
      not permanently raise steady-state memory.
 
-6. [ ] Keep prefix/filter policy store-aware.
+6. [x] Keep prefix/filter policy store-aware.
    - Preserve the default first-separator prefix extractor for structured LSM
      keys, but make per-store extractors explicit where dense, sparse,
      full-text, graph, and primary stores diverge.
+   - Dense/HBC LSM tables now explicitly use no prefix extractor; primary,
+     full-text, sparse, and graph reverse stores keep first-separator prefix
+     extraction.
+   - Persisted table writers now receive the backend prefix policy, so table
+     metadata, table-level prefix blooms, and block-level prefix blooms match
+     the owning store.
    - Track prefix-bloom usefulness separately from exact bloom usefulness so bad
      extractors can be detected from benchmark/status counters.
 

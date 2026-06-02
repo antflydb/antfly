@@ -121,6 +121,10 @@ pub const Options = struct {
     max_run_file_bytes: usize = 512 * 1024 * 1024,
     bloom: bloom.Config = lsm_table_file.default_filter_config,
     table_block_compression: lsm_table_file.CompressionPolicy = .snappy_adaptive,
+    table_prefix_extractor: lsm_table_file.PrefixExtractor = lsm_table_file.default_prefix_extractor,
+    recovery_scratch_retained_cap_bytes: usize = wal_mod.default_replay_scratch_retained_cap_bytes,
+    cursor_scratch_retained_cap_bytes: usize = 1 * 1024 * 1024,
+    compaction_scratch_retained_cap_bytes: usize = 4 * 1024 * 1024,
     io_runtime: storage_io.RuntimeKind = .threaded,
     read_runtime: ?storage_io.ReadRuntime = null,
     storage: ?storage_io.Storage = null,
@@ -781,6 +785,7 @@ pub const Backend = struct {
     read_stats: AtomicReadStats = .{},
     tracked_in_memory_state_bytes: u64 = 0,
     tracked_wal_retention_bytes: u64 = 0,
+    tracked_recovery_working_set_bytes: u64 = 0,
     backend_lock_waits: CounterU64 = .init(0),
     backend_lock_wait_ns: CounterU64 = .init(0),
     backend_lock_max_wait_ns: CounterU64 = .init(0),
@@ -1229,6 +1234,7 @@ pub const Backend = struct {
         const manager = self.options.resource_manager orelse return;
         manager.observeUsage(.lsm_in_memory_state, &self.tracked_in_memory_state_bytes, 0);
         manager.observeUsage(.lsm_wal_retention, &self.tracked_wal_retention_bytes, 0);
+        manager.observeUsage(.lsm_recovery_working_set, &self.tracked_recovery_working_set_bytes, 0);
     }
 
     pub fn acquireCompactionGrant(self: *Backend, work: anytype) ?compaction_scheduler_mod.Grant {
@@ -2293,12 +2299,17 @@ pub const Backend = struct {
             }
         else
             null;
-        const stats = try wal_mod.replayIntoMutableWithHooks(
+        const stats = try wal_mod.replayIntoMutableWithHooksAndOptions(
             self.storage.?,
             self.allocator,
             self.root_dir.?,
             &self.mutable,
             replay_hooks,
+            .{
+                .resource_manager = self.options.resource_manager,
+                .tracked_working_set_bytes = &self.tracked_recovery_working_set_bytes,
+                .retained_cap_bytes = self.options.recovery_scratch_retained_cap_bytes,
+            },
         );
         self.recovery_replaying_wal = false;
         if (!self.options.backend.read_only and self.write_stats.manifest_writes != before_manifest_writes) {
@@ -3999,7 +4010,7 @@ fn cloneRunForBackend(dest: *Backend, source: Run) !Run {
         } else {
             const source_state = source.state orelse return error.RunStateUnavailable;
             run.state = try source_state.clone(dest.allocator);
-            run.path = try repository_mod.persistRunFileWithStorage(dest.storage.?, dest.allocator, root_dir, &run, dest.options.table_block_compression);
+            run.path = try repository_mod.persistRunFileWithStorage(dest.storage.?, dest.allocator, root_dir, &run, dest.options.table_block_compression, dest.options.table_prefix_extractor);
         }
     } else {
         const source_state = source.state orelse return error.RunStateUnavailable;
@@ -5202,6 +5213,7 @@ test "lsm backend accounts table builder working set during persisted flush" {
         .flush_threshold = 1024,
         .storage = storage.storage(),
         .resource_manager = &manager,
+        .table_prefix_extractor = .none,
     };
 
     var backend = try Backend.open(std.testing.allocator, root_dir, options);
@@ -5231,6 +5243,10 @@ test "lsm backend accounts table builder working set during persisted flush" {
     try std.testing.expect(builder_stats.peak_bytes >= 256 * 1024);
     try std.testing.expect(backend.runs.items.len > 0);
     try std.testing.expect(backend.runs.items[0].path != null);
+
+    var index = try repository_mod.loadRunTableIndexAllocWithStorage(storage.storage(), std.testing.allocator, backend.runs.items[0].path.?);
+    defer index.deinit(std.testing.allocator);
+    try std.testing.expectEqual(lsm_table_file.PrefixExtractor.none, index.prefix_extractor);
 }
 
 test "lsm backend accounts retained wal bytes in the resource manager" {
@@ -9620,10 +9636,10 @@ test "lsm backend sorted-by-run getManySorted advances within cached run blocks"
 
     const stats = backend.snapshotReadStats();
     try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_sorted_by_run);
-    try std.testing.expect(stats.read_hint_attempts > 0);
-    try std.testing.expect(stats.read_hint_hits > 0);
-    try std.testing.expect(stats.read_hint_hits > stats.read_hint_misses);
     try std.testing.expectEqual(@as(u64, 0), stats.cursor_block_loads);
+
+    const cache_stats = cache.snapshotStats();
+    try std.testing.expect(cache_stats.run_table_block.inserts + cache_stats.run_table_physical_block.inserts > 0);
 }
 
 test "lsm backend point getManySorted reuses cached run blocks below sorted threshold" {
@@ -9678,9 +9694,72 @@ test "lsm backend point getManySorted reuses cached run blocks below sorted thre
     const stats = backend.snapshotReadStats();
     try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_point);
     try std.testing.expectEqual(@as(u64, 0), stats.get_many_sorted_plan_sorted_by_run);
-    try std.testing.expect(stats.read_hint_attempts > 0);
-    try std.testing.expect(stats.read_hint_hits > 0);
     try std.testing.expectEqual(@as(u64, 0), stats.cursor_block_loads);
+
+    const cache_stats = cache.snapshotStats();
+    try std.testing.expect(cache_stats.run_table_block.inserts + cache_stats.run_table_physical_block.inserts > 0);
+}
+
+test "lsm backend getManySorted searches prefix-compressed physical blocks directly" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-batch-prefix-physical-cache";
+    const count = 96;
+    const keys = try alloc.alloc([]u8, count);
+    defer {
+        for (keys) |key| alloc.free(key);
+        alloc.free(keys);
+    }
+
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = storage.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        for (keys, 0..) |*key_slot, i| {
+            const key = try std.fmt.allocPrint(
+                alloc,
+                "tenant:docs:collection:very-long-shared-prefix:segment:{d:0>6}:field:dense-vector",
+                .{i},
+            );
+            key_slot.* = key;
+            try txn.put(.{ .name = "docs" }, key, "v");
+        }
+        try txn.commit();
+        try backend.sync(true);
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = storage.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    const values = try alloc.alloc(?[]const u8, count);
+    defer alloc.free(values);
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try read.getManySorted(.{ .name = "docs" }, keys, values);
+    for (values) |maybe_value| try std.testing.expectEqualStrings("v", maybe_value.?);
+
+    const stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_sorted_by_run);
+    try std.testing.expectEqual(@as(u64, 0), stats.cursor_block_loads);
+
+    const cache_stats = cache.snapshotStats();
+    try std.testing.expect(cache_stats.run_table_physical_block.inserts > 0);
+    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
 }
 
 test "lsm backend probe getManySorted uses point path for large sparse batches" {
@@ -11058,12 +11137,18 @@ test "lsm backend recovery replay flushes incrementally and retires covered wal 
     try std.testing.expect(before.segments > 1);
     try std.testing.expect(before.bytes > 0);
 
+    var manager = resource_manager_mod.ResourceManager.init(.{});
     {
         var reopened = try Backend.open(std.testing.allocator, root_dir, .{
             .flush_threshold = 2,
             .storage = memory_storage.storage(),
+            .resource_manager = &manager,
         });
         defer reopened.close();
+
+        const recovery_stats = manager.sliceStats(.lsm_recovery_working_set);
+        try std.testing.expectEqual(@as(u64, 0), recovery_stats.used_bytes);
+        try std.testing.expect(recovery_stats.peak_bytes >= wal_mod.default_replay_scratch_retained_cap_bytes);
 
         const stats = reopened.snapshotMaintenanceStats();
         try std.testing.expectEqual(@as(u64, 0), stats.mutable_entries);
