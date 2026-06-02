@@ -58,6 +58,30 @@ export type QueryResponses = components["schemas"]["QueryResponses"];
 export interface BatchRequest {
   inserts?: Record<string, unknown>;
   deletes?: string[];
+  transforms?: components["schemas"]["Transform"][];
+  sync_level?: components["schemas"]["SyncLevel"];
+}
+export type BatchResult = components["schemas"]["BatchResponse"];
+export interface MultiBatchRequest {
+  tables: Record<string, BatchRequest>;
+  sync_level?: components["schemas"]["SyncLevel"];
+}
+export type MultiBatchResult = components["schemas"]["MultiBatchResponse"];
+export type LinearMergeRequest = components["schemas"]["LinearMergeRequest"];
+export type LinearMergeResult = components["schemas"]["LinearMergeResult"];
+export interface WriteOptions {
+  /**
+   * Maximum encoded JSON request body size in bytes.
+   * Non-positive or omitted values use the SDK default.
+   */
+  maxRequestBytes?: number;
+  /**
+   * Maximum success response body size in bytes.
+   * Non-positive or omitted values use the SDK default.
+   */
+  maxResponseBytes?: number;
+  /** AbortSignal to cancel the request. */
+  signal?: AbortSignal;
 }
 
 // Table types
