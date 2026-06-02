@@ -4919,8 +4919,44 @@ pub const ProvisionedTableWriteSource = struct {
         return queue.draining or queue.entries.items.len != 0;
     }
 
+    fn testingWaitForWriteCoalesceQueueEntries(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        expected_entries: usize,
+    ) !void {
+        if (!builtin.is_test) @compileError("testingWaitForWriteCoalesceQueueEntries is test-only");
+        const deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (true) {
+            const count = self.testingWriteCoalesceQueueEntryCount(table_name, group_id);
+            if (count >= expected_entries) return;
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+            sleepNs(std.time.ns_per_ms);
+        }
+    }
+
+    fn testingWriteCoalesceQueueEntryCount(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+    ) usize {
+        if (!builtin.is_test) @compileError("testingWriteCoalesceQueueEntryCount is test-only");
+        const io = self.table_activity_threaded.io();
+        self.write_coalesce_mutex.lockUncancelable(io);
+        defer self.write_coalesce_mutex.unlock(io);
+        const queue_index = self.findWriteCoalesceQueueLocked(table_name, group_id) orelse return 0;
+        return self.write_coalesce_queues.items[queue_index].entries.items.len;
+    }
+
     fn coalesceCompatibleEntry(first: *const WriteCoalesceEntry, candidate: *const WriteCoalesceEntry) bool {
         return first.sync_level == candidate.sync_level and first.timestamp_ns == candidate.timestamp_ns;
+    }
+
+    fn coalescedEntryBatchRequest(entry: *const WriteCoalesceEntry) db_mod.types.BatchRequest {
+        return .{
+            .sync_level = entry.sync_level,
+            .timestamp_ns = entry.timestamp_ns,
+        };
     }
 
     fn enqueueProvisionedGroupBatchCoalesced(
@@ -5017,33 +5053,78 @@ pub const ProvisionedTableWriteSource = struct {
             }
             self.write_coalesce_mutex.unlock(io);
 
+            self.applyCoalescedEntriesWithIsolation(alloc, table_name, group_id, entries.items);
+        }
+    }
+
+    fn applyCoalescedEntriesWithIsolation(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+        entries: []const *WriteCoalesceEntry,
+    ) void {
+        std.debug.assert(entries.len > 0);
+        if (entries.len == 1) {
+            const entry = entries[0];
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
-            const arena_alloc = arena.allocator();
-            var merged = GroupBatch{ .group_id = group_id };
-            merged.writes.ensureTotalCapacity(arena_alloc, totalCoalescedWrites(entries.items)) catch |err| {
-                self.finishCoalescedEntries(entries.items, err);
-                continue;
-            };
-            merged.deletes.ensureTotalCapacity(arena_alloc, totalCoalescedDeletes(entries.items)) catch |err| {
-                self.finishCoalescedEntries(entries.items, err);
-                continue;
-            };
-            for (entries.items) |entry| {
-                for (entry.group.writes.items) |write| merged.writes.appendAssumeCapacity(write);
-                for (entry.group.deletes.items) |key| merged.deletes.appendAssumeCapacity(key);
-            }
-
-            const first = entries.items[0];
-            const apply_req = db_mod.types.BatchRequest{
-                .sync_level = first.sync_level,
-                .timestamp_ns = first.timestamp_ns,
-            };
             const apply_err: ?anyerror = blk: {
-                self.applyProvisionedGroupBatchLocked(arena_alloc, table_name, merged, apply_req) catch |err| break :blk err;
+                self.applyProvisionedGroupBatchLocked(arena.allocator(), table_name, entry.group, coalescedEntryBatchRequest(entry)) catch |err| break :blk err;
                 break :blk null;
             };
-            self.finishCoalescedEntries(entries.items, apply_err);
+            self.finishCoalescedEntry(entry, apply_err);
+            return;
+        }
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        var merged = GroupBatch{ .group_id = group_id };
+        merged.writes.ensureTotalCapacity(arena_alloc, totalCoalescedWrites(entries)) catch |err| {
+            self.finishCoalescedEntries(entries, err);
+            return;
+        };
+        merged.deletes.ensureTotalCapacity(arena_alloc, totalCoalescedDeletes(entries)) catch |err| {
+            self.finishCoalescedEntries(entries, err);
+            return;
+        };
+        for (entries) |entry| {
+            for (entry.group.writes.items) |write| merged.writes.appendAssumeCapacity(write);
+            for (entry.group.deletes.items) |key| merged.deletes.appendAssumeCapacity(key);
+        }
+
+        const merged_req = coalescedEntryBatchRequest(entries[0]);
+        // Default timestamp_ns=0 intentionally remains a DB-batch timestamp:
+        // coalescing preserves ordinary batch semantics and excludes CAS,
+        // graph, transform, and derived-visibility writes.
+        self.applyProvisionedGroupBatchLocked(arena_alloc, table_name, merged, merged_req) catch |merged_err| {
+            std.log.warn("coalesced provisioned batch failed; retrying waiters individually table={s} group_id={} waiters={} err={s}", .{
+                table_name,
+                group_id,
+                entries.len,
+                @errorName(merged_err),
+            });
+            self.applyCoalescedEntriesIndividually(alloc, table_name, entries);
+            return;
+        };
+        self.finishCoalescedEntries(entries, null);
+    }
+
+    fn applyCoalescedEntriesIndividually(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        entries: []const *WriteCoalesceEntry,
+    ) void {
+        for (entries) |entry| {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const apply_err: ?anyerror = blk: {
+                self.applyProvisionedGroupBatchLocked(arena.allocator(), table_name, entry.group, coalescedEntryBatchRequest(entry)) catch |err| break :blk err;
+                break :blk null;
+            };
+            self.finishCoalescedEntry(entry, apply_err);
         }
     }
 
@@ -5067,6 +5148,15 @@ pub const ProvisionedTableWriteSource = struct {
             entry.err = err;
             entry.done = true;
         }
+        self.write_coalesce_ready.broadcast(io);
+    }
+
+    fn finishCoalescedEntry(self: *ProvisionedTableWriteSource, entry: *WriteCoalesceEntry, err: ?anyerror) void {
+        const io = self.table_activity_threaded.io();
+        self.write_coalesce_mutex.lockUncancelable(io);
+        defer self.write_coalesce_mutex.unlock(io);
+        entry.err = err;
+        entry.done = true;
         self.write_coalesce_ready.broadcast(io);
     }
 
@@ -12272,6 +12362,73 @@ test "provisioned table write source routes batch writes across ranges" {
     try std.testing.expect(std.mem.indexOf(u8, right.json, "\"zeta\"") != null);
 }
 
+const ProvisionedWriteCoalesceTestCatalog = struct {
+    fn iface() table_catalog.CatalogSource {
+        return .{
+            .ptr = undefined,
+            .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            },
+        };
+    }
+
+    fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        return .{
+            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                .table_id = 7,
+                .name = "docs",
+                .placement_role = "data",
+                .indexes_json = tables_api.default_indexes_json,
+            }})[0..]),
+            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                .group_id = 7001,
+                .table_id = 7,
+                .start_key = "",
+                .end_key = null,
+            }})[0..]),
+            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        };
+    }
+
+    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+};
+
+const ProvisionedWriteCoalesceProbe = struct {
+    calls: std.atomic.Value(u32) = .init(0),
+    first_entered: std.atomic.Value(bool) = .init(false),
+    release_first: std.atomic.Value(bool) = .init(false),
+
+    fn beforeBatch(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const call = self.calls.fetchAdd(1, .acq_rel) + 1;
+        if (call == 1) {
+            self.first_entered.store(true, .release);
+            while (!self.release_first.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    }
+};
+
+const ProvisionedWriteCoalesceBatchWorker = struct {
+    source: *ProvisionedTableWriteSource,
+    key: []const u8,
+    value: []const u8,
+    err: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        _ = self.source.source().batch(std.heap.page_allocator, "docs", .{
+            .writes = &.{.{ .key = self.key, .value = self.value }},
+            .sync_level = .write,
+        }) catch |err| {
+            self.err = err;
+        };
+    }
+};
+
 test "provisioned table write source coalesces same-group waiters" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-batch-coalesce-waiters";
@@ -12284,95 +12441,28 @@ test "provisioned table write source coalesces same-group waiters" {
     const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(db_path);
 
-    const Catalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .placement_role = "data",
-                    .indexes_json = tables_api.default_indexes_json,
-                }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                    .group_id = 7001,
-                    .table_id = 7,
-                    .start_key = "",
-                    .end_key = null,
-                }})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    const Probe = struct {
-        calls: std.atomic.Value(u32) = .init(0),
-        first_entered: std.atomic.Value(bool) = .init(false),
-        release_first: std.atomic.Value(bool) = .init(false),
-
-        fn beforeBatch(ptr: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const call = self.calls.fetchAdd(1, .acq_rel) + 1;
-            if (call == 1) {
-                self.first_entered.store(true, .release);
-                while (!self.release_first.load(.acquire)) std.atomic.spinLoopHint();
-            }
-        }
-    };
-
-    const BatchWorker = struct {
-        source: *ProvisionedTableWriteSource,
-        key: []const u8,
-        value: []const u8,
-        err: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            _ = self.source.source().batch(std.heap.page_allocator, "docs", .{
-                .writes = &.{.{ .key = self.key, .value = self.value }},
-                .sync_level = .write,
-            }) catch |err| {
-                self.err = err;
-            };
-        }
-    };
-
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
-    var source = ProvisionedTableWriteSource.init(path, Catalog.iface());
+    var source = ProvisionedTableWriteSource.init(path, ProvisionedWriteCoalesceTestCatalog.iface());
     defer source.deinit();
     source.write_cache = &write_cache;
 
     _ = try source.source().createTable(alloc, "docs", .{});
 
-    var probe = Probe{};
-    test_before_batch_execution_hook = .{ .ptr = &probe, .run = Probe.beforeBatch };
+    var probe = ProvisionedWriteCoalesceProbe{};
+    test_before_batch_execution_hook = .{ .ptr = &probe, .run = ProvisionedWriteCoalesceProbe.beforeBatch };
     defer test_before_batch_execution_hook = null;
 
-    var first = BatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-    const first_thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&first});
+    var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
+    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
     while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
-    var second = BatchWorker{ .source = &source, .key = "doc:b", .value = "{\"title\":\"beta\"}" };
-    var third = BatchWorker{ .source = &source, .key = "doc:c", .value = "{\"title\":\"gamma\"}" };
-    const second_thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&second});
-    const third_thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&third});
+    var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:b", .value = "{\"title\":\"beta\"}" };
+    var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:c", .value = "{\"title\":\"gamma\"}" };
+    const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});
 
-    sleepNs(20 * std.time.ns_per_ms);
+    try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
     probe.release_first.store(true, .release);
 
     first_thread.join();
@@ -12390,6 +12480,58 @@ test "provisioned table write source coalesces same-group waiters" {
     var beta = (try cached.db.lookup(alloc, "doc:b", .{})).?;
     defer beta.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, beta.json, "\"beta\"") != null);
+    var gamma = (try cached.db.lookup(alloc, "doc:c", .{})).?;
+    defer gamma.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, gamma.json, "\"gamma\"") != null);
+}
+
+test "provisioned table write coalescer isolates failed waiters" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-batch-coalesce-failure-isolation";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, ProvisionedWriteCoalesceTestCatalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    _ = try source.source().createTable(alloc, "docs", .{});
+
+    var probe = ProvisionedWriteCoalesceProbe{};
+    test_before_batch_execution_hook = .{ .ptr = &probe, .run = ProvisionedWriteCoalesceProbe.beforeBatch };
+    defer test_before_batch_execution_hook = null;
+
+    var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
+    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var invalid = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:b", .value = "{\"title\":" };
+    var valid = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:c", .value = "{\"title\":\"gamma\"}" };
+    const invalid_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&invalid});
+    const valid_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&valid});
+
+    try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
+    probe.release_first.store(true, .release);
+
+    first_thread.join();
+    invalid_thread.join();
+    valid_thread.join();
+    if (first.err) |err| return err;
+    try std.testing.expect(invalid.err != null);
+    if (valid.err) |err| return err;
+
+    var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, db_path, 7001, "docs", .default, null, null);
+    defer cached.deinit(alloc);
+    try drainManagedDbBeforeClose(cached.db);
+    try std.testing.expect((try cached.db.lookup(alloc, "doc:b", .{})) == null);
     var gamma = (try cached.db.lookup(alloc, "doc:c", .{})).?;
     defer gamma.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, gamma.json, "\"gamma\"") != null);

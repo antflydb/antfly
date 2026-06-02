@@ -3452,6 +3452,7 @@ pub fn build(b: *std.Build) void {
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache reserves retirement slots when pruning multiple leased generations",
             "provisioned table write source coalesces same-group waiters",
+            "provisioned table write coalescer isolates failed waiters",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
