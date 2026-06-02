@@ -50,6 +50,22 @@ fn recordCursorValueCopy(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorValueCopy")) backend.recordCursorValueCopy();
 }
 
+fn disableCursorScanValueStats(cursor: anytype) ?bool {
+    const CursorType = @TypeOf(cursor.*);
+    if (comptime !@hasField(CursorType, "record_scan_value_stats")) return null;
+    const previous = cursor.record_scan_value_stats;
+    cursor.record_scan_value_stats = false;
+    return previous;
+}
+
+fn restoreCursorScanValueStats(cursor: anytype, previous: ?bool) void {
+    const value = previous orelse return;
+    const CursorType = @TypeOf(cursor.*);
+    if (comptime @hasField(CursorType, "record_scan_value_stats")) {
+        cursor.record_scan_value_stats = value;
+    }
+}
+
 fn recordPointValueBorrow(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointValueBorrow")) backend.recordPointValueBorrow();
 }
@@ -396,6 +412,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         current_visible_source: ?usize = null,
         upper_bound: ?[]const u8 = null,
         backend_locked: bool = false,
+        record_scan_value_stats: bool = true,
 
         fn cursorStorageSize(source_count: usize) usize {
             var offset: usize = 0;
@@ -591,10 +608,20 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 }
                 if (!entry.tombstone) {
                     self.current_visible_source = winner_source;
+                    self.recordVisibleValueStat(winner_source);
                     return .{ .key = entry.key, .value = entry.value };
                 }
                 self.current_visible_source = null;
                 try self.advanceForwardSourcesAtKey(candidate);
+            }
+        }
+
+        fn recordVisibleValueStat(self: *@This(), source_index: usize) void {
+            if (!self.record_scan_value_stats) return;
+            if (source_index == 0 and comptime MutableType == ActiveMemTable) {
+                recordCursorValueCopy(self.backend);
+            } else {
+                recordCursorValueBorrow(self.backend);
             }
         }
 
@@ -1625,6 +1652,8 @@ fn readManySortedFromCursor(
 
     var result: BatchCursorReadResult = .{};
     backend.recordPointGets(keys.len);
+    const previous_scan_value_stats = disableCursorScanValueStats(cursor);
+    defer restoreCursorScanValueStats(cursor, previous_scan_value_stats);
     var current = try cursor.seekAtOrAfter(keys[0]);
     for (keys, 0..) |key, i| {
         current = try advanceSortedBatchCursorToKey(cursor, current, key);

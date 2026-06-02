@@ -7290,6 +7290,8 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         try std.testing.expect(read_stats.cursor_block_readaheads > 0);
         try std.testing.expectEqual(@as(u64, 1), read_stats.cursor_table_index_misses);
         try std.testing.expect(read_stats.cursor_table_index_hits > read_stats.cursor_table_index_misses);
+        try std.testing.expect(read_stats.cursor_value_borrows > 0);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.cursor_value_copies);
     }
 
     {
@@ -7771,6 +7773,41 @@ test "lsm backend current scan reuses run grouping across cursor movement" {
     try std.testing.expect(after_open.run_group_total_runs > before_scan.run_group_total_runs);
     try std.testing.expectEqual(after_open.run_group_total_runs, after_scan.run_group_total_runs);
     try std.testing.expectEqual(after_open.run_group_l0_runs, after_scan.run_group_l0_runs);
+}
+
+test "lsm backend current scan counts active mutable value copies" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1024,
+        .wal_enabled = false,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var write = try runtime.beginWrite();
+    try write.put("doc:001", "value-1");
+    try write.put("doc:002", "value-2");
+    try write.commit();
+
+    const before_scan = backend.snapshotReadStats();
+    var scan = try runtime.beginCurrentScan();
+    defer scan.abort();
+    var cur = try scan.openCursor();
+    defer cur.close();
+
+    var maybe_entry = try cur.seekAtOrAfter("doc:001");
+    var count: usize = 0;
+    while (maybe_entry) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "doc:")) break;
+        count += 1;
+        maybe_entry = try cur.next();
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+
+    const after_scan = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 0), after_scan.cursor_value_borrows - before_scan.cursor_value_borrows);
+    try std.testing.expectEqual(@as(u64, 2), after_scan.cursor_value_copies - before_scan.cursor_value_copies);
 }
 
 test "lsm backend current probe getManySorted reuses source layout across chunks" {

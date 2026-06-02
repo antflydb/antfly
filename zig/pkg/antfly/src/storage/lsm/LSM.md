@@ -218,6 +218,9 @@ Large-ingest guardrails:
      the cap reuse a bounded geometric buffer, while oversized rows are released
      on the next smaller row instead of pinning cursor memory for the rest of
      the scan.
+   - [x] Normal forward scan cursors now expose whether visible values are
+     borrowed from stable persisted/immutable storage or copied from active
+     mutable scratch, so benchmark counters reflect the remaining copy sources.
 6. [ ] Cache per-cursor source layout (`runs`, L0 groups, lower levels, and
    immutable pointer slice) across repeated seeks while the cursor snapshot is
    valid.
