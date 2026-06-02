@@ -397,13 +397,9 @@ pub fn scanColumnAlloc(
         defer decoded.deinit(alloc);
         if (!std.mem.eql(u8, decoded.column_path, column_path)) continue;
         if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
-        const row_exists = try getRawAlloc(alloc, store, decoded.doc_key);
-        if (row_exists) |raw| {
-            alloc.free(raw);
-        } else {
-            continue;
-        }
-        const cell = (try relational_row_codec.findCellByPath(entry.value, column_path)) orelse continue;
+        const raw_row = try getRawAlloc(alloc, store, decoded.doc_key) orelse continue;
+        defer alloc.free(raw_row);
+        const cell = (try relational_row_codec.findCellByPath(raw_row, column_path)) orelse continue;
         const doc_key = try alloc.dupe(u8, decoded.doc_key);
         var doc_key_owned = true;
         errdefer if (doc_key_owned) alloc.free(doc_key);
@@ -1020,6 +1016,75 @@ test "relational base store scans rows and columns by document range" {
     try appendDelete(alloc, &store, &deletes, &owned_keys, "doc:a");
     try store.putBatch(writes.items, deletes.items);
     try std.testing.expectError(error.NotFound, store.get(alloc, doc_a_amount_key));
+}
+
+test "relational column scans hydrate values from current base rows" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const old_row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "amount",
+            .value_type = .f64_val,
+            .value = .{ .f64_val = 10 },
+        },
+    });
+    defer alloc.free(old_row);
+    const current_row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "amount",
+            .value_type = .f64_val,
+            .value = .{ .f64_val = 20 },
+        },
+    });
+    defer alloc.free(current_row);
+    const row_without_amount = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "title",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "no amount" },
+        },
+    });
+    defer alloc.free(row_without_amount);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", old_row);
+    try store.putBatch(writes.items, deletes.items);
+
+    const row_key = try rowKeyAlloc(alloc, "doc:a");
+    defer alloc.free(row_key);
+    try store.putBatch(&.{.{ .key = row_key, .value = current_row }}, &.{});
+
+    const current_values = try scanColumnAlloc(alloc, &store, "amount", "doc:a", "doc:a");
+    defer freeColumnValues(alloc, current_values);
+    try std.testing.expectEqual(@as(usize, 1), current_values.len);
+    try std.testing.expectEqualStrings("doc:a", current_values[0].doc_key);
+    try std.testing.expectEqual(.f64_val, current_values[0].value_type);
+    try std.testing.expectEqual(@as(f64, 20), current_values[0].value.f64_val);
+
+    try store.putBatch(&.{.{ .key = row_key, .value = row_without_amount }}, &.{});
+
+    const missing_values = try scanColumnAlloc(alloc, &store, "amount", "doc:a", "doc:a");
+    defer freeColumnValues(alloc, missing_values);
+    try std.testing.expectEqual(@as(usize, 0), missing_values.len);
 }
 
 test "relational column indexing policy preserves cells but suppresses scan entries" {

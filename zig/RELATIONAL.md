@@ -423,10 +423,12 @@ destination column-major scan entries from the destination's packed rows using
 the schema's `indexed` policy, and prunes parent scan entries through the
 reverse `doc_key -> column_path` scan-entry namespace only after the
 authoritative parent range has been rewritten. Stale parent scan entries are
-safe across crash/retry because scan reads verify that the base relational row
-still exists before returning a value. Merge bootstrap/catch-up reprojects donor logical writes into
-receiver relational rows and column entries; donor deletes remove receiver column
-entries during catch-up.
+safe across crash/retry because scan reads use the secondary entry only as a
+candidate document id, then hydrate the returned value from the current base
+relational row. Merge-style range cutover replays donor logical writes into the
+receiver's active range, where the relational participant regenerates receiver
+rows and column entries through the normal commit boundary; donor fencing rejects
+post-cutover writes outside the donor's remaining range.
 
 Physical data movement uses the internal table-data classifier rather than
 assuming every table datum lives under the document-range `0x01` namespace.
@@ -510,7 +512,8 @@ round-trip, document-mode passthrough, relational point reads, full-text
 `include_stored` hydration from base rows, scan-based aggregations over
 base-row `stored_data`, scalar filters over column scan entries, transaction
 commit/abort/transform behavior, stale generic-primary cleanup, split movement,
-and merge bootstrap/catch-up for row and column entries.
+stale secondary scan-entry hydration from current base rows, and merge-style
+range cutover for relational row and column entries across reopen.
 
 ## Related docs
 

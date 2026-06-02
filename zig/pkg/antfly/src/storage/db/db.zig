@@ -40668,6 +40668,119 @@ test "db merge-style cutover preserves text sparse and graph indexes across reop
     try std.testing.expectEqual(@as(usize, 0), donor_incoming.len);
 }
 
+test "db merge-style cutover routes relational rows and column scans across reopen" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var receiver_buf: [256]u8 = undefined;
+    const receiver_path = tempPath(&receiver_buf);
+    defer cleanupTempDir(receiver_path);
+
+    var donor_buf: [256]u8 = undefined;
+    const donor_path = tempPath(&donor_buf);
+    defer cleanupTempDir(donor_path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+
+    {
+        var receiver = try DB.open(alloc, std.mem.span(receiver_path), .{
+            .primary_backend = primary_backend,
+        });
+        defer receiver.close();
+        try receiver.setSchema(runtime_schema);
+        try receiver.updateRange(.{ .start = "row:a", .end = "row:m" });
+
+        var donor = try DB.open(alloc, std.mem.span(donor_path), .{
+            .primary_backend = primary_backend,
+        });
+        defer donor.close();
+        try donor.setSchema(runtime_schema);
+        try donor.updateRange(.{ .start = "row:m", .end = "" });
+
+        const index_cfg = types.IndexConfig{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        };
+        try receiver.addIndex(index_cfg);
+        try donor.addIndex(index_cfg);
+
+        try receiver.updateRange(.{ .start = "row:a", .end = "" });
+        try donor.updateRange(.{ .start = "row:m", .end = "row:m" });
+
+        try std.testing.expectError(error.KeyOutOfRange, donor.batch(.{
+            .writes = &.{.{ .key = "row:z", .value = "{\"title\":\"donor rejected\",\"status\":\"closed\",\"amount\":99}" }},
+            .sync_level = .full_index,
+        }));
+
+        try receiver.batch(.{
+            .writes = &.{
+                .{ .key = "row:b", .value = "{\"title\":\"receiver left\",\"status\":\"open\",\"amount\":10}" },
+                .{ .key = "row:z", .value = "{\"title\":\"receiver merged relational\",\"status\":\"closed\",\"amount\":33}" },
+            },
+            .sync_level = .full_index,
+        });
+        try receiver.sync(true);
+        try donor.sync(true);
+    }
+
+    var reopened_receiver = try DB.open(alloc, std.mem.span(receiver_path), .{
+        .primary_backend = primary_backend,
+    });
+    defer reopened_receiver.close();
+
+    var reopened_donor = try DB.open(alloc, std.mem.span(donor_path), .{
+        .primary_backend = primary_backend,
+    });
+    defer reopened_donor.close();
+
+    try std.testing.expectError(error.KeyOutOfRange, reopened_donor.batch(.{
+        .writes = &.{.{ .key = "row:z", .value = "{\"title\":\"donor still fenced\",\"status\":\"closed\",\"amount\":100}" }},
+        .sync_level = .full_index,
+    }));
+
+    const stored = (try reopened_receiver.get(alloc, "row:z")) orelse return error.TestExpectedEqual;
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"title\":\"receiver merged relational\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"status\":\"closed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"amount\":33") != null);
+
+    const amounts = try relational_store_mod.scanColumnAlloc(alloc, reopened_receiver.core.store, "amount", "row:z", "row:z");
+    defer relational_store_mod.freeColumnValues(alloc, amounts);
+    try std.testing.expectEqual(@as(usize, 1), amounts.len);
+    try std.testing.expectEqualStrings("row:z", amounts[0].doc_key);
+    try std.testing.expectEqual(.f64_val, amounts[0].value_type);
+    try std.testing.expectEqual(@as(f64, 33), amounts[0].value.f64_val);
+
+    var receiver_filtered = try reopened_receiver.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "relational" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"closed\"}}",
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer receiver_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), receiver_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:z", receiver_filtered.hits[0].id);
+    try std.testing.expect(receiver_filtered.hits[0].stored_data != null);
+
+    var donor_filtered = try reopened_donor.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "relational" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"closed\"}}",
+        .limit = 10,
+    });
+    defer donor_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 0), donor_filtered.total_hits);
+}
+
 fn cacheBlockHitsForBench(stats: anytype) u64 {
     if (@hasField(@TypeOf(stats), "run_table_block")) {
         return stats.run_table_block.hits;
