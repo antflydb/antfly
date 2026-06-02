@@ -942,6 +942,9 @@ pub fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
     const T = @TypeOf(store);
     if (T == backend_erased.Store) return .{ .store = store, .owned = false };
     if (T == *backend_erased.Store) return .{ .store = store.*, .owned = false };
+    if (T == resolver_lib.ArtifactStore) {
+        @compileError("initRuntimeStore requires a shard backend store; resolver ArtifactStore is already the derived-artifact seam");
+    }
     switch (@typeInfo(T)) {
         .pointer => |ptr| {
             if (@hasDecl(ptr.child, "backendStore")) {

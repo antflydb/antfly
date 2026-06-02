@@ -397,9 +397,51 @@ pub const ProvisionedTableWriteCache = struct {
         }
     }
 
+    fn candidateSourcesEqual(a: ?db_mod.CandidateSource, b: ?db_mod.CandidateSource) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return a.?.ptr == b.?.ptr and a.?.vtable == b.?.vtable;
+    }
+
+    fn entitySinksEqual(a: ?db_mod.EntitySink, b: ?db_mod.EntitySink) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return a.?.ptr == b.?.ptr and a.?.vtable == b.?.vtable;
+    }
+
+    fn promotionLeadershipSourcesEqual(a: ?PromotionLeadershipSource, b: ?PromotionLeadershipSource) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return a.?.ptr == b.?.ptr and a.?.vtable == b.?.vtable;
+    }
+
+    fn runtimeHooksEqual(
+        self: *const ProvisionedTableWriteCache,
+        candidate_source: ?db_mod.CandidateSource,
+        entity_sink_value: ?db_mod.EntitySink,
+        leadership_source: ?PromotionLeadershipSource,
+    ) bool {
+        return candidateSourcesEqual(self.resolution_candidate_source, candidate_source) and
+            entitySinksEqual(self.entity_sink, entity_sink_value) and
+            promotionLeadershipSourcesEqual(self.promotion_leadership_source, leadership_source);
+    }
+
+    fn setRuntimeHooks(
+        self: *ProvisionedTableWriteCache,
+        candidate_source: ?db_mod.CandidateSource,
+        entity_sink_value: ?db_mod.EntitySink,
+        leadership_source: ?PromotionLeadershipSource,
+    ) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        if (self.runtimeHooksEqual(candidate_source, entity_sink_value, leadership_source)) return;
+        self.resolution_candidate_source = candidate_source;
+        self.entity_sink = entity_sink_value;
+        self.promotion_leadership_source = leadership_source;
+        self.refreshRuntimeHooksLocked();
+    }
+
     pub fn setResolutionCandidateSource(self: *ProvisionedTableWriteCache, source: ?db_mod.CandidateSource) void {
         lockAtomic(&self.open_mutex);
         defer self.open_mutex.unlock();
+        if (candidateSourcesEqual(self.resolution_candidate_source, source)) return;
         self.resolution_candidate_source = source;
         self.refreshRuntimeHooksLocked();
     }
@@ -407,6 +449,7 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn setEntitySink(self: *ProvisionedTableWriteCache, sink: ?db_mod.EntitySink) void {
         lockAtomic(&self.open_mutex);
         defer self.open_mutex.unlock();
+        if (entitySinksEqual(self.entity_sink, sink)) return;
         self.entity_sink = sink;
         self.refreshRuntimeHooksLocked();
     }
@@ -414,6 +457,7 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSource) void {
         lockAtomic(&self.open_mutex);
         defer self.open_mutex.unlock();
+        if (promotionLeadershipSourcesEqual(self.promotion_leadership_source, source)) return;
         self.promotion_leadership_source = source;
         self.refreshRuntimeHooksLocked();
     }
@@ -625,7 +669,6 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
                 _ = self.hit_count.fetchAdd(1, .monotonic);
-                self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
                 lockAtomic(&self.entry_lifecycle_mutex);
                 defer self.entry_lifecycle_mutex.unlock();
                 entry.active_leases += 1;
@@ -721,7 +764,6 @@ pub const ProvisionedTableWriteCache = struct {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (!self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) continue;
             _ = self.hit_count.fetchAdd(1, .monotonic);
-            self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
             lockAtomic(&self.entry_lifecycle_mutex);
             defer self.entry_lifecycle_mutex.unlock();
             entry.active_leases += 1;
@@ -749,7 +791,6 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id != group_id) continue;
             if (entry.lsm_root_generation != lsm_root_generation) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
             lockAtomic(&self.entry_lifecycle_mutex);
             defer self.entry_lifecycle_mutex.unlock();
             entry.active_leases += 1;
@@ -764,7 +805,6 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     fn leaseEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) CachedDb {
-        self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
         lockAtomic(&self.entry_lifecycle_mutex);
         defer self.entry_lifecycle_mutex.unlock();
         entry.active_leases += 1;
@@ -791,7 +831,6 @@ pub const ProvisionedTableWriteCache = struct {
                 if (opened.*) |*db| db.close();
                 opened.* = null;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
-                self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
                 lockAtomic(&self.entry_lifecycle_mutex);
                 defer self.entry_lifecycle_mutex.unlock();
                 entry.active_leases += 1;
@@ -2876,9 +2915,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
         cache.antfly_provider = self.antfly_provider;
         cache.remote_content = self.remote_content;
-        cache.resolution_candidate_source = self.resolution_candidate_source;
-        cache.entity_sink = self.entity_sink;
-        cache.promotion_leadership_source = self.promotion_leadership_source;
+        cache.setRuntimeHooks(self.resolution_candidate_source, self.entity_sink, self.promotion_leadership_source);
         const identity_namespace = try loadTableIdentityNamespaceForGroup(cache.alloc, self.catalog, table_name, group_id);
         const expected_identity_namespace = if (mode == .startup_catch_up or mode == .restore_repair)
             null

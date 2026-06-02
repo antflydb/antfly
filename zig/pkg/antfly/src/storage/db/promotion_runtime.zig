@@ -449,6 +449,10 @@ const MapStore = struct {
         gop.value_ptr.* = owned_value;
     }
 
+    fn backendStore(self: *MapStore) BackendStore {
+        return .{ .store_ptr = self };
+    }
+
     fn store(self: *MapStore) resolver_lib.ArtifactStore {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -471,6 +475,89 @@ const MapStore = struct {
             self.alloc.free(kv.value);
         }
     }
+
+    const BackendStore = struct {
+        store_ptr: *MapStore,
+
+        pub fn capabilities(_: BackendStore) backend_erased.types.Capabilities {
+            return .{ .cursors = false };
+        }
+
+        pub fn beginRead(self: BackendStore) !ReadTxn {
+            return .{ .store_ptr = self.store_ptr };
+        }
+
+        pub fn beginWrite(self: BackendStore) !WriteTxn {
+            return .{ .store_ptr = self.store_ptr };
+        }
+
+        pub fn beginBatch(self: BackendStore) !WriteTxn {
+            return self.beginWrite();
+        }
+    };
+
+    const ReadTxn = struct {
+        store_ptr: *MapStore,
+
+        pub fn abort(_: *ReadTxn) void {}
+
+        pub fn get(self: *ReadTxn, key: []const u8) ![]const u8 {
+            return self.store_ptr.map.get(key) orelse error.NotFound;
+        }
+
+        pub fn openCursor(_: *ReadTxn) !EmptyCursor {
+            return error.Unsupported;
+        }
+    };
+
+    const WriteTxn = struct {
+        store_ptr: *MapStore,
+
+        pub fn abort(_: *WriteTxn) void {}
+
+        pub fn commit(_: *WriteTxn) !void {}
+
+        pub fn get(self: *WriteTxn, key: []const u8) ![]const u8 {
+            return self.store_ptr.map.get(key) orelse error.NotFound;
+        }
+
+        pub fn put(self: *WriteTxn, key: []const u8, value: []const u8) !void {
+            try self.store_ptr.put(key, value);
+        }
+
+        pub fn delete(self: *WriteTxn, key: []const u8) !void {
+            if (self.store_ptr.map.fetchRemove(key)) |kv| {
+                self.store_ptr.alloc.free(kv.key);
+                self.store_ptr.alloc.free(kv.value);
+            } else return error.NotFound;
+        }
+
+        pub fn openCursor(_: *WriteTxn) !EmptyCursor {
+            return error.Unsupported;
+        }
+    };
+
+    const EmptyCursor = struct {
+        pub fn close(_: *EmptyCursor) void {}
+        pub fn first(_: *EmptyCursor) !backend_erased.Entry {
+            return error.NotFound;
+        }
+        pub fn last(_: *EmptyCursor) !backend_erased.Entry {
+            return error.NotFound;
+        }
+        pub fn next(_: *EmptyCursor) !backend_erased.Entry {
+            return error.NotFound;
+        }
+        pub fn prev(_: *EmptyCursor) !backend_erased.Entry {
+            return error.NotFound;
+        }
+        pub fn seekAtOrAfter(_: *EmptyCursor, _: []const u8) !backend_erased.Entry {
+            return error.NotFound;
+        }
+        pub fn seekAtOrBefore(_: *EmptyCursor, _: []const u8) !backend_erased.Entry {
+            return error.NotFound;
+        }
+    };
 };
 
 /// Capturing entity sink for tests.
@@ -733,7 +820,7 @@ test "PromotionRuntime waits on source-shard leadership before promoting" {
     var capture = CaptureSink{ .alloc = alloc };
     defer capture.deinit();
     var owner = ToggleOwner{ .local_owner = false };
-    var store_handle = try resolution_runtime.initRuntimeStore(alloc, map.store());
+    var store_handle = try resolution_runtime.initRuntimeStore(alloc, map.backendStore());
     defer store_handle.deinit();
 
     var runtime = PromotionRuntime{
