@@ -3693,6 +3693,15 @@ pub const DB = struct {
         {
             try self.core.appendArtifactPresenceMarker(&store_writes);
         }
+        try appendAssetArtifactSourceIndexMutations(
+            self.alloc,
+            &store_writes,
+            deleted_artifact_keys,
+            &delete_keys,
+            &owned_store_keys,
+            &owned_store_values,
+            &owned_delete_keys,
+        );
 
         var sync_targets: ManagedSyncTargets = .{};
         defer sync_targets.deinit(self.alloc);
@@ -5525,13 +5534,73 @@ pub const DB = struct {
     pub fn recordReviewDecision(
         self: *DB,
         doc_key: []const u8,
+        source_artifact: []const u8,
+        resolution_artifact: []const u8,
         local_id: []const u8,
         decision: resolver_lib.Decision,
         table: []const u8,
         key: []const u8,
     ) !u64 {
-        const runtime = self.resolution_runtime orelse return error.ResolutionRuntimeUnavailable;
-        return try runtime.recordReviewDecision(doc_key, local_id, decision, table, key);
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.executor.failIfUnhealthy();
+
+        lockApply(self);
+        var apply_mutex_held = true;
+        errdefer if (apply_mutex_held) self.core.unlockApply();
+
+        const resolvers = try self.core.listResolvers(self.alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(self.alloc);
+            if (resolvers.len > 0) self.alloc.free(resolvers);
+        }
+        for (resolvers) |cfg| {
+            if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and
+                std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact))
+            {
+                break;
+            }
+        } else return error.ResolverNotFound;
+
+        const override_key = try resolution_runtime_mod.reviewOverrideArtifactKeyAlloc(self.alloc, doc_key, source_artifact, resolution_artifact);
+        defer self.alloc.free(override_key);
+        const existing = self.core.store.get(self.alloc, override_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (existing) |raw| self.alloc.free(raw);
+        const override_bytes = try resolution_runtime_mod.buildReviewDecisionBytesAlloc(self.alloc, existing, local_id, decision, table, key);
+        defer self.alloc.free(override_bytes);
+
+        const source_key = try internal_keys.artifactNamedPrefixAlloc(self.alloc, doc_key, "asset", source_artifact);
+        defer self.alloc.free(source_key);
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const changed_artifact_keys = [_][]const u8{source_key};
+        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
+            .sequence = sequence,
+            .changed_artifact_keys = changed_artifact_keys[0..],
+        }, sequence);
+        defer self.alloc.free(replay_payload);
+
+        const writes = [_]docstore_mod.KVPair{.{
+            .key = override_key,
+            .value = override_bytes,
+        }};
+        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..], &.{}, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.core.unlockApply();
+        apply_mutex_held = false;
+
+        if (self.executor.hasWorkers()) {
+            self.executor.forceSequence(sequence);
+        } else {
+            self.executor.notifySequence(sequence);
+        }
+        if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
+        if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+        return sequence;
     }
 
     /// Eager edge rewrite for an entity merge: repoint every inbound edge of
@@ -12339,6 +12408,89 @@ fn containsStoreWriteKey(list: []const docstore_mod.KVPair, key: []const u8) boo
     return false;
 }
 
+fn appendAssetArtifactSourceIndexMutations(
+    alloc: Allocator,
+    store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deleted_artifact_keys: []const []const u8,
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_store_keys: *std.ArrayListUnmanaged([]u8),
+    owned_store_values: *std.ArrayListUnmanaged([]u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const original_write_count = store_writes.items.len;
+    var write_index: usize = 0;
+    while (write_index < original_write_count) : (write_index += 1) {
+        const write = store_writes.items[write_index];
+        try appendAssetArtifactSourceIndexWrite(alloc, write.key, store_writes, owned_store_keys, owned_store_values);
+    }
+
+    const original_delete_count = delete_keys.items.len;
+    var delete_index: usize = 0;
+    while (delete_index < original_delete_count) : (delete_index += 1) {
+        const key = delete_keys.items[delete_index];
+        try appendAssetArtifactSourceIndexDelete(alloc, key, store_writes.items, delete_keys, owned_delete_keys);
+    }
+    for (deleted_artifact_keys) |key| {
+        try appendAssetArtifactSourceIndexDelete(alloc, key, store_writes.items, delete_keys, owned_delete_keys);
+    }
+}
+
+fn appendAssetArtifactSourceIndexWrite(
+    alloc: Allocator,
+    artifact_key: []const u8,
+    store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_store_keys: *std.ArrayListUnmanaged([]u8),
+    owned_store_values: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, artifact_key)) orelse return;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.artifact_name);
+    }
+
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, parsed.artifact_name, parsed.doc_key);
+    var marker_key_owned = false;
+    errdefer if (!marker_key_owned) alloc.free(marker_key);
+    if (containsStoreWriteKey(store_writes.items, marker_key)) return;
+
+    const marker_value = try alloc.dupe(u8, artifact_key);
+    var marker_value_owned = false;
+    errdefer if (!marker_value_owned) alloc.free(marker_value);
+
+    try owned_store_keys.append(alloc, marker_key);
+    marker_key_owned = true;
+    try owned_store_values.append(alloc, marker_value);
+    marker_value_owned = true;
+    try store_writes.append(alloc, .{
+        .key = marker_key,
+        .value = marker_value,
+    });
+}
+
+fn appendAssetArtifactSourceIndexDelete(
+    alloc: Allocator,
+    artifact_key: []const u8,
+    store_writes: []const docstore_mod.KVPair,
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, artifact_key)) orelse return;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.artifact_name);
+    }
+
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, parsed.artifact_name, parsed.doc_key);
+    var marker_key_owned = false;
+    errdefer if (!marker_key_owned) alloc.free(marker_key);
+    if (containsStoreWriteKey(store_writes, marker_key)) return;
+    if (containsOwnedKey(owned_delete_keys.items, marker_key)) return;
+
+    try owned_delete_keys.append(alloc, marker_key);
+    marker_key_owned = true;
+    try delete_keys.append(alloc, marker_key);
+}
+
 const GraphArtifactClear = struct {
     doc_key: []u8,
     index_name: []u8,
@@ -13819,6 +13971,16 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
 
     var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer store_writes.deinit(ctx.alloc);
+    var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_store_keys.items) |key| ctx.alloc.free(key);
+        owned_store_keys.deinit(ctx.alloc);
+    }
+    var owned_store_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_store_values.items) |value| ctx.alloc.free(value);
+        owned_store_values.deinit(ctx.alloc);
+    }
     var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer {
         for (identity_writes.items) |item| {
@@ -13880,6 +14042,15 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         keys,
     );
     try store_writes.appendSlice(ctx.alloc, identity_writes.items);
+    try appendAssetArtifactSourceIndexMutations(
+        ctx.alloc,
+        &store_writes,
+        deleted_artifact_keys.items,
+        &delete_keys,
+        &owned_store_keys,
+        &owned_store_values,
+        &owned_delete_keys,
+    );
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
     try ctx.store.putBatchWithReplay(ctx.io, store_writes.items, delete_keys.items, .{
@@ -24220,7 +24391,7 @@ test "db does not materialize review-band resolution as canonical mention edges"
     defer graph_mod.GraphIndex.freeEdges(alloc, out);
     try std.testing.expectEqual(@as(usize, 0), out.len);
 
-    _ = try db.recordReviewDecision("doc:a", "e0", .match, "entities", "person/ada_lovelace");
+    _ = try db.recordReviewDecision("doc:a", "relations_v1", "resolution_v1", "e0", .match, "entities", "person/ada_lovelace");
     try db.runUntilIdle();
 
     const curated_raw = try db.core.store.get(alloc, resolution_key);

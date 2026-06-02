@@ -338,10 +338,11 @@ durable replay stages that may lag behind `full_index`.
 That separation is intentional: a resolver can produce `review` decisions that
 require a human or external curation workflow, so no normal write sync level can
 promise "all semantic resolution is complete" without risking an unbounded wait.
-When a curator does act, the curation write is a normal durable mutation that
-enqueues the affected extraction artifact back into the `resolution` replay
-stage; resolution, graph materialization, and promotion then progress through the
-same bounded worker/checkpoint path as automatic changes.
+When a curator does act, the DB curation entry point commits the resolver-scoped
+override and the replay enqueue atomically. The replay record targets the exact
+source extraction artifact for that resolver; resolution, graph materialization,
+and promotion then progress through the same bounded worker/checkpoint path as
+automatic changes.
 Callers that need semantic readiness must inspect the stage status:
 
 ```json
@@ -638,14 +639,16 @@ Open/index/enrichment validation should reject:
    - [x] REVIEW band workflow: a review-band decision is recorded durably in the
          resolution artifact (`decision: "review"`); the review queue
          (`DB.listPendingReviews` / `resolution_runtime.listPendingReviews`)
-         enumerates the mentions awaiting curation. Human curation:
-         `recordReviewDecision` writes a durable per-document override
-         (confirm / relink / reject), the resolver honors it through an
+         enumerates the mentions awaiting curation with their
+         `(source_artifact, resolution_artifact)` scope. Human curation:
+         `recordReviewDecision` writes a durable per-document, per-resolver
+         override (confirm / relink / reject), the resolver honors it through an
          `OverrideProvider` seam, and it survives re-resolution (replay-stable
-         curation). The DB curation entry point also journals the document's
-         extraction artifact so the ordinary resolution -> graph/promotion replay
-         pipeline applies the curated decision asynchronously. The override record
-         doubles as a training label for
+         curation). The DB curation entry point atomically commits that override
+         with a replay record for the resolver's source extraction artifact, so
+         the ordinary resolution -> graph/promotion replay pipeline applies the
+         curated decision asynchronously. The override record doubles as a
+         training label for
          `fitScorerWeights`. Review-band decisions do not feed canonical entity
          promotion or doc->entity provenance edges; only `new` and `match`
          decisions cross that boundary. Verified by lib-resolver-test (the
@@ -667,12 +670,12 @@ Open/index/enrichment validation should reject:
          `merged_into` redirect to the surviving canonical entity (lazy merge).
    - [x] config-generation re-resolution: `DB.upsertResolver` marks a persisted
          re-resolution cursor dirty when a resolver's `config_generation` bumps.
-         `ResolutionRuntime.runReresolveBacklogWindow` scans extraction artifacts
-         in bounded windows, appends them as replay records, and lets the normal
-         resolution worker re-resolve them idempotently. Each window is drained
-         through downstream promotion/graph stages before the next window is
-         queued. Verified by db-tests (bump gen 1 -> 2 re-resolves an
-         already-ingested document).
+         `ResolutionRuntime.runReresolveBacklogWindow` scans the maintained
+         source-artifact index in bounded windows, appends matching extraction
+         artifacts as replay records, and lets the normal resolution worker
+         re-resolve them idempotently. Each window is drained through downstream
+         promotion/graph stages before the next window is queued. Verified by
+         db-tests (bump gen 1 -> 2 re-resolves an already-ingested document).
    - [x] Eager edge rewrite on merge: `DB.rewriteEntityEdges` repoints every
          inbound edge of the merged-away entity at the survivor (preserving type,
          weight, metadata), so provenance mention edges -- which target the

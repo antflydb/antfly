@@ -113,6 +113,16 @@ pub fn resolverForArtifact(
     return null;
 }
 
+pub fn resolverForResolutionArtifact(
+    resolvers: []const ResolverConfig,
+    resolution_artifact: []const u8,
+) ?*const ResolverConfig {
+    for (resolvers) |*cfg| {
+        if (std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact)) return cfg;
+    }
+    return null;
+}
+
 /// Resolve a changed extraction artifact into resolution artifact bytes.
 /// Returns null when no configured resolver consumes `artifact_name`.
 /// `candidates` supplies blocking candidates per entity (empty = deterministic
@@ -229,7 +239,7 @@ pub fn processChangedExtraction(
 
     // Human-curation overrides recorded for this document take precedence over
     // the scorer, and survive re-resolution (replay-stable curation).
-    const override_key = try internal_keys.artifactNamedPrefixAlloc(gpa, parsed.doc_key, "asset", review_override_artifact);
+    const override_key = try reviewOverrideArtifactKeyAlloc(gpa, parsed.doc_key, cfg.source_artifact, cfg.resolution_artifact);
     defer gpa.free(override_key);
     const override_raw = try store.get(gpa, override_key);
     defer if (override_raw) |r| gpa.free(r);
@@ -257,6 +267,25 @@ pub fn processChangedExtraction(
 /// `{ "<local_id>": { "decision": "match", "table": "...", "key": "..." } }`.
 /// No resolver consumes it, so it never triggers resolution itself.
 pub const review_override_artifact = "_resolution_review";
+
+pub fn reviewOverrideArtifactNameAlloc(
+    alloc: std.mem.Allocator,
+    source_artifact: []const u8,
+    resolution_artifact: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}", .{ review_override_artifact, source_artifact, resolution_artifact });
+}
+
+pub fn reviewOverrideArtifactKeyAlloc(
+    alloc: std.mem.Allocator,
+    doc_key: []const u8,
+    source_artifact: []const u8,
+    resolution_artifact: []const u8,
+) ![]u8 {
+    const artifact_name = try reviewOverrideArtifactNameAlloc(alloc, source_artifact, resolution_artifact);
+    defer alloc.free(artifact_name);
+    return try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
+}
 
 /// Override provider backed by a parsed review-overrides artifact. Borrowed
 /// strings live as long as the parse (the resolver copies them into its arena).
@@ -303,22 +332,37 @@ pub fn recordReviewDecision(
     gpa: std.mem.Allocator,
     store: resolver_lib.ArtifactStore,
     doc_key: []const u8,
+    source_artifact: []const u8,
+    resolution_artifact: []const u8,
     local_id: []const u8,
     decision: resolver_lib.Decision,
     table: []const u8,
     key: []const u8,
 ) !void {
-    const override_key = try internal_keys.artifactNamedPrefixAlloc(gpa, doc_key, "asset", review_override_artifact);
+    const override_key = try reviewOverrideArtifactKeyAlloc(gpa, doc_key, source_artifact, resolution_artifact);
     defer gpa.free(override_key);
+    const existing = try store.get(gpa, override_key);
+    defer if (existing) |raw| gpa.free(raw);
+    const bytes = try buildReviewDecisionBytesAlloc(gpa, existing, local_id, decision, table, key);
+    defer gpa.free(bytes);
+    try store.put(override_key, bytes);
+}
 
+pub fn buildReviewDecisionBytesAlloc(
+    gpa: std.mem.Allocator,
+    existing_raw: ?[]const u8,
+    local_id: []const u8,
+    decision: resolver_lib.Decision,
+    table: []const u8,
+    key: []const u8,
+) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(gpa);
+    errdefer out.deinit(gpa);
     try out.append(gpa, '{');
     var first = true;
 
     // Copy existing entries, replacing any for this local_id.
-    if (try store.get(gpa, override_key)) |raw| {
-        defer gpa.free(raw);
+    if (existing_raw) |raw| {
         if (std.json.parseFromSlice(std.json.Value, gpa, raw, .{})) |parsed| {
             var p = parsed;
             defer p.deinit();
@@ -348,7 +392,7 @@ pub fn recordReviewDecision(
     defer gpa.free(entry);
     try out.appendSlice(gpa, entry);
     try out.append(gpa, '}');
-    try store.put(override_key, out.items);
+    return try out.toOwnedSlice(gpa);
 }
 
 /// Adapts the storage `DenseEmbedder` to the resolver's `MentionEmbedder` seam,
@@ -764,9 +808,10 @@ fn enqueueChangedArtifactKeys(
 /// doing resolver/promotion work inline with the curation write.
 pub fn recordReviewDecisionAndEnqueue(
     gpa: std.mem.Allocator,
-    resolvers: []const ResolverConfig,
     store: resolver_lib.ArtifactStore,
     doc_key: []const u8,
+    source_artifact: []const u8,
+    resolution_artifact: []const u8,
     local_id: []const u8,
     decision: resolver_lib.Decision,
     table: []const u8,
@@ -774,24 +819,14 @@ pub fn recordReviewDecisionAndEnqueue(
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
 ) !u64 {
-    try recordReviewDecision(gpa, store, doc_key, local_id, decision, table, key);
+    try recordReviewDecision(gpa, store, doc_key, source_artifact, resolution_artifact, local_id, decision, table, key);
 
     var journal_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer {
         for (journal_keys.items) |k| gpa.free(@constCast(k));
         journal_keys.deinit(gpa);
     }
-    var seen_sources = std.ArrayListUnmanaged([]const u8).empty;
-    defer seen_sources.deinit(gpa);
-
-    for (resolvers) |cfg| {
-        for (seen_sources.items) |seen| {
-            if (std.mem.eql(u8, seen, cfg.source_artifact)) break;
-        } else {
-            try appendUniqueBorrowedString(gpa, &seen_sources, cfg.source_artifact);
-            try journal_keys.append(gpa, try internal_keys.artifactNamedPrefixAlloc(gpa, doc_key, "asset", cfg.source_artifact));
-        }
-    }
+    try journal_keys.append(gpa, try internal_keys.artifactNamedPrefixAlloc(gpa, doc_key, "asset", source_artifact));
     return try enqueueChangedArtifactKeys(&journal_keys, write_ctx, write_fn);
 }
 
@@ -877,56 +912,75 @@ pub fn enqueueReresolveBacklogWindow(
         for (asset_keys.items) |k| gpa.free(@constCast(k));
         asset_keys.deinit(gpa);
     }
+    var source_artifacts = std.ArrayListUnmanaged([]const u8).empty;
+    defer source_artifacts.deinit(gpa);
+    for (resolvers) |cfg| try appendUniqueBorrowedString(gpa, &source_artifacts, cfg.source_artifact);
+    std.mem.sort([]const u8, source_artifacts.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
 
     const Collector = struct {
         gpa: std.mem.Allocator,
-        resolvers: []const ResolverConfig,
         resume_after: ?[]const u8,
         limit: usize,
         out: *std.ArrayListUnmanaged([]const u8),
+        last_index_key: ?[]u8 = null,
         limit_reached: bool = false,
 
         fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
-            _ = value;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.resume_after) |resume_key_value| {
                 if (std.mem.order(u8, key, resume_key_value) != .gt) return;
             }
-            if (!internal_keys.isAssetArtifactKey(key)) return;
-            const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(self.gpa, key)) orelse return;
-            defer self.gpa.free(parsed.doc_key);
-            defer self.gpa.free(parsed.artifact_name);
-            if (resolverForArtifact(self.resolvers, parsed.artifact_name) == null) return;
+            if (!internal_keys.isAssetArtifactKey(value)) return;
             if (self.out.items.len >= self.limit) {
                 self.limit_reached = true;
                 return error.ReresolveWindowFull;
             }
-            try self.out.append(self.gpa, try self.gpa.dupe(u8, key));
+            try self.out.append(self.gpa, try self.gpa.dupe(u8, value));
+            if (self.last_index_key) |previous| self.gpa.free(previous);
+            self.last_index_key = try self.gpa.dupe(u8, key);
         }
     };
 
     var collector = Collector{
         .gpa = gpa,
-        .resolvers = resolvers,
         .resume_after = resume_after,
         .limit = limit,
         .out = &asset_keys,
     };
-    const lower_user = [_]u8{internal_keys.user_namespace};
-    const upper = [_]u8{internal_keys.user_namespace + 1};
-    const lower = if (resume_after) |resume_key_value| resume_key_value else lower_user[0..];
-    store.scanPrefix(lower, upper[0..], &collector, Collector.consume) catch |err| switch (err) {
-        error.ScanUnsupported => return .{},
-        error.ReresolveWindowFull => {},
-        else => return err,
-    };
+    errdefer if (collector.last_index_key) |key| gpa.free(key);
+    for (source_artifacts.items) |source_artifact| {
+        const prefix = try internal_keys.assetArtifactSourceIndexPrefixAlloc(gpa, source_artifact);
+        defer gpa.free(prefix);
+        const upper = (try internal_keys.nextPrefixAlloc(gpa, prefix)) orelse continue;
+        defer gpa.free(upper);
+        if (resume_after) |resume_key_value| {
+            if (std.mem.order(u8, resume_key_value, upper) != .lt) continue;
+        }
+        const lower = if (resume_after) |resume_key_value|
+            if (std.mem.order(u8, resume_key_value, prefix) == .gt and std.mem.order(u8, resume_key_value, upper) == .lt)
+                resume_key_value
+            else
+                prefix
+        else
+            prefix;
+        store.scanPrefix(lower, upper, &collector, Collector.consume) catch |err| switch (err) {
+            error.ScanUnsupported => return .{},
+            error.ReresolveWindowFull => {},
+            else => return err,
+        };
+        if (collector.limit_reached) break;
+    }
 
     _ = try enqueueChangedArtifactKeys(&asset_keys, write_ctx, write_fn);
     if (asset_keys.items.len == 0) return .{ .queued = 0, .complete = true };
     return .{
         .queued = asset_keys.items.len,
         .complete = !collector.limit_reached and asset_keys.items.len < limit,
-        .resume_after = try gpa.dupe(u8, asset_keys.items[asset_keys.items.len - 1]),
+        .resume_after = collector.last_index_key,
     };
 }
 
@@ -936,6 +990,8 @@ pub fn enqueueReresolveBacklogWindow(
 /// and that decision becomes a training label.
 pub const PendingReview = struct {
     doc_key: []u8,
+    source_artifact: []u8,
+    resolution_artifact: []u8,
     local_id: []u8,
     table: []u8,
     key: []u8,
@@ -943,6 +999,8 @@ pub const PendingReview = struct {
 
     pub fn deinit(self: *PendingReview, alloc: std.mem.Allocator) void {
         alloc.free(self.doc_key);
+        alloc.free(self.source_artifact);
+        alloc.free(self.resolution_artifact);
         alloc.free(self.local_id);
         alloc.free(self.table);
         alloc.free(self.key);
@@ -961,12 +1019,14 @@ pub fn freePendingReviews(alloc: std.mem.Allocator, reviews: []PendingReview) vo
 pub fn listPendingReviews(
     gpa: std.mem.Allocator,
     store: resolver_lib.ArtifactStore,
+    resolvers: []const ResolverConfig,
 ) ![]PendingReview {
     var out = std.ArrayListUnmanaged(PendingReview).empty;
     errdefer freePendingReviews(gpa, out.items);
 
     const Ctx = struct {
         gpa: std.mem.Allocator,
+        resolvers: []const ResolverConfig,
         out: *std.ArrayListUnmanaged(PendingReview),
 
         fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
@@ -975,6 +1035,7 @@ pub fn listPendingReviews(
             const parsed_key = (try internal_keys.parseResolutionArtifactKeyAlloc(self.gpa, key)) orelse return;
             defer self.gpa.free(parsed_key.doc_key);
             defer self.gpa.free(parsed_key.artifact_name);
+            const cfg = resolverForResolutionArtifact(self.resolvers, parsed_key.artifact_name) orelse return;
 
             var parsed = resolver_lib.parseResolution(self.gpa, value) catch return;
             defer parsed.deinit();
@@ -982,6 +1043,8 @@ pub fn listPendingReviews(
                 if (e.decision != .review) continue;
                 var review = PendingReview{
                     .doc_key = try self.gpa.dupe(u8, parsed_key.doc_key),
+                    .source_artifact = try self.gpa.dupe(u8, cfg.source_artifact),
+                    .resolution_artifact = try self.gpa.dupe(u8, parsed_key.artifact_name),
                     .local_id = try self.gpa.dupe(u8, e.local_id),
                     .table = try self.gpa.dupe(u8, e.doc_ref.table),
                     .key = try self.gpa.dupe(u8, e.doc_ref.key),
@@ -992,7 +1055,7 @@ pub fn listPendingReviews(
             }
         }
     };
-    var ctx = Ctx{ .gpa = gpa, .out = &out };
+    var ctx = Ctx{ .gpa = gpa, .resolvers = resolvers, .out = &out };
     const lower = [_]u8{internal_keys.user_namespace};
     const upper = [_]u8{internal_keys.user_namespace + 1};
     store.scanPrefix(lower[0..], upper[0..], &ctx, Ctx.consume) catch |err| switch (err) {
@@ -1370,41 +1433,13 @@ pub const ResolutionRuntime = struct {
     pub fn pendingReviews(self: *ResolutionRuntime, alloc: std.mem.Allocator) ![]PendingReview {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
-        var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
-        return listPendingReviews(alloc, das.artifactStore());
-    }
-
-    /// Persist a curator override and enqueue this document for ordinary
-    /// replay-driven re-resolution.
-    pub fn recordReviewDecision(
-        self: *ResolutionRuntime,
-        doc_key: []const u8,
-        local_id: []const u8,
-        decision: resolver_lib.Decision,
-        table: []const u8,
-        key: []const u8,
-    ) !u64 {
-        lockMutex(&self.catch_up_mutex);
-        defer self.catch_up_mutex.unlock();
-
         const resolvers = try self.index_manager.listResolvers(self.alloc);
         defer {
             for (resolvers) |*cfg| cfg.deinit(self.alloc);
             self.alloc.free(resolvers);
         }
         var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
-        return try recordReviewDecisionAndEnqueue(
-            self.alloc,
-            resolvers,
-            das.artifactStore(),
-            doc_key,
-            local_id,
-            decision,
-            table,
-            key,
-            self.write_ctx,
-            self.write_fn,
-        );
+        return listPendingReviews(alloc, das.artifactStore(), resolvers);
     }
 
     fn workerMain(self: *ResolutionRuntime) void {
@@ -2175,6 +2210,18 @@ test "enqueueReresolveBacklogWindow queues bounded extraction artifact windows" 
     try store.put(extraction_b, "{\"entities\":[]}");
     try store.put(extraction_c, "{\"entities\":[]}");
     try store.put(unrelated, "{\"entities\":[]}");
+    const marker_a = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, "relations_v1", "doc:a");
+    defer alloc.free(marker_a);
+    const marker_b = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, "relations_v1", "doc:b");
+    defer alloc.free(marker_b);
+    const marker_c = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, "relations_v1", "doc:c");
+    defer alloc.free(marker_c);
+    const marker_x = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, "other_v1", "doc:x");
+    defer alloc.free(marker_x);
+    try store.put(marker_a, extraction_a);
+    try store.put(marker_b, extraction_b);
+    try store.put(marker_c, extraction_c);
+    try store.put(marker_x, unrelated);
 
     var writer = CaptureWriter{ .alloc = alloc };
     defer writer.deinit();
@@ -2236,9 +2283,10 @@ test "recordReviewDecision makes re-resolution honor a curated override" {
     defer writer.deinit();
     _ = try recordReviewDecisionAndEnqueue(
         alloc,
-        &resolvers,
         store,
         "doc:a",
+        "relations_v1",
+        "resolution_v1",
         "e0",
         .match,
         "entities",
@@ -2264,8 +2312,102 @@ test "recordReviewDecision makes re-resolution honor a curated override" {
     }
 }
 
+test "recordReviewDecision scopes overrides to source and resolution artifacts" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{
+        .{
+            .name = "kg_people",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ slug _entity.text }}",
+            .config_generation = 1,
+        },
+        .{
+            .name = "kg_other",
+            .table = "entities",
+            .source_artifact = "other_v1",
+            .resolution_artifact = "other_resolution_v1",
+            .key_template = "{{ slug _entity.text }}",
+            .config_generation = 1,
+        },
+    };
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+
+    const extraction_a = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(extraction_a);
+    const extraction_b = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "other_v1");
+    defer alloc.free(extraction_b);
+    try store.put(extraction_a,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+    try store.put(extraction_b,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Grace Hopper" } ] }
+    );
+
+    {
+        const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_a, null, null)).?;
+        alloc.free(outcome.resolution_key);
+    }
+    {
+        const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_b, null, null)).?;
+        alloc.free(outcome.resolution_key);
+    }
+
+    var writer = CaptureWriter{ .alloc = alloc };
+    defer writer.deinit();
+    _ = try recordReviewDecisionAndEnqueue(
+        alloc,
+        store,
+        "doc:a",
+        "relations_v1",
+        "resolution_v1",
+        "e0",
+        .match,
+        "entities",
+        "person/ada_canonical",
+        &writer,
+        CaptureWriter.writeFn,
+    );
+
+    {
+        const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_a, null, null)).?;
+        alloc.free(outcome.resolution_key);
+    }
+    {
+        const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_b, null, null)).?;
+        alloc.free(outcome.resolution_key);
+    }
+
+    const resolution_a = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_a);
+    const resolution_b = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "other_resolution_v1");
+    defer alloc.free(resolution_b);
+    const stored_a = (try store.get(alloc, resolution_a)).?;
+    defer alloc.free(stored_a);
+    const stored_b = (try store.get(alloc, resolution_b)).?;
+    defer alloc.free(stored_b);
+
+    try testing.expect(std.mem.indexOf(u8, stored_a, "\"decision\":\"match\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stored_a, "\"key\":\"person/ada_canonical\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stored_b, "\"key\":\"grace_hopper\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stored_b, "person/ada_canonical") == null);
+}
+
 test "listPendingReviews collects review-band mentions awaiting curation" {
     const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ slug _entity.text }}",
+        .config_generation = 1,
+    }};
+
     var map = MapStore{ .alloc = alloc };
     defer map.deinit();
     const store = map.store();
@@ -2288,7 +2430,7 @@ test "listPendingReviews collects review-band mentions awaiting curation" {
         \\]}
     );
 
-    const reviews = try listPendingReviews(alloc, store);
+    const reviews = try listPendingReviews(alloc, store, &resolvers);
     defer freePendingReviews(alloc, reviews);
 
     // Only the two review-band mentions appear, not the match.
@@ -2297,6 +2439,8 @@ test "listPendingReviews collects review-band mentions awaiting curation" {
     var saw_b = false;
     for (reviews) |r| {
         try testing.expectEqualStrings("entities", r.table);
+        try testing.expectEqualStrings("relations_v1", r.source_artifact);
+        try testing.expectEqualStrings("resolution_v1", r.resolution_artifact);
         if (std.mem.eql(u8, r.doc_key, "doc:a")) {
             saw_a = true;
             try testing.expectEqualStrings("e1", r.local_id);

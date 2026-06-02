@@ -34,6 +34,7 @@ pub const replay_meta_init_key = [_]u8{ replay_namespace, 0xff, 0x01 };
 pub const replay_meta_next_sequence_key = [_]u8{ replay_namespace, 0xff, 0x02 };
 pub const replay_meta_latest_sequence_kind: u8 = 0x03;
 pub const artifact_presence_key = [_]u8{ replay_namespace, 0xff, 0x20 };
+pub const asset_artifact_source_index_kind: u8 = 0x21;
 pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
 pub const identity_ordinal_state_kind: u8 = 0x03;
@@ -234,6 +235,30 @@ pub fn artifactNamedPrefixAlloc(alloc: Allocator, doc_key: []const u8, artifact_
     try appendEncodedComponent(&list, alloc, artifact_type);
     try appendEncodedComponent(&list, alloc, artifact_name);
 
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn assetArtifactSourceIndexRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, asset_artifact_source_index_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn assetArtifactSourceIndexPrefixAlloc(alloc: Allocator, source_artifact: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, asset_artifact_source_index_kind });
+    try appendEncodedComponent(&list, alloc, source_artifact);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn assetArtifactSourceIndexKeyAlloc(alloc: Allocator, source_artifact: []const u8, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, asset_artifact_source_index_kind });
+    try appendEncodedComponent(&list, alloc, source_artifact);
+    try appendEncodedComponent(&list, alloc, doc_key);
     return try list.toOwnedSlice(alloc);
 }
 
@@ -1132,6 +1157,22 @@ test "parseAssetArtifactKeyAlloc returns doc key and artifact name" {
     const res = try resolutionArtifactKeyAlloc(alloc, "doc:article-123", "resolution_v1");
     defer alloc.free(res);
     try std.testing.expect((try parseAssetArtifactKeyAlloc(alloc, res)) == null);
+}
+
+test "asset artifact source index keys group by source artifact" {
+    const alloc = std.testing.allocator;
+    const root = try assetArtifactSourceIndexRootPrefixAlloc(alloc);
+    defer alloc.free(root);
+    const prefix = try assetArtifactSourceIndexPrefixAlloc(alloc, "relations_v1");
+    defer alloc.free(prefix);
+    const key = try assetArtifactSourceIndexKeyAlloc(alloc, "relations_v1", "doc:article-123");
+    defer alloc.free(key);
+    const other = try assetArtifactSourceIndexKeyAlloc(alloc, "other_v1", "doc:article-123");
+    defer alloc.free(other);
+
+    try std.testing.expect(std.mem.startsWith(u8, prefix, root));
+    try std.testing.expect(std.mem.startsWith(u8, key, prefix));
+    try std.testing.expect(!std.mem.startsWith(u8, other, prefix));
 }
 
 test "decodePrimaryDocumentKeyAlloc round-trips and rejects non-primary keys" {
