@@ -285,7 +285,10 @@ Resolver catalog/runtime invariants:
   in-place upsert that would orphan old resolution artifacts.
 - Asset source-index markers are maintained by the storage paths that write or
   delete asset artifacts, including async enrichment runtime writes. Resolver
-  backfills depend on that marker index instead of scanning all user artifacts.
+  backfills use that marker index as the fast path. Upgraded stores that already
+  contain asset artifacts without markers are repaired by a separate bounded
+  legacy asset scan, which persists missing markers and then converges back to
+  the marker index.
 - Adding a resolver or materially changing its resolver/scorer config marks a
   persisted re-resolution cursor dirty. Existing source artifacts are replayed in
   bounded windows through the normal resolution, promotion, and graph
@@ -692,11 +695,13 @@ Open/index/enrichment validation should reject:
          or when a material resolver/scorer config field changes.
          `ResolutionRuntime.runReresolveBacklogWindow` scans the maintained
          source-artifact index in bounded windows, appends matching extraction
-         artifacts as replay records, and lets the normal resolution worker
-         re-resolve them idempotently. Each window is drained through downstream
-         promotion/graph stages before the next window is queued. Verified by
-         db-tests (inserted resolver re-resolves an already-ingested document;
-         bump gen 1 -> 2 does the same).
+         artifacts as replay records, and repairs missing source-index markers
+         from upgraded stores with a second bounded cursor over legacy asset
+         keys. The normal resolution worker re-resolves queued artifacts
+         idempotently. Each window is drained through downstream promotion/graph
+         stages before the next window is queued. Verified by db-tests (inserted
+         resolver re-resolves an already-ingested document; bump gen 1 -> 2 does
+         the same; legacy asset markers are repaired and replayed).
    - [x] Eager edge rewrite on merge: `DB.rewriteEntityEdges` repoints every
          inbound edge of the merged-away entity at the survivor (preserving type,
          weight, metadata), so provenance mention edges -- which target the

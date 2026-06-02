@@ -5493,8 +5493,8 @@ pub const DB = struct {
         try self.backfillResolverCorpus();
     }
 
-    /// Add or replace a resolver. When the replacement bumps `config_generation`,
-    /// re-resolve the existing corpus so the new scorer/template applies to
+    /// Add or replace a resolver. Inserts and material config changes re-resolve
+    /// the existing corpus so the new resolver/scorer behavior applies to
     /// documents already ingested (the extraction artifacts did not change, so
     /// the incremental hint would not fire on its own).
     pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {

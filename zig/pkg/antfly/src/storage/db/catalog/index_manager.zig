@@ -2044,10 +2044,10 @@ pub const IndexManager = struct {
         try self.persistResolverCatalog(store);
     }
 
-    /// Add or replace a resolver by name. Returns true when an existing resolver
-    /// was replaced by one with a strictly higher `config_generation` -- the
-    /// signal that the corpus should be re-resolved (the extraction artifacts did
-    /// not change, so the incremental hint will not fire).
+    /// Add or replace a resolver by name. Source/output artifact stream bindings
+    /// are immutable for an existing resolver; material resolver/scorer config
+    /// changes ask the caller to re-resolve existing extraction artifacts because
+    /// their incremental replay hints will not fire on their own.
     pub fn upsertResolver(self: *IndexManager, store: anytype, cfg: resolver_catalog.ResolverConfig) !ResolverUpsertResult {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
