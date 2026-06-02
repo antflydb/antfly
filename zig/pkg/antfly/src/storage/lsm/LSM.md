@@ -450,7 +450,7 @@ Large-ingest guardrails:
    - Current storage APIs are synchronous. A RocksDB/Pebble-shaped follow-up
      needs a future-style block read API so reads can be issued concurrently and
      then consumed in source-precedence order.
-3. [ ] Add a borrowed-value point-read mode that can hold cache block handles
+3. [x] Add a borrowed-value point-read mode that can hold cache block handles
    until transaction end instead of duplicating every returned value.
    - [x] First slice: snapshot point-batch reads can return slices borrowed
      from retained block handles or immutable snapshots instead of copying every
@@ -471,6 +471,10 @@ Large-ingest guardrails:
      rotate a pinned mutable memtable before applying later foreground writes,
      so active mutable hits can be borrowed without making the probe a stale
      open-time snapshot.
+   - [x] Current/live sorted batches deliberately stay on point mode rather
+     than sorted-by-run mode, so transaction-owned held block/value lifetimes
+     are available on the hot probe path. Copy counters remain for explicit
+     no-lifetime fallbacks and uncached local materialization paths.
 4. [x] Make sorted `getManySorted` keep per-run cursor state across keys so
    batch reads resume inside the current block where possible.
    - [x] First slice: cached sorted-by-run reads now keep a per-run forward
