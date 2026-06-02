@@ -506,14 +506,6 @@ pub const LsmStorageStatus = struct {
     background_io_oversized_jobs: ?i64 = null,
 };
 
-pub const StorageStatus = struct {
-    /// Disk usage in bytes.
-    disk_usage: ?i64 = null,
-    /// Whether the table has received data.
-    empty: ?bool = null,
-    lsm: ?LsmStorageStatus = null,
-};
-
 /// MongoDB-style update operator
 pub const TransformOpType = enum {
     @"$set",
@@ -3351,6 +3343,14 @@ pub const LinearMergeRequest = struct {
     /// If true, returns what would be deleted without making changes. Use cases: - Validate sync behavior before committing - Check which records will be removed - Test key range boundaries Response includes deleted_ids array when dry_run=true.
     dry_run: ?bool = null,
     sync_level: ?SyncLevel = null,
+};
+
+pub const StorageStatus = struct {
+    /// Disk usage in bytes.
+    disk_usage: ?i64 = null,
+    /// Whether the table has received data.
+    empty: ?bool = null,
+    lsm: ?LsmStorageStatus = null,
 };
 
 pub const TransformOp = struct {

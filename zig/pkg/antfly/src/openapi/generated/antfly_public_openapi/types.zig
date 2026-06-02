@@ -464,14 +464,6 @@ pub const LsmStorageStatus = struct {
     background_io_oversized_jobs: ?i64 = null,
 };
 
-pub const StorageStatus = struct {
-    /// Disk usage in bytes.
-    disk_usage: ?i64 = null,
-    /// Whether the table has received data.
-    empty: ?bool = null,
-    lsm: ?LsmStorageStatus = null,
-};
-
 /// MongoDB-style update operator
 pub const TransformOpType = enum {
     @"$set",
@@ -1490,6 +1482,14 @@ pub const AggregationRequest = struct {
     algebraic_join: ?AlgebraicAggregationJoin = null,
     /// Nested sub-aggregations
     sub_aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
+};
+
+pub const StorageStatus = struct {
+    /// Disk usage in bytes.
+    disk_usage: ?i64 = null,
+    /// Whether the table has received data.
+    empty: ?bool = null,
+    lsm: ?LsmStorageStatus = null,
 };
 
 pub const TransformOp = struct {
