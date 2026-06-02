@@ -15,9 +15,7 @@
 const std = @import("std");
 const resource_manager_mod = @import("../resource_manager.zig");
 
-pub const max_tracked_work_run_ids = 64;
-pub const max_in_flight_run_ids = 256;
-pub const max_in_flight_key_ranges = 256;
+pub const max_in_flight_jobs = 256;
 
 pub const Options = struct {
     max_concurrent_jobs: usize = 1,
@@ -30,8 +28,7 @@ pub const Work = struct {
     score: u64 = 0,
     input_runs: usize = 0,
     input_bytes: u64 = 0,
-    run_ids: [max_tracked_work_run_ids]u64 = undefined,
-    run_count: usize = 0,
+    run_ids: []const u64 = &.{},
     key_range: ?KeyRange = null,
 };
 
@@ -63,10 +60,8 @@ pub const Stats = struct {
 pub const Grant = struct {
     scheduler: *Scheduler,
     input_bytes: u64,
+    job_id: u64 = 0,
     started_ns: u64 = 0,
-    run_ids: [max_tracked_work_run_ids]u64 = undefined,
-    run_count: usize = 0,
-    key_range: ?KeyRange = null,
     reservation: ?resource_manager_mod.Reservation = null,
     completed: bool = false,
 
@@ -74,20 +69,23 @@ pub const Grant = struct {
         if (self.completed) return;
         self.completed = true;
         if (self.reservation) |*reservation| reservation.release();
-        self.scheduler.complete(self.input_bytes, self.run_ids[0..self.run_count], self.key_range, self.started_ns);
+        self.scheduler.complete(self.job_id, self.input_bytes);
     }
+};
+
+const ActiveJob = struct {
+    id: u64,
+    started_ns: u64,
+    run_ids: []const u64,
+    key_range: ?KeyRange,
 };
 
 pub const Scheduler = struct {
     options: Options = .{},
     active_jobs: usize = 0,
     in_flight_input_bytes: u64 = 0,
-    in_flight_run_ids: [max_in_flight_run_ids]u64 = undefined,
-    in_flight_run_count: usize = 0,
-    in_flight_key_ranges: [max_in_flight_key_ranges]KeyRange = undefined,
-    in_flight_key_range_count: usize = 0,
-    active_start_ns: [max_in_flight_run_ids]u64 = undefined,
-    active_start_count: usize = 0,
+    next_job_id: u64 = 1,
+    active_job_slots: [max_in_flight_jobs]ActiveJob = undefined,
     grants: u64 = 0,
     completions: u64 = 0,
     denied_capacity: u64 = 0,
@@ -113,7 +111,7 @@ pub const Scheduler = struct {
             self.denied_capacity += 1;
             return null;
         }
-        if (work.run_count > work.run_ids.len or self.conflictsWithInFlightRuns(work.run_ids[0..work.run_count])) {
+        if (work.run_ids.len > 0 and self.conflictsWithInFlightRuns(work.run_ids)) {
             self.conflict_denials += 1;
             return null;
         }
@@ -122,21 +120,13 @@ pub const Scheduler = struct {
                 self.conflict_denials += 1;
                 return null;
             }
-            if (self.in_flight_key_range_count >= self.in_flight_key_ranges.len) {
-                self.denied_capacity += 1;
-                return null;
-            }
-        }
-        if (work.run_count > max_in_flight_run_ids - self.in_flight_run_count) {
-            self.denied_capacity += 1;
-            return null;
         }
         const max_jobs = @max(@as(usize, 1), self.options.max_concurrent_jobs);
         if (self.active_jobs >= max_jobs) {
             self.denied_capacity += 1;
             return null;
         }
-        if (self.active_start_count >= self.active_start_ns.len) {
+        if (self.active_jobs >= self.active_job_slots.len) {
             self.denied_capacity += 1;
             return null;
         }
@@ -165,116 +155,75 @@ pub const Scheduler = struct {
 
         self.active_jobs += 1;
         self.in_flight_input_bytes = next_bytes;
-        self.addInFlightRuns(work.run_ids[0..work.run_count]);
-        self.addInFlightKeyRange(work.key_range);
-        self.addActiveStart(now_ns);
+        const job_id = self.nextJobId();
+        self.active_job_slots[self.active_jobs - 1] = .{
+            .id = job_id,
+            .started_ns = now_ns,
+            .run_ids = work.run_ids,
+            .key_range = work.key_range,
+        };
         self.grants += 1;
         if (oversized) self.oversized_grants += 1;
-        var grant = Grant{
+        return .{
             .scheduler = self,
             .input_bytes = work.input_bytes,
+            .job_id = job_id,
             .started_ns = now_ns,
-            .key_range = work.key_range,
             .reservation = reservation,
         };
-        grant.run_count = work.run_count;
-        if (work.run_count > 0) {
-            @memcpy(grant.run_ids[0..work.run_count], work.run_ids[0..work.run_count]);
-        }
-        return grant;
     }
 
-    fn complete(self: *Scheduler, input_bytes: u64, run_ids: []const u64, key_range: ?KeyRange, started_ns: u64) void {
+    fn complete(self: *Scheduler, job_id: u64, input_bytes: u64) void {
+        self.removeActiveJob(job_id);
         self.active_jobs -|= 1;
         self.in_flight_input_bytes -|= input_bytes;
-        self.removeInFlightRuns(run_ids);
-        self.removeInFlightKeyRange(key_range);
-        self.removeActiveStart(started_ns);
         self.completions += 1;
+    }
+
+    fn nextJobId(self: *Scheduler) u64 {
+        const id = self.next_job_id;
+        self.next_job_id +|= 1;
+        if (self.next_job_id == 0) self.next_job_id = 1;
+        return id;
     }
 
     fn conflictsWithInFlightRuns(self: *const Scheduler, run_ids: []const u64) bool {
         for (run_ids) |candidate| {
-            for (self.in_flight_run_ids[0..self.in_flight_run_count]) |active| {
-                if (candidate == active) return true;
+            for (self.active_job_slots[0..self.active_jobs]) |job| {
+                for (job.run_ids) |active| {
+                    if (candidate == active) return true;
+                }
             }
         }
         return false;
     }
 
     fn conflictsWithInFlightKeyRange(self: *const Scheduler, range: KeyRange) bool {
-        for (self.in_flight_key_ranges[0..self.in_flight_key_range_count]) |active| {
-            if (keyRangesOverlap(active, range)) return true;
+        for (self.active_job_slots[0..self.active_jobs]) |job| {
+            if (job.key_range) |active| {
+                if (keyRangesOverlap(active, range)) return true;
+            }
         }
         return false;
     }
 
-    fn addInFlightRuns(self: *Scheduler, run_ids: []const u64) void {
-        if (run_ids.len == 0) return;
-        @memcpy(self.in_flight_run_ids[self.in_flight_run_count .. self.in_flight_run_count + run_ids.len], run_ids);
-        self.in_flight_run_count += run_ids.len;
-    }
-
-    fn addInFlightKeyRange(self: *Scheduler, key_range: ?KeyRange) void {
-        const range = key_range orelse return;
-        self.in_flight_key_ranges[self.in_flight_key_range_count] = range;
-        self.in_flight_key_range_count += 1;
-    }
-
-    fn removeInFlightRuns(self: *Scheduler, run_ids: []const u64) void {
-        for (run_ids) |released| {
-            var idx: usize = 0;
-            while (idx < self.in_flight_run_count) : (idx += 1) {
-                if (self.in_flight_run_ids[idx] != released) continue;
-                const tail_len = self.in_flight_run_count - idx - 1;
-                if (tail_len > 0) {
-                    std.mem.copyForwards(u64, self.in_flight_run_ids[idx .. idx + tail_len], self.in_flight_run_ids[idx + 1 .. self.in_flight_run_count]);
-                }
-                self.in_flight_run_count -= 1;
-                break;
-            }
-        }
-    }
-
-    fn removeInFlightKeyRange(self: *Scheduler, key_range: ?KeyRange) void {
-        const released = key_range orelse return;
+    fn removeActiveJob(self: *Scheduler, job_id: u64) void {
         var idx: usize = 0;
-        while (idx < self.in_flight_key_range_count) : (idx += 1) {
-            if (!keyRangesEqual(self.in_flight_key_ranges[idx], released)) continue;
-            const tail_len = self.in_flight_key_range_count - idx - 1;
+        while (idx < self.active_jobs) : (idx += 1) {
+            if (self.active_job_slots[idx].id != job_id) continue;
+            const tail_len = self.active_jobs - idx - 1;
             if (tail_len > 0) {
-                std.mem.copyForwards(KeyRange, self.in_flight_key_ranges[idx .. idx + tail_len], self.in_flight_key_ranges[idx + 1 .. self.in_flight_key_range_count]);
+                std.mem.copyForwards(ActiveJob, self.active_job_slots[idx .. idx + tail_len], self.active_job_slots[idx + 1 .. self.active_jobs]);
             }
-            self.in_flight_key_range_count -= 1;
             return;
         }
-        if (self.in_flight_key_range_count > 0) self.in_flight_key_range_count -= 1;
-    }
-
-    fn addActiveStart(self: *Scheduler, started_ns: u64) void {
-        self.active_start_ns[self.active_start_count] = started_ns;
-        self.active_start_count += 1;
-    }
-
-    fn removeActiveStart(self: *Scheduler, started_ns: u64) void {
-        var idx: usize = 0;
-        while (idx < self.active_start_count) : (idx += 1) {
-            if (self.active_start_ns[idx] != started_ns) continue;
-            const tail_len = self.active_start_count - idx - 1;
-            if (tail_len > 0) {
-                std.mem.copyForwards(u64, self.active_start_ns[idx .. idx + tail_len], self.active_start_ns[idx + 1 .. self.active_start_count]);
-            }
-            self.active_start_count -= 1;
-            return;
-        }
-        if (self.active_start_count > 0) self.active_start_count -= 1;
     }
 
     fn activeOldestAgeNs(self: *const Scheduler, now_ns: u64) u64 {
-        if (now_ns == 0 or self.active_start_count == 0) return 0;
-        var oldest = self.active_start_ns[0];
-        for (self.active_start_ns[1..self.active_start_count]) |started| {
-            oldest = @min(oldest, started);
+        if (now_ns == 0 or self.active_jobs == 0) return 0;
+        var oldest = self.active_job_slots[0].started_ns;
+        for (self.active_job_slots[1..self.active_jobs]) |job| {
+            oldest = @min(oldest, job.started_ns);
         }
         return if (now_ns >= oldest) now_ns - oldest else 0;
     }
@@ -333,14 +282,6 @@ fn keyRangesOverlap(lhs: KeyRange, rhs: KeyRange) bool {
         compareBound(lhs.largest_namespace_name, lhs.largest_key, rhs.smallest_namespace_name, rhs.smallest_key) != .lt;
 }
 
-fn keyRangesEqual(lhs: KeyRange, rhs: KeyRange) bool {
-    return lhs.output_level == rhs.output_level and
-        namespaceNameEql(lhs.smallest_namespace_name, rhs.smallest_namespace_name) and
-        std.mem.eql(u8, lhs.smallest_key, rhs.smallest_key) and
-        namespaceNameEql(lhs.largest_namespace_name, rhs.largest_namespace_name) and
-        std.mem.eql(u8, lhs.largest_key, rhs.largest_key);
-}
-
 fn compareBound(lhs_namespace_name: ?[]const u8, lhs_key: []const u8, rhs_namespace_name: ?[]const u8, rhs_key: []const u8) std.math.Order {
     const namespace_order = compareNamespaceName(lhs_namespace_name, rhs_namespace_name);
     if (namespace_order != .eq) return namespace_order;
@@ -354,21 +295,13 @@ fn compareNamespaceName(lhs: ?[]const u8, rhs: ?[]const u8) std.math.Order {
     return std.mem.order(u8, lhs.?, rhs.?);
 }
 
-fn namespaceNameEql(lhs: ?[]const u8, rhs: ?[]const u8) bool {
-    if (lhs == null or rhs == null) return lhs == null and rhs == null;
-    return std.mem.eql(u8, lhs.?, rhs.?);
-}
-
 fn testWork(score: u64, input_bytes: u64, run_ids: []const u64) Work {
-    var work = Work{
+    const work = Work{
         .score = score,
         .input_runs = run_ids.len,
         .input_bytes = input_bytes,
-        .run_count = run_ids.len,
+        .run_ids = run_ids,
     };
-    if (run_ids.len > 0) {
-        @memcpy(work.run_ids[0..run_ids.len], run_ids);
-    }
     return work;
 }
 
@@ -489,4 +422,34 @@ test "lsm compaction scheduler reports oldest active job age" {
     stats = scheduler.snapshotAt(250);
     try std.testing.expectEqual(@as(u64, 0), stats.active_jobs);
     try std.testing.expectEqual(@as(u64, 0), stats.active_oldest_age_ns);
+}
+
+test "lsm compaction scheduler tracks large run-id sets without fixed work cap" {
+    var scheduler = Scheduler.init(.{
+        .max_concurrent_jobs = 2,
+        .max_in_flight_input_bytes = 1024 * 1024,
+        .resource_reservation_bytes = 0,
+    });
+
+    var ids: [96]u64 = undefined;
+    for (&ids, 0..) |*id, idx| id.* = @intCast(idx + 1);
+
+    var first = scheduler.tryAcquire(testWork(1, 10, ids[0..]), null) orelse return error.TestUnexpectedResult;
+    defer first.complete();
+
+    var disjoint_ids: [96]u64 = undefined;
+    for (&disjoint_ids, 0..) |*id, idx| id.* = @intCast(idx + 10_000);
+    var second = scheduler.tryAcquire(testWork(1, 10, disjoint_ids[0..]), null) orelse return error.TestUnexpectedResult;
+    second.complete();
+
+    try std.testing.expect(scheduler.tryAcquire(testWork(1, 10, ids[95..96]), null) == null);
+    first.complete();
+
+    var after = scheduler.tryAcquire(testWork(1, 10, ids[95..96]), null) orelse return error.TestUnexpectedResult;
+    after.complete();
+
+    const stats = scheduler.snapshot();
+    try std.testing.expectEqual(@as(u64, 3), stats.grants);
+    try std.testing.expectEqual(@as(u64, 1), stats.conflict_denials);
+    try std.testing.expectEqual(@as(u64, 0), stats.active_jobs);
 }

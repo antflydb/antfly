@@ -1258,12 +1258,8 @@ pub const Backend = struct {
             .input_runs = work.input_runs,
             .input_bytes = work.input_bytes,
         };
-        if (@hasField(@TypeOf(work), "run_count") and @hasField(@TypeOf(work), "run_ids")) {
-            scheduler_work.run_count = work.run_count;
-            const copied_run_count = @min(work.run_count, scheduler_work.run_ids.len);
-            if (copied_run_count > 0) {
-                @memcpy(scheduler_work.run_ids[0..copied_run_count], work.run_ids[0..copied_run_count]);
-            }
+        if (@hasField(@TypeOf(work), "run_ids")) {
+            scheduler_work.run_ids = work.run_ids;
         }
         if (@hasField(@TypeOf(work), "key_range")) {
             scheduler_work.key_range = work.key_range;
@@ -4173,6 +4169,22 @@ fn appendSyntheticLevelRunsForTest(backend: *Backend, level: u32, count: usize, 
     }
 }
 
+fn appendStateLevelRunsForTest(backend: *Backend, level: u32, count: usize) !void {
+    for (0..count) |idx| {
+        var state: State = .{};
+        errdefer state.deinit(backend.allocator);
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>4}", .{idx});
+        var value_buf: [32]u8 = undefined;
+        const value = try std.fmt.bufPrint(&value_buf, "V{d}", .{idx});
+        try state.appendUpsert(backend.allocator, .{ .name = "docs" }, key, value, false);
+        const run = try compaction_mod.makeRunAtLevel(Backend, backend, state, level);
+        state = .{};
+        try backend.runs.append(backend.allocator, run);
+    }
+    compaction_mod.sortRuns(backend.runs.items);
+}
+
 fn sleepForTest(duration_ns: u64) void {
     if (comptime builtin.os.tag == .freestanding) return;
     var req = std.posix.timespec{
@@ -4208,6 +4220,35 @@ test "lsm backend tight base level target reports lower-level overflow" {
     const stats = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 24), stats.level_overflow_runs);
     try std.testing.expect(stats.level_overflow_bytes > 0);
+}
+
+test "lsm backend scheduled compaction admits lower-level plans over scheduler run-id stack cap" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .level_target_runs_base = 32,
+        .level_target_runs_multiplier = 4,
+        .compaction_scheduler = .{
+            .max_concurrent_jobs = 1,
+            .resource_reservation_bytes = 0,
+        },
+    });
+    defer backend.close();
+
+    try appendStateLevelRunsForTest(&backend, 1, 128);
+    const before_runs = countLevelRuns(backend.runs.items, 1);
+    try std.testing.expectEqual(@as(usize, 128), before_runs);
+
+    const progressed = blk: {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        break :blk try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1);
+    };
+    try std.testing.expect(progressed);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 1) < before_runs);
+
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
+    try std.testing.expectEqual(maintenance.compaction_scheduler_grants, maintenance.compaction_scheduler_completions);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_conflict_denials);
 }
 
 test "lsm backend runtime erases namespace store handles" {

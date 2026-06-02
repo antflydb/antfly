@@ -23,6 +23,20 @@ const State = state_mod.State;
 const Run = repository_mod.Run;
 pub const max_remembered_compaction_run_ids = 64;
 
+const CompactionWork = struct {
+    score: u64,
+    input_runs: usize,
+    input_bytes: u64,
+    io_bytes: u64,
+    run_ids: []u64,
+    key_range: ?compaction_scheduler_mod.KeyRange,
+
+    fn deinit(self: *CompactionWork, allocator: std.mem.Allocator) void {
+        if (self.run_ids.len > 0) allocator.free(self.run_ids);
+        self.* = undefined;
+    }
+};
+
 pub const CompactionPlan = struct {
     source_level: u32,
     source_start: usize,
@@ -154,7 +168,8 @@ pub fn maybeCompactRunsScheduled(comptime BackendType: type, backend: *BackendTy
     };
     noteCompactionSelectionStats(BackendType, backend, selection_stats);
 
-    const work = compactionWorkForPlan(backend.runs.items, plan, score);
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    defer work.deinit(backend.allocator);
     var grant = backend.acquireCompactionGrant(work) orelse {
         rememberDeniedCompaction(BackendType, backend, plan, score);
         return false;
@@ -189,7 +204,8 @@ pub fn compactL0ToLimitScheduled(comptime BackendType: type, backend: *BackendTy
         return false;
     };
     noteCompactionSelectionStats(BackendType, backend, selection_stats);
-    const work = compactionWorkForPlan(backend.runs.items, plan, score);
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    defer work.deinit(backend.allocator);
     var grant = backend.acquireCompactionGrant(work) orelse {
         rememberDeniedCompaction(BackendType, backend, plan, score);
         return false;
@@ -223,7 +239,8 @@ pub fn compactL0ToLimitScheduledWithinBudget(
         return false;
     };
     noteCompactionSelectionStats(BackendType, backend, selection_stats);
-    const work = compactionWorkForPlan(backend.runs.items, plan, score);
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    defer work.deinit(backend.allocator);
     var grant = backend.acquireCompactionGrant(work) orelse {
         return false;
     };
@@ -254,36 +271,27 @@ fn allowOversizedSingleCompactionInput(backend: anytype) bool {
     return backend.options.max_compaction_input_allow_oversized_single_job;
 }
 
-fn compactionWorkForPlan(runs: []const Run, plan: CompactionPlan, score: u64) struct {
-    score: u64,
-    input_runs: usize,
-    input_bytes: u64,
-    io_bytes: u64,
-    run_ids: [max_remembered_compaction_run_ids]u64,
-    run_count: usize,
-    key_range: ?compaction_scheduler_mod.KeyRange,
-} {
+fn compactionWorkForPlan(allocator: std.mem.Allocator, runs: []const Run, plan: CompactionPlan, score: u64) !CompactionWork {
+    const total_runs = plan.source_len + plan.target_len;
+    const run_ids = try allocator.alloc(u64, total_runs);
+    errdefer allocator.free(run_ids);
+
     var input_runs: usize = 0;
     var input_bytes: u64 = 0;
-    var run_ids: [max_remembered_compaction_run_ids]u64 = undefined;
     var run_count: usize = 0;
     var key_range: ?compaction_scheduler_mod.KeyRange = null;
     for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
         input_runs += 1;
         input_bytes +|= run.size_bytes;
         includeRunInWorkKeyRange(&key_range, plan.output_level, run);
-        if (run_count < run_ids.len) {
-            run_ids[run_count] = run.id;
-        }
+        run_ids[run_count] = run.id;
         run_count += 1;
     }
     for (runs[plan.target_start .. plan.target_start + plan.target_len]) |run| {
         input_runs += 1;
         input_bytes +|= run.size_bytes;
         includeRunInWorkKeyRange(&key_range, plan.output_level, run);
-        if (run_count < run_ids.len) {
-            run_ids[run_count] = run.id;
-        }
+        run_ids[run_count] = run.id;
         run_count += 1;
     }
     return .{
@@ -292,7 +300,6 @@ fn compactionWorkForPlan(runs: []const Run, plan: CompactionPlan, score: u64) st
         .input_bytes = input_bytes,
         .io_bytes = input_bytes +| input_bytes,
         .run_ids = run_ids,
-        .run_count = run_count,
         .key_range = key_range,
     };
 }
@@ -322,7 +329,18 @@ fn includeRunInWorkKeyRange(key_range: *?compaction_scheduler_mod.KeyRange, outp
 
 fn planWithinInputBudget(runs: []const Run, plan: CompactionPlan, max_input_bytes: u64) bool {
     if (max_input_bytes == 0) return true;
-    return compactionWorkForPlan(runs, plan, 0).input_bytes <= max_input_bytes;
+    return compactionInputBytes(runs, plan) <= max_input_bytes;
+}
+
+fn compactionInputBytes(runs: []const Run, plan: CompactionPlan) u64 {
+    var input_bytes: u64 = 0;
+    for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
+        input_bytes +|= run.size_bytes;
+    }
+    for (runs[plan.target_start .. plan.target_start + plan.target_len]) |run| {
+        input_bytes +|= run.size_bytes;
+    }
+    return input_bytes;
 }
 
 fn planScoreForPlan(runs: []const Run, plan: CompactionPlan) PlanScore {
@@ -372,7 +390,8 @@ fn compactRememberedPlanIfValid(comptime BackendType: type, backend: *BackendTyp
         return false;
     };
 
-    const work = compactionWorkForPlan(backend.runs.items, plan, remembered.score);
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, remembered.score);
+    defer work.deinit(backend.allocator);
     if (backend.options.max_compaction_input_bytes > 0 and work.input_bytes > backend.options.max_compaction_input_bytes) {
         backend.remembered_compaction = null;
         backend.compaction_scheduler.noteRememberedStale();
@@ -401,17 +420,23 @@ fn rememberCompactionPlan(runs: []const Run, plan: CompactionPlan, score: u64) ?
     const total_runs = plan.source_len + plan.target_len;
     if (total_runs == 0 or total_runs > max_remembered_compaction_run_ids) return null;
     if (!planInBounds(runs, plan)) return null;
-    const work = compactionWorkForPlan(runs, plan, score);
-    if (work.run_count != total_runs) return null;
 
     var remembered = RememberedCompaction{
         .plan = plan,
         .run_count = total_runs,
-        .input_runs = work.input_runs,
-        .input_bytes = work.input_bytes,
+        .input_runs = total_runs,
+        .input_bytes = compactionInputBytes(runs, plan),
         .score = score,
     };
-    @memcpy(remembered.run_ids[0..total_runs], work.run_ids[0..total_runs]);
+    var idx: usize = 0;
+    for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
+        remembered.run_ids[idx] = run.id;
+        idx += 1;
+    }
+    for (runs[plan.target_start .. plan.target_start + plan.target_len]) |run| {
+        remembered.run_ids[idx] = run.id;
+        idx += 1;
+    }
     return remembered;
 }
 
