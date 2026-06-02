@@ -22,8 +22,6 @@ const db_mod = @import("../../storage/db/db.zig");
 const relational_store_mod = @import("../../storage/db/relational_store.zig");
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const db_types = @import("../../storage/db/types.zig");
-const storage_schema = @import("../../storage/schema.zig");
-const table_schema = @import("../../schema/mod.zig");
 const range_state = @import("../../storage/db/range_state.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const range_transition = @import("range_transition.zig");
@@ -1654,11 +1652,7 @@ pub fn testMergeCoordinatorBootstrapsRelationalRowsAndColumnEntries() !void {
         const schema_json =
             \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
         ;
-        var parsed_schema = try table_schema.parseValidatedTableSchema(alloc, schema_json);
-        defer parsed_schema.deinit(alloc);
-        const runtime_schema = try table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
-        defer storage_schema.freeSchema(alloc, runtime_schema);
-        try receiver.db.setSchema(runtime_schema);
+        try receiver.db.applyTableSchemaJson(alloc, schema_json, .{});
 
         try receiver.db.batch(.{
             .writes = &.{

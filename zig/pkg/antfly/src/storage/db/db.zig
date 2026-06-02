@@ -4895,7 +4895,7 @@ pub const DB = struct {
         self.core.index_manager.clearDenseHbcCaches();
     }
 
-    pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
+    fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
         try self.core.setSchema(table_schema);
         self.refreshSchemaRuntimeSideEffects();
     }
