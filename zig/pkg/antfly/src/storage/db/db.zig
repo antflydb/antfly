@@ -554,6 +554,7 @@ const StartupOpenStats = struct {
     wal_replay_entries: AtomicU64 = .init(0),
     wal_replay_bytes: AtomicU64 = .init(0),
     wal_replay_ns: AtomicU64 = .init(0),
+    wal_replay_truncated_tail_bytes: AtomicU64 = .init(0),
 
     fn snapshot(self: *const @This()) types.StartupCatchUpStats {
         return .{
@@ -592,6 +593,7 @@ const StartupOpenStats = struct {
             .wal_replay_entries = self.wal_replay_entries.load(.monotonic),
             .wal_replay_bytes = self.wal_replay_bytes.load(.monotonic),
             .wal_replay_ns = self.wal_replay_ns.load(.monotonic),
+            .wal_replay_truncated_tail_bytes = self.wal_replay_truncated_tail_bytes.load(.monotonic),
         };
     }
 };
@@ -3090,7 +3092,8 @@ pub const DB = struct {
         self.async_context.stats.startup.wal_replay_records.store(lsm_open_stats.wal_replay_records, .monotonic);
         self.async_context.stats.startup.wal_replay_entries.store(lsm_open_stats.wal_replay_entries, .monotonic);
         self.async_context.stats.startup.wal_replay_bytes.store(lsm_open_stats.wal_replay_bytes, .monotonic);
-        self.async_context.stats.startup.wal_replay_ns.store(lsm_open_stats.replaying_wal_ns, .monotonic);
+        self.async_context.stats.startup.wal_replay_ns.store(lsm_open_stats.wal_replay_ns, .monotonic);
+        self.async_context.stats.startup.wal_replay_truncated_tail_bytes.store(lsm_open_stats.wal_replay_truncated_tail_bytes, .monotonic);
 
         const lsm_maintenance_stats = self.snapshotLsmMaintenanceStatsLocked();
         self.async_context.stats.startup.wal_retention_known.store(true, .monotonic);

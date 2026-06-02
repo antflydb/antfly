@@ -1467,6 +1467,20 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.wal_retained_segments);
     try out.appendSlice(alloc, ",\"wal_retained_bytes\":");
     try appendIntValue(alloc, out, stats.wal_retained_bytes);
+    try out.appendSlice(alloc, ",\"wal_checkpoint_oldest_retained_segment\":");
+    try appendIntValue(alloc, out, stats.wal_checkpoint_oldest_retained_segment);
+    try out.appendSlice(alloc, ",\"wal_checkpoint_covered_through_segment\":");
+    try appendIntValue(alloc, out, stats.wal_checkpoint_covered_through_segment);
+    try out.appendSlice(alloc, ",\"wal_checkpoint_current_segment\":");
+    try appendIntValue(alloc, out, stats.wal_checkpoint_current_segment);
+    try out.appendSlice(alloc, ",\"wal_checkpoint_lag_segments\":");
+    try appendIntValue(alloc, out, stats.wal_checkpoint_lag_segments);
+    try out.appendSlice(alloc, ",\"wal_replay_retained_segments\":");
+    try appendIntValue(alloc, out, stats.wal_replay_retained_segments);
+    try out.appendSlice(alloc, ",\"wal_replay_retained_bytes\":");
+    try appendIntValue(alloc, out, stats.wal_replay_retained_bytes);
+    try out.appendSlice(alloc, ",\"wal_replay_current_segment\":");
+    try appendIntValue(alloc, out, stats.wal_replay_current_segment);
     try out.appendSlice(alloc, ",\"configured_indexes\":");
     try appendIntValue(alloc, out, stats.configured_indexes);
     try out.appendSlice(alloc, ",\"configured_dense_indexes\":");
@@ -1517,6 +1531,8 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.wal_replay_bytes);
     try out.appendSlice(alloc, ",\"wal_replay_ns\":");
     try appendIntValue(alloc, out, stats.wal_replay_ns);
+    try out.appendSlice(alloc, ",\"wal_replay_truncated_tail_bytes\":");
+    try appendIntValue(alloc, out, stats.wal_replay_truncated_tail_bytes);
     try out.append(alloc, '}');
 }
 
@@ -1850,10 +1866,18 @@ test "index encoders expose local shard runtime status" {
                     .phase = .opening_db,
                     .wal_retained_segments = 4,
                     .wal_retained_bytes = 99,
+                    .wal_checkpoint_oldest_retained_segment = 2,
+                    .wal_checkpoint_covered_through_segment = 3,
+                    .wal_checkpoint_current_segment = 5,
+                    .wal_checkpoint_lag_segments = 2,
+                    .wal_replay_retained_segments = 1,
+                    .wal_replay_retained_bytes = 44,
+                    .wal_replay_current_segment = 6,
                     .lsm_open_stores = 2,
                     .lsm_open_wal_replay_ns = 123,
                     .lsm_open_loaded_runs = 6,
                     .wal_replay_bytes = 456,
+                    .wal_replay_truncated_tail_bytes = 7,
                 },
                 .dense_catch_up = .{
                     .active = true,
@@ -1905,10 +1929,18 @@ test "index encoders expose local shard runtime status" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"phase\":\"opening_db\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_segments\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_oldest_retained_segment\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_covered_through_segment\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_current_segment\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_lag_segments\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_retained_segments\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_retained_bytes\":44") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_current_segment\":6") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_stores\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_wal_replay_ns\":123") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_loaded_runs\":6") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_bytes\":456") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_truncated_tail_bytes\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_sequence\":41") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_target_sequence\":77") != null);

@@ -1714,6 +1714,7 @@ pub const StartupCatchUpStats = struct {
     wal_replay_entries: u64 = 0,
     wal_replay_bytes: u64 = 0,
     wal_replay_ns: u64 = 0,
+    wal_replay_truncated_tail_bytes: u64 = 0,
 };
 
 pub const AsyncIndexingStats = struct {
@@ -1834,6 +1835,7 @@ pub fn accumulateStartupCatchUpStats(dst: *StartupCatchUpStats, src: StartupCatc
     dst.wal_replay_entries += src.wal_replay_entries;
     dst.wal_replay_bytes += src.wal_replay_bytes;
     dst.wal_replay_ns += src.wal_replay_ns;
+    dst.wal_replay_truncated_tail_bytes += src.wal_replay_truncated_tail_bytes;
 }
 
 fn minNonZeroU64(lhs: u64, rhs: u64) u64 {

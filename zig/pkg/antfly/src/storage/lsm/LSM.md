@@ -1104,6 +1104,9 @@ startup replay tax if it retains large WAL segments between runs.
      index stores, and exposes the phase counters through async-index startup
      JSON/Prometheus metrics so LSM replay time is visible separately from
      higher-level catch-up work.
+   - [x] Startup status now carries checkpoint/replay retention coordinates
+     and WAL replay tail-cleanup bytes through both JSON status and Prometheus,
+     so retained-WAL debt can be correlated with startup RSS and replay time.
 
 2. Add aggressive checkpoint triggers for index stores.
    - After successful bulk finalize

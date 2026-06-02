@@ -728,6 +728,7 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_entries", "gauge", "Observed LSM WAL replay entries during startup index open", stats.startup.wal_replay_entries);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_bytes", "gauge", "Observed LSM WAL replay bytes during startup index open", stats.startup.wal_replay_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_ns", "gauge", "Observed LSM WAL replay nanoseconds during startup index open", stats.startup.wal_replay_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_truncated_tail_bytes", "gauge", "Observed truncated WAL tail bytes during startup index open", stats.startup.wal_replay_truncated_tail_bytes);
     try health_metrics.appendPromMetricHeader(writer, "antfly_async_index_startup_phase", "gauge", "One-hot startup catch-up phase, labeled by current phase");
     inline for ([_]antfly.db.types.StartupCatchUpPhase{ .idle, .opening_db, .artifact_rebuild, .startup_catch_up }) |phase| {
         try health_metrics.appendPromSampleLabeled(writer, "antfly_async_index_startup_phase", &.{
@@ -12603,6 +12604,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
                     .wal_replay_entries = 9,
                     .wal_replay_bytes = 10,
                     .wal_replay_ns = 222,
+                    .wal_replay_truncated_tail_bytes = 66,
                 },
             },
         },
@@ -12776,6 +12778,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_entries 9") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_bytes 10") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_ns 222") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_truncated_tail_bytes 66") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_phase{phase=\"opening_db\"} 1") != null);
 }
 

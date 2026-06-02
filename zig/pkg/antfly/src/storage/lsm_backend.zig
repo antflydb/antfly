@@ -174,6 +174,8 @@ pub const Backend = struct {
         wal_replay_records: u64 = 0,
         wal_replay_entries: u64 = 0,
         wal_replay_bytes: u64 = 0,
+        wal_replay_ns: u64 = 0,
+        wal_replay_truncated_tail_bytes: u64 = 0,
     };
 
     pub fn accumulateOpenStats(dst: *OpenStats, src: OpenStats) void {
@@ -195,6 +197,8 @@ pub const Backend = struct {
         dst.wal_replay_records +|= src.wal_replay_records;
         dst.wal_replay_entries +|= src.wal_replay_entries;
         dst.wal_replay_bytes +|= src.wal_replay_bytes;
+        dst.wal_replay_ns +|= src.wal_replay_ns;
+        dst.wal_replay_truncated_tail_bytes +|= src.wal_replay_truncated_tail_bytes;
     }
 
     pub const CompactionStats = struct {
@@ -862,6 +866,8 @@ pub const Backend = struct {
         self.open_stats.wal_replay_records = self.write_stats.wal_replay_records;
         self.open_stats.wal_replay_entries = self.write_stats.wal_replay_entries;
         self.open_stats.wal_replay_bytes = self.write_stats.wal_replay_bytes;
+        self.open_stats.wal_replay_ns = self.write_stats.wal_replay_ns;
+        self.open_stats.wal_replay_truncated_tail_bytes = self.write_stats.wal_replay_truncated_tail_bytes;
     }
 
     pub fn finishOpenSuccess(self: *Backend) void {
@@ -4168,6 +4174,8 @@ test "lsm backend replays committed mutable writes from wal after crash reopen" 
     try std.testing.expectEqual(backend.write_stats.wal_replay_records, open_stats.wal_replay_records);
     try std.testing.expectEqual(backend.write_stats.wal_replay_entries, open_stats.wal_replay_entries);
     try std.testing.expectEqual(backend.write_stats.wal_replay_bytes, open_stats.wal_replay_bytes);
+    try std.testing.expectEqual(backend.write_stats.wal_replay_ns, open_stats.wal_replay_ns);
+    try std.testing.expectEqual(backend.write_stats.wal_replay_truncated_tail_bytes, open_stats.wal_replay_truncated_tail_bytes);
     var read = try backend.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
