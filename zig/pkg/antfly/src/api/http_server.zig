@@ -46,6 +46,7 @@ const table_writes = @import("table_writes.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
+const public_limits = @import("public_limits.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
 const distributed_graph = @import("distributed_graph.zig");
@@ -203,7 +204,7 @@ fn parseSseEventsAlloc(alloc: std.mem.Allocator, body: []const u8) ![]TestSseEve
     return try events.toOwnedSlice(alloc);
 }
 
-pub const public_api_max_request_body_bytes: usize = 64 * 1024 * 1024;
+pub const public_api_max_request_body_bytes: usize = public_limits.max_request_body_bytes;
 
 test "public API request body limit matches Go linear merge contract" {
     try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), public_api_max_request_body_bytes);
@@ -1405,7 +1406,14 @@ pub const ApiHttpServer = struct {
         return .{
             .table_name = table_name,
             .empty = doc_count == 0,
+            .lsm = try self.bestEffortLsmStorageStatus(table_name),
         };
+    }
+
+    fn bestEffortLsmStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.LsmStorageStatus {
+        const source = self.table_reads orelse return null;
+        const stats = (try source.lsmStorageStats(table_name)) orelse return null;
+        return tables_api.lsmStorageStatusFromBackendStats(stats.maintenance, stats.write);
     }
 
     pub fn bestEffortSingleTableStorageStatuses(
@@ -3208,7 +3216,7 @@ pub const ApiHttpServer = struct {
                 const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, lookup.table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
                 if (row_filter_json) |value| {
-                    if (!(try self.docMatchesRowFilter(source, lookup.table_name, decoded_key, value))) {
+                    if (!(try self.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
                         return try textResponse(self.alloc, 404, "not found");
                     }
                 }
@@ -3333,6 +3341,7 @@ pub const ApiHttpServer = struct {
                 if (!(try self.tableExists(merge_route.table_name))) return try textResponse(self.alloc, 404, "not found");
 
                 var merge_req = linear_merge_api.parseRequest(self.alloc, req.body) catch |err| switch (err) {
+                    error.ValueTooLong => return try textResponse(self.alloc, 413, "value too large"),
                     error.InvalidLinearMergeRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
                     else => return err,
                 };
@@ -3463,6 +3472,7 @@ pub const ApiHttpServer = struct {
         return .{
             .table_name = table_name,
             .empty = result.ndjson.len == 0,
+            .lsm = try self.bestEffortLsmStorageStatus(table_name),
         };
     }
 
@@ -3516,7 +3526,16 @@ pub const ApiHttpServer = struct {
     ) !bool {
         var response = (try source.lookup(self.alloc, table_name, key, .{}, .read_index)) orelse return false;
         defer response.deinit(self.alloc);
-        return try search_pattern_filter.storedDocMatchesPatternFilter(self.alloc, key, response.json, row_filter_json);
+        return try self.docJsonMatchesRowFilter(key, response.json, row_filter_json);
+    }
+
+    pub fn docJsonMatchesRowFilter(
+        self: *ApiHttpServer,
+        key: []const u8,
+        json: []const u8,
+        row_filter_json: []const u8,
+    ) !bool {
+        return try search_pattern_filter.storedDocMatchesPatternFilter(self.alloc, key, json, row_filter_json);
     }
 
     pub fn filterScanResultByRowFilter(

@@ -41,6 +41,7 @@ pub const AggregationRequest = types.AggregationRequest;
 pub const AggregationBucket = types.AggregationBucket;
 pub const AggregationResult = types.AggregationResult;
 pub const IndexStatus = types.IndexStatus;
+pub const LsmStorageStatus = types.LsmStorageStatus;
 pub const StorageStatus = types.StorageStatus;
 pub const TableStatus = types.TableStatus;
 pub const TransformOpType = types.TransformOpType;

@@ -98,6 +98,14 @@ pub const TypedDocValuesWriter = struct {
         self.entries.deinit(self.alloc);
     }
 
+    pub fn estimatedMemoryBytes(self: *const TypedDocValuesWriter) u64 {
+        var total: u64 = @as(u64, @intCast(self.entries.capacity)) * @sizeOf(Entry);
+        for (self.entries.items) |entry| {
+            if (entry.owned_bytes) |bytes| total +|= @intCast(bytes.len);
+        }
+        return total;
+    }
+
     pub fn add(self: *TypedDocValuesWriter, doc_id: u32, value: TypedValue) !void {
         var entry = Entry{ .doc_id = doc_id, .value = value };
         // For bytes, dupe the data so we own it

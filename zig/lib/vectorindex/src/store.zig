@@ -34,6 +34,7 @@ pub const BatchMode = enum {
 
 pub const BatchOptions = struct {
     mode: BatchMode = .default,
+    defer_commit_flush: bool = false,
 };
 
 fn entryFrom(value: anytype) Entry {
@@ -124,6 +125,7 @@ pub const NamespaceReadTxn = struct {
 
     pub fn getManySorted(self: *NamespaceReadTxn, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
             return try get_many_sorted(self.ptr, namespace, keys, values);
         }
@@ -376,6 +378,7 @@ pub fn namespaceReadTxnFrom(
 
         fn getManySorted(ptr: *anyopaque, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (keys.len != values.len) return error.InvalidBatch;
+            @memset(values, null);
             if (@hasDecl(Handle, "getManySorted")) {
                 return try unbox(ptr).handle.getManySorted(try mapNamespace(namespace), keys, values);
             }
@@ -581,6 +584,7 @@ pub fn namespaceStoreFrom(
                             .default => .default,
                             .bulk_ingest => .bulk_ingest,
                         },
+                        .defer_commit_flush = options.defer_commit_flush,
                     }),
                     LocalNamespace,
                     mapNamespace,

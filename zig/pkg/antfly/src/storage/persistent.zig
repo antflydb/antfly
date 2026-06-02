@@ -100,13 +100,23 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     return std.c.getenv(name);
 }
 
+fn envEnabled(name: [*:0]const u8) bool {
+    const raw_z = getenv(name) orelse return false;
+    const raw = std.mem.span(raw_z);
+    return !(std.mem.eql(u8, raw, "0") or
+        std.ascii.eqlIgnoreCase(raw, "false") or
+        std.ascii.eqlIgnoreCase(raw, "no"));
+}
+
 fn benchPersistentPublishEnabled() bool {
     switch (bench_persistent_publish_cache.load(.monotonic)) {
         1 => return false,
         2 => return true,
         else => {},
     }
-    const enabled = getenv("ANTFLY_BENCH_PERSISTENT_PUBLISH") != null or getenv("ANTFLY_BENCH_METRICS") != null;
+    const enabled = envEnabled("ANTFLY_BENCH_PERSISTENT_PUBLISH") or
+        envEnabled("ANTFLY_BENCH_TEXT_METRICS") or
+        envEnabled("ANTFLY_BENCH_TEXT_PROFILE");
     bench_persistent_publish_cache.store(if (enabled) 2 else 1, .monotonic);
     return enabled;
 }
@@ -229,6 +239,11 @@ pub const PersistentIndexStats = struct {
     main_commit: ?lmdb.CommitStats,
 };
 
+pub const PersistentIndexMemoryStats = struct {
+    configured_lmdb_main_map_bytes: u64 = 0,
+    configured_lmdb_wal_map_bytes: u64 = 0,
+};
+
 const SegmentFileStore = struct {
     allocator: Allocator,
     root_dir: []u8,
@@ -298,11 +313,116 @@ const SegmentFileStore = struct {
         return .fromMapped(try mapSegmentFile(path));
     }
 
+    fn mapPublished(self: *SegmentFileStore, seg_id: u64) !index_mod.SegmentData {
+        if (self.storage_owner == null) return error.Unsupported;
+        const path = try self.pathAlloc(seg_id);
+        defer self.allocator.free(path);
+        return .fromMapped(try mapSegmentFile(path));
+    }
+
     fn delete(self: *SegmentFileStore, seg_id: u64) void {
         const path = self.pathAlloc(seg_id) catch return;
         defer self.allocator.free(path);
         self.storage.deleteFileAbsolute(path) catch {};
     }
+};
+
+const RetiredSegmentFileDeleter = struct {
+    allocator: Allocator,
+    root_dir: []u8,
+    storage: storage_io.Storage,
+
+    fn init(allocator: Allocator, store: *const SegmentFileStore) !*RetiredSegmentFileDeleter {
+        const deleter = try allocator.create(RetiredSegmentFileDeleter);
+        errdefer allocator.destroy(deleter);
+        deleter.* = .{
+            .allocator = allocator,
+            .root_dir = try allocator.dupe(u8, store.root_dir),
+            .storage = store.storage,
+        };
+        return deleter;
+    }
+
+    fn deinit(self: *RetiredSegmentFileDeleter) void {
+        const allocator = self.allocator;
+        allocator.free(self.root_dir);
+        allocator.destroy(self);
+    }
+
+    fn cleanup(self: *RetiredSegmentFileDeleter) index_mod.RetiredSegmentCleanup {
+        return .{
+            .ptr = self,
+            .delete = delete,
+        };
+    }
+
+    fn pathAlloc(self: *const RetiredSegmentFileDeleter, seg_id: u64) ![]u8 {
+        return try std.fmt.allocPrint(self.allocator, "{s}/{d}.seg", .{ self.root_dir, seg_id });
+    }
+
+    fn delete(ptr: *anyopaque, seg_id: u64) void {
+        const self: *RetiredSegmentFileDeleter = @ptrCast(@alignCast(ptr));
+        const path = self.pathAlloc(seg_id) catch return;
+        defer self.allocator.free(path);
+        self.storage.deleteFileAbsolute(path) catch {};
+    }
+};
+
+const AtomicSegmentSink = struct {
+    writer: *storage_io.AtomicWriteSink,
+
+    fn sink(self: *AtomicSegmentSink) segment_mod.SegmentSink {
+        return .{
+            .ptr = self,
+            .vtable = &atomic_segment_sink_vtable,
+        };
+    }
+
+    fn len(ptr: *anyopaque) usize {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        return self.writer.len();
+    }
+
+    fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        try self.writer.appendSlice(bytes);
+    }
+
+    fn appendByte(ptr: *anyopaque, byte: u8) !void {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        try self.writer.appendByte(byte);
+    }
+
+    fn appendNTimes(ptr: *anyopaque, byte: u8, count: usize) !void {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        var buf: [4096]u8 = undefined;
+        @memset(&buf, byte);
+        var remaining = count;
+        while (remaining > 0) {
+            const n = @min(remaining, buf.len);
+            try self.writer.appendSlice(buf[0..n]);
+            remaining -= n;
+        }
+    }
+
+    fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        try self.writer.writeAt(offset, bytes);
+    }
+
+    fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        return try self.writer.crc32Prefix(len_prefix);
+    }
+};
+
+const atomic_segment_sink_vtable = segment_mod.SegmentSink.VTable{
+    .len = AtomicSegmentSink.len,
+    .append_slice = AtomicSegmentSink.appendSlice,
+    .append_byte = AtomicSegmentSink.appendByte,
+    .append_ntimes = AtomicSegmentSink.appendNTimes,
+    .write_at = AtomicSegmentSink.writeAt,
+    .crc32_prefix = AtomicSegmentSink.crc32Prefix,
 };
 
 fn walCommitBackendForOptions(backend: lmdb.CommitBackend) wal_mod.CommitBackend {
@@ -364,6 +484,18 @@ pub const StoredSegment = struct {
     pub fn deinit(self: *StoredSegment, alloc: Allocator) void {
         alloc.free(self.segment_bytes);
         if (self.deletion_bitmap_bytes) |bytes| alloc.free(bytes);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedMergeSegment = struct {
+    id: u64,
+    data: index_mod.SegmentData,
+    key_range: SegmentKeyRange,
+
+    pub fn deinit(self: *PreparedMergeSegment, alloc: Allocator) void {
+        self.data.deinit(alloc);
+        self.key_range.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -451,6 +583,27 @@ const MainStoreOwner = union(enum) {
         };
     }
 
+    fn snapshotLsmWriteStats(self: *const MainStoreOwner) ?lsm_backend.Backend.WriteStats {
+        return switch (self.*) {
+            .lmdb, .mem => null,
+            .lsm => |handle| handle.backend.snapshotWriteStats(),
+        };
+    }
+
+    fn snapshotLsmOpenStats(self: *const MainStoreOwner) ?lsm_backend.Backend.OpenStats {
+        return switch (self.*) {
+            .lmdb, .mem => null,
+            .lsm => |handle| handle.backend.snapshotOpenStats(),
+        };
+    }
+
+    fn checkpointLsmWalAfterDurableBoundary(self: *MainStoreOwner) !void {
+        switch (self.*) {
+            .lmdb, .mem => {},
+            .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
+        }
+    }
+
     fn snapshotLsmNativeStorageStats(self: *const MainStoreOwner) ?lsm_backend.NativeStorageStats {
         return switch (self.*) {
             .lmdb, .mem => null,
@@ -491,8 +644,13 @@ pub const PersistentIndex = struct {
     main_store: backend_erased.NamespaceStore,
     main_store_owner: MainStoreOwner,
     segment_files: ?SegmentFileStore,
+    retired_segment_file_deleter: ?*RetiredSegmentFileDeleter = null,
     wal: wal_mod.WAL,
     committed_lsn: u64,
+    main_backend: MainBackend,
+    wal_backend: wal_mod.StorageBackend,
+    main_map_size: usize,
+    wal_map_size: usize,
     read_only: bool = false,
 
     pub const BackendStore = backend_adapter.Store(PersistentIndex, MainTxn, MainTxn, MainTxn, .{
@@ -501,6 +659,13 @@ pub const PersistentIndex = struct {
         .begin_write = beginWriteMainTxn,
         .begin_batch = beginWriteMainTxn,
     });
+
+    pub const SegmentSinkBuildFn = *const fn (*anyopaque, *segment_mod.SegmentSink) anyerror!void;
+
+    pub fn supportsFileBackedSegmentArtifacts(self: *const PersistentIndex) bool {
+        const store = self.segment_files orelse return false;
+        return store.storage_owner != null;
+    }
 
     const MainTxn = struct {
         read: ?backend_erased.NamespaceReadTxn = null,
@@ -806,6 +971,7 @@ pub const PersistentIndex = struct {
                     try stale_active_ids.append(alloc, seg_id);
                     continue;
                 };
+                segment_data.madviseAccessPattern();
                 errdefer segment_data.deinit(alloc);
                 writer.addSegmentWithIdData(seg_id, segment_data) catch |err| {
                     if (isStaleActiveSegmentDataError(err)) {
@@ -846,6 +1012,10 @@ pub const PersistentIndex = struct {
             .segment_files = segment_files,
             .wal = wal,
             .committed_lsn = committed_lsn,
+            .main_backend = opts.main_backend,
+            .wal_backend = opts.resolvedWalBackend(),
+            .main_map_size = opts.main_map_size,
+            .wal_map_size = opts.wal_map_size,
             .read_only = opts.read_only,
         };
 
@@ -867,6 +1037,11 @@ pub const PersistentIndex = struct {
             try pi.pruneActiveSegmentsMissingRangesOrDataLocked(path_span);
         }
 
+        if (pi.segment_files) |*store| {
+            pi.retired_segment_file_deleter = try RetiredSegmentFileDeleter.init(alloc, store);
+            pi.writer.setRetiredSegmentCleanup(pi.retired_segment_file_deleter.?.cleanup());
+        }
+
         return pi;
     }
 
@@ -886,6 +1061,7 @@ pub const PersistentIndex = struct {
         self.wal.close();
         self.main_store.deinit();
         self.main_store_owner.close(self.alloc);
+        if (self.retired_segment_file_deleter) |deleter| deleter.deinit();
         if (self.segment_files) |*store| store.close();
         self.unlockStorage();
         self.* = undefined;
@@ -926,6 +1102,18 @@ pub const PersistentIndex = struct {
         return self.main_store_owner.snapshotLsmMaintenanceStats();
     }
 
+    pub fn snapshotLsmWriteStats(self: *const PersistentIndex) ?lsm_backend.Backend.WriteStats {
+        return self.main_store_owner.snapshotLsmWriteStats();
+    }
+
+    pub fn snapshotLsmOpenStats(self: *const PersistentIndex) ?lsm_backend.Backend.OpenStats {
+        return self.main_store_owner.snapshotLsmOpenStats();
+    }
+
+    pub fn checkpointLsmWalAfterDurableBoundary(self: *PersistentIndex) !void {
+        try self.main_store_owner.checkpointLsmWalAfterDurableBoundary();
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const PersistentIndex) ?lsm_backend.NativeStorageStats {
         return self.main_store_owner.snapshotLsmNativeStorageStats();
     }
@@ -963,6 +1151,11 @@ pub const PersistentIndex = struct {
         var materialize_ns: u64 = 0;
         var persist_ns: u64 = 0;
         var writer_publish_ns: u64 = 0;
+        const begin_write_ns: u64 = 0;
+        const build_sink_ns: u64 = 0;
+        const finish_write_ns: u64 = 0;
+        const map_segment_ns: u64 = 0;
+        const key_range_ns: u64 = 0;
         var wal_truncate_ns: u64 = 0;
         const uses_segment_wal = self.segment_files == null;
 
@@ -989,6 +1182,7 @@ pub const PersistentIndex = struct {
         if (self.segment_files != null) {
             const materialize_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
             segment_data = try self.materializeSegmentData(seg_id, owned.?);
+            segment_data.?.madviseAccessPattern();
             if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
         }
         errdefer {
@@ -1021,7 +1215,7 @@ pub const PersistentIndex = struct {
 
         if (profile_enabled) {
             std.log.info(
-                "antfly_bench_text_publish seg_id={d} bytes={d} total_ms={d} wal_append_ms={d} reserve_id_ms={d} materialize_ms={d} persist_ms={d} writer_publish_ms={d} wal_truncate_ms={d} file_backed={} uses_segment_wal={}",
+                "antfly_bench_text_publish seg_id={d} bytes={d} total_ms={d} wal_append_ms={d} reserve_id_ms={d} materialize_ms={d} begin_write_ms={d} build_sink_ms={d} finish_write_ms={d} map_segment_ms={d} key_range_ms={d} persist_ms={d} writer_publish_ms={d} wal_truncate_ms={d} file_backed={} uses_segment_wal={}",
                 .{
                     seg_id,
                     segment_bytes.len,
@@ -1029,6 +1223,11 @@ pub const PersistentIndex = struct {
                     nsToMs(wal_append_ns),
                     nsToMs(reserve_id_ns),
                     nsToMs(materialize_ns),
+                    nsToMs(begin_write_ns),
+                    nsToMs(build_sink_ns),
+                    nsToMs(finish_write_ns),
+                    nsToMs(map_segment_ns),
+                    nsToMs(key_range_ns),
                     nsToMs(persist_ns),
                     nsToMs(writer_publish_ns),
                     nsToMs(wal_truncate_ns),
@@ -1037,6 +1236,124 @@ pub const PersistentIndex = struct {
                 },
             );
         }
+    }
+
+    /// Build and publish one segment directly into the persistent segment
+    /// artifact when native segment files are available.
+    ///
+    /// Memory-only and synthetic storage backends fall back to the heap-backed
+    /// `indexSegmentOwned` path because they cannot mmap the final segment file.
+    pub fn indexSegmentFromSinkBuilder(
+        self: *PersistentIndex,
+        ctx: *anyopaque,
+        build_fn: SegmentSinkBuildFn,
+    ) !usize {
+        if (self.segment_files == null or self.segment_files.?.storage_owner == null) {
+            var sink_impl = segment_mod.MemorySegmentSink.init(self.alloc);
+            errdefer sink_impl.deinit();
+            var sink = sink_impl.sink();
+            try build_fn(ctx, &sink);
+            const segment_len = sink.len();
+            const owned = try sink_impl.finishOwned();
+            try self.indexSegmentOwned(owned);
+            return segment_len;
+        }
+
+        const profile_enabled = benchPersistentPublishEnabled();
+        const total_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        var reserve_id_ns: u64 = 0;
+        var materialize_ns: u64 = 0;
+        var begin_write_ns: u64 = 0;
+        var build_sink_ns: u64 = 0;
+        var finish_write_ns: u64 = 0;
+        var map_segment_ns: u64 = 0;
+        var key_range_ns: u64 = 0;
+        var persist_ns: u64 = 0;
+        var writer_publish_ns: u64 = 0;
+
+        const reserve_id_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        const seg_id = self.reserveSegmentId();
+        if (profile_enabled) reserve_id_ns = platform_time.monotonicNs() - reserve_id_start_ns;
+
+        const store = &self.segment_files.?;
+        const path = try store.pathAlloc(seg_id);
+        defer store.allocator.free(path);
+
+        const materialize_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        const begin_write_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        var writer = try store.storage.beginAtomicWrite(self.alloc, path);
+        if (profile_enabled) begin_write_ns = platform_time.monotonicNs() - begin_write_start_ns;
+        var writer_active = true;
+        errdefer if (writer_active) writer.abort();
+
+        var sink_adapter = AtomicSegmentSink{ .writer = &writer };
+        var sink = sink_adapter.sink();
+        const build_sink_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        try build_fn(ctx, &sink);
+        const segment_len = sink.len();
+        if (profile_enabled) build_sink_ns = platform_time.monotonicNs() - build_sink_start_ns;
+
+        writer_active = false;
+        const finish_write_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        try writer.finish();
+        if (profile_enabled) finish_write_ns = platform_time.monotonicNs() - finish_write_start_ns;
+        if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
+
+        const map_segment_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        var segment_data: ?index_mod.SegmentData = .fromMapped(try mapSegmentFile(path));
+        segment_data.?.madviseAccessPattern();
+        if (profile_enabled) map_segment_ns = platform_time.monotonicNs() - map_segment_start_ns;
+        errdefer {
+            if (segment_data) |*data| data.deinit(self.alloc);
+            self.deleteSegmentFile(seg_id);
+        }
+
+        const key_range_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        var key_range = try extractSegmentKeyRange(self.alloc, segment_data.?.bytes());
+        if (profile_enabled) key_range_ns = platform_time.monotonicNs() - key_range_start_ns;
+        defer key_range.deinit(self.alloc);
+
+        const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try self.saveSegmentRange(&txn, seg_id, key_range);
+        try self.updateActiveSegments(&txn, seg_id, .add);
+        const lsn_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, self.committed_lsn));
+        try txn.put(.meta, meta_committed_lsn, &lsn_bytes);
+        try txn.commit();
+        if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
+
+        const writer_publish_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        try self.writer.addSegmentWithIdData(seg_id, segment_data.?);
+        segment_data = null;
+        if (profile_enabled) writer_publish_ns = platform_time.monotonicNs() - writer_publish_start_ns;
+
+        if (profile_enabled) {
+            std.log.info(
+                "antfly_bench_text_publish seg_id={d} bytes={d} total_ms={d} wal_append_ms={d} reserve_id_ms={d} materialize_ms={d} begin_write_ms={d} build_sink_ms={d} finish_write_ms={d} map_segment_ms={d} key_range_ms={d} persist_ms={d} writer_publish_ms={d} wal_truncate_ms={d} file_backed={} uses_segment_wal={}",
+                .{
+                    seg_id,
+                    segment_len,
+                    nsToMs(platform_time.monotonicNs() - total_start_ns),
+                    0,
+                    nsToMs(reserve_id_ns),
+                    nsToMs(materialize_ns),
+                    nsToMs(begin_write_ns),
+                    nsToMs(build_sink_ns),
+                    nsToMs(finish_write_ns),
+                    nsToMs(map_segment_ns),
+                    nsToMs(key_range_ns),
+                    nsToMs(persist_ns),
+                    nsToMs(writer_publish_ns),
+                    0,
+                    true,
+                    false,
+                },
+            );
+        }
+        return segment_len;
     }
 
     /// Get current snapshot (lock-free, delegates to IndexWriter).
@@ -1060,6 +1377,13 @@ pub const PersistentIndex = struct {
         return .{
             .wal = self.wal.statsSnapshot(),
             .main_commit = self.main_store_owner.commitStatsSnapshot(),
+        };
+    }
+
+    pub fn memoryStatsSnapshot(self: *const PersistentIndex) PersistentIndexMemoryStats {
+        return .{
+            .configured_lmdb_main_map_bytes = if (self.main_backend == .lmdb) @intCast(self.main_map_size) else 0,
+            .configured_lmdb_wal_map_bytes = if (self.wal_backend == .lmdb) @intCast(self.wal_map_size) else 0,
         };
     }
 
@@ -1378,6 +1702,139 @@ pub const PersistentIndex = struct {
         return try self.replaceSegmentsWithReservedIdsOwned(old_seg_ids, new_seg_ids, segment_bytes_list, true);
     }
 
+    pub fn prepareMergedSegmentToFile(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot, segment_indices: []const usize) ![]PreparedMergeSegment {
+        if (segment_indices.len == 0) return error.NoSegments;
+        const store = &(self.segment_files orelse return error.Unsupported);
+        if (store.storage_owner == null) return error.Unsupported;
+
+        const new_seg_id = self.reserveSegmentId();
+        errdefer self.deleteSegmentFile(new_seg_id);
+
+        var inputs = try self.alloc.alloc(segment_mod.MergeInput, segment_indices.len);
+        defer self.alloc.free(inputs);
+        for (segment_indices, 0..) |seg_idx, i| {
+            const seg = &snap.segments[seg_idx];
+            inputs[i] = .{
+                .reader = &seg.reader,
+                .deleted = seg.deleted,
+            };
+        }
+
+        const path = try store.pathAlloc(new_seg_id);
+        defer store.allocator.free(path);
+
+        var writer = try store.storage.beginAtomicWrite(self.alloc, path);
+        var writer_active = true;
+        errdefer if (writer_active) writer.abort();
+
+        var sink_adapter = AtomicSegmentSink{ .writer = &writer };
+        var sink = sink_adapter.sink();
+        try segment_mod.writeMergedSegmentToSink(self.alloc, &sink, inputs);
+
+        writer_active = false;
+        try writer.finish();
+
+        var data: ?index_mod.SegmentData = try store.mapPublished(new_seg_id);
+        errdefer if (data) |*segment_data| segment_data.deinit(self.alloc);
+
+        var key_range = try extractSegmentKeyRange(self.alloc, data.?.bytes());
+        errdefer key_range.deinit(self.alloc);
+        key_range.seg_id = new_seg_id;
+
+        const prepared = try self.alloc.alloc(PreparedMergeSegment, 1);
+        errdefer self.alloc.free(prepared);
+        prepared[0] = .{
+            .id = new_seg_id,
+            .data = data.?,
+            .key_range = key_range,
+        };
+        data = null;
+        return prepared;
+    }
+
+    pub fn replaceSegmentsIfActiveManyPrepared(self: *PersistentIndex, old_seg_ids: []const u64, prepared_segments: []PreparedMergeSegment) !bool {
+        if (old_seg_ids.len == 0) {
+            self.discardPreparedMergeSegments(prepared_segments);
+            return false;
+        }
+        if (prepared_segments.len == 0) {
+            self.alloc.free(prepared_segments);
+            return try self.removeSegmentsIfActive(old_seg_ids);
+        }
+
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        var published_to_writer = false;
+        defer {
+            if (!published_to_writer) {
+                for (prepared_segments) |*segment| {
+                    const id = segment.id;
+                    segment.deinit(self.alloc);
+                    self.deleteSegmentFile(id);
+                }
+            } else {
+                for (prepared_segments) |*segment| {
+                    segment.key_range.deinit(self.alloc);
+                }
+            }
+            self.alloc.free(prepared_segments);
+        }
+
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+
+        const active_ids = try self.loadActiveSegmentIds(&txn, self.alloc);
+        defer self.alloc.free(active_ids);
+        for (old_seg_ids) |old_id| {
+            if (!containsSegmentId(active_ids, old_id)) {
+                txn.abort();
+                return false;
+            }
+        }
+
+        for (old_seg_ids) |old_id| {
+            const old_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, old_id));
+            try self.updateActiveSegments(&txn, old_id, .remove);
+            txn.delete(.segments, &old_seg_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            txn.delete(.deletions, &old_seg_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            try self.deleteSegmentRange(&txn, old_id);
+        }
+
+        for (prepared_segments) |*segment| {
+            try self.saveSegmentRange(&txn, segment.id, segment.key_range);
+            try self.updateActiveSegments(&txn, segment.id, .add);
+        }
+        try txn.commit();
+
+        var replacements = try self.alloc.alloc(index_mod.ReplacementSegmentData, prepared_segments.len);
+        defer self.alloc.free(replacements);
+        for (prepared_segments, 0..) |*segment, i| {
+            replacements[i] = .{
+                .id = segment.id,
+                .data = segment.data,
+            };
+        }
+        try self.writer.replaceSegmentsManyData(old_seg_ids, replacements);
+        published_to_writer = true;
+        return true;
+    }
+
+    pub fn discardPreparedMergeSegments(self: *PersistentIndex, prepared_segments: []PreparedMergeSegment) void {
+        for (prepared_segments) |*segment| {
+            const id = segment.id;
+            segment.deinit(self.alloc);
+            self.deleteSegmentFile(id);
+        }
+        self.alloc.free(prepared_segments);
+    }
+
     pub fn removeSegmentsIfActive(self: *PersistentIndex, old_seg_ids: []const u64) !bool {
         if (old_seg_ids.len == 0) return false;
         self.lockStorage();
@@ -1552,7 +2009,6 @@ pub const PersistentIndex = struct {
 
         try self.writer.replaceSegmentsData(old_seg_ids, new_seg_id, segment_data.?);
         segment_data = null;
-        for (old_seg_ids) |old_id| self.deleteSegmentFile(old_id);
         return true;
     }
 
@@ -1680,7 +2136,6 @@ pub const PersistentIndex = struct {
 
         try self.writer.replaceSegmentsManyData(old_seg_ids, replacements);
         published_to_writer = true;
-        for (old_seg_ids) |old_id| self.deleteSegmentFile(old_id);
         return true;
     }
 
@@ -1713,7 +2168,6 @@ pub const PersistentIndex = struct {
 
         try txn.commit();
         try self.writer.removeSegments(old_seg_ids);
-        for (old_seg_ids) |old_id| self.deleteSegmentFile(old_id);
     }
 
     fn persistSegment(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64) !void {
@@ -2626,6 +3080,55 @@ test "persistent index snapshots use mapped segment files when native storage is
     try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
     try std.testing.expect(snap.segments[0].data.isFileBacked());
     try std.testing.expectEqualStrings("doc:a", snap.storedDoc(0).?.id);
+}
+
+test "persistent index deletes replaced segment files only after retained snapshot release" {
+    if (!supports_main_lmdb) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    var idx = try PersistentIndex.open(alloc, .{
+        .path = path,
+        .main_backend = .lsm,
+    });
+    defer idx.close();
+
+    const seg_a = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(seg_a);
+    try idx.indexSegment(seg_a);
+
+    const seg_b = try buildSimpleSegment(alloc, "doc:z", "omega");
+    defer alloc.free(seg_b);
+    try idx.indexSegment(seg_b);
+
+    const retained = idx.acquireSnapshot();
+    try std.testing.expectEqual(@as(usize, 2), retained.segments.len);
+
+    const store = &idx.segment_files.?;
+    const path_1 = try store.pathAlloc(1);
+    defer alloc.free(path_1);
+    const path_2 = try store.pathAlloc(2);
+    defer alloc.free(path_2);
+
+    _ = try store.storage.fileSize(path_1);
+    _ = try store.storage.fileSize(path_2);
+
+    const merged = try buildMultiDocSegment(alloc, &.{
+        .{ .doc_id = "doc:a", .term = "alpha" },
+        .{ .doc_id = "doc:z", .term = "omega" },
+    });
+    defer alloc.free(merged);
+    try idx.replaceSegments(&.{ 1, 2 }, merged);
+
+    _ = try store.storage.fileSize(path_1);
+    _ = try store.storage.fileSize(path_2);
+
+    retained.release();
+    try std.testing.expectError(error.FileNotFound, store.storage.fileSize(path_1));
+    try std.testing.expectError(error.FileNotFound, store.storage.fileSize(path_2));
 }
 
 const PersistentSimAction = persistent_sim_fixture.Action;

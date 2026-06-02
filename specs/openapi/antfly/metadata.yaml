@@ -2261,6 +2261,121 @@ components:
           $ref: "indexes.yaml#/components/schemas/IndexConfig"
         status:
           $ref: "indexes.yaml#/components/schemas/IndexStats"
+    LsmStorageStatus:
+      type: object
+      description: LSM backend maintenance and WAL pressure counters.
+      properties:
+        mutable_bytes:
+          type: integer
+          format: uint64
+        immutable_bytes:
+          type: integer
+          format: uint64
+        immutable_memtables:
+          type: integer
+          format: uint64
+        total_runs:
+          type: integer
+          format: uint64
+        total_run_bytes:
+          type: integer
+          format: uint64
+        l0_runs:
+          type: integer
+          format: uint64
+        l0_bytes:
+          type: integer
+          format: uint64
+        lower_level_runs:
+          type: integer
+          format: uint64
+        lower_level_bytes:
+          type: integer
+          format: uint64
+        compactable_l0_runs:
+          type: integer
+          format: uint64
+        level_overflow_runs:
+          type: integer
+          format: uint64
+        level_overflow_bytes:
+          type: integer
+          format: uint64
+        obsolete_paths:
+          type: integer
+          format: uint64
+        active_readers:
+          type: integer
+          format: uint64
+        wal_retained_segments:
+          type: integer
+          format: uint64
+        wal_retained_bytes:
+          type: integer
+          format: uint64
+        wal_checkpoint_oldest_retained_segment:
+          type: integer
+          format: uint64
+        wal_checkpoint_covered_through_segment:
+          type: integer
+          format: uint64
+        wal_checkpoint_current_segment:
+          type: integer
+          format: uint64
+        wal_checkpoint_lag_segments:
+          type: integer
+          format: uint64
+        wal_replay_retained_segments:
+          type: integer
+          format: uint64
+        wal_replay_retained_bytes:
+          type: integer
+          format: uint64
+        wal_replay_current_segment:
+          type: integer
+          format: uint64
+        wal_append_records:
+          type: integer
+          format: uint64
+        wal_append_bytes:
+          type: integer
+          format: uint64
+        wal_append_ns:
+          type: integer
+          format: uint64
+        wal_sync_records:
+          type: integer
+          format: uint64
+        wal_sync_ns:
+          type: integer
+          format: uint64
+        wal_replay_records:
+          type: integer
+          format: uint64
+        wal_replay_bytes:
+          type: integer
+          format: uint64
+        wal_replay_ns:
+          type: integer
+          format: uint64
+        wal_resets:
+          type: integer
+          format: uint64
+        wal_reset_ns:
+          type: integer
+          format: uint64
+        background_io_budget_bytes:
+          type: integer
+          format: uint64
+        background_io_reserved_bytes:
+          type: integer
+          format: uint64
+        background_io_denied_jobs:
+          type: integer
+          format: uint64
+        background_io_oversized_jobs:
+          type: integer
+          format: uint64
     StorageStatus: # common.StorageStats
       type: object
       properties:
@@ -2271,6 +2386,8 @@ components:
         empty:
           type: boolean
           description: Whether the table has received data.
+        lsm:
+          $ref: "#/components/schemas/LsmStorageStatus"
     TableStatus: # common.TableStatus
       allOf:
         - $ref: "#/components/schemas/Table"

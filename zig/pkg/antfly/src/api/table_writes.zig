@@ -19,6 +19,7 @@ const scraping = @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const backups_api = @import("backups.zig");
+const metadata_admin = @import("../metadata/admin.zig");
 const metadata_mod = @import("../metadata/mod.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -87,6 +88,55 @@ var test_before_drop_index_work_hook: ?TestExecutionHook = null;
 var test_before_restore_work_hook: ?TestExecutionHook = null;
 
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
+
+fn accumulateTextMemoryAttributionStats(dst: *db_mod.TextMemoryAttributionStats, src: db_mod.TextMemoryAttributionStats) void {
+    dst.text_indexes +|= src.text_indexes;
+    dst.text_segments +|= src.text_segments;
+    dst.text_segment_bytes +|= src.text_segment_bytes;
+    dst.text_mmap_segment_bytes +|= src.text_mmap_segment_bytes;
+    dst.text_heap_segment_bytes +|= src.text_heap_segment_bytes;
+    dst.text_max_segment_bytes = @max(dst.text_max_segment_bytes, src.text_max_segment_bytes);
+    dst.stored_fields_bytes +|= src.stored_fields_bytes;
+    dst.inverted_text_bytes +|= src.inverted_text_bytes;
+    dst.inverted_header_bytes +|= src.inverted_header_bytes;
+    dst.inverted_norm_bytes +|= src.inverted_norm_bytes;
+    dst.inverted_term_dict_bytes +|= src.inverted_term_dict_bytes;
+    dst.inverted_term_block_bytes +|= src.inverted_term_block_bytes;
+    dst.inverted_term_index_bytes +|= src.inverted_term_index_bytes;
+    dst.inverted_fst_bytes +|= src.inverted_fst_bytes;
+    dst.inverted_bloom_bytes +|= src.inverted_bloom_bytes;
+    dst.inverted_postings_bytes +|= src.inverted_postings_bytes;
+    dst.inverted_postings_header_bytes +|= src.inverted_postings_header_bytes;
+    dst.inverted_block_max_bytes +|= src.inverted_block_max_bytes;
+    dst.inverted_chunk_meta_bytes +|= src.inverted_chunk_meta_bytes;
+    dst.inverted_postings_payload_bytes +|= src.inverted_postings_payload_bytes;
+    dst.inverted_positions_bytes +|= src.inverted_positions_bytes;
+    dst.inverted_skip_bytes +|= src.inverted_skip_bytes;
+    dst.inverted_one_hit_terms +|= src.inverted_one_hit_terms;
+    dst.inverted_postings_terms +|= src.inverted_postings_terms;
+    dst.typed_doc_values_bytes +|= src.typed_doc_values_bytes;
+    dst.doc_ordinals_bytes +|= src.doc_ordinals_bytes;
+    dst.section_index_bytes +|= src.section_index_bytes;
+    dst.configured_lmdb_main_map_bytes +|= src.configured_lmdb_main_map_bytes;
+    dst.configured_lmdb_wal_map_bytes +|= src.configured_lmdb_wal_map_bytes;
+}
+
+test "full text memory attribution aggregation includes norm bytes" {
+    var dst = db_mod.TextMemoryAttributionStats{
+        .inverted_header_bytes = 3,
+        .inverted_norm_bytes = 5,
+        .inverted_term_dict_bytes = 7,
+    };
+    accumulateTextMemoryAttributionStats(&dst, .{
+        .inverted_header_bytes = 11,
+        .inverted_norm_bytes = 13,
+        .inverted_term_dict_bytes = 17,
+    });
+
+    try std.testing.expectEqual(@as(u64, 14), dst.inverted_header_bytes);
+    try std.testing.expectEqual(@as(u64, 18), dst.inverted_norm_bytes);
+    try std.testing.expectEqual(@as(u64, 24), dst.inverted_term_dict_bytes);
+}
 
 fn runTestBeforeBatchExecutionHook() void {
     if (comptime builtin.is_test) {
@@ -4063,6 +4113,20 @@ pub const ProvisionedTableWriteSource = struct {
         return stats;
     }
 
+    pub fn lsmWriteStatsBestEffort(self: *ProvisionedTableWriteSource) lsm_backend.Backend.WriteStats {
+        if (!self.local_db_mutex.tryLock()) return .{};
+        defer self.local_db_mutex.unlock();
+        var stats = lsm_backend.Backend.WriteStats{};
+        if (self.write_cache) |cache| {
+            for (cache.entries.items) |entry| {
+                if (entry.db.trySnapshotLsmWriteStats()) |entry_stats| {
+                    lsm_backend.Backend.accumulateWriteStats(&stats, entry_stats);
+                }
+            }
+        }
+        return stats;
+    }
+
     pub fn lsmNativeStorageStatsBestEffort(self: *ProvisionedTableWriteSource) ?lsm_backend.NativeStorageStats {
         if (!self.local_db_mutex.tryLock()) return null;
         defer self.local_db_mutex.unlock();
@@ -4102,6 +4166,30 @@ pub const ProvisionedTableWriteSource = struct {
         var stats = db_mod.types.AsyncIndexingStats{};
         for (cache.entries.items) |entry| {
             db_mod.types.accumulateAsyncIndexingStats(&stats, entry.db.snapshotAsyncIndexingStats());
+        }
+        return stats;
+    }
+
+    pub fn textMemoryAttributionStatsBestEffort(self: *ProvisionedTableWriteSource) db_mod.TextMemoryAttributionStats {
+        if (!self.local_db_mutex.tryLock()) return .{};
+        defer self.local_db_mutex.unlock();
+        const cache = self.write_cache orelse return .{};
+        var stats = db_mod.TextMemoryAttributionStats{};
+        for (cache.entries.items) |entry| {
+            const entry_stats = entry.db.trySnapshotTextMemoryAttributionStats() orelse continue;
+            accumulateTextMemoryAttributionStats(&stats, entry_stats);
+        }
+        return stats;
+    }
+
+    pub fn textMergeStatsBestEffort(self: *ProvisionedTableWriteSource) db_mod.types.TextMergeStats {
+        if (!self.local_db_mutex.tryLock()) return .{};
+        defer self.local_db_mutex.unlock();
+        const cache = self.write_cache orelse return .{};
+        var stats = db_mod.types.TextMergeStats{};
+        for (cache.entries.items) |entry| {
+            const entry_stats = entry.db.trySnapshotTextMergeStats() orelse continue;
+            db_mod.types.accumulateTextMergeStats(&stats, entry_stats);
         }
         return stats;
     }
@@ -4767,18 +4855,25 @@ pub const ProvisionedTableWriteSource = struct {
             grouped.deinit(alloc);
         }
 
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+        defer metadata_admin.freeRangeRefs(alloc, ranges);
+        if (ranges.len == 0) return null;
+
         for (req.writes) |write| {
-            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, write.key)) orelse return null;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, write.key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.writes.append(alloc, write);
         }
         for (req.deletes) |key| {
-            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse return null;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.deletes.append(alloc, key);
         }
         for (req.transforms) |transform| {
-            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, transform.key)) orelse return null;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, transform.key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.transforms.append(alloc, transform);
         }
@@ -5778,18 +5873,25 @@ pub const HostedProvisionedTableWriteSource = struct {
             grouped.deinit(alloc);
         }
 
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+        defer metadata_admin.freeRangeRefs(alloc, ranges);
+        if (ranges.len == 0) return null;
+
         for (req.writes) |write| {
-            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, write.key)) orelse return null;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, write.key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.writes.append(alloc, write);
         }
         for (req.deletes) |key| {
-            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse return null;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.deletes.append(alloc, key);
         }
         for (req.transforms) |transform| {
-            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, transform.key)) orelse return null;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, transform.key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.transforms.append(alloc, transform);
         }

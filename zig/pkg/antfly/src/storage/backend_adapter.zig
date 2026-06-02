@@ -200,6 +200,7 @@ pub fn NamespaceReadTxn(comptime Impl: type, comptime Namespace: type, comptime 
 
         pub fn getManySorted(self: *@This(), namespace: Namespace, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidBatch;
+            @memset(values, null);
             if (comptime @hasField(@TypeOf(ops), "get_many_sorted")) {
                 return try ops.get_many_sorted(self.impl, namespace, keys, values);
             }

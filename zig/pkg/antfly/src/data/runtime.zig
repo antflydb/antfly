@@ -251,7 +251,9 @@ const RaftTableApplyStateMachine = struct {
         self: *RaftTableApplyStateMachine,
         storage: *antfly.public_api.ProvisionedGroupStorage,
     ) void {
-        self.write_cache.lsm_cache = &storage.lsm_cache;
+        // Apply/write replay should not populate the shared query-side LSM
+        // block cache. This keeps indexing memory separate from read caching.
+        self.write_cache.lsm_cache = null;
         self.write_cache.hbc_cache = &storage.hbc_cache;
         self.write_cache.resource_manager = &storage.resource_manager;
         self.write_cache.backend_runtime = storage.backend_runtime;
@@ -451,6 +453,7 @@ pub const HealthSource = struct {
         try writeResourceMetrics(writer, &self.data_server.provisioned_storage.resource_manager);
         try writeLsmCacheMetrics(writer, self.data_server.provisioned_storage.lsm_cache.snapshotStats());
         try writeLsmNativeStorageMetrics(writer, self.data_server.write_source.lsmNativeStorageStatsBestEffort());
+        try writeFullTextMemoryMetrics(writer, self.data_server.write_source.textMemoryAttributionStatsBestEffort());
         try writeProcessMemoryMetrics(writer, process_memory_mod.snapshot());
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_score", "gauge", "Maximum cached table LSM maintenance pressure score", self.data_server.write_source.lsmMaintenanceScoreBestEffort());
         try health_metrics.appendPromMetric(writer, "antfly_lsm_cached_write_dbs", "gauge", "Cached writable table DBs with local LSM state", @intCast(self.data_server.write_source.cachedWriteDbCountBestEffort()));
@@ -463,17 +466,45 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_lock_deferred_total", "counter", "Data server LSM maintenance background wake cycles deferred behind foreground locks", self.data_server.lsm_maintenance_lock_deferred.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_next_eligible_ns", "gauge", "Monotonic timestamp when background LSM maintenance can next run", self.data_server.lsm_maintenance_next_eligible_ns.load(.monotonic));
         try writeLsmMaintenanceMetrics(writer, self.data_server.write_source.lsmMaintenanceStatsBestEffort());
+        try writeLsmWriteMetrics(writer, self.data_server.write_source.lsmWriteStatsBestEffort());
+        try writeTextMergeMetrics(writer, self.data_server.write_source.textMergeStatsBestEffort());
         try writeAsyncIndexingMetrics(writer, self.data_server.write_source.asyncIndexingStatsBestEffort());
         try antfly.db.query_metrics.writePrometheus(writer);
     }
 };
 
 fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.MaintenanceStats) !void {
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_entries", "gauge", "Cached write LSM active mutable memtable entries", stats.mutable_entries);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_bytes", "gauge", "Cached write LSM active mutable memtable estimated bytes", stats.mutable_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_memtables", "gauge", "Cached write LSM immutable memtables waiting to flush", stats.immutable_memtables);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_entries", "gauge", "Cached write LSM immutable memtable entries waiting to flush", stats.immutable_entries);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_bytes", "gauge", "Cached write LSM immutable memtable estimated bytes waiting to flush", stats.immutable_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_runs", "gauge", "Cached write LSM active run count", stats.total_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_run_bytes", "gauge", "Cached write LSM active run bytes on disk", stats.total_run_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_calls_total", "counter", "LSM mutable snapshot clone calls issued by snapshot reads", stats.mutable_snapshot_clone_calls);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_bytes_total", "counter", "Total bytes cloned into LSM mutable snapshot reads", stats.mutable_snapshot_clone_bytes_total);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_peak_bytes", "gauge", "Peak bytes cloned for a single LSM mutable snapshot read", stats.mutable_snapshot_clone_peak_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotations_total", "counter", "LSM mutable memtable rotations triggered to serve broad read snapshots without cloning", stats.read_snapshot_mutable_rotations);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotation_bytes_total", "counter", "Mutable memtable bytes rotated into immutable state for broad read snapshots", stats.read_snapshot_mutable_rotation_bytes_total);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotation_peak_bytes", "gauge", "Peak mutable memtable bytes rotated for one broad read snapshot", stats.read_snapshot_mutable_rotation_peak_bytes);
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_calls_total", "counter", "LSM mutable snapshot clone calls by reader class");
+    for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
+        const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+        const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) }};
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_mutable_snapshot_clone_reason_calls_total", &labels, reason_stats.calls);
+    }
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_bytes_total", "counter", "Total bytes cloned into LSM mutable snapshot reads by reader class");
+    for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
+        const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+        const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) }};
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_mutable_snapshot_clone_reason_bytes_total", &labels, reason_stats.bytes_total);
+    }
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_peak_bytes", "gauge", "Peak bytes cloned for a single LSM mutable snapshot read by reader class");
+    for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
+        const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+        const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) }};
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_mutable_snapshot_clone_reason_peak_bytes", &labels, reason_stats.peak_bytes);
+    }
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_run_logical_entry_bytes", "gauge", "Cached write LSM logical table entry bytes", stats.total_run_logical_entry_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_run_physical_entry_bytes", "gauge", "Cached write LSM physical table entry bytes after block compression", stats.total_run_physical_entry_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_run_compressed_blocks", "gauge", "Cached write LSM compressed table blocks", stats.total_run_compressed_blocks);
@@ -482,25 +513,161 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_l0_bytes", "gauge", "Cached write LSM level-zero run bytes", stats.l0_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_overlapping_l0_runs", "gauge", "Largest cached write LSM overlapping level-zero run pressure", stats.overlapping_l0_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compactable_l0_runs", "gauge", "Cached write LSM level-zero runs over compaction threshold", stats.compactable_l0_runs);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_soft_limit_l0_runs", "gauge", "Configured cached write LSM soft level-zero run pressure threshold", stats.soft_limit_l0_runs);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_hard_limit_l0_runs", "gauge", "Configured cached write LSM hard level-zero run pressure threshold", stats.hard_limit_l0_runs);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_soft_limit_l0_bytes", "gauge", "Configured cached write LSM soft level-zero byte pressure threshold", stats.soft_limit_l0_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_hard_limit_l0_bytes", "gauge", "Configured cached write LSM hard level-zero byte pressure threshold", stats.hard_limit_l0_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_lower_level_runs", "gauge", "Cached write LSM lower-level run count", stats.lower_level_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_lower_level_bytes", "gauge", "Cached write LSM lower-level run bytes", stats.lower_level_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_max_level", "gauge", "Highest cached write LSM lower level currently populated", stats.max_level);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_level_overflow_runs", "gauge", "Cached write LSM lower-level runs over configured level targets", stats.level_overflow_runs);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_level_overflow_bytes", "gauge", "Cached write LSM lower-level bytes over configured level targets", stats.level_overflow_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths", "gauge", "Cached write LSM obsolete table paths waiting for cleanup", stats.obsolete_paths);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_active_readers", "gauge", "Cached write LSM readers currently retaining run or memtable snapshots", stats.active_readers);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_active_bulk_ingest_batches", "gauge", "Cached write LSM active bulk-ingest session batches", stats.active_bulk_ingest_batches);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_retained_segments", "gauge", "Cached write LSM WAL segments still retained for replay", stats.wal_retained_segments);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_retained_bytes", "gauge", "Cached write LSM WAL bytes still retained for replay", stats.wal_retained_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_oldest_retained_segment", "gauge", "Oldest cached write LSM WAL segment still needed by the durable checkpoint", stats.wal_checkpoint_oldest_retained_segment);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_covered_through_segment", "gauge", "Last cached write LSM WAL segment durably covered by the checkpoint", stats.wal_checkpoint_covered_through_segment);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_current_segment", "gauge", "Current cached write LSM WAL segment", stats.wal_checkpoint_current_segment);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_lag_segments", "gauge", "Sealed cached write LSM WAL segments retained before the active segment", stats.wal_checkpoint_lag_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_retained_segments", "gauge", "Cached write LSM dedicated replay WAL segments still retained", stats.wal_replay_retained_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_retained_bytes", "gauge", "Cached write LSM dedicated replay WAL bytes still retained", stats.wal_replay_retained_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_current_segment", "gauge", "Current cached write LSM dedicated replay WAL segment", stats.wal_replay_current_segment);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_manifest_dirty", "gauge", "Whether cached write LSM manifests have unflushed changes", if (stats.manifest_dirty) 1 else 0);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_manifest_dirty", "gauge", "Whether cached write LSM obsolete-file manifests have unflushed changes", if (stats.obsolete_manifest_dirty) 1 else 0);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_active_jobs", "gauge", "Cached write LSM compaction scheduler active jobs", stats.compaction_scheduler_active_jobs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_in_flight_input_bytes", "gauge", "Cached write LSM compaction scheduler in-flight input bytes", stats.compaction_scheduler_in_flight_input_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_active_oldest_age_ns", "gauge", "Oldest active cached write LSM compaction scheduler job age in nanoseconds", stats.compaction_scheduler_active_oldest_age_ns);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_grants_total", "counter", "Cached write LSM compaction scheduler grants", stats.compaction_scheduler_grants);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_completions_total", "counter", "Cached write LSM compaction scheduler completions", stats.compaction_scheduler_completions);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_denied_capacity_total", "counter", "Cached write LSM compaction scheduler capacity denials", stats.compaction_scheduler_denied_capacity);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_denied_resource_pressure_total", "counter", "Cached write LSM compaction scheduler resource-pressure denials", stats.compaction_scheduler_denied_resource_pressure);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_oversized_grants_total", "counter", "Cached write LSM compaction scheduler oversized single-job grants", stats.compaction_scheduler_oversized_grants);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_pending", "gauge", "Cached write LSM remembered compaction candidates pending retry", stats.compaction_scheduler_remembered_pending);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_pending_runs", "gauge", "Cached write LSM input runs in remembered compaction candidates pending retry", stats.compaction_scheduler_remembered_pending_runs);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_pending_bytes", "gauge", "Cached write LSM input bytes in remembered compaction candidates pending retry", stats.compaction_scheduler_remembered_pending_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_candidates_total", "counter", "Cached write LSM compaction candidates remembered after denied scheduling", stats.compaction_scheduler_remembered_candidates);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_retries_total", "counter", "Cached write LSM remembered compaction retry attempts", stats.compaction_scheduler_remembered_retries);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_hits_total", "counter", "Cached write LSM remembered compactions that were executed", stats.compaction_scheduler_remembered_hits);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_stale_total", "counter", "Cached write LSM remembered compactions invalidated by run-set changes", stats.compaction_scheduler_remembered_stale);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_conflict_denials_total", "counter", "Cached write LSM remembered compaction retries denied by active scheduler conflicts", stats.compaction_scheduler_conflict_denials);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_background_io_budget_bytes", "gauge", "Configured cached write LSM per-maintenance-step background IO byte budget", stats.background_io_budget_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_background_io_reserved_bytes_total", "counter", "Cached write LSM background IO bytes reserved by admitted maintenance jobs", stats.background_io_reserved_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_background_io_denied_jobs_total", "counter", "Cached write LSM maintenance jobs denied by background IO admission", stats.background_io_denied_jobs);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_background_io_oversized_jobs_total", "counter", "Cached write LSM maintenance jobs admitted as oversized single jobs", stats.background_io_oversized_jobs);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_backend_lock_waits_total", "counter", "Cached write LSM backend lock waits", stats.backend_lock_waits);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_backend_lock_wait_ns_total", "counter", "Nanoseconds spent waiting on cached write LSM backend locks", stats.backend_lock_wait_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_backend_lock_max_wait_ns", "gauge", "Maximum cached write LSM backend lock wait in nanoseconds", stats.backend_lock_max_wait_ns);
+}
+
+fn writeLsmWriteMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.WriteStats) !void {
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_flushes_total", "counter", "Cached write LSM mutable flushes", stats.flushes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_flush_input_entries_total", "counter", "Entries consumed by cached write LSM mutable flushes", stats.flush_input_entries);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_flush_output_runs_total", "counter", "Runs produced by cached write LSM mutable flushes", stats.flush_output_runs);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_flush_output_bytes_total", "counter", "Run bytes produced by cached write LSM mutable flushes", stats.flush_output_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_flush_ns_total", "counter", "Nanoseconds spent in cached write LSM mutable flushes", stats.flush_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_table_file_writes_total", "counter", "Cached write LSM table files written", stats.table_file_writes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_table_file_bytes_total", "counter", "Cached write LSM table file bytes written", stats.table_file_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_table_file_logical_entry_bytes_total", "counter", "Logical entry bytes written into cached write LSM table files", stats.table_file_logical_entry_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_table_file_physical_entry_bytes_total", "counter", "Physical entry bytes written into cached write LSM table files after block compression", stats.table_file_physical_entry_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_table_file_raw_blocks_total", "counter", "Raw cached write LSM table blocks written", stats.table_file_raw_blocks);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_table_file_compressed_blocks_total", "counter", "Compressed cached write LSM table blocks written", stats.table_file_compressed_blocks);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_table_file_compression_codec_mask", "gauge", "Bit mask of cached write LSM table compression codecs observed in writes", stats.table_file_compression_codec_mask);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_sorted_ingest_runs_total", "counter", "Runs published through cached write LSM sorted ingest", stats.sorted_ingest_runs);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_sorted_ingest_bytes_total", "counter", "Run bytes published through cached write LSM sorted ingest", stats.sorted_ingest_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_sorted_ingest_ns_total", "counter", "Nanoseconds spent in cached write LSM sorted ingest", stats.sorted_ingest_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_ns_total", "counter", "Nanoseconds spent compacting cached write LSM runs", stats.compaction_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_manifest_writes_total", "counter", "Cached write LSM manifest writes", stats.manifest_writes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_manifest_bytes_total", "counter", "Cached write LSM manifest bytes written", stats.manifest_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_manifest_ns_total", "counter", "Nanoseconds spent writing cached write LSM manifests", stats.manifest_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_events_total", "counter", "Cached write LSM foreground write-pressure events", stats.write_pressure_events);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_compactions_total", "counter", "Cached write LSM foreground write-pressure compactions", stats.write_pressure_compactions);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_compaction_steps_total", "counter", "Cached write LSM foreground write-pressure compaction steps", stats.write_pressure_compaction_steps);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_overloads_total", "counter", "Cached write LSM write-pressure events that remained above hard limits after the foreground budget", stats.write_pressure_overloads);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_rejections_total", "counter", "Cached write LSM writes rejected after write-pressure overload", stats.write_pressure_rejections);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_ns_total", "counter", "Nanoseconds spent in cached write LSM foreground write-pressure compactions", stats.write_pressure_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_flushes_total", "counter", "Cached write LSM foreground WAL-pressure flushes", stats.wal_pressure_flushes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_ns_total", "counter", "Nanoseconds spent in cached write LSM foreground WAL-pressure flushes", stats.wal_pressure_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_append_records_total", "counter", "Cached write LSM WAL records appended", stats.wal_append_records);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_append_entries_total", "counter", "Cached write LSM WAL entries appended", stats.wal_append_entries);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_append_bytes_total", "counter", "Cached write LSM WAL bytes appended", stats.wal_append_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_append_ns_total", "counter", "Nanoseconds spent appending cached write LSM WAL records", stats.wal_append_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_sync_records_total", "counter", "Cached write LSM WAL records synced", stats.wal_sync_records);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_sync_ns_total", "counter", "Nanoseconds spent syncing cached write LSM WAL records", stats.wal_sync_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_records_total", "counter", "Cached write LSM WAL records replayed", stats.wal_replay_records);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_entries_total", "counter", "Cached write LSM WAL entries replayed", stats.wal_replay_entries);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_bytes_total", "counter", "Cached write LSM WAL bytes replayed", stats.wal_replay_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_ns_total", "counter", "Nanoseconds spent replaying cached write LSM WAL records", stats.wal_replay_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_truncated_tail_bytes_total", "counter", "Truncated cached write LSM WAL tail bytes ignored during replay", stats.wal_replay_truncated_tail_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_resets_total", "counter", "Cached write LSM WAL reset operations", stats.wal_resets);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_reset_ns_total", "counter", "Nanoseconds spent resetting cached write LSM WAL files", stats.wal_reset_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_rotations_total", "counter", "Cached write LSM mutable-to-immutable rotations", stats.immutable_rotations);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_flushes_total", "counter", "Cached write LSM immutable memtable flushes", stats.immutable_flushes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_flush_entries_total", "counter", "Entries flushed from cached write LSM immutable memtables", stats.immutable_flush_entries);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_flush_ns_total", "counter", "Nanoseconds spent flushing cached write LSM immutable memtables", stats.immutable_flush_ns);
+}
+
+fn writeFullTextMemoryMetrics(writer: *std.Io.Writer, stats: antfly.db.TextMemoryAttributionStats) !void {
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_indexes", "gauge", "Cached write full-text index count", stats.text_indexes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_segments", "gauge", "Cached write full-text segment count", stats.text_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_segment_bytes", "gauge", "Cached write full-text segment bytes", stats.text_segment_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_mmap_segment_bytes", "gauge", "Cached write full-text segment bytes backed by mmap files", stats.text_mmap_segment_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_heap_segment_bytes", "gauge", "Cached write full-text segment bytes retained on the heap", stats.text_heap_segment_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_max_segment_bytes", "gauge", "Largest cached write full-text segment byte size", stats.text_max_segment_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_stored_fields_bytes", "gauge", "Full-text stored-field section bytes across cached write DBs", stats.stored_fields_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_bytes", "gauge", "Full-text inverted section bytes across cached write DBs", stats.inverted_text_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_header_bytes", "gauge", "Full-text inverted section header bytes", stats.inverted_header_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_norm_bytes", "gauge", "Full-text inverted per-document norm table bytes", stats.inverted_norm_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_term_dict_bytes", "gauge", "Full-text inverted term dictionary bytes", stats.inverted_term_dict_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_term_block_bytes", "gauge", "Full-text inverted term dictionary block bytes", stats.inverted_term_block_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_term_index_bytes", "gauge", "Full-text inverted term dictionary block index bytes", stats.inverted_term_index_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_fst_bytes", "gauge", "Full-text inverted term dictionary FST bytes", stats.inverted_fst_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_bloom_bytes", "gauge", "Full-text inverted bloom filter bytes", stats.inverted_bloom_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_postings_bytes", "gauge", "Full-text inverted postings bytes", stats.inverted_postings_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_postings_header_bytes", "gauge", "Full-text inverted postings header bytes", stats.inverted_postings_header_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_block_max_bytes", "gauge", "Full-text inverted block-max metadata bytes", stats.inverted_block_max_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_chunk_meta_bytes", "gauge", "Full-text inverted postings chunk metadata bytes", stats.inverted_chunk_meta_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_postings_payload_bytes", "gauge", "Full-text inverted packed postings payload bytes", stats.inverted_postings_payload_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_positions_bytes", "gauge", "Full-text inverted positions payload bytes", stats.inverted_positions_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_skip_bytes", "gauge", "Full-text inverted skip metadata bytes", stats.inverted_skip_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_one_hit_terms", "gauge", "Full-text inverted one-hit term count", stats.inverted_one_hit_terms);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_postings_terms", "gauge", "Full-text inverted multi-hit postings term count", stats.inverted_postings_terms);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_typed_doc_values_bytes", "gauge", "Full-text typed doc-value bytes", stats.typed_doc_values_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_doc_ordinals_bytes", "gauge", "Full-text doc ordinal bytes", stats.doc_ordinals_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_section_index_bytes", "gauge", "Full-text section index bytes", stats.section_index_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_configured_lmdb_main_map_bytes", "gauge", "Configured LMDB main map bytes for full-text indexes", stats.configured_lmdb_main_map_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_configured_lmdb_wal_map_bytes", "gauge", "Configured LMDB WAL map bytes for full-text indexes", stats.configured_lmdb_wal_map_bytes);
+}
+
+fn writeTextMergeMetrics(writer: *std.Io.Writer, stats: antfly.db.types.TextMergeStats) !void {
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_enabled", "gauge", "Whether text merge scheduling is enabled for cached write DBs", if (stats.enabled) 1 else 0);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_indexes", "gauge", "Cached write full-text indexes with pending merge debt", stats.pending_indexes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_segments", "gauge", "Cached write full-text segments in pending merge debt", stats.pending_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_bytes", "gauge", "Cached write full-text segment bytes in pending merge debt", stats.pending_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_heap_bytes", "gauge", "Heap-backed full-text segment bytes in pending merge debt", stats.pending_heap_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_mmap_bytes", "gauge", "Mmap-backed full-text segment bytes in pending merge debt", stats.pending_mmap_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_in_flight_merges", "gauge", "Cached write full-text merges currently in flight", stats.in_flight_merges);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_in_flight_segments", "gauge", "Cached write full-text source segments currently in flight", stats.in_flight_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_completed_total", "counter", "Cached write full-text merges completed", stats.completed_merges);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_skipped_stale_total", "counter", "Cached write full-text merges skipped because the candidate became stale", stats.skipped_stale_merges);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_failed_total", "counter", "Cached write full-text merges that failed", stats.failed_merges);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_input_segments_total", "counter", "Source full-text segments consumed by completed merges", stats.merge_input_segments_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_input_bytes_total", "counter", "Source full-text segment bytes consumed by completed merges", stats.merge_input_bytes_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_output_segments_total", "counter", "Output full-text segments published by completed merges", stats.merge_output_segments_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_output_bytes_total", "counter", "Output full-text segment bytes published by completed merges", stats.merge_output_bytes_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_input_segments", "gauge", "Source full-text segments consumed by the last completed merge", stats.last_merge_input_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_input_bytes", "gauge", "Source full-text segment bytes consumed by the last completed merge", stats.last_merge_input_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_output_segments", "gauge", "Output full-text segments published by the last completed merge", stats.last_merge_output_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_output_bytes", "gauge", "Output full-text segment bytes published by the last completed merge", stats.last_merge_output_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_quarantined_merges", "gauge", "Cached write full-text merge candidates currently quarantined after failure", stats.quarantined_merges);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_quarantined_segments", "gauge", "Cached write full-text source segments currently quarantined after failure", stats.quarantined_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_retry_after_ns", "gauge", "Latest monotonic retry-after timestamp for cached write full-text merge work", stats.retry_after_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_deferred_for_pressure_total", "counter", "Cached write full-text merge attempts deferred for resource pressure", stats.deferred_for_pressure);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_events_total", "counter", "Cached write full-text merge backpressure events", stats.backpressure_events);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_ns_total", "counter", "Nanoseconds spent under full-text merge backpressure", stats.backpressure_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_max_pending_segments", "gauge", "Maximum pending full-text segments observed by merge scheduling", stats.max_pending_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_max_pending_bytes", "gauge", "Maximum pending full-text segment bytes observed by merge scheduling", stats.max_pending_bytes);
 }
 
 const AsyncMutexMetricField = enum {
@@ -540,14 +707,35 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_active", "gauge", "Whether startup catch-up is actively opening or catching up a local index", if (stats.startup.active) 1 else 0);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_retained_segments", "gauge", "Retained WAL segments reported by the active startup catch-up snapshot", stats.startup.wal_retained_segments);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_retained_bytes", "gauge", "Retained WAL bytes reported by the active startup catch-up snapshot", stats.startup.wal_retained_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_checkpoint_oldest_retained_segment", "gauge", "Oldest WAL segment still retained by the active startup catch-up checkpoint snapshot", stats.startup.wal_checkpoint_oldest_retained_segment);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_checkpoint_covered_through_segment", "gauge", "Last WAL segment covered by the active startup catch-up checkpoint snapshot", stats.startup.wal_checkpoint_covered_through_segment);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_checkpoint_current_segment", "gauge", "Current WAL segment in the active startup catch-up checkpoint snapshot", stats.startup.wal_checkpoint_current_segment);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_checkpoint_lag_segments", "gauge", "Sealed WAL segments retained before the active segment in the startup catch-up snapshot", stats.startup.wal_checkpoint_lag_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_retained_segments", "gauge", "Dedicated replay WAL segments retained by the active startup catch-up snapshot", stats.startup.wal_replay_retained_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_retained_bytes", "gauge", "Dedicated replay WAL bytes retained by the active startup catch-up snapshot", stats.startup.wal_replay_retained_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_current_segment", "gauge", "Current dedicated replay WAL segment in the startup catch-up snapshot", stats.startup.wal_replay_current_segment);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_configured_indexes", "gauge", "Configured indexes on the table currently being opened or caught up", stats.startup.configured_indexes);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_opened_indexes", "gauge", "Configured indexes already opened for the active startup catch-up table", stats.startup.opened_indexes);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_db_open_ns", "gauge", "Observed DB.open duration for the active startup catch-up table", stats.startup.db_open_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_load_indexes_ns", "gauge", "Observed index-load duration inside DB.open for the active startup catch-up table", stats.startup.load_indexes_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_stores", "gauge", "LSM-backed stores observed during startup index open", stats.startup.lsm_open_stores);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_completed", "gauge", "LSM-backed stores that completed startup open", stats.startup.lsm_open_completed);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_failed", "gauge", "LSM-backed stores that failed startup open", stats.startup.lsm_open_failed);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_total_ns", "gauge", "Summed LSM open duration across startup stores", stats.startup.lsm_open_total_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_initializing_storage_ns", "gauge", "Summed LSM storage initialization duration during startup open", stats.startup.lsm_open_initializing_storage_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_manifest_ns", "gauge", "Summed LSM manifest load duration during startup open", stats.startup.lsm_open_manifest_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_ensuring_dirs_ns", "gauge", "Summed LSM directory creation duration during startup open", stats.startup.lsm_open_ensuring_dirs_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_wal_replay_ns", "gauge", "Summed LSM WAL replay duration during startup open", stats.startup.lsm_open_wal_replay_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_mounting_runs_ns", "gauge", "Summed LSM run mounting duration during startup open", stats.startup.lsm_open_mounting_runs_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_loaded_runs", "gauge", "LSM runs loaded during startup open", stats.startup.lsm_open_loaded_runs);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_obsolete_paths", "gauge", "LSM obsolete paths loaded during startup open", stats.startup.lsm_open_obsolete_paths);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_mutable_entries_after_replay", "gauge", "LSM mutable entries after startup WAL replay", stats.startup.lsm_open_mutable_entries_after_replay);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_immutable_memtables_after_replay", "gauge", "LSM immutable memtables after startup WAL replay", stats.startup.lsm_open_immutable_memtables_after_replay);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_records", "gauge", "Observed LSM WAL replay records during startup index open", stats.startup.wal_replay_records);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_entries", "gauge", "Observed LSM WAL replay entries during startup index open", stats.startup.wal_replay_entries);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_bytes", "gauge", "Observed LSM WAL replay bytes during startup index open", stats.startup.wal_replay_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_ns", "gauge", "Observed LSM WAL replay nanoseconds during startup index open", stats.startup.wal_replay_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_truncated_tail_bytes", "gauge", "Observed truncated WAL tail bytes during startup index open", stats.startup.wal_replay_truncated_tail_bytes);
     try health_metrics.appendPromMetricHeader(writer, "antfly_async_index_startup_phase", "gauge", "One-hot startup catch-up phase, labeled by current phase");
     inline for ([_]antfly.db.types.StartupCatchUpPhase{ .idle, .opening_db, .artifact_rebuild, .startup_catch_up }) |phase| {
         try health_metrics.appendPromSampleLabeled(writer, "antfly_async_index_startup_phase", &.{
@@ -581,6 +769,8 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_current_target_sequence", "gauge", "Current replay target sequence for the active dense catch-up replay", stats.dense_catch_up.current_target_sequence);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_current_scanned_entries", "gauge", "Cumulative replay records scanned in the active dense catch-up session", stats.dense_catch_up.current_scanned_entries);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_current_applied_entries", "gauge", "Cumulative replay batches applied in the active dense catch-up session", stats.dense_catch_up.current_applied_entries);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_replay_scan_batches", "gauge", "Replay scan batches opened in the active dense catch-up session", stats.dense_catch_up.replay_scan_batches);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_replay_hint_filter_skips", "gauge", "Replay records skipped by hint filtering in the active dense catch-up session", stats.dense_catch_up.replay_hint_filter_skips);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_progress_updates_total", "counter", "Dense catch-up in-chunk progress updates published", stats.dense_catch_up.progress_updates);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_bulk_finish_windows_total", "counter", "HBC bulk-finish publish windows completed during dense catch-up", stats.dense_catch_up.bulk_finish_windows);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_bulk_finish_split_steps_total", "counter", "HBC deferred leaf split steps completed during dense catch-up bulk finish", stats.dense_catch_up.bulk_finish_split_steps);
@@ -677,6 +867,7 @@ fn writeResourceMetricFamily(
     inline for (.{
         resource_manager_mod.Slice.lsm_block_table_cache,
         resource_manager_mod.Slice.lsm_compaction_work,
+        resource_manager_mod.Slice.lsm_table_builder_working_set,
         resource_manager_mod.Slice.lsm_in_memory_state,
         resource_manager_mod.Slice.lsm_wal_write_working_set,
         resource_manager_mod.Slice.hbc_node_metadata_cache,
@@ -685,6 +876,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.dense_routing_working_set,
         resource_manager_mod.Slice.derived_replay_window,
         resource_manager_mod.Slice.full_text_pending_segments,
+        resource_manager_mod.Slice.full_text_build_working_set,
         resource_manager_mod.Slice.derived_backlog,
         resource_manager_mod.Slice.text_merge_buffers,
         resource_manager_mod.Slice.algebraic_tensor_accumulators,
@@ -732,6 +924,10 @@ fn writeProcessMemoryMetrics(writer: *std.Io.Writer, stats: process_memory_mod.S
     try health_metrics.appendPromMetric(writer, "antfly_process_footprint_bytes", "gauge", "Process physical footprint bytes reported by the operating system", stats.footprint_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_wired_bytes", "gauge", "Process wired bytes reported by the operating system", stats.wired_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_pageins_total", "counter", "Process page-ins reported by the operating system", stats.pageins);
+    try health_metrics.appendPromMetric(writer, "antfly_process_malloc_available", "gauge", "Whether process malloc zone metrics are available on this platform", if (stats.malloc_available) 1 else 0);
+    if (!stats.malloc_available) return;
+    try health_metrics.appendPromMetric(writer, "antfly_process_malloc_allocated_bytes", "gauge", "Live bytes allocated across process malloc zones", stats.malloc_allocated_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_process_malloc_zone_bytes", "gauge", "Bytes reserved by process malloc zones", stats.malloc_zone_bytes);
 }
 
 const LsmCacheMetricField = enum {
@@ -756,6 +952,7 @@ fn writeLsmCacheKindMetricFamily(
     try appendLsmCacheKindSample(writer, name, "run_table_raw", stats.run_table_raw, field);
     try appendLsmCacheKindSample(writer, name, "run_table_index", stats.run_table_index, field);
     try appendLsmCacheKindSample(writer, name, "run_table_block", stats.run_table_block, field);
+    try appendLsmCacheKindSample(writer, name, "run_table_physical_block", stats.run_table_physical_block, field);
 }
 
 fn appendLsmCacheKindSample(
@@ -12117,7 +12314,7 @@ test "data runtime remote admin snapshot clone preserves replication status surf
 
 test "data runtime metrics use prometheus labels for resource and cache dimensions" {
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
-    var writer_buf: [16384]u8 = undefined;
+    var writer_buf: [65536]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&writer_buf);
 
     try writeResourceMetrics(&writer, &resource_manager);
@@ -12149,14 +12346,47 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .footprint_bytes = 13,
         .wired_bytes = 19,
         .pageins = 23,
+        .malloc_available = true,
+        .malloc_allocated_bytes = 29,
+        .malloc_zone_bytes = 31,
     });
     const process_memory_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_memory_available 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_footprint_bytes 13") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_pageins_total 23") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_malloc_allocated_bytes 29") != null);
+
+    writer = .fixed(&writer_buf);
+    try writeFullTextMemoryMetrics(&writer, .{
+        .text_indexes = 1,
+        .text_segments = 2,
+        .text_segment_bytes = 4096,
+        .text_mmap_segment_bytes = 3072,
+        .text_heap_segment_bytes = 1024,
+        .inverted_term_dict_bytes = 512,
+        .inverted_term_block_bytes = 256,
+        .inverted_term_index_bytes = 128,
+        .inverted_fst_bytes = 64,
+        .inverted_postings_bytes = 2048,
+        .inverted_postings_payload_bytes = 128,
+        .inverted_skip_bytes = 32,
+        .configured_lmdb_main_map_bytes = 8192,
+    });
+    const full_text_output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_segment_bytes 4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_mmap_segment_bytes 3072") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_inverted_term_dict_bytes 512") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_inverted_postings_bytes 2048") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_inverted_fst_bytes 64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_inverted_skip_bytes 32") != null);
 
     writer = .fixed(&writer_buf);
     try writeLsmMaintenanceMetrics(&writer, .{
+        .mutable_entries = 11,
+        .mutable_bytes = 2048,
+        .immutable_memtables = 2,
+        .immutable_entries = 7,
+        .immutable_bytes = 1024,
         .total_runs = 3,
         .total_run_bytes = 4096,
         .total_run_logical_entry_bytes = 8192,
@@ -12164,21 +12394,132 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .l0_runs = 2,
         .l0_bytes = 2048,
         .overlapping_l0_runs = 2,
+        .soft_limit_l0_runs = 4,
+        .hard_limit_l0_runs = 8,
+        .soft_limit_l0_bytes = 65536,
+        .hard_limit_l0_bytes = 131072,
+        .lower_level_runs = 5,
+        .lower_level_bytes = 4096,
+        .max_level = 2,
+        .level_overflow_runs = 1,
+        .level_overflow_bytes = 256,
         .obsolete_paths = 1,
+        .active_readers = 6,
+        .manifest_dirty = true,
+        .obsolete_manifest_dirty = true,
+        .compaction_scheduler_active_oldest_age_ns = 99,
         .compaction_scheduler_grants = 3,
         .compaction_scheduler_denied_capacity = 1,
         .compaction_scheduler_remembered_pending = 1,
+        .compaction_scheduler_remembered_pending_runs = 4,
+        .compaction_scheduler_remembered_pending_bytes = 8192,
         .compaction_scheduler_remembered_hits = 2,
+        .background_io_budget_bytes = 1000,
+        .background_io_reserved_bytes = 750,
+        .background_io_denied_jobs = 2,
+        .background_io_oversized_jobs = 1,
+        .backend_lock_waits = 9,
+        .backend_lock_wait_ns = 100,
+        .backend_lock_max_wait_ns = 25,
     });
     const maintenance_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "# HELP antfly_lsm_total_run_bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_mutable_bytes 2048") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_immutable_memtables 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_immutable_bytes 1024") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_l0_runs 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_overlapping_l0_runs 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_soft_limit_l0_runs 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_level_overflow_runs 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers 6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_manifest_dirty 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_active_oldest_age_ns 99") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_grants_total 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_denied_capacity_total 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_remembered_pending 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_remembered_pending_runs 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_remembered_pending_bytes 8192") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_remembered_hits_total 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_background_io_budget_bytes 1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_background_io_reserved_bytes_total 750") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_backend_lock_waits_total 9") != null);
+
+    writer = .fixed(&writer_buf);
+    try writeLsmWriteMetrics(&writer, .{
+        .flushes = 1,
+        .flush_input_entries = 2,
+        .flush_output_bytes = 3,
+        .table_file_writes = 4,
+        .table_file_bytes = 5,
+        .write_pressure_events = 21,
+        .write_pressure_compactions = 6,
+        .write_pressure_compaction_steps = 22,
+        .write_pressure_overloads = 23,
+        .write_pressure_rejections = 24,
+        .wal_pressure_flushes = 7,
+        .wal_append_records = 8,
+        .wal_append_entries = 9,
+        .wal_append_bytes = 10,
+        .wal_append_ns = 11,
+        .wal_sync_records = 12,
+        .wal_sync_ns = 13,
+        .wal_replay_records = 14,
+        .wal_replay_bytes = 15,
+        .wal_replay_ns = 16,
+        .wal_resets = 17,
+        .wal_reset_ns = 18,
+        .immutable_rotations = 19,
+        .immutable_flushes = 20,
+    });
+    const write_output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_flushes_total 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_table_file_writes_total 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_events_total 21") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_compactions_total 6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_compaction_steps_total 22") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_overloads_total 23") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_rejections_total 24") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_pressure_flushes_total 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_append_records_total 8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_sync_records_total 12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_sync_ns_total 13") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_replay_records_total 14") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_resets_total 17") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_immutable_rotations_total 19") != null);
+
+    writer = .fixed(&writer_buf);
+    try writeTextMergeMetrics(&writer, .{
+        .enabled = true,
+        .pending_indexes = 1,
+        .pending_segments = 3,
+        .pending_bytes = 4096,
+        .pending_heap_bytes = 1024,
+        .pending_mmap_bytes = 3072,
+        .in_flight_merges = 1,
+        .completed_merges = 2,
+        .deferred_for_pressure = 4,
+        .merge_input_segments_total = 5,
+        .merge_input_bytes_total = 600,
+        .merge_output_segments_total = 2,
+        .merge_output_bytes_total = 300,
+        .last_merge_input_segments = 3,
+        .last_merge_input_bytes = 256,
+        .last_merge_output_segments = 1,
+        .last_merge_output_bytes = 128,
+        .max_pending_bytes = 8192,
+    });
+    const text_merge_output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_enabled 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_pending_bytes 4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_pending_heap_bytes 1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_pending_mmap_bytes 3072") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_input_bytes_total 600") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_output_bytes_total 300") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_last_input_bytes 256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_last_output_bytes 128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_completed_total 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_deferred_for_pressure_total 4") != null);
 }
 
 test "data runtime health metrics include replay debt and provisioned warmup counters" {
@@ -12268,6 +12609,25 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
                     .phase = .opening_db,
                     .wal_retained_segments = 4,
                     .wal_retained_bytes = 99,
+                    .wal_checkpoint_oldest_retained_segment = 2,
+                    .wal_checkpoint_covered_through_segment = 3,
+                    .wal_checkpoint_current_segment = 5,
+                    .wal_checkpoint_lag_segments = 2,
+                    .wal_replay_retained_segments = 1,
+                    .wal_replay_retained_bytes = 44,
+                    .wal_replay_current_segment = 6,
+                    .lsm_open_stores = 3,
+                    .lsm_open_completed = 2,
+                    .lsm_open_total_ns = 1000,
+                    .lsm_open_manifest_ns = 111,
+                    .lsm_open_wal_replay_ns = 222,
+                    .lsm_open_loaded_runs = 5,
+                    .lsm_open_mutable_entries_after_replay = 7,
+                    .wal_replay_records = 8,
+                    .wal_replay_entries = 9,
+                    .wal_replay_bytes = 10,
+                    .wal_replay_ns = 222,
+                    .wal_replay_truncated_tail_bytes = 66,
                 },
             },
         },
@@ -12325,7 +12685,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     server.provisioned_root_refresh_last_duration_ns.store(66, .monotonic);
 
     var health = HealthSource{ .data_server = &server };
-    var writer_buf: [32768]u8 = undefined;
+    var writer_buf: [65536]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&writer_buf);
     try health.metricsWriter().writeMetrics(&writer);
     const output = writer.buffered();
@@ -12403,11 +12763,45 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_provisioned_read_cache_misses_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_provisioned_write_cache_hits_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_provisioned_write_cache_misses_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_mutable_bytes 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_immutable_memtables 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_immutable_bytes 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_retained_segments 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_retained_bytes 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_checkpoint_oldest_retained_segment 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_checkpoint_covered_through_segment 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_checkpoint_current_segment 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_checkpoint_lag_segments 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_replay_retained_segments 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_replay_retained_bytes 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_replay_current_segment 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_background_io_budget_bytes 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_background_io_denied_jobs_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_append_records_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_sync_ns_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_resets_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_active 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_retained_segments 4") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_retained_bytes 99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_checkpoint_oldest_retained_segment 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_checkpoint_covered_through_segment 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_checkpoint_current_segment 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_checkpoint_lag_segments 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_retained_segments 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_retained_bytes 44") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_current_segment 6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_stores 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_completed 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_total_ns 1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_manifest_ns 111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_wal_replay_ns 222") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_loaded_runs 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_mutable_entries_after_replay 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_records 8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_entries 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_bytes 10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_ns 222") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_truncated_tail_bytes 66") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_phase{phase=\"opening_db\"} 1") != null);
 }
 

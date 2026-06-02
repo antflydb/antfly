@@ -68,6 +68,14 @@ fn replayHintOrdinal(hint: change_journal_mod.TargetHint) u8 {
     return @intCast(@intFromEnum(hint));
 }
 
+fn replayHintFromSingleMask(mask: u8) ?change_journal_mod.TargetHint {
+    if (mask == 0 or (mask & (mask - 1)) != 0) return null;
+    inline for (std.meta.fields(change_journal_mod.TargetHint)) |field| {
+        if (mask == (@as(u8, 1) << @intCast(field.value))) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
 fn encodeReplayNextSequence(sequence: u64) [8]u8 {
     var raw: [8]u8 = undefined;
     std.mem.writeInt(u64, &raw, sequence, .little);
@@ -294,6 +302,15 @@ pub const OwnedKVPair = struct {
     value: []u8,
 };
 
+pub const ReplayIterationStats = struct {
+    scanned_entries: usize = 0,
+    matched_entries: usize = 0,
+    last_sequence: u64 = 0,
+    hint_filter_skips: usize = 0,
+    scan_batches: usize = 0,
+    fallback_used: bool = false,
+};
+
 // ============================================================================
 // ByteRange — shard ownership range
 // ============================================================================
@@ -425,6 +442,7 @@ pub const DocStore = struct {
 
         pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidArgument;
+            @memset(values, null);
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     for (keys, 0..) |key, i| {
@@ -528,6 +546,7 @@ pub const DocStore = struct {
 
             pub fn getManySorted(self: @This(), keys: []const []const u8, values: []?[]const u8) !void {
                 if (keys.len != values.len) return error.InvalidArgument;
+                @memset(values, null);
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
                         for (keys, 0..) |key, i| {
@@ -1224,6 +1243,32 @@ pub const DocStore = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !void {
         if (!(try self.hasReplayEntries())) return error.ReplayIndexUnavailable;
+        _ = try self.forEachReplayLaneFrom(kind_ordinal, from_sequence, 0, ctx, callback);
+    }
+
+    pub fn forEachReplayLaneFrom(
+        self: *DocStore,
+        kind_ordinal: u8,
+        from_sequence: u64,
+        max_entries: usize,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
+    ) !ReplayIterationStats {
+        if (!(try self.hasReplayEntries())) return error.ReplayIndexUnavailable;
+
+        switch (self.kind) {
+            .runtime => {
+                const lane_stats = try self.runtime_store.forEachReplayLaneFrom(kind_ordinal, from_sequence, max_entries, ctx, callback);
+                return .{
+                    .scanned_entries = lane_stats.scanned_entries,
+                    .matched_entries = lane_stats.matched_entries,
+                    .last_sequence = lane_stats.last_sequence,
+                    .scan_batches = lane_stats.scan_batches,
+                    .fallback_used = lane_stats.fallback_used,
+                };
+            },
+            .lmdb => {},
+        }
 
         var txn = try self.beginCurrentScanTxn();
         defer txn.abort();
@@ -1235,12 +1280,18 @@ pub const DocStore = struct {
         const upper = internal_keys.replayRangeUpper(kind_ordinal);
         cur.setUpperBound(upper[0..]);
 
+        var stats = ReplayIterationStats{ .scan_batches = 1 };
         var entry = try cur.seekAtOrAfter(lower[0..]);
         while (entry) |kv| : (entry = try cur.next()) {
             if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
             const sequence = internal_keys.parseReplayEntrySequence(kv.key, kind_ordinal) orelse break;
             try callback(ctx, sequence, kv.value);
+            stats.scanned_entries += 1;
+            stats.matched_entries += 1;
+            stats.last_sequence = sequence;
+            if (max_entries != 0 and stats.matched_entries >= max_entries) break;
         }
+        return stats;
     }
 
     pub fn iterateReplayEntriesFromHint(
@@ -1269,6 +1320,51 @@ pub const DocStore = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !void {
         return try self.forEachReplayEntryFromOrdinal(from_sequence, internal_keys.replay_all_kind, ctx, callback);
+    }
+
+    pub fn forEachReplayFromMatchingHintMask(
+        self: *DocStore,
+        from_sequence: u64,
+        required_hint_mask: u8,
+        callback_ctx: *anyopaque,
+        callback: backend_erased.Store.ReplayCallback,
+    ) !void {
+        var stats = ReplayIterationStats{};
+        return try self.forEachReplayFromMatchingHintMaskWithStats(from_sequence, required_hint_mask, callback_ctx, callback, &stats);
+    }
+
+    pub fn forEachReplayFromMatchingHintMaskWithStats(
+        self: *DocStore,
+        from_sequence: u64,
+        required_hint_mask: u8,
+        callback_ctx: *anyopaque,
+        callback: backend_erased.Store.ReplayCallback,
+        stats: *ReplayIterationStats,
+    ) !void {
+        const Context = struct {
+            callback_ctx: *anyopaque,
+            callback: backend_erased.Store.ReplayCallback,
+
+            fn pass(self_ctx: *@This(), sequence: u64, payload: []const u8) !void {
+                try self_ctx.callback(self_ctx.callback_ctx, sequence, payload);
+            }
+        };
+
+        var ctx = Context{
+            .callback_ctx = callback_ctx,
+            .callback = callback,
+        };
+        const lane_stats = if (required_hint_mask == 0)
+            try self.forEachReplayLaneFrom(internal_keys.replay_all_kind, from_sequence, 0, &ctx, Context.pass)
+        else if (replayHintFromSingleMask(required_hint_mask)) |hint|
+            try self.forEachReplayLaneFrom(replayHintOrdinal(hint), from_sequence, 0, &ctx, Context.pass)
+        else
+            return error.Unsupported;
+        stats.scanned_entries += lane_stats.scanned_entries;
+        stats.matched_entries += lane_stats.matched_entries;
+        stats.last_sequence = lane_stats.last_sequence;
+        stats.scan_batches += lane_stats.scan_batches;
+        stats.fallback_used = lane_stats.fallback_used;
     }
 
     pub fn forEachReplayFromMatchingHint(
@@ -2659,10 +2755,30 @@ test "docstore runtime lsm hint replay iteration does not clone mutable snapshot
             try std.testing.expect(entry_payload.len > 0);
             self.seen += 1;
         }
+
+        fn handleErased(ptr: *anyopaque, sequence: u64, entry_payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.handle(sequence, entry_payload);
+        }
     };
     var ctx = Context{};
     try store.forEachReplayEntryFromHint(1, .full_text, &ctx, Context.handle);
     try std.testing.expectEqual(@as(usize, 1), ctx.seen);
+
+    var erased_ctx = Context{};
+    var replay_stats = ReplayIterationStats{};
+    try store.forEachReplayFromMatchingHintMaskWithStats(
+        1,
+        change_journal_mod.singleHintMask(.full_text),
+        &erased_ctx,
+        Context.handleErased,
+        &replay_stats,
+    );
+    try std.testing.expectEqual(@as(usize, 1), erased_ctx.seen);
+    try std.testing.expectEqual(@as(usize, 1), replay_stats.scan_batches);
+    try std.testing.expectEqual(@as(usize, 1), replay_stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 1), replay_stats.matched_entries);
+    try std.testing.expectEqual(@as(usize, 0), replay_stats.hint_filter_skips);
     try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().mutable_snapshot_clone_calls);
 }
 

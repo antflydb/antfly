@@ -34,6 +34,7 @@ pub const Kind = enum {
     run_table_raw,
     run_table_index,
     run_table_block,
+    run_table_physical_block,
 };
 
 pub const KindStats = struct {
@@ -43,6 +44,7 @@ pub const KindStats = struct {
     evictions: u64 = 0,
     invalidations: u64 = 0,
     waits: u64 = 0,
+    used_bytes: usize = 0,
 };
 
 pub const Stats = struct {
@@ -52,6 +54,7 @@ pub const Stats = struct {
     run_table_raw: KindStats = .{},
     run_table_index: KindStats = .{},
     run_table_block: KindStats = .{},
+    run_table_physical_block: KindStats = .{},
 };
 
 pub const Cache = struct {
@@ -121,6 +124,7 @@ pub const Cache = struct {
         run_table_raw: []u8,
         run_table_index: TableIndex,
         run_table_block: []u8,
+        run_table_physical_block: []u8,
 
         fn deinit(self: *Value, allocator: Allocator) void {
             switch (self.*) {
@@ -128,6 +132,7 @@ pub const Cache = struct {
                 .run_table_raw => |raw| allocator.free(raw),
                 .run_table_index => |*index| index.deinit(allocator),
                 .run_table_block => |raw| allocator.free(raw),
+                .run_table_physical_block => |raw| allocator.free(raw),
             }
             self.* = undefined;
         }
@@ -169,6 +174,7 @@ pub const Cache = struct {
         run_table_raw: AtomicKindStats = .{},
         run_table_index: AtomicKindStats = .{},
         run_table_block: AtomicKindStats = .{},
+        run_table_physical_block: AtomicKindStats = .{},
 
         fn byKind(self: *AtomicStats, kind: Kind) *AtomicKindStats {
             return switch (kind) {
@@ -176,17 +182,29 @@ pub const Cache = struct {
                 .run_table_raw => &self.run_table_raw,
                 .run_table_index => &self.run_table_index,
                 .run_table_block => &self.run_table_block,
+                .run_table_physical_block => &self.run_table_physical_block,
             };
         }
 
-        fn snapshot(self: *const AtomicStats, used_bytes: usize, entry_count: usize) Stats {
+        fn snapshot(self: *const AtomicStats, used_bytes: usize, entry_count: usize, kind_bytes: [@typeInfo(Kind).@"enum".fields.len]usize) Stats {
+            var run_state = self.run_state.snapshot();
+            var run_table_raw = self.run_table_raw.snapshot();
+            var run_table_index = self.run_table_index.snapshot();
+            var run_table_block = self.run_table_block.snapshot();
+            var run_table_physical_block = self.run_table_physical_block.snapshot();
+            run_state.used_bytes = kind_bytes[@intFromEnum(Kind.run_state)];
+            run_table_raw.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_raw)];
+            run_table_index.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_index)];
+            run_table_block.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_block)];
+            run_table_physical_block.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_physical_block)];
             return .{
                 .used_bytes = used_bytes,
                 .entry_count = entry_count,
-                .run_state = self.run_state.snapshot(),
-                .run_table_raw = self.run_table_raw.snapshot(),
-                .run_table_index = self.run_table_index.snapshot(),
-                .run_table_block = self.run_table_block.snapshot(),
+                .run_state = run_state,
+                .run_table_raw = run_table_raw,
+                .run_table_index = run_table_index,
+                .run_table_block = run_table_block,
+                .run_table_physical_block = run_table_physical_block,
             };
         }
     };
@@ -196,6 +214,13 @@ pub const Cache = struct {
     shards: []Shard,
     used_bytes: std.atomic.Value(usize) = .init(0),
     entry_count: std.atomic.Value(usize) = .init(0),
+    kind_bytes: [@typeInfo(Kind).@"enum".fields.len]std.atomic.Value(usize) = .{
+        .init(0),
+        .init(0),
+        .init(0),
+        .init(0),
+        .init(0),
+    },
     access_clock: CounterU64 = .init(0),
     evict_cursor: std.atomic.Value(usize) = .init(0),
     pressure_target_bytes: std.atomic.Value(usize) = .init(0),
@@ -248,7 +273,9 @@ pub const Cache = struct {
     }
 
     pub fn snapshotStats(self: *const Cache) Stats {
-        return self.stats.snapshot(self.currentBytes(), self.entryCount());
+        var by_kind: [@typeInfo(Kind).@"enum".fields.len]usize = undefined;
+        inline for (0..by_kind.len) |i| by_kind[i] = self.kind_bytes[i].load(.monotonic);
+        return self.stats.snapshot(self.currentBytes(), self.entryCount(), by_kind);
     }
 
     pub fn valueAllocator(self: *const Cache) Allocator {
@@ -269,6 +296,10 @@ pub const Cache = struct {
 
     pub fn retainRunTableBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32) ?Handle {
         return self.retainWithBlock(path, run_id, generation, .run_table_block, block_offset, block_len);
+    }
+
+    pub fn retainRunTablePhysicalBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32) ?Handle {
+        return self.retainWithBlock(path, run_id, generation, .run_table_physical_block, block_offset, block_len);
     }
 
     pub fn putRunState(self: *Cache, path: []const u8, run_id: u64, generation: u64, state: State) !Handle {
@@ -299,6 +330,19 @@ pub const Cache = struct {
             run_id,
             generation,
             .{ .run_table_block = block },
+            estimateTableBlockCost(path, block),
+            block_offset,
+            block_len,
+        );
+    }
+
+    pub fn putRunTablePhysicalBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8) !Handle {
+        errdefer self.allocator.free(block);
+        return try self.putWithBlock(
+            path,
+            run_id,
+            generation,
+            .{ .run_table_physical_block = block },
             estimateTableBlockCost(path, block),
             block_offset,
             block_len,
@@ -431,6 +475,17 @@ pub const Cache = struct {
         return null;
     }
 
+    fn retainEntry(self: *Cache, entry: *Entry) void {
+        const shard = self.shardForKey(entry.key());
+        const locked = lockAtomic(&shard.mutex);
+        defer if (locked) shard.mutex.unlock();
+
+        std.debug.assert(entry.ref_count > 0);
+        entry.ref_count += 1;
+        entry.last_access = self.nextAccess();
+        self.touchEntryLocked(shard, entry);
+    }
+
     fn put(self: *Cache, path: []const u8, run_id: u64, generation: u64, value: Value, byte_cost: usize) !Handle {
         return try self.putWithBlock(path, run_id, generation, value, byte_cost, 0, 0);
     }
@@ -493,6 +548,7 @@ pub const Cache = struct {
         gop.value_ptr.* = entry;
         self.linkEntryLocked(shard, entry);
         _ = self.used_bytes.fetchAdd(byte_cost, .monotonic);
+        _ = self.kind_bytes[@intFromEnum(kind)].fetchAdd(byte_cost, .monotonic);
         _ = self.entry_count.fetchAdd(1, .monotonic);
         self.bumpInsert(kind);
         if (locked) shard.mutex.unlock();
@@ -583,6 +639,7 @@ pub const Cache = struct {
         std.debug.assert(entry.ref_count == 0);
         self.unlinkEntryLocked(shard, entry);
         _ = self.used_bytes.fetchSub(entry.byte_cost, .monotonic);
+        _ = self.kind_bytes[@intFromEnum(entry.kind)].fetchSub(entry.byte_cost, .monotonic);
         _ = self.entry_count.fetchSub(1, .monotonic);
         self.bumpEviction(entry.kind);
         entry.deinit(self.allocator);
@@ -740,6 +797,15 @@ pub const Handle = struct {
     entry: *Cache.Entry,
     kind: Kind,
 
+    pub fn retain(self: *const Handle) Handle {
+        self.cache.retainEntry(self.entry);
+        return .{
+            .cache = self.cache,
+            .entry = self.entry,
+            .kind = self.kind,
+        };
+    }
+
     pub fn release(self: *Handle) void {
         self.cache.release(self.entry);
         self.* = undefined;
@@ -763,6 +829,11 @@ pub const Handle = struct {
     pub fn runTableBlock(self: *const Handle) []const u8 {
         std.debug.assert(self.kind == .run_table_block);
         return self.entry.value.run_table_block;
+    }
+
+    pub fn runTablePhysicalBlock(self: *const Handle) []const u8 {
+        std.debug.assert(self.kind == .run_table_physical_block);
+        return self.entry.value.run_table_physical_block;
     }
 };
 
@@ -815,7 +886,8 @@ fn hashKey(path: []const u8, run_id: u64, generation: u64, kind: Kind, block_off
 fn evictionPriority(kind: Kind) u8 {
     return switch (kind) {
         .run_table_raw => 0,
-        .run_table_block => 1,
+        .run_table_block => 0,
+        .run_table_physical_block => 1,
         .run_state => 2,
         .run_table_index => 3,
     };

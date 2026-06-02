@@ -96,6 +96,7 @@ pub const BatchMode = enum {
 
 pub const BatchOptions = struct {
     mode: BatchMode = .default,
+    defer_commit_flush: bool = false,
 };
 
 pub const BulkIngestFinishOptions = struct {
@@ -182,6 +183,14 @@ pub const ReplayEntry = struct {
         alloc.free(self.payload);
         self.* = undefined;
     }
+};
+
+pub const ReplayLaneIterationStats = struct {
+    scanned_entries: usize = 0,
+    matched_entries: usize = 0,
+    last_sequence: u64 = 0,
+    scan_batches: usize = 0,
+    fallback_used: bool = false,
 };
 
 test "default backend capabilities assume ordered single-writer snapshots" {

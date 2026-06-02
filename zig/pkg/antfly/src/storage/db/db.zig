@@ -171,6 +171,8 @@ pub const ReplayProgress = struct {
     target_sequence: u64 = 0,
     scanned_entries: u64 = 0,
     applied_entries: u64 = 0,
+    replay_scan_batches: u64 = 0,
+    replay_hint_filter_skips: u64 = 0,
     active: bool = false,
 };
 
@@ -456,6 +458,8 @@ const DenseCatchUpContentionStats = struct {
     current_target_sequence: AtomicU64 = .init(0),
     current_scanned_entries: AtomicU64 = .init(0),
     current_applied_entries: AtomicU64 = .init(0),
+    replay_scan_batches: AtomicU64 = .init(0),
+    replay_hint_filter_skips: AtomicU64 = .init(0),
     progress_updates: AtomicU64 = .init(0),
     bulk_finish_windows: AtomicU64 = .init(0),
     bulk_finish_split_steps: AtomicU64 = .init(0),
@@ -488,6 +492,8 @@ const DenseCatchUpContentionStats = struct {
             .current_target_sequence = self.current_target_sequence.load(.monotonic),
             .current_scanned_entries = self.current_scanned_entries.load(.monotonic),
             .current_applied_entries = self.current_applied_entries.load(.monotonic),
+            .replay_scan_batches = self.replay_scan_batches.load(.monotonic),
+            .replay_hint_filter_skips = self.replay_hint_filter_skips.load(.monotonic),
             .progress_updates = self.progress_updates.load(.monotonic),
             .bulk_finish_windows = self.bulk_finish_windows.load(.monotonic),
             .bulk_finish_split_steps = self.bulk_finish_split_steps.load(.monotonic),
@@ -513,6 +519,16 @@ const DenseCatchUpContentionStats = struct {
 };
 
 const StartupOpenStats = struct {
+    wal_retention_known: std.atomic.Value(bool) = .init(false),
+    wal_retained_segments: AtomicU64 = .init(0),
+    wal_retained_bytes: AtomicU64 = .init(0),
+    wal_checkpoint_oldest_retained_segment: AtomicU64 = .init(0),
+    wal_checkpoint_covered_through_segment: AtomicU64 = .init(0),
+    wal_checkpoint_current_segment: AtomicU64 = .init(0),
+    wal_checkpoint_lag_segments: AtomicU64 = .init(0),
+    wal_replay_retained_segments: AtomicU64 = .init(0),
+    wal_replay_retained_bytes: AtomicU64 = .init(0),
+    wal_replay_current_segment: AtomicU64 = .init(0),
     configured_indexes: std.atomic.Value(u32) = .init(0),
     configured_dense_indexes: std.atomic.Value(u32) = .init(0),
     configured_sparse_indexes: std.atomic.Value(u32) = .init(0),
@@ -521,13 +537,37 @@ const StartupOpenStats = struct {
     opened_indexes: std.atomic.Value(u32) = .init(0),
     db_open_ns: AtomicU64 = .init(0),
     load_indexes_ns: AtomicU64 = .init(0),
+    lsm_open_stores: AtomicU64 = .init(0),
+    lsm_open_completed: AtomicU64 = .init(0),
+    lsm_open_failed: AtomicU64 = .init(0),
+    lsm_open_total_ns: AtomicU64 = .init(0),
+    lsm_open_initializing_storage_ns: AtomicU64 = .init(0),
+    lsm_open_manifest_ns: AtomicU64 = .init(0),
+    lsm_open_ensuring_dirs_ns: AtomicU64 = .init(0),
+    lsm_open_wal_replay_ns: AtomicU64 = .init(0),
+    lsm_open_mounting_runs_ns: AtomicU64 = .init(0),
+    lsm_open_loaded_runs: AtomicU64 = .init(0),
+    lsm_open_obsolete_paths: AtomicU64 = .init(0),
+    lsm_open_mutable_entries_after_replay: AtomicU64 = .init(0),
+    lsm_open_immutable_memtables_after_replay: AtomicU64 = .init(0),
     wal_replay_records: AtomicU64 = .init(0),
     wal_replay_entries: AtomicU64 = .init(0),
     wal_replay_bytes: AtomicU64 = .init(0),
     wal_replay_ns: AtomicU64 = .init(0),
+    wal_replay_truncated_tail_bytes: AtomicU64 = .init(0),
 
     fn snapshot(self: *const @This()) types.StartupCatchUpStats {
         return .{
+            .wal_retention_known = self.wal_retention_known.load(.monotonic),
+            .wal_retained_segments = self.wal_retained_segments.load(.monotonic),
+            .wal_retained_bytes = self.wal_retained_bytes.load(.monotonic),
+            .wal_checkpoint_oldest_retained_segment = self.wal_checkpoint_oldest_retained_segment.load(.monotonic),
+            .wal_checkpoint_covered_through_segment = self.wal_checkpoint_covered_through_segment.load(.monotonic),
+            .wal_checkpoint_current_segment = self.wal_checkpoint_current_segment.load(.monotonic),
+            .wal_checkpoint_lag_segments = self.wal_checkpoint_lag_segments.load(.monotonic),
+            .wal_replay_retained_segments = self.wal_replay_retained_segments.load(.monotonic),
+            .wal_replay_retained_bytes = self.wal_replay_retained_bytes.load(.monotonic),
+            .wal_replay_current_segment = self.wal_replay_current_segment.load(.monotonic),
             .configured_indexes = self.configured_indexes.load(.monotonic),
             .configured_dense_indexes = self.configured_dense_indexes.load(.monotonic),
             .configured_sparse_indexes = self.configured_sparse_indexes.load(.monotonic),
@@ -536,10 +576,24 @@ const StartupOpenStats = struct {
             .opened_indexes = self.opened_indexes.load(.monotonic),
             .db_open_ns = self.db_open_ns.load(.monotonic),
             .load_indexes_ns = self.load_indexes_ns.load(.monotonic),
+            .lsm_open_stores = self.lsm_open_stores.load(.monotonic),
+            .lsm_open_completed = self.lsm_open_completed.load(.monotonic),
+            .lsm_open_failed = self.lsm_open_failed.load(.monotonic),
+            .lsm_open_total_ns = self.lsm_open_total_ns.load(.monotonic),
+            .lsm_open_initializing_storage_ns = self.lsm_open_initializing_storage_ns.load(.monotonic),
+            .lsm_open_manifest_ns = self.lsm_open_manifest_ns.load(.monotonic),
+            .lsm_open_ensuring_dirs_ns = self.lsm_open_ensuring_dirs_ns.load(.monotonic),
+            .lsm_open_wal_replay_ns = self.lsm_open_wal_replay_ns.load(.monotonic),
+            .lsm_open_mounting_runs_ns = self.lsm_open_mounting_runs_ns.load(.monotonic),
+            .lsm_open_loaded_runs = self.lsm_open_loaded_runs.load(.monotonic),
+            .lsm_open_obsolete_paths = self.lsm_open_obsolete_paths.load(.monotonic),
+            .lsm_open_mutable_entries_after_replay = self.lsm_open_mutable_entries_after_replay.load(.monotonic),
+            .lsm_open_immutable_memtables_after_replay = self.lsm_open_immutable_memtables_after_replay.load(.monotonic),
             .wal_replay_records = self.wal_replay_records.load(.monotonic),
             .wal_replay_entries = self.wal_replay_entries.load(.monotonic),
             .wal_replay_bytes = self.wal_replay_bytes.load(.monotonic),
             .wal_replay_ns = self.wal_replay_ns.load(.monotonic),
+            .wal_replay_truncated_tail_bytes = self.wal_replay_truncated_tail_bytes.load(.monotonic),
         };
     }
 };
@@ -1506,8 +1560,6 @@ fn logSparseWriteProfileDelta(index_name: []const u8, delta: sparse_mod.WritePro
 
 var temp_path_nonce: u64 = 0;
 var split_replay_artifact_nonce: u64 = 0;
-const small_derived_text_compact_segment_threshold: usize = 6;
-const derived_text_compact_segment_threshold: usize = 128;
 
 fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
     if (builtin.os.tag == .freestanding) return;
@@ -1847,6 +1899,8 @@ fn setDenseCatchUpProgress(ctx: *AsyncContext, progress: ReplayProgress) void {
     ctx.stats.dense_catch_up.current_target_sequence.store(progress.target_sequence, .monotonic);
     ctx.stats.dense_catch_up.current_scanned_entries.store(progress.scanned_entries, .monotonic);
     ctx.stats.dense_catch_up.current_applied_entries.store(progress.applied_entries, .monotonic);
+    ctx.stats.dense_catch_up.replay_scan_batches.store(progress.replay_scan_batches, .monotonic);
+    ctx.stats.dense_catch_up.replay_hint_filter_skips.store(progress.replay_hint_filter_skips, .monotonic);
     _ = ctx.stats.dense_catch_up.progress_updates.fetchAdd(1, .monotonic);
 }
 
@@ -2150,6 +2204,19 @@ fn makeLsmBackgroundExecutor(runtime: *background_runtime_mod.BackendRuntime, ow
     return lsm_backend_mod.BackgroundExecutor.init(runtime, owner_id);
 }
 
+fn installLsmReadRuntime(options: *lsm_backend_mod.Options, runtime: *background_runtime_mod.BackendRuntime) void {
+    if (options.read_runtime != null) return;
+    if (runtime.io()) |io| options.read_runtime = lsm_backend_mod.storage_io.ReadRuntime.init(io);
+}
+
+fn installIndexLsmReadRuntime(index_backends: anytype, runtime: *background_runtime_mod.BackendRuntime) void {
+    installLsmReadRuntime(&index_backends.text_main_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.text_wal_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.dense_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.sparse_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.graph_reverse_lsm_options, runtime);
+}
+
 fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpenOptions) !db_core.OpenedPrimaryStore {
     const zpath = try alloc.dupeZ(u8, path);
     defer alloc.free(zpath);
@@ -2334,17 +2401,20 @@ pub const DB = struct {
                 .lsm => |*lsm_opts| {
                     lsm_opts.cache = opts.lsm_cache orelse lsm_opts.cache;
                     lsm_opts.root_generation = opts.lsm_root_generation;
+                    installLsmReadRuntime(lsm_opts, backend_runtime);
                     primary_lsm_background_executor = makeLsmBackgroundExecutor(backend_runtime, backend_owner_id);
                     lsm_opts.background_executor = &primary_lsm_background_executor;
                 },
                 .lsm_memory => |*lsm_opts| {
                     lsm_opts.cache = opts.lsm_cache orelse lsm_opts.cache;
                     lsm_opts.root_generation = opts.lsm_root_generation;
+                    installLsmReadRuntime(lsm_opts, backend_runtime);
                     primary_lsm_background_executor = makeLsmBackgroundExecutor(backend_runtime, backend_owner_id);
                     lsm_opts.background_executor = &primary_lsm_background_executor;
                 },
                 .lmdb, .mem => {},
             }
+            installIndexLsmReadRuntime(&effective_index_backends, backend_runtime);
             const core_opts: db_config.CoreOpenOptions = .{
                 .map_size = opts.map_size,
                 .no_sync = opts.no_sync,
@@ -3017,21 +3087,41 @@ pub const DB = struct {
         self.async_context.stats.startup.db_open_ns.store(profile.total_ns, .monotonic);
         self.async_context.stats.startup.load_indexes_ns.store(profile.load_indexes_ns, .monotonic);
 
-        var replay_records: u64 = 0;
-        var replay_entries: u64 = 0;
-        var replay_bytes: u64 = 0;
-        var replay_ns: u64 = 0;
-        for (self.core.index_manager.dense_indexes.items) |*entry| {
-            const write_stats = entry.index.snapshotLsmWriteStats() orelse continue;
-            replay_records += write_stats.wal_replay_records;
-            replay_entries += write_stats.wal_replay_entries;
-            replay_bytes += write_stats.wal_replay_bytes;
-            replay_ns += write_stats.wal_replay_ns;
+        var lsm_open_stats = lsm_backend_mod.Backend.OpenStats{};
+        if (self.core.primary_store_owner.snapshotLsmOpenStats()) |primary_open_stats| {
+            lsm_backend_mod.Backend.accumulateOpenStats(&lsm_open_stats, primary_open_stats);
         }
-        self.async_context.stats.startup.wal_replay_records.store(replay_records, .monotonic);
-        self.async_context.stats.startup.wal_replay_entries.store(replay_entries, .monotonic);
-        self.async_context.stats.startup.wal_replay_bytes.store(replay_bytes, .monotonic);
-        self.async_context.stats.startup.wal_replay_ns.store(replay_ns, .monotonic);
+        lsm_backend_mod.Backend.accumulateOpenStats(&lsm_open_stats, self.core.index_manager.snapshotLsmOpenStats());
+        self.async_context.stats.startup.lsm_open_stores.store(lsm_open_stats.started, .monotonic);
+        self.async_context.stats.startup.lsm_open_completed.store(lsm_open_stats.completed, .monotonic);
+        self.async_context.stats.startup.lsm_open_failed.store(lsm_open_stats.failed, .monotonic);
+        self.async_context.stats.startup.lsm_open_total_ns.store(lsm_open_stats.total_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_initializing_storage_ns.store(lsm_open_stats.initializing_storage_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_manifest_ns.store(lsm_open_stats.opening_manifest_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_ensuring_dirs_ns.store(lsm_open_stats.ensuring_dirs_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_wal_replay_ns.store(lsm_open_stats.replaying_wal_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_mounting_runs_ns.store(lsm_open_stats.mounting_runs_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_loaded_runs.store(lsm_open_stats.loaded_runs, .monotonic);
+        self.async_context.stats.startup.lsm_open_obsolete_paths.store(lsm_open_stats.obsolete_paths, .monotonic);
+        self.async_context.stats.startup.lsm_open_mutable_entries_after_replay.store(lsm_open_stats.mutable_entries_after_replay, .monotonic);
+        self.async_context.stats.startup.lsm_open_immutable_memtables_after_replay.store(lsm_open_stats.immutable_memtables_after_replay, .monotonic);
+        self.async_context.stats.startup.wal_replay_records.store(lsm_open_stats.wal_replay_records, .monotonic);
+        self.async_context.stats.startup.wal_replay_entries.store(lsm_open_stats.wal_replay_entries, .monotonic);
+        self.async_context.stats.startup.wal_replay_bytes.store(lsm_open_stats.wal_replay_bytes, .monotonic);
+        self.async_context.stats.startup.wal_replay_ns.store(lsm_open_stats.wal_replay_ns, .monotonic);
+        self.async_context.stats.startup.wal_replay_truncated_tail_bytes.store(lsm_open_stats.wal_replay_truncated_tail_bytes, .monotonic);
+
+        const lsm_maintenance_stats = self.snapshotLsmMaintenanceStatsLocked();
+        self.async_context.stats.startup.wal_retention_known.store(true, .monotonic);
+        self.async_context.stats.startup.wal_retained_segments.store(lsm_maintenance_stats.wal_retained_segments, .monotonic);
+        self.async_context.stats.startup.wal_retained_bytes.store(lsm_maintenance_stats.wal_retained_bytes, .monotonic);
+        self.async_context.stats.startup.wal_checkpoint_oldest_retained_segment.store(lsm_maintenance_stats.wal_checkpoint_oldest_retained_segment, .monotonic);
+        self.async_context.stats.startup.wal_checkpoint_covered_through_segment.store(lsm_maintenance_stats.wal_checkpoint_covered_through_segment, .monotonic);
+        self.async_context.stats.startup.wal_checkpoint_current_segment.store(lsm_maintenance_stats.wal_checkpoint_current_segment, .monotonic);
+        self.async_context.stats.startup.wal_checkpoint_lag_segments.store(lsm_maintenance_stats.wal_checkpoint_lag_segments, .monotonic);
+        self.async_context.stats.startup.wal_replay_retained_segments.store(lsm_maintenance_stats.wal_replay_retained_segments, .monotonic);
+        self.async_context.stats.startup.wal_replay_retained_bytes.store(lsm_maintenance_stats.wal_replay_retained_bytes, .monotonic);
+        self.async_context.stats.startup.wal_replay_current_segment.store(lsm_maintenance_stats.wal_replay_current_segment, .monotonic);
     }
 
     pub fn snapshotLsmMaintenanceStats(self: *DB) lsm_backend_mod.Backend.MaintenanceStats {
@@ -3053,6 +3143,51 @@ pub const DB = struct {
         }
         lsm_backend_mod.Backend.accumulateMaintenanceStats(&maintenance_stats, self.core.index_manager.snapshotLsmMaintenanceStats());
         return maintenance_stats;
+    }
+
+    pub fn snapshotLsmWriteStats(self: *DB) lsm_backend_mod.Backend.WriteStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return self.snapshotLsmWriteStatsLocked();
+    }
+
+    pub fn trySnapshotLsmWriteStats(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.snapshotLsmWriteStatsLocked();
+    }
+
+    fn snapshotLsmWriteStatsLocked(self: *DB) lsm_backend_mod.Backend.WriteStats {
+        var write_stats = lsm_backend_mod.Backend.WriteStats{};
+        if (self.core.primary_store_owner.snapshotLsmWriteStats()) |primary_stats| {
+            lsm_backend_mod.Backend.accumulateWriteStats(&write_stats, primary_stats);
+        }
+        lsm_backend_mod.Backend.accumulateWriteStats(&write_stats, self.core.index_manager.snapshotLsmWriteStats());
+        return write_stats;
+    }
+
+    pub fn snapshotTextMemoryAttributionStats(self: *DB) index_manager_mod.TextMemoryAttributionStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.snapshotTextMemoryAttribution();
+    }
+
+    pub fn trySnapshotTextMemoryAttributionStats(self: *DB) ?index_manager_mod.TextMemoryAttributionStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.snapshotTextMemoryAttribution();
+    }
+
+    pub fn snapshotTextMergeStats(self: *DB) types.TextMergeStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.textMergeStatsSnapshot();
+    }
+
+    pub fn trySnapshotTextMergeStats(self: *DB) ?types.TextMergeStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.textMergeStatsSnapshot();
     }
 
     pub fn snapshotPrimaryLsmWriteStatsForTest(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
@@ -14269,6 +14404,7 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
         }
         saw_entries = saw_entries or stats.scanned_entries > 0;
         if (stats.last_sequence > applied) {
+            try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
             try updates.append(ctx.alloc, .{
                 .index_name = index_ref.name,
                 .sequence = stats.last_sequence,
@@ -14441,6 +14577,8 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
         target_sequence: u64 = 0,
         scanned_entries: u64 = 0,
         applied_entries: u64 = 0,
+        replay_scan_batches: u64 = 0,
+        replay_hint_filter_skips: u64 = 0,
         active: bool = false,
 
         fn publish(state: *@This(), index_name: []const u8) !void {
@@ -14449,6 +14587,8 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
                 .target_sequence = state.target_sequence,
                 .scanned_entries = state.scanned_entries,
                 .applied_entries = state.applied_entries,
+                .replay_scan_batches = state.replay_scan_batches,
+                .replay_hint_filter_skips = state.replay_hint_filter_skips,
                 .active = state.active,
             };
             if (state.track_dense) setDenseCatchUpProgress(state.db.async_context, progress);
@@ -14485,7 +14625,7 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
             const resource_snapshot = if (replay.db.core.index_manager.resource_manager) |manager| manager.snapshot() else null;
 
             std.log.warn(
-                "dense catch-up watchdog index={s} sequence={} target={} scanned={} applied={} delta_applied={} cache_caps={{nodes={},vectors={}}} hbc={{total={},accounted={},vector_used={},metadata_used={}}} rm={{lsm_cache={},hbc_cache={},dense_search={},dense_apply={},replay_window={},full_text_pending={}}} profile={{find_leaf_ns={},mutate_leaf_ns={},store_vector_ns={},quantized_vector_load_ns={}}}",
+                "dense catch-up watchdog index={s} sequence={} target={} scanned={} applied={} delta_applied={} cache_caps={{nodes={},vectors={}}} hbc={{total={},accounted={},vector_used={},metadata_used={}}} rm={{lsm_cache={},hbc_cache={},dense_search={},dense_apply={},replay_window={},full_text_pending={},full_text_build={}}} profile={{find_leaf_ns={},mutate_leaf_ns={},store_vector_ns={},quantized_vector_load_ns={}}}",
                 .{
                     replay.index_name,
                     progress.sequence,
@@ -14505,6 +14645,7 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
                     if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)].used_bytes else 0,
                     if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)].used_bytes else 0,
                     if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)].used_bytes else 0,
                     profile.insert_find_leaf_ns,
                     profile.insert_mutate_leaf_ns,
                     profile.insert_store_vector_ns,
@@ -14518,11 +14659,15 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
             const replay: *@This() = @ptrCast(@alignCast(ctx));
             replay.persist.scanned_entries = progress.scanned_entries;
             replay.persist.applied_entries = progress.applied_entries;
+            replay.persist.replay_scan_batches = progress.replay_scan_batches;
+            replay.persist.replay_hint_filter_skips = progress.replay_hint_filter_skips;
             const snapshot: ReplayProgress = .{
                 .sequence = progress.sequence,
                 .target_sequence = replay.persist.target_sequence,
                 .scanned_entries = progress.scanned_entries,
                 .applied_entries = progress.applied_entries,
+                .replay_scan_batches = progress.replay_scan_batches,
+                .replay_hint_filter_skips = progress.replay_hint_filter_skips,
                 .active = replay.persist.active,
             };
             setDenseCatchUpProgress(replay.db.async_context, snapshot);
@@ -14647,6 +14792,7 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
         saw_entries = saw_entries or stats.scanned_entries > 0;
         if (stats.last_sequence > applied) {
             try self.core.saveAppliedSequence(index_ref.name, stats.last_sequence);
+            try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
         }
     }
     try truncateReplayJournalIfSafe(self);
@@ -14668,17 +14814,6 @@ fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_type
     try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null);
 }
 
-fn derivedTextCompactSegmentThreshold(batch: derived_types.DerivedBatch) usize {
-    const work_items = batch.documents.len + batch.deleted_keys.len + batch.overwritten_doc_keys.len;
-    // Preserve low-latency small-write/full_index behavior without making
-    // large replay or ingest windows compact tiny text segments every few
-    // batches.
-    return if (work_items <= 2)
-        small_derived_text_compact_segment_threshold
-    else
-        derived_text_compact_segment_threshold;
-}
-
 fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, profile: ?*BatchProfile) !void {
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
@@ -14687,7 +14822,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             const apply_start_ns = monotonicTimeNs();
             const text_replay_options: index_manager_mod.IndexBatchOptions = .{
                 .compact_text = false,
-                .compact_text_segment_threshold = derivedTextCompactSegmentThreshold(batch),
+                .compact_text_segment_threshold = null,
                 .defer_text_compaction = true,
             };
             const delete_keys = if (batch.deleted_keys.len == 0)
@@ -16619,6 +16754,7 @@ fn finishDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.
     errdefer resources.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     try resources.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
+    try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
     if (resources.index_manager.resource_manager) |manager| {
         manager.noteDenseReplayWindowResult(.{ .finish_ns = elapsedSince(finish_start_ns) });
     }
@@ -16640,6 +16776,7 @@ fn finishDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manag
     errdefer replay_ctx.batch.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     try replay_ctx.batch.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
+    try replay_ctx.batch.index_manager.checkpointLsmWalForManagedIndex(index_ref);
     if (replay_ctx.batch.index_manager.resource_manager) |manager| {
         manager.noteDenseReplayWindowResult(.{ .finish_ns = elapsedSince(finish_start_ns) });
     }
@@ -17558,6 +17695,7 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     if (!published_visibility) {
         if (ctx.query_visibility_hook) |hook| hook.notify(.publish_consistent);
     }
+    try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
     finishDenseCatchUpSessionTracked(ctx, index_ref.name);
     const after_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
     const finish_ns = elapsedSince(finish_start_ns);
@@ -32703,7 +32841,7 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
         .config_json = "{}",
     });
 
-    for (0..6) |i| {
+    for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
         const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"doc {d}\",\"body\":\"common token {d}\"}}", .{ i, i });
@@ -32721,16 +32859,16 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
     try db.runUntilIdle();
 
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
-    try std.testing.expect(text_index.snapshot().segments.len < 6);
+    try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
 
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
         .query = .{ .match = .{ .field = "body", .text = "common" } },
-        .limit = 10,
+        .limit = 20,
     });
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(u32, 6), result.total_hits);
+    try std.testing.expectEqual(@as(u32, 12), result.total_hits);
 }
 
 test "db runUntilIdle drains scheduled text merges without index workers" {
@@ -32822,7 +32960,7 @@ test "db full_text sync does not require draining scheduled text merges" {
     try std.testing.expect(after.pending_segments <= before.pending_segments);
 }
 
-test "db force compacts text index to one searchable segment" {
+test "db force compacts text index to searchable merge tier" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -32858,7 +32996,7 @@ test "db force compacts text index to one searchable segment" {
     try db.forceCompactTextIndexes();
 
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
-    try std.testing.expectEqual(@as(usize, 1), text_index.snapshot().segments.len);
+    try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
 
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -32924,7 +33062,7 @@ test "db text compaction preserves ordinal filters across reopen" {
         try db.forceCompactTextIndexes();
 
         const text_index = db.core.index_manager.textIndex("ft_v1").?;
-        try std.testing.expectEqual(@as(usize, 1), text_index.snapshot().segments.len);
+        try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
 
         var result = try db.search(alloc, .{
             .index_name = "ft_v1",
@@ -32963,7 +33101,7 @@ test "db text compaction preserves ordinal filters across reopen" {
         defer filter.deinit(alloc);
 
         const text_index = reopened.core.index_manager.textIndex("ft_v1").?;
-        try std.testing.expectEqual(@as(usize, 1), text_index.snapshot().segments.len);
+        try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
 
         var result = try reopened.search(alloc, .{
             .index_name = "ft_v1",
@@ -33018,7 +33156,7 @@ test "db best effort force compact leaves text merge debt under pressure" {
         .config_json = "{}",
     });
 
-    for (0..6) |i| {
+    for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
         const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
@@ -33041,11 +33179,11 @@ test "db best effort force compact leaves text merge debt under pressure" {
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
         .query = .{ .match = .{ .field = "body", .text = "common" } },
-        .limit = 10,
+        .limit = 20,
     });
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(u32, 6), result.total_hits);
+    try std.testing.expectEqual(@as(u32, 12), result.total_hits);
 }
 
 test "db runUntilIdle defers full text merge pressure without failing" {
@@ -33082,7 +33220,7 @@ test "db runUntilIdle defers full text merge pressure without failing" {
         .config_json = "{}",
     });
 
-    for (0..6) |i| {
+    for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
         const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
@@ -36430,7 +36568,7 @@ test "db bulk ingest full_text sync defers text merge work until finish" {
     try db.beginBulkIngestSession();
     errdefer db.abortBulkIngestSession();
 
-    for (0..6) |i| {
+    for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
         const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
@@ -38680,10 +38818,14 @@ test "db merge-style cutover preserves text sparse and graph indexes across reop
 }
 
 fn cacheBlockHitsForBench(stats: anytype) u64 {
+    var hits: u64 = 0;
     if (@hasField(@TypeOf(stats), "run_table_block")) {
-        return stats.run_table_block.hits;
+        hits += stats.run_table_block.hits;
     }
-    return 0;
+    if (@hasField(@TypeOf(stats), "run_table_physical_block")) {
+        hits += stats.run_table_physical_block.hits;
+    }
+    return hits;
 }
 
 fn normalizedBenchSearchEffort(effort: ?f32) f32 {

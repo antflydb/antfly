@@ -17,12 +17,14 @@ const Allocator = std.mem.Allocator;
 const bloom = @import("bloom");
 const lsm_manifest = @import("../lsm/manifest.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 const state_mod = @import("state.zig");
 const storage_io = @import("storage_io.zig");
 
 const max_run_file_read_bytes = 512 * 1024 * 1024;
 const max_manifest_read_bytes = 128 * 1024 * 1024;
 const table_write_buffer_size = 256 * 1024;
+const table_builder_accounting_step_bytes: u64 = 64 * 1024;
 
 pub fn maxRunFileReadBytes() usize {
     return max_run_file_read_bytes;
@@ -164,6 +166,45 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
     return out;
 }
 
+pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
+    const smallest_namespace_name = if (source.smallest_namespace_name) |name| try allocator.dupe(u8, name) else null;
+    errdefer if (smallest_namespace_name) |name| allocator.free(name);
+    const smallest_key = try allocator.dupe(u8, source.smallest_key);
+    errdefer allocator.free(smallest_key);
+    const largest_namespace_name = if (source.largest_namespace_name) |name| try allocator.dupe(u8, name) else null;
+    errdefer if (largest_namespace_name) |name| allocator.free(name);
+    const largest_key = try allocator.dupe(u8, source.largest_key);
+    errdefer allocator.free(largest_key);
+
+    var out = Run{
+        .id = source.id,
+        .level = source.level,
+        .size_bytes = source.size_bytes,
+        .compression_stats = source.compression_stats,
+        .path = if (source.path) |path| try allocator.dupe(u8, path) else null,
+        .smallest_namespace_name = smallest_namespace_name,
+        .smallest_key = smallest_key,
+        .largest_namespace_name = largest_namespace_name,
+        .largest_key = largest_key,
+        .entry_count = source.entry_count,
+        .bloom_filter = null,
+        .encoded_bloom_filter = null,
+        .owns_bloom_filter = false,
+        .cached_state_index = null,
+        .cached_index_index = null,
+        .cached_table_index = null,
+        .table_index = null,
+        .state = null,
+    };
+    errdefer out.deinit(allocator);
+
+    if (source.path == null) {
+        const state = source.state orelse return error.RunStateUnavailable;
+        out.state = try state.clone(allocator);
+    }
+    return out;
+}
+
 pub fn ensureOpenDirs(root_dir: []const u8) !void {
     var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
     defer native.deinit();
@@ -253,27 +294,67 @@ pub fn persistRunFile(allocator: Allocator, root_dir: []const u8, run: *Run) ![]
     return try persistRunFileWithStorage(native.storage(), allocator, root_dir, run, .snappy_adaptive);
 }
 
-pub fn persistRunFileWithStorage(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, run: *Run, compression_policy: lsm_table_file.CompressionPolicy) ![]u8 {
-    try ensureOpenDirsWithStorage(storage, root_dir);
-    const run_path = try runPath(allocator, root_dir, run.id);
-    errdefer allocator.free(run_path);
+pub fn persistRunFileWithStorage(
+    storage: storage_io.Storage,
+    allocator: Allocator,
+    root_dir: []const u8,
+    run: *Run,
+    compression_policy: lsm_table_file.CompressionPolicy,
+) ![]u8 {
+    return try persistRunFileWithStorageAccounted(storage, allocator, root_dir, run, compression_policy, null);
+}
 
+pub fn persistRunFileWithStorageAccounted(
+    storage: storage_io.Storage,
+    allocator: Allocator,
+    root_dir: []const u8,
+    run: *Run,
+    compression_policy: lsm_table_file.CompressionPolicy,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+) ![]u8 {
     const state = run.state orelse return error.RunStateUnavailable;
-    var table_entries = try allocator.alloc(lsm_table_file.Entry, state.entries.items.len);
-    defer allocator.free(table_entries);
-    for (state.entries.items, 0..) |entry, i| {
-        table_entries[i] = .{
+    var writer: StreamingRunFileWriter = undefined;
+    try writer.initInPlace(
+        storage,
+        allocator,
+        root_dir,
+        run.id,
+        state.entries.items.len,
+        lsm_table_file.default_filter_config,
+        compression_policy,
+        resource_manager,
+    );
+    var writer_active = true;
+    errdefer if (writer_active) writer.deinit();
+
+    for (state.entries.items) |entry| {
+        try writer.appendEntry(.{
             .namespace_name = entry.namespace_name,
             .key = entry.key,
             .value = entry.value,
             .tombstone = entry.tombstone,
-        };
+        });
     }
 
-    const written = try writeTableFileAtomically(storage, allocator, run_path, table_entries, try run.ensureBloomFilter(allocator), compression_policy);
-    run.size_bytes = written.size_bytes;
-    run.compression_stats = written.compression_stats;
-    return run_path;
+    var persisted = try writer.finish();
+    writer_active = false;
+    errdefer {
+        allocator.free(persisted.path);
+        persisted.filter.deinit(allocator);
+    }
+
+    if (run.owns_bloom_filter) {
+        if (run.bloom_filter) |*filter| filter.deinit(allocator);
+    }
+    if (run.owns_metadata) {
+        if (run.encoded_bloom_filter) |encoded| allocator.free(encoded);
+    }
+    run.size_bytes = persisted.size_bytes;
+    run.compression_stats = persisted.compression_stats;
+    run.bloom_filter = persisted.filter;
+    run.owns_bloom_filter = true;
+    run.encoded_bloom_filter = null;
+    return persisted.path;
 }
 
 pub fn persistTableEntriesAsRunFile(
@@ -519,50 +600,7 @@ pub fn loadRunTableIndexAllocWithStorage(
             return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
         }
     }
-
-    const header_bytes = try storage.readFileRangeAlloc(allocator, path, 0, lsm_table_file.magic.len + 12);
-    defer allocator.free(header_bytes);
-
-    var cursor: usize = 0;
-    const header = try lsm_table_file.decodeHeader(header_bytes, &cursor);
-    if (header.version != 3) {
-        const raw_table = storage.readFileAlloc(allocator, path, max_run_file_read_bytes) catch |err| {
-            logReadFileFailure(storage, path, max_run_file_read_bytes, "loadRunTableIndexAllocWithStorage.legacy", err);
-            return err;
-        };
-        defer allocator.free(raw_table);
-        return try lsm_table_file.decodeIndexAlloc(allocator, raw_table);
-    }
-
-    const offsets_offset: u64 = @intCast(header.entry_offsets_start);
-    const offsets_len = header.entry_count * @sizeOf(u32);
-    const offsets_bytes = try storage.readFileRangeAlloc(allocator, path, offsets_offset, offsets_len);
-    defer allocator.free(offsets_bytes);
-
-    const offsets = try allocator.alloc(u32, header.entry_count);
-    errdefer allocator.free(offsets);
-    for (offsets, 0..) |*offset, i| {
-        const start = i * @sizeOf(u32);
-        offset.* = std.mem.readInt(u32, std.mem.bytesAsValue([4]u8, offsets_bytes[start .. start + @sizeOf(u32)]), .little);
-    }
-
-    const bloom_len_offset = header.entry_data_start + header.entry_data_len;
-    const file_size = try storage.fileSize(path);
-    const bloom_bytes_offset = bloom_len_offset + @sizeOf(u32);
-    if (file_size < bloom_bytes_offset) return error.InvalidTableFile;
-    const bloom_len: usize = @intCast(file_size - bloom_bytes_offset);
-    const encoded_filter = try storage.readFileRangeAlloc(allocator, path, bloom_bytes_offset, bloom_len);
-    defer allocator.free(encoded_filter);
-
-    var filter = try bloom.OwnedFilter.decodeAlloc(allocator, encoded_filter);
-    errdefer filter.deinit(allocator);
-
-    return .{
-        .entry_offsets = offsets,
-        .entry_data_start = header.entry_data_start,
-        .entry_data_len = header.entry_data_len,
-        .filter = filter,
-    };
+    return error.UnsupportedVersion;
 }
 
 pub fn deleteFileAbsolute(path: []const u8) !void {
@@ -846,6 +884,9 @@ pub const StreamingRunFileWriter = struct {
     sink: lsm_table_file.TableSink = undefined,
     encoder: lsm_table_file.StreamingEncoder = undefined,
     encoder_active: bool = false,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    tracked_builder_bytes: u64 = 0,
+    last_reported_builder_bytes: u64 = 0,
 
     pub fn initInPlace(
         self: *StreamingRunFileWriter,
@@ -856,8 +897,9 @@ pub const StreamingRunFileWriter = struct {
         expected_entries: usize,
         bloom_config: bloom.Config,
         compression_policy: lsm_table_file.CompressionPolicy,
+        resource_manager: ?*resource_manager_mod.ResourceManager,
     ) !void {
-        self.* = .{ .allocator = allocator };
+        self.* = .{ .allocator = allocator, .resource_manager = resource_manager };
         try ensureOpenDirsWithStorage(storage, root_dir);
         self.path = try runPath(allocator, root_dir, run_id);
         errdefer {
@@ -885,9 +927,11 @@ pub const StreamingRunFileWriter = struct {
             .bloom_config = bloom_config,
         });
         self.encoder_active = true;
+        self.observeBuilderWorkingSet(true);
     }
 
     pub fn deinit(self: *StreamingRunFileWriter) void {
+        self.releaseBuilderWorkingSet();
         if (self.encoder_active) {
             self.encoder.deinit();
             self.encoder_active = false;
@@ -909,18 +953,23 @@ pub const StreamingRunFileWriter = struct {
 
     pub fn appendEntry(self: *StreamingRunFileWriter, entry: lsm_table_file.Entry) !void {
         try self.encoder.appendEntry(entry);
+        self.observeBuilderWorkingSet(false);
     }
 
     pub fn finish(self: *StreamingRunFileWriter) !PersistedStreamingRunFile {
+        self.observeBuilderWorkingSet(true);
         var encoded = try self.encoder.finish();
         errdefer encoded.filter.deinit(self.allocator);
+        self.observeBuilderWorkingSet(true);
         self.encoder_active = false;
         self.encoder.deinit();
+        self.observeBuilderWorkingSet(true);
         try self.adapter.flush();
         self.writer_active = false;
         try self.writer.finish();
         self.adapter.deinit();
         self.adapter_active = false;
+        self.releaseBuilderWorkingSet();
 
         const path = self.path;
         self.path = &.{};
@@ -932,9 +981,107 @@ pub const StreamingRunFileWriter = struct {
             .filter = encoded.filter,
         };
     }
+
+    fn observeBuilderWorkingSet(self: *StreamingRunFileWriter, force: bool) void {
+        if (self.resource_manager == null) return;
+        const next = self.builderWorkingSetBytes();
+        const grew_enough = next >= self.last_reported_builder_bytes +| table_builder_accounting_step_bytes;
+        const shrank_enough = self.last_reported_builder_bytes >= next +| table_builder_accounting_step_bytes;
+        if (!force and !grew_enough and !shrank_enough) return;
+        self.observeTrackedBuilderBytes(next);
+        self.last_reported_builder_bytes = next;
+    }
+
+    fn builderWorkingSetBytes(self: *const StreamingRunFileWriter) u64 {
+        var bytes: u64 = 0;
+        if (self.adapter_active) bytes +|= self.adapter.buffer.len;
+        if (self.encoder_active) bytes +|= self.encoder.workingSetBytes();
+        return bytes;
+    }
+
+    fn releaseBuilderWorkingSet(self: *StreamingRunFileWriter) void {
+        self.observeTrackedBuilderBytes(0);
+        self.last_reported_builder_bytes = 0;
+    }
+
+    fn observeTrackedBuilderBytes(self: *StreamingRunFileWriter, next: u64) void {
+        const manager = self.resource_manager orelse return;
+        manager.observeUsage(.lsm_table_builder_working_set, &self.tracked_builder_bytes, next);
+    }
 };
 
 const WrittenTableFile = struct {
     size_bytes: u64,
     compression_stats: lsm_table_file.CompressionStats,
 };
+
+test "repository streams state run publication through table builder accounting" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+
+    var value: [512]u8 = undefined;
+    @memset(&value, 'v');
+
+    var state: state_mod.State = .{};
+    errdefer state.deinit(allocator);
+    try state.entries.ensureTotalCapacity(allocator, 64);
+    for (0..64) |i| {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>4}", .{i});
+        state.entries.appendAssumeCapacity(try state_mod.initEntry(
+            allocator,
+            .{ .name = "docs" },
+            key,
+            &value,
+            false,
+        ));
+    }
+
+    var run = Run{
+        .id = 1,
+        .level = 0,
+        .size_bytes = 0,
+        .path = null,
+        .smallest_namespace_name = @constCast("docs"),
+        .smallest_key = @constCast("doc:0000"),
+        .largest_namespace_name = @constCast("docs"),
+        .largest_key = @constCast("doc:0063"),
+        .entry_count = 64,
+        .bloom_filter = null,
+        .encoded_bloom_filter = null,
+        .owns_metadata = false,
+        .owns_bloom_filter = true,
+        .state = state,
+    };
+    state = .{};
+    defer {
+        if (run.path) |path| {
+            allocator.free(path);
+            run.path = null;
+        }
+        run.deinit(allocator);
+    }
+
+    run.path = try persistRunFileWithStorageAccounted(
+        storage.storage(),
+        allocator,
+        "/repository-stream-state-run",
+        &run,
+        .snappy_adaptive,
+        &manager,
+    );
+
+    const builder_stats = manager.sliceStats(.lsm_table_builder_working_set);
+    const compaction_work_stats = manager.sliceStats(.lsm_compaction_work);
+    try std.testing.expectEqual(@as(u64, 0), builder_stats.used_bytes);
+    try std.testing.expect(builder_stats.peak_bytes >= table_write_buffer_size);
+    try std.testing.expectEqual(@as(u64, 0), compaction_work_stats.peak_bytes);
+    try std.testing.expect(run.size_bytes > 0);
+    try std.testing.expect(run.bloom_filter != null);
+
+    var loaded = try loadRunStateAllocWithStorage(storage.storage(), allocator, run.path.?);
+    defer loaded.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 64), loaded.entries.items.len);
+}

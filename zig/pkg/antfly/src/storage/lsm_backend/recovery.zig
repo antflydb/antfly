@@ -24,6 +24,31 @@ fn openDebugLogsEnabled() bool {
     return std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
 }
 
+fn beginOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype) u64 {
+    if (@hasDecl(BackendType, "beginOpenPhase")) return backend.beginOpenPhase(phase);
+    return 0;
+}
+
+fn finishOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype, start_ns: u64) void {
+    if (@hasDecl(BackendType, "finishOpenPhase")) backend.finishOpenPhase(phase, start_ns);
+}
+
+fn recordOpenManifestLoaded(comptime BackendType: type, backend: *BackendType, loaded_manifest: bool) void {
+    if (@hasDecl(BackendType, "recordOpenManifestLoaded")) backend.recordOpenManifestLoaded(loaded_manifest);
+}
+
+fn recordOpenReplayComplete(comptime BackendType: type, backend: *BackendType) void {
+    if (@hasDecl(BackendType, "recordOpenReplayComplete")) backend.recordOpenReplayComplete();
+}
+
+fn finishOpenSuccess(comptime BackendType: type, backend: *BackendType) void {
+    if (@hasDecl(BackendType, "finishOpenSuccess")) backend.finishOpenSuccess();
+}
+
+fn finishOpenFailure(comptime BackendType: type, backend: *BackendType) void {
+    if (@hasDecl(BackendType, "finishOpenFailure")) backend.finishOpenFailure();
+}
+
 pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !BackendType {
     var backend: BackendType = undefined;
     try openInto(BackendType, &backend, allocator, root_dir, options, backend_options);
@@ -51,26 +76,36 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         );
     }
 
-    if (backend_options.storage) |storage| {
-        backend.storage = storage;
-    } else {
-        const owned = try std.heap.page_allocator.create(storage_io.NativeStorage);
-        errdefer std.heap.page_allocator.destroy(owned);
-        owned.* = try storage_io.NativeStorage.init(std.heap.page_allocator, backend_options.io_runtime);
-        backend.storage_owner = owned;
-        backend.storage = owned.storage();
+    {
+        const phase_start = beginOpenPhase(BackendType, backend, .initializing_storage);
+        defer finishOpenPhase(BackendType, backend, .initializing_storage, phase_start);
+        if (backend_options.storage) |storage| {
+            backend.storage = storage;
+        } else {
+            const owned = try std.heap.page_allocator.create(storage_io.NativeStorage);
+            errdefer std.heap.page_allocator.destroy(owned);
+            owned.* = try storage_io.NativeStorage.init(std.heap.page_allocator, backend_options.io_runtime);
+            backend.storage_owner = owned;
+            backend.storage = owned.storage();
+        }
     }
     errdefer cleanup(BackendType, backend, false);
+    errdefer finishOpenFailure(BackendType, backend);
 
-    const loaded_manifest = try repository_mod.loadManifestIfPresentWithStorage(
-        backend.storage.?,
-        allocator,
-        backend.root_dir.?,
-        &backend.manifest_backing,
-        &backend.next_run_id,
-        &backend.runs,
-        &backend.obsolete_paths,
-    );
+    const loaded_manifest = blk: {
+        const phase_start = beginOpenPhase(BackendType, backend, .opening_manifest);
+        defer finishOpenPhase(BackendType, backend, .opening_manifest, phase_start);
+        break :blk try repository_mod.loadManifestIfPresentWithStorage(
+            backend.storage.?,
+            allocator,
+            backend.root_dir.?,
+            &backend.manifest_backing,
+            &backend.next_run_id,
+            &backend.runs,
+            &backend.obsolete_paths,
+        );
+    };
+    recordOpenManifestLoaded(BackendType, backend, loaded_manifest);
     if (debug_open) {
         std.log.info(
             "lsm backend open manifest loaded root={s} loaded={any} runs={d} obsolete_paths={d} next_run_id={d}",
@@ -84,6 +119,8 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         );
     }
     if (!loaded_manifest and options.create_if_missing) {
+        const phase_start = beginOpenPhase(BackendType, backend, .ensuring_dirs);
+        defer finishOpenPhase(BackendType, backend, .ensuring_dirs, phase_start);
         try repository_mod.ensureOpenDirsWithStorage(backend.storage.?, backend.root_dir.?);
         if (debug_open) std.log.info("lsm backend open ensured dirs root={s}", .{backend.root_dir.?});
     }
@@ -93,7 +130,10 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
 
         if (@hasDecl(BackendType, "replayWalIntoMutable")) {
             if (debug_open) std.log.info("lsm backend open wal replay begin root={s}", .{backend.root_dir.?});
+            const phase_start = beginOpenPhase(BackendType, backend, .replaying_wal);
+            defer finishOpenPhase(BackendType, backend, .replaying_wal, phase_start);
             try backend.replayWalIntoMutable();
+            recordOpenReplayComplete(BackendType, backend);
             if (debug_open) {
                 std.log.info(
                     "lsm backend open wal replay done root={s} mutable_entries={d} immutable_memtables={d}",
@@ -105,11 +145,14 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
                 );
             }
         }
+        const phase_start = beginOpenPhase(BackendType, backend, .mounting_runs);
+        defer finishOpenPhase(BackendType, backend, .mounting_runs, phase_start);
         compaction_mod.sortRuns(backend.runs.items);
     }
     if (@hasDecl(BackendType, "refreshMaintenanceDebtHint")) {
         backend.refreshMaintenanceDebtHint();
     }
+    finishOpenSuccess(BackendType, backend);
     if (debug_open) {
         std.log.info(
             "lsm backend open done root={s} runs={d} mutable_entries={d}",

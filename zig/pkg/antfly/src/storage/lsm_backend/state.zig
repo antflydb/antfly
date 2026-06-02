@@ -242,7 +242,7 @@ pub const ActiveMemTable = struct {
         self.* = .{};
     }
 
-    pub fn ensureRecoveryAllocator(self: *ActiveMemTable, allocator: Allocator) !Allocator {
+    pub fn ensureArenaAllocator(self: *ActiveMemTable, allocator: Allocator) !Allocator {
         if (self.arena_owner == null) {
             const arena = try allocator.create(std.heap.ArenaAllocator);
             errdefer allocator.destroy(arena);
@@ -250,6 +250,10 @@ pub const ActiveMemTable = struct {
             self.arena_owner = arena;
         }
         return self.arena_owner.?.allocator();
+    }
+
+    pub fn ensureRecoveryAllocator(self: *ActiveMemTable, allocator: Allocator) !Allocator {
+        return try self.ensureArenaAllocator(allocator);
     }
 
     pub fn get(self: *const ActiveMemTable, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
@@ -272,8 +276,8 @@ pub const ActiveMemTable = struct {
         value: []const u8,
         tombstone: bool,
     ) !void {
-        const entry_allocator = if (self.arena_owner) |arena| arena.allocator() else allocator;
-        const entry_from_arena = self.arena_owner != null;
+        const entry_allocator = try self.ensureArenaAllocator(allocator);
+        const entry_from_arena = true;
         const key_hash = hashEntryKey(namespace, key);
         const gop = try self.index.getOrPut(allocator, key_hash);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -657,6 +661,14 @@ fn applyStateMoveToActive(target: *ActiveMemTable, allocator: Allocator, source:
 }
 
 fn applyActiveMoveToMutable(target: anytype, allocator: Allocator, source: *ActiveMemTable) !void {
+    if (source.arena_owner != null) {
+        for (source.entries.items) |entry| {
+            try target.upsert(allocator, namespaceOf(entry), entry.key, entry.value, entry.tombstone);
+        }
+        source.deinit(allocator);
+        return;
+    }
+
     for (source.entries.items) |entry| {
         try target.upsertMove(allocator, entry);
     }
@@ -783,9 +795,32 @@ test "applyStateMove copies arena backed source into active mutable" {
 
     try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), target.entries.items.len);
-    try std.testing.expect(!target.entries.items[0].key_from_arena);
-    try std.testing.expect(!target.entries.items[0].value_from_arena);
+    try std.testing.expect(target.arena_owner != null);
+    try std.testing.expect(target.entries.items[0].key_from_arena);
+    try std.testing.expect(target.entries.items[0].value_from_arena);
     try std.testing.expectEqualStrings("A1", try target.get(.{}, "doc:a"));
+}
+
+test "applyMutableMoveToMutable copies arena backed active source into target arena" {
+    var target: ActiveMemTable = .{};
+    defer target.deinit(std.testing.allocator);
+
+    var source: ActiveMemTable = .{};
+    try source.upsert(std.testing.allocator, .{}, "doc:a", "A1", false);
+    try source.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:b", "B1", false);
+
+    try applyMutableMoveToMutable(&target, std.testing.allocator, &source);
+
+    try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
+    try std.testing.expect(source.arena_owner == null);
+    try std.testing.expect(target.arena_owner != null);
+    try std.testing.expectEqual(@as(usize, 2), target.entries.items.len);
+    for (target.entries.items) |entry| {
+        try std.testing.expect(entry.key_from_arena);
+        try std.testing.expect(entry.value_from_arena);
+    }
+    try std.testing.expectEqualStrings("A1", try target.get(.{}, "doc:a"));
+    try std.testing.expectEqualStrings("B1", try target.get(.{ .name = "docs" }, "doc:b"));
 }
 
 test "mergeStatesMove clones arena backed inputs before consuming them" {
@@ -819,6 +854,11 @@ test "ActiveMemTable overwrites by hash index and materializes sorted state" {
     try active.upsert(std.testing.allocator, .{}, "doc:c", "C2", false);
 
     try std.testing.expectEqual(@as(usize, 3), active.entries.items.len);
+    try std.testing.expect(active.arena_owner != null);
+    for (active.entries.items) |entry| {
+        try std.testing.expect(entry.key_from_arena);
+        try std.testing.expect(entry.value_from_arena);
+    }
     try std.testing.expectEqualStrings("C2", try active.get(.{}, "doc:c"));
 
     var flushed = try active.clone(std.testing.allocator);
@@ -833,6 +873,8 @@ test "ActiveMemTable overwrites by hash index and materializes sorted state" {
     defer moved.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), active.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), active.index.count());
+    try std.testing.expect(active.arena_owner == null);
+    try std.testing.expect(moved.arena_owner != null);
     try std.testing.expectEqual(@as(usize, 3), moved.entries.items.len);
     try std.testing.expectEqualStrings("doc:a", moved.entries.items[0].key);
     try std.testing.expectEqualStrings("doc:c", moved.entries.items[1].key);

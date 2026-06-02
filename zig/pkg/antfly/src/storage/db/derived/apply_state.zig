@@ -111,7 +111,7 @@ pub fn loadAppliedSequence(alloc: Allocator, store: anytype, index_name: []const
 
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginRead();
+    var txn = try runtime.store.beginProbe();
     defer txn.abort();
     const borrowed = txn.get(key) catch |err| switch (err) {
         error.NotFound => return 0,
@@ -484,6 +484,20 @@ test "derived apply state works with lsm backend store" {
     try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
     try saveAppliedSequence(runtime, "idx", 31);
     try std.testing.expectEqual(@as(u64, 31), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
+}
+
+test "derived apply state lsm point load does not clone mutable snapshot" {
+    var backend = lsm_backend.Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try saveAppliedSequence(runtime, "idx", 41);
+    const before = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 41), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
+    const after = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
 }
 
 test "derived apply state keeps latest lsm value across many flushed overwrites" {

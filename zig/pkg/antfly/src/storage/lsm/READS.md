@@ -36,7 +36,8 @@ Metrics:
 
 - Elapsed ns, ops/sec, and ns/op.
 - Storage read file/range/trailer/file-size calls.
-- `Backend.ReadStats`: point gets, run probes, bloom negatives, mutable/L0/level hits.
+- `Backend.ReadStats`: point gets, run probes, bloom negatives,
+  prefix-bloom negatives, block-prefix-bloom negatives, mutable/L0/level hits.
 - Shared cache stats for raw tables, table indexes, and table blocks.
 
 Useful commands:

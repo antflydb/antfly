@@ -871,16 +871,28 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"read_point_gets\":{d},\"read_run_probes\":{d},\"read_bloom_negatives\":{d},\"read_mutable_hits\":{d},\"read_l0_hits\":{d},\"read_level_hits\":{d},\"read_cursor_block_loads\":{d},\"read_cursor_block_reuses\":{d}",
+        ",\"read_point_gets\":{d},\"read_run_probes\":{d},\"read_point_run_prechecks\":{d},\"read_point_run_precheck_survivors\":{d},\"read_point_run_survivor_reads\":{d},\"read_point_run_survivor_hits\":{d},\"read_point_run_survivor_misses\":{d},\"read_point_run_survivor_tombstones\":{d},\"read_bloom_negatives\":{d},\"read_prefix_bloom_negatives\":{d},\"read_block_prefix_bloom_negatives\":{d},\"read_mutable_hits\":{d},\"read_l0_hits\":{d},\"read_level_hits\":{d},\"read_cursor_block_loads\":{d},\"read_cursor_block_reuses\":{d},\"read_cursor_value_borrows\":{d},\"read_cursor_value_copies\":{d},\"read_point_value_borrows\":{d},\"read_point_value_copies\":{d}",
         .{
             read_delta.point_gets,
             read_delta.run_probes,
+            read_delta.point_run_prechecks,
+            read_delta.point_run_precheck_survivors,
+            read_delta.point_run_survivor_reads,
+            read_delta.point_run_survivor_hits,
+            read_delta.point_run_survivor_misses,
+            read_delta.point_run_survivor_tombstones,
             read_delta.bloom_negatives,
+            read_delta.prefix_bloom_negatives,
+            read_delta.block_prefix_bloom_negatives,
             read_delta.mutable_hits,
             read_delta.l0_hits,
             read_delta.level_hits,
             read_delta.cursor_block_loads,
             read_delta.cursor_block_reuses,
+            read_delta.cursor_value_borrows,
+            read_delta.cursor_value_copies,
+            read_delta.point_value_borrows,
+            read_delta.point_value_copies,
         },
     );
     try writer.print(
@@ -924,7 +936,15 @@ fn diffReadStats(after: ReadStats, before: ReadStats) ReadStats {
         .l0_hits = saturatingSub(after.l0_hits, before.l0_hits),
         .level_hits = saturatingSub(after.level_hits, before.level_hits),
         .run_probes = saturatingSub(after.run_probes, before.run_probes),
+        .point_run_prechecks = saturatingSub(after.point_run_prechecks, before.point_run_prechecks),
+        .point_run_precheck_survivors = saturatingSub(after.point_run_precheck_survivors, before.point_run_precheck_survivors),
+        .point_run_survivor_reads = saturatingSub(after.point_run_survivor_reads, before.point_run_survivor_reads),
+        .point_run_survivor_hits = saturatingSub(after.point_run_survivor_hits, before.point_run_survivor_hits),
+        .point_run_survivor_misses = saturatingSub(after.point_run_survivor_misses, before.point_run_survivor_misses),
+        .point_run_survivor_tombstones = saturatingSub(after.point_run_survivor_tombstones, before.point_run_survivor_tombstones),
         .bloom_negatives = saturatingSub(after.bloom_negatives, before.bloom_negatives),
+        .prefix_bloom_negatives = saturatingSub(after.prefix_bloom_negatives, before.prefix_bloom_negatives),
+        .block_prefix_bloom_negatives = saturatingSub(after.block_prefix_bloom_negatives, before.block_prefix_bloom_negatives),
         .table_entry_parses = saturatingSub(after.table_entry_parses, before.table_entry_parses),
         .table_entry_parse_ns = saturatingSub(after.table_entry_parse_ns, before.table_entry_parse_ns),
         .table_index_loads = saturatingSub(after.table_index_loads, before.table_index_loads),
@@ -938,6 +958,10 @@ fn diffReadStats(after: ReadStats, before: ReadStats) ReadStats {
         .local_block_cache_misses = saturatingSub(after.local_block_cache_misses, before.local_block_cache_misses),
         .cursor_block_loads = saturatingSub(after.cursor_block_loads, before.cursor_block_loads),
         .cursor_block_reuses = saturatingSub(after.cursor_block_reuses, before.cursor_block_reuses),
+        .cursor_value_borrows = saturatingSub(after.cursor_value_borrows, before.cursor_value_borrows),
+        .cursor_value_copies = saturatingSub(after.cursor_value_copies, before.cursor_value_copies),
+        .point_value_borrows = saturatingSub(after.point_value_borrows, before.point_value_borrows),
+        .point_value_copies = saturatingSub(after.point_value_copies, before.point_value_copies),
     };
 }
 
@@ -949,7 +973,15 @@ fn addReadStats(total: *ReadStats, add: ReadStats) void {
     total.l0_hits += add.l0_hits;
     total.level_hits += add.level_hits;
     total.run_probes += add.run_probes;
+    total.point_run_prechecks += add.point_run_prechecks;
+    total.point_run_precheck_survivors += add.point_run_precheck_survivors;
+    total.point_run_survivor_reads += add.point_run_survivor_reads;
+    total.point_run_survivor_hits += add.point_run_survivor_hits;
+    total.point_run_survivor_misses += add.point_run_survivor_misses;
+    total.point_run_survivor_tombstones += add.point_run_survivor_tombstones;
     total.bloom_negatives += add.bloom_negatives;
+    total.prefix_bloom_negatives += add.prefix_bloom_negatives;
+    total.block_prefix_bloom_negatives += add.block_prefix_bloom_negatives;
     total.table_entry_parses += add.table_entry_parses;
     total.table_entry_parse_ns += add.table_entry_parse_ns;
     total.table_index_loads += add.table_index_loads;
@@ -963,6 +995,10 @@ fn addReadStats(total: *ReadStats, add: ReadStats) void {
     total.local_block_cache_misses += add.local_block_cache_misses;
     total.cursor_block_loads += add.cursor_block_loads;
     total.cursor_block_reuses += add.cursor_block_reuses;
+    total.cursor_value_borrows += add.cursor_value_borrows;
+    total.cursor_value_copies += add.cursor_value_copies;
+    total.point_value_borrows += add.point_value_borrows;
+    total.point_value_copies += add.point_value_copies;
 }
 
 fn diffCacheStats(after: CacheStats, before: CacheStats) CacheStats {

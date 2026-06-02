@@ -149,6 +149,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         var batch_req = batch_api.parseBatchRequest(ctx.alloc, req.body) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
+            error.ValueTooLong => return try http_route_helpers.textResponse(ctx.alloc, 413, "value too large"),
             else => return err,
         };
         defer batch_req.deinit(ctx.alloc);

@@ -546,7 +546,7 @@ pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !void {
 pub fn loadSchema(store: anytype, alloc: Allocator) !?TableSchema {
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginRead();
+    var txn = try runtime.store.beginProbe();
     defer txn.abort();
     const raw = txn.get(schema_key) catch |err| switch (err) {
         error.NotFound => return null,
@@ -562,7 +562,7 @@ pub fn loadSchemaVersion(store: anytype, alloc: Allocator, version: u32) !?Table
     defer alloc.free(versioned_key);
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginRead();
+    var txn = try runtime.store.beginProbe();
     defer txn.abort();
     const raw = txn.get(versioned_key) catch |err| switch (err) {
         error.NotFound => return null,
@@ -576,7 +576,7 @@ pub fn loadSchemaVersion(store: anytype, alloc: Allocator, version: u32) !?Table
 pub fn copySchemas(source_store: anytype, dest_store: anytype, alloc: Allocator) !void {
     var source_runtime = try initRuntimeStore(alloc, source_store);
     defer source_runtime.deinit();
-    var source_txn = try source_runtime.store.beginRead();
+    var source_txn = try source_runtime.store.beginProbe();
     defer source_txn.abort();
 
     var dest_runtime = try initRuntimeStore(alloc, dest_store);
@@ -591,7 +591,7 @@ pub fn copySchemas(source_store: anytype, dest_store: anytype, alloc: Allocator)
         else => return err,
     }
 
-    const entries = try backend_scan.scanPrefix(alloc, &source_runtime.store, schema_version_prefix);
+    const entries = try backend_scan.scanPrefixCurrent(alloc, &source_runtime.store, schema_version_prefix);
     defer backend_scan.freeResults(alloc, entries);
     for (entries) |entry| try dest_txn.put(entry.key, entry.value);
 

@@ -19,6 +19,7 @@ const Allocator = std.mem.Allocator;
 const bloom = @import("bloom");
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
+const backend_scan = @import("backend_scan.zig");
 const backend_types = @import("backend_types.zig");
 const lsm_manifest = @import("lsm/manifest.zig");
 const lsm_table_file = @import("lsm/table_file.zig");
@@ -47,6 +48,41 @@ const compareNamespace = state_mod.compareNamespace;
 const compareEntryTo = state_mod.compareEntryTo;
 const CounterU64 = platform.atomic.Value(u64);
 
+pub const MutableSnapshotReason = enum(u8) {
+    bound_read_txn,
+    namespace_read_txn,
+    other,
+};
+
+pub const mutable_snapshot_reason_count = @typeInfo(MutableSnapshotReason).@"enum".fields.len;
+
+pub const MutableSnapshotCloneReasonStats = struct {
+    calls: u64 = 0,
+    bytes_total: u64 = 0,
+    peak_bytes: u64 = 0,
+};
+
+pub const MaintenanceWaker = struct {
+    ptr: *anyopaque,
+    wake_fn: *const fn (ptr: *anyopaque) void,
+
+    pub fn wake(self: MaintenanceWaker) void {
+        self.wake_fn(self.ptr);
+    }
+};
+
+pub fn mutableSnapshotReasonName(reason: MutableSnapshotReason) []const u8 {
+    return switch (reason) {
+        .bound_read_txn => "bound_read_txn",
+        .namespace_read_txn => "namespace_read_txn",
+        .other => "other",
+    };
+}
+
+fn mutableSnapshotReasonIndex(reason: MutableSnapshotReason) usize {
+    return @intFromEnum(reason);
+}
+
 fn atomicMaxCounter(counter: *CounterU64, candidate: u64) void {
     var current = counter.load(.monotonic);
     while (candidate > current) {
@@ -64,34 +100,49 @@ pub const Options = struct {
     flush_threshold_bytes: u64 = 0,
     bulk_ingest_flush_threshold_multiplier: usize = 8,
     bulk_ingest_flush_threshold_bytes_multiplier: usize = 8,
-    compact_threshold_runs: usize = 16,
+    compact_threshold_runs: usize = 4,
     l0_overlap_compact_threshold_runs: usize = 4,
     l0_soft_limit_runs: usize = 0,
     l0_hard_limit_runs: usize = 0,
     l0_soft_limit_bytes: u64 = 0,
     l0_hard_limit_bytes: u64 = 0,
+    write_pressure_max_compaction_steps: usize = 8,
+    write_pressure_reject_on_overload: bool = false,
     foreground_soft_compaction: bool = false,
     defer_flush_on_commit: bool = false,
     max_deferred_immutable_memtables: usize = 8,
     direct_bulk_ingest: bool = true,
-    level_target_runs_base: usize = 4,
+    level_target_runs_base: usize = 32,
     level_target_runs_multiplier: usize = 4,
-    level_target_bytes_base: usize = 128 * 1024,
+    level_target_bytes_base: usize = 1024 * 1024,
     level_target_bytes_multiplier: usize = 8,
+    max_compaction_input_bytes: u64 = 0,
+    max_compaction_input_allow_oversized_single_job: bool = true,
     max_run_file_bytes: usize = 512 * 1024 * 1024,
     bloom: bloom.Config = lsm_table_file.default_filter_config,
     table_block_compression: lsm_table_file.CompressionPolicy = .snappy_adaptive,
     io_runtime: storage_io.RuntimeKind = .threaded,
+    read_runtime: ?storage_io.ReadRuntime = null,
     storage: ?storage_io.Storage = null,
     cache: ?*cache_mod.Cache = null,
+    local_block_cache_enabled: bool = true,
+    max_concurrent_point_block_reads: usize = 4,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     background_executor: ?*const BackgroundExecutor = null,
+    maintenance_waker: ?MaintenanceWaker = null,
     compaction_scheduler: compaction_scheduler_mod.Options = .{},
+    background_io_budget_bytes: u64 = 0,
+    background_io_allow_oversized_single_job: bool = true,
     wal_enabled: bool = true,
     wal_sync_on_commit: bool = false,
     wal_segment_bytes: u64 = 64 * 1024 * 1024,
+    wal_soft_limit_segments: u64 = 0,
+    wal_hard_limit_segments: u64 = 0,
+    wal_soft_limit_bytes: u64 = 0,
+    wal_hard_limit_bytes: u64 = 0,
     root_generation: u64 = 0,
     obsolete_retention_ns: u64 = 5 * std.time.ns_per_min,
+    read_snapshot_rotate_mutable_bytes: u64 = 256 * 1024,
 };
 
 pub const IoRuntime = storage_io.RuntimeKind;
@@ -104,9 +155,70 @@ pub const CacheKindStats = cache_mod.KindStats;
 pub const DefaultCacheSizeBytes = cache_mod.DefaultCacheSizeBytes;
 pub const TableEntry = lsm_table_file.Entry;
 pub const BackgroundExecutor = lsm_background_mod.Executor;
+pub const BackendHandleConfig = struct {
+    background_runtime: ?background_runtime_mod.Config = null,
+    internal_flush_worker: bool = false,
+};
 const max_local_cached_run_blocks: usize = 64;
 
 pub const Backend = struct {
+    pub const OpenPhase = enum {
+        idle,
+        initializing_storage,
+        opening_manifest,
+        ensuring_dirs,
+        replaying_wal,
+        mounting_runs,
+        ready,
+        failed,
+    };
+
+    pub const OpenStats = struct {
+        phase: OpenPhase = .idle,
+        started: u64 = 0,
+        completed: u64 = 0,
+        failed: u64 = 0,
+        total_ns: u64 = 0,
+        initializing_storage_ns: u64 = 0,
+        opening_manifest_ns: u64 = 0,
+        ensuring_dirs_ns: u64 = 0,
+        replaying_wal_ns: u64 = 0,
+        mounting_runs_ns: u64 = 0,
+        loaded_manifest: bool = false,
+        loaded_runs: u64 = 0,
+        obsolete_paths: u64 = 0,
+        mutable_entries_after_replay: u64 = 0,
+        immutable_memtables_after_replay: u64 = 0,
+        wal_replay_records: u64 = 0,
+        wal_replay_entries: u64 = 0,
+        wal_replay_bytes: u64 = 0,
+        wal_replay_ns: u64 = 0,
+        wal_replay_truncated_tail_bytes: u64 = 0,
+    };
+
+    pub fn accumulateOpenStats(dst: *OpenStats, src: OpenStats) void {
+        if (@intFromEnum(src.phase) > @intFromEnum(dst.phase)) dst.phase = src.phase;
+        dst.started +|= src.started;
+        dst.completed +|= src.completed;
+        dst.failed +|= src.failed;
+        dst.total_ns +|= src.total_ns;
+        dst.initializing_storage_ns +|= src.initializing_storage_ns;
+        dst.opening_manifest_ns +|= src.opening_manifest_ns;
+        dst.ensuring_dirs_ns +|= src.ensuring_dirs_ns;
+        dst.replaying_wal_ns +|= src.replaying_wal_ns;
+        dst.mounting_runs_ns +|= src.mounting_runs_ns;
+        dst.loaded_manifest = dst.loaded_manifest or src.loaded_manifest;
+        dst.loaded_runs +|= src.loaded_runs;
+        dst.obsolete_paths +|= src.obsolete_paths;
+        dst.mutable_entries_after_replay +|= src.mutable_entries_after_replay;
+        dst.immutable_memtables_after_replay +|= src.immutable_memtables_after_replay;
+        dst.wal_replay_records +|= src.wal_replay_records;
+        dst.wal_replay_entries +|= src.wal_replay_entries;
+        dst.wal_replay_bytes +|= src.wal_replay_bytes;
+        dst.wal_replay_ns +|= src.wal_replay_ns;
+        dst.wal_replay_truncated_tail_bytes +|= src.wal_replay_truncated_tail_bytes;
+    }
+
     pub const CompactionStats = struct {
         compactions: usize = 0,
         input_runs: usize = 0,
@@ -134,18 +246,28 @@ pub const Backend = struct {
         manifest_writes: u64 = 0,
         manifest_bytes: u64 = 0,
         manifest_ns: u64 = 0,
+        write_pressure_events: u64 = 0,
         write_pressure_compactions: u64 = 0,
+        write_pressure_compaction_steps: u64 = 0,
+        write_pressure_overloads: u64 = 0,
+        write_pressure_rejections: u64 = 0,
         write_pressure_ns: u64 = 0,
+        wal_pressure_flushes: u64 = 0,
+        wal_pressure_ns: u64 = 0,
         wal_append_records: u64 = 0,
         wal_append_entries: u64 = 0,
         wal_append_bytes: u64 = 0,
         wal_append_ns: u64 = 0,
         wal_sync_records: u64 = 0,
+        wal_sync_ns: u64 = 0,
         wal_replay_records: u64 = 0,
         wal_replay_entries: u64 = 0,
         wal_replay_bytes: u64 = 0,
         wal_replay_ns: u64 = 0,
         wal_replay_truncated_tail_bytes: u64 = 0,
+        wal_replay_recovery_flushes: u64 = 0,
+        wal_replay_recovery_entry_bytes: u64 = 0,
+        wal_replay_recovery_window_peak_bytes: u64 = 0,
         wal_resets: u64 = 0,
         wal_reset_ns: u64 = 0,
         immutable_rotations: u64 = 0,
@@ -179,6 +301,10 @@ pub const Backend = struct {
         mutable_snapshot_clone_calls: u64 = 0,
         mutable_snapshot_clone_bytes_total: u64 = 0,
         mutable_snapshot_clone_peak_bytes: u64 = 0,
+        mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+        read_snapshot_mutable_rotations: u64 = 0,
+        read_snapshot_mutable_rotation_bytes_total: u64 = 0,
+        read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
         immutable_memtables: u64 = 0,
         immutable_entries: u64 = 0,
         immutable_bytes: u64 = 0,
@@ -207,10 +333,18 @@ pub const Backend = struct {
         active_bulk_ingest_batches: u64 = 0,
         wal_retained_segments: u64 = 0,
         wal_retained_bytes: u64 = 0,
+        wal_checkpoint_oldest_retained_segment: u64 = 0,
+        wal_checkpoint_covered_through_segment: u64 = 0,
+        wal_checkpoint_current_segment: u64 = 0,
+        wal_checkpoint_lag_segments: u64 = 0,
+        wal_replay_retained_segments: u64 = 0,
+        wal_replay_retained_bytes: u64 = 0,
+        wal_replay_current_segment: u64 = 0,
         manifest_dirty: bool = false,
         obsolete_manifest_dirty: bool = false,
         compaction_scheduler_active_jobs: u64 = 0,
         compaction_scheduler_in_flight_input_bytes: u64 = 0,
+        compaction_scheduler_active_oldest_age_ns: u64 = 0,
         compaction_scheduler_grants: u64 = 0,
         compaction_scheduler_completions: u64 = 0,
         compaction_scheduler_denied_capacity: u64 = 0,
@@ -222,6 +356,12 @@ pub const Backend = struct {
         compaction_scheduler_remembered_stale: u64 = 0,
         compaction_scheduler_conflict_denials: u64 = 0,
         compaction_scheduler_remembered_pending: u64 = 0,
+        compaction_scheduler_remembered_pending_runs: u64 = 0,
+        compaction_scheduler_remembered_pending_bytes: u64 = 0,
+        background_io_budget_bytes: u64 = 0,
+        background_io_reserved_bytes: u64 = 0,
+        background_io_denied_jobs: u64 = 0,
+        background_io_oversized_jobs: u64 = 0,
         backend_lock_waits: u64 = 0,
         backend_lock_wait_ns: u64 = 0,
         backend_lock_max_wait_ns: u64 = 0,
@@ -233,6 +373,14 @@ pub const Backend = struct {
         dst.mutable_snapshot_clone_calls +|= src.mutable_snapshot_clone_calls;
         dst.mutable_snapshot_clone_bytes_total +|= src.mutable_snapshot_clone_bytes_total;
         dst.mutable_snapshot_clone_peak_bytes = @max(dst.mutable_snapshot_clone_peak_bytes, src.mutable_snapshot_clone_peak_bytes);
+        for (&dst.mutable_snapshot_clone_by_reason, src.mutable_snapshot_clone_by_reason) |*dst_reason, src_reason| {
+            dst_reason.calls +|= src_reason.calls;
+            dst_reason.bytes_total +|= src_reason.bytes_total;
+            dst_reason.peak_bytes = @max(dst_reason.peak_bytes, src_reason.peak_bytes);
+        }
+        dst.read_snapshot_mutable_rotations +|= src.read_snapshot_mutable_rotations;
+        dst.read_snapshot_mutable_rotation_bytes_total +|= src.read_snapshot_mutable_rotation_bytes_total;
+        dst.read_snapshot_mutable_rotation_peak_bytes = @max(dst.read_snapshot_mutable_rotation_peak_bytes, src.read_snapshot_mutable_rotation_peak_bytes);
         dst.immutable_memtables +|= src.immutable_memtables;
         dst.immutable_entries +|= src.immutable_entries;
         dst.immutable_bytes +|= src.immutable_bytes;
@@ -261,10 +409,23 @@ pub const Backend = struct {
         dst.active_bulk_ingest_batches +|= src.active_bulk_ingest_batches;
         dst.wal_retained_segments +|= src.wal_retained_segments;
         dst.wal_retained_bytes +|= src.wal_retained_bytes;
+        dst.wal_checkpoint_oldest_retained_segment = if (dst.wal_checkpoint_oldest_retained_segment == 0)
+            src.wal_checkpoint_oldest_retained_segment
+        else if (src.wal_checkpoint_oldest_retained_segment == 0)
+            dst.wal_checkpoint_oldest_retained_segment
+        else
+            @min(dst.wal_checkpoint_oldest_retained_segment, src.wal_checkpoint_oldest_retained_segment);
+        dst.wal_checkpoint_current_segment = @max(dst.wal_checkpoint_current_segment, src.wal_checkpoint_current_segment);
+        dst.wal_checkpoint_covered_through_segment = @max(dst.wal_checkpoint_covered_through_segment, src.wal_checkpoint_covered_through_segment);
+        dst.wal_checkpoint_lag_segments +|= src.wal_checkpoint_lag_segments;
+        dst.wal_replay_retained_segments +|= src.wal_replay_retained_segments;
+        dst.wal_replay_retained_bytes +|= src.wal_replay_retained_bytes;
+        dst.wal_replay_current_segment = @max(dst.wal_replay_current_segment, src.wal_replay_current_segment);
         dst.manifest_dirty = dst.manifest_dirty or src.manifest_dirty;
         dst.obsolete_manifest_dirty = dst.obsolete_manifest_dirty or src.obsolete_manifest_dirty;
         dst.compaction_scheduler_active_jobs +|= src.compaction_scheduler_active_jobs;
         dst.compaction_scheduler_in_flight_input_bytes +|= src.compaction_scheduler_in_flight_input_bytes;
+        dst.compaction_scheduler_active_oldest_age_ns = @max(dst.compaction_scheduler_active_oldest_age_ns, src.compaction_scheduler_active_oldest_age_ns);
         dst.compaction_scheduler_grants +|= src.compaction_scheduler_grants;
         dst.compaction_scheduler_completions +|= src.compaction_scheduler_completions;
         dst.compaction_scheduler_denied_capacity +|= src.compaction_scheduler_denied_capacity;
@@ -276,9 +437,25 @@ pub const Backend = struct {
         dst.compaction_scheduler_remembered_stale +|= src.compaction_scheduler_remembered_stale;
         dst.compaction_scheduler_conflict_denials +|= src.compaction_scheduler_conflict_denials;
         dst.compaction_scheduler_remembered_pending +|= src.compaction_scheduler_remembered_pending;
+        dst.compaction_scheduler_remembered_pending_runs +|= src.compaction_scheduler_remembered_pending_runs;
+        dst.compaction_scheduler_remembered_pending_bytes +|= src.compaction_scheduler_remembered_pending_bytes;
+        dst.background_io_budget_bytes +|= src.background_io_budget_bytes;
+        dst.background_io_reserved_bytes +|= src.background_io_reserved_bytes;
+        dst.background_io_denied_jobs +|= src.background_io_denied_jobs;
+        dst.background_io_oversized_jobs +|= src.background_io_oversized_jobs;
         dst.backend_lock_waits +|= src.backend_lock_waits;
         dst.backend_lock_wait_ns +|= src.backend_lock_wait_ns;
         dst.backend_lock_max_wait_ns = @max(dst.backend_lock_max_wait_ns, src.backend_lock_max_wait_ns);
+    }
+
+    pub fn accumulateWriteStats(dst: *WriteStats, src: WriteStats) void {
+        inline for (@typeInfo(WriteStats).@"struct".fields) |field| {
+            if (comptime std.mem.eql(u8, field.name, "table_file_compression_codec_mask")) {
+                @field(dst, field.name) |= @field(src, field.name);
+            } else {
+                @field(dst, field.name) +|= @field(src, field.name);
+            }
+        }
     }
 
     pub const ReadStats = struct {
@@ -297,7 +474,19 @@ pub const Backend = struct {
         l0_hits: u64 = 0,
         level_hits: u64 = 0,
         run_probes: u64 = 0,
+        point_run_prechecks: u64 = 0,
+        point_run_precheck_survivors: u64 = 0,
+        point_run_survivor_reads: u64 = 0,
+        point_run_survivor_hits: u64 = 0,
+        point_run_survivor_misses: u64 = 0,
+        point_run_survivor_tombstones: u64 = 0,
+        point_run_async_batches: u64 = 0,
+        point_run_async_reads_issued: u64 = 0,
+        point_run_async_reads_canceled: u64 = 0,
+        point_run_async_wait_ns: u64 = 0,
         bloom_negatives: u64 = 0,
+        prefix_bloom_negatives: u64 = 0,
+        block_prefix_bloom_negatives: u64 = 0,
         read_hint_attempts: u64 = 0,
         read_hint_hits: u64 = 0,
         read_hint_misses: u64 = 0,
@@ -316,6 +505,13 @@ pub const Backend = struct {
         local_block_cache_misses: u64 = 0,
         cursor_block_reuses: u64 = 0,
         cursor_block_loads: u64 = 0,
+        cursor_block_readaheads: u64 = 0,
+        cursor_table_index_hits: u64 = 0,
+        cursor_table_index_misses: u64 = 0,
+        cursor_value_borrows: u64 = 0,
+        cursor_value_copies: u64 = 0,
+        point_value_borrows: u64 = 0,
+        point_value_copies: u64 = 0,
         run_group_builds: u64 = 0,
         run_group_build_ns: u64 = 0,
         run_group_total_runs: u64 = 0,
@@ -338,7 +534,19 @@ pub const Backend = struct {
         l0_hits: CounterU64 = .init(0),
         level_hits: CounterU64 = .init(0),
         run_probes: CounterU64 = .init(0),
+        point_run_prechecks: CounterU64 = .init(0),
+        point_run_precheck_survivors: CounterU64 = .init(0),
+        point_run_survivor_reads: CounterU64 = .init(0),
+        point_run_survivor_hits: CounterU64 = .init(0),
+        point_run_survivor_misses: CounterU64 = .init(0),
+        point_run_survivor_tombstones: CounterU64 = .init(0),
+        point_run_async_batches: CounterU64 = .init(0),
+        point_run_async_reads_issued: CounterU64 = .init(0),
+        point_run_async_reads_canceled: CounterU64 = .init(0),
+        point_run_async_wait_ns: CounterU64 = .init(0),
         bloom_negatives: CounterU64 = .init(0),
+        prefix_bloom_negatives: CounterU64 = .init(0),
+        block_prefix_bloom_negatives: CounterU64 = .init(0),
         read_hint_attempts: CounterU64 = .init(0),
         read_hint_hits: CounterU64 = .init(0),
         read_hint_misses: CounterU64 = .init(0),
@@ -357,6 +565,13 @@ pub const Backend = struct {
         local_block_cache_misses: CounterU64 = .init(0),
         cursor_block_reuses: CounterU64 = .init(0),
         cursor_block_loads: CounterU64 = .init(0),
+        cursor_block_readaheads: CounterU64 = .init(0),
+        cursor_table_index_hits: CounterU64 = .init(0),
+        cursor_table_index_misses: CounterU64 = .init(0),
+        cursor_value_borrows: CounterU64 = .init(0),
+        cursor_value_copies: CounterU64 = .init(0),
+        point_value_borrows: CounterU64 = .init(0),
+        point_value_copies: CounterU64 = .init(0),
         run_group_builds: CounterU64 = .init(0),
         run_group_build_ns: CounterU64 = .init(0),
         run_group_total_runs: CounterU64 = .init(0),
@@ -379,7 +594,19 @@ pub const Backend = struct {
                 .l0_hits = self.l0_hits.load(.monotonic),
                 .level_hits = self.level_hits.load(.monotonic),
                 .run_probes = self.run_probes.load(.monotonic),
+                .point_run_prechecks = self.point_run_prechecks.load(.monotonic),
+                .point_run_precheck_survivors = self.point_run_precheck_survivors.load(.monotonic),
+                .point_run_survivor_reads = self.point_run_survivor_reads.load(.monotonic),
+                .point_run_survivor_hits = self.point_run_survivor_hits.load(.monotonic),
+                .point_run_survivor_misses = self.point_run_survivor_misses.load(.monotonic),
+                .point_run_survivor_tombstones = self.point_run_survivor_tombstones.load(.monotonic),
+                .point_run_async_batches = self.point_run_async_batches.load(.monotonic),
+                .point_run_async_reads_issued = self.point_run_async_reads_issued.load(.monotonic),
+                .point_run_async_reads_canceled = self.point_run_async_reads_canceled.load(.monotonic),
+                .point_run_async_wait_ns = self.point_run_async_wait_ns.load(.monotonic),
                 .bloom_negatives = self.bloom_negatives.load(.monotonic),
+                .prefix_bloom_negatives = self.prefix_bloom_negatives.load(.monotonic),
+                .block_prefix_bloom_negatives = self.block_prefix_bloom_negatives.load(.monotonic),
                 .read_hint_attempts = self.read_hint_attempts.load(.monotonic),
                 .read_hint_hits = self.read_hint_hits.load(.monotonic),
                 .read_hint_misses = self.read_hint_misses.load(.monotonic),
@@ -398,6 +625,13 @@ pub const Backend = struct {
                 .local_block_cache_misses = self.local_block_cache_misses.load(.monotonic),
                 .cursor_block_reuses = self.cursor_block_reuses.load(.monotonic),
                 .cursor_block_loads = self.cursor_block_loads.load(.monotonic),
+                .cursor_block_readaheads = self.cursor_block_readaheads.load(.monotonic),
+                .cursor_table_index_hits = self.cursor_table_index_hits.load(.monotonic),
+                .cursor_table_index_misses = self.cursor_table_index_misses.load(.monotonic),
+                .cursor_value_borrows = self.cursor_value_borrows.load(.monotonic),
+                .cursor_value_copies = self.cursor_value_copies.load(.monotonic),
+                .point_value_borrows = self.point_value_borrows.load(.monotonic),
+                .point_value_copies = self.point_value_copies.load(.monotonic),
                 .run_group_builds = self.run_group_builds.load(.monotonic),
                 .run_group_build_ns = self.run_group_build_ns.load(.monotonic),
                 .run_group_total_runs = self.run_group_total_runs.load(.monotonic),
@@ -520,6 +754,7 @@ pub const Backend = struct {
     manifest_backing: ?[]u8 = null,
     next_run_id: u64 = 1,
     active_readers: usize = 0,
+    active_mutable_value_readers: usize = 0,
     manifest_dirty: bool = false,
     obsolete_paths: std.ArrayListUnmanaged(ObsoletePath) = .empty,
     obsolete_manifest_dirty: bool = false,
@@ -534,25 +769,39 @@ pub const Backend = struct {
     background_executor: BackgroundExecutor = BackgroundExecutor.initInline(0),
     immutable_flush_job_in_flight: bool = false,
     immutable_flush_build_in_flight: bool = false,
+    maintenance_job_in_flight: bool = false,
+    maintenance_io_budget_remaining: ?u64 = null,
+    background_io_reserved_bytes: u64 = 0,
+    background_io_denied_jobs: u64 = 0,
+    background_io_oversized_jobs: u64 = 0,
+    write_pressure_enforcing: bool = false,
     remembered_compaction: ?compaction_mod.RememberedCompaction = null,
+    open_stats: OpenStats = .{},
     write_stats: WriteStats = .{},
     read_stats: AtomicReadStats = .{},
     tracked_in_memory_state_bytes: u64 = 0,
+    tracked_wal_retention_bytes: u64 = 0,
     backend_lock_waits: CounterU64 = .init(0),
     backend_lock_wait_ns: CounterU64 = .init(0),
     backend_lock_max_wait_ns: CounterU64 = .init(0),
     mutable_snapshot_clone_calls: u64 = 0,
     mutable_snapshot_clone_bytes_total: u64 = 0,
     mutable_snapshot_clone_peak_bytes: u64 = 0,
+    mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+    read_snapshot_mutable_rotations: u64 = 0,
+    read_snapshot_mutable_rotation_bytes_total: u64 = 0,
+    read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
     active_bulk_ingest_batches: usize = 0,
     mutable: ActiveMemTable = .{},
     mutable_wal_range: WalSegmentRange = .{},
+    empty_mutable_snapshot: State = .{},
     mutable_read_snapshot: ?*State = null,
     immutable_memtables: std.ArrayListUnmanaged(*State) = .empty,
     immutable_wal_ranges: std.ArrayListUnmanaged(WalSegmentRange) = .empty,
     immutable_head: usize = 0,
     retired_immutable_memtables: std.ArrayListUnmanaged(*State) = .empty,
     retired_mutable_snapshots: std.ArrayListUnmanaged(*State) = .empty,
+    closing: std.atomic.Value(bool) = .init(false),
     recovery_replaying_wal: bool = false,
     runs: std.ArrayListUnmanaged(repository_mod.Run) = .empty,
 
@@ -590,6 +839,7 @@ pub const Backend = struct {
     }
 
     pub fn close(self: *Backend) void {
+        self.closing.store(true, .release);
         self.background_executor.drain();
         self.releaseTrackedResourceUsage();
         recovery_mod.close(Backend, self);
@@ -626,6 +876,72 @@ pub const Backend = struct {
         return self.write_stats;
     }
 
+    pub fn snapshotOpenStats(self: *const Backend) OpenStats {
+        return self.open_stats;
+    }
+
+    pub fn openStatsNowNs(_: *Backend) u64 {
+        return platform_time.monotonicNs();
+    }
+
+    pub fn beginOpenPhase(self: *Backend, phase: OpenPhase) u64 {
+        const now = self.openStatsNowNs();
+        if (self.open_stats.started == 0) {
+            self.open_stats.started = 1;
+            self.open_stats.total_ns = now;
+        }
+        self.open_stats.phase = phase;
+        return now;
+    }
+
+    pub fn finishOpenPhase(self: *Backend, phase: OpenPhase, start_ns: u64) void {
+        const elapsed = self.openStatsElapsedNs(start_ns);
+        switch (phase) {
+            .initializing_storage => self.open_stats.initializing_storage_ns +|= elapsed,
+            .opening_manifest => self.open_stats.opening_manifest_ns +|= elapsed,
+            .ensuring_dirs => self.open_stats.ensuring_dirs_ns +|= elapsed,
+            .replaying_wal => self.open_stats.replaying_wal_ns +|= elapsed,
+            .mounting_runs => self.open_stats.mounting_runs_ns +|= elapsed,
+            .idle, .ready, .failed => {},
+        }
+    }
+
+    pub fn recordOpenManifestLoaded(self: *Backend, loaded_manifest: bool) void {
+        self.open_stats.loaded_manifest = loaded_manifest;
+        self.open_stats.loaded_runs = @intCast(self.runs.items.len);
+        self.open_stats.obsolete_paths = @intCast(self.obsolete_paths.items.len);
+    }
+
+    pub fn recordOpenReplayComplete(self: *Backend) void {
+        self.open_stats.mutable_entries_after_replay = @intCast(self.mutable.entries.items.len);
+        self.open_stats.immutable_memtables_after_replay = @intCast(self.activeImmutableMemtableCount());
+        self.open_stats.wal_replay_records = self.write_stats.wal_replay_records;
+        self.open_stats.wal_replay_entries = self.write_stats.wal_replay_entries;
+        self.open_stats.wal_replay_bytes = self.write_stats.wal_replay_bytes;
+        self.open_stats.wal_replay_ns = self.write_stats.wal_replay_ns;
+        self.open_stats.wal_replay_truncated_tail_bytes = self.write_stats.wal_replay_truncated_tail_bytes;
+    }
+
+    pub fn finishOpenSuccess(self: *Backend) void {
+        self.open_stats.phase = .ready;
+        self.open_stats.completed = 1;
+        self.open_stats.failed = 0;
+        self.open_stats.total_ns = self.openStatsElapsedNs(self.open_stats.total_ns);
+    }
+
+    pub fn finishOpenFailure(self: *Backend) void {
+        self.open_stats.phase = .failed;
+        self.open_stats.failed = 1;
+        if (self.open_stats.total_ns != 0) {
+            self.open_stats.total_ns = self.openStatsElapsedNs(self.open_stats.total_ns);
+        }
+    }
+
+    fn openStatsElapsedNs(self: *Backend, start_ns: u64) u64 {
+        const end_ns = self.openStatsNowNs();
+        return if (end_ns >= start_ns) end_ns - start_ns else 0;
+    }
+
     pub fn snapshotMaintenanceStats(self: *const Backend) MaintenanceStats {
         const mutable: *Backend = @constCast(self);
         const locked = runtime_mod.lockBackend(Backend, mutable);
@@ -644,6 +960,10 @@ pub const Backend = struct {
             .mutable_snapshot_clone_calls = self.mutable_snapshot_clone_calls,
             .mutable_snapshot_clone_bytes_total = self.mutable_snapshot_clone_bytes_total,
             .mutable_snapshot_clone_peak_bytes = self.mutable_snapshot_clone_peak_bytes,
+            .mutable_snapshot_clone_by_reason = self.mutable_snapshot_clone_by_reason,
+            .read_snapshot_mutable_rotations = self.read_snapshot_mutable_rotations,
+            .read_snapshot_mutable_rotation_bytes_total = self.read_snapshot_mutable_rotation_bytes_total,
+            .read_snapshot_mutable_rotation_peak_bytes = self.read_snapshot_mutable_rotation_peak_bytes,
             .immutable_memtables = @intCast(self.activeImmutableMemtableCount()),
             .total_runs = @intCast(self.runs.items.len),
             .obsolete_paths = @intCast(self.obsolete_paths.items.len),
@@ -700,9 +1020,10 @@ pub const Backend = struct {
             }
         }
 
-        const scheduler_stats = self.compaction_scheduler.snapshot();
+        const scheduler_stats = self.compaction_scheduler.snapshotAt(platform_time.monotonicNs());
         stats.compaction_scheduler_active_jobs = scheduler_stats.active_jobs;
         stats.compaction_scheduler_in_flight_input_bytes = scheduler_stats.in_flight_input_bytes;
+        stats.compaction_scheduler_active_oldest_age_ns = scheduler_stats.active_oldest_age_ns;
         stats.compaction_scheduler_grants = scheduler_stats.grants;
         stats.compaction_scheduler_completions = scheduler_stats.completions;
         stats.compaction_scheduler_denied_capacity = scheduler_stats.denied_capacity;
@@ -713,7 +1034,15 @@ pub const Backend = struct {
         stats.compaction_scheduler_remembered_hits = scheduler_stats.remembered_hits;
         stats.compaction_scheduler_remembered_stale = scheduler_stats.remembered_stale;
         stats.compaction_scheduler_conflict_denials = scheduler_stats.conflict_denials;
-        stats.compaction_scheduler_remembered_pending = if (self.remembered_compaction != null) 1 else 0;
+        if (self.remembered_compaction) |remembered| {
+            stats.compaction_scheduler_remembered_pending = 1;
+            stats.compaction_scheduler_remembered_pending_runs = @intCast(remembered.input_runs);
+            stats.compaction_scheduler_remembered_pending_bytes = remembered.input_bytes;
+        }
+        stats.background_io_budget_bytes = self.options.background_io_budget_bytes;
+        stats.background_io_reserved_bytes = self.background_io_reserved_bytes;
+        stats.background_io_denied_jobs = self.background_io_denied_jobs;
+        stats.background_io_oversized_jobs = self.background_io_oversized_jobs;
         stats.backend_lock_waits = self.backend_lock_waits.load(.monotonic);
         stats.backend_lock_wait_ns = self.backend_lock_wait_ns.load(.monotonic);
         stats.backend_lock_max_wait_ns = self.backend_lock_max_wait_ns.load(.monotonic);
@@ -721,9 +1050,19 @@ pub const Backend = struct {
             const wal_retention = wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?) catch wal_mod.RetentionStats{};
             stats.wal_retained_segments = wal_retention.segments;
             stats.wal_retained_bytes = wal_retention.bytes;
+            stats.wal_checkpoint_oldest_retained_segment = wal_retention.oldest_retained_segment;
+            stats.wal_checkpoint_covered_through_segment = wal_retention.checkpoint_covered_through_segment;
+            stats.wal_checkpoint_current_segment = wal_retention.current_segment;
+            if (wal_retention.current_segment > wal_retention.oldest_retained_segment) {
+                stats.wal_checkpoint_lag_segments = wal_retention.current_segment - wal_retention.oldest_retained_segment;
+            }
             const replay_retention = wal_mod.snapshotReplayRetention(self.storage.?, self.allocator, self.root_dir.?) catch wal_mod.RetentionStats{};
             stats.wal_retained_segments += replay_retention.segments;
             stats.wal_retained_bytes += replay_retention.bytes;
+            stats.wal_replay_retained_segments = replay_retention.segments;
+            stats.wal_replay_retained_bytes = replay_retention.bytes;
+            stats.wal_replay_current_segment = replay_retention.current_segment;
+            self.syncTrackedWalRetentionUsageLocked(stats.wal_retained_bytes);
         }
         self.syncTrackedInMemoryStateUsageLocked(stats);
         return stats;
@@ -751,6 +1090,11 @@ pub const Backend = struct {
 
     pub fn notePotentialMaintenanceDebt(self: *Backend) void {
         self.cached_maintenance_hint.store(1, .release);
+        self.wakeMaintenanceWorker();
+    }
+
+    fn wakeMaintenanceWorker(self: *Backend) void {
+        if (self.options.maintenance_waker) |waker| waker.wake();
     }
 
     pub fn refreshMaintenanceDebtHint(self: *Backend) void {
@@ -832,7 +1176,8 @@ pub const Backend = struct {
 
         score +|= level_overflow_runs * 500;
         score +|= level_overflow_bytes / (64 * 1024);
-        if (self.manifest_dirty or self.obsolete_manifest_dirty) score +|= 1;
+        score +|= self.walRetentionPressureScoreLocked();
+        if (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()) score +|= 1;
         return score;
     }
 
@@ -860,6 +1205,18 @@ pub const Backend = struct {
         );
     }
 
+    fn syncTrackedWalRetentionUsageCurrentLocked(self: *Backend) void {
+        if (!self.options.wal_enabled or self.root_dir == null) return;
+        const retention = wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?) catch wal_mod.RetentionStats{};
+        const replay_retention = wal_mod.snapshotReplayRetention(self.storage.?, self.allocator, self.root_dir.?) catch wal_mod.RetentionStats{};
+        self.syncTrackedWalRetentionUsageLocked(retention.bytes +| replay_retention.bytes);
+    }
+
+    fn syncTrackedWalRetentionUsageLocked(self: *Backend, bytes: u64) void {
+        const manager = self.options.resource_manager orelse return;
+        manager.observeUsage(.lsm_wal_retention, &self.tracked_wal_retention_bytes, bytes);
+    }
+
     fn estimateInMemoryStateBytesLocked(self: *const Backend) u64 {
         var bytes = estimateStateBytes(&self.mutable);
         for (self.activeImmutableMemtables()) |state| {
@@ -871,14 +1228,55 @@ pub const Backend = struct {
     fn releaseTrackedResourceUsage(self: *Backend) void {
         const manager = self.options.resource_manager orelse return;
         manager.observeUsage(.lsm_in_memory_state, &self.tracked_in_memory_state_bytes, 0);
+        manager.observeUsage(.lsm_wal_retention, &self.tracked_wal_retention_bytes, 0);
     }
 
     pub fn acquireCompactionGrant(self: *Backend, work: anytype) ?compaction_scheduler_mod.Grant {
-        return self.compaction_scheduler.tryAcquire(.{
+        const io_bytes = if (@hasField(@TypeOf(work), "io_bytes")) work.io_bytes else work.input_bytes;
+        if (!self.canReserveMaintenanceIoBudget(io_bytes)) return null;
+        var scheduler_work = compaction_scheduler_mod.Work{
             .score = work.score,
             .input_runs = work.input_runs,
             .input_bytes = work.input_bytes,
-        }, self.options.resource_manager);
+        };
+        if (@hasField(@TypeOf(work), "run_count") and @hasField(@TypeOf(work), "run_ids")) {
+            scheduler_work.run_count = work.run_count;
+            const copied_run_count = @min(work.run_count, scheduler_work.run_ids.len);
+            if (copied_run_count > 0) {
+                @memcpy(scheduler_work.run_ids[0..copied_run_count], work.run_ids[0..copied_run_count]);
+            }
+        }
+        const grant = self.compaction_scheduler.tryAcquireAt(scheduler_work, self.options.resource_manager, platform_time.monotonicNs()) orelse return null;
+        self.reserveMaintenanceIoBudgetAssumeAdmitted(io_bytes);
+        return grant;
+    }
+
+    fn canReserveMaintenanceIoBudget(self: *Backend, io_bytes: u64) bool {
+        const remaining = self.maintenance_io_budget_remaining orelse return true;
+        if (io_bytes == 0 or io_bytes <= remaining) return true;
+        const budget = self.options.background_io_budget_bytes;
+        if (self.options.background_io_allow_oversized_single_job and remaining == budget) return true;
+        self.background_io_denied_jobs +|= 1;
+        return false;
+    }
+
+    fn reserveMaintenanceIoBudgetAssumeAdmitted(self: *Backend, io_bytes: u64) void {
+        if (io_bytes == 0) return;
+        const remaining = self.maintenance_io_budget_remaining orelse return;
+        if (io_bytes <= remaining) {
+            self.maintenance_io_budget_remaining = remaining - io_bytes;
+            self.background_io_reserved_bytes +|= io_bytes;
+            return;
+        }
+        self.maintenance_io_budget_remaining = 0;
+        self.background_io_reserved_bytes +|= io_bytes;
+        self.background_io_oversized_jobs +|= 1;
+    }
+
+    fn tryReserveMaintenanceIoBudget(self: *Backend, io_bytes: u64) bool {
+        if (!self.canReserveMaintenanceIoBudget(io_bytes)) return false;
+        self.reserveMaintenanceIoBudgetAssumeAdmitted(io_bytes);
+        return true;
     }
 
     pub fn runMaintenanceStep(self: *Backend) !bool {
@@ -896,10 +1294,15 @@ pub const Backend = struct {
 
     fn runMaintenanceStepLocked(self: *Backend) !bool {
         if (self.options.backend.read_only or self.bulkIngestActive()) return false;
+        self.maintenance_io_budget_remaining = if (self.options.background_io_budget_bytes > 0)
+            self.options.background_io_budget_bytes
+        else
+            null;
+        defer self.maintenance_io_budget_remaining = null;
         const before_compactions = self.compaction_stats.compactions;
         const before_manifest_writes = self.write_stats.manifest_writes;
 
-        if (self.shouldFlushMutable()) {
+        if (self.shouldFlushMutable() or try self.shouldFlushMutableForWalPressureLocked()) {
             try self.rotateMutableToImmutable();
         }
         if (self.activeImmutableMemtableCount() > 0) {
@@ -915,7 +1318,7 @@ pub const Backend = struct {
             }
         }
         try self.enforceWritePressure();
-        if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty)) {
+        if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
             try self.persistManifest();
         }
 
@@ -944,8 +1347,47 @@ pub const Backend = struct {
         return snapshot;
     }
 
+    pub fn prepareReadSnapshot(self: *Backend) !void {
+        if (self.mutable_read_snapshot != null) return;
+        if (self.options.read_snapshot_rotate_mutable_bytes == 0) return;
+        if (self.mutable.entries.items.len == 0) return;
+        const mutable_bytes = estimateStateBytes(&self.mutable);
+        if (mutable_bytes < self.options.read_snapshot_rotate_mutable_bytes) return;
+
+        try self.rotateMutableToImmutable();
+        self.read_snapshot_mutable_rotations +|= 1;
+        self.read_snapshot_mutable_rotation_bytes_total +|= mutable_bytes;
+        self.read_snapshot_mutable_rotation_peak_bytes = @max(self.read_snapshot_mutable_rotation_peak_bytes, mutable_bytes);
+        if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
+        self.notePotentialMaintenanceDebt();
+    }
+
+    pub fn prepareCurrentScanSnapshot(self: *Backend) !void {
+        if (self.mutable.entries.items.len == 0) return;
+        const mutable_bytes = estimateStateBytes(&self.mutable);
+        try self.rotateMutableToImmutable();
+        self.read_snapshot_mutable_rotations +|= 1;
+        self.read_snapshot_mutable_rotation_bytes_total +|= mutable_bytes;
+        self.read_snapshot_mutable_rotation_peak_bytes = @max(self.read_snapshot_mutable_rotation_peak_bytes, mutable_bytes);
+        if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
+        self.notePotentialMaintenanceDebt();
+    }
+
+    pub fn prepareMutableForWrite(self: *Backend) !void {
+        if (self.active_mutable_value_readers == 0) return;
+        if (self.mutable.entries.items.len == 0) return;
+        try self.rotateMutableToImmutable();
+        if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
+        self.notePotentialMaintenanceDebt();
+    }
+
     pub fn snapshotMutableState(self: *Backend) !*const State {
+        return try self.snapshotMutableStateWithReason(.other);
+    }
+
+    pub fn snapshotMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !*const State {
         if (self.mutable_read_snapshot) |snapshot| return snapshot;
+        if (self.mutable.entries.items.len == 0) return &self.empty_mutable_snapshot;
         const snapshot = try self.allocator.create(State);
         errdefer self.allocator.destroy(snapshot);
         snapshot.* = try self.mutable.clone(self.allocator);
@@ -954,6 +1396,10 @@ pub const Backend = struct {
         self.mutable_snapshot_clone_calls +|= 1;
         self.mutable_snapshot_clone_bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_peak_bytes = @max(self.mutable_snapshot_clone_peak_bytes, snapshot_bytes);
+        const reason_index = mutableSnapshotReasonIndex(reason);
+        self.mutable_snapshot_clone_by_reason[reason_index].calls +|= 1;
+        self.mutable_snapshot_clone_by_reason[reason_index].bytes_total +|= snapshot_bytes;
+        self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes = @max(self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes, snapshot_bytes);
         try self.retired_mutable_snapshots.ensureUnusedCapacity(self.allocator, 1);
         self.mutable_read_snapshot = snapshot;
         return snapshot;
@@ -1049,6 +1495,7 @@ pub const Backend = struct {
         const oldest_active = self.oldestActiveWalSegment() orelse return;
         if (oldest_active <= 1) return;
         try wal_mod.retireCoveredSegments(self.storage.?, self.allocator, self.root_dir.?, oldest_active - 1);
+        self.syncTrackedWalRetentionUsageCurrentLocked();
     }
 
     fn estimateStateBytes(state: anytype) u64 {
@@ -1060,6 +1507,11 @@ pub const Backend = struct {
             total += @sizeOf(state_mod.OwnedEntry);
         }
         return total;
+    }
+
+    fn estimatedFlushIoBytes(state: *const State) u64 {
+        const bytes = estimateStateBytes(state);
+        return bytes +| bytes;
     }
 
     fn maintenanceLevelRunTarget(level: u32, base: usize, multiplier: usize) usize {
@@ -1131,14 +1583,17 @@ pub const Backend = struct {
     }
 
     pub fn maybeFlushMutable(self: *Backend) !void {
-        if (!self.shouldFlushMutable()) return;
-        if (self.shouldDeferCommitFlush()) {
-            try self.rotateMutableToImmutable();
-            self.scheduleImmutableFlushJob();
-            try self.enforceDeferredImmutableBackpressure();
-        } else {
-            try self.flushMutable();
+        if (self.shouldFlushMutable()) {
+            if (self.shouldDeferCommitFlush()) {
+                try self.rotateMutableToImmutable();
+                self.scheduleImmutableFlushJob();
+                try self.enforceDeferredImmutableBackpressure();
+            } else {
+                try self.flushMutable();
+            }
         }
+        try self.enforceWalRetentionHardPressureGuarded();
+        self.scheduleMaintenanceJobIfNeededLocked();
     }
 
     fn shouldDeferCommitFlush(self: *const Backend) bool {
@@ -1313,6 +1768,7 @@ pub const Backend = struct {
     fn directIngestMutableAtBulkFinishIfPossible(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
         if (self.mutable.entries.items.len == 0) return false;
+        if (self.active_mutable_value_readers != 0) return false;
         if (self.activeImmutableMemtableCount() != 0) return false;
         self.invalidateMutableReadSnapshot();
         var sorted = try self.mutable.toStateMove(self.allocator);
@@ -1327,6 +1783,10 @@ pub const Backend = struct {
     pub fn drainMutableBeforeBulkAppendDirectIngest(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
         if (self.mutable.entries.items.len == 0) return true;
+        if (self.active_mutable_value_readers != 0) {
+            try self.prepareMutableForWrite();
+            return false;
+        }
         if (self.activeImmutableMemtableCount() != 0) return false;
         self.invalidateMutableReadSnapshot();
         var sorted = try self.mutable.toStateMove(self.allocator);
@@ -1359,12 +1819,18 @@ pub const Backend = struct {
 
     fn scheduleImmutableFlushJob(self: *Backend) void {
         if (self.activeImmutableMemtableCount() == 0) return;
+        if (self.closing.load(.acquire)) return;
+        if (self.options.maintenance_waker != null) {
+            self.wakeMaintenanceWorker();
+            return;
+        }
         if (self.immutable_flush_job_in_flight) return;
         if (!self.background_executor.canRunDetached()) return;
 
         self.immutable_flush_job_in_flight = true;
         self.background_executor.submit(.commit_durable, self, runImmutableFlushJob, deinitImmutableFlushJob) catch |err| {
             self.immutable_flush_job_in_flight = false;
+            if (err == error.BackgroundOwnerClosing) return;
             std.log.warn("lsm immutable flush background scheduling failed root={?s} err={}", .{ self.root_dir, err });
         };
     }
@@ -1381,13 +1847,51 @@ pub const Backend = struct {
 
     fn deinitImmutableFlushJob(_: *anyopaque) void {}
 
+    fn scheduleMaintenanceJobIfNeededLocked(self: *Backend) void {
+        if (self.closing.load(.acquire)) return;
+        if (self.options.backend.read_only or self.bulkIngestActive()) return;
+        if (self.options.maintenance_waker != null) {
+            if (self.maintenanceScoreLocked() != 0) self.wakeMaintenanceWorker();
+            return;
+        }
+        if (self.maintenance_job_in_flight) return;
+        if (self.immutable_flush_job_in_flight or self.immutable_flush_build_in_flight) return;
+        if (self.activeImmutableMemtableCount() > 0) return;
+        if (!self.background_executor.canRunDetached()) return;
+        if (self.maintenanceScoreLocked() == 0) return;
+
+        self.maintenance_job_in_flight = true;
+        self.background_executor.submit(.maintenance, self, runMaintenanceJob, deinitMaintenanceJob) catch |err| {
+            self.maintenance_job_in_flight = false;
+            if (err == error.BackgroundOwnerClosing) return;
+            std.log.warn("lsm maintenance background scheduling failed root={?s} err={}", .{ self.root_dir, err });
+        };
+    }
+
+    fn runMaintenanceJob(ptr: *anyopaque) !void {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        errdefer self.maintenance_job_in_flight = false;
+        if (self.closing.load(.acquire)) {
+            self.maintenance_job_in_flight = false;
+            return;
+        }
+        const progressed = try self.runMaintenanceStepLocked();
+        self.maintenance_job_in_flight = false;
+        if (progressed and !self.closing.load(.acquire)) self.scheduleMaintenanceJobIfNeededLocked();
+    }
+
+    fn deinitMaintenanceJob(_: *anyopaque) void {}
+
     fn flushOldestImmutableMemtable(self: *Backend) !bool {
         if (self.activeImmutableMemtableCount() == 0) return false;
+        const state = self.immutable_memtables.items[self.immutable_head];
+        if (!self.tryReserveMaintenanceIoBudget(estimatedFlushIoBytes(state))) return false;
         if (self.root_dir != null and self.storage != null) {
             return try self.flushOldestImmutableMemtableUnlockedBuild();
         }
         const start_ns = self.writeStatsNowNs();
-        const state = self.immutable_memtables.items[self.immutable_head];
         const input_entries = state.entries.items.len;
 
         var new_runs = try compaction_mod.makeRunsFromStateBorrowed(Backend, self, state);
@@ -1761,11 +2265,16 @@ pub const Backend = struct {
             .{ .segment_bytes = self.options.wal_segment_bytes },
         );
         self.noteMutableWalSegment(try wal_mod.currentSegment(self.storage.?, self.allocator, self.root_dir.?));
+        self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_append_records += 1;
         self.write_stats.wal_append_entries += @intCast(state.entries.items.len);
         self.write_stats.wal_append_bytes += bytes;
-        self.write_stats.wal_append_ns += self.writeStatsElapsedNs(start_ns);
-        if (self.options.wal_sync_on_commit) self.write_stats.wal_sync_records += 1;
+        const append_ns = self.writeStatsElapsedNs(start_ns);
+        self.write_stats.wal_append_ns += append_ns;
+        if (self.options.wal_sync_on_commit) {
+            self.write_stats.wal_sync_records += 1;
+            self.write_stats.wal_sync_ns += append_ns;
+        }
     }
 
     pub fn replayWalIntoMutable(self: *Backend) !void {
@@ -1774,10 +2283,12 @@ pub const Backend = struct {
         const before_manifest_writes = self.write_stats.manifest_writes;
         self.recovery_replaying_wal = true;
         errdefer self.recovery_replaying_wal = false;
+        var recovery_session = RecoveryReplaySession{ .backend = self };
         const replay_hooks: ?wal_mod.ReplayHooks = if (!self.options.backend.read_only)
             .{
-                .ctx = @ptrCast(self),
+                .ctx = @ptrCast(&recovery_session),
                 .entry_allocator = replayWalEntryAllocatorHook,
+                .on_applied_entry = replayWalAppliedEntryHook,
                 .on_applied_record = replayWalAppliedRecordHook,
             }
         else
@@ -1801,32 +2312,96 @@ pub const Backend = struct {
                 .first = retention.oldest_retained_segment,
                 .last = retention.current_segment,
             };
+        self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_replay_records += stats.records;
         self.write_stats.wal_replay_entries += stats.entries;
         self.write_stats.wal_replay_bytes += stats.bytes;
         self.write_stats.wal_replay_ns += self.writeStatsElapsedNs(start_ns);
         self.write_stats.wal_replay_truncated_tail_bytes += stats.truncated_tail_bytes;
+        self.write_stats.wal_replay_recovery_flushes += recovery_session.flushes;
+        self.write_stats.wal_replay_recovery_entry_bytes += recovery_session.total_entry_bytes;
+        self.write_stats.wal_replay_recovery_window_peak_bytes = @max(
+            self.write_stats.wal_replay_recovery_window_peak_bytes,
+            recovery_session.peak_window_bytes,
+        );
+    }
+
+    const RecoveryReplaySession = struct {
+        backend: *Backend,
+        active_window_bytes: u64 = 0,
+        peak_window_bytes: u64 = 0,
+        total_entry_bytes: u64 = 0,
+        flushes: u64 = 0,
+
+        fn noteEntry(self: *@This(), segment: u64, entry_bytes: u64) !void {
+            if (segment != 0) self.backend.noteMutableWalSegment(segment);
+            self.active_window_bytes +|= entry_bytes;
+            self.total_entry_bytes +|= entry_bytes;
+            self.peak_window_bytes = @max(self.peak_window_bytes, self.active_window_bytes);
+            if (!self.backend.shouldFlushMutable()) return;
+            try self.backend.flushMutable();
+            self.flushes += 1;
+            self.active_window_bytes = 0;
+        }
+
+        fn noteRecord(self: *@This(), segment: u64) !void {
+            if (segment != 0) self.backend.noteMutableWalSegment(segment);
+            if (!self.backend.shouldFlushMutable()) return;
+            try self.backend.flushMutable();
+            self.flushes += 1;
+            self.active_window_bytes = 0;
+        }
+
+        fn entryAllocator(self: *@This(), default_allocator: Allocator) !Allocator {
+            // ActiveMemTable owns structural containers on the backend allocator.
+            // During recovery, entry byte copies live in the current mutable
+            // arena, which is transferred to the immutable flush window and
+            // released wholesale when that flush retires.
+            _ = try self.backend.mutable.ensureRecoveryAllocator(default_allocator);
+            return default_allocator;
+        }
+    };
+
+    fn replayWalAppliedEntryHook(ctx: *anyopaque, segment: u64, entry_bytes: u64) anyerror!void {
+        const session: *RecoveryReplaySession = @ptrCast(@alignCast(ctx));
+        try session.noteEntry(segment, entry_bytes);
     }
 
     fn replayWalAppliedRecordHook(ctx: *anyopaque, segment: u64, _: u64) anyerror!void {
-        const self: *Backend = @ptrCast(@alignCast(ctx));
-        if (segment != 0) self.noteMutableWalSegment(segment);
-        if (!self.shouldFlushMutable()) return;
-        try self.flushMutable();
+        const session: *RecoveryReplaySession = @ptrCast(@alignCast(ctx));
+        try session.noteRecord(segment);
     }
 
     fn replayWalEntryAllocatorHook(ctx: *anyopaque, default_allocator: Allocator) anyerror!Allocator {
-        const self: *Backend = @ptrCast(@alignCast(ctx));
-        _ = try self.mutable.ensureRecoveryAllocator(default_allocator);
-        return default_allocator;
+        const session: *RecoveryReplaySession = @ptrCast(@alignCast(ctx));
+        return try session.entryAllocator(default_allocator);
     }
 
     fn resetWalAfterManifestCheckpoint(self: *Backend) !void {
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
         const start_ns = self.writeStatsNowNs();
         try wal_mod.reset(self.storage.?, self.allocator, self.root_dir.?);
+        self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_resets += 1;
         self.write_stats.wal_reset_ns += self.writeStatsElapsedNs(start_ns);
+    }
+
+    pub fn checkpointWalAfterDurableBoundary(self: *Backend) !void {
+        if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+
+        const saved_budget = self.maintenance_io_budget_remaining;
+        self.maintenance_io_budget_remaining = null;
+        defer self.maintenance_io_budget_remaining = saved_budget;
+
+        if (self.mutable.entries.items.len > 0) {
+            try self.rotateMutableToImmutable();
+        }
+        while (self.activeImmutableMemtableCount() > 0) {
+            if (!try self.flushOldestImmutableMemtable()) break;
+        }
+        try self.maybeCheckpointWalAfterManifestPublish();
     }
 
     pub fn writeStatsNowNs(_: *Backend) u64 {
@@ -1978,6 +2553,19 @@ pub const Backend = struct {
         self.active_readers += 1;
     }
 
+    pub fn retainActiveMutableValueReader(self: *Backend) void {
+        self.active_mutable_value_readers += 1;
+    }
+
+    pub fn releaseActiveMutableValueReader(self: *Backend) void {
+        std.debug.assert(self.active_mutable_value_readers > 0);
+        self.active_mutable_value_readers -= 1;
+    }
+
+    pub fn canBorrowActiveMutableValues(self: *const Backend) bool {
+        return self.active_mutable_value_readers > 0;
+    }
+
     pub fn recordPointGet(self: *Backend) void {
         _ = self.read_stats.point_gets.fetchAdd(1, .monotonic);
     }
@@ -2049,8 +2637,55 @@ pub const Backend = struct {
         _ = self.read_stats.run_probes.fetchAdd(1, .monotonic);
     }
 
+    pub fn recordPointRunPrecheck(self: *Backend) void {
+        _ = self.read_stats.point_run_prechecks.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointRunPrecheckSurvivor(self: *Backend) void {
+        _ = self.read_stats.point_run_precheck_survivors.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointRunSurvivorRead(self: *Backend) void {
+        _ = self.read_stats.point_run_survivor_reads.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointRunSurvivorHit(self: *Backend) void {
+        _ = self.read_stats.point_run_survivor_hits.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointRunSurvivorMiss(self: *Backend) void {
+        _ = self.read_stats.point_run_survivor_misses.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointRunSurvivorTombstone(self: *Backend) void {
+        _ = self.read_stats.point_run_survivor_tombstones.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointRunAsyncBatch(self: *Backend, reads_issued: usize) void {
+        _ = self.read_stats.point_run_async_batches.fetchAdd(1, .monotonic);
+        _ = self.read_stats.point_run_async_reads_issued.fetchAdd(@intCast(reads_issued), .monotonic);
+    }
+
+    pub fn recordPointRunAsyncCancel(self: *Backend) void {
+        _ = self.read_stats.point_run_async_reads_canceled.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointRunAsyncWait(self: *Backend, elapsed_ns: u64) void {
+        _ = self.read_stats.point_run_async_wait_ns.fetchAdd(elapsed_ns, .monotonic);
+    }
+
     pub fn recordBloomNegative(self: *Backend) void {
         _ = self.read_stats.bloom_negatives.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPrefixBloomNegative(self: *Backend) void {
+        _ = self.read_stats.bloom_negatives.fetchAdd(1, .monotonic);
+        _ = self.read_stats.prefix_bloom_negatives.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordBlockPrefixBloomNegative(self: *Backend) void {
+        _ = self.read_stats.bloom_negatives.fetchAdd(1, .monotonic);
+        _ = self.read_stats.block_prefix_bloom_negatives.fetchAdd(1, .monotonic);
     }
 
     pub fn recordReadHintAttempt(self: *Backend) void {
@@ -2111,12 +2746,44 @@ pub const Backend = struct {
         _ = self.read_stats.local_block_cache_misses.fetchAdd(1, .monotonic);
     }
 
+    pub fn localBlockCacheEnabled(self: *const Backend) bool {
+        return self.options.local_block_cache_enabled;
+    }
+
     pub fn recordCursorBlockReuse(self: *Backend) void {
         _ = self.read_stats.cursor_block_reuses.fetchAdd(1, .monotonic);
     }
 
     pub fn recordCursorBlockLoad(self: *Backend) void {
         _ = self.read_stats.cursor_block_loads.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordCursorBlockReadahead(self: *Backend) void {
+        _ = self.read_stats.cursor_block_readaheads.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordCursorTableIndexHit(self: *Backend) void {
+        _ = self.read_stats.cursor_table_index_hits.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordCursorTableIndexMiss(self: *Backend) void {
+        _ = self.read_stats.cursor_table_index_misses.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordCursorValueBorrow(self: *Backend) void {
+        _ = self.read_stats.cursor_value_borrows.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordCursorValueCopy(self: *Backend) void {
+        _ = self.read_stats.cursor_value_copies.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointValueBorrow(self: *Backend) void {
+        _ = self.read_stats.point_value_borrows.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointValueCopy(self: *Backend) void {
+        _ = self.read_stats.point_value_copies.fetchAdd(1, .monotonic);
     }
 
     pub fn recordRunGroupBuild(self: *Backend, total_runs: usize, l0_runs: usize, elapsed_ns: u64) void {
@@ -2336,6 +3003,7 @@ pub const Backend = struct {
         block_offset: u64,
         block_len: u32,
     ) ?[]const u8 {
+        if (!self.options.local_block_cache_enabled) return null;
         for (self.run_block_cache.items) |*cached| {
             if (cached.run_id != run_id or
                 cached.block_offset != block_offset or
@@ -2355,6 +3023,10 @@ pub const Backend = struct {
         block_len: u32,
         block: []u8,
     ) ![]const u8 {
+        if (!self.options.local_block_cache_enabled) {
+            self.allocator.free(block);
+            return &.{};
+        }
         errdefer self.allocator.free(block);
         const cached_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(cached_path);
@@ -2384,12 +3056,24 @@ pub const Backend = struct {
 
     pub fn finalizeWriteReaderRelease(self: *Backend) !void {
         self.releaseReader();
-        if ((!self.manifest_dirty and !self.obsolete_manifest_dirty) or
+        const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
+        if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
             self.active_readers != 0 or
             self.bulkIngestActive() or
             self.root_dir == null or
             self.options.backend.read_only) return;
         try self.persistManifest();
+    }
+
+    pub fn finalizeReadReaderRelease(self: *Backend) void {
+        self.releaseReader();
+        const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
+        if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
+            self.active_readers != 0 or
+            self.bulkIngestActive() or
+            self.root_dir == null or
+            self.options.backend.read_only) return;
+        self.persistManifest() catch {};
     }
 
     pub fn beginBatchMode(self: *Backend, options: backend_types.BatchOptions) void {
@@ -2435,6 +3119,54 @@ pub const Backend = struct {
         return self.mutable.entries.items.len >= self.effectiveFlushThreshold();
     }
 
+    fn shouldFlushMutableForWalPressureLocked(self: *Backend) !bool {
+        if (self.mutable.entries.items.len == 0) return false;
+        const retention = try self.snapshotWalRetentionForPressureLocked() orelse return false;
+        return self.walRetentionOverSoftLimit(retention);
+    }
+
+    fn walRetentionPressureEnabled(self: *const Backend) bool {
+        return self.options.wal_soft_limit_segments > 0 or
+            self.options.wal_hard_limit_segments > 0 or
+            self.options.wal_soft_limit_bytes > 0 or
+            self.options.wal_hard_limit_bytes > 0;
+    }
+
+    fn snapshotWalRetentionForPressureLocked(self: *Backend) !?wal_mod.RetentionStats {
+        if (!self.walRetentionPressureEnabled()) return null;
+        if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return null;
+        return try wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?);
+    }
+
+    fn walRetentionOverSoftLimit(self: *const Backend, retention: wal_mod.RetentionStats) bool {
+        if (self.options.wal_soft_limit_segments > 0 and retention.segments > self.options.wal_soft_limit_segments) return true;
+        if (self.options.wal_soft_limit_bytes > 0 and retention.bytes > self.options.wal_soft_limit_bytes) return true;
+        return self.walRetentionOverHardLimit(retention);
+    }
+
+    fn walRetentionOverHardLimit(self: *const Backend, retention: wal_mod.RetentionStats) bool {
+        if (self.options.wal_hard_limit_segments > 0 and retention.segments > self.options.wal_hard_limit_segments) return true;
+        if (self.options.wal_hard_limit_bytes > 0 and retention.bytes > self.options.wal_hard_limit_bytes) return true;
+        return false;
+    }
+
+    fn walRetentionPressureScoreLocked(self: *Backend) u64 {
+        const retention = self.snapshotWalRetentionForPressureLocked() catch return 0;
+        const stats = retention orelse return 0;
+        var score: u64 = 0;
+        if (self.options.wal_hard_limit_segments > 0 and stats.segments > self.options.wal_hard_limit_segments) {
+            score +|= (stats.segments - self.options.wal_hard_limit_segments) * 1_000_000;
+        } else if (self.options.wal_soft_limit_segments > 0 and stats.segments > self.options.wal_soft_limit_segments) {
+            score +|= (stats.segments - self.options.wal_soft_limit_segments) * 10_000;
+        }
+        if (self.options.wal_hard_limit_bytes > 0 and stats.bytes > self.options.wal_hard_limit_bytes) {
+            score +|= (stats.bytes - self.options.wal_hard_limit_bytes) / 1024;
+        } else if (self.options.wal_soft_limit_bytes > 0 and stats.bytes > self.options.wal_soft_limit_bytes) {
+            score +|= (stats.bytes - self.options.wal_soft_limit_bytes) / (16 * 1024);
+        }
+        return score;
+    }
+
     fn effectiveL0SoftLimitRuns(self: *const Backend) usize {
         if (self.options.l0_soft_limit_runs != 0) return self.options.l0_soft_limit_runs;
         return self.options.compact_threshold_runs;
@@ -2443,31 +3175,106 @@ pub const Backend = struct {
     fn effectiveL0HardLimitRuns(self: *const Backend) usize {
         if (self.options.l0_hard_limit_runs != 0) return self.options.l0_hard_limit_runs;
         const soft = self.effectiveL0SoftLimitRuns();
-        return std.math.mul(usize, @max(@as(usize, 1), soft), 4) catch std.math.maxInt(usize);
+        return std.math.mul(usize, @max(@as(usize, 1), soft), 2) catch std.math.maxInt(usize);
     }
 
-    fn enforceWritePressure(self: *Backend) !void {
+    const L0Pressure = struct {
+        runs: usize = 0,
+        bytes: u64 = 0,
+
+        fn overHardLimit(self: @This(), hard_runs: usize, hard_bytes: u64) bool {
+            return (hard_runs > 0 and self.runs > hard_runs) or
+                (hard_bytes > 0 and self.bytes > hard_bytes);
+        }
+    };
+
+    fn snapshotL0PressureLocked(self: *const Backend) L0Pressure {
+        var pressure = L0Pressure{};
+        while (pressure.runs < self.runs.items.len and self.runs.items[pressure.runs].level == 0) : (pressure.runs += 1) {
+            pressure.bytes += self.runs.items[pressure.runs].size_bytes;
+        }
+        return pressure;
+    }
+
+    fn enforceWritePressure(self: *Backend) anyerror!void {
         if (self.bulkIngestActive()) return;
+        if (self.write_pressure_enforcing) return;
+        self.write_pressure_enforcing = true;
+        defer self.write_pressure_enforcing = false;
+
+        try self.enforceWalRetentionHardPressure();
+
         const hard_runs = self.effectiveL0HardLimitRuns();
         const hard_bytes = self.options.l0_hard_limit_bytes;
         if (hard_runs == 0 and hard_bytes == 0) return;
 
-        var l0_runs: usize = 0;
-        var l0_bytes: u64 = 0;
-        while (l0_runs < self.runs.items.len and self.runs.items[l0_runs].level == 0) : (l0_runs += 1) {
-            l0_bytes += self.runs.items[l0_runs].size_bytes;
-        }
-        const over_runs = hard_runs > 0 and l0_runs > hard_runs;
-        const over_bytes = hard_bytes > 0 and l0_bytes > hard_bytes;
-        if (!over_runs and !over_bytes) return;
+        var pressure = self.snapshotL0PressureLocked();
+        if (!pressure.overHardLimit(hard_runs, hard_bytes)) return;
 
         const start_ns = self.writeStatsNowNs();
+        self.write_stats.write_pressure_events += 1;
         const target_runs = if (self.options.l0_soft_limit_runs != 0) self.options.l0_soft_limit_runs else self.options.compact_threshold_runs;
         const before_compactions = self.compaction_stats.compactions;
-        try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
-        if (self.compaction_stats.compactions != before_compactions) {
-            self.write_stats.write_pressure_compactions += 1;
-            self.write_stats.write_pressure_ns += self.writeStatsElapsedNs(start_ns);
+        const max_steps = @max(@as(usize, 1), self.options.write_pressure_max_compaction_steps);
+        var steps: usize = 0;
+        while (pressure.overHardLimit(hard_runs, hard_bytes) and steps < max_steps) {
+            const before_step_compactions = self.compaction_stats.compactions;
+            try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
+            if (self.compaction_stats.compactions == before_step_compactions) break;
+            steps += self.compaction_stats.compactions - before_step_compactions;
+            pressure = self.snapshotL0PressureLocked();
+        }
+
+        const compaction_delta = self.compaction_stats.compactions - before_compactions;
+        self.write_stats.write_pressure_compactions += @intCast(compaction_delta);
+        self.write_stats.write_pressure_compaction_steps += @intCast(steps);
+        self.write_stats.write_pressure_ns += self.writeStatsElapsedNs(start_ns);
+
+        if (pressure.overHardLimit(hard_runs, hard_bytes)) {
+            self.write_stats.write_pressure_overloads += 1;
+            if (self.options.write_pressure_reject_on_overload) {
+                self.write_stats.write_pressure_rejections += 1;
+                return error.WritePressureExceeded;
+            }
+        }
+    }
+
+    fn enforceWalRetentionHardPressureGuarded(self: *Backend) anyerror!void {
+        if (self.bulkIngestActive()) return;
+        if (self.write_pressure_enforcing) return;
+        self.write_pressure_enforcing = true;
+        defer self.write_pressure_enforcing = false;
+        try self.enforceWalRetentionHardPressure();
+    }
+
+    fn enforceWalRetentionHardPressure(self: *Backend) anyerror!void {
+        var retention = try self.snapshotWalRetentionForPressureLocked() orelse return;
+        if (!self.walRetentionOverHardLimit(retention)) return;
+
+        const start_ns = self.writeStatsNowNs();
+        var flushes: u64 = 0;
+        if (self.mutable.entries.items.len > 0) {
+            try self.rotateMutableToImmutable();
+        }
+
+        const saved_budget = self.maintenance_io_budget_remaining;
+        self.maintenance_io_budget_remaining = null;
+        defer self.maintenance_io_budget_remaining = saved_budget;
+
+        while (self.activeImmutableMemtableCount() > 0 and self.walRetentionOverHardLimit(retention)) {
+            if (!try self.flushOldestImmutableMemtable()) break;
+            flushes += 1;
+            retention = try self.snapshotWalRetentionForPressureLocked() orelse break;
+        }
+
+        if (self.activeImmutableMemtableCount() == 0 and self.mutable.entries.items.len == 0 and self.walRetentionOverHardLimit(retention)) {
+            try self.resetWalAfterManifestCheckpoint();
+            retention = try self.snapshotWalRetentionForPressureLocked() orelse retention;
+        }
+
+        if (flushes > 0 or !self.walRetentionOverHardLimit(retention)) {
+            self.write_stats.wal_pressure_flushes += flushes;
+            self.write_stats.wal_pressure_ns += self.writeStatsElapsedNs(start_ns);
         }
     }
 
@@ -2509,7 +3316,7 @@ pub const Backend = struct {
         try self.runForegroundCompactionBudget(options);
         if (options.compact) {
             try self.finalizeDeferredRunWork(.{ .force_soft_compaction = true });
-        } else if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty)) {
+        } else if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
             try self.persistManifest();
         } else {
             _ = self.refreshCachedMaintenanceHintLocked();
@@ -2527,7 +3334,7 @@ pub const Backend = struct {
                 }
             }
             try self.runForegroundCompactionBudget(options);
-            if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty)) {
+            if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
                 try self.persistManifest();
             } else {
                 _ = self.refreshCachedMaintenanceHintLocked();
@@ -2591,7 +3398,7 @@ pub const Backend = struct {
         if (!self.bulkIngestActive() and (options.force_soft_compaction or self.options.foreground_soft_compaction)) {
             try self.maybeCompactRuns();
         }
-        if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty)) {
+        if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
             try self.persistManifest();
         }
     }
@@ -2660,6 +3467,16 @@ pub const Backend = struct {
             removed.deinit(self.allocator);
         }
         return needs_follow_up;
+    }
+
+    fn hasReclaimableObsoletePathsLocked(self: *Backend) bool {
+        if (self.active_readers != 0 or self.obsolete_paths.items.len == 0) return false;
+        if (self.root_dir == null or self.storage == null or self.options.backend.read_only) return false;
+        const now_ns = self.nowNs();
+        for (self.obsolete_paths.items) |obsolete| {
+            if (obsolete.delete_after_ns <= now_ns) return true;
+        }
+        return false;
     }
 
     fn nowNs(self: *Backend) u64 {
@@ -2743,38 +3560,289 @@ pub const Backend = struct {
     }
 };
 
+const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.single_threaded) struct {
+    backend: *Backend,
+
+    const Stats = struct {
+        wakeups: u64 = 0,
+        maintenance_steps: u64 = 0,
+        errors: u64 = 0,
+        joined: bool = false,
+    };
+
+    fn init(backend: *Backend) InternalFlushWorker {
+        return .{ .backend = backend };
+    }
+
+    fn start(_: *InternalFlushWorker) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    fn stopAndJoin(_: *InternalFlushWorker, _: bool) void {}
+
+    fn waker(self: *InternalFlushWorker) MaintenanceWaker {
+        return .{ .ptr = self, .wake_fn = wake };
+    }
+
+    fn wake(_: *anyopaque) void {}
+
+    fn snapshotStats(_: *InternalFlushWorker) Stats {
+        return .{};
+    }
+} else struct {
+    backend: *Backend,
+    mutex: std.atomic.Mutex = .unlocked,
+    thread: ?std.Thread = null,
+    stop_requested: bool = false,
+    drain_on_stop: bool = false,
+    wake_requested: bool = false,
+    wakeups: u64 = 0,
+    maintenance_steps: u64 = 0,
+    errors: u64 = 0,
+    joined: bool = false,
+
+    const Stats = struct {
+        wakeups: u64 = 0,
+        maintenance_steps: u64 = 0,
+        errors: u64 = 0,
+        joined: bool = false,
+    };
+
+    fn init(backend: *Backend) InternalFlushWorker {
+        return .{ .backend = backend };
+    }
+
+    fn start(self: *InternalFlushWorker) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn stopAndJoin(self: *InternalFlushWorker, drain: bool) void {
+        lockWorkerMutex(&self.mutex);
+        self.stop_requested = true;
+        self.drain_on_stop = self.drain_on_stop or drain;
+        self.wake_requested = true;
+        self.mutex.unlock();
+
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+            self.joined = true;
+        }
+    }
+
+    fn waker(self: *InternalFlushWorker) MaintenanceWaker {
+        return .{ .ptr = self, .wake_fn = wake };
+    }
+
+    fn wake(ptr: *anyopaque) void {
+        const self: *InternalFlushWorker = @ptrCast(@alignCast(ptr));
+        lockWorkerMutex(&self.mutex);
+        self.wake_requested = true;
+        self.wakeups +|= 1;
+        self.mutex.unlock();
+    }
+
+    fn snapshotStats(self: *InternalFlushWorker) Stats {
+        lockWorkerMutex(&self.mutex);
+        defer self.mutex.unlock();
+        return .{
+            .wakeups = self.wakeups,
+            .maintenance_steps = self.maintenance_steps,
+            .errors = self.errors,
+            .joined = self.joined,
+        };
+    }
+
+    fn run(self: *InternalFlushWorker) void {
+        while (true) {
+            const drain_then_stop = self.waitForWork();
+            if (drain_then_stop) {
+                self.drainMaintenance();
+                return;
+            }
+            self.drainMaintenance();
+        }
+    }
+
+    fn waitForWork(self: *InternalFlushWorker) bool {
+        while (true) {
+            lockWorkerMutex(&self.mutex);
+            if (self.stop_requested or self.wake_requested) break;
+            self.mutex.unlock();
+            sleepForTest(2 * std.time.ns_per_ms);
+        }
+        defer self.mutex.unlock();
+        const drain_then_stop = self.stop_requested and self.drain_on_stop;
+        if (self.stop_requested and !drain_then_stop) return true;
+        self.wake_requested = false;
+        return drain_then_stop;
+    }
+
+    fn drainMaintenance(self: *InternalFlushWorker) void {
+        var steps: usize = 0;
+        while (steps < 64) : (steps += 1) {
+            const progressed = self.backend.runMaintenanceStep() catch |err| {
+                self.recordError(err);
+                return;
+            };
+            if (!progressed) return;
+            self.recordStep();
+        }
+        lockWorkerMutex(&self.mutex);
+        self.wake_requested = true;
+        self.mutex.unlock();
+    }
+
+    fn recordStep(self: *InternalFlushWorker) void {
+        lockWorkerMutex(&self.mutex);
+        self.maintenance_steps +|= 1;
+        self.mutex.unlock();
+    }
+
+    fn recordError(self: *InternalFlushWorker, err: anyerror) void {
+        lockWorkerMutex(&self.mutex);
+        self.errors +|= 1;
+        self.mutex.unlock();
+        std.log.warn("lsm internal flush worker failed root={?s} err={}", .{ self.backend.root_dir, err });
+    }
+};
+
+fn lockWorkerMutex(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) {
+        std.Thread.yield() catch {};
+    }
+}
+
+pub const InternalFlushWorkerStats = InternalFlushWorker.Stats;
+
 pub const BackendHandle = struct {
     allocator: Allocator,
     backend: *Backend,
+    background_runtime: ?background_runtime_mod.BackendRuntimeHandle = null,
+    internal_flush_worker: ?*InternalFlushWorker = null,
 
     pub fn init(allocator: Allocator, options: Options) !BackendHandle {
+        return try initWithConfig(allocator, options, .{});
+    }
+
+    pub fn initWithConfig(allocator: Allocator, options: Options, config: BackendHandleConfig) !BackendHandle {
         const backend = try allocator.create(Backend);
         errdefer allocator.destroy(backend);
-        backend.* = Backend.init(allocator, options);
+
+        var owned_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
+        errdefer if (owned_runtime) |*runtime| runtime.deinit();
+        var internal_flush_worker: ?*InternalFlushWorker = null;
+        errdefer if (internal_flush_worker) |worker| {
+            worker.stopAndJoin(true);
+            allocator.destroy(worker);
+        };
+
+        var resolved_options = options;
+        if (config.background_runtime) |runtime_config| {
+            if (resolved_options.background_executor != null) return error.BackgroundExecutorAlreadyConfigured;
+            owned_runtime = try background_runtime_mod.BackendRuntimeHandle.init(allocator, runtime_config);
+            const runtime = owned_runtime.?.ptr();
+            const executor = BackgroundExecutor.init(runtime, runtime.allocOwnerId());
+            resolved_options.background_executor = &executor;
+            if (resolved_options.read_runtime == null) {
+                if (runtime.io()) |io| resolved_options.read_runtime = storage_io.ReadRuntime.init(io);
+            }
+        }
+
+        backend.* = Backend.init(allocator, resolved_options);
+        if (config.internal_flush_worker) {
+            internal_flush_worker = try startInternalFlushWorker(allocator, backend);
+        }
         return .{
             .allocator = allocator,
             .backend = backend,
+            .background_runtime = owned_runtime,
+            .internal_flush_worker = internal_flush_worker,
         };
     }
 
     pub fn open(allocator: Allocator, root_dir: []const u8, options: Options) !BackendHandle {
+        return try openWithConfig(allocator, root_dir, options, .{});
+    }
+
+    pub fn openWithConfig(allocator: Allocator, root_dir: []const u8, options: Options, config: BackendHandleConfig) !BackendHandle {
         const backend = try allocator.create(Backend);
         errdefer allocator.destroy(backend);
-        try backend.openInto(allocator, root_dir, options);
+
+        var owned_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
+        errdefer if (owned_runtime) |*runtime| runtime.deinit();
+        var internal_flush_worker: ?*InternalFlushWorker = null;
+        errdefer if (internal_flush_worker) |worker| {
+            worker.stopAndJoin(true);
+            allocator.destroy(worker);
+        };
+
+        var resolved_options = options;
+        if (config.background_runtime) |runtime_config| {
+            if (resolved_options.background_executor != null) return error.BackgroundExecutorAlreadyConfigured;
+            owned_runtime = try background_runtime_mod.BackendRuntimeHandle.init(allocator, runtime_config);
+            const runtime = owned_runtime.?.ptr();
+            const executor = BackgroundExecutor.init(runtime, runtime.allocOwnerId());
+            resolved_options.background_executor = &executor;
+            if (resolved_options.read_runtime == null) {
+                if (runtime.io()) |io| resolved_options.read_runtime = storage_io.ReadRuntime.init(io);
+            }
+        }
+
+        try backend.openInto(allocator, root_dir, resolved_options);
+        if (config.internal_flush_worker) {
+            internal_flush_worker = try startInternalFlushWorker(allocator, backend);
+        }
         return .{
             .allocator = allocator,
             .backend = backend,
+            .background_runtime = owned_runtime,
+            .internal_flush_worker = internal_flush_worker,
         };
     }
 
     pub fn close(self: *BackendHandle) void {
+        if (self.internal_flush_worker) |worker| {
+            worker.stopAndJoin(true);
+            self.backend.options.maintenance_waker = null;
+            self.allocator.destroy(worker);
+            self.internal_flush_worker = null;
+        }
         self.backend.close();
         self.allocator.destroy(self.backend);
+        if (self.background_runtime) |*runtime| runtime.deinit();
         self.* = undefined;
     }
 
     pub fn ptr(self: *BackendHandle) *Backend {
         return self.backend;
+    }
+
+    pub fn ownedBackgroundRuntime(self: *BackendHandle) ?*background_runtime_mod.BackendRuntime {
+        return if (self.background_runtime) |*runtime| runtime.ptr() else null;
+    }
+
+    pub fn stopInternalFlushWorkerForTest(self: *BackendHandle) ?InternalFlushWorkerStats {
+        const worker = self.internal_flush_worker orelse return null;
+        worker.stopAndJoin(true);
+        self.backend.options.maintenance_waker = null;
+        return worker.snapshotStats();
+    }
+
+    pub fn internalFlushWorkerStats(self: *BackendHandle) ?InternalFlushWorkerStats {
+        const worker = self.internal_flush_worker orelse return null;
+        return worker.snapshotStats();
+    }
+
+    fn startInternalFlushWorker(allocator: Allocator, backend: *Backend) !*InternalFlushWorker {
+        if (backend.options.maintenance_waker != null) return error.MaintenanceWakerAlreadyConfigured;
+        const worker = try allocator.create(InternalFlushWorker);
+        errdefer allocator.destroy(worker);
+        worker.* = InternalFlushWorker.init(backend);
+        backend.options.maintenance_waker = worker.waker();
+        errdefer backend.options.maintenance_waker = null;
+        try worker.start();
+        return worker;
     }
 };
 
@@ -3034,6 +4102,63 @@ fn countRunEntriesForTest(backend: *Backend) !usize {
     return count;
 }
 
+fn appendSyntheticLevelRunsForTest(backend: *Backend, level: u32, count: usize, size_bytes: u64) !void {
+    for (0..count) |idx| {
+        try backend.runs.append(backend.allocator, .{
+            .id = @intCast(idx + 1),
+            .level = level,
+            .size_bytes = size_bytes,
+            .path = null,
+            .smallest_namespace_name = null,
+            .smallest_key = &.{},
+            .largest_namespace_name = null,
+            .largest_key = &.{},
+            .entry_count = 1,
+            .bloom_filter = null,
+            .encoded_bloom_filter = null,
+            .owns_metadata = false,
+            .state = null,
+        });
+    }
+}
+
+fn sleepForTest(duration_ns: u64) void {
+    if (comptime builtin.os.tag == .freestanding) return;
+    var req = std.posix.timespec{
+        .sec = @intCast(duration_ns / std.time.ns_per_s),
+        .nsec = @intCast(duration_ns % std.time.ns_per_s),
+    };
+    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => return,
+    };
+}
+
+test "lsm backend default base level target absorbs L0 pressure output" {
+    var backend = Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    try appendSyntheticLevelRunsForTest(&backend, 1, 28, 20 * 1024);
+
+    const stats = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.level_overflow_runs);
+    try std.testing.expectEqual(@as(u64, 0), stats.level_overflow_bytes);
+    try std.testing.expectEqual(@as(u64, 28), stats.lower_level_runs);
+}
+
+test "lsm backend tight base level target reports lower-level overflow" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .level_target_runs_base = 4,
+        .level_target_bytes_base = 128 * 1024,
+    });
+    defer backend.close();
+    try appendSyntheticLevelRunsForTest(&backend, 1, 28, 20 * 1024);
+
+    const stats = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 24), stats.level_overflow_runs);
+    try std.testing.expect(stats.level_overflow_bytes > 0);
+}
+
 test "lsm backend runtime erases namespace store handles" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 2 });
     defer backend.close();
@@ -3081,6 +4206,193 @@ test "lsm backend heap handle owns a stable backend pointer" {
     var read = try runtime.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("value", try read.get("doc:1"));
+}
+
+test "lsm backend heap handle can own a detached background runtime" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var handle = try BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-handle-owned-runtime-install-test",
+        .{ .storage = storage.storage() },
+        .{ .background_runtime = .{ .backend = .io_threaded } },
+    );
+    defer handle.close();
+
+    const backend = handle.ptr();
+    try std.testing.expect(handle.ownedBackgroundRuntime() != null);
+    try std.testing.expect(backend.background_executor.canRunDetached());
+    try std.testing.expect(backend.background_executor.jobs != null);
+    try std.testing.expect(backend.background_executor.owner_id != 0);
+}
+
+test "lsm backend heap handle owned runtime wakes deferred immutable flush" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var handle = try BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-handle-owned-runtime-flush-test",
+        .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .defer_flush_on_commit = true,
+        },
+        .{ .background_runtime = .{ .backend = .io_threaded } },
+    );
+    defer handle.close();
+
+    const backend = handle.ptr();
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key", "value");
+        try txn.commit();
+    }
+
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        _ = try backend.background_executor.poll(8);
+        const maintenance = backend.snapshotMaintenanceStats();
+        if (maintenance.immutable_memtables == 0 and maintenance.total_runs > 0) break;
+        sleepForTest(5 * std.time.ns_per_ms);
+    }
+
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.immutable_memtables);
+    try std.testing.expect(maintenance.total_runs > 0);
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
+}
+
+test "lsm backend heap handle internal flush worker wakes deferred immutable flush" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var handle = try BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-handle-internal-flush-worker-wake-test",
+        .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .defer_flush_on_commit = true,
+        },
+        .{ .internal_flush_worker = true },
+    );
+    defer handle.close();
+
+    const backend = handle.ptr();
+    try std.testing.expect(backend.options.maintenance_waker != null);
+    try std.testing.expect(!backend.background_executor.canRunDetached());
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key", "value");
+        try txn.commit();
+    }
+
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        const maintenance = backend.snapshotMaintenanceStats();
+        if (maintenance.immutable_memtables == 0 and maintenance.total_runs > 0) break;
+        sleepForTest(5 * std.time.ns_per_ms);
+    }
+
+    const worker_stats = handle.stopInternalFlushWorkerForTest().?;
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.immutable_memtables);
+    try std.testing.expect(maintenance.total_runs > 0);
+    try std.testing.expect(worker_stats.wakeups > 0);
+    try std.testing.expect(worker_stats.maintenance_steps > 0);
+    try std.testing.expectEqual(@as(u64, 0), worker_stats.errors);
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
+}
+
+test "lsm backend heap handle internal flush worker stop joins after final drain" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var handle = try BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-handle-internal-flush-worker-stop-test",
+        .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .defer_flush_on_commit = true,
+        },
+        .{ .internal_flush_worker = true },
+    );
+    defer handle.close();
+
+    const backend = handle.ptr();
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key", "value");
+        try txn.commit();
+    }
+
+    const worker_stats = handle.stopInternalFlushWorkerForTest().?;
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(worker_stats.joined);
+    try std.testing.expect(worker_stats.wakeups > 0);
+    try std.testing.expectEqual(@as(u64, 0), worker_stats.errors);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.immutable_memtables);
+    try std.testing.expect(maintenance.total_runs > 0);
+    try std.testing.expect(backend.options.maintenance_waker == null);
+}
+
+test "lsm backend heap handle internal flush worker compacts soft L0 pressure" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var handle = try BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-handle-internal-flush-worker-pressure-test",
+        .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .compact_threshold_runs = 100,
+            .l0_soft_limit_runs = 1,
+            .l0_hard_limit_runs = 100,
+        },
+        .{ .internal_flush_worker = true },
+    );
+    defer handle.close();
+
+    const backend = handle.ptr();
+    for (0..6) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "key:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, key, "value");
+        try txn.commit();
+    }
+
+    var maintenance = backend.snapshotMaintenanceStats();
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        maintenance = backend.snapshotMaintenanceStats();
+        if (maintenance.compaction_scheduler_grants > 0 and maintenance.l0_runs <= 1) break;
+        sleepForTest(5 * std.time.ns_per_ms);
+    }
+
+    const worker_stats = handle.stopInternalFlushWorkerForTest().?;
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(worker_stats.wakeups > 0);
+    try std.testing.expect(worker_stats.maintenance_steps > 0);
+    try std.testing.expectEqual(@as(u64, 0), worker_stats.errors);
+    try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
+    try std.testing.expect(maintenance.l0_runs <= 1);
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:0"));
 }
 
 test "lsm backend defaults background executor to inline mode" {
@@ -3141,6 +4453,7 @@ test "lsm backend copies configured background executor" {
         const vtable = background_runtime_mod.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };
@@ -3191,6 +4504,7 @@ test "lsm backend schedules deferred immutable flush on configured background ex
         const vtable = background_runtime_mod.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };
@@ -3269,6 +4583,7 @@ test "lsm backend close drains scheduled immutable flush before destroying backe
         const vtable = background_runtime_mod.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };
@@ -3328,6 +4643,7 @@ test "lsm backend deferred immutable queue enforces per-backend limit" {
         const vtable = background_runtime_mod.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };
@@ -3404,6 +4720,7 @@ test "lsm backend deferred immutable backpressure does not spin behind in-flight
         const vtable = background_runtime_mod.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };
@@ -3487,6 +4804,173 @@ test "lsm backend manual runtime flush progress does not require threads" {
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
 }
 
+test "lsm backend schedules detached maintenance job for compaction debt" {
+    const FakeLane = struct {
+        submitted_job: ?background_runtime_mod.Job = null,
+
+        fn lane(self: *@This()) background_runtime_mod.DurableJobLane {
+            return .{
+                .ptr = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.submitted_job == null);
+            self.submitted_job = job;
+        }
+
+        fn drainOwner(_: *anyopaque, _: u64) void {}
+
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+
+        const vtable = background_runtime_mod.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drainOwner,
+            .close_owner = drainOwner,
+            .poll = poll,
+        };
+    };
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var lane = FakeLane{};
+    const executor = BackgroundExecutor.initLane(lane.lane(), 782);
+    var backend = try Backend.open(std.testing.allocator, "/lsm-background-maintenance-job-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .background_executor = &executor,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:a", "a");
+        try txn.commit();
+    }
+    try std.testing.expect(lane.submitted_job == null);
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:b", "b");
+        try txn.commit();
+    }
+    try std.testing.expect(lane.submitted_job != null);
+    try std.testing.expect(backend.maintenance_job_in_flight);
+    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
+
+    var job = lane.submitted_job.?;
+    lane.submitted_job = null;
+    try job.run(job.ptr);
+    job.deinit(job.ptr);
+
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expect(backend.compaction_stats.compactions > 0);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+    try std.testing.expectEqualStrings("a", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:a"));
+    try std.testing.expectEqualStrings("b", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
+}
+
+test "lsm backend detached maintenance jobs reschedule while debt remains" {
+    const FakeLane = struct {
+        submitted_jobs: [16]background_runtime_mod.Job = undefined,
+        submitted_count: usize = 0,
+
+        fn lane(self: *@This()) background_runtime_mod.DurableJobLane {
+            return .{
+                .ptr = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.submitted_count < self.submitted_jobs.len);
+            self.submitted_jobs[self.submitted_count] = job;
+            self.submitted_count += 1;
+        }
+
+        fn pop(self: *@This()) ?background_runtime_mod.Job {
+            if (self.submitted_count == 0) return null;
+            const job = self.submitted_jobs[0];
+            var i: usize = 1;
+            while (i < self.submitted_count) : (i += 1) {
+                self.submitted_jobs[i - 1] = self.submitted_jobs[i];
+            }
+            self.submitted_count -= 1;
+            return job;
+        }
+
+        fn drainOwner(_: *anyopaque, _: u64) void {}
+
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+
+        const vtable = background_runtime_mod.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drainOwner,
+            .close_owner = drainOwner,
+            .poll = poll,
+        };
+    };
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var lane = FakeLane{};
+    const executor = BackgroundExecutor.initLane(lane.lane(), 783);
+    var backend = try Backend.open(std.testing.allocator, "/lsm-background-maintenance-reschedule-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .background_executor = &executor,
+    });
+    defer backend.close();
+
+    var key_buf: [16]u8 = undefined;
+    for (0..6) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "key:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, key, "value");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), lane.submitted_count);
+    try std.testing.expectEqual(@as(usize, 6), countLevelRuns(backend.runs.items, 0));
+
+    var first_job = lane.pop().?;
+    try first_job.run(first_job.ptr);
+    first_job.deinit(first_job.ptr);
+
+    try std.testing.expect(backend.maintenance_job_in_flight);
+    try std.testing.expect(backend.maintenanceScore() > 0);
+    try std.testing.expectEqual(@as(usize, 1), lane.submitted_count);
+
+    var drain_steps: usize = 0;
+    while (lane.pop()) |job_const| {
+        var job = job_const;
+        try job.run(job.ptr);
+        job.deinit(job.ptr);
+        drain_steps += 1;
+        try std.testing.expect(drain_steps < 16);
+    }
+
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expectEqual(@as(u64, 0), backend.maintenanceScore());
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+}
+
 test "lsm backends share one threaded runtime durable lane" {
     if (builtin.os.tag == .freestanding) return;
 
@@ -3531,6 +5015,11 @@ test "lsm backend replays committed mutable writes from wal after crash reopen" 
     };
 
     var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    var open_stats = backend.snapshotOpenStats();
+    try std.testing.expectEqual(Backend.OpenPhase.ready, open_stats.phase);
+    try std.testing.expectEqual(@as(u64, 1), open_stats.completed);
+    try std.testing.expect(!open_stats.loaded_manifest);
+    try std.testing.expect(open_stats.total_ns > 0);
     {
         var txn = try backend.beginWrite();
         defer txn.abort();
@@ -3544,6 +5033,19 @@ test "lsm backend replays committed mutable writes from wal after crash reopen" 
 
     backend = try Backend.open(std.testing.allocator, root_dir, options);
     defer backend.close();
+    open_stats = backend.snapshotOpenStats();
+    try std.testing.expectEqual(Backend.OpenPhase.ready, open_stats.phase);
+    try std.testing.expectEqual(@as(u64, 1), open_stats.completed);
+    try std.testing.expect(!open_stats.loaded_manifest);
+    try std.testing.expectEqual(@as(u64, 1), open_stats.mutable_entries_after_replay);
+    try std.testing.expect(open_stats.wal_replay_records > 0);
+    try std.testing.expect(open_stats.wal_replay_entries > 0);
+    try std.testing.expect(open_stats.wal_replay_bytes > 0);
+    try std.testing.expectEqual(backend.write_stats.wal_replay_records, open_stats.wal_replay_records);
+    try std.testing.expectEqual(backend.write_stats.wal_replay_entries, open_stats.wal_replay_entries);
+    try std.testing.expectEqual(backend.write_stats.wal_replay_bytes, open_stats.wal_replay_bytes);
+    try std.testing.expectEqual(backend.write_stats.wal_replay_ns, open_stats.wal_replay_ns);
+    try std.testing.expectEqual(backend.write_stats.wal_replay_truncated_tail_bytes, open_stats.wal_replay_truncated_tail_bytes);
     var read = try backend.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
@@ -3571,6 +5073,10 @@ test "lsm backend maintenance stats report retained wal debt across reopen and r
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
     try std.testing.expect(maintenance.wal_retained_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
 
     backend.options.backend.read_only = true;
     backend.close();
@@ -3580,12 +5086,53 @@ test "lsm backend maintenance stats report retained wal debt across reopen and r
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
     try std.testing.expect(maintenance.wal_retained_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
     try std.testing.expect(backend.write_stats.wal_replay_records > 0);
 
     try backend.resetWalAfterManifestCheckpoint();
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
+}
+
+test "lsm backend durable boundary checkpoint flushes mutable state and retires wal" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-durable-boundary-checkpoint-flushes-mutable";
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold = 1024,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+        try txn.commit();
+    }
+
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
+    try std.testing.expect(maintenance.wal_retained_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+
+    try backend.checkpointWalAfterDurableBoundary();
+
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 }
 
 test "lsm backend accounts in-memory recovery state in the resource manager and releases it on close" {
@@ -3645,6 +5192,88 @@ test "lsm backend eagerly accounts mutable state and wal write working set" {
     try std.testing.expect(wal_stats.peak_bytes > 0);
 }
 
+test "lsm backend accounts table builder working set during persisted flush" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    const root_dir = "/lsm-table-builder-resource-accounting";
+    const options = Options{
+        .flush_threshold = 1024,
+        .storage = storage.storage(),
+        .resource_manager = &manager,
+    };
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    defer backend.close();
+
+    var value_buf: [512]u8 = undefined;
+    @memset(&value_buf, 'v');
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        var i: usize = 0;
+        while (i < 64) : (i += 1) {
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>4}", .{i});
+            try txn.put(.{ .name = "docs" }, key, &value_buf);
+        }
+        try txn.commit();
+    }
+
+    {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        try backend.flushMutable();
+    }
+    const builder_stats = manager.sliceStats(.lsm_table_builder_working_set);
+    try std.testing.expectEqual(@as(u64, 0), builder_stats.used_bytes);
+    try std.testing.expect(builder_stats.peak_bytes >= 256 * 1024);
+    try std.testing.expect(backend.runs.items.len > 0);
+    try std.testing.expect(backend.runs.items[0].path != null);
+}
+
+test "lsm backend accounts retained wal bytes in the resource manager" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    const root_dir = "/lsm-wal-retention-resource-accounting";
+    const options = Options{
+        .flush_threshold = 1024,
+        .storage = storage.storage(),
+        .resource_manager = &manager,
+    };
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+        try txn.commit();
+    }
+
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(maintenance.wal_retained_bytes > 0);
+    try std.testing.expectEqual(maintenance.wal_retained_bytes, manager.sliceStats(.lsm_wal_retention).used_bytes);
+
+    try backend.finalizeDeferredStorageWork();
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_wal_retention).used_bytes);
+
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:b", "beta");
+        try txn.commit();
+    }
+    try std.testing.expect(manager.sliceStats(.lsm_wal_retention).used_bytes > 0);
+
+    backend.close();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_wal_retention).used_bytes);
+}
+
 test "lsm backend retires covered wal segments after durable manifest publish" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
@@ -3692,6 +5321,10 @@ test "lsm backend retires covered wal segments after durable manifest publish" {
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
     try std.testing.expect(maintenance.wal_retained_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 3), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 2), maintenance.wal_checkpoint_covered_through_segment);
+    try std.testing.expectEqual(@as(u64, 3), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
 
     backend.options.backend.read_only = true;
     backend.close();
@@ -3700,6 +5333,10 @@ test "lsm backend retires covered wal segments after durable manifest publish" {
     defer backend.close();
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 3), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 2), maintenance.wal_checkpoint_covered_through_segment);
+    try std.testing.expectEqual(@as(u64, 3), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
     try std.testing.expect(backend.write_stats.wal_replay_records <= 1);
 
     var read = try backend.beginRead();
@@ -3707,6 +5344,186 @@ test "lsm backend retires covered wal segments after durable manifest publish" {
     try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
     try std.testing.expectEqualStrings("gamma", try read.get(.{ .name = "docs" }, "doc:c"));
+}
+
+test "lsm backend wal pressure maintenance flushes and checkpoints retained segments" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-wal-pressure-maintenance";
+    const options = Options{
+        .flush_threshold = 1024,
+        .storage = storage.storage(),
+        .wal_segment_bytes = 32,
+        .wal_soft_limit_segments = 1,
+        .compact_threshold_runs = 100,
+    };
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+        try txn.commit();
+    }
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:b", "beta");
+        try txn.commit();
+    }
+
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 2), maintenance.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
+    try std.testing.expectEqual(@as(u64, 2), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_lag_segments);
+    try std.testing.expect(backend.maintenanceScore() > 0);
+
+    try std.testing.expect(try backend.runMaintenanceStep());
+
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_entries);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.immutable_memtables);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
+}
+
+test "lsm backend hard wal pressure forces foreground checkpoint on commit" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-hard-wal-pressure-commit";
+    const options = Options{
+        .flush_threshold = 1024,
+        .storage = storage.storage(),
+        .wal_segment_bytes = 32,
+        .wal_hard_limit_segments = 1,
+        .compact_threshold_runs = 100,
+    };
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+        try txn.commit();
+    }
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:b", "beta");
+        try txn.commit();
+    }
+
+    const write_stats = backend.snapshotWriteStats();
+    try std.testing.expect(write_stats.wal_pressure_flushes > 0);
+    try std.testing.expect(write_stats.wal_pressure_ns > 0);
+
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_entries);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.immutable_memtables);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
+}
+
+test "lsm backend repeated checkpointed reopen cycles do not accumulate retained wal" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-repeated-checkpointed-reopen";
+    const options = Options{
+        .flush_threshold = 1024,
+        .storage = storage.storage(),
+        .wal_segment_bytes = 32,
+        .compact_threshold_runs = 100,
+    };
+
+    var cycle: usize = 0;
+    while (cycle < 3) : (cycle += 1) {
+        var backend = try Backend.open(std.testing.allocator, root_dir, options);
+        defer backend.close();
+
+        const open_stats = backend.snapshotOpenStats();
+        try std.testing.expectEqual(Backend.OpenPhase.ready, open_stats.phase);
+        try std.testing.expectEqual(@as(u64, 0), open_stats.wal_replay_records);
+        try std.testing.expectEqual(@as(u64, 0), open_stats.wal_replay_bytes);
+
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{cycle});
+        {
+            var txn = try backend.beginWrite();
+            defer txn.abort();
+            try txn.put(.{ .name = "docs" }, key, "value");
+            try txn.commit();
+        }
+
+        const before_checkpoint = backend.snapshotMaintenanceStats();
+        try std.testing.expect(before_checkpoint.wal_retained_segments > 0);
+        try std.testing.expect(before_checkpoint.wal_retained_bytes > 0);
+
+        try backend.checkpointWalAfterDurableBoundary();
+
+        const after_checkpoint = backend.snapshotMaintenanceStats();
+        try std.testing.expectEqual(@as(u64, 0), after_checkpoint.wal_retained_segments);
+        try std.testing.expectEqual(@as(u64, 0), after_checkpoint.wal_retained_bytes);
+        try std.testing.expectEqual(@as(u64, 0), after_checkpoint.wal_checkpoint_lag_segments);
+        try std.testing.expectEqual(@as(u64, 0), after_checkpoint.mutable_entries);
+        try std.testing.expectEqual(@as(u64, 0), after_checkpoint.immutable_memtables);
+
+        var read = try backend.beginRead();
+        defer read.abort();
+        var seen: usize = 0;
+        while (seen <= cycle) : (seen += 1) {
+            var seen_key_buf: [32]u8 = undefined;
+            const seen_key = try std.fmt.bufPrint(&seen_key_buf, "doc:{d}", .{seen});
+            try std.testing.expectEqualStrings("value", try read.get(.{ .name = "docs" }, seen_key));
+        }
+    }
+
+    var reopened = try Backend.open(std.testing.allocator, root_dir, options);
+    defer reopened.close();
+
+    const final_open = reopened.snapshotOpenStats();
+    try std.testing.expectEqual(Backend.OpenPhase.ready, final_open.phase);
+    try std.testing.expectEqual(@as(u64, 0), final_open.wal_replay_records);
+    try std.testing.expectEqual(@as(u64, 0), final_open.wal_replay_bytes);
+
+    const final_maintenance = reopened.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), final_maintenance.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 0), final_maintenance.wal_retained_bytes);
+
+    var read = try reopened.beginRead();
+    defer read.abort();
+    cycle = 0;
+    while (cycle < 3) : (cycle += 1) {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{cycle});
+        try std.testing.expectEqualStrings("value", try read.get(.{ .name = "docs" }, key));
+    }
 }
 
 test "lsm backend byte flush window coalesces hot overwrites before run publication" {
@@ -3975,6 +5792,124 @@ test "lsm backend direct bulk ingest cursor hides older overlapping l0 values" {
     try std.testing.expectEqualStrings("A2", try visible.get(.{ .name = "docs" }, "doc:a"));
 }
 
+test "lsm backend reopens overlapping direct ingest l0 runs with newest values visible" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "direct-ingest-overlap-reopen");
+    defer repository_mod.cleanupTmp(path);
+
+    var packed_node_key: [12]u8 = undefined;
+    packed_node_key[0] = 'n';
+    packed_node_key[1] = ':';
+    std.mem.writeInt(u64, packed_node_key[2..10], 1, .big);
+    packed_node_key[10] = ':';
+    packed_node_key[11] = 'p';
+    var node_range_key = packed_node_key;
+    node_range_key[11] = 'r';
+    var node_posting_key = packed_node_key;
+    node_posting_key[11] = 'o';
+    var vec_meta_keys: [4][10]u8 = undefined;
+    for (&vec_meta_keys, 0..) |*key, i| {
+        key[0] = 'm';
+        key[1] = ':';
+        std.mem.writeInt(u64, key[2..10], @as(u64, @intCast(i + 1)), .big);
+    }
+
+    {
+        var backend = try Backend.open(std.testing.allocator, std.mem.span(path), .{
+            .flush_threshold = 1,
+            .bulk_ingest_flush_threshold_multiplier = 1,
+            .compact_threshold_runs = 999,
+            .foreground_soft_compaction = false,
+        });
+        defer backend.close();
+
+        {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            try txn.put(.{ .name = "docs" }, "doc:a", "A1");
+            try txn.put(.{ .name = "docs" }, "doc:b", "B1");
+            try txn.put(.{ .name = "hbc_nodes" }, packed_node_key[0..], "old-packed-node");
+            try txn.put(.{ .name = "hbc_nodes" }, node_range_key[0..], "old-range");
+            try txn.put(.{ .name = "hbc_nodes" }, node_posting_key[0..], "old-posting");
+            for (&vec_meta_keys, 0..) |*key, i| {
+                const value = switch (i) {
+                    0 => "meta-1",
+                    1 => "meta-2",
+                    2 => "meta-3",
+                    else => "meta-4",
+                };
+                try txn.put(.{ .name = "hbc_vecs" }, key[0..], value);
+            }
+            try txn.commit();
+        }
+        {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            try txn.put(.{ .name = "docs" }, "doc:a", "A2");
+            try txn.put(.{ .name = "docs" }, "doc:c", "C2");
+            try txn.put(.{ .name = "hbc_nodes" }, packed_node_key[0..], "new-packed-node");
+            try txn.put(.{ .name = "hbc_nodes" }, node_range_key[0..], "new-range");
+            try txn.put(.{ .name = "hbc_nodes" }, node_posting_key[0..], "new-posting");
+            for (&vec_meta_keys, 0..) |*key, i| {
+                const value = switch (i) {
+                    0 => "meta-1b",
+                    1 => "meta-2b",
+                    2 => "meta-3b",
+                    else => "meta-4b",
+                };
+                try txn.put(.{ .name = "hbc_vecs" }, key[0..], value);
+            }
+            try txn.commit();
+        }
+
+        try std.testing.expect(backend.runs.items.len >= 2);
+        try backend.persistManifest();
+    }
+
+    {
+        var reopened = try Backend.open(std.testing.allocator, std.mem.span(path), .{
+            .flush_threshold = 1,
+            .bulk_ingest_flush_threshold_multiplier = 1,
+            .compact_threshold_runs = 999,
+            .foreground_soft_compaction = false,
+        });
+        defer reopened.close();
+
+        var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+        var read = try runtime.beginRead();
+        defer read.abort();
+
+        try std.testing.expectEqualStrings("A2", try read.get("doc:a"));
+        {
+            var namespace_read = try reopened.beginRead();
+            defer namespace_read.abort();
+            try std.testing.expectEqualStrings("new-packed-node", try namespace_read.get(.{ .name = "hbc_nodes" }, packed_node_key[0..]));
+            try std.testing.expectEqualStrings("new-range", try namespace_read.get(.{ .name = "hbc_nodes" }, node_range_key[0..]));
+            try std.testing.expectEqualStrings("meta-4b", try namespace_read.get(.{ .name = "hbc_vecs" }, vec_meta_keys[3][0..]));
+        }
+
+        var cur = try read.openCursor();
+        defer cur.close();
+
+        const first = (try cur.first()).?;
+        try std.testing.expectEqualStrings("doc:a", first.key);
+        try std.testing.expectEqualStrings("A2", first.value);
+        const second = (try cur.next()).?;
+        try std.testing.expectEqualStrings("doc:b", second.key);
+        try std.testing.expectEqualStrings("B1", second.value);
+        const third = (try cur.next()).?;
+        try std.testing.expectEqualStrings("doc:c", third.key);
+        try std.testing.expectEqualStrings("C2", third.value);
+        try std.testing.expect((try cur.next()) == null);
+
+        var visible = try reopened.materializeVisibleState();
+        defer visible.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("A2", try visible.get(.{ .name = "docs" }, "doc:a"));
+        try std.testing.expectEqualStrings("new-packed-node", try visible.get(.{ .name = "hbc_nodes" }, packed_node_key[0..]));
+        try std.testing.expectEqualStrings("new-range", try visible.get(.{ .name = "hbc_nodes" }, node_range_key[0..]));
+        try std.testing.expectEqualStrings("meta-4b", try visible.get(.{ .name = "hbc_vecs" }, vec_meta_keys[3][0..]));
+    }
+}
+
 test "lsm backend can disable direct bulk ingest for overwrite-heavy stores" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1,
@@ -4022,6 +5957,89 @@ test "lsm backend byte flush threshold controls mutable flushes" {
     try std.testing.expectEqualStrings(value[0..], try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 }
 
+test "lsm backend probe borrows immutable point values until reader release" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-immutable-probe-borrow", .{
+        .flush_threshold = 1000,
+        .flush_threshold_bytes = 256,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 300;
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+
+    const borrowed = try probe.get("doc:a");
+    try std.testing.expectEqualStrings(value[0..], borrowed);
+
+    var read_stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), read_stats.point_value_borrows);
+    try std.testing.expectEqual(@as(u64, 0), read_stats.point_value_copies);
+
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 1), backend.retired_immutable_memtables.items.len);
+    try std.testing.expectEqualStrings(value[0..], borrowed);
+
+    read_stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), read_stats.point_value_borrows);
+    try std.testing.expectEqual(@as(u64, 0), read_stats.point_value_copies);
+}
+
+test "lsm backend probe borrows active mutable point values across later writes" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1000,
+        .wal_enabled = false,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+
+    const before = backend.snapshotReadStats();
+    const borrowed_a = try probe.get("doc:a");
+    try std.testing.expectEqualStrings("A", borrowed_a);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "B");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqualStrings("A", borrowed_a);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+
+    const borrowed_b = try probe.get("doc:a");
+    try std.testing.expectEqualStrings("B", borrowed_b);
+
+    const after = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 2), after.point_value_borrows - before.point_value_borrows);
+    try std.testing.expectEqual(@as(u64, 0), after.point_value_copies - before.point_value_copies);
+}
+
 test "lsm backend wal backed entry threshold defers commit flush to maintenance" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
@@ -4050,6 +6068,48 @@ test "lsm backend wal backed entry threshold defers commit flush to maintenance"
     try std.testing.expectEqual(@as(u64, 1), stats.flushes);
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
     try std.testing.expect(backend.runs.items.len > 0);
+}
+
+test "lsm backend write stats separate wal sync latency from append latency" {
+    {
+        var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer storage.deinit();
+        var backend = try Backend.open(std.testing.allocator, "/lsm-wal-async-stats", .{
+            .storage = storage.storage(),
+            .flush_threshold = 1024,
+            .wal_sync_on_commit = false,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+
+        const stats = backend.snapshotWriteStats();
+        try std.testing.expectEqual(@as(u64, 1), stats.wal_append_records);
+        try std.testing.expectEqual(@as(u64, 0), stats.wal_sync_records);
+        try std.testing.expectEqual(@as(u64, 0), stats.wal_sync_ns);
+    }
+
+    {
+        var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer storage.deinit();
+        var backend = try Backend.open(std.testing.allocator, "/lsm-wal-sync-stats", .{
+            .storage = storage.storage(),
+            .flush_threshold = 1024,
+            .wal_sync_on_commit = true,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+
+        const stats = backend.snapshotWriteStats();
+        try std.testing.expectEqual(@as(u64, 1), stats.wal_append_records);
+        try std.testing.expectEqual(@as(u64, 1), stats.wal_sync_records);
+        try std.testing.expectEqual(stats.wal_append_ns, stats.wal_sync_ns);
+    }
 }
 
 test "lsm backend read snapshot keeps immutable data visible after flush" {
@@ -4139,6 +6199,63 @@ test "lsm backend write pressure compacts hard L0 debt" {
     const stats = backend.snapshotWriteStats();
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
     try std.testing.expect(stats.write_pressure_compactions > 0);
+}
+
+test "lsm backend write pressure records bounded overload after max foreground steps" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .write_pressure_max_compaction_steps = 1,
+    });
+    defer backend.close();
+
+    for (0..10) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+
+    backend.options.l0_hard_limit_runs = 2;
+    try backend.finalizeDeferredStorageWork();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_events);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_compaction_steps);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_overloads);
+    try std.testing.expectEqual(@as(u64, 0), stats.write_pressure_rejections);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 2);
+}
+
+test "lsm backend write pressure can reject when overload remains after budget" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .write_pressure_max_compaction_steps = 1,
+        .write_pressure_reject_on_overload = true,
+    });
+    defer backend.close();
+
+    for (0..10) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+
+    backend.options.l0_hard_limit_runs = 2;
+    try std.testing.expectError(error.WritePressureExceeded, backend.finalizeDeferredStorageWork());
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_events);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_overloads);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_rejections);
 }
 
 test "lsm backend maintenance step compacts soft L0 debt" {
@@ -4458,6 +6575,8 @@ test "lsm backend compaction scheduler denies and later grants capacity" {
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
     try std.testing.expect(maintenance.compaction_scheduler_denied_capacity > 0);
     try std.testing.expectEqual(@as(u64, 1), maintenance.compaction_scheduler_remembered_pending);
+    try std.testing.expect(maintenance.compaction_scheduler_remembered_pending_runs > 0);
+    try std.testing.expect(maintenance.compaction_scheduler_remembered_pending_bytes > 0);
     try std.testing.expect(maintenance.compaction_scheduler_remembered_candidates > 0);
 
     backend.compaction_scheduler.options.max_in_flight_input_bytes = 1024 * 1024;
@@ -4466,8 +6585,148 @@ test "lsm backend compaction scheduler denies and later grants capacity" {
     try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
     try std.testing.expectEqual(maintenance.compaction_scheduler_grants, maintenance.compaction_scheduler_completions);
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_remembered_pending);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_remembered_pending_runs);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_remembered_pending_bytes);
     try std.testing.expect(maintenance.compaction_scheduler_remembered_hits > 0);
     try std.testing.expect(backend.compaction_stats.compactions > 0);
+}
+
+test "lsm backend background io budget defers immutable flush" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "background-io-flush-budget");
+    defer repository_mod.cleanupTmp(path);
+    const root_dir = std.mem.span(path);
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .background_io_budget_bytes = 1,
+        .background_io_allow_oversized_single_job = false,
+    });
+    defer backend.close();
+
+    var txn = try backend.beginWrite();
+    try txn.put(.{ .name = "docs" }, "doc:1", "value large enough for a non-zero flush estimate");
+    try txn.commit();
+
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expect(!try backend.runMaintenanceStep());
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 1), maintenance.background_io_budget_bytes);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.background_io_reserved_bytes);
+    try std.testing.expect(maintenance.background_io_denied_jobs > 0);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+
+    backend.options.background_io_budget_bytes = 1024 * 1024;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(maintenance.background_io_reserved_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+}
+
+test "lsm backend background io budget defers scheduled compaction" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 2,
+        .l0_hard_limit_runs = 100,
+        .background_io_budget_bytes = 1,
+        .background_io_allow_oversized_single_job = false,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 64;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, value[0..]);
+        try txn.commit();
+    }
+
+    try backend.finalizeDeferredStorageWork();
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expect(!try backend.runMaintenanceStep());
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
+    try std.testing.expect(maintenance.background_io_denied_jobs > 0);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.compaction_scheduler_remembered_pending);
+    try std.testing.expect(maintenance.compaction_scheduler_remembered_pending_runs > 0);
+    try std.testing.expect(maintenance.compaction_scheduler_remembered_pending_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+
+    backend.options.background_io_budget_bytes = 1024 * 1024;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(maintenance.background_io_reserved_bytes > 0);
+    try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
+    try std.testing.expect(backend.compaction_stats.compactions > 0);
+}
+
+test "lsm backend max compaction input bytes skips oversized scheduled plan" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .max_compaction_input_bytes = 1,
+        .max_compaction_input_allow_oversized_single_job = false,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 64;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, value[0..]);
+        try txn.commit();
+    }
+
+    try backend.finalizeDeferredStorageWork();
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expect(!try backend.runMaintenanceStep());
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_remembered_pending);
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+
+    backend.options.max_compaction_input_bytes = 1024 * 1024;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
+    try std.testing.expect(backend.compaction_stats.compactions > 0);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 3);
+}
+
+test "lsm backend max compaction input bytes allows oversized minimum L0 job" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .max_compaction_input_bytes = 1,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 64;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, value[0..]);
+        try txn.commit();
+    }
+
+    try backend.finalizeDeferredStorageWork();
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expect(try backend.runMaintenanceStep());
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
+    try std.testing.expect(backend.compaction_stats.compactions > 0);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 3);
 }
 
 test "lsm backend compaction scheduler reserves resource-manager work budget" {
@@ -4928,7 +7187,7 @@ test "lsm backend bulk ingest finish applies bounded foreground L0 budget" {
     });
     bulk_active = false;
 
-    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 2);
     try std.testing.expectEqual(@as(usize, 1), backend.compaction_stats.compactions);
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:0"));
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:4"));
@@ -4940,6 +7199,7 @@ test "lsm backend hard L0 pressure applies bounded step after publish not inside
         .bulk_ingest_flush_threshold_multiplier = 1,
         .compact_threshold_runs = 1,
         .l0_hard_limit_runs = 2,
+        .write_pressure_max_compaction_steps = 1,
     });
     defer backend.close();
 
@@ -6157,6 +8417,14 @@ test "lsm backend multi-block point read skips directly to one candidate block" 
         var txn = try runtime.beginRead();
         defer txn.abort();
         try std.testing.expectEqualStrings(large_value, try txn.get("doc:005"));
+
+        const read_stats = backend.snapshotReadStats();
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_prechecks);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_precheck_survivors);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_survivor_reads);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_survivor_hits);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.point_run_survivor_misses);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.point_run_survivor_tombstones);
     }
 
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);
@@ -6341,12 +8609,25 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         try std.testing.expectEqualStrings("doc:005", (try cur.next()).?.key);
         try std.testing.expect((try cur.next()) == null);
 
+        const after_forward_scan = backend.snapshotReadStats();
+        try std.testing.expectEqualStrings("doc:002", (try cur.seekAtOrAfter("doc:002")).?.key);
+        try std.testing.expectEqualStrings("doc:004", (try cur.seekAtOrAfter("doc:004")).?.key);
+        try std.testing.expectEqualStrings("doc:003", (try cur.seekAtOrAfter("doc:003")).?.key);
+
         const read_stats = backend.snapshotReadStats();
         try std.testing.expect(read_stats.table_entry_parses > 0);
         try std.testing.expect(read_stats.table_block_loads > 0);
         try std.testing.expect(read_stats.table_block_bytes > 0);
         try std.testing.expect(read_stats.cursor_block_loads > 0);
         try std.testing.expect(read_stats.cursor_block_reuses > 0);
+        try std.testing.expect(read_stats.cursor_block_readaheads > 0);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.cursor_table_index_misses);
+        try std.testing.expectEqual(after_forward_scan.run_group_builds, read_stats.run_group_builds);
+        try std.testing.expectEqual(after_forward_scan.cursor_table_index_misses, read_stats.cursor_table_index_misses);
+        try std.testing.expect(read_stats.cursor_table_index_hits > after_forward_scan.cursor_table_index_hits);
+        try std.testing.expect(read_stats.cursor_table_index_hits > read_stats.cursor_table_index_misses);
+        try std.testing.expect(read_stats.cursor_value_borrows > 0);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.cursor_value_copies);
     }
 
     {
@@ -6374,6 +8655,40 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
 
         const read_stats = backend.snapshotReadStats();
         try std.testing.expectEqual(@as(u64, 1), read_stats.cursor_block_loads);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.cursor_block_readaheads);
+    }
+
+    {
+        var reverse_cache = Cache.init(alloc, DefaultCacheSizeBytes);
+        defer reverse_cache.deinit();
+
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = host.storage(),
+            .flush_threshold = 6,
+            .cache = &reverse_cache,
+        });
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        var cur = try txn.openCursor();
+        defer cur.close();
+
+        try std.testing.expectEqualStrings("doc:004", (try cur.seekAtOrBefore("doc:004")).?.key);
+        try std.testing.expectEqualStrings("doc:003", (try cur.prev()).?.key);
+        try std.testing.expectEqualStrings("doc:002", (try cur.prev()).?.key);
+
+        const read_stats = backend.snapshotReadStats();
+        try std.testing.expect(read_stats.table_entry_parses > 0);
+        try std.testing.expect(read_stats.table_block_loads > 0);
+        try std.testing.expect(read_stats.table_block_bytes > 0);
+        try std.testing.expect(read_stats.cursor_block_loads > 0);
+        try std.testing.expect(read_stats.cursor_block_reuses > 0);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.cursor_table_index_misses);
+        try std.testing.expect(read_stats.cursor_table_index_hits > read_stats.cursor_table_index_misses);
     }
 
     {
@@ -6410,6 +8725,8 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         try std.testing.expect(read_stats.table_block_bytes > 0);
         try std.testing.expect(read_stats.cursor_block_loads > 0);
         try std.testing.expect(read_stats.cursor_block_reuses > 0);
+        try std.testing.expectEqual(@as(u64, keys.len), read_stats.cursor_value_borrows);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.cursor_value_copies);
     }
 
     {
@@ -6436,12 +8753,184 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
 
         const read_stats = backend.snapshotReadStats();
         try std.testing.expectEqual(@as(u64, 1), read_stats.point_gets);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_value_borrows);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.point_value_copies);
     }
 
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);
-    try std.testing.expect(ctx.run_range_reads <= 12);
-    try std.testing.expect(ctx.run_trailer_reads <= 6);
+    try std.testing.expect(ctx.run_range_reads <= 18);
+    try std.testing.expect(ctx.run_trailer_reads <= 8);
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_size_reads);
+}
+
+test "lsm backend prefix bloom skips bounded scan blocks" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-prefix-bloom-scan-skip";
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = 2,
+        });
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginWrite();
+        try txn.put("tenant-a:001", "a");
+        try txn.put("tenant-c:001", "c");
+        try txn.commit();
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = 2,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var txn = try runtime.beginRead();
+    defer txn.abort();
+    var cur = try txn.openCursor();
+    defer cur.close();
+    cur.setUpperBound("tenant-b;");
+
+    try std.testing.expect((try cur.seekAtOrAfter("tenant-b:")) == null);
+
+    const read_stats = backend.snapshotReadStats();
+    try std.testing.expect(read_stats.bloom_negatives > 0);
+    try std.testing.expectEqual(read_stats.bloom_negatives, read_stats.prefix_bloom_negatives + read_stats.block_prefix_bloom_negatives);
+    try std.testing.expect(read_stats.prefix_bloom_negatives > 0 or read_stats.block_prefix_bloom_negatives > 0);
+    try std.testing.expectEqual(@as(u64, 0), read_stats.cursor_block_loads);
+    try std.testing.expectEqual(@as(u64, 0), read_stats.table_block_loads);
+}
+
+test "lsm backend shared cache point reads search prefix-compressed physical blocks directly" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-shared-cache-prefix-physical-point";
+    const count = 96;
+    const keys = try alloc.alloc([]u8, count);
+    defer {
+        for (keys) |key| alloc.free(key);
+        alloc.free(keys);
+    }
+
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginWrite();
+        for (keys, 0..) |*key_slot, i| {
+            const key = try std.fmt.allocPrint(
+                alloc,
+                "tenant:docs:collection:very-long-shared-prefix:segment:{d:0>6}:field:dense-vector",
+                .{i},
+            );
+            key_slot.* = key;
+            try txn.put(key, "v");
+        }
+        try txn.commit();
+        try backend.sync(true);
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var txn = try runtime.beginRead();
+    defer txn.abort();
+    try std.testing.expectEqualStrings("v", try txn.get(keys[37]));
+
+    const stats = cache.snapshotStats();
+    try std.testing.expect(stats.run_table_index.inserts > 0);
+    try std.testing.expect(stats.run_table_physical_block.inserts > 0);
+    try std.testing.expectEqual(@as(u64, 0), stats.run_table_block.inserts);
+}
+
+test "lsm backend async point reads issue overlapping survivors in source order" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-async-point-survivors";
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        {
+            var txn = try runtime.beginWrite();
+            try txn.put("tenant:collection:shared-prefix:doc:000001", "older");
+            try txn.commit();
+            try backend.sync(true);
+        }
+        {
+            var txn = try runtime.beginWrite();
+            try txn.put("tenant:collection:shared-prefix:doc:000001", "newer");
+            try txn.commit();
+            try backend.sync(true);
+        }
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+        .max_concurrent_point_block_reads = 4,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var txn = try runtime.beginRead();
+    defer txn.abort();
+    try std.testing.expectEqualStrings("newer", try txn.get("tenant:collection:shared-prefix:doc:000001"));
+
+    const read_stats = backend.snapshotReadStats();
+    try std.testing.expect(read_stats.point_run_async_batches > 0);
+    try std.testing.expect(read_stats.point_run_async_reads_issued >= 2);
+    try std.testing.expect(read_stats.point_run_async_reads_canceled > 0);
+
+    const cache_stats = cache.snapshotStats();
+    try std.testing.expect(cache_stats.run_table_physical_block.inserts > 0);
+    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
 }
 
 test "lsm backend block filter avoids candidate block read on run-bloom false positive" {
@@ -6629,6 +9118,14 @@ test "lsm backend block filter avoids candidate block read on run-bloom false po
         var txn = try runtime.beginRead();
         defer txn.abort();
         try std.testing.expectError(error.NotFound, txn.get(missing_key));
+
+        const read_stats = backend.snapshotReadStats();
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_prechecks);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_precheck_survivors);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_survivor_reads);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.point_run_survivor_hits);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_run_survivor_misses);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.point_run_survivor_tombstones);
     }
 
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);
@@ -6744,7 +9241,85 @@ test "lsm backend current scan reuses run grouping across cursor movement" {
     try std.testing.expectEqual(after_open.run_group_l0_runs, after_scan.run_group_l0_runs);
 }
 
-test "lsm backend current scan does not rotate or clone mutable writer generation" {
+test "lsm backend current scan borrows frozen mutable values" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1024,
+        .wal_enabled = false,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var write = try runtime.beginWrite();
+    try write.put("doc:001", "value-1");
+    try write.put("doc:002", "value-2");
+    try write.commit();
+
+    const before_scan = backend.snapshotReadStats();
+    var scan = try runtime.beginCurrentScan();
+    defer scan.abort();
+    var cur = try scan.openCursor();
+    defer cur.close();
+
+    var maybe_entry = try cur.seekAtOrAfter("doc:001");
+    var count: usize = 0;
+    while (maybe_entry) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "doc:")) break;
+        count += 1;
+        maybe_entry = try cur.next();
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+
+    const after_scan = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 2), after_scan.cursor_value_borrows - before_scan.cursor_value_borrows);
+    try std.testing.expectEqual(@as(u64, 0), after_scan.cursor_value_copies - before_scan.cursor_value_copies);
+}
+
+test "lsm backend current probe getManySorted reuses source layout across chunks" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1024,
+        .l0_overlap_compact_threshold_runs = 1024,
+        .wal_enabled = false,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var key_buf: [32]u8 = undefined;
+    var value_buf: [32]u8 = undefined;
+    for (0..160) |i| {
+        var write = try runtime.beginWrite();
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>3}", .{i});
+        const value = try std.fmt.bufPrint(&value_buf, "value-{d}", .{i});
+        try write.put(key, value);
+        try write.commit();
+    }
+
+    try backend.mutable.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:live", "value-live", false);
+
+    var key_storage: [160][16]u8 = undefined;
+    var keys: [160][]const u8 = undefined;
+    var values: [160]?[]const u8 = undefined;
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_storage[i], "doc:{d:0>3}", .{i});
+    }
+    @memset(&values, null);
+
+    const before_read = backend.snapshotReadStats();
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+    try probe.getManySorted(&keys, &values);
+    const after_read = backend.snapshotReadStats();
+
+    try std.testing.expectEqual(@as(u64, 1), after_read.run_group_builds - before_read.run_group_builds);
+    try std.testing.expectEqualStrings("value-0", values[0].?);
+    try std.testing.expectEqualStrings("value-159", values[159].?);
+}
+
+test "lsm backend current scan freezes mutable generation without cloning it" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
     defer backend.close();
 
@@ -6765,8 +9340,8 @@ test "lsm backend current scan does not rotate or clone mutable writer generatio
     defer scan.abort();
 
     const after_open = backend.snapshotMaintenanceStats();
-    try std.testing.expectEqual(before_writes.immutable_rotations, backend.snapshotWriteStats().immutable_rotations);
-    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(before_writes.immutable_rotations + 1, backend.snapshotWriteStats().immutable_rotations);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
     try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls, after_open.mutable_snapshot_clone_calls);
 
     var cursor = try scan.openCursor();
@@ -6783,7 +9358,57 @@ test "lsm backend current scan does not rotate or clone mutable writer generatio
     try std.testing.expect(saw_a);
 }
 
-test "lsm backend current scan survives mutable rotation after positioning active source" {
+test "lsm backend current scan helpers do not clone mutable writer generation" {
+    var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "A");
+        try write.put("doc:b", "B");
+        try write.commit();
+    }
+
+    const before = backend.snapshotMaintenanceStats();
+
+    const ScanState = struct {
+        count: usize = 0,
+
+        threadlocal var active: ?*@This() = null;
+
+        fn cb(key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
+            const self = active.?;
+            if (std.mem.startsWith(u8, key, "doc:")) {
+                try std.testing.expect(value.len > 0);
+                self.count += 1;
+            }
+            return .@"continue";
+        }
+    };
+
+    var state = ScanState{};
+    ScanState.active = &state;
+    defer ScanState.active = null;
+
+    try backend_scan.scanCurrent(&runtime, "doc:", "doc;", .{}, &ScanState.cb);
+    try std.testing.expectEqual(@as(usize, 2), state.count);
+
+    const prefix = try backend_scan.scanPrefixCurrent(std.testing.allocator, &runtime, "doc:");
+    defer backend_scan.freeResults(std.testing.allocator, prefix);
+    try std.testing.expectEqual(@as(usize, 2), prefix.len);
+
+    const range = try backend_scan.scanRangeCurrent(std.testing.allocator, &runtime, "doc:", "doc;");
+    defer backend_scan.freeResults(std.testing.allocator, range);
+    try std.testing.expectEqual(@as(usize, 2), range.len);
+
+    const after = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
+}
+
+test "lsm backend current scan keeps frozen mutable values across later writes" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
     defer backend.close();
 
@@ -6806,9 +9431,14 @@ test "lsm backend current scan survives mutable rotation after positioning activ
     const first = try cursor.seekAtOrAfter("doc:a") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("doc:a", first.key);
 
-    try backend.rotateMutableToImmutable();
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:b", "B");
+        try write.commit();
+    }
 
-    _ = try cursor.next();
+    const second = try cursor.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc:c", second.key);
 }
 
 test "lsm backend read txn getManySorted uses sorted-by-run path for leaf-sized sparse batches" {
@@ -6933,6 +9563,123 @@ test "lsm backend bound read txn getManySorted uses sorted-by-run path for leaf-
     try std.testing.expectEqual(@as(u64, 0), stats.get_many_sorted_plan_point);
     try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_sorted_by_run);
     try std.testing.expectEqual(@as(u64, 0), stats.get_many_sorted_plan_cursor);
+    try std.testing.expectEqual(@as(u64, 0), stats.cursor_block_loads);
+}
+
+test "lsm backend sorted-by-run getManySorted advances within cached run blocks" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-sorted-by-run-forward-cache";
+    const count = 128;
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .cache = &cache,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        var key_buf: [64]u8 = undefined;
+        var value_buf: [32]u8 = undefined;
+        for (0..count) |i| {
+            const key = try std.fmt.bufPrint(&key_buf, "artifact:{d:0>8}:dense", .{i * 10});
+            const value = try std.fmt.bufPrint(&value_buf, "value-{d}", .{i});
+            try txn.put(.{ .name = "docs" }, key, value);
+        }
+        try txn.commit();
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    const keys = try alloc.alloc([]const u8, count);
+    defer {
+        for (keys) |key| alloc.free(key);
+        alloc.free(keys);
+    }
+    const values = try alloc.alloc(?[]const u8, count);
+    defer alloc.free(values);
+    for (keys, 0..) |*key, i| {
+        key.* = try std.fmt.allocPrint(alloc, "artifact:{d:0>8}:dense", .{i * 10});
+    }
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try read.getManySorted(.{ .name = "docs" }, keys, values);
+    try std.testing.expectEqualStrings("value-0", values[0].?);
+    try std.testing.expectEqualStrings("value-127", values[count - 1].?);
+
+    const stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_sorted_by_run);
+    try std.testing.expect(stats.read_hint_attempts > 0);
+    try std.testing.expect(stats.read_hint_hits > 0);
+    try std.testing.expect(stats.read_hint_hits > stats.read_hint_misses);
+    try std.testing.expectEqual(@as(u64, 0), stats.cursor_block_loads);
+}
+
+test "lsm backend point getManySorted reuses cached run blocks below sorted threshold" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-point-batch-forward-cache";
+    const count = 64;
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .cache = &cache,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        var key_buf: [64]u8 = undefined;
+        var value_buf: [32]u8 = undefined;
+        for (0..count) |i| {
+            const key = try std.fmt.bufPrint(&key_buf, "artifact:{d:0>8}:dense", .{i * 10});
+            const value = try std.fmt.bufPrint(&value_buf, "value-{d}", .{i});
+            try txn.put(.{ .name = "docs" }, key, value);
+        }
+        try txn.commit();
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    const batch_count = 31;
+    var key_storage: [batch_count][64]u8 = undefined;
+    var keys: [batch_count][]const u8 = undefined;
+    var values: [batch_count]?[]const u8 = undefined;
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_storage[i], "artifact:{d:0>8}:dense", .{i * 10});
+    }
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try read.getManySorted(.{ .name = "docs" }, &keys, &values);
+    try std.testing.expectEqualStrings("value-0", values[0].?);
+    try std.testing.expectEqualStrings("value-30", values[batch_count - 1].?);
+
+    const stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_point);
+    try std.testing.expectEqual(@as(u64, 0), stats.get_many_sorted_plan_sorted_by_run);
+    try std.testing.expect(stats.read_hint_attempts > 0);
+    try std.testing.expect(stats.read_hint_hits > 0);
     try std.testing.expectEqual(@as(u64, 0), stats.cursor_block_loads);
 }
 
@@ -7109,6 +9856,78 @@ test "lsm backend reuses mutable read snapshot until writes invalidate it" {
     try std.testing.expectEqualStrings("B", try read_c.get(.{ .name = "docs" }, "doc:b"));
     try std.testing.expect(backend.mutable_read_snapshot != null);
     try std.testing.expect(first_snapshot != backend.mutable_read_snapshot.?);
+}
+
+test "lsm backend rotates large mutable state for read snapshots instead of cloning" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .read_snapshot_rotate_mutable_bytes = 1,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+    }
+
+    try std.testing.expect(backend.mutable.entries.items.len > 0);
+    try std.testing.expectEqual(@as(u64, 0), backend.mutable_snapshot_clone_calls);
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("A", try read.get(.{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(?*State, null), backend.mutable_read_snapshot);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(u64, 0), backend.mutable_snapshot_clone_calls);
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 1), maintenance.read_snapshot_mutable_rotations);
+    try std.testing.expect(maintenance.read_snapshot_mutable_rotation_bytes_total > 0);
+    try std.testing.expectEqual(maintenance.read_snapshot_mutable_rotation_bytes_total, maintenance.read_snapshot_mutable_rotation_peak_bytes);
+}
+
+test "lsm backend attributes mutable snapshot clones by reader class" {
+    var backend = Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    {
+        var read = try runtime.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("A", try read.get("doc:a"));
+    }
+
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 1), maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.bound_read_txn)].calls);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.namespace_read_txn)].calls);
+    try std.testing.expect(maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.bound_read_txn)].bytes_total > 0);
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:b", "B");
+        try txn.commit();
+    }
+
+    {
+        var read = try backend.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("B", try read.get(.{ .name = "docs" }, "doc:b"));
+    }
+
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 2), maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.bound_read_txn)].calls);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.namespace_read_txn)].calls);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.other)].calls);
 }
 
 test "lsm backend write txns retain reader guards until completion" {
@@ -7764,6 +10583,114 @@ test "lsm backend reclaims obsolete run files after retention on a later writer 
     }
 }
 
+test "lsm backend reclaims obsolete run files when last reader releases" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-reader-release-obsolete-gc";
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 1);
+    defer alloc.free(obsolete_path);
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1,
+        .foreground_soft_compaction = true,
+        .obsolete_retention_ns = 0,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    var read_txn = try runtime.beginRead();
+    try std.testing.expectEqualStrings("A", try read_txn.get("doc:a"));
+
+    {
+        var txn = try runtime.beginWrite();
+        try txn.delete("doc:a");
+        try txn.put("doc:b", "B");
+        try txn.commit();
+    }
+
+    try std.testing.expect(backend.obsolete_paths.items.len > 0);
+    {
+        const bytes = try backing.storage().readFileAlloc(alloc, obsolete_path, 1024);
+        defer alloc.free(bytes);
+        try std.testing.expect(bytes.len > 0);
+    }
+
+    read_txn.abort();
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+
+    var manifest_backing: ?[]u8 = null;
+    defer if (manifest_backing) |raw| alloc.free(raw);
+    var next_run_id: u64 = 0;
+    var runs = std.ArrayListUnmanaged(repository_mod.Run).empty;
+    var obsolete_paths = std.ArrayListUnmanaged(repository_mod.ObsoletePath).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+        for (obsolete_paths.items) |*obsolete| obsolete.deinit(alloc);
+        obsolete_paths.deinit(alloc);
+    }
+
+    try std.testing.expect(try repository_mod.loadManifestIfPresentWithStorage(
+        backing.storage(),
+        alloc,
+        root_dir,
+        &manifest_backing,
+        &next_run_id,
+        &runs,
+        &obsolete_paths,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), obsolete_paths.items.len);
+}
+
+test "lsm backend reader release reclaims expired clean obsolete paths" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-reader-release-clean-obsolete-gc";
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 999);
+    defer alloc.free(obsolete_path);
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .obsolete_retention_ns = 0,
+    });
+    defer backend.close();
+
+    try repository_mod.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
+    try backend.obsolete_paths.append(alloc, .{
+        .path = try alloc.dupe(u8, obsolete_path),
+        .delete_after_ns = 0,
+    });
+    backend.manifest_dirty = false;
+    backend.obsolete_manifest_dirty = false;
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var read_txn = try runtime.beginRead();
+    try std.testing.expectEqual(@as(usize, 1), backend.active_readers);
+    read_txn.abort();
+
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+}
+
 test "lsm backend reloads persisted manifest and run files" {
     var path_buf: [256]u8 = undefined;
     const path = repository_mod.tmpPath(&path_buf, "reload");
@@ -7835,6 +10762,11 @@ test "lsm backend reloads persisted manifest and run files over memory storage" 
             .storage = memory_storage.storage(),
         });
         defer reopened.close();
+
+        const open_stats = reopened.snapshotOpenStats();
+        try std.testing.expectEqual(Backend.OpenPhase.ready, open_stats.phase);
+        try std.testing.expect(open_stats.loaded_manifest);
+        try std.testing.expect(open_stats.loaded_runs > 0);
 
         var runtime = try reopened.runtimeNamespaceStore(std.testing.allocator);
         defer runtime.deinit();
@@ -8137,6 +11069,10 @@ test "lsm backend recovery replay flushes incrementally and retires covered wal 
         try std.testing.expectEqual(@as(u64, 0), stats.mutable_entries);
         try std.testing.expectEqual(@as(u64, 0), stats.immutable_memtables);
         try std.testing.expect(reopened.runs.items.len > 0);
+        const write_stats = reopened.snapshotWriteStats();
+        try std.testing.expect(write_stats.wal_replay_recovery_flushes > 0);
+        try std.testing.expect(write_stats.wal_replay_recovery_entry_bytes > 0);
+        try std.testing.expect(write_stats.wal_replay_recovery_window_peak_bytes > 0);
 
         var runtime = try reopened.runtimeNamespaceStore(std.testing.allocator);
         defer runtime.deinit();
@@ -8161,6 +11097,101 @@ test "lsm backend recovery replay flushes incrementally and retires covered wal 
         try std.testing.expectEqual(@as(u64, 0), write_stats.wal_replay_bytes);
         try std.testing.expectEqual(@as(u64, 0), write_stats.wal_replay_records);
     }
+}
+
+test "lsm backend recovery replay stores mutable entries in a flush-scoped arena" {
+    var memory_storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer memory_storage.deinit();
+
+    const root_dir = "/memory/recovery-replay-arena";
+    try memory_storage.storage().createDirPath(root_dir);
+
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    try state.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:a", "alpha", false);
+    try state.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:b", "bravo", false);
+    _ = try wal_mod.appendStateWithOptions(
+        memory_storage.storage(),
+        std.testing.allocator,
+        root_dir,
+        &state,
+        false,
+        .{ .segment_bytes = 512 },
+    );
+
+    var reopened = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold = 1024,
+        .storage = memory_storage.storage(),
+    });
+    defer reopened.close();
+
+    try std.testing.expect(reopened.mutable.arena_owner != null);
+    try std.testing.expectEqual(@as(usize, 2), reopened.mutable.entries.items.len);
+    for (reopened.mutable.entries.items) |entry| {
+        try std.testing.expect(entry.namespace_from_arena);
+        try std.testing.expect(entry.key_from_arena);
+        try std.testing.expect(entry.value_from_arena);
+    }
+    try std.testing.expectEqualStrings("alpha", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:a"));
+
+    try reopened.finalizeDeferredStorageWork();
+    try std.testing.expect(reopened.mutable.arena_owner == null);
+    try std.testing.expectEqual(@as(usize, 0), reopened.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), reopened.activeImmutableMemtableCount());
+    try std.testing.expect(reopened.runs.items.len > 0);
+}
+
+test "lsm backend recovery replay byte threshold flushes within a large wal record" {
+    const alloc = std.testing.allocator;
+    var memory_storage = storage_io.MemoryStorage.init(alloc);
+    defer memory_storage.deinit();
+
+    const root_dir = "/memory/recovery-replay-byte-flush-inside-record";
+    try memory_storage.storage().createDirPath(root_dir);
+
+    const large_value = try alloc.alloc(u8, 128);
+    defer alloc.free(large_value);
+    @memset(large_value, 'v');
+
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.upsert(alloc, .{ .name = "docs" }, "doc:a", large_value, false);
+    try state.upsert(alloc, .{ .name = "docs" }, "doc:b", large_value, false);
+    try state.upsert(alloc, .{ .name = "docs" }, "doc:c", large_value, false);
+    _ = try wal_mod.appendStateWithOptions(
+        memory_storage.storage(),
+        alloc,
+        root_dir,
+        &state,
+        false,
+        .{ .segment_bytes = 4096 },
+    );
+
+    var reopened = try Backend.open(alloc, root_dir, .{
+        .flush_threshold = 1024,
+        .flush_threshold_bytes = 96,
+        .storage = memory_storage.storage(),
+    });
+    defer reopened.close();
+
+    const maintenance = reopened.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_entries);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.immutable_memtables);
+    try std.testing.expect(reopened.runs.items.len >= 2);
+
+    const write_stats = reopened.snapshotWriteStats();
+    try std.testing.expect(write_stats.immutable_flushes >= 2);
+    try std.testing.expect(write_stats.wal_replay_recovery_flushes >= 2);
+    try std.testing.expect(write_stats.wal_replay_recovery_entry_bytes >= large_value.len * 3);
+    try std.testing.expect(write_stats.wal_replay_recovery_window_peak_bytes >= large_value.len);
+
+    var runtime = try reopened.runtimeNamespaceStore(alloc);
+    defer runtime.deinit();
+    var txn = try runtime.beginRead();
+    defer txn.abort();
+    try std.testing.expectEqualStrings(large_value, try txn.get(.{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings(large_value, try txn.get(.{ .name = "docs" }, "doc:b"));
+    try std.testing.expectEqualStrings(large_value, try txn.get(.{ .name = "docs" }, "doc:c"));
 }
 
 test "lsm backend reloads persisted manifest and run files over host storage" {

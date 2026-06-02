@@ -7,7 +7,10 @@ This document tracks the near-term LSM backend performance work derived from the
 - `pkg/antfly/src/storage/lsm_backend/recovery.zig`
 - `pkg/antfly/src/storage/lsm_backend/storage_io.zig`
 
-The goal is to pull in the highest-leverage lessons from RocksDB and Pebble without forcing an immediate table-format rewrite.
+The goal is to pull in the highest-leverage lessons from RocksDB and Pebble. The
+project is still unreleased, so clean table/WAL codec breaks are preferable to
+carrying compatibility shims when a format change materially improves the
+long-term shape.
 
 ## Preferred Design
 
@@ -132,6 +135,135 @@ ResourceManager pressure:
 - Treat table metadata and block skipping as a separate phase because they touch the table format and reader contract.
 - Treat compaction as background debt management, not as an all-or-nothing foreground write tax.
 - Measure L0/run debt directly so write stalls, compaction scheduling, and bulk-ingest policy can be tuned from metrics instead of inferred from disk growth.
+- Keep transient heap growth tied to explicit owners: mutable/immutable
+  memtables, block cache, WAL retention, table builders, compaction scratch, and
+  higher-level index rebuild buffers.
+- Prefer streaming or disk-backed builders for flush, compaction, and artifact
+  publication so peak memory is bounded by active blocks/windows rather than by
+  a whole run or whole artifact.
+
+## RocksDB/Pebble-Shaped LSM Roadmap
+
+Status: active
+
+The LSM is now past the first large architectural step: WAL-backed foreground
+writes, immutable memtables, bounded maintenance, WAL checkpoints, prefix
+blooms, block-window scans, sharded caches, and table-block compression are all
+represented in the implementation. The remaining work is less about adding one
+missing feature and more about tightening the engine around RocksDB/Pebble
+invariants: bounded working set, table-local skipping, explicit write stalls,
+and maintenance that is always debt-driven.
+
+### Already landed
+
+- WAL-backed commit path with segmented WAL, checksummed records, replay, and
+  checkpoint/retirement metadata.
+- Immutable memtable queue and background flush/maintenance path.
+- Bounded hard-pressure foreground assists instead of unbounded publish-time
+  compaction.
+- Sharded/blocking block-cache miss coordination and sharded native fd cache.
+- Borrowed scan and point-read values where the transaction owns the lifetime.
+- Block-window scans, table index caching, per-block bloom/hash metadata,
+  prefix blooms, and adaptive table-block compression.
+- Startup/open, retained-WAL, write-pressure, and maintenance debt metrics in
+  benchmark/status/Prometheus surfaces.
+
+### Next priorities
+
+1. [ ] Finish no-heap table-artifact publication and disk-backed merge output.
+   - Flush, compaction, and HBC final artifact publication should write through
+     bounded block builders and output sinks.
+   - [x] LSM persisted flushes, sorted ingest, and compaction output now use
+     the streaming table writer instead of the non-streaming sorted-entry
+     table encoder on the hot persisted paths.
+   - [x] Streaming table writers publish active encoder/write-buffer scratch
+     into the ResourceManager `lsm.table_builder_working_set` slice and
+     release it after finish/abort, so builder peaks are visible separately
+     from block cache, memtables, WAL retention, and compaction scheduler work.
+   - [x] State-backed run publication now streams directly from `State` entries
+     through `StreamingRunFileWriter`, instead of first materializing one
+     whole-run `[]TableEntry` scratch array before writing the table file.
+   - Peak memory should be the active builder block/window plus bounded scratch,
+     not the whole run, whole merge output, or whole artifact.
+   - ResourceManager should account table-builder bytes, compaction scratch,
+     and publish scratch separately from long-lived cache/memtable bytes.
+
+2. [x] Finish direct prefix-compressed block reader integration.
+   - The codec already has restart-point search primitives; runtime readers
+     should use them before expanding a full logical block.
+   - [x] First runtime slice: local/no-shared-cache point reads now search
+     prefix-compressed block payloads directly by restart point and return only
+     the matched encoded entry instead of materializing the whole logical block.
+   - [x] Shared-cache point-read slice: exact point reads now cache compressed
+     physical block payloads under a separate `run_table_physical_block` cache
+     kind and direct-search restart windows from that payload. Decoded
+     `run_table_block` entries remain reserved for iterator/block-window paths.
+   - [x] Cache policy now distinguishes compressed physical block payloads from
+     decoded iterator/window blocks: physical point-read payloads use
+     `run_table_physical_block`, decoded full blocks stay in `run_table_block`,
+     and direct-search matched entries remain transaction-held scratch instead
+     of cache entries.
+   - [x] Exact point reads on prefix-compressed blocks no longer populate the
+     decoded block cache. Compatibility expansion remains only for callers that
+     need decoded iterator/window blocks or non-prefix block materialization.
+
+3. [x] Add async/future-style block reads for point-read survivors.
+   - [x] Storage now exposes a one-shot range-read future API plus a neutral
+     `ReadRuntime` handle. Native storage uses the supplied runtime's
+     `std.Io.concurrent` lane; storage without a runtime keeps a completed
+     synchronous future fallback.
+   - [x] `BackendHandle` and DB-owned LSM options install the shared
+     `backend_runtime` read runtime, so point-read IO uses the existing backend
+     runtime abstraction instead of spawning ad hoc read threads.
+   - [x] Persisted path-backed exact point reads issue independent survivor
+     block reads up to `max_concurrent_point_block_reads`, then consume results
+     in run/source-precedence order. Completion order does not decide the
+     visible value.
+   - [x] Higher-precedence hits and tombstones cancel/drop lower-priority
+     futures, and read stats expose async point batches, reads issued, canceled
+     reads, and wait time.
+
+4. [ ] Make compaction scheduling fully score- and overlap-driven.
+   - Raise compaction concurrency only when selected jobs are disjoint by run
+     IDs/key ranges or otherwise proven safe by the scheduler.
+   - Track pending bytes, write-stall debt, conflict denials, oversized-plan
+     fallback, and elapsed compaction age in status/metrics.
+   - [x] Scheduler stats now expose oldest active compaction age plus remembered
+     pending input runs/bytes through maintenance stats, Prometheus, and HBC
+     benchmark logs, so deferred compaction debt is visible as size rather than
+     only as a boolean pending flag.
+   - Keep foreground assists bounded and reserved for hard pressure.
+
+5. [ ] Make LSM memory pressure first-class.
+   - Account mutable arena bytes, immutable pinned bytes, block-cache bytes,
+     WAL retention, recovery scratch, table-builder scratch, and compaction
+     scratch in ResourceManager.
+   - [x] Table-builder scratch is now a separate ResourceManager and
+     Prometheus slice (`lsm.table_builder_working_set`) for persisted
+     flush/sorted-ingest/compaction table writers.
+   - Compare those slices against RSS/physical footprint in the large-root
+     benchmarks; any remaining gap is allocator retention or higher-level
+     dense/docstore working set, not hidden LSM cache.
+   - Add retained-cap policies for reusable scratch so one large row/block does
+     not permanently raise steady-state memory.
+
+6. [ ] Keep prefix/filter policy store-aware.
+   - Preserve the default first-separator prefix extractor for structured LSM
+     keys, but make per-store extractors explicit where dense, sparse,
+     full-text, graph, and primary stores diverge.
+   - Track prefix-bloom usefulness separately from exact bloom usefulness so bad
+     extractors can be detected from benchmark/status counters.
+
+7. [x] Keep WAL retention aggressive for all index stores.
+   - Dense, sparse, full-text, graph, and primary stores should checkpoint after
+     successful durable boundaries, startup repair/rebuild, and large catch-up
+     windows.
+   - Reopen should replay only uncovered tails, not historical retained WAL.
+   - Sparse and graph LSM-backed stores now expose the same durable-boundary
+     WAL checkpoint hook as primary, full-text, and dense/HBC stores. Full-text
+     and sparse startup backfill paths checkpoint after successful flushed
+     rebuild batches, and graph reverse rebuild checkpoints after publishing
+     rebuilt reverse edges.
 
 ## Current Performance Checklist
 
@@ -153,6 +285,57 @@ Write path:
 
 - `zig build lsm-write-bench -- --samples 5 --keys 20000 --storage host --mode both > /tmp/lsm-write-before.jsonl`
 - `zig build lsm-write-bench-compare -- --before /tmp/lsm-write-before.jsonl --after /tmp/lsm-write-after.jsonl`
+- `zig build lsm-write-bench -- --samples 5 --keys 20000 --batch-size 100 --flush-threshold 100 --storage host --mode default --workload-set l0_pressure > /tmp/lsm-write-l0-before.jsonl`
+- `zig build lsm-write-bench-compare -- --before /tmp/lsm-write-l0-before.jsonl --after /tmp/lsm-write-l0-after.jsonl`
+- Add `--wal-sync-on-commit` when measuring WAL sync latency and retention
+  behavior under durable commit pressure.
+- Add `--compact-threshold-runs`, `--l0-soft-limit-runs`,
+  `--l0-hard-limit-runs`, `--l0-soft-limit-bytes`,
+  `--l0-hard-limit-bytes`, `--max-run-file-bytes`,
+  `--max-compaction-input-bytes`, and `--background-io-budget-bytes`
+  when measuring RocksDB-like compaction and write-stall policy changes.
+
+### Current Sampled Baseline
+
+Collected on 2026-06-02 from this worktree with 3 samples and 20k keys:
+
+- Read command: `zig build lsm-backend-bench -- --samples 3 --keys 20000 --value-size 128 --storage host --cache both > /tmp/lsm-read-current.jsonl`
+- Read comparator smoke: `zig build lsm-backend-bench-compare -- --before /tmp/lsm-read-current.jsonl --after /tmp/lsm-read-current.jsonl`
+- Cached warm hit path: median `ns/op=702.60`, `read_table_block_loads=6`,
+  shared block hit/miss `99994/6`.
+- Cached warm full scan: median `ns/op=88.51`, `cursor_block_loads=485`,
+  `cursor_block_reuses=199515`, `read_table_block_loads=0`, and cursor
+  value borrow/copy `100000/0`.
+- Uncached warm full scan: median `ns/op=139.50`, `read_table_block_loads=450`,
+  `read_table_block_bytes=798655`, and cursor value borrow/copy `100000/0`.
+- Mixed read/write cache mode: median `ns/op=656.63`, bloom negatives
+  `56205`, survivor reads/hits/misses/tombstones `60111/60000/111/0`,
+  and shared block hit/miss `59986/14`.
+- L0-pressure command: `zig build lsm-write-bench -- --samples 3 --keys 20000 --batch-size 100 --flush-threshold 100 --storage host --mode default --workload-set l0_pressure > /tmp/lsm-write-l0-current.jsonl`
+- L0-pressure comparator smoke: `zig build lsm-write-bench-compare -- --before /tmp/lsm-write-l0-current.jsonl --after /tmp/lsm-write-l0-current.jsonl`
+- L0-pressure load median after the 2026-06-02 base-level target tuning:
+  `ns/op=1449.60`, effective L0 soft/hard `4/8`, foreground write-pressure
+  compactions `28`, `l0_runs_after=4`, `compactable_l0_runs_after=0`,
+  `level_overflow_runs_after=0`, `level_overflow_bytes_after=0`,
+  `wal_retained_bytes_after=0`.
+- L0 maintenance median after the same tuning: `ns/op=250.00`,
+  compactions `0`, `l0_runs_after=4`, `compactable_l0_runs_after=0`,
+  `level_overflow_runs_after=0`, `wal_retained_bytes_after=0`.
+- After widening nonzero L0 pressure assist windows to compact up to
+  `2 * l0_limit`, the same 3-sample L0-pressure run produced load
+  `ns/op=1546.75`, write-pressure compactions `28`, `l0_runs_after=4`,
+  `compactable_l0_runs_after=0`, `level_overflow_runs_after=24`, and
+  `wal_retained_bytes_after=0`. Follow-up maintenance dropped to
+  `ns/op=1504125.00` with `1` compaction.
+- Before the base-level target tuning, the same current run still left
+  `level_overflow_runs_after=24` and required one follow-up maintenance
+  compaction. Raising the default base-level target from 4 runs/128 KiB to
+  32 runs/1 MiB removes that immediate L1 overflow while preserving bounded L0
+  and zero retained WAL.
+
+The next compaction-policy slice should target the remaining foreground
+compaction cost shown by the L0-pressure load phase, while preserving the zero
+retained-WAL after-state and bounded maintenance cleanup.
 
 Large-ingest guardrails:
 
@@ -172,30 +355,68 @@ Large-ingest guardrails:
    negatives, and block loads.
    - [x] Surface existing table parse/block load and shared/local block-cache
      hit/miss counters in the read benchmark JSON and comparison output.
-3. [ ] Implement a block-window cursor for persisted scans in the shared-cache
+   - [x] Surface cursor and point value borrow/copy counters in the read
+     benchmark JSON and comparator, so borrowed-value work can be measured
+     directly instead of inferred from allocator samples.
+   - [x] Surface point-run precheck/survivor counters in the read benchmark
+     JSON and comparator, so the precheck phase can be evaluated for selectivity
+     and overhead.
+3. [x] Implement a block-window cursor for persisted scans in the shared-cache
    path, matching the no-shared-cache table-index/block-window shape.
    - Expected signal: full/short scan throughput improves and cache pollution
      drops because scans stop pinning or materializing whole tables.
    - [x] First slice: when the shared block cache is configured, merge cursors
      now hold one cache block handle per source instead of duplicating cached
      block bytes into cursor-owned memory.
+   - [x] Forward and reverse persisted cursor paths now have regression coverage
+     proving they stay on table-index/block-window reads instead of loading
+     whole run tables.
 4. [x] Replace linear forward winner selection with heap-backed source
    selection for merge cursors.
    - Expected signal: scans with many sources improve in rows/sec and CPU per
      row; correctness must preserve tombstone/source precedence.
    - The existing loser-tree helper is integer-keyed, so the first production
      slice uses cursor-owned byte-slice heap state with the same ordering.
-5. [ ] Return borrowed scan values until `next()` instead of allocating and
+5. [x] Return borrowed scan values until `next()` instead of allocating and
    copying every visible row.
    - Expected signal: scan CPU and allocator traffic fall, especially for wide
      rows.
    - [x] First slice: merge cursors now reuse cursor-owned scratch for source
      advancement, removing the per-row stable-key allocation while preserving
      block-release safety.
-6. [ ] Cache per-cursor source layout (`runs`, L0 groups, lower levels, and
+   - [x] Snapshot cursor-plan `getManySorted` now returns values borrowed from
+     retained cache block handles or stable snapshot states instead of copying
+     every hit into transaction-owned value buffers.
+   - [x] Current/probe reads can now retain cached run-block handles for
+     path-backed point hits, so persisted values survive lock release without a
+     transaction-owned value copy.
+   - [x] Live mutable merge cursors now reuse cursor-owned entry scratch across
+     source movement, avoiding one allocation/free cycle per visible mutable row
+     while preserving the valid-until-next cursor contract.
+   - [x] Live mutable cursor scratch now has a retained-cap policy: rows within
+     the cap reuse a bounded geometric buffer, while oversized rows are released
+     on the next smaller row instead of pinning cursor memory for the rest of
+     the scan.
+   - [x] Normal forward scan cursors now expose whether visible values are
+     borrowed from stable persisted/immutable storage or copied from active
+     mutable scratch, so benchmark counters reflect the remaining copy sources.
+   - [x] Current scans now freeze the active mutable memtable into a retained
+     immutable generation at open, so visible mutable rows are borrowed from
+     stable reader-pinned state instead of copied into cursor scratch.
+6. [x] Cache per-cursor source layout (`runs`, L0 groups, lower levels, and
    immutable pointer slice) across repeated seeks while the cursor snapshot is
    valid.
-7. [ ] Add table block smallest-key metadata and use block min/max bounds to
+   - [x] Current-live probe and large write-batch `getManySorted` now build
+     the active source layout once per batch and reuse it across backend-lock
+     chunks, avoiding repeated run/L0/level reconstruction for the same live
+     read view.
+   - [x] Persisted scan cursors now cache each run source's table index pointer
+     inside the cursor, so block-window movement no longer reacquires the table
+     index through the backend cache on every `next()`.
+   - [x] Repeated persisted cursor seeks now have regression coverage proving
+     the cursor does not rebuild run groups and does not reacquire table-index
+     pointers after the first seek within the same snapshot.
+7. [x] Add table block smallest-key metadata and use block min/max bounds to
    skip non-overlapping range-scan blocks.
    - [x] First slice: table footer metadata now records per-block smallest
      key/namespace and exact point reads reject out-of-block candidates by
@@ -203,29 +424,86 @@ Large-ingest guardrails:
    - [x] Bounded forward scans can now pass an upper bound into erased cursors;
      persisted LSM merge cursors stop before that bound and skip later table
      blocks whose smallest key is already outside the scan range.
-8. [ ] Add sequential scan readahead/prefetch hints for full-run scans.
+8. [x] Add sequential scan readahead/prefetch hints for full-run scans.
+   - [x] First slice: persisted merge cursors warm the next table block in
+     the shared cache after loading the current block, while respecting scan
+     upper bounds.
+9. [x] Add prefix extractor and prefix bloom metadata for structured key
+   families.
+   - Table codec version 9 now records a first-separator prefix extractor,
+     run-level prefix bloom, and per-block prefix blooms.
+   - Persisted forward scans use prefix blooms to skip block loads when the
+     scan upper bound proves the cursor cannot leave the extracted prefix.
+   - Read stats and read-bench JSON now split whole-run prefix-bloom negatives
+     from block-level prefix-bloom negatives, so before/after comparisons can
+     verify useful prefix skips separately from exact-key bloom negatives.
 
 ### Point Read Work
 
-1. [ ] Split point lookup into a bloom/range precheck phase followed by a read
+1. [x] Split point lookup into a bloom/range precheck phase followed by a read
    phase for surviving runs.
-   - Existing run and block blooms are already consulted before block loads in
-     the block-index path; the missing piece is avoiding one synchronous
-     miss-at-a-time across candidate runs.
    - [x] First slice: point reads now consult the manifest-carried run bloom
      before loading a persisted run table index/block from `getFromRunIndices`.
-2. [ ] Issue concurrent block reads for surviving point-read candidates where
+   - [x] Persisted path-backed point reads now run a precheck pass over
+     candidate runs using run bounds, run bloom, and table filter metadata
+     before loading surviving blocks; `ReadStats` exposes precheck and survivor
+     counters.
+   - [x] The precheck survivor list is stack-backed for the normal small
+     candidate set, with heap overflow only for unusually broad lookups.
+   - [x] The survivor read phase now records actual read, hit, miss, and
+     tombstone outcomes in `ReadStats`, `lsm-backend-bench` JSON, and the
+     comparator. This makes the remaining synchronous miss-at-a-time work
+     visible before changing storage IO semantics.
+2. [x] Issue concurrent block reads for surviving point-read candidates where
    precedence allows it.
-   - L0/tombstone semantics require resolving by source order, not by first
-     completed read.
-3. [ ] Add a borrowed-value point-read mode that can hold cache block handles
+   - [x] L0/tombstone semantics are preserved by consuming issued reads in
+     source order; completion order never determines the visible value.
+   - [x] Storage now has a future-style range-read API with a neutral
+     `ReadRuntime`, and native range futures use the shared backend runtime
+     when one is supplied.
+   - [x] The survivor read phase issues persisted-run block reads concurrently
+     where bloom/range/table-index precheck leaves multiple legal block
+     candidates, then cancels/drops lower-priority work after a decisive hit or
+     tombstone.
+   - [ ] Extend the same future path into sorted-by-run/batch point-read state
+     once those paths can share issued reads without disturbing their current
+     block/index reuse.
+3. [x] Add a borrowed-value point-read mode that can hold cache block handles
    until transaction end instead of duplicating every returned value.
    - [x] First slice: snapshot point-batch reads can return slices borrowed
      from retained block handles or immutable snapshots instead of copying every
      result into `held_values`. Current/live locked helpers still copy because
      they do not own a transaction-level block lifetime.
-4. [ ] Make sorted `getManySorted` keep per-run cursor state across keys so
+   - [x] Cursor scratch now uses one aligned backing allocation for all
+     per-source arrays instead of allocating positions, heap state, block
+     handles, and entry slots separately for every cursor open.
+   - [x] Current/probe point reads now borrow values from retained cache block
+     handles for path-backed run hits when the transaction owns a held-block
+     list; live mutable hits still copy until their generation lifetime is
+     explicitly pinned.
+   - [x] Read benchmarks now emit and compare cursor/point value borrow and
+     copy counts, making the remaining mutable-hit copies visible in baselines.
+   - [x] Current/probe point reads now also borrow values from immutable
+     memtables and in-memory run state while a reader is retained.
+   - [x] Probe point reads now pin active mutable value generations. Writers
+     rotate a pinned mutable memtable before applying later foreground writes,
+     so active mutable hits can be borrowed without making the probe a stale
+     open-time snapshot.
+   - [x] Current/live sorted batches deliberately stay on point mode rather
+     than sorted-by-run mode, so transaction-owned held block/value lifetimes
+     are available on the hot probe path. Copy counters remain for explicit
+     no-lifetime fallbacks and uncached local materialization paths.
+4. [x] Make sorted `getManySorted` keep per-run cursor state across keys so
    batch reads resume inside the current block where possible.
+   - [x] First slice: cached sorted-by-run reads now keep a per-run forward
+     entry hint and bounded-scan from the previous hit before falling back to
+     exact block lookup.
+   - [x] Point-batch slice: sorted point-plan batches now reuse per-run table
+     index and current-block state too, so sub-threshold exact batches can
+     advance inside cached blocks instead of reloading/reseeking each key.
+   - [x] Current implementation note: sorted-by-run batches and point-plan
+     batches both use `RunBatchIndexHandles` to retain per-run table-index and
+     current-block state across keys.
 5. [x] Tune bloom defaults once the benchmark can show false-positive block
    loads.
    - Run-level and per-block LSM filters now default to 14 bits/key. The option
@@ -234,32 +512,153 @@ Large-ingest guardrails:
 
 ### Write And Maintenance Work
 
-1. [ ] Add explicit WAL checkpoint/retention metadata and retire covered
+1. [x] Add explicit WAL checkpoint/retention metadata and retire covered
    segments incrementally instead of relying on clean full resets.
-2. [ ] Export retained WAL bytes, oldest uncheckpointed segment, WAL truncation
+2. [x] Export retained WAL bytes, oldest uncheckpointed segment, WAL truncation
    lag, immutable-memtable bytes, and WAL sync latency through status/metrics.
-3. [ ] Replace recovery replay allocation churn with a bounded recovery
+   - [x] First slice: backend write stats now expose WAL sync latency alongside
+     sync record counts, while maintenance stats expose retained WAL segments,
+     retained bytes, checkpoint lag, and replay retention.
+   - [x] Bench slice: `lsm-write-bench` and `lsm-write-bench-compare` now emit
+     and compare WAL append/sync/reset deltas plus retained-WAL after-state,
+     with a `--wal-sync-on-commit` workload flag.
+   - [x] Status slice: public table status can now include a compact
+     `storage_status.lsm` object populated from aggregate local DB primary and
+     index LSM maintenance/write stats, including mutable/immutable bytes,
+     run/L0 debt, WAL retention/checkpoint lag, WAL append/sync/replay/reset
+     counters, and background-IO admission counters.
+   - [x] API schema slice: `storage_status.lsm` now carries the dedicated
+     replay WAL current segment as well, matching the backend maintenance stats
+     and Prometheus WAL checkpoint surface.
+   - [x] Metrics slice: the data-server Prometheus endpoint now exports the
+     same cached-write LSM pressure surface for alerting and benchmark
+     sampling, including mutable/immutable bytes, WAL retention/checkpoint
+     lag, WAL append/sync/replay/reset latency counters, compaction policy
+     debt, background-IO admission, and backend-lock waits.
+   - [x] Startup metrics slice: async startup catch-up metrics now retain the
+     WAL checkpoint coordinates captured after DB open, including oldest
+     retained/current/covered segments, lag, replay retained bytes, and replay
+     current segment.
+3. [x] Replace recovery replay allocation churn with a bounded recovery
    allocation model that can release whole chunks after flush.
+   - [x] First slice: state WAL recovery now reads segment chunks directly
+     into the reusable pending replay buffer instead of allocating one chunk
+     per read and retaining those chunks until segment replay exits.
+   - [x] Replay pending scratch now has a retained-cap policy: normal replay
+     chunks are reused, but an oversized retained buffer from a large WAL record
+     is released once the unconsumed tail is back inside the normal chunk
+     window. The shared scratch path now grows and frees this buffer with the
+     same scratch allocator.
+   - [x] Recovery replay now checks the mutable byte threshold after each
+     decoded WAL entry, so one large state record can flush incrementally
+     instead of materializing the whole record in the active mutable arena
+     before the first recovery flush.
+   - [x] Recovery replay now tracks a flush-scoped active byte window and
+     publishes recovery flush, entry-byte, and peak-window counters. Replayed
+     entry bytes live in the current mutable recovery arena, which moves as a
+     unit into the immutable flush window and is released when that flush
+     retires.
 4. [ ] Add final-state HBC bulk publication for sustained ingest so large loads
    avoid persisting every intermediate online mutation.
-5. [ ] Raise compaction concurrency only after the scheduler can prove selected
+5. [x] Add background IO admission budgeting for maintenance work.
+   - First slice: immutable flushes and scheduled compactions now reserve from
+     a per-step background IO byte budget, can defer when the budget is
+     exhausted, and expose budget/reserved/denied/oversized counters in
+     maintenance stats.
+6. [ ] Raise compaction concurrency only after the scheduler can prove selected
    jobs are non-overlapping or otherwise safe to run in parallel.
-6. [ ] Consider memtable structure changes after byte-budgeted WAL/flush and
+   - [x] Safety gate slice: compaction work now carries the selected source
+     and target run IDs into the scheduler. The scheduler tracks in-flight run
+     IDs, denies overlapping candidates with `conflict_denials`, and admits
+     non-overlapping candidates when job and byte budgets allow. This does not
+     raise concurrency by itself, but it establishes the required admission
+     invariant before enabling parallel background compaction.
+   - [x] Detached maintenance slice: backends with a detached background
+     executor now enqueue one `.maintenance` job when post-write flush/compaction
+     debt is visible and no immutable flush job is already responsible for the
+     same work. The job runs a bounded maintenance step off the foreground path,
+     so soft L0 debt can make progress without waiting for a later writer to
+     call maintenance explicitly.
+   - [x] Continuation slice: a detached maintenance job that makes progress now
+     clears its in-flight bit and re-enters the same admission path while score
+     remains nonzero. Background LSM work therefore drains visible debt as a
+     sequence of bounded jobs instead of stopping after the first slice.
+   - [x] Policy slice: scheduled maintenance now has a default-off
+     `max_compaction_input_bytes` cap. Plan selection can skip oversized
+     compactions and choose eligible smaller work instead of repeatedly
+     admitting or remembering a plan larger than the configured policy budget.
+   - [x] Benchmark slice: `lsm-write-bench` can now drive and emit compaction
+     trigger/limit/background-IO policy knobs, and the comparator reports L0
+     debt, level overflow, scheduler pressure, and background IO admission
+     counters for before/after tuning.
+   - [x] Write-stall threshold observability: write-bench JSON and comparator
+     now report effective L0 soft/hard run limits, including derived hard
+     limits when `l0_hard_limit_runs` is left at its default, plus foreground
+     write-pressure and WAL-pressure counters.
+   - [x] WAL/working-set benchmark surface: write-bench JSON and comparator
+     now include mutable/immutable after-state bytes and full WAL checkpoint
+     coordinates: oldest retained segment, covered-through segment, current
+     segment, lag, and replay-current segment.
+   - [x] L0-pressure benchmark slice: `lsm-write-bench --workload-set
+     l0_pressure` repeatedly flushes small batches into L0, then times bounded
+     maintenance separately so compaction trigger and write-stall policy changes
+     can be compared against real L0 debt.
+   - [x] Default L0 compaction trigger now uses a RocksDB-like 4-run target.
+     The fallback hard limit is now two times the soft trigger, so foreground
+     write-pressure assist starts at 8 L0 runs unless overridden. A 3-sample
+     `lsm-write-bench --workload-set l0_pressure` comparison on 20k keys cut
+     post-load L0 runs from 16 to 8 and reduced follow-up maintenance
+     compactions from 7 to 3, while median load ns/op moved from 1513.25 to
+     1499.25.
+   - [x] Nonzero L0 pressure assist now uses a wider window, up to
+     `2 * l0_limit`, while preserving the `l0_limit=0` oldest-pair fallback.
+     On the 20k-key L0-pressure benchmark, load median moved from
+     `1954.05 ns/op` to `1546.75 ns/op`, foreground write-pressure
+     compactions stayed at `28`, L0 stayed at `4`, and follow-up maintenance
+     dropped to one compaction.
+   - [x] Base-level target tuning: default lower-level targets now start at
+     32 runs and 1 MiB instead of 4 runs and 128 KiB. On the same 20k-key
+     L0-pressure harness, median load moved from `1518.05 ns/op` to
+     `1449.60 ns/op`, post-load `level_overflow_runs_after` fell from `24` to
+     `0`, and follow-up maintenance compactions fell from `1` to `0`, while
+     `l0_runs_after=4` and `wal_retained_bytes_after=0` were preserved.
+   - [x] Max compaction input bytes now behaves like a target for scheduled L0
+     maintenance: if no legal L0 compaction fits under the cap, the scheduler
+     can admit the minimum oversized job so soft L0 debt does not get stuck
+     permanently. The same progress rule now applies to lower-level repair and
+     pressure compactions. Strict cap behavior remains available for tests and
+     diagnostics.
+7. [ ] Consider memtable structure changes after byte-budgeted WAL/flush and
    recovery allocation work are measured; the current active memtable appends
    plus hash-indexes writes and sorts on freeze/flush, so the main costs are
    flush sort, range iteration, immutable lookup, and memory layout rather than
    ordered-insert shifts.
-7. [ ] Add table key-prefix compression with restart points after the scan and
+   - [x] First slice: normal active memtable key/value/namespace payloads now
+     allocate from a memtable-owned arena, matching the recovery replay arena
+     path. Structural entry arrays and hash-index buckets still use the backend
+     allocator, but foreground payload churn is reclaimed at memtable
+     rotation/flush instead of per overwritten value.
+   - [x] Active-to-active mutable merge now copies arena-backed source entries
+     into the target arena before releasing the source arena, preserving batch
+     commit safety.
+8. [x] Add table key-prefix compression with restart points after the scan and
    WAL/flush bottlenecks are under control, because it is a table-format change.
    - [x] First slice: table blocks can now be stored as prefix-compressed key
-     deltas with restart offsets, optionally followed by Snappy. The current
-     reader expands blocks back to the existing full-entry layout before search.
+     deltas with restart offsets, optionally followed by Snappy.
    - [x] Decode cleanup: prefix-block materialization reuses key scratch while
      expanding entries, avoiding one temporary key allocation per entry.
    - [x] Direct-search primitive: prefix-compressed block payloads can be
      searched by restart point and scanned within the restart window without
-     expanding the full logical block. Runtime integration needs a cache policy
-     that does not displace hot decoded blocks on mixed workloads.
+     expanding the full logical block.
+   - [x] Breaking codec slice: run tables now use v9 table/footer magic and the
+     production decoder no longer accepts legacy v2-v8 table files.
+   - [x] Runtime point-read slice: local/no-shared-cache exact reads use the
+     direct restart search for prefix-compressed blocks instead of decoding the
+     full logical block before lookup. Shared-cache cursor/block policy remains
+     a separate cache-shape follow-up.
+   - [x] Shared-cache exact reads now use a distinct physical-block cache for
+     prefix-compressed payloads, so repeated point probes can reuse compressed
+     bytes without populating the decoded iterator block cache.
 
 ### Comparison Rules
 
@@ -310,6 +709,12 @@ Current symptoms:
   hot ingest. On the Zig LSM backend, `beginReadTxn()` clones the active mutable
   memtable, so replay workers could drive multi-GB Activity Monitor footprint
   even on 50k vector runs.
+- Broad storage verification can still stall in `DB.close()` while draining a
+  durable LSM background runtime. A sample during `lib-storage-test` showed the
+  main thread waiting in `Backend.close() -> background.Executor.drain()` while
+  runtime worker threads contended in `reapCompleted`/`submit`. That is separate
+  from replay-lane filtering, but it is still a RocksDB/Pebble-shaped lifecycle
+  issue: background work must have a non-reentrant stop/drain protocol.
 
 Task list:
 
@@ -346,36 +751,70 @@ Task list:
    - [x] Migrated runtime DB/store LSM owner construction to `BackendHandle`
      across persistent indexes, HBC, DB primary stores, WAL-backed stores,
      graph reverse stores, raft apply stores, and auth stores.
-   - [ ] A dedicated internal flush thread can now be built on `BackendHandle`
-     and enabled after its stop/join, wakeup, and write-pressure behavior is
-     covered by tests.
+   - [x] `BackendHandle` can now own an internal backend runtime and install a
+     handle-scoped detached background executor, so standalone WAL-backed
+     handles can wake immutable flush work without an external DB runtime.
+     Tests cover executor installation and wake/drain of deferred immutable
+     flush work through the owned threaded runtime; shared DB runtimes remain
+     the default for DB-managed stores.
+   - [x] `BackendHandle` also has an opt-in dedicated internal flush worker.
+     The backend exposes a maintenance waker, deferred flush and maintenance
+     scheduling route to that worker when installed, and the worker drains
+     bounded maintenance steps until immutable flush/L0 debt is clean. Tests
+     cover wakeup, stop/join with a final drain, and soft L0 pressure
+     compaction through the handle-owned worker.
 9. [x] Add WAL-aware recovery and manifest checkpoints. Recovery should load
    durable runs from the manifest, replay WAL records after the last checkpoint
    into mutable/immutable memory state, and safely truncate or recycle WAL files
    only after a published flush checkpoint.
-10. [ ] Add WAL metrics and pressure hooks: bytes appended, sync latency,
+10. [x] Add WAL metrics and pressure hooks: bytes appended, sync latency,
    records replayed, oldest uncheckpointed LSN, immutable-memtable bytes, and
    WAL truncation lag.
-11. [ ] Add incremental WAL checkpoints and segment retirement. Durable flush +
+11. [x] Add incremental WAL checkpoints and segment retirement. Durable flush +
    manifest publication should retire covered WAL segments without waiting for
    a full backend reset.
-12. [ ] Export startup open phases and retained-WAL debt. LSM-backed stores
+12. [x] Export startup open phases and retained-WAL debt. LSM-backed stores
    should report whether they are opening the manifest, replaying WAL, mounting
    runs/indexes, or doing higher-level catch-up/rebuild work.
-13. [ ] Add per-backend WAL retention policy for index stores. Dense, sparse,
+   - Backend open stats now track manifest, WAL replay, run mounting, replay
+     bytes/records, and loaded run counts.
+   - DB startup/status aggregates LSM open stats across primary and index stores
+     and exposes retained-WAL coordinates through JSON status and Prometheus.
+13. [x] Add per-backend WAL retention policy for index stores. Dense, sparse,
    and graph backends should checkpoint aggressively after successful bulk
    finalize, startup recovery, and large catch-up sessions so retained WAL stays
    bounded across restarts.
-14. [ ] Add final-state HBC bulk publication for empty or sustained ingest so
+   - Primary and index LSM profiles now configure bounded WAL-retention pressure
+     by default; soft pressure schedules checkpoint maintenance and hard
+     pressure forces bounded foreground flush/checkpoint work.
+14. [x] Fix background-runtime close/drain behavior so maintenance workers cannot
+   enqueue or recursively schedule new work while a backend owner is draining.
+   - `Backend.close()` now publishes a stopping state before drain, the durable
+     runtime marks the owner closing, and same-owner submissions fail with
+     `BackgroundOwnerClosing`.
+   - Already-accepted owner jobs still drain deterministically, but maintenance
+     callbacks cannot recursively schedule new work while close is draining the
+     owner.
+   - Verification: `lib-storage-test --test-timeout 600s` advanced past the
+     prior `Backend.close() -> background.Executor.drain()` stall and the new
+     owner-close runtime tests passed; that long-suite run later timed out in a
+     focused shared-embedding wait that passes independently.
+15. [ ] Add final-state HBC bulk publication for empty or sustained ingest so
    large loads do not persist every intermediate online mutation.
-15. [x] Add LSM table-block compression. Start with adaptive per-block Snappy
+16. [x] Add LSM table-block compression. Start with adaptive per-block Snappy
    because the repo has a pure Zig codec today, keep the policy configurable per
    backend/store, and store blocks uncompressed when the compressed payload does
    not clear a savings threshold. Add zstd/lz4 policies later when encoder
    support is available and benchmarked.
-16. [ ] Keep dense/sparse embeddings in their binary artifact format rather
+17. [x] Keep dense/sparse embeddings in their binary artifact format rather
    than relying on table compression to shrink JSON float arrays.
-17. [ ] Re-run 50k and 1M VectorDBBench with samples and compare:
+   - Dense and sparse embedding artifacts are encoded by
+     `storage/db/enrichment/artifact_codec.zig` as binary `dense_embedding` and
+     `sparse_embedding` payloads with little-endian `f32`/`u32` arrays. The DB
+     vector-field-backed index path strips source JSON vector fields from
+     stored documents and persists the vectors as embedding artifacts, so table
+     compression is only a secondary storage win.
+18. [ ] Re-run 50k and 1M VectorDBBench with samples and compare:
    `logical_bytes`, `table_file_bytes`, `l0_runs`, `compaction_debt`,
    `flush_ms`, `compaction_ms`, `wal_append_ms`, `wal_sync_ms`, and search
    p95/p99.
@@ -495,6 +934,12 @@ debt before returning.
      work.
    - Hard-limit enforcement should be visible in metrics; it should not appear
      as a mysterious multi-minute publish window.
+   - [x] Foreground hard-pressure enforcement now runs a configurable bounded
+     number of L0 compaction steps before accepting more work. Write stats,
+     write-bench JSON, index status, and Prometheus expose pressure events,
+     compaction steps, overloads, rejections, and elapsed pressure time. A
+     default-off rejection option can fail writes with `WritePressureExceeded`
+     when the backend remains above hard limits after the foreground budget.
 
 5. [x] Checkpoint WAL independently from compaction.
    - After a successful flush + manifest publication, advance WAL coverage for
@@ -676,13 +1121,33 @@ Near-term task list:
    onto a probe path.
 5. [x] Keep `ProbeTxn` point-read only by splitting replay scans onto a
    dedicated current-scan contract.
-6. [ ] Add native LSM/runtime replay-lane iteration so replay workers no longer
+6. [x] Add native LSM/runtime replay-lane iteration so replay workers no longer
    scan the replay-all lane and decode hint masks in userland.
+   - [x] First slice: `DocStore` and the erased store API now expose streaming
+     replay iteration by hint mask. Single-hint scans use the per-hint replay
+     lane directly, and derived replay source uses this streaming API for
+     chunk collection.
+   - [x] Native runtime slice: erased stores now expose
+     `forEachReplayLaneFrom`, LSM and memory runtime stores implement it as a
+     lane-bounded replay scan, and `DocStore` delegates runtime replay
+     iteration through that API instead of opening a generic current-scan
+     cursor.
+   - [x] Derived replay source now calls the native lane iterator directly for
+     primary-store catch-up and cursor windows, preserving max-entry chunking
+     and `StopReplayChunk` behavior without constructing a generic erased
+     current-scan cursor.
+   - [x] Compatibility cleanup: hinted replay no longer falls back to the
+     replay-all lane. Missing hint-lane rows produce no hinted work; the
+     replay-all lane remains for unhinted/all-lane consumers.
 7. [ ] Export replay-live scan metrics so we can compare:
    - replay sequences scanned
    - replay scan batches
    - replay hint-filter skips
    - replay clone bytes avoided
+   - [x] First slice: replay source stats now distinguish matched rows from
+     scanned rows, count replay scan batches, and count hint-filter skips.
+     Dense catch-up status JSON and Prometheus export scan batches and
+     hint-filter skips alongside the existing scanned/applied counters.
 
 Design target:
 
@@ -752,7 +1217,7 @@ That means there are still two independent problems to fix:
    against the earlier multi-GB replay runs.
 6. [ ] Verify the second restart cost drops further once a run reaches a clean
    post-recovery checkpoint, rather than replaying the same retained bytes.
-7. [ ] Replace recovery's general-allocator entry churn with a bounded recovery
+7. [x] Replace recovery's general-allocator entry churn with a bounded recovery
    allocation model.
    - Current evidence from `vmmap` on the live `1M` root:
      - physical footprint can reach about `14.1G`
@@ -761,9 +1226,10 @@ That means there are still two independent problems to fix:
      - malloc zones account for about `13.0G` allocated / `13.8G` swapped
    - This means the remaining memory problem is process-private heap growth and
      allocator retention during recovery, not primarily mapped-file residency.
-   - The target fix is recovery-specific chunk/arena allocation for replayed
-     state so flush can drop whole chunks instead of retaining millions of
-     medium/small heap objects.
+   - Recovery replay now creates a mutable-memtable recovery arena and keeps
+     replayed namespace/key/value bytes arena-owned, while mutable hash-index
+     metadata stays on the normal allocator. A regression covers both the
+     replay ownership and arena release after deferred flush.
 8. [ ] Add a distinct startup/recovery working-set slice for higher-level dense
    rebuild/catch-up transient buffers if physical footprint still materially
    exceeds the new bounded recovery heap plus tracked caches.
@@ -847,7 +1313,7 @@ Implemented next slice:
 
 ## WAL Retention And Startup Replay
 
-Status: planned
+Status: implemented; keep benchmarked
 
 Recent 1M loaded-root runs showed the next backend-level gap clearly:
 
@@ -875,34 +1341,48 @@ startup replay tax if it retains large WAL segments between runs.
 - Dense, sparse, and graph index stores should all inherit the same retention
   guarantees from the LSM layer.
 
-### Planned work
+### Current status
 
 1. Add explicit WAL checkpoint metadata to the backend.
-   - Persist:
+   - Implemented:
      - current segment
      - oldest uncheckpointed segment
-     - last checkpointed mutation sequence or equivalent durable flush marker
      - retained WAL bytes/segments
-   - Surface the metadata through backend maintenance stats and status.
+     - checkpoint lag in sealed segments before the active WAL segment
+     - last durably covered WAL segment
+   - Surfaced through backend maintenance stats and Prometheus metrics.
+   - The durable flush marker is segment-granular because the state WAL is
+     segment-framed rather than mutation-sequenced; dedicated replay WALs keep
+     their own sequence watermarks.
 
 2. Add incremental segment retirement after durable publication.
-   - When a flush + manifest publication durably covers WAL through segment `N`,
-     retire segments `<= N` immediately.
+   - Implemented: when a flush + manifest publication durably covers WAL through
+     segment `N`, retire segments `<= N` immediately.
    - Keep the full-reset path for the totally clean case, but do not require a
      full reset to reclaim historical WAL.
 
 3. Split "checkpoint" from "reset".
-   - `checkpoint`: advance durable coverage and retire covered segments while
-     keeping the current WAL live for new writes
-   - `reset`: clean-slate path when mutable + immutable state are both empty
+   - Implemented:
+     - `checkpoint`: advance durable coverage and retire covered segments while
+       keeping the current WAL live for new writes
+     - `reset`: clean-slate path when mutable + immutable state are both empty
 
 4. Add WAL pressure policy.
-   - Soft threshold: schedule maintenance/checkpoint sooner
-   - Hard threshold: throttle or force checkpoint before retained WAL grows
-     without bound
-   - Feed this into backend maintenance score and resource-manager pressure
+   - Implemented:
+     - optional soft/hard WAL segment and byte limits on `Options`
+     - retained WAL pressure feeds backend maintenance score
+     - soft WAL pressure makes maintenance flush/checkpoint a live mutable
+       memtable before the normal flush threshold
+     - hard WAL pressure forces foreground rotate/flush/checkpoint work on the
+       commit path so retained WAL segments are retired without waiting for a
+       later maintenance pass.
+     - retained WAL bytes are accounted in the ResourceManager under
+       `lsm.wal_retention`, so pressure snapshots distinguish durable WAL debt
+       from transient WAL write buffers.
 
-5. Export startup/open phases for LSM-backed stores.
+### Remaining work
+
+1. Export startup/open phases for LSM-backed stores.
    - Suggested phases:
      - `opening_manifest`
      - `replaying_wal`
@@ -911,14 +1391,39 @@ startup replay tax if it retains large WAL segments between runs.
      - `higher_level_catch_up`
    - Status/metrics should distinguish LSM replay debt from derived replay debt
      and from index rebuild/backfill work.
+   - [x] First LSM slice: `Backend.OpenStats` now records successful open phase
+     timing for storage initialization, manifest loading, directory creation,
+     WAL replay, and run mounting, plus replay records/bytes and loaded run
+     counts. Higher-level index-runtime and catch-up phases remain separate
+     runtime work.
+   - [x] DB startup/status now aggregates LSM open stats across primary and
+     index stores, and exposes the phase counters through async-index startup
+     JSON/Prometheus metrics so LSM replay time is visible separately from
+     higher-level catch-up work.
+   - [x] Startup status now carries checkpoint/replay retention coordinates
+     and WAL replay tail-cleanup bytes through both JSON status and Prometheus,
+     so retained-WAL debt can be correlated with startup RSS and replay time.
 
-6. Add aggressive checkpoint triggers for index stores.
+2. Add aggressive checkpoint triggers for index stores.
    - After successful bulk finalize
    - After successful startup repair/rebuild
    - After large catch-up sessions
    - After sustained write bursts that rotated segments
+   - [x] First slice: LSM-backed primary, full-text, and dense/HBC index
+     owners expose a durable-boundary WAL checkpoint hook that drains mutable
+     and immutable state before retiring covered WAL. Derived replay catch-up
+     paths now call it after successful dense bulk-window finalization and
+     after applied sequence publication for indexes that advanced.
+   - [x] Default policy slice: primary and index LSM profiles now configure
+     bounded WAL-retention pressure by default. Soft limits feed background
+     maintenance/checkpointing; hard limits force bounded foreground
+     flush/checkpoint work before retained WAL can grow without limit.
+   - [x] Sparse and graph LSM-backed stores now expose durable-boundary
+     checkpoint hooks. The managed-index dispatcher handles sparse and graph
+     refs, and full-text, sparse, and graph startup rebuild/backfill boundaries
+     explicitly checkpoint retained WAL after successful publication.
 
-7. Re-benchmark loaded-root restart behavior.
+3. Re-benchmark loaded-root restart behavior.
    - Measure time to:
      - LSM open complete
      - first visible higher-level catch-up progress
@@ -956,6 +1461,10 @@ Core backend tests:
 5. Repeated open/close does not accumulate retained WAL indefinitely.
    - Drive several write / flush / reopen cycles.
    - Assert retained WAL bytes/segments stay bounded.
+   - [x] Backend coverage now drives repeated checkpointed write/reopen cycles,
+     asserts each clean reopen skips historical WAL replay, verifies retained
+     WAL bytes/segments return to zero after durable checkpoint, and confirms
+     all prior rows remain readable after the final reopen.
 
 Index-facing integration tests:
 
@@ -1117,12 +1626,14 @@ Implemented in this pass:
 
 - The block-read index path now reuses cached full-table raw bytes when they are already present, decoding the index from cached raw data instead of falling back to the fragmented `readFileRangeAlloc` sequence.
 - This does not eliminate the multi-read metadata path when raw bytes are not cached, but it removes redundant metadata I/O when range/full-table reads have already populated the raw-table cache.
-- Added `fileSize` to the storage abstraction and switched the v3 index loader to derive bloom length from EOF, reducing the uncached v3 metadata path from four reads to two range reads plus one size lookup.
-- Added a new v4 run-table format with a fixed footer at EOF. The footer points to one contiguous metadata bundle containing entry offsets and bloom bytes.
+- Removed the legacy v3 index fallback after the v9 codec break; production
+  run tables now require footer-backed metadata.
+- The current run-table format uses a fixed footer at EOF. The footer points to
+  one contiguous metadata bundle containing entry offsets, bloom bytes, block
+  bounds, hash slots, compression metadata, and prefix filters.
 - New table files now load indexes via:
   - one fixed-size footer trailer read
   - one contiguous metadata read
-- Legacy v2/v3 table files remain readable through the older decode path.
 - Bloom-negative reads now require and use manifest-carried `encoded_bloom_filter` bytes, avoiding whole-table I/O on common negative probes after reopen.
 - Once a manifest bloom has been decoded for a live run, later read snapshots now borrow that decoded filter instead of re-decoding it per transaction.
 - Added a backend-local `TableIndex` cache for no-shared-cache readers, and point reads now use `footer metadata + one data block read` instead of loading the full table on first access after reopen.
@@ -1141,7 +1652,8 @@ Implemented in this pass:
 Candidate implementation options:
 
 1. Add a native-only table metadata cache keyed by `(path, run_id, generation)`.
-2. Extend native or host storage with a direct trailer read helper so the v4 footer can be fetched without an explicit `fileSize` round trip.
+2. Keep direct trailer reads as the required index-open path for v9 footer
+   metadata.
 3. Optionally move more reader-open metadata into the footer bundle if future table properties are added.
 
 Why this is not in Phase 1:
@@ -1198,18 +1710,18 @@ Expected cost:
 ## Suggested Order From Here
 
 1. Keep the current Phase 1-3 changes and benchmark them under miss-heavy point-lookups and reopen-heavy workloads.
-2. Benchmark the v4 footer path against the v3 fallback path under reopen-heavy point-lookups.
-3. Only after measuring Phase 4, decide whether the next format revision should add:
-   - a trailer read helper in the storage layer
-   - a block hash index
-   - block property collectors
+2. Benchmark v9 footer metadata and prefix-compressed direct point lookup under
+   reopen-heavy point-lookups.
+3. Use the measurements to decide whether the next format revision should add
+   richer block property collectors or a shared-cache physical-block policy.
 
 ## What Landed In This Pass
 
 - Pending load coordination is now keyed and blocking instead of scan-plus-yield.
 - The native fd cache is now sharded and hashed, and it no longer holds the hot lock across `openat`.
 - The block cache now evicts from maintained shard-local LRU state instead of globally rescanning the cache.
-- New run tables now use a footer-backed v4 metadata layout, while legacy table versions still decode through the compatibility path.
+- New run tables now use a footer-backed v9 metadata layout and legacy table
+  versions are intentionally rejected.
 
 ## Validation
 
@@ -1231,7 +1743,9 @@ The harness emits JSONL with:
 - reopen-heavy open/get/miss/short-scan timings
 - mixed read/write timings
 - storage read counters (`read_file`, `read_range`, `read_trailer`, `file_size`)
-- backend read-stat deltas (`point_gets`, `run_probes`, `bloom_negatives`, etc.)
+- backend read-stat deltas (`read_point_gets`, `read_run_probes`,
+  `read_bloom_negatives`, `read_prefix_bloom_negatives`,
+  `read_block_prefix_bloom_negatives`, etc.)
 - shared-cache hit/miss deltas when cache is enabled
 
 Run the same command on two revisions and diff the JSON lines by `scenario + workload`.

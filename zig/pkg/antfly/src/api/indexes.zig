@@ -608,6 +608,7 @@ fn appendIndexRuntimeStatus(
 }
 
 const AggregatedIndexStatus = struct {
+    kind: ?db_mod.types.IndexKind = null,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     table_doc_count: u64 = 0,
@@ -717,6 +718,7 @@ fn aggregateIndexStatus(
         if (!expectedGroupAllowsStatus(expected_group_ids, runtime.group_id)) continue;
         const item = findIndexStatus(runtime.stats.indexes, index_name) orelse continue;
         found = true;
+        if (aggregate.kind == null) aggregate.kind = item.kind;
         const runtime_present = runtime_status.statusHasRuntimeFacts(runtime);
         if (!runtime_present) continue;
         runtime_count += 1;
@@ -803,7 +805,21 @@ fn aggregateIndexStatus(
     }
     if (!found and expected_group_ids.len == 0) return null;
     if (active_count > 0) aggregate.backfill_progress = active_progress_sum / @as(f64, @floatFromInt(active_count));
+    normalizeReadyFullTextAggregate(&aggregate);
     return aggregate;
+}
+
+fn normalizeReadyFullTextAggregate(aggregate: *AggregatedIndexStatus) void {
+    const kind = aggregate.kind orelse return;
+    if (kind != .full_text) return;
+    if (aggregate.reported_group_count == 0 or aggregate.missing_group_count > 0 or aggregate.remote_unknown_group_count > 0) return;
+    if (aggregate.replay_target_sequence == 0 or aggregate.replay_applied_sequence < aggregate.replay_target_sequence) return;
+    if (aggregate.table_doc_count == 0 or aggregate.doc_count < aggregate.table_doc_count) return;
+
+    aggregate.replay_catch_up_required = false;
+    aggregate.catch_up_active = false;
+    aggregate.backfill_active = false;
+    aggregate.backfill_progress = 1.0;
 }
 
 fn algebraicProgressSummaryRanksHigher(
@@ -856,11 +872,21 @@ fn aggregateTextMergeStats(dst: *db_mod.types.TextMergeStats, src: db_mod.types.
     dst.pending_indexes += src.pending_indexes;
     dst.pending_segments += src.pending_segments;
     dst.pending_bytes += src.pending_bytes;
+    dst.pending_heap_bytes += src.pending_heap_bytes;
+    dst.pending_mmap_bytes += src.pending_mmap_bytes;
     dst.in_flight_merges += src.in_flight_merges;
     dst.in_flight_segments += src.in_flight_segments;
     dst.completed_merges += src.completed_merges;
     dst.skipped_stale_merges += src.skipped_stale_merges;
     dst.failed_merges += src.failed_merges;
+    dst.merge_input_segments_total += src.merge_input_segments_total;
+    dst.merge_input_bytes_total += src.merge_input_bytes_total;
+    dst.merge_output_segments_total += src.merge_output_segments_total;
+    dst.merge_output_bytes_total += src.merge_output_bytes_total;
+    dst.last_merge_input_segments = @max(dst.last_merge_input_segments, src.last_merge_input_segments);
+    dst.last_merge_input_bytes = @max(dst.last_merge_input_bytes, src.last_merge_input_bytes);
+    dst.last_merge_output_segments = @max(dst.last_merge_output_segments, src.last_merge_output_segments);
+    dst.last_merge_output_bytes = @max(dst.last_merge_output_bytes, src.last_merge_output_bytes);
     dst.quarantined_merges += src.quarantined_merges;
     dst.quarantined_segments += src.quarantined_segments;
     dst.deferred_for_pressure += src.deferred_for_pressure;
@@ -1362,6 +1388,10 @@ fn appendDenseCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanag
     try appendIntValue(alloc, out, stats.current_scanned_entries);
     try out.appendSlice(alloc, ",\"current_applied_entries\":");
     try appendIntValue(alloc, out, stats.current_applied_entries);
+    try out.appendSlice(alloc, ",\"replay_scan_batches\":");
+    try appendIntValue(alloc, out, stats.replay_scan_batches);
+    try out.appendSlice(alloc, ",\"replay_hint_filter_skips\":");
+    try appendIntValue(alloc, out, stats.replay_hint_filter_skips);
     try out.appendSlice(alloc, ",\"progress_updates\":");
     try appendIntValue(alloc, out, stats.progress_updates);
     try out.appendSlice(alloc, ",\"bulk_finish_windows\":");
@@ -1437,6 +1467,20 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.wal_retained_segments);
     try out.appendSlice(alloc, ",\"wal_retained_bytes\":");
     try appendIntValue(alloc, out, stats.wal_retained_bytes);
+    try out.appendSlice(alloc, ",\"wal_checkpoint_oldest_retained_segment\":");
+    try appendIntValue(alloc, out, stats.wal_checkpoint_oldest_retained_segment);
+    try out.appendSlice(alloc, ",\"wal_checkpoint_covered_through_segment\":");
+    try appendIntValue(alloc, out, stats.wal_checkpoint_covered_through_segment);
+    try out.appendSlice(alloc, ",\"wal_checkpoint_current_segment\":");
+    try appendIntValue(alloc, out, stats.wal_checkpoint_current_segment);
+    try out.appendSlice(alloc, ",\"wal_checkpoint_lag_segments\":");
+    try appendIntValue(alloc, out, stats.wal_checkpoint_lag_segments);
+    try out.appendSlice(alloc, ",\"wal_replay_retained_segments\":");
+    try appendIntValue(alloc, out, stats.wal_replay_retained_segments);
+    try out.appendSlice(alloc, ",\"wal_replay_retained_bytes\":");
+    try appendIntValue(alloc, out, stats.wal_replay_retained_bytes);
+    try out.appendSlice(alloc, ",\"wal_replay_current_segment\":");
+    try appendIntValue(alloc, out, stats.wal_replay_current_segment);
     try out.appendSlice(alloc, ",\"configured_indexes\":");
     try appendIntValue(alloc, out, stats.configured_indexes);
     try out.appendSlice(alloc, ",\"configured_dense_indexes\":");
@@ -1453,6 +1497,32 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.db_open_ns);
     try out.appendSlice(alloc, ",\"load_indexes_ns\":");
     try appendIntValue(alloc, out, stats.load_indexes_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_stores\":");
+    try appendIntValue(alloc, out, stats.lsm_open_stores);
+    try out.appendSlice(alloc, ",\"lsm_open_completed\":");
+    try appendIntValue(alloc, out, stats.lsm_open_completed);
+    try out.appendSlice(alloc, ",\"lsm_open_failed\":");
+    try appendIntValue(alloc, out, stats.lsm_open_failed);
+    try out.appendSlice(alloc, ",\"lsm_open_total_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_total_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_initializing_storage_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_initializing_storage_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_manifest_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_manifest_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_ensuring_dirs_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_ensuring_dirs_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_wal_replay_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_wal_replay_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_mounting_runs_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_mounting_runs_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_loaded_runs\":");
+    try appendIntValue(alloc, out, stats.lsm_open_loaded_runs);
+    try out.appendSlice(alloc, ",\"lsm_open_obsolete_paths\":");
+    try appendIntValue(alloc, out, stats.lsm_open_obsolete_paths);
+    try out.appendSlice(alloc, ",\"lsm_open_mutable_entries_after_replay\":");
+    try appendIntValue(alloc, out, stats.lsm_open_mutable_entries_after_replay);
+    try out.appendSlice(alloc, ",\"lsm_open_immutable_memtables_after_replay\":");
+    try appendIntValue(alloc, out, stats.lsm_open_immutable_memtables_after_replay);
     try out.appendSlice(alloc, ",\"wal_replay_records\":");
     try appendIntValue(alloc, out, stats.wal_replay_records);
     try out.appendSlice(alloc, ",\"wal_replay_entries\":");
@@ -1461,6 +1531,8 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.wal_replay_bytes);
     try out.appendSlice(alloc, ",\"wal_replay_ns\":");
     try appendIntValue(alloc, out, stats.wal_replay_ns);
+    try out.appendSlice(alloc, ",\"wal_replay_truncated_tail_bytes\":");
+    try appendIntValue(alloc, out, stats.wal_replay_truncated_tail_bytes);
     try out.append(alloc, '}');
 }
 
@@ -1551,10 +1623,30 @@ fn appendTextMergeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(
     try appendIntValue(alloc, out, stats.pending_segments);
     try out.appendSlice(alloc, ",\"pending_bytes\":");
     try appendIntValue(alloc, out, stats.pending_bytes);
+    try out.appendSlice(alloc, ",\"pending_heap_bytes\":");
+    try appendIntValue(alloc, out, stats.pending_heap_bytes);
+    try out.appendSlice(alloc, ",\"pending_mmap_bytes\":");
+    try appendIntValue(alloc, out, stats.pending_mmap_bytes);
     try out.appendSlice(alloc, ",\"in_flight_merges\":");
     try appendIntValue(alloc, out, stats.in_flight_merges);
     try out.appendSlice(alloc, ",\"failed_merges\":");
     try appendIntValue(alloc, out, stats.failed_merges);
+    try out.appendSlice(alloc, ",\"merge_input_segments_total\":");
+    try appendIntValue(alloc, out, stats.merge_input_segments_total);
+    try out.appendSlice(alloc, ",\"merge_input_bytes_total\":");
+    try appendIntValue(alloc, out, stats.merge_input_bytes_total);
+    try out.appendSlice(alloc, ",\"merge_output_segments_total\":");
+    try appendIntValue(alloc, out, stats.merge_output_segments_total);
+    try out.appendSlice(alloc, ",\"merge_output_bytes_total\":");
+    try appendIntValue(alloc, out, stats.merge_output_bytes_total);
+    try out.appendSlice(alloc, ",\"last_merge_input_segments\":");
+    try appendIntValue(alloc, out, stats.last_merge_input_segments);
+    try out.appendSlice(alloc, ",\"last_merge_input_bytes\":");
+    try appendIntValue(alloc, out, stats.last_merge_input_bytes);
+    try out.appendSlice(alloc, ",\"last_merge_output_segments\":");
+    try appendIntValue(alloc, out, stats.last_merge_output_segments);
+    try out.appendSlice(alloc, ",\"last_merge_output_bytes\":");
+    try appendIntValue(alloc, out, stats.last_merge_output_bytes);
     try out.appendSlice(alloc, ",\"quarantined_merges\":");
     try appendIntValue(alloc, out, stats.quarantined_merges);
     try out.appendSlice(alloc, ",\"quarantined_segments\":");
@@ -1774,6 +1866,18 @@ test "index encoders expose local shard runtime status" {
                     .phase = .opening_db,
                     .wal_retained_segments = 4,
                     .wal_retained_bytes = 99,
+                    .wal_checkpoint_oldest_retained_segment = 2,
+                    .wal_checkpoint_covered_through_segment = 3,
+                    .wal_checkpoint_current_segment = 5,
+                    .wal_checkpoint_lag_segments = 2,
+                    .wal_replay_retained_segments = 1,
+                    .wal_replay_retained_bytes = 44,
+                    .wal_replay_current_segment = 6,
+                    .lsm_open_stores = 2,
+                    .lsm_open_wal_replay_ns = 123,
+                    .lsm_open_loaded_runs = 6,
+                    .wal_replay_bytes = 456,
+                    .wal_replay_truncated_tail_bytes = 7,
                 },
                 .dense_catch_up = .{
                     .active = true,
@@ -1825,6 +1929,18 @@ test "index encoders expose local shard runtime status" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"phase\":\"opening_db\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_segments\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_oldest_retained_segment\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_covered_through_segment\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_current_segment\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_lag_segments\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_retained_segments\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_retained_bytes\":44") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_current_segment\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_stores\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_wal_replay_ns\":123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_loaded_runs\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_bytes\":456") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_truncated_tail_bytes\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_sequence\":41") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_target_sequence\":77") != null);
@@ -2193,6 +2309,41 @@ test "index encoders aggregate replay debt across local shards" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.400") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"8\":{") != null);
+}
+
+test "full text aggregate clears stale completed replay backfill flag" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = try std.testing.allocator.dupe(u8, "full_text_index_v1"),
+        .kind = .full_text,
+        .doc_count = 1000,
+        .term_count = 0,
+        .backfill_active = true,
+        .backfill_progress = 0.0,
+        .replay_applied_sequence = 1,
+        .replay_target_sequence = 1,
+        .replay_catch_up_required = true,
+        .catch_up_applied_sequence = 1,
+        .catch_up_target_sequence = 1,
+    }};
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .stale },
+        .stats = .{
+            .doc_count = 1000,
+            .index_count = 1,
+            .indexes = indexes[0..],
+        },
+    }};
+
+    const aggregate = aggregateIndexStatus(runtimes[0..], "full_text_index_v1", &.{7}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), aggregate.stale_group_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.replay_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.replay_target_sequence);
+    try std.testing.expect(!aggregate.replay_catch_up_required);
+    try std.testing.expect(!aggregate.backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), aggregate.backfill_progress);
 }
 
 test "index status keeps generic catch-up lag pending when replay sequence is equal" {

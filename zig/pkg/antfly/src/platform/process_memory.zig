@@ -21,6 +21,9 @@ pub const Stats = struct {
     footprint_bytes: u64 = 0,
     wired_bytes: u64 = 0,
     pageins: u64 = 0,
+    malloc_available: bool = false,
+    malloc_allocated_bytes: u64 = 0,
+    malloc_zone_bytes: u64 = 0,
 };
 
 pub fn snapshot() Stats {
@@ -30,17 +33,27 @@ pub fn snapshot() Stats {
     const rc = darwin.proc_pid_rusage(darwin.getpid(), darwin.RUSAGE_INFO_CURRENT, @ptrCast(&info));
     if (rc != 0) return .{};
 
-    return .{
+    var stats = Stats{
         .available = true,
         .resident_bytes = info.ri_resident_size,
         .footprint_bytes = info.ri_phys_footprint,
         .wired_bytes = info.ri_wired_size,
         .pageins = info.ri_pageins,
     };
+    const malloc_stats = darwin.mallocStats();
+    stats.malloc_available = malloc_stats.available;
+    stats.malloc_allocated_bytes = malloc_stats.allocated_bytes;
+    stats.malloc_zone_bytes = malloc_stats.zone_bytes;
+    return stats;
 }
 
 const darwin = if (builtin.os.tag == .macos) struct {
     const darwin_c_int = i32;
+    const mach_port_t = u32;
+    const kern_return_t = i32;
+    const vm_address_t = usize;
+    const vm_size_t = usize;
+    const memory_reader_t = ?*const fn (mach_port_t, vm_address_t, vm_size_t, *?*anyopaque) callconv(.c) kern_return_t;
 
     pub const RUSAGE_INFO_CURRENT: darwin_c_int = 6;
 
@@ -93,6 +106,52 @@ const darwin = if (builtin.os.tag == .macos) struct {
         ri_reserved: [12]u64,
     };
 
+    const malloc_statistics_t = extern struct {
+        blocks_in_use: c_uint,
+        size_in_use: usize,
+        max_size_in_use: usize,
+        size_allocated: usize,
+    };
+
+    const MallocStats = struct {
+        available: bool = false,
+        allocated_bytes: u64 = 0,
+        zone_bytes: u64 = 0,
+    };
+
+    fn mallocStats() MallocStats {
+        var zones: [*]vm_address_t = undefined;
+        var zone_count: c_uint = 0;
+        if (malloc_get_all_zones(mach_task_self_, null, &zones, &zone_count) != 0) {
+            return mallocStatsForDefaultZone();
+        }
+
+        var out: MallocStats = .{ .available = true };
+        for (zones[0..zone_count]) |zone_addr| {
+            var zone_stats: malloc_statistics_t = std.mem.zeroes(malloc_statistics_t);
+            const zone: *anyopaque = @ptrFromInt(zone_addr);
+            malloc_zone_statistics(zone, &zone_stats);
+            out.allocated_bytes +|= @intCast(zone_stats.size_in_use);
+            out.zone_bytes +|= @intCast(zone_stats.size_allocated);
+        }
+        return out;
+    }
+
+    fn mallocStatsForDefaultZone() MallocStats {
+        const zone = malloc_default_zone() orelse return .{};
+        var zone_stats: malloc_statistics_t = std.mem.zeroes(malloc_statistics_t);
+        malloc_zone_statistics(zone, &zone_stats);
+        return .{
+            .available = true,
+            .allocated_bytes = @intCast(zone_stats.size_in_use),
+            .zone_bytes = @intCast(zone_stats.size_allocated),
+        };
+    }
+
     extern "c" fn proc_pid_rusage(pid: darwin_c_int, flavor: darwin_c_int, buffer: *rusage_info_current) darwin_c_int;
     extern "c" fn getpid() darwin_c_int;
+    extern "c" var mach_task_self_: mach_port_t;
+    extern "c" fn malloc_get_all_zones(task: mach_port_t, reader: memory_reader_t, addresses: *[*]vm_address_t, count: *c_uint) kern_return_t;
+    extern "c" fn malloc_default_zone() ?*anyopaque;
+    extern "c" fn malloc_zone_statistics(zone: *anyopaque, stats: *malloc_statistics_t) void;
 } else struct {};

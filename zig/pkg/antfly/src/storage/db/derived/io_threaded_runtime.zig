@@ -718,6 +718,22 @@ fn workerMain(worker: *Worker) void {
     while (true) {
         runtime.mutex.lockUncancelable(io);
         while (!runtime.shutdown and !worker.stop and runtime.last_error_name == null and worker.target_sequence <= worker.applied_sequence) {
+            if (worker.applied_sequence > worker.persisted_sequence) {
+                const sequence = worker.applied_sequence;
+                runtime.mutex.unlock(io);
+                const persisted = persistIdleAppliedSequence(runtime, worker, sequence, io) catch |err| {
+                    if (err == error.WriterLocked) {
+                        io.sleep(Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
+                        runtime.mutex.lockUncancelable(io);
+                        continue;
+                    }
+                    runtime.recordError(io, worker.name, "idle_persist", err);
+                    return;
+                };
+                if (!persisted) io.sleep(Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
+                runtime.mutex.lockUncancelable(io);
+                continue;
+            }
             if (!worker.catch_up_open) {
                 runtime.cond.waitUncancelable(io, &runtime.mutex);
                 continue;
@@ -918,6 +934,44 @@ fn workerMain(worker: *Worker) void {
             runtime.mutex.unlock(io);
         }
     }
+}
+
+fn persistIdleAppliedSequence(runtime: *DerivedRuntime, worker: *Worker, sequence: u64, io: Io) !bool {
+    const persisted = try runtime.persist_fn(runtime.ctx, worker.name, sequence, false);
+    var truncate_sequence: u64 = 0;
+    runtime.mutex.lockUncancelable(io);
+    if (persisted and sequence > worker.persisted_sequence) {
+        worker.persisted_sequence = sequence;
+    }
+    if (worker.persisted_sequence > runtime.last_truncated_sequence) {
+        const min_persisted = runtime.computeMinPersistedLocked();
+        if (min_persisted > runtime.last_truncated_sequence) {
+            runtime.last_truncated_sequence = min_persisted;
+            truncate_sequence = min_persisted;
+        }
+    }
+    if (truncate_sequence > 0) {
+        runtime.truncates_in_flight += 1;
+    } else {
+        runtime.cond.broadcast(io);
+    }
+    runtime.mutex.unlock(io);
+
+    if (truncate_sequence > 0) {
+        runtime.truncate_fn(runtime.ctx, truncate_sequence) catch |err| {
+            runtime.mutex.lockUncancelable(io);
+            runtime.truncates_in_flight -= 1;
+            runtime.cond.broadcast(io);
+            runtime.mutex.unlock(io);
+            return err;
+        };
+        runtime.mutex.lockUncancelable(io);
+        runtime.backlog.releaseThrough(truncate_sequence);
+        runtime.truncates_in_flight -= 1;
+        runtime.cond.broadcast(io);
+        runtime.mutex.unlock(io);
+    }
+    return persisted;
 }
 
 fn ensureWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64) !void {

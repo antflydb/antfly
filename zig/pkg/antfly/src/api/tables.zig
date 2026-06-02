@@ -26,6 +26,7 @@ const schema_openapi = @import("antfly_schema_openapi");
 const schema_mod = @import("../schema/mod.zig");
 const runtime_schema_mod = @import("../storage/schema.zig");
 const algebraic_mod = @import("../storage/db/algebraic/mod.zig");
+const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const full_text_indexes = @import("full_text_indexes.zig");
 const json_helpers = @import("json_helpers.zig");
 
@@ -41,10 +42,142 @@ pub fn effectiveSchemaJson(schema_json: ?[]const u8) []const u8 {
 }
 
 pub const ParsedTableSchema = schema_mod.ParsedTableSchema;
+pub const LsmStorageStatus = struct {
+    mutable_bytes: u64 = 0,
+    immutable_bytes: u64 = 0,
+    immutable_memtables: u64 = 0,
+    total_runs: u64 = 0,
+    total_run_bytes: u64 = 0,
+    l0_runs: u64 = 0,
+    l0_bytes: u64 = 0,
+    lower_level_runs: u64 = 0,
+    lower_level_bytes: u64 = 0,
+    compactable_l0_runs: u64 = 0,
+    level_overflow_runs: u64 = 0,
+    level_overflow_bytes: u64 = 0,
+    obsolete_paths: u64 = 0,
+    active_readers: u64 = 0,
+    wal_retained_segments: u64 = 0,
+    wal_retained_bytes: u64 = 0,
+    wal_checkpoint_oldest_retained_segment: u64 = 0,
+    wal_checkpoint_covered_through_segment: u64 = 0,
+    wal_checkpoint_current_segment: u64 = 0,
+    wal_checkpoint_lag_segments: u64 = 0,
+    wal_replay_retained_segments: u64 = 0,
+    wal_replay_retained_bytes: u64 = 0,
+    wal_replay_current_segment: u64 = 0,
+    wal_append_records: u64 = 0,
+    wal_append_bytes: u64 = 0,
+    wal_append_ns: u64 = 0,
+    wal_sync_records: u64 = 0,
+    wal_sync_ns: u64 = 0,
+    wal_replay_records: u64 = 0,
+    wal_replay_bytes: u64 = 0,
+    wal_replay_ns: u64 = 0,
+    wal_resets: u64 = 0,
+    wal_reset_ns: u64 = 0,
+    background_io_budget_bytes: u64 = 0,
+    background_io_reserved_bytes: u64 = 0,
+    background_io_denied_jobs: u64 = 0,
+    background_io_oversized_jobs: u64 = 0,
+};
+
 pub const TableStorageStatus = struct {
     table_name: []const u8,
     empty: bool,
+    lsm: ?LsmStorageStatus = null,
 };
+
+pub fn lsmStorageStatusFromBackendStats(
+    maintenance: lsm_backend.Backend.MaintenanceStats,
+    write: lsm_backend.Backend.WriteStats,
+) LsmStorageStatus {
+    return .{
+        .mutable_bytes = maintenance.mutable_bytes,
+        .immutable_bytes = maintenance.immutable_bytes,
+        .immutable_memtables = maintenance.immutable_memtables,
+        .total_runs = maintenance.total_runs,
+        .total_run_bytes = maintenance.total_run_bytes,
+        .l0_runs = maintenance.l0_runs,
+        .l0_bytes = maintenance.l0_bytes,
+        .lower_level_runs = maintenance.lower_level_runs,
+        .lower_level_bytes = maintenance.lower_level_bytes,
+        .compactable_l0_runs = maintenance.compactable_l0_runs,
+        .level_overflow_runs = maintenance.level_overflow_runs,
+        .level_overflow_bytes = maintenance.level_overflow_bytes,
+        .obsolete_paths = maintenance.obsolete_paths,
+        .active_readers = maintenance.active_readers,
+        .wal_retained_segments = maintenance.wal_retained_segments,
+        .wal_retained_bytes = maintenance.wal_retained_bytes,
+        .wal_checkpoint_oldest_retained_segment = maintenance.wal_checkpoint_oldest_retained_segment,
+        .wal_checkpoint_covered_through_segment = maintenance.wal_checkpoint_covered_through_segment,
+        .wal_checkpoint_current_segment = maintenance.wal_checkpoint_current_segment,
+        .wal_checkpoint_lag_segments = maintenance.wal_checkpoint_lag_segments,
+        .wal_replay_retained_segments = maintenance.wal_replay_retained_segments,
+        .wal_replay_retained_bytes = maintenance.wal_replay_retained_bytes,
+        .wal_replay_current_segment = maintenance.wal_replay_current_segment,
+        .wal_append_records = write.wal_append_records,
+        .wal_append_bytes = write.wal_append_bytes,
+        .wal_append_ns = write.wal_append_ns,
+        .wal_sync_records = write.wal_sync_records,
+        .wal_sync_ns = write.wal_sync_ns,
+        .wal_replay_records = write.wal_replay_records,
+        .wal_replay_bytes = write.wal_replay_bytes,
+        .wal_replay_ns = write.wal_replay_ns,
+        .wal_resets = write.wal_resets,
+        .wal_reset_ns = write.wal_reset_ns,
+        .background_io_budget_bytes = maintenance.background_io_budget_bytes,
+        .background_io_reserved_bytes = maintenance.background_io_reserved_bytes,
+        .background_io_denied_jobs = maintenance.background_io_denied_jobs,
+        .background_io_oversized_jobs = maintenance.background_io_oversized_jobs,
+    };
+}
+
+fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStorageStatus {
+    return .{
+        .mutable_bytes = u64ToI64(status.mutable_bytes),
+        .immutable_bytes = u64ToI64(status.immutable_bytes),
+        .immutable_memtables = u64ToI64(status.immutable_memtables),
+        .total_runs = u64ToI64(status.total_runs),
+        .total_run_bytes = u64ToI64(status.total_run_bytes),
+        .l0_runs = u64ToI64(status.l0_runs),
+        .l0_bytes = u64ToI64(status.l0_bytes),
+        .lower_level_runs = u64ToI64(status.lower_level_runs),
+        .lower_level_bytes = u64ToI64(status.lower_level_bytes),
+        .compactable_l0_runs = u64ToI64(status.compactable_l0_runs),
+        .level_overflow_runs = u64ToI64(status.level_overflow_runs),
+        .level_overflow_bytes = u64ToI64(status.level_overflow_bytes),
+        .obsolete_paths = u64ToI64(status.obsolete_paths),
+        .active_readers = u64ToI64(status.active_readers),
+        .wal_retained_segments = u64ToI64(status.wal_retained_segments),
+        .wal_retained_bytes = u64ToI64(status.wal_retained_bytes),
+        .wal_checkpoint_oldest_retained_segment = u64ToI64(status.wal_checkpoint_oldest_retained_segment),
+        .wal_checkpoint_covered_through_segment = u64ToI64(status.wal_checkpoint_covered_through_segment),
+        .wal_checkpoint_current_segment = u64ToI64(status.wal_checkpoint_current_segment),
+        .wal_checkpoint_lag_segments = u64ToI64(status.wal_checkpoint_lag_segments),
+        .wal_replay_retained_segments = u64ToI64(status.wal_replay_retained_segments),
+        .wal_replay_retained_bytes = u64ToI64(status.wal_replay_retained_bytes),
+        .wal_replay_current_segment = u64ToI64(status.wal_replay_current_segment),
+        .wal_append_records = u64ToI64(status.wal_append_records),
+        .wal_append_bytes = u64ToI64(status.wal_append_bytes),
+        .wal_append_ns = u64ToI64(status.wal_append_ns),
+        .wal_sync_records = u64ToI64(status.wal_sync_records),
+        .wal_sync_ns = u64ToI64(status.wal_sync_ns),
+        .wal_replay_records = u64ToI64(status.wal_replay_records),
+        .wal_replay_bytes = u64ToI64(status.wal_replay_bytes),
+        .wal_replay_ns = u64ToI64(status.wal_replay_ns),
+        .wal_resets = u64ToI64(status.wal_resets),
+        .wal_reset_ns = u64ToI64(status.wal_reset_ns),
+        .background_io_budget_bytes = u64ToI64(status.background_io_budget_bytes),
+        .background_io_reserved_bytes = u64ToI64(status.background_io_reserved_bytes),
+        .background_io_denied_jobs = u64ToI64(status.background_io_denied_jobs),
+        .background_io_oversized_jobs = u64ToI64(status.background_io_oversized_jobs),
+    };
+}
+
+fn u64ToI64(value: u64) i64 {
+    return if (value > std.math.maxInt(i64)) std.math.maxInt(i64) else @intCast(value);
+}
 
 const RuntimeSchemaDebugBinding = struct {
     index_name: []const u8,
@@ -627,6 +760,10 @@ fn buildTableStatus(
     }
 
     const empty = if (storage_status) |status| status.empty else ranges.len == 0;
+    const lsm_status = if (storage_status) |status|
+        if (status.lsm) |lsm| generatedLsmStorageStatus(lsm) else null
+    else
+        null;
     return .{
         .name = table.name,
         .description = if (table.description.len > 0) table.description else null,
@@ -641,6 +778,7 @@ fn buildTableStatus(
         .storage_status = .{
             .disk_usage = 0,
             .empty = empty,
+            .lsm = lsm_status,
         },
     };
 }
@@ -1850,11 +1988,40 @@ test "metadata.table status encoder honors storage status overrides" {
         .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
         .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
     };
-    const storage_statuses = [_]TableStorageStatus{.{ .table_name = "docs", .empty = true }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = true,
+        .lsm = .{
+            .mutable_bytes = 11,
+            .immutable_bytes = 22,
+            .immutable_memtables = 2,
+            .total_runs = 3,
+            .total_run_bytes = 44,
+            .l0_runs = 1,
+            .l0_bytes = 33,
+            .wal_retained_segments = 4,
+            .wal_retained_bytes = 55,
+            .wal_checkpoint_lag_segments = 6,
+            .wal_replay_current_segment = 10,
+            .wal_sync_records = 7,
+            .wal_sync_ns = 88,
+            .background_io_denied_jobs = 9,
+        },
+    }};
 
     const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true,\"lsm\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mutable_bytes\":11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_memtables\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_runs\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"l0_bytes\":33") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":55") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_lag_segments\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_current_segment\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_sync_records\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_sync_ns\":88") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"background_io_denied_jobs\":9") != null);
 }
 
 test "metadata.table status encoder canonicalizes embeddings indexes without inline names" {

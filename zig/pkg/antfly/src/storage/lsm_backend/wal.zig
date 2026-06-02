@@ -42,6 +42,7 @@ const replay_record_magic: u32 = 0x31435741; // "AWC1", little-endian.
 const replay_record_version: u16 = 1;
 const replay_record_header_len: usize = 24;
 const committed_segment_entry_len: usize = 16;
+const max_retained_replay_pending_bytes: usize = replay_chunk_bytes + @max(record_header_len, replay_record_header_len);
 
 fn scratchAllocator(allocator: Allocator) Allocator {
     return if (builtin.link_libc) std.heap.c_allocator else allocator;
@@ -64,6 +65,7 @@ pub const ReplayStats = struct {
 pub const ReplayHooks = struct {
     ctx: *anyopaque,
     entry_allocator: ?*const fn (ctx: *anyopaque, default_allocator: Allocator) anyerror!Allocator = null,
+    on_applied_entry: ?*const fn (ctx: *anyopaque, segment: u64, entry_bytes: u64) anyerror!void = null,
     on_applied_record: *const fn (ctx: *anyopaque, segment: u64, entries: u64) anyerror!void,
 };
 
@@ -72,6 +74,7 @@ pub const RetentionStats = struct {
     bytes: u64 = 0,
     oldest_retained_segment: u64 = 0,
     current_segment: u64 = 0,
+    checkpoint_covered_through_segment: u64 = 0,
 };
 
 pub const ReplayStreamStats = struct {
@@ -162,7 +165,10 @@ pub fn appendStateWithOptions(
     var current_size = current.size;
     if (!current.index_exists) {
         try writeCurrentSegment(storage, allocator, root_dir, segment, current_size);
-        try writeCheckpointIndex(storage, allocator, root_dir, 1);
+        try writeCheckpointIndex(storage, allocator, root_dir, .{
+            .oldest_retained_segment = 1,
+            .covered_through_segment = 0,
+        });
     }
     var segment_path = try segmentPathAlloc(allocator, root_dir, segment);
     var segment_path_owned = true;
@@ -264,7 +270,10 @@ pub fn reset(storage: storage_io.Storage, allocator: Allocator, root_dir: []cons
         else => return err,
     }).segment;
     try writeCurrentSegment(storage, allocator, root_dir, 1, 0);
-    try writeCheckpointIndex(storage, allocator, root_dir, 1);
+    try writeCheckpointIndex(storage, allocator, root_dir, .{
+        .oldest_retained_segment = 1,
+        .covered_through_segment = 0,
+    });
     const first_segment = try segmentPathAlloc(allocator, root_dir, 1);
     defer allocator.free(first_segment);
     try storage.writeFileAbsolute(first_segment, "");
@@ -320,6 +329,7 @@ pub fn snapshotRetention(
     }).segment;
     const checkpoint = try readCheckpointIndex(storage, allocator, root_dir);
     stats.oldest_retained_segment = checkpoint.oldest_retained_segment;
+    stats.checkpoint_covered_through_segment = checkpoint.covered_through_segment;
     stats.current_segment = current_segment;
 
     var segment: u64 = checkpoint.oldest_retained_segment;
@@ -398,7 +408,10 @@ pub fn retireCoveredSegments(
         allocator.free(segment_path);
     }
 
-    try writeCheckpointIndex(storage, allocator, root_dir, max_covered + 1);
+    try writeCheckpointIndex(storage, allocator, root_dir, .{
+        .oldest_retained_segment = max_covered + 1,
+        .covered_through_segment = max_covered,
+    });
 }
 
 const ReplayIndex = struct {
@@ -611,10 +624,7 @@ fn iterateReplayStreaming(
         1 +
         "00000000000000000000.log".len;
     try scratch.path_buf.ensureTotalCapacityPrecise(scratch_allocator, max_path_len);
-    try scratch.pending.ensureTotalCapacityPrecise(
-        scratch_allocator,
-        replay_chunk_bytes + @max(record_header_len, replay_record_header_len),
-    );
+    try scratch.pending.ensureTotalCapacityPrecise(scratch_allocator, max_retained_replay_pending_bytes);
 
     if (!(try replayScratchDedicatedLayoutOnly(scratch, storage, allocator, root_dir))) {
         const main_wal_start_segment = try replayMainWalStartSegment(storage, allocator, root_dir, effective_from);
@@ -707,7 +717,7 @@ fn replayRecordsFromMainWal(
     comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     stats: *ReplayStreamStats,
 ) !void {
-    const chunk_allocator = allocator;
+    const chunk_allocator = scratchAllocator(allocator);
     const file_size = storage.fileSize(wal_path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
@@ -737,6 +747,7 @@ fn replayRecordsFromMainWal(
             },
             else => return err,
         };
+        releaseOversizedReplayPendingBuffer(chunk_allocator, pending);
     }
     if (pending.items.len > 0) stats.truncated_tail_bytes += @intCast(pending.items.len);
 }
@@ -796,6 +807,7 @@ fn replayFile(
                 });
                 stats.truncated_tail_bytes += @intCast(pending.items.len);
                 pending.clearRetainingCapacity();
+                releaseOversizedReplayPendingBuffer(chunk_allocator, pending);
                 break;
             },
             error.CorruptLsmWal => {
@@ -808,10 +820,17 @@ fn replayFile(
             },
             else => return err,
         };
+        releaseOversizedReplayPendingBuffer(chunk_allocator, pending);
         if (read_len < replay_chunk_bytes) break;
     }
     if (saw_bytes) stats.segments += 1;
     if (pending.items.len > 0) stats.truncated_tail_bytes += @intCast(pending.items.len);
+}
+
+fn releaseOversizedReplayPendingBuffer(allocator: Allocator, pending: *std.ArrayListUnmanaged(u8)) void {
+    if (pending.capacity <= max_retained_replay_pending_bytes) return;
+    if (pending.items.len > max_retained_replay_pending_bytes) return;
+    pending.shrinkAndFree(allocator, pending.items.len);
 }
 
 fn repairTruncatedReplayFile(
@@ -970,7 +989,6 @@ fn replayFileStreaming(
     hooks: ?ReplayHooks,
     options: ReplayFileOptions,
 ) !void {
-    const chunk_allocator = allocator;
     const file_size = storage.fileSize(wal_path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
@@ -981,13 +999,16 @@ fn replayFileStreaming(
 
     var pending = std.ArrayListUnmanaged(u8).empty;
     defer pending.deinit(allocator);
+    try pending.ensureTotalCapacityPrecise(allocator, max_retained_replay_pending_bytes);
 
     var offset: u64 = 0;
     while (offset < file_size) {
         const len: usize = @intCast(@min(@as(u64, replay_chunk_bytes), file_size - offset));
-        const chunk = try storage.readFileRangeAlloc(chunk_allocator, wal_path, offset, len);
-        defer chunk_allocator.free(chunk);
-        try pending.appendSlice(allocator, chunk);
+        const start = pending.items.len;
+        try pending.ensureUnusedCapacity(allocator, len);
+        pending.items.len += len;
+        errdefer pending.items.len = start;
+        try storage.readFileRangeInto(allocator, wal_path, offset, pending.items[start..][0..len]);
         const final_chunk = offset + len >= file_size;
         offset += len;
         consumeCompleteRecords(allocator, &pending, segment, mutable, stats, hooks) catch |err| switch (err) {
@@ -1009,10 +1030,12 @@ fn replayFileStreaming(
                 });
                 stats.truncated_tail_bytes += @intCast(pending.items.len);
                 pending.clearRetainingCapacity();
+                releaseOversizedReplayPendingBuffer(allocator, &pending);
                 break;
             },
             else => return err,
         };
+        releaseOversizedReplayPendingBuffer(allocator, &pending);
     }
     if (pending.items.len > 0) {
         stats.truncated_tail_bytes += @intCast(pending.items.len);
@@ -1064,7 +1087,7 @@ fn consumeCompleteRecords(
                     allocator
             else
                 allocator;
-            const applied = decodePayloadIntoMutable(apply_allocator, payload, mutable) catch |err| switch (err) {
+            const applied = decodePayloadIntoMutableWithHooks(apply_allocator, payload, mutable, hooks, segment) catch |err| switch (err) {
                 error.CorruptLsmWal => {
                     logCorruptWalDetail("record_decode", segment, pos, pending.items.len, "state record payload decode failed");
                     return err;
@@ -1381,7 +1404,13 @@ const CurrentSegment = struct {
 
 const ReadCheckpoint = struct {
     oldest_retained_segment: u64 = 1,
+    covered_through_segment: u64 = 0,
     exists: bool = false,
+};
+
+const CheckpointIndex = struct {
+    oldest_retained_segment: u64,
+    covered_through_segment: u64,
 };
 
 fn readCurrentSegment(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !CurrentSegment {
@@ -1432,21 +1461,27 @@ fn readCheckpointIndex(storage: storage_io.Storage, allocator: Allocator, root_d
         error.FileNotFound => return .{},
         else => return err,
     };
-    if (index_size != 8) return error.CorruptLsmWalIndex;
-    const raw = try storage.readFileRangeAlloc(temp_allocator, checkpoint_path, 0, 8);
+    if (index_size != 16) return error.CorruptLsmWalIndex;
+    const raw = try storage.readFileRangeAlloc(temp_allocator, checkpoint_path, 0, 16);
     defer temp_allocator.free(raw);
-    if (raw.len != 8) return error.CorruptLsmWalIndex;
+    if (raw.len != 16) return error.CorruptLsmWalIndex;
     const oldest_retained_segment = std.mem.readInt(u64, raw[0..8], .little);
+    const covered_through_segment = std.mem.readInt(u64, raw[8..16], .little);
     if (oldest_retained_segment == 0) return error.CorruptLsmWalIndex;
+    if (covered_through_segment + 1 < oldest_retained_segment) return error.CorruptLsmWalIndex;
     return .{
         .oldest_retained_segment = oldest_retained_segment,
+        .covered_through_segment = covered_through_segment,
         .exists = true,
     };
 }
 
-fn writeCheckpointIndex(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, oldest_retained_segment: u64) !void {
-    var raw: [8]u8 = undefined;
-    std.mem.writeInt(u64, &raw, oldest_retained_segment, .little);
+fn writeCheckpointIndex(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, index: CheckpointIndex) !void {
+    if (index.oldest_retained_segment == 0) return error.CorruptLsmWalIndex;
+    if (index.covered_through_segment + 1 < index.oldest_retained_segment) return error.CorruptLsmWalIndex;
+    var raw: [16]u8 = undefined;
+    std.mem.writeInt(u64, raw[0..8], index.oldest_retained_segment, .little);
+    std.mem.writeInt(u64, raw[8..16], index.covered_through_segment, .little);
     const temp_allocator = allocator;
     const checkpoint_path = try checkpointPathAlloc(temp_allocator, root_dir);
     defer temp_allocator.free(checkpoint_path);
@@ -1565,6 +1600,16 @@ fn encodedPayloadLen(state: anytype) usize {
 }
 
 fn decodePayloadIntoMutable(allocator: Allocator, payload: []const u8, mutable: anytype) !u64 {
+    return try decodePayloadIntoMutableWithHooks(allocator, payload, mutable, null, 0);
+}
+
+fn decodePayloadIntoMutableWithHooks(
+    allocator: Allocator,
+    payload: []const u8,
+    mutable: anytype,
+    hooks: ?ReplayHooks,
+    segment: u64,
+) !u64 {
     var pos: usize = 0;
     const entry_count = try readInt(payload, &pos, u32);
     var applied: u64 = 0;
@@ -1589,6 +1634,11 @@ fn decodePayloadIntoMutable(allocator: Allocator, payload: []const u8, mutable: 
         const namespace = backend_types.Namespace{ .name = if ((flags & 0x02) != 0) ns else null };
         try mutable.upsert(allocator, namespace, key, value, (flags & 0x01) != 0);
         applied += 1;
+        if (hooks) |active_hooks| {
+            if (active_hooks.on_applied_entry) |on_applied_entry| {
+                try on_applied_entry(active_hooks.ctx, segment, @intCast(ns.len + key.len + value.len));
+            }
+        }
     }
     if (pos != payload.len) return error.CorruptLsmWal;
     return applied;
@@ -1606,6 +1656,23 @@ fn readInt(bytes: []const u8, pos: *usize, comptime T: type) !T {
     const value = std.mem.readInt(T, bytes[pos.*..][0..len], .little);
     pos.* += len;
     return value;
+}
+
+test "lsm wal replay pending scratch releases oversized retained capacity" {
+    var pending = std.ArrayListUnmanaged(u8).empty;
+    defer pending.deinit(std.testing.allocator);
+
+    try pending.ensureTotalCapacityPrecise(std.testing.allocator, max_retained_replay_pending_bytes * 2);
+    try std.testing.expect(pending.capacity > max_retained_replay_pending_bytes);
+
+    pending.items.len = max_retained_replay_pending_bytes + 1;
+    releaseOversizedReplayPendingBuffer(std.testing.allocator, &pending);
+    try std.testing.expect(pending.capacity > max_retained_replay_pending_bytes);
+
+    pending.items.len = 8;
+    releaseOversizedReplayPendingBuffer(std.testing.allocator, &pending);
+    try std.testing.expectEqual(@as(usize, 8), pending.items.len);
+    try std.testing.expect(pending.capacity <= max_retained_replay_pending_bytes);
 }
 
 test "lsm wal encodes and replays state" {
@@ -1628,6 +1695,120 @@ test "lsm wal encodes and replays state" {
     try std.testing.expectEqual(@as(u64, 2), stats.entries);
     try std.testing.expectEqualStrings("A", try replayed.get(.{ .name = "docs" }, "a"));
     try std.testing.expectError(error.NotFound, replayed.get(.{}, "b"));
+}
+
+test "lsm wal replay reads chunks into bounded pending buffer" {
+    const CountingStorage = struct {
+        backing: *storage_io.MemoryStorage,
+        range_alloc_reads: usize = 0,
+        range_alloc_log_reads: usize = 0,
+        range_into_reads: usize = 0,
+        range_into_log_reads: usize = 0,
+
+        fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().createDirPath(path);
+        }
+
+        fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().readFileAlloc(allocator, path, max_bytes);
+        }
+
+        fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.range_alloc_reads += 1;
+            if (std.mem.endsWith(u8, path, ".log")) self.range_alloc_log_reads += 1;
+            return self.backing.storage().readFileRangeAlloc(allocator, path, offset, len);
+        }
+
+        fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.range_into_reads += 1;
+            if (std.mem.endsWith(u8, path, ".log")) self.range_into_log_reads += 1;
+            return self.backing.storage().readFileRangeInto(std.testing.allocator, path, offset, out);
+        }
+
+        fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().fileSize(path);
+        }
+
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
+        }
+
+        fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().writeFileAbsolute(path, contents);
+        }
+
+        fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().appendFileAbsolute(std.testing.allocator, path, contents, sync);
+        }
+
+        fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().renameAbsolute(old_path, new_path);
+        }
+
+        fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().deleteFileAbsolute(path);
+        }
+
+        fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().deleteTree(path);
+        }
+
+        fn nowNs(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().nowNs();
+        }
+    };
+
+    const vtable: storage_io.Storage.VTable = .{
+        .create_dir_path = CountingStorage.createDirPath,
+        .read_file_alloc = CountingStorage.readFileAlloc,
+        .read_file_range_alloc = CountingStorage.readFileRangeAlloc,
+        .read_file_range_into = CountingStorage.readFileRangeInto,
+        .file_size = CountingStorage.fileSize,
+        .read_file_trailer_alloc = CountingStorage.readFileTrailerAlloc,
+        .write_file_absolute = CountingStorage.writeFileAbsolute,
+        .append_file_absolute = CountingStorage.appendFileAbsolute,
+        .rename_absolute = CountingStorage.renameAbsolute,
+        .delete_file_absolute = CountingStorage.deleteFileAbsolute,
+        .delete_tree = CountingStorage.deleteTree,
+        .now_ns = CountingStorage.nowNs,
+    };
+
+    var backing = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer backing.deinit();
+    var counting = CountingStorage{ .backing = &backing };
+    const storage = storage_io.HostStorage.init(&counting, &vtable).storage();
+    const root_dir = "/wal-replay-bounded-buffer-test";
+    try storage.createDirPath(root_dir);
+
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    for (0..64) |i| {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>3}", .{i});
+        try state.upsert(std.testing.allocator, .{ .name = "docs" }, key, "value", false);
+    }
+    _ = try appendStateWithOptions(storage, std.testing.allocator, root_dir, &state, false, .{ .segment_bytes = 256 });
+
+    var replayed: State = .{};
+    defer replayed.deinit(std.testing.allocator);
+    const stats = try replayIntoMutable(storage, std.testing.allocator, root_dir, &replayed);
+    try std.testing.expectEqual(@as(u64, 1), stats.records);
+    try std.testing.expectEqual(@as(u64, 64), stats.entries);
+    try std.testing.expect(counting.range_into_reads > 0);
+    try std.testing.expect(counting.range_into_log_reads > 0);
+    try std.testing.expectEqual(@as(usize, 0), counting.range_alloc_log_reads);
 }
 
 test "lsm wal rotates small segments and replays all records" {
@@ -1738,6 +1919,7 @@ test "lsm wal checkpoint retires covered segments and replay starts at retained 
 
     const retained = try snapshotRetention(storage.storage(), std.testing.allocator, root_dir);
     try std.testing.expectEqual(@as(u64, 3), retained.oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 2), retained.checkpoint_covered_through_segment);
     try std.testing.expectEqual(@as(u64, 3), retained.current_segment);
     try std.testing.expectEqual(@as(u64, 1), retained.segments);
     try std.testing.expect(retained.bytes > 0);

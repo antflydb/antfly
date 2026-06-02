@@ -425,9 +425,22 @@ fn workerMain(worker: *Worker) void {
             return;
         }
         const from_sequence = worker.applied_sequence;
+        const persisted_sequence = worker.persisted_sequence;
         const target_sequence = worker.target_sequence;
         runtime.mutex.unlock();
         if (target_sequence <= from_sequence) {
+            if (from_sequence > persisted_sequence) {
+                const persisted = persistIdleAppliedSequence(runtime, worker, from_sequence) catch |err| {
+                    if (err == error.WriterLocked) {
+                        sleepNs(50 * std.time.ns_per_ms);
+                        continue;
+                    }
+                    runtime.recordError(err);
+                    return;
+                };
+                if (!persisted) sleepNs(50 * std.time.ns_per_ms);
+                continue;
+            }
             if (waitForCatchUpSessionReuse(runtime, worker, from_sequence)) continue;
             closeWorkerCatchUpState(runtime, worker, true) catch |err| {
                 close_success = false;
@@ -591,6 +604,40 @@ fn workerMain(worker: *Worker) void {
     }
 }
 
+fn persistIdleAppliedSequence(runtime: *DerivedRuntime, worker: *Worker, sequence: u64) !bool {
+    const persisted = try runtime.persist_fn(runtime.ctx, worker.name, sequence, false);
+    var truncate_sequence: u64 = 0;
+    lock(runtime);
+    if (persisted and sequence > worker.persisted_sequence) {
+        worker.persisted_sequence = sequence;
+    }
+    if (worker.persisted_sequence > runtime.last_truncated_sequence) {
+        const min_persisted = runtime.computeMinPersistedLocked();
+        if (min_persisted > runtime.last_truncated_sequence) {
+            runtime.last_truncated_sequence = min_persisted;
+            truncate_sequence = min_persisted;
+        }
+    }
+    if (truncate_sequence > 0) {
+        runtime.truncates_in_flight += 1;
+    }
+    runtime.mutex.unlock();
+
+    if (truncate_sequence > 0) {
+        runtime.truncate_fn(runtime.ctx, truncate_sequence) catch |err| {
+            lock(runtime);
+            runtime.truncates_in_flight -= 1;
+            runtime.mutex.unlock();
+            return err;
+        };
+        lock(runtime);
+        runtime.backlog.releaseThrough(truncate_sequence);
+        runtime.truncates_in_flight -= 1;
+        runtime.mutex.unlock();
+    }
+    return persisted;
+}
+
 fn ensureWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64) !void {
     if (!worker.catch_up_open) {
         if (runtime.begin_catch_up_fn) |begin_catch_up| try begin_catch_up(runtime.ctx, worker.kind);
@@ -733,6 +780,7 @@ const TestRuntimeCapture = struct {
     persist_calls: std.atomic.Value(u64) = .init(0),
     persisted_sequence: std.atomic.Value(u64) = .init(0),
     last_applied_batch_sequence: std.atomic.Value(u64) = .init(0),
+    defer_next_persist: std.atomic.Value(bool) = .init(false),
     fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
     fail_next_publish: std.atomic.Value(bool) = .init(false),
 };
@@ -753,6 +801,7 @@ fn testRuntimePersist(ctx: *anyopaque, index_name: []const u8, sequence: u64, fo
     _ = force;
     const capture: *TestRuntimeCapture = @ptrCast(@alignCast(ctx));
     _ = capture.persist_calls.fetchAdd(1, .monotonic);
+    if (capture.defer_next_persist.swap(false, .monotonic)) return false;
     capture.persisted_sequence.store(sequence, .monotonic);
     return true;
 }
@@ -1051,6 +1100,64 @@ test "async full-text catch-up uses generic publish lifecycle" {
     try std.testing.expect(capture.apply_calls.load(.monotonic) >= 1);
     try std.testing.expectEqual(@as(u64, 2), runtime.appliedSequence("text_idx").?);
     try std.testing.expectEqual(@as(u64, 2), capture.persisted_sequence.load(.monotonic));
+}
+
+test "async worker retries idle applied sequence persist and releases backlog" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-idle-persist-retry-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+    try appendTestChangeJournalRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.full_text},
+    });
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+        .soft_limit_bytes = 1 << 20,
+        .hard_limit_bytes = 2 << 20,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var capture = TestRuntimeCapture{ .alloc = alloc };
+    capture.defer_next_persist.store(true, .monotonic);
+    var runtime = DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testRuntimeApply,
+        testRuntimePersist,
+        testRuntimeTruncate,
+        testRuntimeBeginCatchUp,
+        testRuntimeFinishCatchUp,
+        null,
+        &manager,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("text_idx", .{ .name = "text_idx", .kind = .full_text }, 0);
+    try runtime.trackBacklogBytes(1, 7);
+    runtime.notifySequence(1);
+
+    var waited: usize = 0;
+    while (waited < 2_000) : (waited += 1) {
+        const stats = manager.snapshot();
+        if (stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].used_bytes == 0) break;
+        sleepNs(std.time.ns_per_ms);
+    }
+
+    try runtime.failIfUnhealthy();
+    const stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].used_bytes);
+    try std.testing.expect(capture.persist_calls.load(.monotonic) >= 2);
+    try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
 }
 
 test "async dense publishes applied window before target tail is visible" {
