@@ -45,34 +45,16 @@ pub const ParsedTableSchema = schema_mod.ParsedTableSchema;
 pub const LsmStorageStatus = struct {
     // Table status intentionally exposes a compact operational snapshot. Full
     // low-level WAL and scheduler counters remain available through metrics.
+    memory_bytes: u64 = 0,
     mutable_bytes: u64 = 0,
     immutable_bytes: u64 = 0,
-    immutable_memtables: u64 = 0,
-    total_runs: u64 = 0,
-    total_run_bytes: u64 = 0,
-    l0_runs: u64 = 0,
+    run_count: u64 = 0,
+    run_bytes: u64 = 0,
+    l0_run_count: u64 = 0,
     l0_bytes: u64 = 0,
-    lower_level_runs: u64 = 0,
-    lower_level_bytes: u64 = 0,
-    compactable_l0_runs: u64 = 0,
-    level_overflow_runs: u64 = 0,
-    level_overflow_bytes: u64 = 0,
-    obsolete_paths: u64 = 0,
-    active_readers: u64 = 0,
-    wal_retained_segments: u64 = 0,
     wal_retained_bytes: u64 = 0,
-    wal_checkpoint_lag_segments: u64 = 0,
-    compaction_active_jobs: u64 = 0,
-    compaction_pending_runs: u64 = 0,
-    compaction_pending_bytes: u64 = 0,
-    compaction_oldest_active_age_ns: u64 = 0,
-    compaction_denied_jobs: u64 = 0,
-    compaction_conflict_denials: u64 = 0,
-    compaction_oversized_skips: u64 = 0,
-    background_io_budget_bytes: u64 = 0,
-    background_io_reserved_bytes: u64 = 0,
-    background_io_denied_jobs: u64 = 0,
-    write_pressure_events: u64 = 0,
+    compaction_backlog_bytes: u64 = 0,
+    active_readers: u64 = 0,
     write_pressure_overloads: u64 = 0,
 };
 
@@ -87,68 +69,32 @@ pub fn lsmStorageStatusFromBackendStats(
     write: lsm_backend.Backend.WriteStats,
 ) LsmStorageStatus {
     return .{
+        .memory_bytes = maintenance.mutable_bytes +| maintenance.immutable_bytes,
         .mutable_bytes = maintenance.mutable_bytes,
         .immutable_bytes = maintenance.immutable_bytes,
-        .immutable_memtables = maintenance.immutable_memtables,
-        .total_runs = maintenance.total_runs,
-        .total_run_bytes = maintenance.total_run_bytes,
-        .l0_runs = maintenance.l0_runs,
+        .run_count = maintenance.total_runs,
+        .run_bytes = maintenance.total_run_bytes,
+        .l0_run_count = maintenance.l0_runs,
         .l0_bytes = maintenance.l0_bytes,
-        .lower_level_runs = maintenance.lower_level_runs,
-        .lower_level_bytes = maintenance.lower_level_bytes,
-        .compactable_l0_runs = maintenance.compactable_l0_runs,
-        .level_overflow_runs = maintenance.level_overflow_runs,
-        .level_overflow_bytes = maintenance.level_overflow_bytes,
-        .obsolete_paths = maintenance.obsolete_paths,
-        .active_readers = maintenance.active_readers,
-        .wal_retained_segments = maintenance.wal_retained_segments,
         .wal_retained_bytes = maintenance.wal_retained_bytes,
-        .wal_checkpoint_lag_segments = maintenance.wal_checkpoint_lag_segments,
-        .compaction_active_jobs = maintenance.compaction_scheduler_active_jobs,
-        .compaction_pending_runs = maintenance.compaction_scheduler_remembered_pending_runs,
-        .compaction_pending_bytes = maintenance.compaction_scheduler_remembered_pending_bytes,
-        .compaction_oldest_active_age_ns = maintenance.compaction_scheduler_active_oldest_age_ns,
-        .compaction_denied_jobs = maintenance.compaction_scheduler_denied_capacity +| maintenance.compaction_scheduler_denied_resource_pressure,
-        .compaction_conflict_denials = maintenance.compaction_scheduler_conflict_denials,
-        .compaction_oversized_skips = maintenance.compaction_scheduler_oversized_skips,
-        .background_io_budget_bytes = maintenance.background_io_budget_bytes,
-        .background_io_reserved_bytes = maintenance.background_io_reserved_bytes,
-        .background_io_denied_jobs = maintenance.background_io_denied_jobs,
-        .write_pressure_events = write.write_pressure_events,
+        .compaction_backlog_bytes = maintenance.compaction_scheduler_remembered_pending_bytes,
+        .active_readers = maintenance.active_readers,
         .write_pressure_overloads = write.write_pressure_overloads,
     };
 }
 
 fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStorageStatus {
     return .{
+        .memory_bytes = u64ToI64(status.memory_bytes),
         .mutable_bytes = u64ToI64(status.mutable_bytes),
         .immutable_bytes = u64ToI64(status.immutable_bytes),
-        .immutable_memtables = u64ToI64(status.immutable_memtables),
-        .total_runs = u64ToI64(status.total_runs),
-        .total_run_bytes = u64ToI64(status.total_run_bytes),
-        .l0_runs = u64ToI64(status.l0_runs),
+        .run_count = u64ToI64(status.run_count),
+        .run_bytes = u64ToI64(status.run_bytes),
+        .l0_run_count = u64ToI64(status.l0_run_count),
         .l0_bytes = u64ToI64(status.l0_bytes),
-        .lower_level_runs = u64ToI64(status.lower_level_runs),
-        .lower_level_bytes = u64ToI64(status.lower_level_bytes),
-        .compactable_l0_runs = u64ToI64(status.compactable_l0_runs),
-        .level_overflow_runs = u64ToI64(status.level_overflow_runs),
-        .level_overflow_bytes = u64ToI64(status.level_overflow_bytes),
-        .obsolete_paths = u64ToI64(status.obsolete_paths),
-        .active_readers = u64ToI64(status.active_readers),
-        .wal_retained_segments = u64ToI64(status.wal_retained_segments),
         .wal_retained_bytes = u64ToI64(status.wal_retained_bytes),
-        .wal_checkpoint_lag_segments = u64ToI64(status.wal_checkpoint_lag_segments),
-        .compaction_active_jobs = u64ToI64(status.compaction_active_jobs),
-        .compaction_pending_runs = u64ToI64(status.compaction_pending_runs),
-        .compaction_pending_bytes = u64ToI64(status.compaction_pending_bytes),
-        .compaction_oldest_active_age_ns = u64ToI64(status.compaction_oldest_active_age_ns),
-        .compaction_denied_jobs = u64ToI64(status.compaction_denied_jobs),
-        .compaction_conflict_denials = u64ToI64(status.compaction_conflict_denials),
-        .compaction_oversized_skips = u64ToI64(status.compaction_oversized_skips),
-        .background_io_budget_bytes = u64ToI64(status.background_io_budget_bytes),
-        .background_io_reserved_bytes = u64ToI64(status.background_io_reserved_bytes),
-        .background_io_denied_jobs = u64ToI64(status.background_io_denied_jobs),
-        .write_pressure_events = u64ToI64(status.write_pressure_events),
+        .compaction_backlog_bytes = u64ToI64(status.compaction_backlog_bytes),
+        .active_readers = u64ToI64(status.active_readers),
         .write_pressure_overloads = u64ToI64(status.write_pressure_overloads),
     };
 }
@@ -1970,36 +1916,34 @@ test "metadata.table status encoder honors storage status overrides" {
         .table_name = "docs",
         .empty = true,
         .lsm = .{
+            .memory_bytes = 33,
             .mutable_bytes = 11,
             .immutable_bytes = 22,
-            .immutable_memtables = 2,
-            .total_runs = 3,
-            .total_run_bytes = 44,
-            .l0_runs = 1,
+            .run_count = 3,
+            .run_bytes = 44,
+            .l0_run_count = 1,
             .l0_bytes = 33,
-            .wal_retained_segments = 4,
             .wal_retained_bytes = 55,
-            .wal_checkpoint_lag_segments = 6,
-            .compaction_pending_runs = 10,
-            .compaction_denied_jobs = 7,
+            .compaction_backlog_bytes = 10,
+            .active_readers = 2,
             .write_pressure_overloads = 88,
-            .background_io_denied_jobs = 9,
         },
     }};
 
     const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true,\"lsm\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"memory_bytes\":33") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mutable_bytes\":11") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_memtables\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_runs\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"run_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"l0_bytes\":33") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":55") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_lag_segments\":6") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_pending_runs\":10") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_denied_jobs\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_backlog_bytes\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_readers\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_overloads\":88") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"background_io_denied_jobs\":9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_memtables\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_denied_jobs\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"background_io_denied_jobs\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_sync_records\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_current_segment\"") == null);
 }

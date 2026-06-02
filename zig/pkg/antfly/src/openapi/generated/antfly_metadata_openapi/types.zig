@@ -422,36 +422,18 @@ pub const IndexStatus = struct {
     status: antfly_indexes_openapi.IndexStats,
 };
 
-/// Curated LSM backend operational status. Detailed low-level counters are available through metrics.
+/// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
 pub const LsmStorageStatus = struct {
+    memory_bytes: ?i64 = null,
     mutable_bytes: ?i64 = null,
     immutable_bytes: ?i64 = null,
-    immutable_memtables: ?i64 = null,
-    total_runs: ?i64 = null,
-    total_run_bytes: ?i64 = null,
-    l0_runs: ?i64 = null,
+    run_count: ?i64 = null,
+    run_bytes: ?i64 = null,
+    l0_run_count: ?i64 = null,
     l0_bytes: ?i64 = null,
-    lower_level_runs: ?i64 = null,
-    lower_level_bytes: ?i64 = null,
-    compactable_l0_runs: ?i64 = null,
-    level_overflow_runs: ?i64 = null,
-    level_overflow_bytes: ?i64 = null,
-    obsolete_paths: ?i64 = null,
-    active_readers: ?i64 = null,
-    wal_retained_segments: ?i64 = null,
     wal_retained_bytes: ?i64 = null,
-    wal_checkpoint_lag_segments: ?i64 = null,
-    compaction_active_jobs: ?i64 = null,
-    compaction_pending_runs: ?i64 = null,
-    compaction_pending_bytes: ?i64 = null,
-    compaction_oldest_active_age_ns: ?i64 = null,
-    compaction_denied_jobs: ?i64 = null,
-    compaction_conflict_denials: ?i64 = null,
-    compaction_oversized_skips: ?i64 = null,
-    background_io_budget_bytes: ?i64 = null,
-    background_io_reserved_bytes: ?i64 = null,
-    background_io_denied_jobs: ?i64 = null,
-    write_pressure_events: ?i64 = null,
+    compaction_backlog_bytes: ?i64 = null,
+    active_readers: ?i64 = null,
     write_pressure_overloads: ?i64 = null,
 };
 

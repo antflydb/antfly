@@ -6557,91 +6557,37 @@ components:
           $ref: '#/components/schemas/IndexStats'
     LsmStorageStatus:
       type: object
-      description: Curated LSM backend operational status. Detailed low-level counters are available through
+      description: Compact LSM backend operational status. Detailed low-level counters are available through
         metrics.
       properties:
+        memory_bytes:
+          type: integer
+          format: uint64
         mutable_bytes:
           type: integer
           format: uint64
         immutable_bytes:
           type: integer
           format: uint64
-        immutable_memtables:
+        run_count:
           type: integer
           format: uint64
-        total_runs:
+        run_bytes:
           type: integer
           format: uint64
-        total_run_bytes:
-          type: integer
-          format: uint64
-        l0_runs:
+        l0_run_count:
           type: integer
           format: uint64
         l0_bytes:
           type: integer
           format: uint64
-        lower_level_runs:
-          type: integer
-          format: uint64
-        lower_level_bytes:
-          type: integer
-          format: uint64
-        compactable_l0_runs:
-          type: integer
-          format: uint64
-        level_overflow_runs:
-          type: integer
-          format: uint64
-        level_overflow_bytes:
-          type: integer
-          format: uint64
-        obsolete_paths:
-          type: integer
-          format: uint64
-        active_readers:
-          type: integer
-          format: uint64
-        wal_retained_segments:
-          type: integer
-          format: uint64
         wal_retained_bytes:
           type: integer
           format: uint64
-        wal_checkpoint_lag_segments:
+        compaction_backlog_bytes:
           type: integer
           format: uint64
-        compaction_active_jobs:
-          type: integer
-          format: uint64
-        compaction_pending_runs:
-          type: integer
-          format: uint64
-        compaction_pending_bytes:
-          type: integer
-          format: uint64
-        compaction_oldest_active_age_ns:
-          type: integer
-          format: uint64
-        compaction_denied_jobs:
-          type: integer
-          format: uint64
-        compaction_conflict_denials:
-          type: integer
-          format: uint64
-        compaction_oversized_skips:
-          type: integer
-          format: uint64
-        background_io_budget_bytes:
-          type: integer
-          format: uint64
-        background_io_reserved_bytes:
-          type: integer
-          format: uint64
-        background_io_denied_jobs:
-          type: integer
-          format: uint64
-        write_pressure_events:
+        active_readers:
           type: integer
           format: uint64
         write_pressure_overloads:
