@@ -42,6 +42,7 @@ const replay_record_magic: u32 = 0x31435741; // "AWC1", little-endian.
 const replay_record_version: u16 = 1;
 const replay_record_header_len: usize = 24;
 const committed_segment_entry_len: usize = 16;
+const max_retained_replay_pending_bytes: usize = replay_chunk_bytes + @max(record_header_len, replay_record_header_len);
 
 fn scratchAllocator(allocator: Allocator) Allocator {
     return if (builtin.link_libc) std.heap.c_allocator else allocator;
@@ -622,10 +623,7 @@ fn iterateReplayStreaming(
         1 +
         "00000000000000000000.log".len;
     try scratch.path_buf.ensureTotalCapacityPrecise(scratch_allocator, max_path_len);
-    try scratch.pending.ensureTotalCapacityPrecise(
-        scratch_allocator,
-        replay_chunk_bytes + @max(record_header_len, replay_record_header_len),
-    );
+    try scratch.pending.ensureTotalCapacityPrecise(scratch_allocator, max_retained_replay_pending_bytes);
 
     if (!(try replayScratchDedicatedLayoutOnly(scratch, storage, allocator, root_dir))) {
         const main_wal_start_segment = try replayMainWalStartSegment(storage, allocator, root_dir, effective_from);
@@ -718,7 +716,7 @@ fn replayRecordsFromMainWal(
     comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     stats: *ReplayStreamStats,
 ) !void {
-    const chunk_allocator = allocator;
+    const chunk_allocator = scratchAllocator(allocator);
     const file_size = storage.fileSize(wal_path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
@@ -748,6 +746,7 @@ fn replayRecordsFromMainWal(
             },
             else => return err,
         };
+        releaseOversizedReplayPendingBuffer(chunk_allocator, pending);
     }
     if (pending.items.len > 0) stats.truncated_tail_bytes += @intCast(pending.items.len);
 }
@@ -807,6 +806,7 @@ fn replayFile(
                 });
                 stats.truncated_tail_bytes += @intCast(pending.items.len);
                 pending.clearRetainingCapacity();
+                releaseOversizedReplayPendingBuffer(chunk_allocator, pending);
                 break;
             },
             error.CorruptLsmWal => {
@@ -819,10 +819,17 @@ fn replayFile(
             },
             else => return err,
         };
+        releaseOversizedReplayPendingBuffer(chunk_allocator, pending);
         if (read_len < replay_chunk_bytes) break;
     }
     if (saw_bytes) stats.segments += 1;
     if (pending.items.len > 0) stats.truncated_tail_bytes += @intCast(pending.items.len);
+}
+
+fn releaseOversizedReplayPendingBuffer(allocator: Allocator, pending: *std.ArrayListUnmanaged(u8)) void {
+    if (pending.capacity <= max_retained_replay_pending_bytes) return;
+    if (pending.items.len > max_retained_replay_pending_bytes) return;
+    pending.shrinkAndFree(allocator, pending.items.len);
 }
 
 fn repairTruncatedReplayFile(
@@ -991,7 +998,7 @@ fn replayFileStreaming(
 
     var pending = std.ArrayListUnmanaged(u8).empty;
     defer pending.deinit(allocator);
-    try pending.ensureTotalCapacityPrecise(allocator, replay_chunk_bytes + @max(record_header_len, replay_record_header_len));
+    try pending.ensureTotalCapacityPrecise(allocator, max_retained_replay_pending_bytes);
 
     var offset: u64 = 0;
     while (offset < file_size) {
@@ -1022,10 +1029,12 @@ fn replayFileStreaming(
                 });
                 stats.truncated_tail_bytes += @intCast(pending.items.len);
                 pending.clearRetainingCapacity();
+                releaseOversizedReplayPendingBuffer(allocator, &pending);
                 break;
             },
             else => return err,
         };
+        releaseOversizedReplayPendingBuffer(allocator, &pending);
     }
     if (pending.items.len > 0) {
         stats.truncated_tail_bytes += @intCast(pending.items.len);
@@ -1631,6 +1640,23 @@ fn readInt(bytes: []const u8, pos: *usize, comptime T: type) !T {
     const value = std.mem.readInt(T, bytes[pos.*..][0..len], .little);
     pos.* += len;
     return value;
+}
+
+test "lsm wal replay pending scratch releases oversized retained capacity" {
+    var pending = std.ArrayListUnmanaged(u8).empty;
+    defer pending.deinit(std.testing.allocator);
+
+    try pending.ensureTotalCapacityPrecise(std.testing.allocator, max_retained_replay_pending_bytes * 2);
+    try std.testing.expect(pending.capacity > max_retained_replay_pending_bytes);
+
+    pending.items.len = max_retained_replay_pending_bytes + 1;
+    releaseOversizedReplayPendingBuffer(std.testing.allocator, &pending);
+    try std.testing.expect(pending.capacity > max_retained_replay_pending_bytes);
+
+    pending.items.len = 8;
+    releaseOversizedReplayPendingBuffer(std.testing.allocator, &pending);
+    try std.testing.expectEqual(@as(usize, 8), pending.items.len);
+    try std.testing.expect(pending.capacity <= max_retained_replay_pending_bytes);
 }
 
 test "lsm wal encodes and replays state" {

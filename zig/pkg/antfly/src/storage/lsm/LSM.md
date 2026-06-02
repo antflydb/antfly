@@ -353,6 +353,11 @@ Large-ingest guardrails:
    - [x] First slice: state WAL recovery now reads segment chunks directly
      into the reusable pending replay buffer instead of allocating one chunk
      per read and retaining those chunks until segment replay exits.
+   - [x] Replay pending scratch now has a retained-cap policy: normal replay
+     chunks are reused, but an oversized retained buffer from a large WAL record
+     is released once the unconsumed tail is back inside the normal chunk
+     window. The shared scratch path now grows and frees this buffer with the
+     same scratch allocator.
 4. [ ] Add final-state HBC bulk publication for sustained ingest so large loads
    avoid persisting every intermediate online mutation.
 5. [x] Add background IO admission budgeting for maintenance work.
