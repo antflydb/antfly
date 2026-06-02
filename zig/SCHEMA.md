@@ -216,30 +216,31 @@ Template-only updates propagate without a recreate on two levels:
   and configured HLL cardinalities) so a schema change does not reset tuning or
   drop approximate-cardinality sketches; fresh opens, new replicas, and restarts
   pick up the new rules; and
-- live indexes are refreshed in place
-  (`DB.reloadAlgebraicSchemaConfigs` → `Index.reloadConfigJson`) so running
-  writers apply the new rules immediately.
+- live indexes are refreshed and rebuilt in place
+  (`DB.reloadAlgebraicSchemaConfigs` → `IndexManager.reloadAlgebraicSchemaConfigs`)
+  so running writers apply the new rules after the local sidecar has been
+  reprojected from committed base rows.
 
-Because the change applies without re-projecting existing documents, a capability
-change (detected by a differing capability fingerprint) sets
-`capability_lifecycle_status: "rebuild_required"` on the algebraic config — both
-durably and in the live index. While pending, algebraic planning falls back
-instead of reading schema-derived facts that may only cover the post-change
-subset. Dynamic-template changes also keep the narrower
-`dynamic_rules_backfill_pending` diagnostic/field guard. The lifecycle marker is
-cleared when the sidecar is rebuilt, which re-projects existing documents. Tables
-created with a template (rather than updated) take the fingerprint-equality fast
-path and are never flagged.
+Capability changes (detected by a differing capability fingerprint) first set
+`capability_lifecycle_status: "rebuild_required"` on the algebraic config so a
+crash or reopen during migration falls back instead of reading schema-derived
+facts that may only cover the post-change subset. Local schema reload then clears
+the algebraic sidecar, replays existing committed base rows through the refreshed
+config, and persists `capability_lifecycle_status: "current"` after success.
+Dynamic-template changes also use the narrower `dynamic_rules_backfill_pending`
+diagnostic/field guard while the rebuild is pending. Tables created with a
+template (rather than updated) take the fingerprint-equality fast path and are
+never flagged.
 
 Relational `json` columns use the same shape at the column scope. Each embedded
 JSON domain is emitted as a `json_subdocument_domains` entry with the owning
 path and a capability fingerprint. Updating that column's embedded `schema` or
 column-local `dynamic_templates` marks the changed domain
-`lifecycle_status: "rebuild_required"` in durable `indexes_json` and live
-algebraic configs. While pending, algebraic field resolution withholds static
-and dynamic facts below that JSON path, but unrelated top-level relational
-fields remain eligible for the sidecar. Rebuild/backfill reprojects the JSON
-cell from the committed relational row; the schema update does not rewrite
+`lifecycle_status: "rebuild_required"` as a transition state. While pending,
+algebraic field resolution withholds static and dynamic facts below that JSON
+path, but unrelated top-level relational fields remain eligible for the sidecar.
+Local rebuild/backfill reprojects the JSON cell from the committed relational row
+and then marks the domain `current`; the schema update does not rewrite
 unchanged row values.
 
 Relational base-column changes are different: they change authoritative storage

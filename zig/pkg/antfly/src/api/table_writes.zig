@@ -56,7 +56,7 @@ const platform_time = @import("../platform/time.zig");
 const Io = std.Io;
 
 var txn_id_nonce: std.atomic.Value(u64) = .init(0);
-const local_schema_json_key = "\x00\x00__metadata__:schema_json";
+const local_schema_json_key = db_mod.local_schema_json_key;
 const max_cached_write_tables = 64;
 const auto_bulk_ingest_min_batch_ops: usize = 100;
 const auto_bulk_ingest_max_window_ops: usize = 25_000;
@@ -8495,19 +8495,7 @@ fn applyLocalTableSchemaJson(
     db: *db_mod.DB,
     schema_json: []const u8,
 ) !void {
-    if (schema_json.len == 0) return;
-
-    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-
-    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer storage_schema.freeSchema(alloc, runtime_schema);
-
-    try db.setSchema(runtime_schema);
-    // Propagate dynamic-template (and other schema-derived) changes to live
-    // algebraic indexes so template updates take effect without a reopen.
-    try db.reloadAlgebraicSchemaConfigs(schema_json);
-    try db.core.store.put(local_schema_json_key, schema_json);
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
 }
 
 fn rebuildEmptyVersionedFullTextIndexesAfterSchemaUpdate(

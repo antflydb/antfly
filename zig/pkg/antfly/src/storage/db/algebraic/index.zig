@@ -3051,9 +3051,8 @@ pub const Index = struct {
 
     /// Swap the index configuration in place from a new config JSON. Used to
     /// apply a dynamic-template change to a running index without a reopen:
-    /// the next ingest projects facts using the refreshed dynamic_field_rules.
-    /// Persisted sidecar rows are untouched (lazy backfill); only newly written
-    /// or rewritten documents reflect the new rules until a full rebuild.
+    /// the index manager first installs a pending config, clears/replays persisted
+    /// rows through the refreshed config, then installs the current config.
     ///
     /// Concurrency: this frees the old parsed Config (whose slices back the
     /// FieldConfig/DynamicRule values returned by `config()`/`fieldConfig`). It
@@ -3075,6 +3074,40 @@ pub const Index = struct {
         const old = self.parsed;
         self.parsed = parsed;
         old.deinit();
+    }
+
+    /// Delete every persisted row owned by this algebraic index. Used by
+    /// schema-capability rebuilds before replaying base rows through the updated
+    /// config. Algebraic storage has two historical key namespaces: the raw
+    /// `keyAlloc` namespace for doc/path facts and the canonical tuple namespace
+    /// for tensors/adaptive/HLL rows, so both prefixes must be cleared.
+    pub fn clearPersistedRows(self: *Index, store: *docstore_mod.DocStore) !usize {
+        var deleted: usize = 0;
+
+        const raw_prefix = try self.keyAlloc(&.{});
+        defer self.alloc.free(raw_prefix);
+        deleted += try self.deleteRowsWithPrefix(store, raw_prefix);
+
+        const canonical_prefix = try token.canonicalTupleAlloc(self.alloc, &.{ "\x00\x00__algebraic__", self.name });
+        defer self.alloc.free(canonical_prefix);
+        deleted += try self.deleteRowsWithPrefix(store, canonical_prefix);
+
+        self.invalidateAdaptiveReadySpecCache();
+        self.clearObservedQueryState();
+        self.clearBulkDirtyPathPromotionDictionaries();
+        return deleted;
+    }
+
+    fn deleteRowsWithPrefix(self: *Index, store: *docstore_mod.DocStore, prefix: []const u8) !usize {
+        const rows = try store.scanPrefix(self.alloc, prefix);
+        defer docstore_mod.DocStore.freeResults(self.alloc, rows);
+        if (rows.len == 0) return 0;
+
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(self.alloc);
+        for (rows) |row| try deletes.append(self.alloc, row.key);
+        try store.putBatch(&.{}, deletes.items);
+        return rows.len;
     }
 
     pub fn attachResourceManager(self: *Index, manager: *resource_manager_mod.ResourceManager) void {

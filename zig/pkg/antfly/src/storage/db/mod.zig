@@ -70,6 +70,7 @@ pub const SparseSplitHandoff = @import("catalog/index_manager.zig").SparseSplitH
 pub const DB = @import("db.zig").DB;
 pub const OpenOptions = @import("db.zig").OpenOptions;
 pub const OpenMode = @import("db.zig").OpenMode;
+pub const local_schema_json_key = @import("db.zig").local_schema_json_key;
 pub const ReplayProgress = @import("db.zig").ReplayProgress;
 pub const QueryVisibilityHook = @import("db.zig").QueryVisibilityHook;
 pub const QueryVisibilityChange = @import("db.zig").QueryVisibilityChange;

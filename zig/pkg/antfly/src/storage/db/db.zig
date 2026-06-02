@@ -68,6 +68,7 @@ const mem_backend_mod = @import("../mem_backend.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const schema_mod = @import("../schema.zig");
+const schema_api_mod = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
 const transactions_mod = @import("../transactions.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
@@ -170,6 +171,7 @@ pub const OpenOptions = struct {
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
+pub const local_schema_json_key = "\x00\x00__metadata__:schema_json";
 pub const ReplayProgress = struct {
     sequence: u64 = 0,
     target_sequence: u64 = 0,
@@ -4905,6 +4907,38 @@ pub const DB = struct {
         }
     }
 
+    pub const ApplyTableSchemaOptions = struct {
+        persist_local_schema_json: bool = true,
+        reload_algebraic_schema_configs: bool = true,
+    };
+
+    /// Apply table metadata schema JSON to the DB runtime and all schema-derived
+    /// local artifacts. This is the single production entry point for table
+    /// schema application so write-cache reconciliation, metadata provisioning,
+    /// and crash recovery keep algebraic sidecars in the same lifecycle state.
+    pub fn applyTableSchemaJson(
+        self: *DB,
+        alloc: Allocator,
+        schema_json: []const u8,
+        options: ApplyTableSchemaOptions,
+    ) !void {
+        if (schema_json.len == 0) return;
+
+        var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+
+        const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+
+        try self.setSchema(runtime_schema);
+        if (options.reload_algebraic_schema_configs) {
+            try self.reloadAlgebraicSchemaConfigs(schema_json);
+        }
+        if (options.persist_local_schema_json) {
+            try self.core.store.put(local_schema_json_key, schema_json);
+        }
+    }
+
     /// Returns the relational column catalog when the table is in relational
     /// storage mode (so document writes store a dedicated relational base row),
     /// or null for document-mode tables (which keep the JSON blob).
@@ -4923,7 +4957,7 @@ pub const DB = struct {
     /// rules) in place from the given table schema JSON, so a dynamic-template
     /// change applies to a running DB without a reopen.
     pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
-        try self.core.index_manager.reloadAlgebraicSchemaConfigs(schema_json);
+        try self.core.index_manager.reloadAlgebraicSchemaConfigs(self.core.store, schema_json);
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {

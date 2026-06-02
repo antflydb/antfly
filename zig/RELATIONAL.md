@@ -340,8 +340,9 @@ Schema-derived algebraic configs record each JSON column as a
 status. When that fingerprint changes, durable schema regeneration and live
 reload mark the affected domain `rebuild_required`, and algebraic query
 planning withholds fields below that JSON column until the sidecar is rebuilt
-from committed rows. Full-text JSON projection follows the existing
-schema-versioned index handoff.
+from committed rows. Successful local rebuild clears the domain back to
+`current`. Full-text JSON projection follows the existing schema-versioned index
+handoff.
 
 By contrast, changing the relational base-column catalog is a storage migration.
 Schema updates that switch storage mode or add, remove, rename, retag, or change

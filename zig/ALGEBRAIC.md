@@ -1989,22 +1989,23 @@ fields. Schemaless `pathfact`, `path_lookup`, and `path_profile` rows are the
 discovery substrate for late-typed promotion. Mixed-kind paths require
 kind-qualified plans, explicit coercion policy, or fallback.
 
-Schema lifecycle drift marks the algebraic capability stale or rebuild-required.
-Until a sidecar rebuild re-projects existing documents, durable regeneration and
-live reload set `capability_lifecycle_status: "rebuild_required"` and the
-planner declines schema-derived algebraic execution. This favors correct scan
-fallback over reading facts that only cover the post-change subset. More precise
-per-field compatibility can be layered on top later, but the production contract
-is that a changed capability is not current until rebuilt.
+Schema lifecycle drift marks the algebraic capability stale or rebuild-required
+while migration is in progress. Durable regeneration records
+`capability_lifecycle_status: "rebuild_required"` for crash safety, and local
+live reload persists that pending state before clearing algebraic rows. The
+index manager then replays committed base rows through the refreshed config and
+persists `capability_lifecycle_status: "current"` after success. While pending,
+the planner declines schema-derived algebraic execution, favoring correct scan
+fallback over reading facts that only cover the post-change subset.
 
 Relational embedded JSON domains apply that lifecycle per column path. Durable
-schema regeneration and live `Index.reloadConfigJson` preserve user-owned knobs,
-compare each `json_subdocument_domains` fingerprint, and mark changed domains
-`lifecycle_status: "rebuild_required"`. `Index.fieldConfig` then declines both
-static and dynamic fields under that JSON path while the domain is pending, so
-queries either fall back or report pending capability instead of reading stale
-facts. Fields outside the pending JSON column remain eligible for algebraic
-execution.
+schema regeneration and local schema reload preserve user-owned knobs, compare
+each `json_subdocument_domains` fingerprint, and mark changed domains
+`lifecycle_status: "rebuild_required"` until local replay has reprojected the
+committed relational rows. `Index.fieldConfig` declines both static and dynamic
+fields under that JSON path while the domain is pending, so queries either fall
+back or report pending capability instead of reading stale facts. Fields outside
+the pending JSON column remain eligible for algebraic execution.
 
 ### Adaptive Lifecycle
 

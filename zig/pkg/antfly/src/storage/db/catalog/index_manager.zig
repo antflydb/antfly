@@ -96,6 +96,7 @@ pub var test_abort_text_backfill_after_batches: ?usize = null;
 const sparse_backfill_batch_size: usize = 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
+const algebraic_backfill_batch_size: usize = 1024;
 
 pub const ManagedIndexRef = struct {
     name: []const u8,
@@ -1223,15 +1224,16 @@ pub const IndexManager = struct {
     }
 
     /// Regenerate every algebraic index's schema-derived config from `schema_json`
-    /// and apply it in place when the schema-derived capability actually changed.
-    /// Carries forward user-tunable runtime knobs, and sets
-    /// dynamic_rules_backfill_pending on a real change so query-time resolution of
-    /// dynamic-template fields is withheld (those aggregations fall back to a
-    /// complete scan instead of reading facts that only cover post-change docs)
-    /// until the index is rebuilt. No-op when there are no algebraic indexes, no
-    /// schema, or the capability fingerprint is unchanged.
-    pub fn reloadAlgebraicSchemaConfigs(self: *IndexManager, schema_json: []const u8) !void {
+    /// and rebuild the persisted algebraic sidecar when the schema-derived
+    /// capability changed or is already marked pending. The pending config is
+    /// persisted before clearing rows so reopen stays in fallback if replay fails;
+    /// a successful replay persists a current config.
+    pub fn reloadAlgebraicSchemaConfigs(self: *IndexManager, store: *docstore_mod.DocStore, schema_json: []const u8) !void {
         if (schema_json.len == 0) return;
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        self.bindPrimaryStore(store);
+
         for (self.algebraic_indexes.items) |*entry| {
             const cur = entry.index.config();
             const new_config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(self.alloc, cur.table, schema_json);
@@ -1246,8 +1248,12 @@ pub const IndexManager = struct {
             // serializations differ in shape and tunable knobs, so a byte compare
             // would never short-circuit and every reconcile would churn the
             // live config.
-            if (cur.capability_fingerprint.len > 0 and
-                std.mem.eql(u8, new_parsed.value.capability_fingerprint, cur.capability_fingerprint)) continue;
+            const capability_changed = cur.capability_fingerprint.len == 0 or
+                !std.mem.eql(u8, new_parsed.value.capability_fingerprint, cur.capability_fingerprint);
+            const lifecycle_pending = algebraicLifecyclePending(cur.capability_lifecycle_status) or
+                cur.dynamic_rules_backfill_pending or
+                anyJsonSubdocumentDomainLifecyclePending(cur);
+            if (!capability_changed and !lifecycle_pending) continue;
 
             // Carry forward user-tunable runtime knobs (the durable regeneration
             // in api/tables.zig preserves the same set) so a schema/template
@@ -1264,24 +1270,125 @@ pub const IndexManager = struct {
             markJsonSubdocumentDomainLifecycles(&new_parsed.value, cur);
 
             // The capability changed against an already-open table, so existing
-            // documents have not been re-projected through the new dynamic rules.
-            // Keep the dynamic-rule marker as a field-level diagnostic, while the
-            // index-level lifecycle marker above blocks all schema-derived
-            // algebraic planning until rebuild. The durable regeneration in
-            // api/tables.zig sets the same markers so this survives reopen. (Table
-            // create takes the fingerprint-equality skip above, so a freshly-built
-            // index is never flagged.)
+            // documents have not been re-projected through the new config. Persist
+            // the blocked state before clearing rows; if the rebuild fails, reopen
+            // keeps schema-derived algebraic planning withheld.
             new_parsed.value.dynamic_rules_backfill_pending = new_parsed.value.dynamic_field_rules.len > 0;
 
-            const merged_json = try std.json.Stringify.valueAlloc(self.alloc, new_parsed.value, .{ .emit_null_optional_fields = false });
-            defer self.alloc.free(merged_json);
+            const pending_json = try std.json.Stringify.valueAlloc(self.alloc, new_parsed.value, .{ .emit_null_optional_fields = false });
+            defer self.alloc.free(pending_json);
+            try self.replaceAlgebraicConfigJson(entry, pending_json);
+            try self.persistCatalog(store);
 
-            const owned = try self.alloc.dupe(u8, merged_json);
-            errdefer self.alloc.free(owned);
-            try entry.index.reloadConfigJson(merged_json);
-            self.alloc.free(entry.config.config_json);
-            entry.config.config_json = owned;
+            try self.completePendingAlgebraicRebuild(store, entry);
         }
+    }
+
+    fn resumePendingAlgebraicRebuilds(self: *IndexManager, store: *docstore_mod.DocStore) !void {
+        for (self.algebraic_indexes.items) |*entry| {
+            const cur = entry.index.config();
+            if (!algebraicLifecyclePending(cur.capability_lifecycle_status) and
+                !cur.dynamic_rules_backfill_pending and
+                !anyJsonSubdocumentDomainLifecyclePending(cur)) continue;
+
+            try self.completePendingAlgebraicRebuild(store, entry);
+        }
+    }
+
+    fn completePendingAlgebraicRebuild(self: *IndexManager, store: *docstore_mod.DocStore, entry: *AlgebraicIndex) !void {
+        _ = try self.rebuildAlgebraicIndexFromBaseRows(store, entry);
+        try self.saveBackfilledAppliedSequence(store, entry.config);
+
+        var parsed = try std.json.parseFromSlice(algebraic_mod.index.Config, self.alloc, entry.config.config_json, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        parsed.value.capability_lifecycle_status = "current";
+        parsed.value.dynamic_rules_backfill_pending = false;
+        markJsonSubdocumentDomainLifecyclesCurrent(&parsed.value);
+
+        const current_json = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(current_json);
+        try self.replaceAlgebraicConfigJson(entry, current_json);
+        try self.persistCatalog(store);
+    }
+
+    fn replaceAlgebraicConfigJson(self: *IndexManager, entry: *AlgebraicIndex, config_json: []const u8) !void {
+        const owned = try self.alloc.dupe(u8, config_json);
+        errdefer self.alloc.free(owned);
+        try entry.index.reloadConfigJson(config_json);
+        self.alloc.free(entry.config.config_json);
+        entry.config.config_json = owned;
+    }
+
+    fn rebuildAlgebraicIndexFromBaseRows(self: *IndexManager, store: *docstore_mod.DocStore, entry: *AlgebraicIndex) !usize {
+        _ = try entry.index.clearPersistedRows(store);
+
+        const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
+        defer self.alloc.free(lower);
+        const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
+        defer if (upper) |buf| self.alloc.free(buf);
+
+        const rows = try store.scanRange(self.alloc, lower, if (upper) |buf| buf else "");
+        defer docstore_mod.DocStore.freeResults(self.alloc, rows);
+        try self.materializeScannedDocumentRows(rows);
+
+        try entry.index.beginBulkIngestSession();
+        var bulk_session_open = true;
+        errdefer if (bulk_session_open) entry.index.abortBulkIngestSession();
+
+        var docs = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
+        defer docs.deinit(self.alloc);
+        var owned_doc_ids = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_doc_ids.items) |doc_id| self.alloc.free(doc_id);
+            owned_doc_ids.deinit(self.alloc);
+        }
+
+        var rebuilt: usize = 0;
+        const flush_batch = struct {
+            fn run(
+                manager: *IndexManager,
+                doc_store: *docstore_mod.DocStore,
+                algebraic_entry: *AlgebraicIndex,
+                docs_buf: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+                owned_keys: *std.ArrayListUnmanaged([]u8),
+            ) !void {
+                if (docs_buf.items.len == 0) return;
+                try algebraic_entry.index.applyBatchWithOptions(doc_store, .{ .documents = docs_buf.items }, .{ .batch_options = .{ .mode = .bulk_ingest } });
+                for (owned_keys.items) |doc_id| manager.alloc.free(doc_id);
+                owned_keys.clearRetainingCapacity();
+                docs_buf.clearRetainingCapacity();
+            }
+        }.run;
+
+        for (rows) |row| {
+            if (isMetadataKey(row.key)) continue;
+            if (!self.visibleBaseDocumentRowKey(row.key)) continue;
+            const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, row.key)) orelse continue;
+            if (!self.keyInRange(doc_id)) {
+                self.alloc.free(doc_id);
+                continue;
+            }
+
+            docs.append(self.alloc, .{
+                .key = doc_id,
+                .cleaned_value = row.value,
+            }) catch |err| {
+                self.alloc.free(doc_id);
+                return err;
+            };
+            owned_doc_ids.append(self.alloc, doc_id) catch |err| {
+                docs.items.len -= 1;
+                self.alloc.free(doc_id);
+                return err;
+            };
+            rebuilt += 1;
+            if (docs.items.len >= algebraic_backfill_batch_size) try flush_batch(self, store, entry, &docs, &owned_doc_ids);
+        }
+        try flush_batch(self, store, entry, &docs, &owned_doc_ids);
+
+        try entry.index.finishBulkIngestSessionWithOptions(store, .{});
+        bulk_session_open = false;
+        return rebuilt;
     }
 
     fn markJsonSubdocumentDomainLifecycles(new_config: *algebraic_mod.index.Config, current: algebraic_mod.index.Config) void {
@@ -1307,6 +1414,23 @@ pub const IndexManager = struct {
         return status.len != 0 and
             !std.mem.eql(u8, status, "current") and
             !std.mem.eql(u8, status, "compatible_additive");
+    }
+
+    fn algebraicLifecyclePending(status: []const u8) bool {
+        return status.len != 0 and !std.mem.eql(u8, status, "current");
+    }
+
+    fn anyJsonSubdocumentDomainLifecyclePending(config: algebraic_mod.index.Config) bool {
+        for (config.json_subdocument_domains) |domain| {
+            if (jsonDomainLifecyclePending(domain.lifecycle_status)) return true;
+        }
+        return false;
+    }
+
+    fn markJsonSubdocumentDomainLifecyclesCurrent(config: *algebraic_mod.index.Config) void {
+        for (config.json_subdocument_domains) |*domain| {
+            domain.lifecycle_status = "current";
+        }
     }
 
     fn freeAlgebraicIndexEntry(self: *IndexManager, entry: *AlgebraicIndex) void {
@@ -1830,6 +1954,11 @@ pub const IndexManager = struct {
                     try self.ensureConfiguredIndexDir(cfg);
                 }
                 try self.loadConfiguredIndexesParallel(store, configs, parallelism, allow_backfill, read_only);
+            }
+        }
+        if (allow_backfill and !read_only) {
+            if (comptime @TypeOf(store) == *docstore_mod.DocStore) {
+                try self.resumePendingAlgebraicRebuilds(store);
             }
         }
         try self.refreshGeneratedEnrichmentTargetCache();
@@ -4664,7 +4793,7 @@ pub const IndexManager = struct {
     /// only relational row keys are materialized, and the value under that
     /// keyspace must be a typed row. Stale generic primary document rows are not
     /// a supported relational fallback and are filtered by backfill consumers.
-    fn materializeScannedDocumentRows(self: *IndexManager, rows: []backend_scan.OwnedKVPair) !void {
+    fn materializeScannedDocumentRows(self: *IndexManager, rows: anytype) !void {
         for (rows) |*row| {
             if (self.relational_base_rows) {
                 if (!internal_keys.isRelationalRowKey(row.key)) continue;
@@ -11212,6 +11341,8 @@ test "index manager algebraic schema reload preserves HLL cardinalities" {
 
     var manager = try IndexManager.init(alloc, std.mem.span(path_z));
     defer manager.deinit();
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
 
     const config_json =
         \\{
@@ -11246,7 +11377,7 @@ test "index manager algebraic schema reload preserves HLL cardinalities" {
     try manager.algebraic_indexes.append(alloc, entry);
     entry_owned = false;
 
-    try manager.reloadAlgebraicSchemaConfigs(
+    try manager.reloadAlgebraicSchemaConfigs(&store,
         \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}},"dynamic_templates":[{"name":"ext","match":"ext_*","mapping":{"type":"numeric"}}]}
     );
 
@@ -11255,9 +11386,10 @@ test "index manager algebraic schema reload preserves HLL cardinalities" {
     try std.testing.expectEqualStrings("customers_by_region", reloaded.hll_cardinalities[0].name);
     try std.testing.expectEqualStrings("customer", reloaded.hll_cardinalities[0].value_field);
     try std.testing.expectEqual(@as(u8, 12), reloaded.hll_cardinalities[0].precision);
-    try std.testing.expectEqualStrings("rebuild_required", reloaded.capability_lifecycle_status);
+    try std.testing.expectEqualStrings("current", reloaded.capability_lifecycle_status);
+    try std.testing.expect(!reloaded.dynamic_rules_backfill_pending);
     try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"hll_cardinalities\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") == null);
 }
 
 test "index manager algebraic schema reload marks changed json subdocument domains pending" {
@@ -11268,6 +11400,8 @@ test "index manager algebraic schema reload marks changed json subdocument domai
 
     var manager = try IndexManager.init(alloc, std.mem.span(path_z));
     defer manager.deinit();
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
 
     const schema_v1 =
         \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"plan":{"type":"keyword"},"score":{"type":"numeric"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
@@ -11303,15 +11437,128 @@ test "index manager algebraic schema reload marks changed json subdocument domai
     try manager.algebraic_indexes.append(alloc, entry);
     entry_owned = false;
 
-    try manager.reloadAlgebraicSchemaConfigs(schema_v2);
+    try manager.reloadAlgebraicSchemaConfigs(&store, schema_v2);
 
     const reloaded = manager.algebraic_indexes.items[0].index.config();
     try std.testing.expectEqual(@as(usize, 1), reloaded.json_subdocument_domains.len);
     try std.testing.expectEqualStrings("attrs", reloaded.json_subdocument_domains[0].path);
-    try std.testing.expectEqualStrings("rebuild_required", reloaded.capability_lifecycle_status);
-    try std.testing.expectEqualStrings("rebuild_required", reloaded.json_subdocument_domains[0].lifecycle_status);
-    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"lifecycle_status\":\"rebuild_required\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") != null);
+    try std.testing.expectEqualStrings("current", reloaded.capability_lifecycle_status);
+    try std.testing.expectEqualStrings("current", reloaded.json_subdocument_domains[0].lifecycle_status);
+    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"lifecycle_status\":\"rebuild_required\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") == null);
+}
+
+test "index manager algebraic schema reload rebuilds stale persisted rows" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "schema-reload-rebuild");
+    defer cleanupIndexManagerDir(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+    defer manager.deinit();
+
+    const schema_v1 =
+        \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
+    ;
+    const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_v1);
+    defer alloc.free(config_json);
+
+    try manager.add(&store, .{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json = config_json,
+    });
+
+    const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:1");
+    defer alloc.free(stored_key);
+    const doc_json = "{\"old_field\":\"legacy\",\"new_field\":\"fresh\"}";
+    try store.put(stored_key, doc_json);
+    try manager.applyAlgebraicBatchByNameWithOptions(&store, "alg", .{
+        .documents = &.{.{ .key = "doc:1", .cleaned_value = doc_json }},
+    }, .{ .mode = .bulk_ingest });
+
+    try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
+    try manager.reloadAlgebraicSchemaConfigs(&store, schema_v2);
+
+    const reloaded = manager.algebraic_indexes.items[0].index.config();
+    try std.testing.expectEqualStrings("current", reloaded.capability_lifecycle_status);
+    try std.testing.expect(!reloaded.dynamic_rules_backfill_pending);
+    try std.testing.expect(!try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
+    try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "new_field"));
+}
+
+test "index manager writable open resumes pending algebraic schema rebuild" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "schema-open-resume");
+    defer cleanupIndexManagerDir(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+        defer manager.deinit();
+
+        const schema_v1 =
+            \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+        ;
+        const schema_v2 =
+            \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
+        ;
+        const config_v1 = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_v1);
+        defer alloc.free(config_v1);
+        try manager.add(&store, .{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = config_v1,
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:1");
+        defer alloc.free(stored_key);
+        const doc_json = "{\"old_field\":\"legacy\",\"new_field\":\"fresh\"}";
+        try store.put(stored_key, doc_json);
+        try manager.applyAlgebraicBatchByNameWithOptions(&store, "alg", .{
+            .documents = &.{.{ .key = "doc:1", .cleaned_value = doc_json }},
+        }, .{ .mode = .bulk_ingest });
+        try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
+
+        const config_v2 = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_v2);
+        defer alloc.free(config_v2);
+        var parsed = try std.json.parseFromSlice(algebraic_mod.index.Config, alloc, config_v2, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        parsed.value.capability_lifecycle_status = "rebuild_required";
+        const pending_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+        defer alloc.free(pending_json);
+        try manager.replaceAlgebraicConfigJson(&manager.algebraic_indexes.items[0], pending_json);
+        try manager.persistCatalog(&store);
+    }
+
+    {
+        var reopened = try IndexManager.init(alloc, std.mem.span(path_z));
+        defer reopened.deinit();
+        try reopened.load(&store);
+
+        const reloaded = reopened.algebraic_indexes.items[0].index.config();
+        try std.testing.expectEqualStrings("current", reloaded.capability_lifecycle_status);
+        try std.testing.expect(!try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
+        try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "new_field"));
+        try std.testing.expect(std.mem.indexOf(u8, reopened.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") == null);
+    }
+}
+
+fn storeHasDocFactScalarKeyContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !bool {
+    const rows = try store.scanRange(alloc, "", "");
+    defer docstore_mod.DocStore.freeResults(alloc, rows);
+    for (rows) |row| {
+        if (std.mem.indexOf(u8, row.key, "docfact_scalar") != null and
+            std.mem.indexOf(u8, row.key, needle) != null) return true;
+    }
+    return false;
 }
 
 fn parseMetric(raw: []const u8) !vector_mod.DistanceMetric {
