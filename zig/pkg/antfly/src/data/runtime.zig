@@ -1421,6 +1421,16 @@ pub const DataServer = struct {
     provisioned_storage: antfly.public_api.ProvisionedGroupStorage,
     read_source: antfly.public_api.ProvisionedTableReadSource,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
+    /// Long-lived backing for the cross-shard entity-resolution candidate
+    /// source; its `CandidateSource` vtable points into this field, so it must
+    /// not move. Wraps `read_source.source()` and is handed to the write
+    /// source(s) so every managed DB blocks entity resolution across shards.
+    distributed_candidate_source: ?antfly.public_api.DistributedCandidateSource = null,
+    /// Long-lived backing for the promoter's cross-shard entity sink; its
+    /// `EntitySink` vtable points into this field, so it must not move. Wraps
+    /// `write_source.source()` and is handed to the write source(s) so the
+    /// promoter upserts canonical entities into whichever shard owns them.
+    distributed_entity_sink: ?antfly.public_api.DistributedEntitySink = null,
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
@@ -1635,6 +1645,36 @@ pub const DataServer = struct {
         self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
         self.write_source.setLocalChangeHook(self.localChangeHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+        const promotion_leadership = self.promotionLeadershipSource();
+        _ = self.write_source.withPromotionLeadershipSource(promotion_leadership);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withPromotionLeadershipSource(promotion_leadership);
+        }
+
+        // Cross-shard entity-resolution blocking: wrap the routing-aware read
+        // source so resolution workers fetch candidate entities from whichever
+        // shard owns the entity table, then hand it to the write source(s) that
+        // open managed DBs. Captures `read_source.source()` (ptr+vtable), so
+        // later read-source mutations remain visible.
+        self.distributed_candidate_source = .{ .reads = self.read_source.source() };
+        const candidate_source = self.distributed_candidate_source.?.candidateSource();
+        _ = self.write_source.withResolutionCandidateSource(candidate_source);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withResolutionCandidateSource(candidate_source);
+        }
+
+        // The promoter's cross-shard entity sink: wrap the routing-aware write
+        // source so the promoter upserts canonical entity documents into the
+        // shard that owns each entity key, then hand it to the write source(s)
+        // that open managed DBs.
+        // Promote each document's entities atomically through the 2PC commit
+        // path (multi-participant across the entity table's shards).
+        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .transactional = true };
+        const entity_sink = self.distributed_entity_sink.?.entitySink();
+        _ = self.write_source.withEntitySink(entity_sink);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withEntitySink(entity_sink);
+        }
         self.http_server = antfly.public_api.ApiHttpServer.init(
             self.alloc,
             api_server_cfg,
@@ -2047,6 +2087,22 @@ pub const DataServer = struct {
             .vtable = &.{
                 .batch_group = localRaftBatchGroup,
                 .batch_group_local = localRaftBatchGroupLocal,
+            },
+        };
+    }
+
+    fn promotionLeadershipSource(self: *DataServer) ?antfly.public_api.table_writes.ProvisionedTableWriteCache.PromotionLeadershipSource {
+        if (self.group_leadership_source == null) return null;
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .is_local_leader = struct {
+                    fn isLocalLeader(ptr: *anyopaque, group_id: u64) bool {
+                        const server: *DataServer = @ptrCast(@alignCast(ptr));
+                        const source = server.group_leadership_source orelse return true;
+                        return source.isLocalLeader(group_id);
+                    }
+                }.isLocalLeader,
             },
         };
     }

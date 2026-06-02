@@ -189,8 +189,9 @@ pub fn reconcileDbIndexes(
 ) !ProvisionSummary {
     const removed = try removeMissingIndexes(alloc, db, indexes_json);
     const enrichments_added = try ensureEnrichments(alloc, db, indexes_json);
+    const resolvers_added = try ensureResolvers(alloc, db, indexes_json);
     const added = try ensureIndexes(alloc, db, indexes_json);
-    if (added > 0 or removed > 0 or enrichments_added > 0) {
+    if (added > 0 or removed > 0 or enrichments_added > 0 or resolvers_added > 0) {
         const pending = db.pendingWorkStats();
         if (pending.enrichment.error_count == 0) {
             try db.core.index_manager.syncAll(false);
@@ -458,6 +459,9 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
     var added: usize = 0;
     var it = object.iterator();
     while (it.next()) |entry| {
+        // `resolvers` is a reserved top-level section (entity-resolution config,
+        // handled by ensureResolvers), not an index.
+        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
         if (db.core.index_manager.has(entry.key_ptr.*)) continue;
 
@@ -534,6 +538,77 @@ fn collectDesiredEnrichments(
 fn enrichmentExists(existing: []const db_mod.types.EnrichmentConfig, kind: db_mod.types.EnrichmentKind, name: []const u8) bool {
     for (existing) |cfg| {
         if (cfg.kind == kind and std.mem.eql(u8, cfg.name, name)) return true;
+    }
+    return false;
+}
+
+pub fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !usize {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+
+    var desired = std.ArrayListUnmanaged(db_mod.ResolverConfig).empty;
+    defer {
+        for (desired.items) |*cfg| cfg.deinit(alloc);
+        desired.deinit(alloc);
+    }
+    try collectDesiredResolvers(alloc, parsed.value, &desired);
+
+    if (desired.items.len == 0) return 0;
+
+    const existing = try db.listResolvers(alloc);
+    defer {
+        for (existing) |*cfg| cfg.deinit(alloc);
+        alloc.free(existing);
+    }
+
+    var added: usize = 0;
+    for (desired.items) |cfg| {
+        if (resolverExists(existing, cfg.name)) continue;
+        try db.addResolver(cfg);
+        added += 1;
+    }
+    return added;
+}
+
+fn collectDesiredResolvers(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    out: *std.ArrayListUnmanaged(db_mod.ResolverConfig),
+) !void {
+    switch (value) {
+        .object => |object| {
+            if (object.get("resolvers")) |resolvers| {
+                if (resolvers == .array) {
+                    for (resolvers.array.items) |item| {
+                        if (item != .object) continue;
+                        const parsed = try std.json.parseFromValue(db_mod.ResolverConfig, alloc, item, .{
+                            .allocate = .alloc_always,
+                            .ignore_unknown_fields = true,
+                        });
+                        // `parsed.value` is owned by the parse arena; clone with
+                        // `alloc` so `out`'s entries free correctly (and so they
+                        // outlive the arena).
+                        defer parsed.deinit();
+                        try out.append(alloc, try db_mod.ResolverConfig.clone(alloc, parsed.value));
+                    }
+                }
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                try collectDesiredResolvers(alloc, entry.value_ptr.*, out);
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| try collectDesiredResolvers(alloc, item, out);
+        },
+        else => {},
+    }
+}
+
+fn resolverExists(existing: []const db_mod.ResolverConfig, name: []const u8) bool {
+    for (existing) |cfg| {
+        if (std.mem.eql(u8, cfg.name, name)) return true;
     }
     return false;
 }
@@ -822,6 +897,70 @@ test "table provisioner materializes metadata indexes into hosted group dbs" {
     var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
     defer db.close();
     try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
+}
+
+test "table provisioner registers a resolver declared in the table index config" {
+    const path = "/tmp/antfly-metadata-table-provisioner-resolver";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    // A graph index produces the relations_v1 extraction asset; the reserved
+    // top-level `resolvers` section declares the entity resolver that consumes
+    // it. ensureIndexes skips `resolvers`; ensureResolvers registers it.
+    const indexes_json =
+        \\{
+        \\  "relations_graph":{"type":"graph",
+        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\  "resolvers":[
+        \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}
+        \\  ]
+        \\}
+    ;
+
+    const summary = try reconcileReplicaRoot(
+        std.testing.allocator,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 9,
+            .name = "docs",
+            .indexes_json = indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 9,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 1), summary.dbs_opened);
+    // The graph index was added; the resolvers section was not treated as one.
+    try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
+
+    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2001);
+    defer std.testing.allocator.free(db_path);
+    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+    defer db.close();
+
+    try std.testing.expect(db.core.index_manager.has("relations_graph"));
+    try std.testing.expect(!db.core.index_manager.has("resolvers"));
+
+    const resolvers = try db.listResolvers(std.testing.allocator);
+    defer {
+        for (resolvers) |*cfg| cfg.deinit(std.testing.allocator);
+        std.testing.allocator.free(resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+    try std.testing.expectEqualStrings("kg", resolvers[0].name);
+    try std.testing.expectEqualStrings("entities", resolvers[0].table);
+    try std.testing.expectEqualStrings("relations_v1", resolvers[0].source_artifact);
+    try std.testing.expectEqualStrings("prefix", resolvers[0].candidate_search);
+    try std.testing.expectEqual(@as(u64, 1), resolvers[0].config_generation);
 }
 
 test "table provisioner restores local shard data from metadata restore intent" {

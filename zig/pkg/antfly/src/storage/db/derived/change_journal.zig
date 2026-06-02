@@ -30,6 +30,12 @@ pub const TargetHint = enum {
     sparse_vector,
     graph,
     algebraic,
+    // Appended (bit 6) so existing encoded hint masks stay compatible. Drives
+    // the entity-resolution stage off changed extraction (asset) artifacts.
+    resolution,
+    // Appended (bit 7). Drives the promoter stage off changed resolution
+    // artifacts (it upserts canonical entity documents into the entity table).
+    promotion,
 };
 
 pub const Record = struct {
@@ -204,6 +210,14 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
         } else if (internal_keys.isAssetArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
+            try appendUniqueHintAlloc(alloc, &target_hints, .resolution);
+        } else if (internal_keys.isResolutionArtifactKey(key)) {
+            // The resolution stage journals its output; wake the graph
+            // materializer for doc->entity provenance edges and the promoter so
+            // it upserts the canonical entity documents for the resolved
+            // mentions.
+            try appendUniqueHintAlloc(alloc, &target_hints, .graph);
+            try appendUniqueHintAlloc(alloc, &target_hints, .promotion);
         } else if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
             try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
@@ -350,6 +364,8 @@ fn decodeHintMask(alloc: Allocator, mask: u8) ![]TargetHint {
     if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.sparse_vector))) != 0) count += 1;
     if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.graph))) != 0) count += 1;
     if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.algebraic))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.resolution))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.promotion))) != 0) count += 1;
     if (count == 0) return &.{};
 
     const hints = try alloc.alloc(TargetHint, count);
@@ -378,6 +394,14 @@ fn decodeHintMask(alloc: Allocator, mask: u8) ![]TargetHint {
         hints[index] = .algebraic;
         index += 1;
     }
+    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.resolution))) != 0) {
+        hints[index] = .resolution;
+        index += 1;
+    }
+    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.promotion))) != 0) {
+        hints[index] = .promotion;
+        index += 1;
+    }
     return hints;
 }
 
@@ -387,6 +411,8 @@ const dense_vector_hint_slice = [_]TargetHint{.dense_vector};
 const sparse_vector_hint_slice = [_]TargetHint{.sparse_vector};
 const graph_hint_slice = [_]TargetHint{.graph};
 const algebraic_hint_slice = [_]TargetHint{.algebraic};
+const resolution_hint_slice = [_]TargetHint{.resolution};
+const promotion_hint_slice = [_]TargetHint{.promotion};
 
 fn targetHintsAreStaticSingleton(target_hints: []const TargetHint) bool {
     if (target_hints.len != 1) return false;
@@ -395,7 +421,9 @@ fn targetHintsAreStaticSingleton(target_hints: []const TargetHint) bool {
         target_hints.ptr == dense_vector_hint_slice[0..].ptr or
         target_hints.ptr == sparse_vector_hint_slice[0..].ptr or
         target_hints.ptr == graph_hint_slice[0..].ptr or
-        target_hints.ptr == algebraic_hint_slice[0..].ptr;
+        target_hints.ptr == algebraic_hint_slice[0..].ptr or
+        target_hints.ptr == resolution_hint_slice[0..].ptr or
+        target_hints.ptr == promotion_hint_slice[0..].ptr;
 }
 
 fn freeTargetHintsIfOwned(alloc: Allocator, target_hints: []const TargetHint) void {
@@ -413,6 +441,8 @@ fn decodeHintMaskBorrowed(alloc: Allocator, mask: u8) ![]const TargetHint {
             singleHintMask(.sparse_vector) => sparse_vector_hint_slice[0..],
             singleHintMask(.graph) => graph_hint_slice[0..],
             singleHintMask(.algebraic) => algebraic_hint_slice[0..],
+            singleHintMask(.resolution) => resolution_hint_slice[0..],
+            singleHintMask(.promotion) => promotion_hint_slice[0..],
             else => return error.InvalidBinaryRecord,
         };
     }
@@ -747,7 +777,7 @@ pub fn encodedRecordMatchesHintMask(raw: []const u8, required_mask: u8) !bool {
 }
 
 fn recordMatchesHintMaskFast(raw: []const u8, required_mask: u8) !bool {
-    const hints = [_]TargetHint{ .enrichment, .full_text, .dense_vector, .sparse_vector, .graph, .algebraic };
+    const hints = [_]TargetHint{ .enrichment, .full_text, .dense_vector, .sparse_vector, .graph, .algebraic, .resolution, .promotion };
     for (hints) |hint| {
         if ((required_mask & singleHintMask(hint)) == 0) continue;
         if (try recordHasHintFast(raw, hint)) return true;
@@ -984,4 +1014,42 @@ test "change journal encodedRecordHasHint matches legacy json payloads" {
 test "change journal encodedRecordHasHint ignores non-record payloads" {
     try std.testing.expect(!(try encodedRecordHasHint("not-json", .graph)));
     try std.testing.expect(!(try encodedRecordHasHint("", .graph)));
+}
+
+test "change journal roundtrips the resolution target hint" {
+    const alloc = std.testing.allocator;
+    const payload = try encodeRecord(alloc, .{
+        .sequence = 5,
+        .changed_artifact_keys = &.{"artifact:extraction"},
+        .target_hints = &.{.resolution},
+    });
+    defer alloc.free(payload);
+
+    try std.testing.expectEqual(singleHintMask(.resolution), try encodedRecordHintMask(payload));
+    try std.testing.expect(try encodedRecordHasHint(payload, .resolution));
+    try std.testing.expect(!(try encodedRecordHasHint(payload, .graph)));
+
+    // Full decode and the borrowed singleton path both recover the hint.
+    var decoded = try decodeRecord(alloc, payload);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.target_hints.len);
+    try std.testing.expectEqual(TargetHint.resolution, decoded.record.target_hints[0]);
+
+    var borrowed = try decodeBinaryRecordBorrowed(alloc, payload);
+    defer borrowed.deinit();
+    try std.testing.expectEqual(TargetHint.resolution, borrowed.record.target_hints[0]);
+}
+
+test "change journal emits resolution and graph hints for changed asset artifacts" {
+    const alloc = std.testing.allocator;
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+
+    var record = try recordFromDerivedBatch(alloc, .{
+        .changed_artifact_keys = &.{asset_key},
+    }, 21);
+    defer deinitRecord(alloc, &record);
+
+    try std.testing.expect(recordHasHint(record, .graph));
+    try std.testing.expect(recordHasHint(record, .resolution));
 }

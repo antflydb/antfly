@@ -40,6 +40,8 @@ pub const http_routes = @import("http_routes.zig");
 pub const provisioned_storage = @import("provisioned_storage.zig");
 pub const table_reads = @import("table_reads.zig");
 pub const table_writes = @import("table_writes.zig");
+pub const distributed_candidate_source = @import("distributed_candidate_source.zig");
+pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
 pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
@@ -60,6 +62,8 @@ pub const ProvisionedTableReadCache = table_reads.ProvisionedTableReadCache;
 pub const ProvisionedTableReadSource = table_reads.ProvisionedTableReadSource;
 pub const GroupLsmGenerationSource = table_reads.GroupLsmGenerationSource;
 pub const HostedProvisionedTableReadSource = table_reads.HostedProvisionedTableReadSource;
+pub const DistributedCandidateSource = distributed_candidate_source.DistributedCandidateSource;
+pub const DistributedEntitySink = distributed_entity_sink.DistributedEntitySink;
 pub const TableWriteSource = table_writes.TableWriteSource;
 pub const BoundTableWriteSource = table_writes.BoundTableWriteSource;
 pub const ProvisionedTableWriteCache = table_writes.ProvisionedTableWriteCache;
@@ -154,6 +158,8 @@ test "api module compiles" {
     _ = provisioned_storage;
     _ = table_reads;
     _ = table_writes;
+    _ = distributed_candidate_source;
+    _ = distributed_entity_sink;
     _ = distributed_join;
     _ = distributed_graph;
     _ = http_internal_group_read_routes;
@@ -188,6 +194,10 @@ test "distributed graph result_ref fail-closed guards are covered" {
 
 test "api distributed graph hydrate carries identity generation and clears cross-range ordinals" {
     try distributed_graph.testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(std.testing.allocator);
+}
+
+test "api distributed graph cross-table hydrate clears query scoped filter" {
+    try distributed_graph.testCrossTableHydrateClearsQueryScopedFilterAndOrdinals(std.testing.allocator);
 }
 
 test "public graph result_ref fail-closed guards are covered" {

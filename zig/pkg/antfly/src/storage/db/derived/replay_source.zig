@@ -84,7 +84,7 @@ pub const Source = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    const VTable = struct {
+    pub const VTable = struct {
         open_matching_cursor: *const fn (
             ptr: *anyopaque,
             alloc: Allocator,

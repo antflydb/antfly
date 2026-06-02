@@ -364,7 +364,12 @@ const ReplayChunkBuilder = struct {
             .graph => {
                 for (record.deleted_doc_keys) |key| try self.appendUniqueKey(&self.deleted_doc_keys, &self.seen_deleted_docs, key);
                 for (record.changed_artifact_keys) |key| {
-                    if (!internal_keys.isGraphEdgeArtifactKey(key) and !internal_keys.isAssetArtifactKey(key)) continue;
+                    if (!internal_keys.isGraphEdgeArtifactKey(key) and
+                        !internal_keys.isAssetArtifactKey(key) and
+                        !internal_keys.isResolutionArtifactKey(key))
+                    {
+                        continue;
+                    }
                     try self.appendUniqueKey(&self.changed_artifact_keys, &self.seen_changed_artifacts, key);
                 }
             },
@@ -512,7 +517,12 @@ fn countEmbeddingArtifactKeys(keys: []const []const u8) usize {
 fn countGraphArtifactKeys(keys: []const []const u8) usize {
     var count: usize = 0;
     for (keys) |key| {
-        if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key)) count += 1;
+        if (internal_keys.isGraphEdgeArtifactKey(key) or
+            internal_keys.isAssetArtifactKey(key) or
+            internal_keys.isResolutionArtifactKey(key))
+        {
+            count += 1;
+        }
     }
     return count;
 }
@@ -1417,5 +1427,47 @@ test "catchUpIndex batches graph artifact journal records before applying" {
     try std.testing.expectEqual(@as(usize, 1), capture.call_count);
     try std.testing.expectEqual(@as(usize, 1), capture.applied_changed_artifact_keys);
     try std.testing.expectEqual(@as(usize, 0), capture.applied_graph_writes);
+    try std.testing.expectEqualStrings(artifact_key, capture.last_batch.?.changed_artifact_keys[0]);
+}
+
+test "catchUpIndex batches resolution artifact graph journal records before applying" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-resolution-graph-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+
+    const artifact_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(artifact_key);
+    try appendChangeJournalRecord(&journal, alloc, .{
+        .sequence = 7,
+        .changed_artifact_keys = &.{artifact_key},
+        .target_hints = &.{.graph},
+    });
+
+    var capture = TestApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+
+    const stats = try catchUpIndex(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        .{ .name = "graph_v1", .kind = .graph },
+        0,
+        null,
+        &capture,
+        testApplyCapture,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 1), stats.applied_entries);
+    try std.testing.expectEqual(@as(usize, 1), capture.applied_changed_artifact_keys);
     try std.testing.expectEqualStrings(artifact_key, capture.last_batch.?.changed_artifact_keys[0]);
 }

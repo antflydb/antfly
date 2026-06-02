@@ -1821,10 +1821,99 @@ fn hydrateHitsForResultNodes(
     nodes: []const graph_query_mod.GraphResultNode,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.SearchHit {
-    var keys = try alloc.alloc([]const u8, nodes.len);
-    defer alloc.free(keys);
-    for (nodes, 0..) |node, i| keys[i] = node.key;
-    return try hydrateHitsForKeys(alloc, catalog, worker, table_name, topology_epoch, identity_read_generation, resolved_doc_filter, resolved_doc_filter_wire_context, keys, consistency);
+    // Most nodes are hydrated from the query table. Mention/DocRef edges carry a
+    // cross-table endpoint (`node.table`, e.g. the canonical "entities" table)
+    // that must be routed and hydrated against *that* table's shard topology,
+    // not the query table's. Partition by effective table; the single-table
+    // common case keeps the original fast path untouched.
+    var needs_cross_table = false;
+    for (nodes) |node| {
+        if (node.table) |t| {
+            if (!std.mem.eql(u8, t, table_name)) {
+                needs_cross_table = true;
+                break;
+            }
+        }
+    }
+
+    if (!needs_cross_table) {
+        var keys = try alloc.alloc([]const u8, nodes.len);
+        defer alloc.free(keys);
+        for (nodes, 0..) |node, i| keys[i] = node.key;
+        return try hydrateHitsForKeys(alloc, catalog, worker, table_name, topology_epoch, identity_read_generation, resolved_doc_filter, resolved_doc_filter_wire_context, keys, consistency);
+    }
+
+    // Bucket node keys by their effective hydration table.
+    var tables = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)).empty;
+    defer {
+        for (tables.values()) |*list| list.deinit(alloc);
+        tables.deinit(alloc);
+    }
+    for (nodes) |node| {
+        const eff_table = node.table orelse table_name;
+        const gop = try tables.getOrPut(alloc, eff_table);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(alloc, node.key);
+    }
+
+    const HydratedBucket = struct {
+        table: []const u8,
+        hits: []db_mod.types.SearchHit,
+
+        fn deinit(self: *@This(), a: std.mem.Allocator) void {
+            for (self.hits) |*hit| hit.deinit(a);
+            if (self.hits.len > 0) a.free(self.hits);
+        }
+    };
+    var hydrated = std.ArrayListUnmanaged(HydratedBucket).empty;
+    defer {
+        for (hydrated.items) |*bucket| bucket.deinit(alloc);
+        hydrated.deinit(alloc);
+    }
+    var it = tables.iterator();
+    while (it.next()) |entry| {
+        const eff_table = entry.key_ptr.*;
+        const same_table = std.mem.eql(u8, eff_table, table_name);
+        // A cross-table endpoint whose table no longer exists fails closed (no
+        // hit), matching the same-table path's behavior for a missing key,
+        // rather than erroring the whole graph query.
+        if (!same_table and !try table_catalog.tableExists(catalog, eff_table)) continue;
+        const eff_epoch = if (same_table) topology_epoch else try table_catalog.topologyEpoch(alloc, catalog, eff_table);
+        const eff_identity_generation = if (same_table) identity_read_generation else null;
+        const eff_resolved_filter = if (same_table) resolved_doc_filter else null;
+        const eff_resolved_filter_context = if (same_table) resolved_doc_filter_wire_context else null;
+        const hits = try hydrateHitsForKeys(alloc, catalog, worker, eff_table, eff_epoch, eff_identity_generation, eff_resolved_filter, eff_resolved_filter_context, entry.value_ptr.items, consistency);
+        errdefer {
+            for (hits) |*hit| hit.deinit(alloc);
+            if (hits.len > 0) alloc.free(hits);
+        }
+        if (!same_table) {
+            // Ordinals are scoped to the hydrated table's identity namespace.
+            // SearchHit has no table/namespace carrier today, so do not export a
+            // cross-table ordinal as if it belonged to the query table.
+            for (hits) |*hit| hit.doc_ordinal = null;
+        }
+        try hydrated.append(alloc, .{ .table = eff_table, .hits = hits });
+    }
+
+    var out = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+    errdefer {
+        for (out.items) |*hit| hit.deinit(alloc);
+        out.deinit(alloc);
+    }
+    for (nodes) |node| {
+        const eff_table = node.table orelse table_name;
+        for (hydrated.items) |bucket| {
+            if (!std.mem.eql(u8, bucket.table, eff_table)) continue;
+            for (bucket.hits) |hit| {
+                if (!std.mem.eql(u8, hit.id, node.key)) continue;
+                try out.append(alloc, try hit.clone(alloc));
+                break;
+            }
+            break;
+        }
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 fn hydrateHitsForKeys(
@@ -3412,6 +3501,7 @@ fn materializeResultNode(
             .distance = parent.distance + node.distance,
             .path = null,
             .path_edges = null,
+            .table = if (node.table) |t| try alloc.dupe(u8, t) else null,
         };
     }
 
@@ -3431,6 +3521,7 @@ fn materializeResultNode(
             alloc.free(path_edges);
             break :blk null;
         },
+        .table = if (node.table) |t| try alloc.dupe(u8, t) else null,
     };
 }
 
@@ -3772,6 +3863,159 @@ pub fn testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(alloc: std.mem.
     for (results[0].hits) |hit| try std.testing.expect(hit.doc_ordinal == null);
 }
 
+pub fn testCrossTableHydrateClearsQueryScopedFilterAndOrdinals(alloc: std.mem.Allocator) !void {
+    const TestState = struct {
+        filter_ptr: *const anyopaque,
+        same_table_calls: u32 = 0,
+        cross_table_calls: u32 = 0,
+    };
+
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{
+            .{ .table_id = 7, .name = "docs", .placement_role = "data" },
+            .{ .table_id = 8, .name = "entities", .placement_role = "data" },
+        };
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11, .table_id = 7, .start_key = "", .end_key = null },
+            .{ .group_id = 22, .table_id = 8, .start_key = "", .end_key = null },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeWorker = struct {
+        fn iface(state: *TestState) Worker {
+            return .{
+                .ptr = state,
+                .vtable = &.{
+                    .execute_graph_expand = executeGraphExpand,
+                    .execute_graph_hydrate = executeGraphHydrate,
+                },
+            };
+        }
+
+        fn executeGraphExpand(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: GraphExpandRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphExpandResponse {
+            return error.UnsupportedQueryRequest;
+        }
+
+        fn executeGraphHydrate(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: GraphHydrateRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphHydrateResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), req.keys.len);
+            if (std.mem.eql(u8, table_name, "docs")) {
+                state.same_table_calls += 1;
+                try std.testing.expectEqual(@as(u64, 11), group_id);
+                try std.testing.expectEqualStrings("doc:a", req.keys[0]);
+                try std.testing.expectEqual(@as(?u64, 44), req.identity_read_generation);
+                try std.testing.expect(req.resolved_doc_filter == state.filter_ptr);
+                try std.testing.expect(req.resolved_doc_filter_wire_context != null);
+            } else if (std.mem.eql(u8, table_name, "entities")) {
+                state.cross_table_calls += 1;
+                try std.testing.expectEqual(@as(u64, 22), group_id);
+                try std.testing.expectEqualStrings("person/ada", req.keys[0]);
+                try std.testing.expect(req.identity_read_generation == null);
+                try std.testing.expect(req.resolved_doc_filter == null);
+                try std.testing.expect(req.resolved_doc_filter_wire_context == null);
+            } else {
+                return error.UnexpectedTable;
+            }
+
+            const hits = try alloc_inner.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc_inner.dupe(u8, req.keys[0]),
+                .doc_ordinal = if (std.mem.eql(u8, table_name, "docs")) 7 else 99,
+                .stored_data = try alloc_inner.dupe(u8, "{}"),
+            };
+            return .{ .hits = hits };
+        }
+    };
+
+    var filter_sentinel: u8 = 0;
+    const filter_ptr: *const anyopaque = &filter_sentinel;
+    var state = TestState{ .filter_ptr = filter_ptr };
+    const context = db_mod.types.ResolvedDocFilterWireContext{
+        .namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 11 },
+        .identity_read_generation = 44,
+    };
+    const nodes = [_]graph_query_mod.GraphResultNode{
+        .{
+            .key = "doc:a",
+            .depth = 0,
+            .distance = 0,
+            .path = null,
+            .path_edges = null,
+        },
+        .{
+            .key = "person/ada",
+            .depth = 1,
+            .distance = 1,
+            .path = null,
+            .path_edges = null,
+            .table = "entities",
+        },
+    };
+
+    const hits = try hydrateHitsForResultNodes(
+        alloc,
+        FakeCatalog.iface(),
+        FakeWorker.iface(&state),
+        "docs",
+        0,
+        44,
+        filter_ptr,
+        context,
+        nodes[0..],
+        .read_index,
+    );
+    defer {
+        for (hits) |*hit| hit.deinit(alloc);
+        alloc.free(hits);
+    }
+
+    try std.testing.expectEqual(@as(u32, 1), state.same_table_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.cross_table_calls);
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    try std.testing.expectEqualStrings("doc:a", hits[0].id);
+    try std.testing.expectEqual(@as(?u32, 7), hits[0].doc_ordinal);
+    try std.testing.expectEqualStrings("person/ada", hits[1].id);
+    try std.testing.expect(hits[1].doc_ordinal == null);
+}
+
 fn freeFrontier(alloc: std.mem.Allocator, items: []FrontierState) void {
     for (items) |*item| item.deinit(alloc);
     if (items.len > 0) alloc.free(items);
@@ -4030,6 +4274,7 @@ fn cloneGraphNode(
         .path = if (node.path) |path| try dupPath(alloc, path) else null,
         .path_edges = if (node.path_edges) |edges| try dupPathEdges(alloc, edges) else null,
         .provenance = if (node.provenance) |items| try dupPath(alloc, items) else null,
+        .table = if (node.table) |t| try alloc.dupe(u8, t) else null,
     };
 }
 

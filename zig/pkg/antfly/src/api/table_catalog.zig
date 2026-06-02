@@ -139,6 +139,18 @@ pub fn resolveGroupForKey(
     return null;
 }
 
+/// Whether a table with this name currently exists in the catalog. Used by
+/// cross-table graph hydration to fail closed (skip) rather than error when a
+/// node references a dropped table.
+pub fn tableExists(
+    catalog: CatalogSource,
+    table_name: []const u8,
+) !bool {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    return tables_api.findTableByName(&snapshot, table_name) != null;
+}
+
 pub fn topologyEpoch(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,

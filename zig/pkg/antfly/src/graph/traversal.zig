@@ -47,7 +47,22 @@ pub const TraversalResult = struct {
     depth: u32,
     total_weight: f64,
     path: ?[]const []const u8, // if include_paths
+    /// Table of the reached node, when the edge that reached it declared a
+    /// cross-table endpoint (`target_table` in its metadata). Owned.
+    target_table: ?[]const u8 = null,
 };
+
+/// Extract `target_table` from an edge's metadata JSON
+/// (`{"target_table":"entities",...}`) without a full parse. Returns a slice
+/// into `metadata`; caller copies it if it must outlive the edge.
+pub fn metadataTargetTable(metadata: []const u8) ?[]const u8 {
+    const marker = "\"target_table\":\"";
+    const start = std.mem.indexOf(u8, metadata, marker) orelse return null;
+    const value_start = start + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, metadata, value_start, '"') orelse return null;
+    if (end == value_start) return null;
+    return metadata[value_start..end];
+}
 
 // ============================================================================
 // BFS traversal
@@ -58,6 +73,7 @@ const QueueEntry = struct {
     depth: u32,
     total_weight: f64,
     path: ?std.ArrayListUnmanaged([]const u8),
+    target_table: ?[]const u8 = null,
 };
 
 /// Perform BFS graph traversal from start_key using the given rules.
@@ -105,6 +121,7 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
         const current = queue.items[queue_head];
         queue_head += 1;
         defer alloc.free(current.key);
+        defer if (current.target_table) |tt| alloc.free(tt);
 
         // Add to results (skip depth 0 = start node)
         if (current.depth > 0) {
@@ -121,6 +138,7 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
                 .depth = current.depth,
                 .total_weight = current.total_weight,
                 .path = path_slice,
+                .target_table = if (current.target_table) |tt| try alloc.dupe(u8, tt) else null,
             });
 
             if (rules.max_results > 0 and results.items.len >= rules.max_results) {
@@ -133,6 +151,7 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
                 // Free remaining queue entries (skip already-dequeued entries)
                 for (queue.items[queue_head..]) |qe| {
                     alloc.free(qe.key);
+                    if (qe.target_table) |tt| alloc.free(tt);
                     if (qe.path) |p| {
                         for (p.items) |s| alloc.free(s);
                         var mp = p;
@@ -181,11 +200,20 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
                 try next_path.?.append(alloc, try alloc.dupe(u8, next_key));
             }
 
+            // The reached node's table comes from the edge that points at it
+            // (only meaningful when traversing toward the edge's target).
+            const next_target_table: ?[]const u8 = if (std.mem.eql(u8, next_key, edge.target)) blk: {
+                const tt = metadataTargetTable(edge.metadata) orelse break :blk null;
+                break :blk try alloc.dupe(u8, tt);
+            } else null;
+            errdefer if (next_target_table) |tt| alloc.free(tt);
+
             try queue.append(alloc, .{
                 .key = try alloc.dupe(u8, next_key),
                 .depth = current.depth + 1,
                 .total_weight = current.total_weight * edge.weight,
                 .path = next_path,
+                .target_table = next_target_table,
             });
         }
 
@@ -225,6 +253,7 @@ pub fn freeResults(alloc: Allocator, results: []const TraversalResult) void {
             for (p) |s| alloc.free(s);
             alloc.free(p);
         }
+        if (r.target_table) |tt| alloc.free(tt);
     }
 }
 

@@ -14,4 +14,5 @@
 
 test {
     _ = @import("storage/db/db.zig");
+    _ = @import("storage/db/resolution_runtime.zig");
 }

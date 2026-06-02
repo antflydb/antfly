@@ -62,6 +62,8 @@ const replay_hints = [_]change_journal_mod.TargetHint{
     .sparse_vector,
     .graph,
     .algebraic,
+    .resolution,
+    .promotion,
 };
 
 fn replayHintOrdinal(hint: change_journal_mod.TargetHint) u8 {
@@ -98,7 +100,11 @@ fn appendReplayArtifactsForHint(
     for (artifact_keys) |key| {
         const keep = switch (hint) {
             .dense_vector, .sparse_vector => isEmbeddingReplayArtifactKey(key),
-            .graph => internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key),
+            .graph => internal_keys.isGraphEdgeArtifactKey(key) or
+                internal_keys.isAssetArtifactKey(key) or
+                internal_keys.isResolutionArtifactKey(key),
+            .resolution => internal_keys.isAssetArtifactKey(key),
+            .promotion => internal_keys.isResolutionArtifactKey(key),
             .enrichment, .full_text, .algebraic => false,
         };
         if (keep) try out.append(alloc, key);
@@ -141,6 +147,14 @@ fn encodeReplayPayloadForHint(
             filtered.changed_artifact_keys = artifact_keys.items;
         },
         .graph => {
+            filtered.deleted_doc_keys = record.deleted_doc_keys;
+            filtered.changed_artifact_keys = artifact_keys.items;
+        },
+        .resolution => {
+            filtered.deleted_doc_keys = record.deleted_doc_keys;
+            filtered.changed_artifact_keys = artifact_keys.items;
+        },
+        .promotion => {
             filtered.deleted_doc_keys = record.deleted_doc_keys;
             filtered.changed_artifact_keys = artifact_keys.items;
         },

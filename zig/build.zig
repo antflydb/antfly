@@ -462,6 +462,8 @@ const AntflyRootImports = struct {
     bloom: *std.Build.Module,
     vector: *std.Build.Module,
     vectorindex: *std.Build.Module,
+    matcher: *std.Build.Module,
+    resolver: *std.Build.Module,
     casbin: *std.Build.Module,
     vellum: *std.Build.Module,
     regex: *std.Build.Module,
@@ -523,6 +525,8 @@ const AntflyRootImports = struct {
         .{ .name = "bloom", .field = "bloom" },
         .{ .name = "antfly_vector", .field = "vector" },
         .{ .name = "antfly_vectorindex", .field = "vectorindex" },
+        .{ .name = "antfly_matcher", .field = "matcher" },
+        .{ .name = "antfly_resolver", .field = "resolver" },
         .{ .name = "antfly_casbin", .field = "casbin" },
         .{ .name = "antfly_vellum", .field = "vellum" },
         .{ .name = "antfly_regex", .field = "regex" },
@@ -1388,6 +1392,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const matcher_mod = b.addModule("antfly_matcher", .{
+        .root_source_file = b.path("lib/matcher/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const resolver_mod = b.addModule("antfly_resolver", .{
+        .root_source_file = b.path("lib/resolver/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    resolver_mod.addImport("antfly_matcher", matcher_mod);
     httpx_mod.addImport("antfly-json", json_mod);
     jsonschema_mod.addImport("antfly_regex", regex_mod);
     jsonschema_mod.addImport("antfly-json", json_mod);
@@ -1634,6 +1649,8 @@ pub fn build(b: *std.Build) void {
         .bloom = bloom_mod,
         .vector = vector_mod,
         .vectorindex = vectorindex_mod,
+        .matcher = matcher_mod,
+        .resolver = resolver_mod,
         .casbin = casbin_mod,
         .vellum = vellum_mod,
         .regex = regex_mod,
@@ -2101,6 +2118,20 @@ pub fn build(b: *std.Build) void {
     const run_lib_a2a_tests = b.addRunArtifact(lib_a2a_tests);
     const lib_a2a_test_step = b.step("lib-a2a-test", "Run standalone lib/a2a tests");
     lib_a2a_test_step.dependOn(&run_lib_a2a_tests.step);
+
+    const lib_matcher_tests = b.addTest(.{
+        .root_module = matcher_mod,
+    });
+    const run_lib_matcher_tests = b.addRunArtifact(lib_matcher_tests);
+    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone lib/matcher tests");
+    lib_matcher_test_step.dependOn(&run_lib_matcher_tests.step);
+
+    const lib_resolver_tests = b.addTest(.{
+        .root_module = resolver_mod,
+    });
+    const run_lib_resolver_tests = b.addRunArtifact(lib_resolver_tests);
+    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone lib/resolver tests");
+    lib_resolver_test_step.dependOn(&run_lib_resolver_tests.step);
 
     const lib_toon_conformance = b.addExecutable(.{
         .name = "lib-toon-conformance",
@@ -3229,6 +3260,18 @@ pub fn build(b: *std.Build) void {
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
 
+    const lib_resolution_source_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "DistributedCandidateSource",
+            "prefixUpperBoundAlloc",
+            "DistributedEntitySink",
+        },
+    });
+    const run_lib_resolution_source_tests = b.addRunArtifact(lib_resolution_source_tests);
+    const lib_resolution_source_test_step = b.step("lib-resolution-source-test", "Run focused cross-shard resolution candidate-source and entity-sink tests");
+    lib_resolution_source_test_step.dependOn(&run_lib_resolution_source_tests.step);
+
     const lib_api_auth_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -4157,6 +4200,8 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_vellum", vellum_mod);
     index_manager_test_mod.addImport("antfly_vector", vector_mod);
     index_manager_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    index_manager_test_mod.addImport("antfly_matcher", matcher_mod);
+    index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     const index_manager_unit_tests = b.addTest(.{
@@ -4216,6 +4261,8 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("antfly_vellum", vellum_mod);
     db_test_mod.addImport("antfly_vector", vector_mod);
     db_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    db_test_mod.addImport("antfly_matcher", matcher_mod);
+    db_test_mod.addImport("antfly_resolver", resolver_mod);
     db_test_mod.addImport("antfly_chunking", chunking_mod);
     db_test_mod.addImport("antfly_regex", regex_mod);
     db_test_mod.addImport("raft_engine", raft_engine_mod);

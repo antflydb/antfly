@@ -841,6 +841,10 @@ fn encodeTableIndexesObject(alloc: std.mem.Allocator, indexes_json: []const u8) 
     var first = true;
     var it = root.iterator();
     while (it.next()) |entry| {
+        // `resolvers` is a reserved entity-resolution section, not an index
+        // config; the provisioner reads it from the stored indexes_json. Skip it
+        // here so the typed IndexConfig validation/projection ignores it.
+        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
