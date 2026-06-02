@@ -1021,7 +1021,7 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"lsm_flushes\":{d},\"lsm_flush_input_entries\":{d},\"lsm_flush_output_runs\":{d},\"lsm_flush_output_bytes\":{d},\"lsm_flush_ns\":{d},\"lsm_table_file_writes\":{d},\"lsm_table_file_bytes\":{d},\"lsm_table_file_logical_entry_bytes\":{d},\"lsm_table_file_physical_entry_bytes\":{d},\"lsm_table_file_raw_blocks\":{d},\"lsm_table_file_compressed_blocks\":{d},\"lsm_table_file_compression_codec_mask\":{d},\"lsm_sorted_ingest_runs\":{d},\"lsm_sorted_ingest_bytes\":{d},\"lsm_sorted_ingest_ns\":{d},\"lsm_manifest_writes\":{d},\"lsm_manifest_bytes\":{d},\"lsm_manifest_ns\":{d},\"lsm_wal_append_records\":{d},\"lsm_wal_append_entries\":{d},\"lsm_wal_append_bytes\":{d},\"lsm_wal_append_ns\":{d},\"lsm_wal_sync_records\":{d},\"lsm_wal_sync_ns\":{d},\"lsm_wal_resets\":{d},\"lsm_wal_reset_ns\":{d}",
+        ",\"lsm_flushes\":{d},\"lsm_flush_input_entries\":{d},\"lsm_flush_output_runs\":{d},\"lsm_flush_output_bytes\":{d},\"lsm_flush_ns\":{d},\"lsm_table_file_writes\":{d},\"lsm_table_file_bytes\":{d},\"lsm_table_file_logical_entry_bytes\":{d},\"lsm_table_file_physical_entry_bytes\":{d},\"lsm_table_file_raw_blocks\":{d},\"lsm_table_file_compressed_blocks\":{d},\"lsm_table_file_compression_codec_mask\":{d},\"lsm_sorted_ingest_runs\":{d},\"lsm_sorted_ingest_bytes\":{d},\"lsm_sorted_ingest_ns\":{d},\"lsm_manifest_writes\":{d},\"lsm_manifest_bytes\":{d},\"lsm_manifest_ns\":{d},\"lsm_write_pressure_compactions\":{d},\"lsm_write_pressure_ns\":{d},\"lsm_wal_pressure_flushes\":{d},\"lsm_wal_pressure_ns\":{d},\"lsm_wal_append_records\":{d},\"lsm_wal_append_entries\":{d},\"lsm_wal_append_bytes\":{d},\"lsm_wal_append_ns\":{d},\"lsm_wal_sync_records\":{d},\"lsm_wal_sync_ns\":{d},\"lsm_wal_resets\":{d},\"lsm_wal_reset_ns\":{d}",
         .{
             write_delta.flushes,
             write_delta.flush_input_entries,
@@ -1041,6 +1041,10 @@ fn printResult(
             write_delta.manifest_writes,
             write_delta.manifest_bytes,
             write_delta.manifest_ns,
+            write_delta.write_pressure_compactions,
+            write_delta.write_pressure_ns,
+            write_delta.wal_pressure_flushes,
+            write_delta.wal_pressure_ns,
             write_delta.wal_append_records,
             write_delta.wal_append_entries,
             write_delta.wal_append_bytes,
@@ -1186,6 +1190,10 @@ fn diffWriteStats(after: WriteStats, before: WriteStats) WriteStats {
         .manifest_writes = after.manifest_writes - before.manifest_writes,
         .manifest_bytes = after.manifest_bytes - before.manifest_bytes,
         .manifest_ns = after.manifest_ns - before.manifest_ns,
+        .write_pressure_compactions = after.write_pressure_compactions - before.write_pressure_compactions,
+        .write_pressure_ns = after.write_pressure_ns - before.write_pressure_ns,
+        .wal_pressure_flushes = after.wal_pressure_flushes - before.wal_pressure_flushes,
+        .wal_pressure_ns = after.wal_pressure_ns - before.wal_pressure_ns,
         .wal_append_records = after.wal_append_records - before.wal_append_records,
         .wal_append_entries = after.wal_append_entries - before.wal_append_entries,
         .wal_append_bytes = after.wal_append_bytes - before.wal_append_bytes,
