@@ -560,6 +560,12 @@ class MultiNodeScalingCluster:
             raise last_error
         raise AssertionError("cluster has no metadata URLs")
 
+    def metadata_snapshot_diagnostic(self) -> str:
+        try:
+            return json.dumps(self.metadata_snapshot(), indent=2, sort_keys=True)
+        except Exception as exc:
+            return f"<metadata snapshot unavailable: {exc!r}>"
+
     def post_metadata(self, path: str, *, json_body: dict[str, Any] | None = None) -> requests.Response:
         last_error: Exception | None = None
         for url in self.metadata_urls:
@@ -1310,9 +1316,19 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
     }
     _insert_docs(cluster, table_name, docs, min_group_count=1)
 
+    last_reallocate_at = 0.0
+
+    def maybe_trigger_reallocate() -> None:
+        nonlocal last_reallocate_at
+        now = time.monotonic()
+        if now - last_reallocate_at < 5.0:
+            return
+        cluster.trigger_reallocate()
+        last_reallocate_at = now
+
     def split_completed() -> set[int] | None:
         try:
-            cluster.trigger_reallocate()
+            maybe_trigger_reallocate()
             group_ids = _table_group_ids(cluster, table_name)
         except (AssertionError, requests.RequestException):
             return None
@@ -1324,7 +1340,7 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
     assert split_groups is not None, (
         "table did not finalize an automatic split after exceeding the configured shard size threshold\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
-        f"snapshot: {cluster.metadata_snapshot()}\n"
+        f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
         f"{cluster.debug_logs()}"
     )
     _assert_docs_readable(cluster, table_name, docs, timeout_s=60.0)
