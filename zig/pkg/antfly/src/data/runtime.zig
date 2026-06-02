@@ -99,6 +99,19 @@ const ResolvedMetadataApiUrls = struct {
     }
 };
 
+fn publicApiListenerConfig(bind_host: []const u8, bind_port: u16) antfly.raft.transport.StdHttpListenerConfig {
+    return .{
+        .bind_host = bind_host,
+        .bind_port = bind_port,
+        .max_request_bytes = antfly.public_api.http_server.public_api_max_request_body_bytes,
+    };
+}
+
+test "data public API listener uses public API request body limit" {
+    const cfg = publicApiListenerConfig("127.0.0.1", 8080);
+    try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
+}
+
 const DataDescriptorFactory = struct {
     alloc: std.mem.Allocator,
     fallback_store: *raft_engine.core.MemoryStorage,
@@ -1636,10 +1649,7 @@ pub const DataServer = struct {
             .api_server_cfg = cfg.api_server_cfg,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
-            .listener_cfg = .{
-                .bind_host = cfg.bind_host,
-                .bind_port = cfg.bind_port,
-            },
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
     }
 
@@ -1669,10 +1679,7 @@ pub const DataServer = struct {
             .api_server_cfg = cfg.api_server_cfg,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
-            .listener_cfg = .{
-                .bind_host = cfg.bind_host,
-                .bind_port = cfg.bind_port,
-            },
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
     }
 
@@ -1702,10 +1709,7 @@ pub const DataServer = struct {
             .api_server_cfg = cfg.api_server_cfg,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
-            .listener_cfg = .{
-                .bind_host = cfg.bind_host,
-                .bind_port = cfg.bind_port,
-            },
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
     }
 
@@ -5389,10 +5393,7 @@ pub const DataServer = struct {
             .api_server_cfg = cfg.api_server_cfg,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
-            .listener_cfg = .{
-                .bind_host = cfg.bind_host,
-                .bind_port = cfg.bind_port,
-            },
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
     }
 };
