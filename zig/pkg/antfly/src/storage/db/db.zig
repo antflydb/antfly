@@ -14324,6 +14324,7 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
         }
         saw_entries = saw_entries or stats.scanned_entries > 0;
         if (stats.last_sequence > applied) {
+            try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
             try updates.append(ctx.alloc, .{
                 .index_name = index_ref.name,
                 .sequence = stats.last_sequence,
@@ -14703,6 +14704,7 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
         saw_entries = saw_entries or stats.scanned_entries > 0;
         if (stats.last_sequence > applied) {
             try self.core.saveAppliedSequence(index_ref.name, stats.last_sequence);
+            try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
         }
     }
     try truncateReplayJournalIfSafe(self);
@@ -16664,6 +16666,7 @@ fn finishDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.
     errdefer resources.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     try resources.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
+    try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
     if (resources.index_manager.resource_manager) |manager| {
         manager.noteDenseReplayWindowResult(.{ .finish_ns = elapsedSince(finish_start_ns) });
     }
@@ -16685,6 +16688,7 @@ fn finishDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manag
     errdefer replay_ctx.batch.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     try replay_ctx.batch.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
+    try replay_ctx.batch.index_manager.checkpointLsmWalForManagedIndex(index_ref);
     if (replay_ctx.batch.index_manager.resource_manager) |manager| {
         manager.noteDenseReplayWindowResult(.{ .finish_ns = elapsedSince(finish_start_ns) });
     }
@@ -17603,6 +17607,7 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     if (!published_visibility) {
         if (ctx.query_visibility_hook) |hook| hook.notify(.publish_consistent);
     }
+    try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
     finishDenseCatchUpSessionTracked(ctx, index_ref.name);
     const after_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
     const finish_ns = elapsedSince(finish_start_ns);

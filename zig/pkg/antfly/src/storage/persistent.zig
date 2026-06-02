@@ -590,6 +590,13 @@ const MainStoreOwner = union(enum) {
         };
     }
 
+    fn checkpointLsmWalAfterDurableBoundary(self: *MainStoreOwner) !void {
+        switch (self.*) {
+            .lmdb, .mem => {},
+            .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
+        }
+    }
+
     fn snapshotLsmNativeStorageStats(self: *const MainStoreOwner) ?lsm_backend.NativeStorageStats {
         return switch (self.*) {
             .lmdb, .mem => null,
@@ -1090,6 +1097,10 @@ pub const PersistentIndex = struct {
 
     pub fn snapshotLsmOpenStats(self: *const PersistentIndex) ?lsm_backend.Backend.OpenStats {
         return self.main_store_owner.snapshotLsmOpenStats();
+    }
+
+    pub fn checkpointLsmWalAfterDurableBoundary(self: *PersistentIndex) !void {
+        try self.main_store_owner.checkpointLsmWalAfterDurableBoundary();
     }
 
     pub fn snapshotLsmNativeStorageStats(self: *const PersistentIndex) ?lsm_backend.NativeStorageStats {

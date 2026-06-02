@@ -1729,6 +1729,20 @@ pub const IndexManager = struct {
         return stats;
     }
 
+    pub fn checkpointLsmWalForManagedIndex(self: *IndexManager, index_ref: ManagedIndexRef) !void {
+        switch (index_ref.kind) {
+            .full_text => {
+                const entry = self.textIndex(index_ref.name) orelse return error.IndexNotFound;
+                try entry.checkpointLsmWalAfterDurableBoundary();
+            },
+            .dense_vector => {
+                const entry = self.denseIndex(index_ref.name) orelse return error.IndexNotFound;
+                try entry.index.checkpointLsmWalAfterDurableBoundary();
+            },
+            else => {},
+        }
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const IndexManager) lsm_backend_mod.NativeStorageStats {
         var stats = lsm_backend_mod.NativeStorageStats{};
         for (self.text_indexes.items) |*entry| {

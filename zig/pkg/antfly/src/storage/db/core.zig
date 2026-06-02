@@ -178,6 +178,13 @@ pub const PrimaryStoreOwner = union(enum) {
         };
     }
 
+    pub fn checkpointLsmWalAfterDurableBoundary(self: *PrimaryStoreOwner) !void {
+        switch (self.*) {
+            .none, .mem => {},
+            .lsm => |owner| try owner.handle.backend.checkpointWalAfterDurableBoundary(),
+        }
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const PrimaryStoreOwner) ?lsm_backend_mod.NativeStorageStats {
         return switch (self.*) {
             .none, .mem => null,

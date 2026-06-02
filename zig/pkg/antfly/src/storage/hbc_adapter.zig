@@ -1483,6 +1483,13 @@ pub const HBCIndex = struct {
         };
     }
 
+    pub fn checkpointLsmWalAfterDurableBoundary(self: *HBCIndex) !void {
+        switch (self.env_owner) {
+            .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
+            .lmdb => {},
+        }
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const HBCIndex) ?lsm_backend.NativeStorageStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),

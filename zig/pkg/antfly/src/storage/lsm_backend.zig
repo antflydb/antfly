@@ -2163,6 +2163,24 @@ pub const Backend = struct {
         self.write_stats.wal_reset_ns += self.writeStatsElapsedNs(start_ns);
     }
 
+    pub fn checkpointWalAfterDurableBoundary(self: *Backend) !void {
+        if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+
+        const saved_budget = self.maintenance_io_budget_remaining;
+        self.maintenance_io_budget_remaining = null;
+        defer self.maintenance_io_budget_remaining = saved_budget;
+
+        if (self.mutable.entries.items.len > 0) {
+            try self.rotateMutableToImmutable();
+        }
+        while (self.activeImmutableMemtableCount() > 0) {
+            if (!try self.flushOldestImmutableMemtable()) break;
+        }
+        try self.maybeCheckpointWalAfterManifestPublish();
+    }
+
     pub fn writeStatsNowNs(_: *Backend) u64 {
         return platform_time.monotonicNs();
     }
@@ -4097,6 +4115,39 @@ test "lsm backend maintenance stats report retained wal debt across reopen and r
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
+}
+
+test "lsm backend durable boundary checkpoint flushes mutable state and retires wal" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-durable-boundary-checkpoint-flushes-mutable";
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold = 1024,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+        try txn.commit();
+    }
+
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
+    try std.testing.expect(maintenance.wal_retained_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+
+    try backend.checkpointWalAfterDurableBoundary();
+
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 }
 
 test "lsm backend accounts in-memory recovery state in the resource manager and releases it on close" {

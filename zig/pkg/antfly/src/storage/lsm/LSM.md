@@ -1006,6 +1006,11 @@ startup replay tax if it retains large WAL segments between runs.
    - After successful startup repair/rebuild
    - After large catch-up sessions
    - After sustained write bursts that rotated segments
+   - [x] First slice: LSM-backed primary, full-text, and dense/HBC index
+     owners expose a durable-boundary WAL checkpoint hook that drains mutable
+     and immutable state before retiring covered WAL. Derived replay catch-up
+     paths now call it after successful dense bulk-window finalization and
+     after applied sequence publication for indexes that advanced.
 
 3. Re-benchmark loaded-root restart behavior.
    - Measure time to:
