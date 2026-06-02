@@ -857,11 +857,13 @@ pub fn estimateTableIndexCost(path: []const u8, index: *const TableIndex) usize 
         @sizeOf(TableIndex) +
         index.entry_offsets.len * @sizeOf(u32) +
         index.filter.bytes.len;
+    if (index.prefix_filter) |filter| total += filter.bytes.len;
     total += index.blocks.len * @sizeOf(TableIndex.BlockMeta);
     for (index.blocks) |block| {
         if (block.largest_namespace_name) |name| total += name.len;
         total += block.largest_key.len;
         if (block.filter) |filter| total += filter.bytes.len;
+        if (block.prefix_filter) |filter| total += filter.bytes.len;
         total += block.hash_slots.len * @sizeOf(u32);
     }
     return total;
@@ -1005,6 +1007,43 @@ test "cache pending load waiter survives finish removal" {
     if (waiter.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), cache.pendingLoadCountForTests());
     try std.testing.expect(cache.snapshotStats().run_table_index.waits > 0);
+}
+
+test "cache accounts table index prefix bloom filters" {
+    const allocator = std.testing.allocator;
+    const path = "run-prefix-index";
+    const entries = [_]lsm_table_file.Entry{
+        .{ .namespace_name = "docs", .key = "tenant-a:001", .value = "a" },
+        .{ .namespace_name = "docs", .key = "tenant-a:002", .value = "b" },
+        .{ .namespace_name = "docs", .key = "tenant-c:001", .value = "c" },
+    };
+
+    const encoded = try lsm_table_file.encodeAlloc(allocator, &entries);
+    defer allocator.free(encoded);
+
+    var index = try lsm_table_file.decodeIndexAlloc(allocator, encoded);
+    var index_owned = true;
+    errdefer if (index_owned) index.deinit(allocator);
+    const table_prefix_filter = index.prefix_filter orelse return error.ExpectedPrefixFilter;
+    try std.testing.expect(table_prefix_filter.bytes.len > 0);
+    var block_prefix_filter_bytes: usize = 0;
+    for (index.blocks) |block| {
+        if (block.prefix_filter) |filter| block_prefix_filter_bytes += filter.bytes.len;
+    }
+    try std.testing.expect(block_prefix_filter_bytes > 0);
+
+    const expected_cost = estimateTableIndexCost(path, &index);
+    var cache = Cache.init(allocator, 1024 * 1024);
+    defer cache.deinit();
+
+    var handle = try cache.putRunTableIndex(path, 1, 1, index);
+    index_owned = false;
+    defer handle.release();
+
+    const stats = cache.snapshotStats();
+    try std.testing.expectEqual(expected_cost, cache.currentBytes());
+    try std.testing.expectEqual(expected_cost, stats.run_table_index.used_bytes);
+    try std.testing.expect(expected_cost >= path.len + table_prefix_filter.bytes.len + block_prefix_filter_bytes);
 }
 
 test "cache reports shared byte usage to resource manager" {
