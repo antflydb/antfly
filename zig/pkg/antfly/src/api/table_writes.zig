@@ -391,11 +391,6 @@ pub const ProvisionedTableWriteCache = struct {
         }
     }
 
-    fn prepareFailedOpenRetirementLocked(self: *ProvisionedTableWriteCache, cached: CachedDb) !void {
-        if (cached.entry == null) return;
-        try self.retired_entries.ensureUnusedCapacity(self.alloc, 1);
-    }
-
     fn retireFailedOpenLocked(self: *ProvisionedTableWriteCache, cached: *CachedDb) void {
         const entry = cached.entry orelse {
             cached.deinit(self.alloc);
@@ -3075,6 +3070,7 @@ pub const ProvisionedTableWriteSource = struct {
         var cached = blk: {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
+            try cache.retired_entries.ensureUnusedCapacity(cache.alloc, 1);
             const adopted = try cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
             if (mode == .default or mode == .default_async) {
                 adopted.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(adopted.entry.?.table_name, group_id, adopted.db));
@@ -3082,10 +3078,11 @@ pub const ProvisionedTableWriteSource = struct {
             if (ensure_auto_bulk_now_ns) |now_ns| try cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns);
             break :blk adopted;
         };
-        var retire_cached_on_error = false;
-        errdefer if (retire_cached_on_error) cache.retireFailedOpenLocked(&cached) else cached.deinit(cache.alloc);
-        try cache.prepareFailedOpenRetirementLocked(cached);
-        retire_cached_on_error = true;
+        errdefer {
+            lockAtomic(&self.local_db_mutex);
+            defer self.local_db_mutex.unlock();
+            cache.retireFailedOpenLocked(&cached);
+        }
         try cached.db.drainResolverBackfill();
         return cached;
     }
@@ -5926,12 +5923,14 @@ pub const HostedProvisionedTableWriteSource = struct {
         var cached = blk: {
             lockAtomic(&cache.mutex);
             defer cache.mutex.unlock();
+            try cache.write_cache.retired_entries.ensureUnusedCapacity(cache.write_cache.alloc, 1);
             break :blk try cache.write_cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
         };
-        var retire_cached_on_error = false;
-        errdefer if (retire_cached_on_error) cache.write_cache.retireFailedOpenLocked(&cached) else cached.deinit(cache.write_cache.alloc);
-        try cache.write_cache.prepareFailedOpenRetirementLocked(cached);
-        retire_cached_on_error = true;
+        errdefer {
+            lockAtomic(&cache.mutex);
+            defer cache.mutex.unlock();
+            cache.write_cache.retireFailedOpenLocked(&cached);
+        }
         try cached.db.drainResolverBackfill();
         return cached;
     }
