@@ -17,6 +17,7 @@ const resource_manager_mod = @import("../resource_manager.zig");
 
 pub const max_tracked_work_run_ids = 64;
 pub const max_in_flight_run_ids = 256;
+pub const max_in_flight_key_ranges = 256;
 
 pub const Options = struct {
     max_concurrent_jobs: usize = 1,
@@ -31,6 +32,15 @@ pub const Work = struct {
     input_bytes: u64 = 0,
     run_ids: [max_tracked_work_run_ids]u64 = undefined,
     run_count: usize = 0,
+    key_range: ?KeyRange = null,
+};
+
+pub const KeyRange = struct {
+    output_level: u32,
+    smallest_namespace_name: ?[]const u8,
+    smallest_key: []const u8,
+    largest_namespace_name: ?[]const u8,
+    largest_key: []const u8,
 };
 
 pub const Stats = struct {
@@ -42,6 +52,7 @@ pub const Stats = struct {
     denied_capacity: u64 = 0,
     denied_resource_pressure: u64 = 0,
     oversized_grants: u64 = 0,
+    oversized_skips: u64 = 0,
     remembered_candidates: u64 = 0,
     remembered_retries: u64 = 0,
     remembered_hits: u64 = 0,
@@ -55,6 +66,7 @@ pub const Grant = struct {
     started_ns: u64 = 0,
     run_ids: [max_tracked_work_run_ids]u64 = undefined,
     run_count: usize = 0,
+    key_range: ?KeyRange = null,
     reservation: ?resource_manager_mod.Reservation = null,
     completed: bool = false,
 
@@ -62,7 +74,7 @@ pub const Grant = struct {
         if (self.completed) return;
         self.completed = true;
         if (self.reservation) |*reservation| reservation.release();
-        self.scheduler.complete(self.input_bytes, self.run_ids[0..self.run_count], self.started_ns);
+        self.scheduler.complete(self.input_bytes, self.run_ids[0..self.run_count], self.key_range, self.started_ns);
     }
 };
 
@@ -72,6 +84,8 @@ pub const Scheduler = struct {
     in_flight_input_bytes: u64 = 0,
     in_flight_run_ids: [max_in_flight_run_ids]u64 = undefined,
     in_flight_run_count: usize = 0,
+    in_flight_key_ranges: [max_in_flight_key_ranges]KeyRange = undefined,
+    in_flight_key_range_count: usize = 0,
     active_start_ns: [max_in_flight_run_ids]u64 = undefined,
     active_start_count: usize = 0,
     grants: u64 = 0,
@@ -79,6 +93,7 @@ pub const Scheduler = struct {
     denied_capacity: u64 = 0,
     denied_resource_pressure: u64 = 0,
     oversized_grants: u64 = 0,
+    oversized_skips: u64 = 0,
     remembered_candidates: u64 = 0,
     remembered_retries: u64 = 0,
     remembered_hits: u64 = 0,
@@ -101,6 +116,16 @@ pub const Scheduler = struct {
         if (work.run_count > work.run_ids.len or self.conflictsWithInFlightRuns(work.run_ids[0..work.run_count])) {
             self.conflict_denials += 1;
             return null;
+        }
+        if (work.key_range) |range| {
+            if (self.conflictsWithInFlightKeyRange(range)) {
+                self.conflict_denials += 1;
+                return null;
+            }
+            if (self.in_flight_key_range_count >= self.in_flight_key_ranges.len) {
+                self.denied_capacity += 1;
+                return null;
+            }
         }
         if (work.run_count > max_in_flight_run_ids - self.in_flight_run_count) {
             self.denied_capacity += 1;
@@ -141,6 +166,7 @@ pub const Scheduler = struct {
         self.active_jobs += 1;
         self.in_flight_input_bytes = next_bytes;
         self.addInFlightRuns(work.run_ids[0..work.run_count]);
+        self.addInFlightKeyRange(work.key_range);
         self.addActiveStart(now_ns);
         self.grants += 1;
         if (oversized) self.oversized_grants += 1;
@@ -148,6 +174,7 @@ pub const Scheduler = struct {
             .scheduler = self,
             .input_bytes = work.input_bytes,
             .started_ns = now_ns,
+            .key_range = work.key_range,
             .reservation = reservation,
         };
         grant.run_count = work.run_count;
@@ -157,10 +184,11 @@ pub const Scheduler = struct {
         return grant;
     }
 
-    fn complete(self: *Scheduler, input_bytes: u64, run_ids: []const u64, started_ns: u64) void {
+    fn complete(self: *Scheduler, input_bytes: u64, run_ids: []const u64, key_range: ?KeyRange, started_ns: u64) void {
         self.active_jobs -|= 1;
         self.in_flight_input_bytes -|= input_bytes;
         self.removeInFlightRuns(run_ids);
+        self.removeInFlightKeyRange(key_range);
         self.removeActiveStart(started_ns);
         self.completions += 1;
     }
@@ -174,10 +202,23 @@ pub const Scheduler = struct {
         return false;
     }
 
+    fn conflictsWithInFlightKeyRange(self: *const Scheduler, range: KeyRange) bool {
+        for (self.in_flight_key_ranges[0..self.in_flight_key_range_count]) |active| {
+            if (keyRangesOverlap(active, range)) return true;
+        }
+        return false;
+    }
+
     fn addInFlightRuns(self: *Scheduler, run_ids: []const u64) void {
         if (run_ids.len == 0) return;
         @memcpy(self.in_flight_run_ids[self.in_flight_run_count .. self.in_flight_run_count + run_ids.len], run_ids);
         self.in_flight_run_count += run_ids.len;
+    }
+
+    fn addInFlightKeyRange(self: *Scheduler, key_range: ?KeyRange) void {
+        const range = key_range orelse return;
+        self.in_flight_key_ranges[self.in_flight_key_range_count] = range;
+        self.in_flight_key_range_count += 1;
     }
 
     fn removeInFlightRuns(self: *Scheduler, run_ids: []const u64) void {
@@ -193,6 +234,21 @@ pub const Scheduler = struct {
                 break;
             }
         }
+    }
+
+    fn removeInFlightKeyRange(self: *Scheduler, key_range: ?KeyRange) void {
+        const released = key_range orelse return;
+        var idx: usize = 0;
+        while (idx < self.in_flight_key_range_count) : (idx += 1) {
+            if (!keyRangesEqual(self.in_flight_key_ranges[idx], released)) continue;
+            const tail_len = self.in_flight_key_range_count - idx - 1;
+            if (tail_len > 0) {
+                std.mem.copyForwards(KeyRange, self.in_flight_key_ranges[idx .. idx + tail_len], self.in_flight_key_ranges[idx + 1 .. self.in_flight_key_range_count]);
+            }
+            self.in_flight_key_range_count -= 1;
+            return;
+        }
+        if (self.in_flight_key_range_count > 0) self.in_flight_key_range_count -= 1;
     }
 
     fn addActiveStart(self: *Scheduler, started_ns: u64) void {
@@ -243,6 +299,10 @@ pub const Scheduler = struct {
         self.conflict_denials += 1;
     }
 
+    pub fn noteOversizedSkips(self: *Scheduler, count: u64) void {
+        self.oversized_skips +|= count;
+    }
+
     pub fn snapshot(self: *const Scheduler) Stats {
         return self.snapshotAt(0);
     }
@@ -257,6 +317,7 @@ pub const Scheduler = struct {
             .denied_capacity = self.denied_capacity,
             .denied_resource_pressure = self.denied_resource_pressure,
             .oversized_grants = self.oversized_grants,
+            .oversized_skips = self.oversized_skips,
             .remembered_candidates = self.remembered_candidates,
             .remembered_retries = self.remembered_retries,
             .remembered_hits = self.remembered_hits,
@@ -265,6 +326,38 @@ pub const Scheduler = struct {
         };
     }
 };
+
+fn keyRangesOverlap(lhs: KeyRange, rhs: KeyRange) bool {
+    if (lhs.output_level != rhs.output_level) return false;
+    return compareBound(lhs.smallest_namespace_name, lhs.smallest_key, rhs.largest_namespace_name, rhs.largest_key) != .gt and
+        compareBound(lhs.largest_namespace_name, lhs.largest_key, rhs.smallest_namespace_name, rhs.smallest_key) != .lt;
+}
+
+fn keyRangesEqual(lhs: KeyRange, rhs: KeyRange) bool {
+    return lhs.output_level == rhs.output_level and
+        namespaceNameEql(lhs.smallest_namespace_name, rhs.smallest_namespace_name) and
+        std.mem.eql(u8, lhs.smallest_key, rhs.smallest_key) and
+        namespaceNameEql(lhs.largest_namespace_name, rhs.largest_namespace_name) and
+        std.mem.eql(u8, lhs.largest_key, rhs.largest_key);
+}
+
+fn compareBound(lhs_namespace_name: ?[]const u8, lhs_key: []const u8, rhs_namespace_name: ?[]const u8, rhs_key: []const u8) std.math.Order {
+    const namespace_order = compareNamespaceName(lhs_namespace_name, rhs_namespace_name);
+    if (namespace_order != .eq) return namespace_order;
+    return std.mem.order(u8, lhs_key, rhs_key);
+}
+
+fn compareNamespaceName(lhs: ?[]const u8, rhs: ?[]const u8) std.math.Order {
+    if (lhs == null and rhs == null) return .eq;
+    if (lhs == null) return .lt;
+    if (rhs == null) return .gt;
+    return std.mem.order(u8, lhs.?, rhs.?);
+}
+
+fn namespaceNameEql(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return std.mem.eql(u8, lhs.?, rhs.?);
+}
 
 fn testWork(score: u64, input_bytes: u64, run_ids: []const u64) Work {
     var work = Work{
@@ -277,6 +370,16 @@ fn testWork(score: u64, input_bytes: u64, run_ids: []const u64) Work {
         @memcpy(work.run_ids[0..run_ids.len], run_ids);
     }
     return work;
+}
+
+fn testRange(output_level: u32, smallest_key: []const u8, largest_key: []const u8) KeyRange {
+    return .{
+        .output_level = output_level,
+        .smallest_namespace_name = "docs",
+        .smallest_key = smallest_key,
+        .largest_namespace_name = "docs",
+        .largest_key = largest_key,
+    };
 }
 
 test "lsm compaction scheduler denies overlapping in-flight run ids" {
@@ -328,6 +431,37 @@ test "lsm compaction scheduler admits non-overlapping concurrent run ids" {
     try std.testing.expectEqual(@as(u64, 0), stats.active_jobs);
     try std.testing.expectEqual(@as(u64, 0), stats.in_flight_input_bytes);
     try std.testing.expectEqual(@as(u64, 2), stats.completions);
+}
+
+test "lsm compaction scheduler denies overlapping in-flight key ranges" {
+    var scheduler = Scheduler.init(.{
+        .max_concurrent_jobs = 2,
+        .max_in_flight_input_bytes = 1024 * 1024,
+        .resource_reservation_bytes = 0,
+    });
+
+    var first_work = testWork(1, 10, &.{1});
+    first_work.key_range = testRange(1, "doc:a", "doc:m");
+    var first = scheduler.tryAcquire(first_work, null) orelse return error.TestUnexpectedResult;
+    defer first.complete();
+
+    var overlapping_work = testWork(1, 10, &.{2});
+    overlapping_work.key_range = testRange(1, "doc:h", "doc:z");
+    try std.testing.expect(scheduler.tryAcquire(overlapping_work, null) == null);
+
+    var different_level_work = testWork(1, 10, &.{3});
+    different_level_work.key_range = testRange(2, "doc:h", "doc:z");
+    var different_level = scheduler.tryAcquire(different_level_work, null) orelse return error.TestUnexpectedResult;
+    different_level.complete();
+
+    var disjoint_work = testWork(1, 10, &.{4});
+    disjoint_work.key_range = testRange(1, "doc:n", "doc:z");
+    var disjoint = scheduler.tryAcquire(disjoint_work, null) orelse return error.TestUnexpectedResult;
+    disjoint.complete();
+
+    const stats = scheduler.snapshot();
+    try std.testing.expectEqual(@as(u64, 3), stats.grants);
+    try std.testing.expectEqual(@as(u64, 1), stats.conflict_denials);
 }
 
 test "lsm compaction scheduler reports oldest active job age" {

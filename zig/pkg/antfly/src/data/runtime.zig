@@ -515,8 +515,10 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compactable_l0_runs", "gauge", "Cached write LSM level-zero runs over compaction threshold", stats.compactable_l0_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_soft_limit_l0_runs", "gauge", "Configured cached write LSM soft level-zero run pressure threshold", stats.soft_limit_l0_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_hard_limit_l0_runs", "gauge", "Configured cached write LSM hard level-zero run pressure threshold", stats.hard_limit_l0_runs);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_write_stall_l0_run_debt", "gauge", "Cached write LSM level-zero runs currently over hard write-stall pressure", stats.write_stall_l0_run_debt);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_soft_limit_l0_bytes", "gauge", "Configured cached write LSM soft level-zero byte pressure threshold", stats.soft_limit_l0_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_hard_limit_l0_bytes", "gauge", "Configured cached write LSM hard level-zero byte pressure threshold", stats.hard_limit_l0_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_write_stall_l0_byte_debt", "gauge", "Cached write LSM level-zero bytes currently over hard write-stall pressure", stats.write_stall_l0_byte_debt);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_lower_level_runs", "gauge", "Cached write LSM lower-level run count", stats.lower_level_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_lower_level_bytes", "gauge", "Cached write LSM lower-level run bytes", stats.lower_level_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_max_level", "gauge", "Highest cached write LSM lower level currently populated", stats.max_level);
@@ -544,6 +546,7 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_denied_capacity_total", "counter", "Cached write LSM compaction scheduler capacity denials", stats.compaction_scheduler_denied_capacity);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_denied_resource_pressure_total", "counter", "Cached write LSM compaction scheduler resource-pressure denials", stats.compaction_scheduler_denied_resource_pressure);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_oversized_grants_total", "counter", "Cached write LSM compaction scheduler oversized single-job grants", stats.compaction_scheduler_oversized_grants);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_oversized_skips_total", "counter", "Cached write LSM compaction candidates skipped by strict input-size limits", stats.compaction_scheduler_oversized_skips);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_pending", "gauge", "Cached write LSM remembered compaction candidates pending retry", stats.compaction_scheduler_remembered_pending);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_pending_runs", "gauge", "Cached write LSM input runs in remembered compaction candidates pending retry", stats.compaction_scheduler_remembered_pending_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_remembered_pending_bytes", "gauge", "Cached write LSM input bytes in remembered compaction candidates pending retry", stats.compaction_scheduler_remembered_pending_bytes);
@@ -584,7 +587,11 @@ fn writeLsmWriteMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.W
     try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_events_total", "counter", "Cached write LSM foreground write-pressure events", stats.write_pressure_events);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_compactions_total", "counter", "Cached write LSM foreground write-pressure compactions", stats.write_pressure_compactions);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_compaction_steps_total", "counter", "Cached write LSM foreground write-pressure compaction steps", stats.write_pressure_compaction_steps);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_l0_run_debt_total", "counter", "Level-zero hard-limit run debt observed at cached write LSM write-pressure events", stats.write_pressure_l0_run_debt);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_l0_byte_debt_total", "counter", "Level-zero hard-limit byte debt observed at cached write LSM write-pressure events", stats.write_pressure_l0_byte_debt);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_overloads_total", "counter", "Cached write LSM write-pressure events that remained above hard limits after the foreground budget", stats.write_pressure_overloads);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_overload_l0_run_debt_total", "counter", "Level-zero hard-limit run debt remaining after cached write LSM foreground write-pressure budgets", stats.write_pressure_overload_l0_run_debt);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_overload_l0_byte_debt_total", "counter", "Level-zero hard-limit byte debt remaining after cached write LSM foreground write-pressure budgets", stats.write_pressure_overload_l0_byte_debt);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_rejections_total", "counter", "Cached write LSM writes rejected after write-pressure overload", stats.write_pressure_rejections);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_write_pressure_ns_total", "counter", "Nanoseconds spent in cached write LSM foreground write-pressure compactions", stats.write_pressure_ns);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_pressure_flushes_total", "counter", "Cached write LSM foreground WAL-pressure flushes", stats.wal_pressure_flushes);
@@ -12396,8 +12403,10 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .overlapping_l0_runs = 2,
         .soft_limit_l0_runs = 4,
         .hard_limit_l0_runs = 8,
+        .write_stall_l0_run_debt = 5,
         .soft_limit_l0_bytes = 65536,
         .hard_limit_l0_bytes = 131072,
+        .write_stall_l0_byte_debt = 16384,
         .lower_level_runs = 5,
         .lower_level_bytes = 4096,
         .max_level = 2,
@@ -12410,6 +12419,7 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .compaction_scheduler_active_oldest_age_ns = 99,
         .compaction_scheduler_grants = 3,
         .compaction_scheduler_denied_capacity = 1,
+        .compaction_scheduler_oversized_skips = 10,
         .compaction_scheduler_remembered_pending = 1,
         .compaction_scheduler_remembered_pending_runs = 4,
         .compaction_scheduler_remembered_pending_bytes = 8192,
@@ -12430,6 +12440,8 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_l0_runs 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_overlapping_l0_runs 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_soft_limit_l0_runs 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_write_stall_l0_run_debt 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_write_stall_l0_byte_debt 16384") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_level_overflow_runs 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers 6") != null);
@@ -12437,6 +12449,7 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_active_oldest_age_ns 99") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_grants_total 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_denied_capacity_total 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_oversized_skips_total 10") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_remembered_pending 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_remembered_pending_runs 4") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_remembered_pending_bytes 8192") != null);
@@ -12455,6 +12468,10 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .write_pressure_events = 21,
         .write_pressure_compactions = 6,
         .write_pressure_compaction_steps = 22,
+        .write_pressure_l0_run_debt = 25,
+        .write_pressure_l0_byte_debt = 26,
+        .write_pressure_overload_l0_run_debt = 27,
+        .write_pressure_overload_l0_byte_debt = 28,
         .write_pressure_overloads = 23,
         .write_pressure_rejections = 24,
         .wal_pressure_flushes = 7,
@@ -12478,7 +12495,11 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_events_total 21") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_compactions_total 6") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_compaction_steps_total 22") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_l0_run_debt_total 25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_l0_byte_debt_total 26") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_overloads_total 23") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_overload_l0_run_debt_total 27") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_overload_l0_byte_debt_total 28") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_write_pressure_rejections_total 24") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_pressure_flushes_total 7") != null);
     try std.testing.expect(std.mem.indexOf(u8, write_output, "antfly_lsm_wal_append_records_total 8") != null);

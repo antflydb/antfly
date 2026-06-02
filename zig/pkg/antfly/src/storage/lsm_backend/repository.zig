@@ -1067,3 +1067,72 @@ test "repository streams state run publication through table builder accounting"
     defer loaded.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 64), loaded.entries.items.len);
 }
+
+test "repository table builder peak stays below whole-run logical payload" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+
+    var value: [2048]u8 = undefined;
+    @memset(&value, 'v');
+
+    var state: state_mod.State = .{};
+    errdefer state.deinit(allocator);
+    const entry_count: usize = 1024;
+    try state.entries.ensureTotalCapacity(allocator, entry_count);
+    var logical_payload_bytes: u64 = 0;
+    for (0..entry_count) |i| {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>6}", .{i});
+        logical_payload_bytes +|= key.len + value.len;
+        state.entries.appendAssumeCapacity(try state_mod.initEntry(
+            allocator,
+            .{ .name = "docs" },
+            key,
+            &value,
+            false,
+        ));
+    }
+
+    var run = Run{
+        .id = 2,
+        .level = 0,
+        .size_bytes = 0,
+        .path = null,
+        .smallest_namespace_name = @constCast("docs"),
+        .smallest_key = @constCast("doc:000000"),
+        .largest_namespace_name = @constCast("docs"),
+        .largest_key = @constCast("doc:001023"),
+        .entry_count = @intCast(entry_count),
+        .bloom_filter = null,
+        .encoded_bloom_filter = null,
+        .owns_metadata = false,
+        .owns_bloom_filter = true,
+        .state = state,
+    };
+    state = .{};
+    defer {
+        if (run.path) |path| {
+            allocator.free(path);
+            run.path = null;
+        }
+        run.deinit(allocator);
+    }
+
+    run.path = try persistRunFileWithStorageAccounted(
+        storage.storage(),
+        allocator,
+        "/repository-stream-large-state-run",
+        &run,
+        .none,
+        .none,
+        &manager,
+    );
+
+    const builder_stats = manager.sliceStats(.lsm_table_builder_working_set);
+    try std.testing.expectEqual(@as(u64, 0), builder_stats.used_bytes);
+    try std.testing.expect(builder_stats.peak_bytes >= table_write_buffer_size);
+    try std.testing.expect(builder_stats.peak_bytes < logical_payload_bytes / 2);
+    try std.testing.expect(run.size_bytes > logical_payload_bytes);
+}

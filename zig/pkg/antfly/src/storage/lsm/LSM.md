@@ -170,7 +170,7 @@ and maintenance that is always debt-driven.
 
 ### Next priorities
 
-1. [ ] Finish no-heap table-artifact publication and disk-backed merge output.
+1. [x] Finish no-heap table-artifact publication and disk-backed merge output.
    - Flush, compaction, and HBC final artifact publication should write through
      bounded block builders and output sinks.
    - [x] LSM persisted flushes, sorted ingest, and compaction output now use
@@ -183,10 +183,15 @@ and maintenance that is always debt-driven.
    - [x] State-backed run publication now streams directly from `State` entries
      through `StreamingRunFileWriter`, instead of first materializing one
      whole-run `[]TableEntry` scratch array before writing the table file.
-   - Peak memory should be the active builder block/window plus bounded scratch,
-     not the whole run, whole merge output, or whole artifact.
-   - ResourceManager should account table-builder bytes, compaction scratch,
-     and publish scratch separately from long-lived cache/memtable bytes.
+   - [x] HBC bulk-finish publishes deferred roots, metadata, and final flushes
+     through normal LSM mutable batches; the forced durable finish reaches the
+     same streaming table writer path as persisted flush/sorted ingest.
+   - [x] Repository tests now assert multi-megabyte run publication leaves
+     `lsm.table_builder_working_set` below the whole logical payload and
+     releases it after finish, proving peak memory is bounded by the active
+     builder block/window plus scratch rather than whole-run materialization.
+   - [x] ResourceManager accounts table-builder bytes, compaction scratch, and
+     publish scratch separately from long-lived cache/memtable bytes.
 
 2. [x] Finish direct prefix-compressed block reader integration.
    - The codec already has restart-point search primitives; runtime readers
@@ -225,16 +230,27 @@ and maintenance that is always debt-driven.
      futures, and read stats expose async point batches, reads issued, canceled
      reads, and wait time.
 
-4. [ ] Make compaction scheduling fully score- and overlap-driven.
+4. [x] Make compaction scheduling fully score- and overlap-driven.
    - Raise compaction concurrency only when selected jobs are disjoint by run
      IDs/key ranges or otherwise proven safe by the scheduler.
-   - Track pending bytes, write-stall debt, conflict denials, oversized-plan
-     fallback, and elapsed compaction age in status/metrics.
+   - [x] Scheduler admission now rejects same-output-level key-range conflicts
+     in addition to shared input run IDs, so disjoint-run L0 work cannot publish
+     overlapping lower-level outputs concurrently.
+   - [x] Plan selection now scores L0 overlap, L0 pressure, lower-level repair,
+     and lower-level pressure candidates before choosing work, so a later
+     higher-debt candidate can beat an earlier low-debt candidate.
+   - [x] Pending bytes, write-stall debt, conflict denials, oversized-plan
+     fallback, and elapsed compaction age are tracked in status/metrics.
    - [x] Scheduler stats now expose oldest active compaction age plus remembered
      pending input runs/bytes through maintenance stats, Prometheus, and HBC
      benchmark logs, so deferred compaction debt is visible as size rather than
      only as a boolean pending flag.
-   - Keep foreground assists bounded and reserved for hard pressure.
+   - [x] Scheduler stats now distinguish oversized compaction fallback grants
+     from strict input-budget skips in maintenance stats and HBC benchmark logs.
+   - [x] Foreground assists stay bounded by explicit step/time/input budgets and
+     are reserved for hard L0/WAL pressure or caller-specified bulk-finish
+     budgets; write-pressure stats now record initial and remaining L0 hard
+     debt after bounded assists.
 
 5. [ ] Make LSM memory pressure first-class.
    - Account mutable arena bytes, immutable pinned bytes, block-cache bytes,
@@ -251,9 +267,10 @@ and maintenance that is always debt-driven.
    - [x] LSM options now expose retained-cap knobs for recovery replay,
      merge-cursor mutable-entry scratch, and compaction scratch; the merge
      cursor uses the configured cap instead of a hard-coded retained size.
-   - Compare those slices against RSS/physical footprint in the large-root
-     benchmarks; any remaining gap is allocator retention or higher-level
-     dense/docstore working set, not hidden LSM cache.
+   - [x] Large-root memory logs now include aggregate LSM ResourceManager
+     used/peak bytes, table-builder/WAL slices, and RSS/physical-footprint gaps;
+     any remaining gap is allocator retention or higher-level dense/docstore
+     working set, not hidden LSM cache.
    - [x] Add retained-cap policies for reusable scratch so one large row/block does
      not permanently raise steady-state memory.
 

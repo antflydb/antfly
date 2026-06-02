@@ -1878,8 +1878,14 @@ pub const IndexManager = struct {
         var lsm_cache_peak: u64 = 0;
         var lsm_compaction_used: u64 = 0;
         var lsm_compaction_peak: u64 = 0;
+        var lsm_table_builder_used: u64 = 0;
+        var lsm_table_builder_peak: u64 = 0;
         var lsm_state_used: u64 = 0;
         var lsm_state_peak: u64 = 0;
+        var lsm_wal_write_used: u64 = 0;
+        var lsm_wal_write_peak: u64 = 0;
+        var lsm_wal_retention_used: u64 = 0;
+        var lsm_wal_retention_peak: u64 = 0;
         var lsm_recovery_used: u64 = 0;
         var lsm_recovery_peak: u64 = 0;
         if (self.resource_manager) |manager| {
@@ -1889,7 +1895,10 @@ pub const IndexManager = struct {
             const text_merge = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)];
             const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
             const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
+            const lsm_table_builder = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)];
             const lsm_state = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)];
+            const lsm_wal_write = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)];
+            const lsm_wal_retention = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_retention)];
             const lsm_recovery = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_recovery_working_set)];
             ft_pending_used = ft_pending.used_bytes;
             ft_pending_peak = ft_pending.peak_bytes;
@@ -1901,11 +1910,21 @@ pub const IndexManager = struct {
             lsm_cache_peak = lsm_cache.peak_bytes;
             lsm_compaction_used = lsm_compaction.used_bytes;
             lsm_compaction_peak = lsm_compaction.peak_bytes;
+            lsm_table_builder_used = lsm_table_builder.used_bytes;
+            lsm_table_builder_peak = lsm_table_builder.peak_bytes;
             lsm_state_used = lsm_state.used_bytes;
             lsm_state_peak = lsm_state.peak_bytes;
+            lsm_wal_write_used = lsm_wal_write.used_bytes;
+            lsm_wal_write_peak = lsm_wal_write.peak_bytes;
+            lsm_wal_retention_used = lsm_wal_retention.used_bytes;
+            lsm_wal_retention_peak = lsm_wal_retention.peak_bytes;
             lsm_recovery_used = lsm_recovery.used_bytes;
             lsm_recovery_peak = lsm_recovery.peak_bytes;
         }
+        const lsm_resource_used = lsm_cache_used +| lsm_compaction_used +| lsm_table_builder_used +| lsm_state_used +| lsm_wal_write_used +| lsm_wal_retention_used +| lsm_recovery_used;
+        const lsm_resource_peak = lsm_cache_peak +| lsm_compaction_peak +| lsm_table_builder_peak +| lsm_state_peak +| lsm_wal_write_peak +| lsm_wal_retention_peak +| lsm_recovery_peak;
+        const rss_after_lsm_resource_gap = memory.resident_bytes -| lsm_resource_used;
+        const footprint_after_lsm_resource_gap = memory.footprint_bytes -| lsm_resource_used;
 
         std.log.info(
             "antfly_bench_memory_attribution label={s} source_docs={d} projection_docs={d} batch_segments={d} rss_bytes={d} footprint_bytes={d} malloc_available={any} malloc_allocated_bytes={d} malloc_zone_bytes={d} text_indexes={d} text_segments={d} text_segment_bytes={d} mapped_segment_bytes={d} text_mmap_segment_bytes={d} text_heap_segment_bytes={d} text_max_segment_bytes={d} configured_lmdb_main_map_bytes={d} configured_lmdb_wal_map_bytes={d}",
@@ -1958,7 +1977,7 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_physical_block_bytes={d}",
+            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_used_bytes={d} lsm_wal_retention_peak_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d} rss_after_lsm_resource_gap_bytes={d} footprint_after_lsm_resource_gap_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_physical_block_bytes={d}",
             .{
                 label,
                 ft_pending_used,
@@ -1971,10 +1990,20 @@ pub const IndexManager = struct {
                 lsm_cache_peak,
                 lsm_compaction_used,
                 lsm_compaction_peak,
+                lsm_table_builder_used,
+                lsm_table_builder_peak,
                 lsm_state_used,
                 lsm_state_peak,
+                lsm_wal_write_used,
+                lsm_wal_write_peak,
+                lsm_wal_retention_used,
+                lsm_wal_retention_peak,
                 lsm_recovery_used,
                 lsm_recovery_peak,
+                lsm_resource_used,
+                lsm_resource_peak,
+                rss_after_lsm_resource_gap,
+                footprint_after_lsm_resource_gap,
                 lsm_stats.mutable_bytes,
                 lsm_stats.immutable_bytes,
                 lsm_stats.immutable_memtables,
@@ -7314,12 +7343,17 @@ pub const IndexManager = struct {
                 const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
                 const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
                 const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
+                const lsm_table_builder = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)];
                 const lsm_state = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)];
+                const lsm_wal_write = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)];
+                const lsm_wal_retention = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_retention)];
                 const lsm_recovery = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_recovery_working_set)];
                 const lsm_stats = self.snapshotLsmMaintenanceStats();
                 const lsm_cache_stats: lsm_backend_mod.cache.Stats = if (self.lsm_cache) |cache| cache.snapshotStats() else .{};
+                const lsm_resource_used = lsm_cache.used_bytes +| lsm_compaction.used_bytes +| lsm_table_builder.used_bytes +| lsm_state.used_bytes +| lsm_wal_write.used_bytes +| lsm_wal_retention.used_bytes +| lsm_recovery.used_bytes;
+                const lsm_resource_peak = lsm_cache.peak_bytes +| lsm_compaction.peak_bytes +| lsm_table_builder.peak_bytes +| lsm_state.peak_bytes +| lsm_wal_write.peak_bytes +| lsm_wal_retention.peak_bytes +| lsm_recovery.peak_bytes;
                 std.log.info(
-                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_block_inserts={d} lsm_cache_block_evictions={d} lsm_cache_physical_block_bytes={d} lsm_cache_physical_block_inserts={d} lsm_cache_physical_block_evictions={d}",
+                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_used_bytes={d} lsm_wal_retention_peak_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_block_inserts={d} lsm_cache_block_evictions={d} lsm_cache_physical_block_bytes={d} lsm_cache_physical_block_inserts={d} lsm_cache_physical_block_evictions={d}",
                     .{
                         entry.config.name,
                         source_docs.len,
@@ -7333,10 +7367,18 @@ pub const IndexManager = struct {
                         lsm_cache.peak_bytes,
                         lsm_compaction.used_bytes,
                         lsm_compaction.peak_bytes,
+                        lsm_table_builder.used_bytes,
+                        lsm_table_builder.peak_bytes,
                         lsm_state.used_bytes,
                         lsm_state.peak_bytes,
+                        lsm_wal_write.used_bytes,
+                        lsm_wal_write.peak_bytes,
+                        lsm_wal_retention.used_bytes,
+                        lsm_wal_retention.peak_bytes,
                         lsm_recovery.used_bytes,
                         lsm_recovery.peak_bytes,
+                        lsm_resource_used,
+                        lsm_resource_peak,
                         lsm_stats.mutable_bytes,
                         lsm_stats.immutable_bytes,
                         lsm_stats.immutable_memtables,
@@ -9270,7 +9312,7 @@ pub const IndexManager = struct {
         if (before_lsm_stats) |before_lsm| {
             if (after_lsm_stats) |after_lsm| {
                 std.log.info(
-                    "antfly_bench_hbc_lsm_write phase={s} index={s} flushes={d} flush_entries={d} flush_runs={d} flush_bytes={d} flush_ms={d} sorted_ingest_runs={d} sorted_ingest_bytes={d} sorted_ingest_ms={d} compaction_ms={d} write_pressure_compactions={d} write_pressure_ms={d} manifest_writes={d} manifest_bytes={d} manifest_ms={d} table_writes={d} table_bytes={d} table_logical_entry_bytes={d} table_physical_entry_bytes={d} table_compressed_blocks={d} table_raw_blocks={d} table_compression_codec_mask={d}",
+                    "antfly_bench_hbc_lsm_write phase={s} index={s} flushes={d} flush_entries={d} flush_runs={d} flush_bytes={d} flush_ms={d} sorted_ingest_runs={d} sorted_ingest_bytes={d} sorted_ingest_ms={d} compaction_ms={d} write_pressure_compactions={d} write_pressure_run_debt={d} write_pressure_byte_debt={d} write_pressure_overload_run_debt={d} write_pressure_overload_byte_debt={d} write_pressure_ms={d} manifest_writes={d} manifest_bytes={d} manifest_ms={d} table_writes={d} table_bytes={d} table_logical_entry_bytes={d} table_physical_entry_bytes={d} table_compressed_blocks={d} table_raw_blocks={d} table_compression_codec_mask={d}",
                     .{
                         phase,
                         entry.config.name,
@@ -9284,6 +9326,10 @@ pub const IndexManager = struct {
                         nsToMs(deltaU64(after_lsm.sorted_ingest_ns, before_lsm.sorted_ingest_ns)),
                         nsToMs(deltaU64(after_lsm.compaction_ns, before_lsm.compaction_ns)),
                         deltaU64(after_lsm.write_pressure_compactions, before_lsm.write_pressure_compactions),
+                        deltaU64(after_lsm.write_pressure_l0_run_debt, before_lsm.write_pressure_l0_run_debt),
+                        deltaU64(after_lsm.write_pressure_l0_byte_debt, before_lsm.write_pressure_l0_byte_debt),
+                        deltaU64(after_lsm.write_pressure_overload_l0_run_debt, before_lsm.write_pressure_overload_l0_run_debt),
+                        deltaU64(after_lsm.write_pressure_overload_l0_byte_debt, before_lsm.write_pressure_overload_l0_byte_debt),
                         nsToMs(deltaU64(after_lsm.write_pressure_ns, before_lsm.write_pressure_ns)),
                         deltaU64(after_lsm.manifest_writes, before_lsm.manifest_writes),
                         deltaU64(after_lsm.manifest_bytes, before_lsm.manifest_bytes),
@@ -9301,7 +9347,7 @@ pub const IndexManager = struct {
         }
         if (after_lsm_maintenance) |maintenance| {
             std.log.info(
-                "antfly_bench_hbc_lsm_maintenance phase={s} index={s} mutable_entries={d} mutable_bytes={d} mutable_snapshot_clone_calls={d} mutable_snapshot_clone_bytes_total={d} mutable_snapshot_clone_peak_bytes={d} total_runs={d} total_run_bytes={d} total_run_logical_entry_bytes={d} total_run_physical_entry_bytes={d} total_run_compressed_blocks={d} total_run_raw_blocks={d} total_run_compression_codec_mask={d} l0_runs={d} l0_bytes={d} overlapping_l0_runs={d} lower_level_runs={d} lower_level_bytes={d} max_level={d} compactable_l0_runs={d} soft_limit_l0_runs={d} hard_limit_l0_runs={d} soft_limit_l0_bytes={d} hard_limit_l0_bytes={d} level_overflow_runs={d} level_overflow_bytes={d} obsolete_paths={d} active_readers={d} active_bulk_ingest_batches={d} manifest_dirty={any} obsolete_manifest_dirty={any}",
+                "antfly_bench_hbc_lsm_maintenance phase={s} index={s} mutable_entries={d} mutable_bytes={d} mutable_snapshot_clone_calls={d} mutable_snapshot_clone_bytes_total={d} mutable_snapshot_clone_peak_bytes={d} total_runs={d} total_run_bytes={d} total_run_logical_entry_bytes={d} total_run_physical_entry_bytes={d} total_run_compressed_blocks={d} total_run_raw_blocks={d} total_run_compression_codec_mask={d} l0_runs={d} l0_bytes={d} overlapping_l0_runs={d} lower_level_runs={d} lower_level_bytes={d} max_level={d} compactable_l0_runs={d} soft_limit_l0_runs={d} hard_limit_l0_runs={d} write_stall_l0_run_debt={d} soft_limit_l0_bytes={d} hard_limit_l0_bytes={d} write_stall_l0_byte_debt={d} level_overflow_runs={d} level_overflow_bytes={d} obsolete_paths={d} active_readers={d} active_bulk_ingest_batches={d} manifest_dirty={any} obsolete_manifest_dirty={any}",
                 .{
                     phase,
                     entry.config.name,
@@ -9326,8 +9372,10 @@ pub const IndexManager = struct {
                     maintenance.compactable_l0_runs,
                     maintenance.soft_limit_l0_runs,
                     maintenance.hard_limit_l0_runs,
+                    maintenance.write_stall_l0_run_debt,
                     maintenance.soft_limit_l0_bytes,
                     maintenance.hard_limit_l0_bytes,
+                    maintenance.write_stall_l0_byte_debt,
                     maintenance.level_overflow_runs,
                     maintenance.level_overflow_bytes,
                     maintenance.obsolete_paths,
@@ -9338,7 +9386,7 @@ pub const IndexManager = struct {
                 },
             );
             std.log.info(
-                "antfly_bench_hbc_lsm_scheduler phase={s} index={s} active_jobs={d} in_flight_input_bytes={d} active_oldest_age_ns={d} grants={d} completions={d} denied_capacity={d} denied_resource_pressure={d} oversized_grants={d} remembered_pending={d} remembered_pending_runs={d} remembered_pending_bytes={d} remembered_candidates={d} remembered_retries={d} remembered_hits={d} remembered_stale={d} conflict_denials={d}",
+                "antfly_bench_hbc_lsm_scheduler phase={s} index={s} active_jobs={d} in_flight_input_bytes={d} active_oldest_age_ns={d} grants={d} completions={d} denied_capacity={d} denied_resource_pressure={d} oversized_grants={d} oversized_skips={d} remembered_pending={d} remembered_pending_runs={d} remembered_pending_bytes={d} remembered_candidates={d} remembered_retries={d} remembered_hits={d} remembered_stale={d} conflict_denials={d}",
                 .{
                     phase,
                     entry.config.name,
@@ -9350,6 +9398,7 @@ pub const IndexManager = struct {
                     maintenance.compaction_scheduler_denied_capacity,
                     maintenance.compaction_scheduler_denied_resource_pressure,
                     maintenance.compaction_scheduler_oversized_grants,
+                    maintenance.compaction_scheduler_oversized_skips,
                     maintenance.compaction_scheduler_remembered_pending,
                     maintenance.compaction_scheduler_remembered_pending_runs,
                     maintenance.compaction_scheduler_remembered_pending_bytes,

@@ -253,6 +253,10 @@ pub const Backend = struct {
         write_pressure_events: u64 = 0,
         write_pressure_compactions: u64 = 0,
         write_pressure_compaction_steps: u64 = 0,
+        write_pressure_l0_run_debt: u64 = 0,
+        write_pressure_l0_byte_debt: u64 = 0,
+        write_pressure_overload_l0_run_debt: u64 = 0,
+        write_pressure_overload_l0_byte_debt: u64 = 0,
         write_pressure_overloads: u64 = 0,
         write_pressure_rejections: u64 = 0,
         write_pressure_ns: u64 = 0,
@@ -328,8 +332,10 @@ pub const Backend = struct {
         overlapping_l0_runs: u64 = 0,
         soft_limit_l0_runs: u64 = 0,
         hard_limit_l0_runs: u64 = 0,
+        write_stall_l0_run_debt: u64 = 0,
         soft_limit_l0_bytes: u64 = 0,
         hard_limit_l0_bytes: u64 = 0,
+        write_stall_l0_byte_debt: u64 = 0,
         level_overflow_runs: u64 = 0,
         level_overflow_bytes: u64 = 0,
         obsolete_paths: u64 = 0,
@@ -354,6 +360,7 @@ pub const Backend = struct {
         compaction_scheduler_denied_capacity: u64 = 0,
         compaction_scheduler_denied_resource_pressure: u64 = 0,
         compaction_scheduler_oversized_grants: u64 = 0,
+        compaction_scheduler_oversized_skips: u64 = 0,
         compaction_scheduler_remembered_candidates: u64 = 0,
         compaction_scheduler_remembered_retries: u64 = 0,
         compaction_scheduler_remembered_hits: u64 = 0,
@@ -404,8 +411,10 @@ pub const Backend = struct {
         dst.overlapping_l0_runs +|= src.overlapping_l0_runs;
         dst.soft_limit_l0_runs +|= src.soft_limit_l0_runs;
         dst.hard_limit_l0_runs +|= src.hard_limit_l0_runs;
+        dst.write_stall_l0_run_debt +|= src.write_stall_l0_run_debt;
         dst.soft_limit_l0_bytes +|= src.soft_limit_l0_bytes;
         dst.hard_limit_l0_bytes +|= src.hard_limit_l0_bytes;
+        dst.write_stall_l0_byte_debt +|= src.write_stall_l0_byte_debt;
         dst.level_overflow_runs +|= src.level_overflow_runs;
         dst.level_overflow_bytes +|= src.level_overflow_bytes;
         dst.obsolete_paths +|= src.obsolete_paths;
@@ -435,6 +444,7 @@ pub const Backend = struct {
         dst.compaction_scheduler_denied_capacity +|= src.compaction_scheduler_denied_capacity;
         dst.compaction_scheduler_denied_resource_pressure +|= src.compaction_scheduler_denied_resource_pressure;
         dst.compaction_scheduler_oversized_grants +|= src.compaction_scheduler_oversized_grants;
+        dst.compaction_scheduler_oversized_skips +|= src.compaction_scheduler_oversized_skips;
         dst.compaction_scheduler_remembered_candidates +|= src.compaction_scheduler_remembered_candidates;
         dst.compaction_scheduler_remembered_retries +|= src.compaction_scheduler_remembered_retries;
         dst.compaction_scheduler_remembered_hits +|= src.compaction_scheduler_remembered_hits;
@@ -1007,6 +1017,8 @@ pub const Backend = struct {
             if (level == 0) {
                 stats.l0_runs = @intCast(level_len);
                 stats.l0_bytes = level_bytes;
+                stats.write_stall_l0_run_debt = self.l0RunDebtForHardLimit(level_len, self.effectiveL0HardLimitRuns());
+                stats.write_stall_l0_byte_debt = self.l0ByteDebtForHardLimit(level_bytes, self.options.l0_hard_limit_bytes);
                 if (level_len > self.options.compact_threshold_runs) {
                     stats.compactable_l0_runs = @intCast(level_len - self.options.compact_threshold_runs);
                 }
@@ -1034,6 +1046,7 @@ pub const Backend = struct {
         stats.compaction_scheduler_denied_capacity = scheduler_stats.denied_capacity;
         stats.compaction_scheduler_denied_resource_pressure = scheduler_stats.denied_resource_pressure;
         stats.compaction_scheduler_oversized_grants = scheduler_stats.oversized_grants;
+        stats.compaction_scheduler_oversized_skips = scheduler_stats.oversized_skips;
         stats.compaction_scheduler_remembered_candidates = scheduler_stats.remembered_candidates;
         stats.compaction_scheduler_remembered_retries = scheduler_stats.remembered_retries;
         stats.compaction_scheduler_remembered_hits = scheduler_stats.remembered_hits;
@@ -1251,6 +1264,9 @@ pub const Backend = struct {
             if (copied_run_count > 0) {
                 @memcpy(scheduler_work.run_ids[0..copied_run_count], work.run_ids[0..copied_run_count]);
             }
+        }
+        if (@hasField(@TypeOf(work), "key_range")) {
+            scheduler_work.key_range = work.key_range;
         }
         const grant = self.compaction_scheduler.tryAcquireAt(scheduler_work, self.options.resource_manager, platform_time.monotonicNs()) orelse return null;
         self.reserveMaintenanceIoBudgetAssumeAdmitted(io_bytes);
@@ -3197,7 +3213,27 @@ pub const Backend = struct {
             return (hard_runs > 0 and self.runs > hard_runs) or
                 (hard_bytes > 0 and self.bytes > hard_bytes);
         }
+
+        fn runDebt(self: @This(), hard_runs: usize) u64 {
+            if (hard_runs == 0 or self.runs <= hard_runs) return 0;
+            return @intCast(self.runs - hard_runs);
+        }
+
+        fn byteDebt(self: @This(), hard_bytes: u64) u64 {
+            if (hard_bytes == 0 or self.bytes <= hard_bytes) return 0;
+            return self.bytes - hard_bytes;
+        }
     };
+
+    fn l0RunDebtForHardLimit(_: *const Backend, l0_runs: usize, hard_runs: usize) u64 {
+        if (hard_runs == 0 or l0_runs <= hard_runs) return 0;
+        return @intCast(l0_runs - hard_runs);
+    }
+
+    fn l0ByteDebtForHardLimit(_: *const Backend, l0_bytes: u64, hard_bytes: u64) u64 {
+        if (hard_bytes == 0 or l0_bytes <= hard_bytes) return 0;
+        return l0_bytes - hard_bytes;
+    }
 
     fn snapshotL0PressureLocked(self: *const Backend) L0Pressure {
         var pressure = L0Pressure{};
@@ -3224,6 +3260,8 @@ pub const Backend = struct {
 
         const start_ns = self.writeStatsNowNs();
         self.write_stats.write_pressure_events += 1;
+        self.write_stats.write_pressure_l0_run_debt +|= pressure.runDebt(hard_runs);
+        self.write_stats.write_pressure_l0_byte_debt +|= pressure.byteDebt(hard_bytes);
         const target_runs = if (self.options.l0_soft_limit_runs != 0) self.options.l0_soft_limit_runs else self.options.compact_threshold_runs;
         const before_compactions = self.compaction_stats.compactions;
         const max_steps = @max(@as(usize, 1), self.options.write_pressure_max_compaction_steps);
@@ -3243,6 +3281,8 @@ pub const Backend = struct {
 
         if (pressure.overHardLimit(hard_runs, hard_bytes)) {
             self.write_stats.write_pressure_overloads += 1;
+            self.write_stats.write_pressure_overload_l0_run_debt +|= pressure.runDebt(hard_runs);
+            self.write_stats.write_pressure_overload_l0_byte_debt +|= pressure.byteDebt(hard_bytes);
             if (self.options.write_pressure_reject_on_overload) {
                 self.write_stats.write_pressure_rejections += 1;
                 return error.WritePressureExceeded;
@@ -6215,6 +6255,7 @@ test "lsm backend write pressure compacts hard L0 debt" {
     const stats = backend.snapshotWriteStats();
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
     try std.testing.expect(stats.write_pressure_compactions > 0);
+    try std.testing.expect(stats.write_pressure_l0_run_debt > 0);
 }
 
 test "lsm backend write pressure records bounded overload after max foreground steps" {
@@ -6242,8 +6283,11 @@ test "lsm backend write pressure records bounded overload after max foreground s
     try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_events);
     try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_compaction_steps);
     try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_overloads);
+    try std.testing.expect(stats.write_pressure_l0_run_debt > 0);
+    try std.testing.expect(stats.write_pressure_overload_l0_run_debt > 0);
     try std.testing.expectEqual(@as(u64, 0), stats.write_pressure_rejections);
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 2);
+    try std.testing.expect(backend.snapshotMaintenanceStats().write_stall_l0_run_debt > 0);
 }
 
 test "lsm backend write pressure can reject when overload remains after budget" {
@@ -6271,6 +6315,8 @@ test "lsm backend write pressure can reject when overload remains after budget" 
     const stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_events);
     try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_overloads);
+    try std.testing.expect(stats.write_pressure_l0_run_debt > 0);
+    try std.testing.expect(stats.write_pressure_overload_l0_run_debt > 0);
     try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_rejections);
 }
 
@@ -6706,6 +6752,7 @@ test "lsm backend max compaction input bytes skips oversized scheduled plan" {
     try std.testing.expect(!try backend.runMaintenanceStep());
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
+    try std.testing.expect(maintenance.compaction_scheduler_oversized_skips > 0);
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_remembered_pending);
     try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
 
