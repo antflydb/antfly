@@ -79,6 +79,28 @@ fn canBorrowReaderRetainedState(backend: anytype) bool {
     return @hasField(BackendType, "active_readers") and backend.active_readers > 0;
 }
 
+fn retainActiveMutableValueReader(backend: anytype) bool {
+    if (@hasDecl(@TypeOf(backend.*), "retainActiveMutableValueReader")) {
+        backend.retainActiveMutableValueReader();
+        return true;
+    }
+    return false;
+}
+
+fn releaseActiveMutableValueReader(backend: anytype, retained: bool) void {
+    if (!retained) return;
+    if (@hasDecl(@TypeOf(backend.*), "releaseActiveMutableValueReader")) backend.releaseActiveMutableValueReader();
+}
+
+fn canBorrowActiveMutableValues(backend: anytype) bool {
+    if (@hasDecl(@TypeOf(backend.*), "canBorrowActiveMutableValues")) return backend.canBorrowActiveMutableValues();
+    return false;
+}
+
+fn prepareMutableForWrite(backend: anytype) !void {
+    if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
+}
+
 fn recordCursorBlockReadahead(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorBlockReadahead")) backend.recordCursorBlockReadahead();
 }
@@ -1924,6 +1946,11 @@ fn getCurrentPointRetainedLocked(
     if (backend.mutable.findIndex(namespace, key)) |idx| {
         const entry = backend.mutable.entries.items[idx];
         if (entry.tombstone) return error.NotFound;
+        if (canBorrowActiveMutableValues(backend)) {
+            recordPointValueBorrow(backend);
+            backend.recordMutableHit();
+            return entry.value;
+        }
         const owned = try allocator.dupe(u8, entry.value);
         errdefer allocator.free(owned);
         try held_values.append(allocator, owned);
@@ -2467,6 +2494,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         namespace: backend_types.Namespace,
         stable_point_view: bool = false,
         stable_point_view_loaded: bool = false,
+        active_mutable_value_reader_retained: bool = false,
         empty_state: State = .{},
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
@@ -2483,12 +2511,15 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             errdefer releaseReadReader(BackendType, backend);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             const stable_point_view = backend.mutable.entries.items.len == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
+            const active_mutable_value_reader_retained = if (!stable_point_view) retainActiveMutableValueReader(backend) else false;
+            errdefer releaseActiveMutableValueReader(backend, active_mutable_value_reader_retained);
             return .{
                 .allocator = runtimeScratchAllocator(backend.allocator),
                 .metadata_allocator = metadata_allocator,
                 .backend = backend,
                 .namespace = namespace,
                 .stable_point_view = stable_point_view,
+                .active_mutable_value_reader_retained = active_mutable_value_reader_retained,
             };
         }
 
@@ -2503,6 +2534,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
+            releaseActiveMutableValueReader(backend, self.active_mutable_value_reader_retained);
             releaseReadReader(BackendType, backend);
             self.* = undefined;
         }
@@ -2893,6 +2925,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
             if (!try self.tryCommitDirectBulkIngest()) {
                 const mutated = self.mutable.entries.items.len > 0;
+                if (mutated) try prepareMutableForWrite(self.backend);
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
                     try self.backend.appendWalForMutable(&self.mutable);
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
@@ -5142,6 +5175,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             };
             if (!try self.tryCommitDirectBulkIngest()) {
                 const mutated = self.mutable.entries.items.len > 0;
+                if (mutated) try prepareMutableForWrite(self.backend);
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
                     try self.backend.appendWalForMutable(&self.mutable);
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();

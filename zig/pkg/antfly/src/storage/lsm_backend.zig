@@ -683,6 +683,7 @@ pub const Backend = struct {
     manifest_backing: ?[]u8 = null,
     next_run_id: u64 = 1,
     active_readers: usize = 0,
+    active_mutable_value_readers: usize = 0,
     manifest_dirty: bool = false,
     obsolete_paths: std.ArrayListUnmanaged(ObsoletePath) = .empty,
     obsolete_manifest_dirty: bool = false,
@@ -1278,6 +1279,14 @@ pub const Backend = struct {
         self.notePotentialMaintenanceDebt();
     }
 
+    pub fn prepareMutableForWrite(self: *Backend) !void {
+        if (self.active_mutable_value_readers == 0) return;
+        if (self.mutable.entries.items.len == 0) return;
+        try self.rotateMutableToImmutable();
+        if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
+        self.notePotentialMaintenanceDebt();
+    }
+
     pub fn snapshotMutableState(self: *Backend) !*const State {
         return try self.snapshotMutableStateWithReason(.other);
     }
@@ -1664,6 +1673,7 @@ pub const Backend = struct {
     fn directIngestMutableAtBulkFinishIfPossible(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
         if (self.mutable.entries.items.len == 0) return false;
+        if (self.active_mutable_value_readers != 0) return false;
         if (self.activeImmutableMemtableCount() != 0) return false;
         self.invalidateMutableReadSnapshot();
         var sorted = try self.mutable.toStateMove(self.allocator);
@@ -1678,6 +1688,10 @@ pub const Backend = struct {
     pub fn drainMutableBeforeBulkAppendDirectIngest(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
         if (self.mutable.entries.items.len == 0) return true;
+        if (self.active_mutable_value_readers != 0) {
+            try self.prepareMutableForWrite();
+            return false;
+        }
         if (self.activeImmutableMemtableCount() != 0) return false;
         self.invalidateMutableReadSnapshot();
         var sorted = try self.mutable.toStateMove(self.allocator);
@@ -2353,6 +2367,19 @@ pub const Backend = struct {
 
     pub fn retainReader(self: *Backend) void {
         self.active_readers += 1;
+    }
+
+    pub fn retainActiveMutableValueReader(self: *Backend) void {
+        self.active_mutable_value_readers += 1;
+    }
+
+    pub fn releaseActiveMutableValueReader(self: *Backend) void {
+        std.debug.assert(self.active_mutable_value_readers > 0);
+        self.active_mutable_value_readers -= 1;
+    }
+
+    pub fn canBorrowActiveMutableValues(self: *const Backend) bool {
+        return self.active_mutable_value_readers > 0;
     }
 
     pub fn recordPointGet(self: *Backend) void {
@@ -4803,6 +4830,49 @@ test "lsm backend probe borrows immutable point values until reader release" {
     read_stats = backend.snapshotReadStats();
     try std.testing.expectEqual(@as(u64, 1), read_stats.point_value_borrows);
     try std.testing.expectEqual(@as(u64, 0), read_stats.point_value_copies);
+}
+
+test "lsm backend probe borrows active mutable point values across later writes" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1000,
+        .wal_enabled = false,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+
+    const before = backend.snapshotReadStats();
+    const borrowed_a = try probe.get("doc:a");
+    try std.testing.expectEqualStrings("A", borrowed_a);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "B");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqualStrings("A", borrowed_a);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+
+    const borrowed_b = try probe.get("doc:a");
+    try std.testing.expectEqualStrings("B", borrowed_b);
+
+    const after = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 2), after.point_value_borrows - before.point_value_borrows);
+    try std.testing.expectEqual(@as(u64, 0), after.point_value_copies - before.point_value_copies);
 }
 
 test "lsm backend wal backed entry threshold defers commit flush to maintenance" {
