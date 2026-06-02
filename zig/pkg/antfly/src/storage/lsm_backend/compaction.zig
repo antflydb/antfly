@@ -1827,6 +1827,8 @@ pub fn makeRuns(comptime BackendType: type, backend: *BackendType, state: *State
 
 pub fn makeRunsFromStateBorrowed(comptime BackendType: type, backend: *BackendType, state: *const State) !std.ArrayListUnmanaged(Run) {
     if (state.entries.items.len == 0) return error.EmptyRun;
+    if (backend.root_dir != null) return try makePersistedRunsFromStateBorrowedAtLevel(BackendType, backend, state, 0);
+
     var scratch_bytes_accounted: u64 = 0;
     if (@hasField(BackendType, "options")) {
         if (backend.options.resource_manager) |manager| {
@@ -1850,6 +1852,39 @@ pub fn makeRunsFromStateBorrowed(comptime BackendType: type, backend: *BackendTy
         };
     }
     return try makeRunsFromSortedTableEntriesAtLevel(BackendType, backend, entries, 0);
+}
+
+fn makePersistedRunsFromStateBorrowedAtLevel(comptime BackendType: type, backend: *BackendType, state: *const State, level: u32) !std.ArrayListUnmanaged(Run) {
+    if (state.entries.items.len == 0) return error.EmptyRun;
+    try validateSortedUniqueOwnedEntries(state.entries.items);
+
+    var runs = std.ArrayListUnmanaged(Run).empty;
+    errdefer deinitRunList(backend.allocator, &runs);
+
+    const target_bytes = targetRunFileBytes(BackendType, backend);
+    var start: usize = 0;
+    while (start < state.entries.items.len) {
+        const end = splitOwnedEntriesEnd(state.entries.items, start, target_bytes);
+        try runs.ensureUnusedCapacity(backend.allocator, 1);
+
+        var output: PersistedOutputRunBuilder(BackendType) = undefined;
+        try output.initInPlace(backend, level, end - start);
+        var output_active = true;
+        errdefer if (output_active) output.deinit();
+
+        for (state.entries.items[start..end]) |entry| {
+            const table_entry = tableEntryFromOwnedEntry(entry);
+            try output.appendEntry(table_entry, estimateOwnedEntryBytes(entry));
+        }
+
+        const run = try output.finish();
+        output.deinit();
+        output_active = false;
+        runs.appendAssumeCapacity(run);
+        start = end;
+    }
+
+    return runs;
 }
 
 pub fn makeRunsFromSortedTableEntries(comptime BackendType: type, backend: *BackendType, entries: []const lsm_table_file.Entry) !std.ArrayListUnmanaged(Run) {
@@ -2047,6 +2082,18 @@ fn validateSortedUniqueTableEntries(entries: []const lsm_table_file.Entry) !void
     }
 }
 
+fn validateSortedUniqueOwnedEntries(entries: []const state_mod.OwnedEntry) !void {
+    if (entries.len <= 1) return;
+    var prev = entries[0];
+    for (entries[1..]) |entry| {
+        switch (compareOwnedEntry(prev, entry)) {
+            .lt => prev = entry,
+            .eq => return error.DuplicateBulkIngestKey,
+            .gt => return error.UnsortedBulkIngestEntries,
+        }
+    }
+}
+
 fn estimateStateBytes(state: *const State) u64 {
     var total: u64 = 0;
     for (state.entries.items) |entry| {
@@ -2144,4 +2191,17 @@ fn estimateTableEntryBytes(entry: lsm_table_file.Entry) usize {
     total +|= entry.key.len;
     total +|= entry.value.len;
     return total;
+}
+
+fn tableEntryFromOwnedEntry(entry: state_mod.OwnedEntry) lsm_table_file.Entry {
+    return .{
+        .namespace_name = entry.namespace_name,
+        .key = entry.key,
+        .value = entry.value,
+        .tombstone = entry.tombstone,
+    };
+}
+
+fn compareOwnedEntry(lhs: state_mod.OwnedEntry, rhs: state_mod.OwnedEntry) std.math.Order {
+    return compareTableEntry(tableEntryFromOwnedEntry(lhs), tableEntryFromOwnedEntry(rhs));
 }

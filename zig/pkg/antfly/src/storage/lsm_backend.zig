@@ -2165,18 +2165,31 @@ pub const Backend = struct {
     }
 
     pub fn ingestSortedState(self: *Backend, state: *const State) !void {
+        if (self.options.backend.read_only) return error.ReadOnly;
         if (state.entries.items.len == 0) return;
-        var entries = try self.allocator.alloc(TableEntry, state.entries.items.len);
-        defer self.allocator.free(entries);
-        for (state.entries.items, 0..) |entry, i| {
-            entries[i] = .{
-                .namespace_name = entry.namespace_name,
-                .key = entry.key,
-                .value = entry.value,
-                .tombstone = entry.tombstone,
-            };
+
+        if (self.mutable.entries.items.len > 0) {
+            try self.flushMutable();
         }
-        try self.ingestSortedTableEntries(entries);
+
+        const start_ns = self.writeStatsNowNs();
+        var new_runs = try compaction_mod.makeRunsFromStateBorrowed(Backend, self, state);
+        errdefer {
+            for (new_runs.items) |*run| run.deinit(self.allocator);
+            new_runs.deinit(self.allocator);
+        }
+
+        self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
+        try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+
+        compaction_mod.sortRuns(self.runs.items);
+        if (self.root_dir != null) {
+            if (self.bulkIngestActive()) {
+                self.markManifestDirty();
+            } else {
+                try self.persistManifest();
+            }
+        }
     }
 
     pub fn ingestOwnedSortedState(self: *Backend, state: *State) !void {
@@ -5317,11 +5330,14 @@ test "lsm backend accounts table builder working set during persisted flush" {
     {
         const locked = runtime_mod.lockBackend(Backend, &backend);
         defer runtime_mod.unlockBackend(Backend, &backend, locked);
-        try backend.flushMutable();
+        try backend.rotateMutableToImmutable();
+        try std.testing.expect(try backend.flushOldestImmutableMemtable());
     }
     const builder_stats = manager.sliceStats(.lsm_table_builder_working_set);
+    const compaction_work_stats = manager.sliceStats(.lsm_compaction_work);
     try std.testing.expectEqual(@as(u64, 0), builder_stats.used_bytes);
     try std.testing.expect(builder_stats.peak_bytes >= 256 * 1024);
+    try std.testing.expectEqual(@as(u64, 0), compaction_work_stats.peak_bytes);
     try std.testing.expect(backend.runs.items.len > 0);
     try std.testing.expect(backend.runs.items[0].path != null);
 
