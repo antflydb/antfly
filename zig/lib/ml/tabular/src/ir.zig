@@ -15,9 +15,8 @@
 //! Intermediate representation for traditional ML models (tree ensembles,
 //! linear / logistic regression, SVMs) plus preprocessing (Scaler, Imputer).
 //!
-//! The IR is framework-agnostic and serialised to `tabular_model.json`. Both
-//! Antfly's Zig engine and termite's Go engine consume the same on-disk format
-//! verbatim, so models produced by either converter work in either runtime.
+//! The IR is framework-agnostic and serialised to `tabular_model.json`.
+//! Antfly Inference consumes the format verbatim after conversion or pull.
 
 const std = @import("std");
 

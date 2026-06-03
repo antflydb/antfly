@@ -50,10 +50,9 @@ A single, framework-agnostic JSON file describing the full pipeline:
 }
 ```
 
-The on-disk format is **bit-for-bit compatible with termite's
-[`traditional_ml`](https://github.com/antflydb/termite/tree/traditional_ml)
-branch**, so models produced by either converter run unchanged in either
-runtime.
+The on-disk format is Antfly Inference's framework-agnostic tabular IR. Models
+produced by the converter or installed from a hosted IR run unchanged in the
+inference runtime.
 
 ## Producing models
 
@@ -66,8 +65,8 @@ Two paths, depending on the source format:
 | ONNX-ML | `antfly inference convert <model.onnx> -o <dir> --framework onnx` | Native Zig |
 | Hosted `tabular_model.json` IR | `antfly inference pull <url> --name <name>` | Validated CLI pull |
 
-`--optimize` runs the dead-leaf-elimination + threshold-precision passes
-before writing the IR. Equivalent to termite's `--optimize`.
+`--optimize` runs the dead-leaf-elimination + threshold-precision passes before
+writing the IR.
 
 ## Serving
 

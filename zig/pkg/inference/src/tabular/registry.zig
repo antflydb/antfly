@@ -14,10 +14,10 @@
 
 //! Predictor registry. Lazy load + TTL eviction + ref-counted handle.
 //!
-//! Matches the patterns used by the embedder / reranker registries in the
-//! Go termite implementation (lazy discovery, TTL-evicted cache, deferred
-//! close for in-flight handles). Wired into `model_manager.zig` so listing
-//! the inference catalog returns predictors alongside other model kinds.
+//! Matches the existing embedder / reranker registry patterns: lazy discovery,
+//! TTL-evicted cache, and deferred close for in-flight handles. Wired into
+//! `model_manager.zig` so listing the inference catalog returns predictors
+//! alongside other model kinds.
 
 const std = @import("std");
 const tabular = @import("ml_tabular");

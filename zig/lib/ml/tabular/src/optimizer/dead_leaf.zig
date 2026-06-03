@@ -17,9 +17,8 @@
 //! global max) preserves contributions from gradient-boosting correction
 //! trees, whose leaves are systematically smaller than the early trees'.
 //!
-//! Mirrors termite's `optimizer/dead_leaf.go`. After this pass the engine
-//! sees the same leaf zeroes; it never short-circuits the walk, so behaviour
-//! is bit-identical to a manual leaf rewrite.
+//! After this pass the engine sees the same leaf zeroes; it never short-circuits
+//! the walk, so behaviour is bit-identical to a manual leaf rewrite.
 
 const std = @import("std");
 const ir = @import("../ir.zig");

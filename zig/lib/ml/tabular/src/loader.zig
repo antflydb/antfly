@@ -398,7 +398,7 @@ fn toF64Matrix(alloc: std.mem.Allocator, v: std.json.Value) LoadError![]const []
 }
 
 // ---------------------------------------------------------------------------
-// Validation. Mirrors termite's loader.go.
+// Validation for Antfly Inference tabular models.
 // ---------------------------------------------------------------------------
 
 pub fn validate(m: ir.TabularModel) LoadError!void {
