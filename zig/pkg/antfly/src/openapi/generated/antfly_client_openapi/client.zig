@@ -969,6 +969,15 @@ pub const Client = struct {
         return ApiResponse(types.InferenceEmbedResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// List Traditional ML predictors
+    /// GET /ml/v1/models
+    pub fn listPredictors(self: *@This()) !ApiResponse(types.InferencePredictorsResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ml/v1/models", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferencePredictorsResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Run a traditional ML predictor
     /// POST /ml/v1/predict
     pub fn predict(self: *@This(), body: types.InferencePredictRequest) !ApiResponse(types.InferencePredictResponse) {

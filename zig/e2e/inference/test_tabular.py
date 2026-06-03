@@ -431,9 +431,9 @@ def test_ragged_batch_rejected(api):
     assert r.status_code == 400, r.text
 
 
-def test_listmodels_includes_predictors(api):
-    """/models includes the predictors bucket."""
-    r = api.get("/models")
+def test_ml_models_lists_predictors(api):
+    """/ml/v1/models is the Traditional ML predictor catalog."""
+    r = api.get("/ml/v1/models")
     assert r.status_code == 200, r.text
     body = r.json()
     assert "predictors" in body, body
@@ -442,6 +442,19 @@ def test_listmodels_includes_predictors(api):
     assert iris["task"] == "multiclass"
     assert iris["num_features"] == 4
     assert iris["num_outputs"] == 3
+    assert iris["feature_names"] == [
+        "sepal_length",
+        "sepal_width",
+        "petal_length",
+        "petal_width",
+    ]
+
+
+def test_ai_models_excludes_predictors(api):
+    """/ai/v1/models remains the AI model catalog."""
+    r = api.get("/models")
+    assert r.status_code == 200, r.text
+    assert "predictors" not in r.json()
 
 
 def test_hostile_int_does_not_crash_loader(base_url, tmp_path):

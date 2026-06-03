@@ -5587,6 +5587,29 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+  /ml/v1/models:
+    get:
+      summary: List Traditional ML predictors
+      description: >
+        Returns the Traditional ML predictor catalog for `/ml/v1/predict`.
+
+        Predictors are loaded from `<models_dir>/predictors/<name>/` and exposed
+
+        separately from the AI model catalog.
+      operationId: listPredictors
+      responses:
+        '200':
+          description: Predictors retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferencePredictorsResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/predict:
     post:
       summary: Run a traditional ML predictor
@@ -5595,7 +5618,7 @@ paths:
 
         feature vectors. Models are loaded from `<models_dir>/predictors/<name>/`
 
-        and identified by name. Use the model catalog for the list of available
+        and identified by name. Use `/ml/v1/models` for the list of available
 
         predictors and their feature schemas.
       operationId: predict
@@ -14826,6 +14849,48 @@ components:
         - binary_classification
         - multiclass
         - ranking
+    InferencePredictorInfo:
+      type: object
+      description: Traditional ML predictor metadata.
+      required:
+        - task
+        - num_features
+        - num_outputs
+      properties:
+        task:
+          $ref: '#/components/schemas/InferencePredictorTask'
+        num_features:
+          type: integer
+          minimum: 1
+          description: Number of feature columns expected by the predictor.
+        num_outputs:
+          type: integer
+          minimum: 1
+          description: Number of output values emitted per input row.
+        feature_names:
+          type: array
+          description: Optional feature names in input order.
+          items:
+            type: string
+        source_framework:
+          type: string
+          description: Source framework used to produce the predictor IR.
+    InferencePredictorsResponse:
+      type: object
+      required:
+        - object
+        - predictors
+      properties:
+        object:
+          type: string
+          enum:
+            - list
+          description: Response object type.
+        predictors:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/InferencePredictorInfo'
+          description: Traditional ML predictors keyed by predictor name.
     InferenceTextContentPart:
       $ref: '#/components/schemas/TextContentPart'
     InferenceImageURL:

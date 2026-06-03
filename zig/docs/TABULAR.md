@@ -78,7 +78,7 @@ HTTP routes:
 
 ```text
 POST /ml/v1/predict          # batched prediction
-GET  /ai/v1/models           # predictors listed alongside embedders/rerankers
+GET  /ml/v1/models           # predictor catalog
 ```
 
 ```sh

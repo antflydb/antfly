@@ -84,6 +84,8 @@ def prefixed_path(prefix: str, path: str) -> str:
 def inference_public_path(path: str) -> str:
     if path == "/predict":
         return prefixed_path("/ml/v1", path)
+    if path == "/predictors":
+        return prefixed_path("/ml/v1", "/models")
     return prefixed_path("/ai/v1", path)
 
 

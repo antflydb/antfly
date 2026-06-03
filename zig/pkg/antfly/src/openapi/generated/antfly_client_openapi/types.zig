@@ -4171,6 +4171,19 @@ pub const InferencePredictResponse = struct {
     predictions: []const []const f32,
 };
 
+/// Traditional ML predictor metadata.
+pub const InferencePredictorInfo = struct {
+    task: InferencePredictorTask,
+    /// Number of feature columns expected by the predictor.
+    num_features: i64,
+    /// Number of output values emitted per input row.
+    num_outputs: i64,
+    /// Optional feature names in input order.
+    feature_names: ?[]const []const u8 = null,
+    /// Source framework used to produce the predictor IR.
+    source_framework: ?[]const u8 = null,
+};
+
 /// A single embedding result
 pub const InferenceEmbeddingObject = struct {
     /// Object type, always "embedding"
@@ -4906,6 +4919,13 @@ pub const QueryProfile = struct {
     reranker: ?RerankerProfile = null,
     /// Result merge statistics (present for hybrid search).
     merge: ?MergeProfile = null,
+};
+
+pub const InferencePredictorsResponse = struct {
+    /// Response object type.
+    object: []const u8,
+    /// Traditional ML predictors keyed by predictor name.
+    predictors: std.json.ArrayHashMap(InferencePredictorInfo),
 };
 
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors

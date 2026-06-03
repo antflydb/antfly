@@ -4716,34 +4716,6 @@ pub const Node = struct {
             try body.append(a, '}');
         }
 
-        // Append the predictors bucket from the tabular registry. This is
-        // separate from model_listing_tasks because predictors don't share
-        // the embedder/reranker/generator manifest schema.
-        self.discoverPredictors(ctx.io);
-        try body.appendSlice(a, ",\"predictors\":{");
-        const predictor_infos = self.tabular_registry.list(a) catch &[_]tabular_registry_mod.ModelInfo{};
-        defer if (predictor_infos.len > 0) a.free(predictor_infos);
-        for (predictor_infos, 0..) |info, i| {
-            if (i > 0) try body.append(a, ',');
-            try jsonEncodeString(&body, a, info.name);
-            try body.appendSlice(a, ":{\"task\":\"");
-            try body.appendSlice(a, ml_tabular.ir.taskTypeToString(info.task));
-            try body.appendSlice(a, "\",\"num_features\":");
-            const nf_str = try std.fmt.allocPrint(a, "{d}", .{info.num_features});
-            defer a.free(nf_str);
-            try body.appendSlice(a, nf_str);
-            try body.appendSlice(a, ",\"num_outputs\":");
-            const no_str = try std.fmt.allocPrint(a, "{d}", .{info.num_outputs});
-            defer a.free(no_str);
-            try body.appendSlice(a, no_str);
-            if (info.source_framework.len > 0) {
-                try body.appendSlice(a, ",\"source_framework\":");
-                try jsonEncodeString(&body, a, info.source_framework);
-            }
-            try body.append(a, '}');
-        }
-        try body.append(a, '}');
-
         try buf.appendSlice(a, "{\"object\":\"list\",\"data\":[");
         try buf.appendSlice(a, openai_data.items);
         try buf.appendSlice(a, "],\"allow_downloads\":");
@@ -4765,6 +4737,55 @@ pub const Node = struct {
         try buf.appendSlice(a, if (build_options.enable_wasm) "true" else "false");
         try buf.appendSlice(a, "},");
         try buf.appendSlice(a, body.items);
+        try buf.append(a, '}');
+
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(buf.items);
+        return ctx.response.build();
+    }
+
+    fn appendPredictorCatalog(self: *Node, io: std.Io, a: std.mem.Allocator, body: *std.ArrayListUnmanaged(u8)) !void {
+        self.discoverPredictors(io);
+        try body.appendSlice(a, "\"predictors\":{");
+        const predictor_infos = try self.tabular_registry.list(a);
+        defer a.free(predictor_infos);
+        for (predictor_infos, 0..) |info, i| {
+            if (i > 0) try body.append(a, ',');
+            try jsonEncodeString(body, a, info.name);
+            try body.appendSlice(a, ":{\"task\":\"");
+            try body.appendSlice(a, ml_tabular.ir.taskTypeToString(info.task));
+            try body.appendSlice(a, "\",\"num_features\":");
+            const nf_str = try std.fmt.allocPrint(a, "{d}", .{info.num_features});
+            defer a.free(nf_str);
+            try body.appendSlice(a, nf_str);
+            try body.appendSlice(a, ",\"num_outputs\":");
+            const no_str = try std.fmt.allocPrint(a, "{d}", .{info.num_outputs});
+            defer a.free(no_str);
+            try body.appendSlice(a, no_str);
+            if (info.source_framework.len > 0) {
+                try body.appendSlice(a, ",\"source_framework\":");
+                try jsonEncodeString(body, a, info.source_framework);
+            }
+            if (info.feature_names.len > 0) {
+                try body.appendSlice(a, ",\"feature_names\":[");
+                for (info.feature_names, 0..) |feature_name, feature_idx| {
+                    if (feature_idx > 0) try body.append(a, ',');
+                    try jsonEncodeString(body, a, feature_name);
+                }
+                try body.append(a, ']');
+            }
+            try body.append(a, '}');
+        }
+        try body.append(a, '}');
+    }
+
+    pub fn listPredictors(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const a = ctx.allocator;
+        var buf = std.ArrayListUnmanaged(u8).empty;
+        defer buf.deinit(a);
+
+        try buf.appendSlice(a, "{\"object\":\"list\",");
+        try self.appendPredictorCatalog(ctx.io, a, &buf);
         try buf.append(a, '}');
 
         try ctx.setHeader("content-type", "application/json");
@@ -5998,7 +6019,11 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         }
 
         pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.inner.get(prefix ++ path, handler);
+            if (comptime (std.mem.eql(u8, prefix, public_api_prefix) and std.mem.eql(u8, path, "/predictors"))) {
+                try self.inner.get(public_ml_api_prefix ++ "/models", handler);
+            } else {
+                try self.inner.get(prefix ++ path, handler);
+            }
         }
 
         pub fn put(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
@@ -6108,6 +6133,8 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/predict/upload"));
     try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/predict/convert"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.get, public_ml_api_prefix ++ "/models"));
+    try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/predictors"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
@@ -6166,6 +6193,7 @@ test "registerRoutesOn supports alternate prefixes through the shared router" {
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embeddings"));
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/predict"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/models"));
+    try std.testing.expect(server.hasRoute(.get, "/custom/v9/predictors"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/metrics"));
 }
 

@@ -15,9 +15,8 @@
 //! Predictor registry. Lazy load + TTL eviction + ref-counted handle.
 //!
 //! Matches the existing embedder / reranker registry patterns: lazy discovery,
-//! TTL-evicted cache, and deferred close for in-flight handles. Wired into
-//! `model_manager.zig` so listing the inference catalog returns predictors
-//! alongside other model kinds.
+//! TTL-evicted cache, and deferred close for in-flight handles. Exposed through
+//! the `/ml/v1/models` predictor catalog.
 
 const std = @import("std");
 const tabular = @import("ml_tabular");

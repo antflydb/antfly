@@ -532,6 +532,19 @@ pub const PredictResponse = struct {
     predictions: []const []const f32,
 };
 
+/// Traditional ML predictor metadata.
+pub const PredictorInfo = struct {
+    task: PredictorTask,
+    /// Number of feature columns expected by the predictor.
+    num_features: i64,
+    /// Number of output values emitted per input row.
+    num_outputs: i64,
+    /// Optional feature names in input order.
+    feature_names: ?[]const []const u8 = null,
+    /// Source framework used to produce the predictor IR.
+    source_framework: ?[]const u8 = null,
+};
+
 /// Exactly one of `texts` or `images` must be provided. When using `images`, the server selects a compatible reader internally and processes the request as: read document text -> run structured extraction.
 pub const ExtractRequest = struct {
     /// Name of extractor model with 'extraction' capability
@@ -805,6 +818,13 @@ pub const Chunk = struct {
 pub const SchemasConfig = struct {
     level: ?Level = null,
     style: ?Style = null,
+};
+
+pub const PredictorsResponse = struct {
+    /// Response object type.
+    object: []const u8,
+    /// Traditional ML predictors keyed by predictor name.
+    predictors: std.json.ArrayHashMap(PredictorInfo),
 };
 
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
