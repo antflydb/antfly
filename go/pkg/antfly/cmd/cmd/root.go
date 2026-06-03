@@ -18,6 +18,7 @@ package cmd
 ////go:generate sh -c "echo 'package cmd\n\nconst Version = \"'$(git describe --always --long --tags 2>/dev/null || echo 'dev')'\"' > version.go"
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -43,7 +44,7 @@ var rootCmd = &cobra.Command{
 - store: Run as a data storage node (default)
 - metadata: Run as a metadata server to manage cluster metadata
 - swarm: Run as both metadata and raft services
-- termite: Run in termite mode for specialized operations
+- inference: Run the inference runtime
 
 Each mode has its own set of configuration options. Use 'antfly [mode] --help' for mode-specific options.`,
 	SilenceUsage: true,
@@ -55,6 +56,10 @@ func Execute() {
 	rootCmd.Version = Version
 	err := rootCmd.Execute()
 	if err != nil {
+		var exitErr interface{ ExitCode() int }
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.ExitCode())
+		}
 		os.Exit(1)
 	}
 }
@@ -98,8 +103,8 @@ func init() {
 		viper.SetDefault("log_style", "logfmt")
 	}
 
-	// Termite defaults
-	viper.SetDefault("termite.models_dir", common.DefaultModelsDir())
+	// Inference defaults
+	viper.SetDefault("inference.models_dir", common.DefaultModelsDir())
 }
 
 // initConfig reads in config file and ENV variables if set.

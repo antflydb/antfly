@@ -625,7 +625,7 @@ const EvalsPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -721,7 +721,7 @@ const EvalsPlaygroundPage: React.FC = () => {
                       onOpenChange={() => toggleResultExpanded(result.itemId)}
                     >
                       <CollapsibleTrigger asChild>
-                        <div className="flex items-center gap-2 p-2 rounded-lg border hover:bg-muted/50 cursor-pointer">
+                        <div className="flex items-center gap-2 p-2 rounded-none border hover:bg-muted/50 cursor-pointer">
                           {expandedResults.has(result.itemId) ? (
                             <ChevronDown className="h-4 w-4" />
                           ) : (
@@ -742,7 +742,7 @@ const EvalsPlaygroundPage: React.FC = () => {
                         </div>
                       </CollapsibleTrigger>
                       <CollapsibleContent>
-                        <div className="ml-6 mt-2 p-3 rounded-lg bg-muted/30 space-y-3 text-sm">
+                        <div className="ml-6 mt-2 p-3 rounded-none bg-muted/30 space-y-3 text-sm">
                           {result.error ? (
                             <div className="af-status-text-warning">
                               <span className="font-medium">Error:</span> {result.error}
@@ -880,7 +880,7 @@ const EvalsPlaygroundPage: React.FC = () => {
             </div>
             <div className="space-y-2 flex-1 min-h-0">
               <Label>Preview</Label>
-              <div className="p-3 bg-muted rounded-lg text-xs max-h-40 overflow-auto">
+              <div className="p-3 bg-muted rounded-none text-xs max-h-40 overflow-auto">
                 {(() => {
                   try {
                     const parsed = JSON.parse(importJson);
@@ -898,7 +898,7 @@ const EvalsPlaygroundPage: React.FC = () => {
                             <div
                               // biome-ignore lint/suspicious/noArrayIndexKey: preview items don't have stable IDs
                               key={i}
-                              className="p-2 bg-background rounded border"
+                              className="p-2 bg-background rounded-none border"
                             >
                               <p className="font-medium truncate">
                                 Q: {entry.vars?.question || "—"}
@@ -928,7 +928,7 @@ const EvalsPlaygroundPage: React.FC = () => {
                                 <div
                                   // biome-ignore lint/suspicious/noArrayIndexKey: preview items don't have stable IDs
                                   key={i}
-                                  className="p-2 bg-background rounded border"
+                                  className="p-2 bg-background rounded-none border"
                                 >
                                   <p className="font-medium truncate">Q: {item.question || "—"}</p>
                                   <p className="text-muted-foreground truncate">
@@ -1049,7 +1049,7 @@ const EvalsPlaygroundPage: React.FC = () => {
 // Sub-component for eval item display
 function EvalItemCard({ item, onRemove }: { item: EvalItem; onRemove: () => void }) {
   return (
-    <div className="p-3 border rounded-lg group relative">
+    <div className="p-3 border rounded-none group relative">
       <Button
         variant="ghost"
         size="icon"

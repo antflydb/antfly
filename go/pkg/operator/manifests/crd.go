@@ -16,14 +16,14 @@ var antflyBackupCRDYAML []byte
 //go:embed crd/antfly.io_antflyrestores.yaml
 var antflyRestoreCRDYAML []byte
 
-//go:embed crd/antfly.io_termitepools.yaml
-var termitePoolCRDYAML []byte
+//go:embed crd/antfly.io_inferencepools.yaml
+var inferencePoolCRDYAML []byte
 
-//go:embed crd/antfly.io_externaltermitepools.yaml
-var externalTermitePoolCRDYAML []byte
+//go:embed crd/antfly.io_externalinferencepools.yaml
+var externalInferencePoolCRDYAML []byte
 
-//go:embed crd/antfly.io_termiteroutes.yaml
-var termiteRouteCRDYAML []byte
+//go:embed crd/antfly.io_inferenceproxies.yaml
+var inferenceRouteCRDYAML []byte
 
 // AntflyClusterCRD returns the parsed CustomResourceDefinition for AntflyCluster.
 func AntflyClusterCRD() (*apiextv1.CustomResourceDefinition, error) {
@@ -68,46 +68,46 @@ func AntflyRestoreCRDYAML() string {
 	return string(antflyRestoreCRDYAML)
 }
 
-// TermitePoolCRD returns the parsed CustomResourceDefinition for TermitePool.
-func TermitePoolCRD() (*apiextv1.CustomResourceDefinition, error) {
+// InferencePoolCRD returns the parsed CustomResourceDefinition for InferencePool.
+func InferencePoolCRD() (*apiextv1.CustomResourceDefinition, error) {
 	var crd apiextv1.CustomResourceDefinition
-	if err := yaml.Unmarshal(termitePoolCRDYAML, &crd); err != nil {
+	if err := yaml.Unmarshal(inferencePoolCRDYAML, &crd); err != nil {
 		return nil, err
 	}
 	return &crd, nil
 }
 
-// TermitePoolCRDYAML returns the raw CRD YAML for TermitePool.
-func TermitePoolCRDYAML() string {
-	return string(termitePoolCRDYAML)
+// InferencePoolCRDYAML returns the raw CRD YAML for InferencePool.
+func InferencePoolCRDYAML() string {
+	return string(inferencePoolCRDYAML)
 }
 
-// ExternalTermitePoolCRD returns the parsed CustomResourceDefinition for ExternalTermitePool.
-func ExternalTermitePoolCRD() (*apiextv1.CustomResourceDefinition, error) {
+// ExternalInferencePoolCRD returns the parsed CustomResourceDefinition for ExternalInferencePool.
+func ExternalInferencePoolCRD() (*apiextv1.CustomResourceDefinition, error) {
 	var crd apiextv1.CustomResourceDefinition
-	if err := yaml.Unmarshal(externalTermitePoolCRDYAML, &crd); err != nil {
+	if err := yaml.Unmarshal(externalInferencePoolCRDYAML, &crd); err != nil {
 		return nil, err
 	}
 	return &crd, nil
 }
 
-// ExternalTermitePoolCRDYAML returns the raw CRD YAML for ExternalTermitePool.
-func ExternalTermitePoolCRDYAML() string {
-	return string(externalTermitePoolCRDYAML)
+// ExternalInferencePoolCRDYAML returns the raw CRD YAML for ExternalInferencePool.
+func ExternalInferencePoolCRDYAML() string {
+	return string(externalInferencePoolCRDYAML)
 }
 
-// TermiteRouteCRD returns the parsed CustomResourceDefinition for TermiteRoute.
-func TermiteRouteCRD() (*apiextv1.CustomResourceDefinition, error) {
+// InferenceProxyCRD returns the parsed CustomResourceDefinition for InferenceProxy.
+func InferenceProxyCRD() (*apiextv1.CustomResourceDefinition, error) {
 	var crd apiextv1.CustomResourceDefinition
-	if err := yaml.Unmarshal(termiteRouteCRDYAML, &crd); err != nil {
+	if err := yaml.Unmarshal(inferenceRouteCRDYAML, &crd); err != nil {
 		return nil, err
 	}
 	return &crd, nil
 }
 
-// TermiteRouteCRDYAML returns the raw CRD YAML for TermiteRoute.
-func TermiteRouteCRDYAML() string {
-	return string(termiteRouteCRDYAML)
+// InferenceProxyCRDYAML returns the raw CRD YAML for InferenceProxy.
+func InferenceProxyCRDYAML() string {
+	return string(inferenceRouteCRDYAML)
 }
 
 // AllCRDs returns all CRDs needed for the omni Antfly operator as parsed objects.
@@ -124,15 +124,15 @@ func AllCRDs() ([]*apiextv1.CustomResourceDefinition, error) {
 	if err != nil {
 		return nil, err
 	}
-	termitePoolCRD, err := TermitePoolCRD()
+	inferencePoolCRD, err := InferencePoolCRD()
 	if err != nil {
 		return nil, err
 	}
-	externalTermitePoolCRD, err := ExternalTermitePoolCRD()
+	externalInferencePoolCRD, err := ExternalInferencePoolCRD()
 	if err != nil {
 		return nil, err
 	}
-	termiteRouteCRD, err := TermiteRouteCRD()
+	inferenceRouteCRD, err := InferenceProxyCRD()
 	if err != nil {
 		return nil, err
 	}
@@ -140,9 +140,9 @@ func AllCRDs() ([]*apiextv1.CustomResourceDefinition, error) {
 		clusterCRD,
 		backupCRD,
 		restoreCRD,
-		termitePoolCRD,
-		externalTermitePoolCRD,
-		termiteRouteCRD,
+		inferencePoolCRD,
+		externalInferencePoolCRD,
+		inferenceRouteCRD,
 	}, nil
 }
 
@@ -152,9 +152,9 @@ func AllCRDYAMLBytes() [][]byte {
 		antflyClusterCRDYAML,
 		antflyBackupCRDYAML,
 		antflyRestoreCRDYAML,
-		termitePoolCRDYAML,
-		externalTermitePoolCRDYAML,
-		termiteRouteCRDYAML,
+		inferencePoolCRDYAML,
+		externalInferencePoolCRDYAML,
+		inferenceRouteCRDYAML,
 	}
 }
 
@@ -164,7 +164,7 @@ func AllCRDsYAML() string {
 	return AntflyClusterCRDYAML() +
 		"---\n" + AntflyBackupCRDYAML() +
 		"---\n" + AntflyRestoreCRDYAML() +
-		"---\n" + TermitePoolCRDYAML() +
-		"---\n" + ExternalTermitePoolCRDYAML() +
-		"---\n" + TermiteRouteCRDYAML()
+		"---\n" + InferencePoolCRDYAML() +
+		"---\n" + ExternalInferencePoolCRDYAML() +
+		"---\n" + InferenceProxyCRDYAML()
 }

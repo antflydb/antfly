@@ -5,21 +5,21 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.termite_error import TermiteError
-from ...models.termite_rerank_request import TermiteRerankRequest
-from ...models.termite_rerank_response import TermiteRerankResponse
+from ...models.inference_error import InferenceError
+from ...models.inference_rerank_request import InferenceRerankRequest
+from ...models.inference_rerank_response import InferenceRerankResponse
 from ...types import Response
 
 
 def _get_kwargs(
     *,
-    body: TermiteRerankRequest,
+    body: InferenceRerankRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/ml/v1/rerank",
+        "url": "/ai/v1/rerank",
     }
 
     _kwargs["json"] = body.to_dict()
@@ -32,29 +32,29 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> TermiteError | TermiteRerankResponse | None:
+) -> InferenceError | InferenceRerankResponse | None:
     if response.status_code == 200:
-        response_200 = TermiteRerankResponse.from_dict(response.json())
+        response_200 = InferenceRerankResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 400:
-        response_400 = TermiteError.from_dict(response.json())
+        response_400 = InferenceError.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 404:
-        response_404 = TermiteError.from_dict(response.json())
+        response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
     if response.status_code == 500:
-        response_500 = TermiteError.from_dict(response.json())
+        response_500 = InferenceError.from_dict(response.json())
 
         return response_500
 
     if response.status_code == 503:
-        response_503 = TermiteError.from_dict(response.json())
+        response_503 = InferenceError.from_dict(response.json())
 
         return response_503
 
@@ -66,7 +66,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[TermiteError | TermiteRerankResponse]:
+) -> Response[InferenceError | InferenceRerankResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -78,8 +78,8 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteRerankRequest,
-) -> Response[TermiteError | TermiteRerankResponse]:
+    body: InferenceRerankRequest,
+) -> Response[InferenceError | InferenceRerankResponse]:
     """Rerank prompts by relevance
 
      Re-scores pre-rendered text prompts based on relevance to a query using native or ONNX reranking
@@ -92,7 +92,7 @@ def sync_detailed(
     2. Render any templates
     3. Send pre-rendered text strings as `prompts`
 
-    This design keeps Termite stateless and allows clients to customize rendering logic.
+    This design keeps inference stateless and allows clients to customize rendering logic.
 
     ## Models
 
@@ -110,14 +110,14 @@ def sync_detailed(
     `lib/reranking` package which handles rendering before calling this endpoint.
 
     Args:
-        body (TermiteRerankRequest):
+        body (InferenceRerankRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteRerankResponse]
+        Response[InferenceError | InferenceRerankResponse]
     """
 
     kwargs = _get_kwargs(
@@ -134,8 +134,8 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteRerankRequest,
-) -> TermiteError | TermiteRerankResponse | None:
+    body: InferenceRerankRequest,
+) -> InferenceError | InferenceRerankResponse | None:
     """Rerank prompts by relevance
 
      Re-scores pre-rendered text prompts based on relevance to a query using native or ONNX reranking
@@ -148,7 +148,7 @@ def sync(
     2. Render any templates
     3. Send pre-rendered text strings as `prompts`
 
-    This design keeps Termite stateless and allows clients to customize rendering logic.
+    This design keeps inference stateless and allows clients to customize rendering logic.
 
     ## Models
 
@@ -166,14 +166,14 @@ def sync(
     `lib/reranking` package which handles rendering before calling this endpoint.
 
     Args:
-        body (TermiteRerankRequest):
+        body (InferenceRerankRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteRerankResponse
+        InferenceError | InferenceRerankResponse
     """
 
     return sync_detailed(
@@ -185,8 +185,8 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteRerankRequest,
-) -> Response[TermiteError | TermiteRerankResponse]:
+    body: InferenceRerankRequest,
+) -> Response[InferenceError | InferenceRerankResponse]:
     """Rerank prompts by relevance
 
      Re-scores pre-rendered text prompts based on relevance to a query using native or ONNX reranking
@@ -199,7 +199,7 @@ async def asyncio_detailed(
     2. Render any templates
     3. Send pre-rendered text strings as `prompts`
 
-    This design keeps Termite stateless and allows clients to customize rendering logic.
+    This design keeps inference stateless and allows clients to customize rendering logic.
 
     ## Models
 
@@ -217,14 +217,14 @@ async def asyncio_detailed(
     `lib/reranking` package which handles rendering before calling this endpoint.
 
     Args:
-        body (TermiteRerankRequest):
+        body (InferenceRerankRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteRerankResponse]
+        Response[InferenceError | InferenceRerankResponse]
     """
 
     kwargs = _get_kwargs(
@@ -239,8 +239,8 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteRerankRequest,
-) -> TermiteError | TermiteRerankResponse | None:
+    body: InferenceRerankRequest,
+) -> InferenceError | InferenceRerankResponse | None:
     """Rerank prompts by relevance
 
      Re-scores pre-rendered text prompts based on relevance to a query using native or ONNX reranking
@@ -253,7 +253,7 @@ async def asyncio(
     2. Render any templates
     3. Send pre-rendered text strings as `prompts`
 
-    This design keeps Termite stateless and allows clients to customize rendering logic.
+    This design keeps inference stateless and allows clients to customize rendering logic.
 
     ## Models
 
@@ -271,14 +271,14 @@ async def asyncio(
     `lib/reranking` package which handles rendering before calling this endpoint.
 
     Args:
-        body (TermiteRerankRequest):
+        body (InferenceRerankRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteRerankResponse
+        InferenceError | InferenceRerankResponse
     """
 
     return (

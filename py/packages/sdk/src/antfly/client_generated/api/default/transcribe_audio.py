@@ -5,21 +5,21 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.termite_error import TermiteError
-from ...models.termite_transcribe_request import TermiteTranscribeRequest
-from ...models.termite_transcribe_response import TermiteTranscribeResponse
+from ...models.inference_error import InferenceError
+from ...models.inference_transcribe_request import InferenceTranscribeRequest
+from ...models.inference_transcribe_response import InferenceTranscribeResponse
 from ...types import Response
 
 
 def _get_kwargs(
     *,
-    body: TermiteTranscribeRequest,
+    body: InferenceTranscribeRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/ml/v1/transcribe",
+        "url": "/ai/v1/transcribe",
     }
 
     _kwargs["json"] = body.to_dict()
@@ -32,29 +32,29 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> TermiteError | TermiteTranscribeResponse | None:
+) -> InferenceError | InferenceTranscribeResponse | None:
     if response.status_code == 200:
-        response_200 = TermiteTranscribeResponse.from_dict(response.json())
+        response_200 = InferenceTranscribeResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 400:
-        response_400 = TermiteError.from_dict(response.json())
+        response_400 = InferenceError.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 404:
-        response_404 = TermiteError.from_dict(response.json())
+        response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
     if response.status_code == 500:
-        response_500 = TermiteError.from_dict(response.json())
+        response_500 = InferenceError.from_dict(response.json())
 
         return response_500
 
     if response.status_code == 503:
-        response_503 = TermiteError.from_dict(response.json())
+        response_503 = InferenceError.from_dict(response.json())
 
         return response_503
 
@@ -66,7 +66,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[TermiteError | TermiteTranscribeResponse]:
+) -> Response[InferenceError | InferenceTranscribeResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -78,8 +78,8 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteTranscribeRequest,
-) -> Response[TermiteError | TermiteTranscribeResponse]:
+    body: InferenceTranscribeRequest,
+) -> Response[InferenceError | InferenceTranscribeResponse]:
     r"""Transcribe audio to text (speech-to-text)
 
      Transcribes audio to text using Speech2Seq models like Whisper, Wav2Vec2, or HuBERT.
@@ -120,14 +120,14 @@ def sync_detailed(
     ```
 
     Args:
-        body (TermiteTranscribeRequest):
+        body (InferenceTranscribeRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteTranscribeResponse]
+        Response[InferenceError | InferenceTranscribeResponse]
     """
 
     kwargs = _get_kwargs(
@@ -144,8 +144,8 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteTranscribeRequest,
-) -> TermiteError | TermiteTranscribeResponse | None:
+    body: InferenceTranscribeRequest,
+) -> InferenceError | InferenceTranscribeResponse | None:
     r"""Transcribe audio to text (speech-to-text)
 
      Transcribes audio to text using Speech2Seq models like Whisper, Wav2Vec2, or HuBERT.
@@ -186,14 +186,14 @@ def sync(
     ```
 
     Args:
-        body (TermiteTranscribeRequest):
+        body (InferenceTranscribeRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteTranscribeResponse
+        InferenceError | InferenceTranscribeResponse
     """
 
     return sync_detailed(
@@ -205,8 +205,8 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteTranscribeRequest,
-) -> Response[TermiteError | TermiteTranscribeResponse]:
+    body: InferenceTranscribeRequest,
+) -> Response[InferenceError | InferenceTranscribeResponse]:
     r"""Transcribe audio to text (speech-to-text)
 
      Transcribes audio to text using Speech2Seq models like Whisper, Wav2Vec2, or HuBERT.
@@ -247,14 +247,14 @@ async def asyncio_detailed(
     ```
 
     Args:
-        body (TermiteTranscribeRequest):
+        body (InferenceTranscribeRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteTranscribeResponse]
+        Response[InferenceError | InferenceTranscribeResponse]
     """
 
     kwargs = _get_kwargs(
@@ -269,8 +269,8 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteTranscribeRequest,
-) -> TermiteError | TermiteTranscribeResponse | None:
+    body: InferenceTranscribeRequest,
+) -> InferenceError | InferenceTranscribeResponse | None:
     r"""Transcribe audio to text (speech-to-text)
 
      Transcribes audio to text using Speech2Seq models like Whisper, Wav2Vec2, or HuBERT.
@@ -311,14 +311,14 @@ async def asyncio(
     ```
 
     Args:
-        body (TermiteTranscribeRequest):
+        body (InferenceTranscribeRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteTranscribeResponse
+        InferenceError | InferenceTranscribeResponse
     """
 
     return (

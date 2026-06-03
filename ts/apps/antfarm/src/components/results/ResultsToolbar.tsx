@@ -85,7 +85,7 @@ const ResultsToolbar: React.FC<ResultsToolbarProps> = ({
   };
 
   return (
-    <div className="flex flex-col gap-3 p-4 bg-muted/30 rounded-lg border">
+    <div className="flex flex-col gap-3 p-4 bg-muted/30 rounded-none border">
       {/* Top Row: Stats and View Mode */}
       <div className="flex items-center justify-between flex-wrap gap-2">
         {/* Stats */}
@@ -103,7 +103,7 @@ const ResultsToolbar: React.FC<ResultsToolbarProps> = ({
         </div>
 
         {/* View Mode Toggle */}
-        <div className="flex items-center gap-1 bg-background rounded-md border p-1">
+        <div className="flex items-center gap-1 bg-background rounded-none border p-1">
           <Button
             variant={viewMode === "cards" ? "secondary" : "ghost"}
             size="sm"

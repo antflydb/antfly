@@ -904,7 +904,7 @@ fn runSwarmWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: SwarmWikiC
         terminateWikiSwarm(io, &child);
     };
 
-    const base_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/api/v1", .{ cfg.bind_host, cfg.bind_port });
+    const base_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/db/v1", .{ cfg.bind_host, cfg.bind_port });
     defer alloc.free(base_uri);
     const health_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/healthz", .{ cfg.bind_host, cfg.health_port });
     defer alloc.free(health_uri);

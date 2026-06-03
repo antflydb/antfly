@@ -30,7 +30,7 @@ func TestResolveCapabilities_ExactMatch(t *testing.T) {
 
 func TestResolveCapabilities_ProviderPrefix(t *testing.T) {
 	// Models with provider/ prefix should resolve to base model capabilities
-	// This is critical for Termite models like "openai/clip-vit-base-patch32"
+	// This is critical for Inference models like "openai/clip-vit-base-patch32"
 	testCases := []struct {
 		model            string
 		expectMultimodal bool

@@ -6,7 +6,7 @@ A monorepo containing TypeScript/JavaScript packages for Antfly.
 
 | Package | Description | npm |
 |---------|-------------|-----|
-| [@antfly/sdk](./packages/sdk) | TypeScript SDK for the Antfly and Termite APIs | [![npm](https://img.shields.io/npm/v/@antfly/sdk.svg)](https://www.npmjs.com/package/@antfly/sdk) |
+| [@antfly/sdk](./packages/sdk) | TypeScript SDK for the Antfly and Antfly inference APIs | [![npm](https://img.shields.io/npm/v/@antfly/sdk.svg)](https://www.npmjs.com/package/@antfly/sdk) |
 | [@antfly/components](./packages/components) | React components for building search interfaces | [![npm](https://img.shields.io/npm/v/@antfly/components.svg)](https://www.npmjs.com/package/@antfly/components) |
 
 ## Quick Start

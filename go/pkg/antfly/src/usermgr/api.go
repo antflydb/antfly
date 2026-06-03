@@ -14,7 +14,7 @@
 
 //go:build go1.24
 
-//go:generate go tool oapi-codegen --config=cfg.yaml ./api.yaml
+//go:generate go tool oapi-codegen --config=cfg.yaml ../../../../../specs/openapi/auth/api.yaml
 package usermgr
 
 import (
@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -88,6 +89,49 @@ func (um *UserApi) GetCurrentUser(
 		"permissions": permissions,
 	}
 	um.jsonResponse(w, response, http.StatusOK)
+}
+
+func (um *UserApi) ListAuthSubjects(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	subjects, err := um.um.ListAuthSubjects()
+	if err != nil {
+		um.httpError(w, "Failed to list auth subjects", http.StatusInternalServerError, err)
+		return
+	}
+
+	users, err := um.um.ListUsers()
+	if err != nil {
+		um.httpError(w, "Failed to classify auth subjects", http.StatusInternalServerError, err)
+		return
+	}
+	userSet := make(map[string]struct{}, len(users))
+	for _, user := range users {
+		userSet[user] = struct{}{}
+	}
+
+	result := make([]AuthSubject, len(subjects))
+	for i, subject := range subjects {
+		result[i] = AuthSubject{
+			Subject: subject,
+			Kind:    authSubjectKind(subject, userSet),
+		}
+	}
+	um.jsonResponse(w, result, http.StatusOK)
+}
+
+func authSubjectKind(subject string, users map[string]struct{}) AuthSubjectKind {
+	if _, ok := users[subject]; ok {
+		return AuthSubjectKindUser
+	}
+	if strings.HasPrefix(subject, "role:") {
+		return AuthSubjectKindRole
+	}
+	if strings.HasPrefix(subject, "group:") {
+		return AuthSubjectKindGroup
+	}
+	return AuthSubjectKindSubject
 }
 
 func (um *UserApi) ListUsers(
@@ -321,6 +365,75 @@ func (um *UserApi) RemovePermissionFromUser(
 	um.jsonResponse(w, nil, http.StatusNoContent)
 }
 
+func (um *UserApi) ListUserRoles(
+	w http.ResponseWriter,
+	r *http.Request,
+	userName UserNamePathParameter,
+) {
+	roles, err := um.um.GetRolesForUser(userName)
+	if err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			um.httpError(w, ErrUserNotFound.Error(), http.StatusNotFound, err)
+		} else {
+			um.httpError(w, "Failed to list user roles", http.StatusInternalServerError, err)
+		}
+		return
+	}
+	um.jsonResponse(w, roles, http.StatusOK)
+}
+
+func (um *UserApi) AddRoleToUser(
+	w http.ResponseWriter,
+	r *http.Request,
+	userName UserNamePathParameter,
+) {
+	var assignment RoleAssignment
+	if err := json.NewDecoder(r.Body).Decode(&assignment); err != nil {
+		um.httpError(w, "Invalid request body: "+err.Error(), http.StatusBadRequest, err)
+		return
+	}
+	defer func() { _ = r.Body.Close() }()
+
+	if assignment.Role == "" {
+		um.httpError(w, "Role is required", http.StatusBadRequest, nil)
+		return
+	}
+
+	if err := um.um.AddRoleToUser(userName, assignment.Role); err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			um.httpError(w, ErrUserNotFound.Error(), http.StatusNotFound, err)
+		} else {
+			um.httpError(w, "Failed to add role", http.StatusInternalServerError, err)
+		}
+		return
+	}
+	um.jsonResponse(w, map[string]string{"message": "Role added successfully"}, http.StatusCreated)
+}
+
+func (um *UserApi) RemoveRoleFromUser(
+	w http.ResponseWriter,
+	r *http.Request,
+	userName UserNamePathParameter,
+	params RemoveRoleFromUserParams,
+) {
+	if params.Role == "" {
+		um.httpError(w, "Role is required", http.StatusBadRequest, nil)
+		return
+	}
+
+	if err := um.um.RemoveRoleFromUser(userName, params.Role); err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			um.httpError(w, ErrUserNotFound.Error(), http.StatusNotFound, err)
+		} else if errors.Is(err, ErrRoleNotFound) {
+			um.httpError(w, ErrRoleNotFound.Error(), http.StatusNotFound, err)
+		} else {
+			um.httpError(w, "Failed to remove role", http.StatusInternalServerError, err)
+		}
+		return
+	}
+	um.jsonResponse(w, nil, http.StatusNoContent)
+}
+
 func (um *UserApi) ListApiKeys(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -525,6 +638,86 @@ func (um *UserApi) RemoveRowFilter(
 	um.jsonResponse(w, nil, http.StatusNoContent)
 }
 
+func (um *UserApi) ListSubjectRowFilters(
+	w http.ResponseWriter,
+	r *http.Request,
+	subject SubjectPathParameter,
+) {
+	entries, err := um.um.ListSubjectRowFilters(subject)
+	if err != nil {
+		um.httpError(w, "Failed to list subject row filters", http.StatusInternalServerError, err)
+		return
+	}
+	um.jsonResponse(w, rowFilterEntries(entries), http.StatusOK)
+}
+
+func (um *UserApi) GetSubjectRowFilter(
+	w http.ResponseWriter,
+	r *http.Request,
+	subject SubjectPathParameter,
+	table string,
+) {
+	filterJSON, err := um.um.GetSubjectRowFilter(subject, table)
+	if err != nil {
+		if errors.Is(err, ErrRowFilterNotFound) {
+			um.httpError(w, ErrRowFilterNotFound.Error(), http.StatusNotFound, err)
+		} else {
+			um.httpError(w, "Failed to get subject row filter", http.StatusInternalServerError, err)
+		}
+		return
+	}
+	um.jsonResponse(w, RowFilterEntry{
+		Table:  table,
+		Filter: rawToMap(filterJSON),
+	}, http.StatusOK)
+}
+
+func (um *UserApi) SetSubjectRowFilter(
+	w http.ResponseWriter,
+	r *http.Request,
+	subject SubjectPathParameter,
+	table string,
+) {
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		um.httpError(w, "Invalid request body: "+err.Error(), http.StatusBadRequest, err)
+		return
+	}
+	defer func() { _ = r.Body.Close() }()
+
+	filterJSON, err := json.Marshal(body)
+	if err != nil {
+		um.httpError(w, "Failed to marshal filter", http.StatusBadRequest, err)
+		return
+	}
+
+	if err := um.um.SetSubjectRowFilter(subject, table, filterJSON); err != nil {
+		um.httpError(w, "Failed to set subject row filter: "+err.Error(), http.StatusBadRequest, err)
+		return
+	}
+	um.jsonResponse(w, RowFilterEntry{
+		Table:  table,
+		Filter: body,
+	}, http.StatusOK)
+}
+
+func (um *UserApi) RemoveSubjectRowFilter(
+	w http.ResponseWriter,
+	r *http.Request,
+	subject SubjectPathParameter,
+	table string,
+) {
+	if err := um.um.RemoveSubjectRowFilter(subject, table); err != nil {
+		if errors.Is(err, ErrRowFilterNotFound) {
+			um.httpError(w, ErrRowFilterNotFound.Error(), http.StatusNotFound, err)
+		} else {
+			um.httpError(w, "Failed to remove subject row filter", http.StatusInternalServerError, err)
+		}
+		return
+	}
+	um.jsonResponse(w, nil, http.StatusNoContent)
+}
+
 func (um *UserApi) DeleteApiKey(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -540,6 +733,17 @@ func (um *UserApi) DeleteApiKey(
 		return
 	}
 	um.jsonResponse(w, nil, http.StatusNoContent)
+}
+
+func rowFilterEntries(entries []rowFilterPolicy) []RowFilterEntry {
+	result := make([]RowFilterEntry, len(entries))
+	for i, e := range entries {
+		result[i] = RowFilterEntry{
+			Table:  e.Table,
+			Filter: rawToMap(e.Filter),
+		}
+	}
+	return result
 }
 
 // rawToMap converts json.RawMessage to map[string]interface{} for the generated types.

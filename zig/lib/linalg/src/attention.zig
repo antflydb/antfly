@@ -1354,7 +1354,7 @@ test "flashCausalAttentionHost uses local bias columns with kv offset" {
 
 // Reference materialized softmax(Q @ K^T / sqrt(d)) @ V with optional bias
 // and per-position mask, mirroring the legacy sdpaOp body in
-// pkg/termite/src/ops/native_compute.zig (head-major Q/K/V layout:
+// pkg/inference/src/ops/native_compute.zig (head-major Q/K/V layout:
 // `[batch, num_heads, seq, head_dim]`).  Used to verify flashAttentionHost.
 fn referenceSdpaForTest(
     allocator: std.mem.Allocator,

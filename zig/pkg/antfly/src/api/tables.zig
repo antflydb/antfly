@@ -26,6 +26,7 @@ const schema_openapi = @import("antfly_schema_openapi");
 const schema_mod = @import("../schema/mod.zig");
 const runtime_schema_mod = @import("../storage/schema.zig");
 const algebraic_mod = @import("../storage/db/algebraic/mod.zig");
+const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const full_text_indexes = @import("full_text_indexes.zig");
 const json_helpers = @import("json_helpers.zig");
 
@@ -41,10 +42,51 @@ pub fn effectiveSchemaJson(schema_json: ?[]const u8) []const u8 {
 }
 
 pub const ParsedTableSchema = schema_mod.ParsedTableSchema;
+pub const LsmStorageStatus = struct {
+    // Table status intentionally exposes a compact operational snapshot. Full
+    // low-level WAL and scheduler counters remain available through metrics.
+    run_count: u64 = 0,
+    run_bytes: u64 = 0,
+    l0_run_count: u64 = 0,
+    l0_bytes: u64 = 0,
+    wal_retained_bytes: u64 = 0,
+    compaction_backlog_bytes: u64 = 0,
+    active_readers: u64 = 0,
+};
+
 pub const TableStorageStatus = struct {
     table_name: []const u8,
     empty: bool,
+    lsm: ?LsmStorageStatus = null,
 };
+
+pub fn lsmStorageStatusFromMaintenanceStats(maintenance: lsm_backend.Backend.MaintenanceStats) LsmStorageStatus {
+    return .{
+        .run_count = maintenance.total_runs,
+        .run_bytes = maintenance.total_run_bytes,
+        .l0_run_count = maintenance.l0_runs,
+        .l0_bytes = maintenance.l0_bytes,
+        .wal_retained_bytes = maintenance.wal_retained_bytes,
+        .compaction_backlog_bytes = maintenance.compaction_scheduler_remembered_pending_bytes,
+        .active_readers = maintenance.active_readers,
+    };
+}
+
+fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStorageStatus {
+    return .{
+        .run_count = u64ToI64(status.run_count),
+        .run_bytes = u64ToI64(status.run_bytes),
+        .l0_run_count = u64ToI64(status.l0_run_count),
+        .l0_bytes = u64ToI64(status.l0_bytes),
+        .wal_retained_bytes = u64ToI64(status.wal_retained_bytes),
+        .compaction_backlog_bytes = u64ToI64(status.compaction_backlog_bytes),
+        .active_readers = u64ToI64(status.active_readers),
+    };
+}
+
+fn u64ToI64(value: u64) i64 {
+    return if (value > std.math.maxInt(i64)) std.math.maxInt(i64) else @intCast(value);
+}
 
 const RuntimeSchemaDebugBinding = struct {
     index_name: []const u8,
@@ -462,8 +504,10 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
 }
 
 pub fn deriveInitialRange(table: metadata_table_manager.TableRecord) metadata_table_manager.RangeRecord {
+    const group_id = deriveDataGroupId(table.name, 0x47525031);
     return .{
-        .group_id = deriveDataGroupId(table.name, 0x47525031),
+        .group_id = group_id,
+        .range_id = group_id,
         .table_id = table.table_id,
         .start_key = "",
         .end_key = null,
@@ -475,9 +519,11 @@ pub fn deriveInitialRanges(
     table: metadata_table_manager.TableRecord,
 ) ![]metadata_table_manager.RangeRecord {
     if (table.min_ranges <= 1) {
+        const initial_range = deriveInitialRange(table);
         const out = try alloc.alloc(metadata_table_manager.RangeRecord, 1);
         out[0] = .{
-            .group_id = deriveInitialRange(table).group_id,
+            .group_id = initial_range.group_id,
+            .range_id = initial_range.range_id,
             .table_id = table.table_id,
             .start_key = try alloc.dupe(u8, ""),
             .end_key = null,
@@ -509,8 +555,10 @@ pub fn deriveInitialRanges(
             try deriveShardBoundaryKey(alloc, i + 1, shard_count);
         errdefer if (end_key) |value| alloc.free(value);
 
+        const group_id = deriveShardGroupId(table.name, i);
         out[i] = .{
-            .group_id = deriveShardGroupId(table.name, i),
+            .group_id = group_id,
+            .range_id = group_id,
             .table_id = table.table_id,
             .start_key = start_key,
             .end_key = end_key,
@@ -621,6 +669,10 @@ fn buildTableStatus(
     }
 
     const empty = if (storage_status) |status| status.empty else ranges.len == 0;
+    const lsm_status = if (storage_status) |status|
+        if (status.lsm) |lsm| generatedLsmStorageStatus(lsm) else null
+    else
+        null;
     return .{
         .name = table.name,
         .description = if (table.description.len > 0) table.description else null,
@@ -635,6 +687,7 @@ fn buildTableStatus(
         .storage_status = .{
             .disk_usage = 0,
             .empty = empty,
+            .lsm = lsm_status,
         },
     };
 }
@@ -1507,6 +1560,7 @@ fn antflyTypeName(value: runtime_schema_mod.AntflyType) []const u8 {
 
 fn queryNeedsPrimaryTextIndex(req: db_mod.types.SearchRequest) bool {
     if (req.full_text != null) return true;
+    if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) return true;
     if (req.full_text_queries.len > 0) return false;
 
     return switch (req.query) {
@@ -1843,11 +1897,28 @@ test "metadata.table status encoder honors storage status overrides" {
         .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
         .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
     };
-    const storage_statuses = [_]TableStorageStatus{.{ .table_name = "docs", .empty = true }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = true,
+        .lsm = .{
+            .run_count = 3,
+            .run_bytes = 44,
+            .l0_run_count = 1,
+            .l0_bytes = 33,
+            .wal_retained_bytes = 55,
+            .compaction_backlog_bytes = 10,
+            .active_readers = 2,
+        },
+    }};
 
     const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true,\"lsm\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"run_count\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"l0_bytes\":33") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":55") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_backlog_bytes\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_readers\":2") != null);
 }
 
 test "metadata.table status encoder canonicalizes embeddings indexes without inline names" {
@@ -2250,6 +2321,37 @@ test "metadata.query routing preserves vector index and records read schema text
     defer if (req.index_name) |index_name| std.testing.allocator.free(index_name);
     defer if (req.primary_text_index_name) |index_name| std.testing.allocator.free(index_name);
     defer std.testing.allocator.free(req.filter_query_json);
+
+    try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
+    try std.testing.expectEqualStrings("dense_idx", req.index_name.?);
+    try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+}
+
+test "metadata.query routing selects read schema text index for vector-only structured filters" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":3}",
+        .read_schema_json = "{\"version\":0}",
+        .indexes_json = "{\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v3\":{\"type\":\"full_text\"}}",
+        .placement_role = "data",
+    };
+    var req: db_mod.types.SearchRequest = .{
+        .query = .{ .dense_knn = .{
+            .vector = try std.testing.allocator.dupe(f32, &.{ 1, 2, 3 }),
+            .k = 10,
+        } },
+        .index_name = try std.testing.allocator.dupe(u8, "dense_idx"),
+        .filter_query_json = try std.testing.allocator.dupe(u8, "{\"term\":{\"status\":\"active\"}}"),
+        .exclusion_query_json = try std.testing.allocator.dupe(u8, "{\"term\":{\"archived\":true}}"),
+    };
+    defer if (req.index_name) |index_name| std.testing.allocator.free(index_name);
+    defer if (req.primary_text_index_name) |index_name| std.testing.allocator.free(index_name);
+    defer {
+        std.testing.allocator.free(req.query.dense_knn.vector);
+        std.testing.allocator.free(req.filter_query_json);
+        std.testing.allocator.free(req.exclusion_query_json);
+    }
 
     try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
     try std.testing.expectEqualStrings("dense_idx", req.index_name.?);

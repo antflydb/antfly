@@ -34,7 +34,7 @@ Supported intent includes:
 - metadata node count and resources
 - data node count and resources
 - swarm-mode resources
-- inference pool attachment through Termite
+- inference pool attachment through Inference
 - metadata, data, and swarm storage sizes
 - data-node autoscaling bounds
 - cloud-specific placement and service settings
@@ -45,40 +45,40 @@ conditions. Consumers should use those fields to determine whether a requested
 operation has completed. Inspecting child StatefulSets, PVCs, or HPAs directly is
 useful for debugging, but should not be the primary completion signal.
 
-## Termite Inference Pools
+## Inference Inference Pools
 
-The operator exposes Termite inference as part of the Antfly cluster contract
-without collapsing Termite and Antfly into one reconciler. `AntflyCluster` is the
-product-level API a user or cloud control plane can submit, while `TermitePool`
+The operator exposes Inference inference as part of the Antfly cluster contract
+without collapsing Inference and Antfly into one reconciler. `AntflyCluster` is the
+product-level API a user or cloud control plane can submit, while `InferencePool`
 remains the reusable inference primitive with its own reconciliation loop,
 autoscaling, model pullers, scheduling, and readiness conditions.
 
-`spec.termite.mode` selects how inference capacity is provided:
+`spec.inference.mode` selects how inference capacity is provided:
 
-- `PlatformShared`: use platform-operated shared TermitePools. These pools are
+- `PlatformShared`: use platform-operated shared InferencePools. These pools are
   managed outside the customer cluster and are suitable for common models,
   zero-config onboarding, and shared warm capacity.
-- `Managed`: create TermitePools owned by this AntflyCluster. This is suitable
+- `Managed`: create InferencePools owned by this AntflyCluster. This is suitable
   for customer-specific models, dedicated capacity, stricter isolation, and
   cluster-local scaling rules.
-- `SharedRef`: reference existing customer-managed TermitePools. This is useful
+- `SharedRef`: reference existing customer-managed InferencePools. This is useful
   when multiple AntflyClusters share one inference tier.
-- `Disabled`: do not configure cluster-level Termite inference.
+- `Disabled`: do not configure cluster-level Inference inference.
 
-Managed pools are declared under `spec.termite.managedPools`. The operator
-creates child `TermitePool` resources, sets owner references, applies the
-default Termite image when the pool does not specify one, and deletes stale
-owned pools when the AntflyCluster no longer requests them. The TermitePool
+Managed pools are declared under `spec.inference.managedPools`. The operator
+creates child `InferencePool` resources, sets owner references, applies the
+default Inference image when the pool does not specify one, and deletes stale
+owned pools when the AntflyCluster no longer requests them. The InferencePool
 controller remains responsible for creating the StatefulSet, model-puller init
 containers, service, HPA, scheduling, and status.
 
-Shared and platform pools are declared under `spec.termite.sharedPools` and
-`spec.termite.platformPools`. The AntflyCluster reconciler records that the
+Shared and platform pools are declared under `spec.inference.sharedPools` and
+`spec.inference.platformPools`. The AntflyCluster reconciler records that the
 references are configured but does not mutate or delete those pools. Ownership
 is explicit: referenced pools may be reused across clusters, while managed pools
 belong to the declaring AntflyCluster.
 
-Model references in TermitePool specs are canonical tags in
+Model references in InferencePool specs are canonical tags in
 `models.preload[].name`, for example:
 
 ```yaml
@@ -91,7 +91,7 @@ models:
 ```
 
 The operator should not synthesize a separate model `variant` field. The Zig
-runtime contract is `/antfly termite pull <model-ref> --models-dir /models`,
+runtime contract is `/antfly inference pull <model-ref> --models-dir /models`,
 with `--tasks` and `--capabilities` added when the model preload spec declares
 them.
 

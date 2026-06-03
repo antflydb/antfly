@@ -101,7 +101,7 @@ Dry run to preview changes:
 
 **Flags:**
 - `--input` - Input JSON file path (default: `docs.json`)
-- `--url` - Antfly API URL (default: `http://localhost:8080/api/v1`)
+- `--url` - Antfly API URL (default: `http://localhost:8080/db/v1`)
 - `--table` - Table name to merge into (default: `docs`)
 - `--create-table` - Create table if it doesn't exist (default: `false`)
 - `--num-shards` - Number of shards for new table (default: `1`)
@@ -125,7 +125,7 @@ Full pipeline - process files and load directly (original behavior):
 
 **Flags:**
 - `--dir` *(required)* - Path to directory containing documentation files
-- `--url` - Antfly API URL (default: `http://localhost:8080/api/v1`)
+- `--url` - Antfly API URL (default: `http://localhost:8080/db/v1`)
 - `--table` - Table name to merge into (default: `docs`)
 - `--base-url` - Base URL for generating document links (e.g., `https://docs.example.com`)
 - `--create-table` - Create table if it doesn't exist (default: `false`)
@@ -400,7 +400,7 @@ Once ingested, you can query by document type:
 ### Search all markdown sections
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/tables/docs/query \
+curl -X POST http://localhost:8080/db/v1/tables/docs/query \
   -H "Content-Type: application/json" \
   -d '{
     "query": {
@@ -415,7 +415,7 @@ curl -X POST http://localhost:8080/api/v1/tables/docs/query \
 ### Search OpenAPI paths
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/tables/docs/query \
+curl -X POST http://localhost:8080/db/v1/tables/docs/query \
   -H "Content-Type: application/json" \
   -d '{
     "query": {
@@ -430,7 +430,7 @@ curl -X POST http://localhost:8080/api/v1/tables/docs/query \
 ### Filter by HTTP method
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/tables/docs/query \
+curl -X POST http://localhost:8080/db/v1/tables/docs/query \
   -H "Content-Type: application/json" \
   -d '{
     "query": {
@@ -447,7 +447,7 @@ curl -X POST http://localhost:8080/api/v1/tables/docs/query \
 ### Get OpenAPI schemas
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/tables/docs/query \
+curl -X POST http://localhost:8080/db/v1/tables/docs/query \
   -H "Content-Type: application/json" \
   -d '{
     "query": {

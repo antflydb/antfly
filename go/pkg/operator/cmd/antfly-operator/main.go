@@ -24,12 +24,12 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
-	termitev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/termite/v1alpha1"
+	inferencev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
 	bootstrap "github.com/antflydb/antfly/go/pkg/operator/bootstrap/antfly"
 	controllers "github.com/antflydb/antfly/go/pkg/operator/controllers/antfly"
-	termitecontrollers "github.com/antflydb/antfly/go/pkg/operator/controllers/termite"
+	inferencecontrollers "github.com/antflydb/antfly/go/pkg/operator/controllers/inference"
 	webhookv1 "github.com/antflydb/antfly/go/pkg/operator/internal/webhook/antfly/v1"
-	termitewebhookv1alpha1 "github.com/antflydb/antfly/go/pkg/operator/internal/webhook/termite/v1alpha1"
+	inferencewebhookv1alpha1 "github.com/antflydb/antfly/go/pkg/operator/internal/webhook/inference/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 )
 
@@ -38,12 +38,12 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
-const defaultTermiteOmniImage = "ghcr.io/antflydb/antfly:omni"
+const defaultInferenceOmniImage = "ghcr.io/antflydb/antfly:omni"
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(antflyv1.AddToScheme(scheme))
-	utilruntime.Must(termitev1alpha1.AddToScheme(scheme))
+	utilruntime.Must(inferencev1alpha1.AddToScheme(scheme))
 	utilruntime.Must(metricsv1beta1.AddToScheme(scheme))
 	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
 }
@@ -53,8 +53,8 @@ func main() {
 	var enableLeaderElection bool
 	var probeAddr string
 	var skipCRDInstall bool
-	var enableTermiteControllers bool
-	var termiteAntflyImage string
+	var enableInferenceControllers bool
+	var inferenceAntflyImage string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -62,10 +62,10 @@ func main() {
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.BoolVar(&skipCRDInstall, "skip-crd-install", false,
 		"Skip automatic CRD installation (use if CRDs managed externally)")
-	flag.BoolVar(&enableTermiteControllers, "enable-termite-controllers", true,
-		"Enable TermitePool and TermiteRoute controllers and AntflyCluster.spec.termite management. CRD installation remains unconditional unless --skip-crd-install is set.")
-	flag.StringVar(&termiteAntflyImage, "termite-antfly-image", defaultTermiteOmniImage,
-		"Default omni Antfly image for TermitePool pods. The image must provide the /antfly termite runtime contract.")
+	flag.BoolVar(&enableInferenceControllers, "enable-inference-controllers", true,
+		"Enable InferencePool and InferenceProxy controllers and AntflyCluster.spec.inference management. CRD installation remains unconditional unless --skip-crd-install is set.")
+	flag.StringVar(&inferenceAntflyImage, "inference-antfly-image", defaultInferenceOmniImage,
+		"Default omni Antfly image for InferencePool pods. The image must provide the /antfly inference runtime contract.")
 	opts := zap.Options{
 		Development: false,
 		TimeEncoder: zapcore.RFC3339TimeEncoder,
@@ -104,8 +104,8 @@ func main() {
 	}
 
 	setupLog.Info("operator configuration",
-		"enableTermiteControllers", enableTermiteControllers,
-		"termiteAntflyImage", termiteAntflyImage,
+		"enableInferenceControllers", enableInferenceControllers,
+		"inferenceAntflyImage", inferenceAntflyImage,
 		"skipCRDInstall", skipCRDInstall,
 		"webhooksEnabled", webhooksEnabled(),
 	)
@@ -114,13 +114,13 @@ func main() {
 	autoScaler := controllers.NewAutoScaler(mgr.GetClient(), k8sClient, mgr.GetClient())
 
 	if err = (&controllers.AntflyClusterReconciler{
-		Client:              mgr.GetClient(),
-		Scheme:              mgr.GetScheme(),
-		AutoScaler:          autoScaler,
-		KubeClient:          k8sClient,
-		Recorder:            mgr.GetEventRecorder("antfly-operator"),
-		ManageTermitePools:  enableTermiteControllers,
-		DefaultTermiteImage: termiteAntflyImage,
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		AutoScaler:            autoScaler,
+		KubeClient:            k8sClient,
+		Recorder:              mgr.GetEventRecorder("antfly-operator"),
+		ManageInferencePools:  enableInferenceControllers,
+		DefaultInferenceImage: inferenceAntflyImage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AntflyCluster")
 		os.Exit(1)
@@ -144,23 +144,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	if enableTermiteControllers {
-		if err = (&termitecontrollers.TermitePoolReconciler{
+	if enableInferenceControllers {
+		if err = (&inferencecontrollers.InferencePoolReconciler{
 			Client:      mgr.GetClient(),
 			Scheme:      mgr.GetScheme(),
-			AntflyImage: termiteAntflyImage,
-			Recorder:    mgr.GetEventRecorder("termitepool-controller"),
+			AntflyImage: inferenceAntflyImage,
+			Recorder:    mgr.GetEventRecorder("inferencepool-controller"),
 		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create controller", "controller", "TermitePool")
+			setupLog.Error(err, "unable to create controller", "controller", "InferencePool")
 			os.Exit(1)
 		}
 
-		if err = (&termitecontrollers.TermiteRouteReconciler{
+		if err = (&inferencecontrollers.InferenceProxyReconciler{
 			Client:   mgr.GetClient(),
 			Scheme:   mgr.GetScheme(),
-			Recorder: mgr.GetEventRecorder("termiteroute-controller"),
+			Recorder: mgr.GetEventRecorder("inferenceproxy-controller"),
 		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create controller", "controller", "TermiteRoute")
+			setupLog.Error(err, "unable to create controller", "controller", "InferenceProxy")
 			os.Exit(1)
 		}
 	}
@@ -171,9 +171,9 @@ func main() {
 			setupLog.Error(err, "unable to create webhooks")
 			os.Exit(1)
 		}
-		if enableTermiteControllers {
-			if err := termitewebhookv1alpha1.SetupWithManager(mgr); err != nil {
-				setupLog.Error(err, "unable to create Termite webhooks")
+		if enableInferenceControllers {
+			if err := inferencewebhookv1alpha1.SetupWithManager(mgr); err != nil {
+				setupLog.Error(err, "unable to create Inference webhooks")
 				os.Exit(1)
 			}
 		}

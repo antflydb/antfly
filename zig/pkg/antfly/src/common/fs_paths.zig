@@ -15,6 +15,21 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+fn fsPathDebugEnabled() bool {
+    if (builtin.os.tag == .freestanding) return false;
+    return std.c.getenv("ANTFLY_FS_PATH_DEBUG") != null;
+}
+
+fn logPathDebug(comptime event: []const u8, path: []const u8) void {
+    if (!fsPathDebugEnabled()) return;
+    const ptr_int = @intFromPtr(path.ptr);
+    std.log.info("fs_paths {s} ptr=0x{x} len={d}", .{
+        event,
+        ptr_int,
+        path.len,
+    });
+}
+
 pub fn createDirPathPortable(io: anytype, path: []const u8) !void {
     if (path.len == 0) return;
     if (!std.fs.path.isAbsolute(path)) {
@@ -84,6 +99,24 @@ test "syncDirPortable opens a real directory fd" {
     try syncDirPortable(io_impl.io(), path);
 }
 
+test "createDirPathPortable creates absolute nested directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+
+    const cwd_path = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".zig-cache/tmp", std.testing.allocator);
+    defer std.testing.allocator.free(cwd_path);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}/abs/a/b/c", .{ cwd_path, tmp.sub_path });
+    defer std.testing.allocator.free(path);
+
+    try createDirPathPortable(io_impl.io(), path);
+
+    var dir = try std.Io.Dir.openDirAbsolute(io_impl.io(), path, .{});
+    defer dir.close(io_impl.io());
+}
+
 fn createDirAbsolutePortable(path: []const u8) !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -146,22 +179,25 @@ fn mkdirPathIgnoreExistingPosix(dir_fd: std.posix.fd_t, path: []const u8) !void 
     }
 }
 
-fn dirAlreadyExistsAtPosix(dir_fd: std.posix.fd_t, path: []const u8) bool {
-    const fd = std.posix.openat(dir_fd, path, .{
+fn openDirAtPathPosix(dir_fd: std.posix.fd_t, path: []const u8) !std.posix.fd_t {
+    const allocator = std.heap.page_allocator;
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    return try std.posix.openatZ(dir_fd, path_z.ptr, .{
         .ACCMODE = .RDONLY,
         .DIRECTORY = true,
         .CLOEXEC = true,
-    }, 0) catch return false;
+    }, 0);
+}
+
+fn dirAlreadyExistsAtPosix(dir_fd: std.posix.fd_t, path: []const u8) bool {
+    const fd = openDirAtPathPosix(dir_fd, path) catch return false;
     _ = std.posix.system.close(fd);
     return true;
 }
 
 fn dirAlreadyExistsPosix(path: []const u8) bool {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
-        .ACCMODE = .RDONLY,
-        .DIRECTORY = true,
-        .CLOEXEC = true,
-    }, 0) catch return false;
+    const fd = openDirAtPathPosix(std.posix.AT.FDCWD, path) catch return false;
     _ = std.posix.system.close(fd);
     return true;
 }
@@ -195,8 +231,9 @@ fn createAbsoluteDirPathPosix(path: []const u8) !void {
     if (path.len == 0) return;
     if (!std.fs.path.isAbsolute(path)) return error.BadPathName;
     if (path.len == 1 and path[0] == std.fs.path.sep) return;
+    logPathDebug("create_absolute_dir_path_begin", path);
 
-    var current_fd = try std.posix.openat(std.posix.AT.FDCWD, std.fs.path.sep_str, .{
+    var current_fd = try std.posix.openatZ(std.posix.AT.FDCWD, "/", .{
         .ACCMODE = .RDONLY,
         .DIRECTORY = true,
         .CLOEXEC = true,
@@ -211,16 +248,13 @@ fn createAbsoluteDirPathPosix(path: []const u8) !void {
         const component_start = idx;
         while (idx < path.len and path[idx] != std.fs.path.sep) : (idx += 1) {}
         const component = path[component_start..idx];
+        logPathDebug("create_absolute_dir_path_component", component);
         mkdirPathIgnoreExistingPosix(current_fd, component) catch |err| switch (err) {
             error.BadPathName => try mkdirAbsoluteIgnoreExistingPosix(path[0..idx]),
             else => return err,
         };
 
-        const next_fd = try std.posix.openat(current_fd, component, .{
-            .ACCMODE = .RDONLY,
-            .DIRECTORY = true,
-            .CLOEXEC = true,
-        }, 0);
+        const next_fd = try openDirAtPathPosix(current_fd, component);
         _ = std.posix.system.close(current_fd);
         current_fd = next_fd;
     }

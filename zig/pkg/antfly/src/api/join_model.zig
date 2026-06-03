@@ -21,6 +21,7 @@ pub const join_broadcast_threshold_bytes: u64 = 10 * 1024 * 1024;
 pub const join_lookup_selectivity_threshold: f64 = 0.1;
 pub const join_estimated_row_bytes: u64 = 200;
 pub const join_lookup_batch_size: u64 = 1000;
+pub const internal_doc_identity_key_field = "__antfly_doc_identity_key";
 
 pub const JoinResponseMetadata = struct {
     total_hits: usize,
@@ -240,7 +241,10 @@ pub fn replaceQueryResponseHitsAlloc(
     hits_ptr.deinit();
     hits_ptr.* = std.json.Array.init(alloc);
     for (hits) |item| {
-        try hits_ptr.append(try json_helpers.cloneJsonValue(alloc, item));
+        var cloned = try json_helpers.cloneJsonValue(alloc, item);
+        errdefer json_helpers.deinitJsonValue(alloc, &cloned);
+        stripInternalDocIdentityKey(alloc, &cloned);
+        try hits_ptr.append(cloned);
     }
     try applyJoinResponseMetadata(alloc, try queryHitsObjectPtr(root), makeJoinResponseMetadata(hits_ptr.items));
 }
@@ -372,6 +376,9 @@ pub fn buildUnmatchedRightJoinHitAlloc(
     if (right_hit.object.get("_id")) |id_value| {
         try setObjectFieldOwned(alloc, &hit_obj, "_id", try json_helpers.cloneJsonValue(alloc, id_value));
     }
+    if (right_hit.object.get(internal_doc_identity_key_field)) |identity_key| {
+        try setObjectFieldOwned(alloc, &hit_obj, internal_doc_identity_key_field, try json_helpers.cloneJsonValue(alloc, identity_key));
+    }
     if (right_hit.object.get("_score")) |score_value| {
         try setObjectFieldOwned(alloc, &hit_obj, "_score", try json_helpers.cloneJsonValue(alloc, score_value));
     } else {
@@ -393,7 +400,7 @@ pub fn appendUnmatchedRightJoinHitsAlloc(
 ) !usize {
     var appended: usize = 0;
     for (right_hits) |right_hit| {
-        const right_id = rightHitId(right_hit) orelse continue;
+        const right_id = rightHitIdentityKey(right_hit) orelse continue;
         if (matched_right_ids.contains(right_id)) continue;
         try appendJsonHit(out, alloc, try buildUnmatchedRightJoinHitAlloc(alloc, right_hit, join, left_fields, appended_left_field));
         appended += 1;
@@ -432,6 +439,9 @@ pub fn buildUnmatchedRightJoinHitFromSearchHitAlloc(
         hit_obj.deinit(alloc);
     }
     try setObjectFieldOwned(alloc, &hit_obj, "_id", .{ .string = try alloc.dupe(u8, right_hit.id) });
+    if (right_hit.doc_ordinal) |ordinal| {
+        try setObjectFieldOwned(alloc, &hit_obj, internal_doc_identity_key_field, .{ .string = try std.fmt.allocPrint(alloc, "o:{d}", .{ordinal}) });
+    }
     try setObjectFieldOwned(alloc, &hit_obj, "_score", if (right_hit.score) |score| .{ .float = score } else .{ .float = 0 });
     try setObjectFieldOwned(alloc, &hit_obj, "_source", source_value);
     source_value = undefined;
@@ -449,6 +459,11 @@ pub fn appendUnmatchedRightJoinSearchHitsAlloc(
 ) !usize {
     var appended: usize = 0;
     for (right_hits) |right_hit| {
+        if (right_hit.doc_ordinal) |ordinal| {
+            var key_buf: [32]u8 = undefined;
+            const identity_key = try std.fmt.bufPrint(&key_buf, "o:{d}", .{ordinal});
+            if (matched_right_ids.contains(identity_key)) continue;
+        }
         if (matched_right_ids.contains(right_hit.id)) continue;
         try appendJsonHit(out, alloc, try buildUnmatchedRightJoinHitFromSearchHitAlloc(alloc, right_hit, join, left_fields, appended_left_field));
         appended += 1;
@@ -659,6 +674,27 @@ pub fn rightHitId(right_hit: std.json.Value) ?[]const u8 {
     };
 }
 
+pub fn rightHitIdentityKey(right_hit: std.json.Value) ?[]const u8 {
+    return switch (right_hit) {
+        .object => |obj| blk: {
+            if (obj.get(internal_doc_identity_key_field)) |identity_key| {
+                if (identity_key == .string) break :blk identity_key.string;
+            }
+            break :blk rightHitId(right_hit);
+        },
+        else => null,
+    };
+}
+
+pub fn stripInternalDocIdentityKey(alloc: Allocator, hit: *std.json.Value) void {
+    if (hit.* != .object) return;
+    if (hit.object.fetchOrderedRemove(internal_doc_identity_key_field)) |kv| {
+        alloc.free(@constCast(kv.key));
+        var value = kv.value;
+        json_helpers.deinitJsonValue(alloc, &value);
+    }
+}
+
 fn appendJsonHit(out: anytype, alloc: Allocator, hit: std.json.Value) !void {
     const T = @TypeOf(out.*);
     if (T == std.json.Array) {
@@ -758,6 +794,7 @@ test "join model applies shell to response and refreshes hit metadata" {
     }
     hits[0] = try testJoinHitAlloc(alloc, "doc:1", 1.5, "1");
     hits[1] = try testJoinHitAlloc(alloc, "doc:2", 2.25, "2");
+    try setObjectFieldOwned(alloc, &hits[0].object, internal_doc_identity_key_field, .{ .string = try alloc.dupe(u8, "o:17") });
 
     var matched_right_ids = std.StringHashMapUnmanaged(void){};
     defer matched_right_ids.deinit(alloc);
@@ -775,6 +812,7 @@ test "join model applies shell to response and refreshes hit metadata" {
     try std.testing.expectEqual(@as(i64, 2), hits_obj.get("total").?.integer);
     try std.testing.expectApproxEqAbs(@as(f64, 2.25), hits_obj.get("max_score").?.float, 0.000001);
     try std.testing.expectEqualStrings("doc:1", hits_ptr.items[0].object.get("_id").?.string);
+    try std.testing.expect(hits_ptr.items[0].object.get(internal_doc_identity_key_field) == null);
     try std.testing.expectEqualStrings("2", hits_ptr.items[1].object.get("_source").?.object.get("id").?.string);
 }
 

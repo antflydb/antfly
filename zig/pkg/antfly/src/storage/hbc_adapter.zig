@@ -84,6 +84,7 @@ pub const StorageBackend = vectorindex_types.StorageBackend;
 pub const BulkBuildAlgo = vectorindex_types.BulkBuildAlgo;
 pub const LsmWriteStats = lsm_backend.Backend.WriteStats;
 pub const LsmMaintenanceStats = lsm_backend.Backend.MaintenanceStats;
+pub const LsmOpenStats = lsm_backend.Backend.OpenStats;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) {
@@ -820,6 +821,9 @@ pub const Cache = struct {
         self.mutex.lockExclusive();
         defer self.mutex.unlockExclusive();
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = vector_id };
+        if (self.vector_cache.get(key)) |existing| {
+            if (existing.vector.ptr == vector_data.ptr and existing.vector.len == vector_data.len) return existing.vector;
+        }
         _ = self.removeVectorLocked(key, false);
         const bytes = estimateVectorCacheBytes(vector_data);
         const admission = self.admitLocked(.vector, namespace, key, bytes, false) orelse {
@@ -1472,6 +1476,20 @@ pub const HBCIndex = struct {
         };
     }
 
+    pub fn snapshotLsmOpenStats(self: *const HBCIndex) ?LsmOpenStats {
+        return switch (self.env_owner) {
+            .lsm => |handle| handle.backend.snapshotOpenStats(),
+            .lmdb => null,
+        };
+    }
+
+    pub fn checkpointLsmWalAfterDurableBoundary(self: *HBCIndex) !void {
+        switch (self.env_owner) {
+            .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
+            .lmdb => {},
+        }
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const HBCIndex) ?lsm_backend.NativeStorageStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
@@ -1598,8 +1616,15 @@ pub const HBCIndex = struct {
                 });
             };
         }
+        var finish_options = options;
+        if (finishing_outermost) {
+            // HBC publishes deferred roots and metadata through normal mutable
+            // batches so repeated rewrites coalesce. Make the final published
+            // state durable before exposing the completed bulk session.
+            finish_options.flush = true;
+        }
         switch (self.env_owner) {
-            .lsm => |handle| try handle.backend.finishBulkIngestSessionWithOptions(options),
+            .lsm => |handle| try handle.backend.finishBulkIngestSessionWithOptions(finish_options),
             .lmdb => {},
         }
         if (self.bulk_ingest_session_depth > 0) self.bulk_ingest_session_depth -= 1;
@@ -2678,6 +2703,7 @@ pub const HBCIndex = struct {
         // stale internal rewrite becomes durable table bytes during large loads.
         return try self.store.beginBatchWithOptions(.{
             .mode = .default,
+            .defer_commit_flush = self.bulk_ingest_session_depth > 0,
         });
     }
 
@@ -2926,6 +2952,9 @@ pub const HBCIndex = struct {
     }
 
     fn cacheVectorLocalLocked(self: *HBCIndex, vector_id: u64, vector_data: []const f32) ![]const f32 {
+        if (self.vector_cache.get(vector_id)) |existing| {
+            if (existing.vector.ptr == vector_data.ptr and existing.vector.len == vector_data.len) return existing.vector;
+        }
         const reserved_slot = self.ensureLocalVectorCacheCapacityLocked(vector_id);
         self.invalidateLocalVectorCacheLocked(vector_id);
         const copied = try self.alloc.dupe(f32, vector_data);
@@ -3207,6 +3236,18 @@ pub const HBCIndex = struct {
         if (self.bypass_external_vector_cache) return vector_data;
         if (self.bulk_ingest_session_depth > 0) return vector_data;
         if (self.active_searches.load(.acquire) > 1) return vector_data;
+        return try self.cacheVectorRetained(vector_id, vector_data);
+    }
+
+    pub fn cacheVectorForWarmup(self: *HBCIndex, vector_id: u64, vector_data: []const f32) ![]const f32 {
+        if (!self.cache_enabled) return vector_data;
+        if (!self.retained_vector_cache_enabled) return vector_data;
+        if (self.bypass_external_vector_cache) return vector_data;
+        if (self.active_searches.load(.acquire) > 1) return vector_data;
+        return try self.cacheVectorRetained(vector_id, vector_data);
+    }
+
+    fn cacheVectorRetained(self: *HBCIndex, vector_id: u64, vector_data: []const f32) ![]const f32 {
         if (self.shared_cache) |cache| {
             if (self.config.max_cached_vectors == 0) return vector_data;
             return try cache.cacheVector(self.cache_namespace, vector_id, vector_data);
@@ -4476,6 +4517,57 @@ pub const HBCIndex = struct {
                 .raw_values = values_storage,
             },
             profile,
+        ) catch |err| switch (err) {
+            error.Unsupported => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    pub fn scoreExternalVectorsSortedWithScratch(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        query: []const f32,
+        query_measure: f32,
+        distances: []f32,
+        metadata_storage: []?[]const u8,
+        lookup_storage: []FixedKeyLookup,
+        key_views_storage: [][]const u8,
+        values_storage: []?[]const u8,
+        batch_scratch: []f32,
+    ) !bool {
+        const loader = self.external_vector_batch_distance_loader orelse return false;
+        const ctx = self.external_vector_ctx orelse return false;
+        if (distances.len < vector_ids.len) return error.InvalidArgument;
+        if (metadata_storage.len < vector_ids.len) return error.InvalidArgument;
+        if (vector_ids.len == 0) return true;
+
+        for (distances[0..vector_ids.len]) |*distance| distance.* = std.math.inf(f32);
+        const metadata = metadata_storage[0..vector_ids.len];
+        try self.getMetadataManySortedInTxnWithScratch(
+            txn,
+            vector_ids,
+            metadata,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+        );
+        loader(
+            ctx,
+            vector_ids,
+            metadata,
+            query,
+            query_measure,
+            self.config.metric,
+            distances[0..vector_ids.len],
+            batch_scratch,
+            @intCast(self.config.dims),
+            .{
+                .artifact_keys = key_views_storage,
+                .raw_values = values_storage,
+            },
+            null,
         ) catch |err| switch (err) {
             error.Unsupported => return false,
             else => return err,

@@ -11,7 +11,6 @@ class GeneratorProvider(str, Enum):
     OLLAMA = "ollama"
     OPENAI = "openai"
     OPENROUTER = "openrouter"
-    TERMITE = "termite"
     VERTEX = "vertex"
 
     def __str__(self) -> str:

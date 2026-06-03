@@ -40,9 +40,9 @@ run_check "typecheck" pnpm typecheck
 run_check "build" pnpm build
 run_check "test" pnpm test
 
-# Playwright tests (from playwright.yml) - must run from apps/antfarm directory
-# Skip webkit locally as it requires system deps that may not be installed
-# CI installs all deps via `playwright install --with-deps`
+# Playwright tests (from ts-ci.yml) - must run from apps/antfarm directory.
+# Keep this in sync with CI: WebKit is intentionally excluded because its Linux
+# dependency install is much heavier and has been unreliable on hosted runners.
 if [[ -d "apps/antfarm" ]]; then
     run_check "playwright" bash -c "cd apps/antfarm && pnpm exec playwright test --project=chromium --project=firefox --reporter=list"
 fi

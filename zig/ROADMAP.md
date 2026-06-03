@@ -60,7 +60,7 @@ Substantial pieces already exist:
   backend work
 - table/index lifecycle, routed reads/writes, graph/query/retrieval surfaces,
   and OpenAPI-shaped API contracts
-- reusable full-text, vector, graph, JSON, regex, image, audio, and Termite
+- reusable full-text, vector, graph, JSON, regex, image, audio, and Antfly inference
   library modules
 - serverless manifest/artifact/publication work with a table-first public
   contract under active convergence
@@ -152,7 +152,7 @@ Near-term goals:
 - support metadata/data workflows without storage regressions
 - keep reopen/recovery and simulation matrices strong
 
-### 6. Termite And Shared Libraries
+### 6. Antfly inference And Shared Libraries
 
 Primary references:
 - [go/pkg/termite/ROADMAP.md](go/pkg/termite/ROADMAP.md)
@@ -163,7 +163,7 @@ Primary references:
 
 Near-term goals:
 - keep reusable libraries documented where their implementation lives
-- keep Termite API/model work separate from Antfly product API planning unless
+- keep Antfly inference API/model work separate from Antfly product API planning unless
   the integration surface requires it
 - use library-level docs for design details and root docs for repository
   orientation

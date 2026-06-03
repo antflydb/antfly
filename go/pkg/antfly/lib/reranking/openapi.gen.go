@@ -22,25 +22,20 @@ import (
 
 // Defines values for RerankerProvider.
 const (
-	RerankerProviderAntfly  RerankerProvider = "antfly"
-	RerankerProviderCohere  RerankerProvider = "cohere"
-	RerankerProviderOllama  RerankerProvider = "ollama"
-	RerankerProviderTermite RerankerProvider = "termite"
-	RerankerProviderVertex  RerankerProvider = "vertex"
+	RerankerProviderAntfly RerankerProvider = "antfly"
+	RerankerProviderCohere RerankerProvider = "cohere"
+	RerankerProviderOllama RerankerProvider = "ollama"
+	RerankerProviderVertex RerankerProvider = "vertex"
 )
 
-// AntflyRerankerConfig Configuration for the built-in Antfly reranking provider.
-//
-// Uses an embedded INT8-quantized cross-encoder/ms-marco-MiniLM-L-6-v2 ONNX model
-// bundled directly in the binary. No external service, API key, or model download required.
-//
-// **Model:** cross-encoder/ms-marco-MiniLM-L-6-v2 (6-layer MiniLM cross-encoder)
-//
-// **Features:**
-// - Zero configuration — works out of the box
-// - No network access required
-// - Pure Go inference via GoMLX
-type AntflyRerankerConfig = map[string]interface{}
+// AntflyRerankerConfig Configuration for the Antfly inference reranking provider.
+type AntflyRerankerConfig struct {
+	// Model The name of the reranking model (e.g., cross-encoder model name).
+	Model string `json:"model"`
+
+	// Url The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+	Url *string `json:"url,omitempty"`
+}
 
 // CohereRerankerConfig Configuration for the Cohere reranking provider.
 //
@@ -87,15 +82,6 @@ type RerankerConfig struct {
 
 // RerankerProvider The reranking provider to use.
 type RerankerProvider string
-
-// TermiteRerankerConfig Configuration for the Termite reranking provider.
-type TermiteRerankerConfig struct {
-	// Model The name of the reranking model (e.g., cross-encoder model name).
-	Model string `json:"model"`
-
-	// Url The URL of the Termite API endpoint.
-	Url *string `json:"url,omitempty"`
-}
 
 // VertexRerankerConfig Configuration for the Google Vertex AI Ranking API.
 //
@@ -166,32 +152,6 @@ func (t *RerankerConfig) FromOllamaRerankerConfig(v OllamaRerankerConfig) error 
 
 // MergeOllamaRerankerConfig performs a merge with any union data inside the RerankerConfig, using the provided OllamaRerankerConfig
 func (t *RerankerConfig) MergeOllamaRerankerConfig(v OllamaRerankerConfig) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
-
-// AsTermiteRerankerConfig returns the union data inside the RerankerConfig as a TermiteRerankerConfig
-func (t RerankerConfig) AsTermiteRerankerConfig() (TermiteRerankerConfig, error) {
-	var body TermiteRerankerConfig
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromTermiteRerankerConfig overwrites any union data inside the RerankerConfig as the provided TermiteRerankerConfig
-func (t *RerankerConfig) FromTermiteRerankerConfig(v TermiteRerankerConfig) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeTermiteRerankerConfig performs a merge with any union data inside the RerankerConfig, using the provided TermiteRerankerConfig
-func (t *RerankerConfig) MergeTermiteRerankerConfig(v TermiteRerankerConfig) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -457,33 +417,30 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
-	"iS9REgAA",
+	"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",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

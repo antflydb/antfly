@@ -5,21 +5,21 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.termite_embed_request import TermiteEmbedRequest
-from ...models.termite_embed_response import TermiteEmbedResponse
-from ...models.termite_error import TermiteError
+from ...models.inference_embed_request import InferenceEmbedRequest
+from ...models.inference_embed_response import InferenceEmbedResponse
+from ...models.inference_error import InferenceError
 from ...types import Response
 
 
 def _get_kwargs(
     *,
-    body: TermiteEmbedRequest,
+    body: InferenceEmbedRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/ml/v1/embed",
+        "url": "/ai/v1/embed",
     }
 
     _kwargs["json"] = body.to_dict()
@@ -32,24 +32,24 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> TermiteEmbedResponse | TermiteError | None:
+) -> InferenceEmbedResponse | InferenceError | None:
     if response.status_code == 200:
-        response_200 = TermiteEmbedResponse.from_dict(response.json())
+        response_200 = InferenceEmbedResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 400:
-        response_400 = TermiteError.from_dict(response.json())
+        response_400 = InferenceError.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 404:
-        response_404 = TermiteError.from_dict(response.json())
+        response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
     if response.status_code == 500:
-        response_500 = TermiteError.from_dict(response.json())
+        response_500 = InferenceError.from_dict(response.json())
 
         return response_500
 
@@ -61,7 +61,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[TermiteEmbedResponse | TermiteError]:
+) -> Response[InferenceEmbedResponse | InferenceError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -73,26 +73,26 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteEmbedRequest,
-) -> Response[TermiteEmbedResponse | TermiteError]:
+    body: InferenceEmbedRequest,
+) -> Response[InferenceEmbedResponse | InferenceError]:
     """Create embeddings (alias of `/embeddings`)
 
-     Alias of `/ml/v1/embeddings`.
+     Alias of `/ai/v1/embeddings`.
 
     Accepts the OpenAI embeddings request shape and returns the same OpenAI-compatible
     response envelope. For sparse-capable models, `data[i].embedding` is a sparse
     vector object instead of a dense float array.
 
     Args:
-        body (TermiteEmbedRequest): OpenAI-compatible embedding request with Termite multimodal
-            content-part extension
+        body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
+            multimodal content-part extension
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteEmbedResponse | TermiteError]
+        Response[InferenceEmbedResponse | InferenceError]
     """
 
     kwargs = _get_kwargs(
@@ -109,26 +109,26 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteEmbedRequest,
-) -> TermiteEmbedResponse | TermiteError | None:
+    body: InferenceEmbedRequest,
+) -> InferenceEmbedResponse | InferenceError | None:
     """Create embeddings (alias of `/embeddings`)
 
-     Alias of `/ml/v1/embeddings`.
+     Alias of `/ai/v1/embeddings`.
 
     Accepts the OpenAI embeddings request shape and returns the same OpenAI-compatible
     response envelope. For sparse-capable models, `data[i].embedding` is a sparse
     vector object instead of a dense float array.
 
     Args:
-        body (TermiteEmbedRequest): OpenAI-compatible embedding request with Termite multimodal
-            content-part extension
+        body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
+            multimodal content-part extension
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteEmbedResponse | TermiteError
+        InferenceEmbedResponse | InferenceError
     """
 
     return sync_detailed(
@@ -140,26 +140,26 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteEmbedRequest,
-) -> Response[TermiteEmbedResponse | TermiteError]:
+    body: InferenceEmbedRequest,
+) -> Response[InferenceEmbedResponse | InferenceError]:
     """Create embeddings (alias of `/embeddings`)
 
-     Alias of `/ml/v1/embeddings`.
+     Alias of `/ai/v1/embeddings`.
 
     Accepts the OpenAI embeddings request shape and returns the same OpenAI-compatible
     response envelope. For sparse-capable models, `data[i].embedding` is a sparse
     vector object instead of a dense float array.
 
     Args:
-        body (TermiteEmbedRequest): OpenAI-compatible embedding request with Termite multimodal
-            content-part extension
+        body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
+            multimodal content-part extension
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteEmbedResponse | TermiteError]
+        Response[InferenceEmbedResponse | InferenceError]
     """
 
     kwargs = _get_kwargs(
@@ -174,26 +174,26 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteEmbedRequest,
-) -> TermiteEmbedResponse | TermiteError | None:
+    body: InferenceEmbedRequest,
+) -> InferenceEmbedResponse | InferenceError | None:
     """Create embeddings (alias of `/embeddings`)
 
-     Alias of `/ml/v1/embeddings`.
+     Alias of `/ai/v1/embeddings`.
 
     Accepts the OpenAI embeddings request shape and returns the same OpenAI-compatible
     response envelope. For sparse-capable models, `data[i].embedding` is a sparse
     vector object instead of a dense float array.
 
     Args:
-        body (TermiteEmbedRequest): OpenAI-compatible embedding request with Termite multimodal
-            content-part extension
+        body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
+            multimodal content-part extension
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteEmbedResponse | TermiteError
+        InferenceEmbedResponse | InferenceError
     """
 
     return (

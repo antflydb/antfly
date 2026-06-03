@@ -63,6 +63,38 @@ func (m *mockChunker) Close() error {
 	return nil
 }
 
+func registerMockChunker(t *testing.T) *chunking.ChunkerConfig {
+	t.Helper()
+
+	previous, hadPrevious := chunking.ChunkerRegistry[chunking.ChunkerProviderMock]
+	chunking.ChunkerRegistry[chunking.ChunkerProviderMock] = func(config chunking.ChunkerConfig) (chunking.Chunker, error) {
+		return &mockChunker{
+			chunkFunc: func(ctx context.Context, text string) ([]chunking.Chunk, error) {
+				if text == "" {
+					return nil, nil
+				}
+				midpoint := len(text) / 2
+				if midpoint < 1 || midpoint >= len(text) {
+					return []chunking.Chunk{chunking.NewTextChunk(0, text, 0, len(text))}, nil
+				}
+				return []chunking.Chunk{
+					chunking.NewTextChunk(0, text[:midpoint], 0, midpoint),
+					chunking.NewTextChunk(1, text[midpoint:], midpoint, len(text)),
+				}, nil
+			},
+		}, nil
+	}
+	t.Cleanup(func() {
+		if hadPrevious {
+			chunking.ChunkerRegistry[chunking.ChunkerProviderMock] = previous
+			return
+		}
+		delete(chunking.ChunkerRegistry, chunking.ChunkerProviderMock)
+	})
+
+	return &chunking.ChunkerConfig{Provider: chunking.ChunkerProviderMock}
+}
+
 // TestPipelineEnricher_OptionalSummarizer verifies that the summarizer is truly optional
 func TestPipelineEnricher_OptionalSummarizer(t *testing.T) {
 	logger := zaptest.NewLogger(t).Sugar().Desugar()
@@ -570,7 +602,7 @@ func TestPipelineEnricher_ChunkKeyWithSummarizer(t *testing.T) {
 
 // TestPipelineEnricher_ChunkKeySummarizationRouting verifies chunk keys route to summarization when both enrichers present
 
-// TestPipelineEnricher_FullPipelineIntegration tests the complete doc→chunk→summary→embed pipeline with real Termite
+// TestPipelineEnricher_FullPipelineIntegration tests the complete doc→chunk→summary→embed pipeline with real Antfly inference.
 // This test requires ONNX models in models/chunkers/ directory (enables ONNX-based chunking)
 //
 // To run this test:
@@ -578,14 +610,14 @@ func TestPipelineEnricher_ChunkKeyWithSummarizer(t *testing.T) {
 //  1. Ensure ONNX models are in models/chunkers/chonky-mmbert-small-multilingual-1/:
 //     ls models/chunkers/chonky-mmbert-small-multilingual-1/model.onnx
 //
-//  2. Run the test (Termite is started automatically as an embedded service):
+//  2. Run the test (Antfly inference is started automatically as an embedded service):
 //     go test -v ./go/pkg/antfly/src/store/indexes -run TestPipelineEnricher_FullPipelineIntegration
 //
 // The test automatically:
-// - Starts an embedded Termite service on port 18433
+// - Starts an embedded Antfly inference service on port 18433
 // - Loads ONNX models from models/chunkers/ directory
 // - Runs the full doc→chunk→summary→embed pipeline synchronously
-// - Shuts down Termite when the test completes
+// - Shuts down Antfly inference when the test completes
 //
 // This test verifies:
 // - Documents are chunked using ONNX-based semantic chunking with neural networks
@@ -646,7 +678,7 @@ func TestEmbeddingIndex_GeneratePrompts_ChunkKeys(t *testing.T) {
 	// Create EmbeddingIndex config with chunking enabled
 	// StoreChunks must be true because this test writes chunks directly to storage
 	// and expects them to be read back (non-ephemeral mode)
-	chunkerConfig, err := chunking.NewChunkerConfig(chunking.TermiteChunkerConfig{
+	chunkerConfig, err := chunking.NewChunkerConfig(chunking.AntflyChunkerConfig{
 		ApiUrl: "http://mock",
 		Model:  "semantic",
 	})
@@ -815,7 +847,7 @@ func TestEmbeddingIndex_Batch_ChunkKeyRouting(t *testing.T) {
 	// Create EmbeddingIndex config with chunking enabled
 	// StoreChunks must be true because this test writes chunks directly to storage
 	// and expects them to be read back (non-ephemeral mode)
-	chunkerConfig, err := chunking.NewChunkerConfig(chunking.TermiteChunkerConfig{
+	chunkerConfig, err := chunking.NewChunkerConfig(chunking.AntflyChunkerConfig{
 		ApiUrl: "http://mock",
 		Model:  "semantic",
 	})
@@ -1065,14 +1097,7 @@ func TestPipelineEnricher_GenerateEmbeddingsWithoutPersist_Chunking(t *testing.T
 	configBytes, _ := json.Marshal(config)
 	_ = json.Unmarshal(configBytes, &embedderConfig)
 
-	antflyChunkingConfig := chunking.AntflyChunkerConfig{
-		Text: chunking.TextChunkOptions{
-			TargetTokens:  50, // Small chunks for testing
-			OverlapTokens: 10,
-		},
-	}
-	chunkingConfig, err := chunking.NewChunkerConfig(antflyChunkingConfig)
-	require.NoError(t, err)
+	chunkingConfig := registerMockChunker(t)
 
 	antflyConfig := &common.Config{}
 
@@ -1313,14 +1338,7 @@ func TestGenerateEphemeralChunkPrompts_BackfillWithDocument(t *testing.T) {
 		return content, xxhash.Sum64String(content), nil
 	}
 
-	antflyChunkingConfig := chunking.AntflyChunkerConfig{
-		Text: chunking.TextChunkOptions{
-			TargetTokens:  50,
-			OverlapTokens: 10,
-		},
-	}
-	chunkingConfig, err := chunking.NewChunkerConfig(antflyChunkingConfig)
-	require.NoError(t, err)
+	chunkingConfig := registerMockChunker(t)
 
 	ctx := t.Context()
 
@@ -1440,14 +1458,7 @@ func TestGenerateEphemeralChunkPrompts_EnrichmentStillWorks(t *testing.T) {
 		return "", 0, fmt.Errorf("should not be called")
 	}
 
-	antflyChunkingConfig := chunking.AntflyChunkerConfig{
-		Text: chunking.TextChunkOptions{
-			TargetTokens:  50,
-			OverlapTokens: 10,
-		},
-	}
-	chunkingConfig, err := chunking.NewChunkerConfig(antflyChunkingConfig)
-	require.NoError(t, err)
+	chunkingConfig := registerMockChunker(t)
 
 	ctx := t.Context()
 
@@ -1557,14 +1568,7 @@ func TestGenerateEphemeralChunkPrompts_ChunkOffsetWrites(t *testing.T) {
 		return nil
 	}
 
-	antflyChunkingConfig := chunking.AntflyChunkerConfig{
-		Text: chunking.TextChunkOptions{
-			TargetTokens:  50,
-			OverlapTokens: 10,
-		},
-	}
-	chunkingConfig, err := chunking.NewChunkerConfig(antflyChunkingConfig)
-	require.NoError(t, err)
+	chunkingConfig := registerMockChunker(t)
 
 	ctx := t.Context()
 
@@ -1720,14 +1724,7 @@ func TestPipelineEnricher_GenerateEmbeddingsWithoutPersist_EphemeralChunking(t *
 	configBytes, _ := json.Marshal(config)
 	_ = json.Unmarshal(configBytes, &embedderConfig)
 
-	antflyChunkingConfig := chunking.AntflyChunkerConfig{
-		Text: chunking.TextChunkOptions{
-			TargetTokens:  50,
-			OverlapTokens: 10,
-		},
-	}
-	chunkingConfig, err := chunking.NewChunkerConfig(antflyChunkingConfig)
-	require.NoError(t, err)
+	chunkingConfig := registerMockChunker(t)
 
 	antflyConfig := &common.Config{}
 

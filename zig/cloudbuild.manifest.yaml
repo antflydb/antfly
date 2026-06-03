@@ -1,0 +1,40 @@
+# Cloud Build config for assembling the multi-arch Zig runtime manifest.
+#
+# Substitutions:
+#   _IMAGE_NAME: image name in the containers repo
+#   _VERSION_TAG: final versioned tag, such as zig-v0.1.0
+#   _ALIAS_TAG: optional stable tag, such as zig
+#   _AMD64_TAG: source amd64 image tag
+#   _ARM64_TAG: source arm64 image tag
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    id: create-manifest
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -eux
+        IMAGE_BASE="us-central1-docker.pkg.dev/$PROJECT_ID/containers/${_IMAGE_NAME}"
+        docker buildx imagetools create \
+          --tag "$${IMAGE_BASE}:${_VERSION_TAG}" \
+          "$${IMAGE_BASE}:${_AMD64_TAG}" \
+          "$${IMAGE_BASE}:${_ARM64_TAG}"
+        if [ -n "${_ALIAS_TAG}" ] && [ "${_ALIAS_TAG}" != "__skip_alias__" ]; then
+          docker buildx imagetools create \
+            --tag "$${IMAGE_BASE}:${_ALIAS_TAG}" \
+            "$${IMAGE_BASE}:${_VERSION_TAG}"
+        fi
+        docker buildx imagetools inspect "$${IMAGE_BASE}:${_VERSION_TAG}"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 900s
+
+substitutions:
+  _IMAGE_NAME: antfly
+  _VERSION_TAG: zig-latest
+  _ALIAS_TAG: zig
+  _AMD64_TAG: zig-latest-amd64
+  _ARM64_TAG: zig-latest-arm64

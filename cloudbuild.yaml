@@ -1,7 +1,7 @@
 # Cloud Build config for Antfly container images.
 #
 # Substitutions:
-#   _IMAGE_NAME: image name in the antfly-labs repo
+#   _IMAGE_NAME: image name in the containers repo
 #   _DOCKERFILE: Dockerfile path relative to repo root
 #   _CONTEXT: build context path
 #   _ALIAS_TAG: optional stable tag, such as latest or omni
@@ -27,7 +27,7 @@ steps:
       - -c
       - |
         set -eux
-        IMAGE_BASE="us-east5-docker.pkg.dev/$PROJECT_ID/antfly-labs/${_IMAGE_NAME}"
+        IMAGE_BASE="us-central1-docker.pkg.dev/$PROJECT_ID/containers/${_IMAGE_NAME}"
         TAG_ARGS=(-t "$${IMAGE_BASE}:${_VERSION_TAG}")
         if [ -n "${_ALIAS_TAG}" ] && [ "${_ALIAS_TAG}" != "__skip_alias__" ]; then
           TAG_ARGS=(-t "$${IMAGE_BASE}:${_ALIAS_TAG}" "$${TAG_ARGS[@]}")

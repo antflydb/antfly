@@ -202,6 +202,8 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
     for (batch.changed_artifact_keys) |key| {
         if (internal_keys.isGraphEdgeArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
+        } else if (internal_keys.isAssetArtifactKey(key)) {
+            try appendUniqueHintAlloc(alloc, &target_hints, .graph);
         } else if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
             try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
@@ -238,8 +240,6 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
     if (batch.generated_enrichment_refs.len > 0) try appendUniqueHintAlloc(alloc, &target_hints, .enrichment);
     for (batch.generated_enrichment_refs) |ref| {
         try appendUniqueString(alloc, &changed_doc_keys, ref.doc_key);
-        if (ref.kind == .dense_embedding) try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
-        if (ref.kind == .sparse_embedding) try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
     }
 
     return .{

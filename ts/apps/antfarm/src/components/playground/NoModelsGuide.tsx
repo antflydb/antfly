@@ -8,8 +8,8 @@ import {
   getModelsWithCapability,
   type ModelType,
   type RecognizerCapability,
-} from "@/data/termite-models";
-import { useTermiteRegistry } from "@/hooks/use-termite-registry";
+} from "@/data/inference-models";
+import { useInferenceRegistry } from "@/hooks/use-inference-registry";
 
 function CopyCommandButton({ command }: { command: string }) {
   const [copied, setCopied] = useState(false);
@@ -24,7 +24,7 @@ function CopyCommandButton({ command }: { command: string }) {
     <button
       type="button"
       onClick={handleCopy}
-      className="shrink-0 p-1.5 rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
+      className="shrink-0 p-1.5 rounded-none hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
       title="Copy command"
     >
       {copied ? (
@@ -50,7 +50,7 @@ export function NoModelsGuide({
   typeName,
   soft = false,
 }: NoModelsGuideProps) {
-  const { models, loading } = useTermiteRegistry();
+  const { models, loading } = useInferenceRegistry();
 
   // Don't flash while loading
   if (loading) return null;
@@ -65,8 +65,8 @@ export function NoModelsGuide({
   const suggestions = recommended.slice(0, 2);
 
   const containerClasses = soft
-    ? "mb-4 p-4 rounded-lg border bg-muted/30 border-border"
-    : "mb-4 p-4 rounded-lg border af-status-badge-warning";
+    ? "mb-4 p-4 rounded-none border bg-muted/30 border-border"
+    : "mb-4 p-4 rounded-none border af-status-badge-warning";
 
   const titleClasses = soft ? "text-sm font-medium text-foreground" : "text-sm font-medium";
 
@@ -93,7 +93,7 @@ export function NoModelsGuide({
                 return (
                   <div
                     key={model.id}
-                    className="flex items-center gap-2 rounded-md border bg-background/80 p-2"
+                    className="flex items-center gap-2 rounded-none border bg-background/80 p-2"
                   >
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 mb-1">
@@ -117,7 +117,7 @@ export function NoModelsGuide({
 
           <div className="mt-3">
             <Button variant="link" size="sm" className="h-auto p-0 text-xs" asChild>
-              <Link to="/models">
+              <Link to="/inference/models">
                 Browse all models
                 <ExternalLink className="h-3 w-3 ml-1" />
               </Link>

@@ -26,16 +26,20 @@ pub const SparseVector = struct {
 pub const SparseWrite = struct {
     doc_id: []const u8,
     vec: SparseVector,
+    doc_num: ?u32 = null,
 };
 
 pub const SearchResult = struct {
     doc_id: []u8,
+    doc_num: ?u32 = null,
     score: f32,
 };
 
 pub const SearchConstraints = struct {
     filter_doc_ids: []const []const u8 = &.{},
     exclude_doc_ids: []const []const u8 = &.{},
+    filter_doc_nums: []const u32 = &.{},
+    exclude_doc_nums: []const u32 = &.{},
 };
 
 pub const SplitRebuildResult = struct {
@@ -115,10 +119,28 @@ pub const WriteProfile = struct {
 
 pub const SparseIndex = struct {
     next_doc_num: u64 = 0,
+    chunk_size: u32 = 1024,
 
     pub const Stats = struct {
         doc_count: u64 = 0,
         term_count: u64 = 0,
+    };
+
+    pub const SegmentCompactionOptions = struct {
+        min_segments: usize = 32,
+        max_segments: usize = 128,
+    };
+
+    pub const SegmentCompactionTask = struct {
+        pub fn deinit(self: *SegmentCompactionTask, _: Allocator) void {
+            self.* = undefined;
+        }
+    };
+
+    pub const SegmentCompactionResult = struct {
+        pub fn deinit(self: *SegmentCompactionResult, _: Allocator) void {
+            self.* = undefined;
+        }
     };
 
     pub fn open(_: Allocator, _: [*:0]const u8, _: SparseIndexOptions) !SparseIndex {
@@ -169,11 +191,27 @@ pub const SparseIndex = struct {
         return error.UnsupportedPlatform;
     }
 
+    pub fn beginSegmentCompactionTask(_: *SparseIndex, _: Allocator, _: SegmentCompactionOptions) !?SegmentCompactionTask {
+        return null;
+    }
+
+    pub fn executeSegmentCompactionTask(_: Allocator, _: *const SegmentCompactionTask, _: u32) !SegmentCompactionResult {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn finishSegmentCompactionTask(_: *SparseIndex, _: *const SegmentCompactionTask, _: *SegmentCompactionResult) !bool {
+        return error.UnsupportedPlatform;
+    }
+
     pub fn search(_: *SparseIndex, _: Allocator, _: *const SparseVector, _: u32) ![]SearchResult {
         return error.UnsupportedPlatform;
     }
 
     pub fn searchConstrained(_: *SparseIndex, _: Allocator, _: *const SparseVector, _: u32, _: SearchConstraints) ![]SearchResult {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn debugDocNumForDocId(_: *SparseIndex, _: []const u8) !?u32 {
         return error.UnsupportedPlatform;
     }
 

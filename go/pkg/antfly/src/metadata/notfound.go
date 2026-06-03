@@ -27,48 +27,48 @@ import (
 // extracted from api.yaml OpenAPI specification
 var validEndpoints = []string{
 	// Cluster
-	"/api/v1/status",
-	"/api/v1/backup",
-	"/api/v1/restore",
-	"/api/v1/backups",
+	"/db/v1/status",
+	"/db/v1/backup",
+	"/db/v1/restore",
+	"/db/v1/backups",
 
 	// Global operations
-	"/api/v1/query",
+	"/db/v1/query",
 
 	// Table management
-	"/api/v1/tables",
-	"/api/v1/tables/{tableName}",
-	"/api/v1/tables/{tableName}/schema",
+	"/db/v1/tables",
+	"/db/v1/tables/{tableName}",
+	"/db/v1/tables/{tableName}/schema",
 
 	// Table operations
-	"/api/v1/tables/{tableName}/query",
-	"/api/v1/tables/{tableName}/batch",
-	"/api/v1/tables/{tableName}/merge",
-	"/api/v1/tables/{tableName}/lookup",
-	"/api/v1/tables/{tableName}/lookup/{key}",
-	"/api/v1/tables/{tableName}/backup",
-	"/api/v1/tables/{tableName}/restore",
+	"/db/v1/tables/{tableName}/query",
+	"/db/v1/tables/{tableName}/batch",
+	"/db/v1/tables/{tableName}/merge",
+	"/db/v1/tables/{tableName}/lookup",
+	"/db/v1/tables/{tableName}/lookup/{key}",
+	"/db/v1/tables/{tableName}/backup",
+	"/db/v1/tables/{tableName}/restore",
 
 	// Index management
-	"/api/v1/tables/{tableName}/indexes",
-	"/api/v1/tables/{tableName}/indexes/{indexName}",
+	"/db/v1/tables/{tableName}/indexes",
+	"/db/v1/tables/{tableName}/indexes/{indexName}",
 
 	// Agents
-	"/api/v1/agents/retrieval",
-	"/api/v1/agents/query-builder",
+	"/db/v1/agents/retrieval",
+	"/db/v1/agents/query-builder",
 
 	// Cross-table operations
-	"/api/v1/batch",
+	"/db/v1/batch",
 
 	// Transactions
-	"/api/v1/transactions/commit",
+	"/db/v1/transactions/commit",
 
 	// MCP (Model Context Protocol)
 	"/mcp/v1/",
 
 	// API Key management
-	"/api/v1/users/{userName}/api-keys",
-	"/api/v1/users/{userName}/api-keys/{keyId}",
+	"/auth/v1/users/{userName}/api-keys",
+	"/auth/v1/users/{userName}/api-keys/{keyId}",
 }
 
 // patternReplacements maps common typos to their correct forms
@@ -197,9 +197,9 @@ func findSimilarEndpoints(requestedPath string) []string {
 
 // applyPatternCorrections applies common singular→plural corrections
 func applyPatternCorrections(path string) string {
-	// Normalize path (ensure it starts with /api/v1/)
+	// Normalize path (ensure it starts with /db/v1/)
 	normalized := path
-	if !strings.HasPrefix(normalized, "/api/v1/") {
+	if !strings.HasPrefix(normalized, "/db/v1/") {
 		return normalized // Don't try to correct non-API paths
 	}
 
@@ -251,15 +251,15 @@ func fuzzyMatchEndpoints(requestedPath string, maxSuggestions int) []string {
 		distance int
 	}
 
-	// Strip /api/v1/ prefix for comparison to reduce distance noise
-	normalizedPath := strings.TrimPrefix(requestedPath, "/api/v1")
+	// Strip /db/v1/ prefix for comparison to reduce distance noise
+	normalizedPath := strings.TrimPrefix(requestedPath, "/db/v1")
 	normalizedPath = strings.TrimSuffix(normalizedPath, "/")
 
 	var matches []match
 	const maxDistance = 5 // Maximum edit distance to consider
 
 	for _, endpoint := range validEndpoints {
-		normalizedEndpoint := strings.TrimPrefix(endpoint, "/api/v1")
+		normalizedEndpoint := strings.TrimPrefix(endpoint, "/db/v1")
 		normalizedEndpoint = strings.TrimSuffix(normalizedEndpoint, "/")
 
 		// Replace {param} patterns with a placeholder for comparison

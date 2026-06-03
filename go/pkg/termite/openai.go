@@ -90,7 +90,7 @@ func (ln *TermiteNode) handleOpenAIModels(w http.ResponseWriter, r *http.Request
 				ID:      name,
 				Object:  "model",
 				Created: now,
-				OwnedBy: "termite",
+				OwnedBy: "antfly",
 			})
 		}
 	}
@@ -102,7 +102,7 @@ func (ln *TermiteNode) handleOpenAIModels(w http.ResponseWriter, r *http.Request
 				ID:      name,
 				Object:  "model",
 				Created: now,
-				OwnedBy: "termite",
+				OwnedBy: "antfly",
 			})
 		}
 	}

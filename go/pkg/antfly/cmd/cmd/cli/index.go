@@ -186,9 +186,9 @@ Example templates:
 	indexCreateCmd.Flags().String("field", "", "Field to index (mutually exclusive with template)")
 	indexCreateCmd.Flags().String("template", "", "Handlebars template to construct indexed value (mutually exclusive with field)")
 	indexCreateCmd.Flags().Int("dimension", 768, "Dimension of the vector embeddings")
-	indexCreateCmd.Flags().String("embedder", `{"provider": "termite", "model": "bge-small-en-v1.5"}`, "JSON string for embedder configuration")
+	indexCreateCmd.Flags().String("embedder", `{"provider": "antfly", "model": "bge-small-en-v1.5"}`, "JSON string for embedder configuration")
 	indexCreateCmd.Flags().String("generator", "", `JSON string for generator configuration (e.g. {"provider": "ollama", "model": "gemma3:4b", "url": "http://localhost:11434"})`)
-	indexCreateCmd.Flags().String("chunker", "", `JSON string for chunker configuration (e.g. {"provider": "termite", "model": "chonky-mmbert-small-multilingual-1", "target_tokens": 512, "overlap_tokens": 50})`)
+	indexCreateCmd.Flags().String("chunker", "", `JSON string for chunker configuration (e.g. {"provider": "antfly", "model": "chonky-mmbert-small-multilingual-1", "target_tokens": 512, "overlap_tokens": 50})`)
 
 	parent.AddCommand(indexCmd)
 }

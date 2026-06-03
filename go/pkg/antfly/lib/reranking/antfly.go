@@ -1,0 +1,106 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+package reranking
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/schema"
+	client "github.com/antflydb/antfly/go/pkg/sdk"
+)
+
+type AntflyReranker struct {
+	client   *client.InferenceClient
+	config   RerankerConfig
+	field    string
+	template string
+}
+
+func init() {
+	RegisterReranker(RerankerProviderAntfly, NewAntflyReranker)
+}
+
+func NewAntflyReranker(config RerankerConfig) (Reranker, error) {
+	c, err := config.AsAntflyRerankerConfig()
+	if err != nil {
+		return nil, fmt.Errorf("parsing antfly inference config: %w", err)
+	}
+
+	url := "http://localhost:11433"
+	if c.Url != nil && *c.Url != "" {
+		url = *c.Url
+	}
+
+	field := ""
+	if config.Field != nil {
+		field = *config.Field
+	}
+
+	template := ""
+	if config.Template != nil {
+		template = *config.Template
+	}
+
+	httpClient := &http.Client{Timeout: time.Second * 540}
+	inferenceClient, err := client.NewInferenceClient(url, httpClient)
+	if err != nil {
+		return nil, fmt.Errorf("creating inference client: %w", err)
+	}
+
+	return &AntflyReranker{
+		client:   inferenceClient,
+		config:   config,
+		field:    field,
+		template: template,
+	}, nil
+}
+
+func (t *AntflyReranker) Rerank(
+	ctx context.Context,
+	query string,
+	documents []schema.Document,
+) ([]float32, error) {
+	// Extract model name from config
+	antflyConfig, err := t.config.AsAntflyRerankerConfig()
+	if err != nil {
+		return nil, fmt.Errorf("extracting antfly inference config: %w", err)
+	}
+
+	// Extract text from documents using field or template
+	prompts, err := ExtractDocumentTexts(documents, t.field, t.template)
+	if err != nil {
+		return nil, fmt.Errorf("extracting document texts: %w", err)
+	}
+
+	// Rerank using the inference client
+	scores, err := t.client.Rerank(ctx, antflyConfig.Model, query, prompts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate response
+	if len(scores) != len(prompts) {
+		return nil, fmt.Errorf(
+			"expected %d scores, got %d",
+			len(prompts),
+			len(scores),
+		)
+	}
+
+	return scores, nil
+}

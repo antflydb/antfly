@@ -5,7 +5,7 @@ const std = @import("std");
 const antfly_usermgr_openapi = @import("antfly_usermgr_openapi");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
-const antfly_ai_openapi = @import("antfly_ai_openapi");
+const antfly_generating_api_openapi = @import("antfly_generating_api_openapi");
 const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
@@ -49,6 +49,69 @@ pub const ClusterHealth = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const ClusterDataNodeStatus = struct {
+    data_id: i64,
+    node_id: i64,
+    api_url: ?[]const u8 = null,
+    raft_url: ?[]const u8 = null,
+    role: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    health_class: ?[]const u8 = null,
+    failure_domain: ?[]const u8 = null,
+    live: ?bool = null,
+    drain_requested: ?bool = null,
+    capacity_bytes: ?i64 = null,
+    available_bytes: ?i64 = null,
+    lease_pressure: ?i64 = null,
+    read_load: ?i64 = null,
+    write_load: ?i64 = null,
+    active_backfills: ?i64 = null,
+};
+
+pub const ClusterDataRangeStatus = struct {
+    group_id: i64,
+    range_id: i64,
+    table_id: i64,
+    table_name: ?[]const u8 = null,
+    start_key: ?[]const u8 = null,
+    end_key: ?[]const u8 = null,
+    doc_identity_shard_id: ?i64 = null,
+    doc_identity_range_id: ?i64 = null,
+    state: ?[]const u8 = null,
+    leader_data_id: ?i64 = null,
+    voter_count: ?i64 = null,
+    doc_count: ?i64 = null,
+    disk_bytes: ?i64 = null,
+    empty: ?bool = null,
+};
+
+pub const ClusterDataReplicaStatus = struct {
+    group_id: i64,
+    data_id: i64,
+    node_id: i64,
+    replica_id: i64,
+    peer_node_ids: ?[]const i64 = null,
+};
+
+pub const ClusterDataGroupStatus = struct {
+    group_id: i64,
+    leader_known: ?bool = null,
+    leader_data_id: ?i64 = null,
+    voter_count_known: ?bool = null,
+    voter_count: ?i64 = null,
+    healthy_voter_reports: ?i64 = null,
+    joint_consensus: ?bool = null,
+    transition_pending: ?bool = null,
+    replay_required: ?bool = null,
+    replay_caught_up: ?bool = null,
+    cutover_ready: ?bool = null,
+    reads_ready_after_cutover: ?bool = null,
+    doc_identity_lifecycle: ?[]const u8 = null,
+    doc_count: ?i64 = null,
+    disk_bytes: ?i64 = null,
+    empty: ?bool = null,
 };
 
 /// Non-secret status for the local secrets file store, when one is available.
@@ -359,11 +422,15 @@ pub const IndexStatus = struct {
     status: antfly_indexes_openapi.IndexStats,
 };
 
-pub const StorageStatus = struct {
-    /// Disk usage in bytes.
-    disk_usage: ?i64 = null,
-    /// Whether the table has received data.
-    empty: ?bool = null,
+/// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
+pub const LsmStorageStatus = struct {
+    run_count: ?i64 = null,
+    run_bytes: ?i64 = null,
+    l0_run_count: ?i64 = null,
+    l0_bytes: ?i64 = null,
+    wal_retained_bytes: ?i64 = null,
+    compaction_backlog_bytes: ?i64 = null,
+    active_readers: ?i64 = null,
 };
 
 /// MongoDB-style update operator
@@ -896,15 +963,15 @@ pub const PruneStats = struct {
 /// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
 pub const RetrievalAgentSteps = struct {
     /// Tool configuration for the retrieval agent. Controls which tools are available and their settings. If not specified, tools are automatically determined from the table's available indexes.
-    tools: ?antfly_ai_openapi.ChatToolsConfig = null,
+    tools: ?antfly_generating_api_openapi.ChatToolsConfig = null,
     /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
-    classification: ?antfly_ai_openapi.ClassificationStepConfig = null,
+    classification: ?antfly_generating_api_openapi.ClassificationStepConfig = null,
     /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
-    generation: ?antfly_ai_openapi.GenerationStepConfig = null,
+    generation: ?antfly_generating_api_openapi.GenerationStepConfig = null,
     /// Configuration for generating follow-up questions. Requires steps.generation to be set.
-    followup: ?antfly_ai_openapi.FollowupStepConfig = null,
+    followup: ?antfly_generating_api_openapi.FollowupStepConfig = null,
     /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
-    confidence: ?antfly_ai_openapi.ConfidenceStepConfig = null,
+    confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
     /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
     eval: ?antfly_eval_openapi.EvalConfig = null,
 };
@@ -912,13 +979,13 @@ pub const RetrievalAgentSteps = struct {
 /// DEPRECATED: Use RetrievalAgentSteps instead. Configuration for the answer agent's pipeline steps.
 pub const AnswerAgentSteps = struct {
     /// Configuration for query classification and transformation.
-    classification: ?antfly_ai_openapi.ClassificationStepConfig = null,
+    classification: ?antfly_generating_api_openapi.ClassificationStepConfig = null,
     /// DEPRECATED: Use steps.generation on RetrievalAgentRequest instead. Configuration for answer generation from retrieved documents.
-    answer: ?antfly_ai_openapi.GenerationStepConfig = null,
+    answer: ?antfly_generating_api_openapi.GenerationStepConfig = null,
     /// Configuration for generating follow-up questions.
-    followup: ?antfly_ai_openapi.FollowupStepConfig = null,
+    followup: ?antfly_generating_api_openapi.FollowupStepConfig = null,
     /// Configuration for confidence assessment.
-    confidence: ?antfly_ai_openapi.ConfidenceStepConfig = null,
+    confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
 };
 
 pub const Embedding = std.json.Value;
@@ -1208,6 +1275,14 @@ pub const ReplicationTransformOp = struct {
     value: ?std.json.Value = null,
 };
 
+/// Typed Zig status view for table data topology and range placement.
+pub const ClusterDataStatus = struct {
+    nodes: ?[]const ClusterDataNodeStatus = null,
+    ranges: ?[]const ClusterDataRangeStatus = null,
+    replicas: ?[]const ClusterDataReplicaStatus = null,
+    groups: ?[]const ClusterDataGroupStatus = null,
+};
+
 pub const ClusterStatus = struct {
     health: ClusterHealth,
     /// Optional message providing details about the health status
@@ -1282,6 +1357,14 @@ pub const AggregationRequest = struct {
     algebraic_join: ?AlgebraicAggregationJoin = null,
     /// Nested sub-aggregations
     sub_aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
+};
+
+pub const StorageStatus = struct {
+    /// Disk usage in bytes.
+    disk_usage: ?i64 = null,
+    /// Whether the table has received data.
+    empty: ?bool = null,
+    lsm: ?LsmStorageStatus = null,
 };
 
 pub const TransformOp = struct {
@@ -1572,6 +1655,18 @@ pub const ReplicationRoute = struct {
     on_delete: ?[]const ReplicationTransformOp = null,
 };
 
+pub const ClusterTopology = struct {
+    health: ClusterHealth,
+    /// Optional message providing details about the health status
+    message: ?[]const u8 = null,
+    /// Indicates whether authentication is enabled for the cluster
+    auth_enabled: ?bool = null,
+    /// Indicates whether the cluster is running in single-node swarm mode
+    swarm_mode: ?bool = null,
+    secret_store: ?SecretStoreStatus = null,
+    data: ClusterDataStatus,
+};
+
 pub const SecretList = struct {
     secrets: []const SecretEntry,
 };
@@ -1631,13 +1726,13 @@ pub const RetrievalAgentResult = struct {
     /// Clarification questions exposed in the shared bounded-agent envelope.
     questions: ?[]const AgentQuestion = null,
     /// Filters that were applied during retrieval
-    applied_filters: ?[]const antfly_ai_openapi.FilterSpec = null,
+    applied_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
     /// Total number of tool calls made during retrieval
     tool_calls_made: ?i64 = null,
     /// Optional conversational context including tool calls and responses. Decisions remain the authoritative continuation input for bounded agent interactions.
-    messages: ?[]const antfly_ai_openapi.ChatMessage = null,
+    messages: ?[]const antfly_generating_openapi.ChatMessage = null,
     /// Query classification and transformation result. Present when steps.classification was configured. Includes strategy, semantic_query, sub_questions (decompose), step_back_query, and reasoning.
-    classification: ?antfly_ai_openapi.ClassificationTransformationResult = null,
+    classification: ?antfly_generating_api_openapi.ClassificationTransformationResult = null,
     /// Generated response in markdown format. Present when steps.generation was configured.
     generation: ?[]const u8 = null,
     /// Confidence in the generated response (requires steps.confidence)
@@ -1765,7 +1860,7 @@ pub const QueryRequest = struct {
     count: ?bool = null,
     /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
     profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "termite", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
@@ -1872,7 +1967,7 @@ pub const RetrievalQueryRequest = struct {
     count: ?bool = null,
     /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
     profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "termite", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
@@ -1973,11 +2068,11 @@ pub const RetrievalAgentRequest = struct {
     /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available.
     queries: []const RetrievalQueryRequest,
     /// Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
-    messages: ?[]const antfly_ai_openapi.ChatMessage = null,
+    messages: ?[]const antfly_generating_openapi.ChatMessage = null,
     /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
     agent_knowledge: ?[]const u8 = null,
     /// Pre-applied filters from prior interactions. These are applied to all search tool invocations.
-    accumulated_filters: ?[]const antfly_ai_openapi.FilterSpec = null,
+    accumulated_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
     /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
     session_id: ?[]const u8 = null,
     /// Structured answers provided by the user as part of client-carried continuation.
@@ -2061,7 +2156,7 @@ pub const AnswerAgentResult = struct {
     /// Relevance of retrieved documents to the query
     context_relevance: ?f32 = null,
     /// DEPRECATED: Use classification on RetrievalAgentResult instead. Query classification and transformation result.
-    classification_transformation: ?antfly_ai_openapi.ClassificationTransformationResult = null,
+    classification_transformation: ?antfly_generating_api_openapi.ClassificationTransformationResult = null,
     /// DEPRECATED: Use hits on RetrievalAgentResult instead. Query results grouped by table.
     query_results: ?[]const QueryResult = null,
     /// Suggested follow-up questions

@@ -47,7 +47,7 @@ builds:
       - -Dmlx=false
       - -Dmetal=false
       - -Dsystem-blas=false
-      - install-antfly
+      - install
 
   - id: "antfly-darwin-arm64"
     builder: zig
@@ -66,7 +66,7 @@ builds:
       - -Dsystem-blas=true
       - --sysroot
       - "{{ .Env.SDK_PATH }}"
-      - install-antfly
+      - install
   # ============================================
   # Go fallback OMNI builds (ONNX + XLA) for old data dirs and rollback.
   # ============================================

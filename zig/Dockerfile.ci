@@ -1,0 +1,39 @@
+FROM ubuntu:24.04
+
+ARG ZIG_VERSION=0.16.0
+ARG TARGETARCH
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/opt/zig:${PATH}"
+ENV UV_CACHE_DIR=/tmp/antfly-ci-uv-cache
+ENV HF_HOME=/tmp/antfly-ci-hf
+ENV TERMITE_HOME=/tmp/antfly-ci-termite
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      bash \
+      build-essential \
+      ca-certificates \
+      curl \
+      git \
+      pkg-config \
+      python3 \
+      xz-utils && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN case "${TARGETARCH}" in \
+      amd64) zig_arch="x86_64" ;; \
+      arm64) zig_arch="aarch64" ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \
+    mkdir -p /opt && \
+    tar -xJf /tmp/zig.tar.xz -C /opt && \
+    mv "/opt/zig-${zig_arch}-linux-${ZIG_VERSION}" /opt/zig && \
+    rm /tmp/zig.tar.xz
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+WORKDIR /workspace
+
+CMD ["scripts/ci/zig-e2e-base-linux.sh"]

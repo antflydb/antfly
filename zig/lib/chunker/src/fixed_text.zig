@@ -14,9 +14,9 @@
 
 const std = @import("std");
 const types = @import("types.zig");
-const HfTokenizer = @import("termite_hf_tokenizer").HfTokenizer;
+const HfTokenizer = @import("inference_hf_tokenizer").HfTokenizer;
 
-const tokenizer_json = @import("termite_fixed_tokenizer_data").tokenizer_json;
+const tokenizer_json = @import("inference_fixed_tokenizer_data").tokenizer_json;
 const Allocator = std.mem.Allocator;
 
 const PositionedSection = struct {

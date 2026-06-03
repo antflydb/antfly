@@ -15,6 +15,7 @@
 const std = @import("std");
 const db_mod = @import("../storage/db/mod.zig");
 const document_mapper = @import("../storage/db/document_mapper.zig");
+const public_limits = @import("public_limits.zig");
 
 pub const BatchResult = struct {
     inserted: u32,
@@ -58,9 +59,19 @@ pub const OwnedBatchRequest = struct {
 };
 
 pub fn parseBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatchRequest {
+    return try parseBatchRequestWithOptions(alloc, body, .{
+        .allocate = .alloc_always,
+        .max_value_len = public_limits.max_json_value_len,
+    });
+}
+
+fn parseBatchRequestWithOptions(alloc: std.mem.Allocator, body: []const u8, options: std.json.ParseOptions) !OwnedBatchRequest {
     if (body.len == 0) return .{};
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .allocate = .alloc_always }) catch return error.InvalidBatchRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, options) catch |err| switch (err) {
+        error.ValueTooLong => return error.ValueTooLong,
+        else => return error.InvalidBatchRequest,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidBatchRequest;
     const root = parsed.value.object;
@@ -358,6 +369,34 @@ test "batch parser accepts inserts and deletes" {
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), owned.writes.len);
     try std.testing.expectEqual(@as(usize, 1), owned.deletes.len);
+}
+
+test "batch parser preserves oversized value errors" {
+    const body =
+        \\{"inserts":{"doc:a":{"raw_payload":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
+    ;
+    try std.testing.expectError(error.ValueTooLong, parseBatchRequestWithOptions(std.testing.allocator, body, .{ .allocate = .alloc_always, .max_value_len = 64 }));
+}
+
+test "batch parser accepts raw payload value under public request cap" {
+    const alloc = std.testing.allocator;
+    const payload = try alloc.alloc(u8, 6 * 1024 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("{\"inserts\":{\"doc:a\":{\"raw_payload\":\"");
+    try writer.writeAll(payload);
+    try writer.writeAll("\"}}}");
+
+    var owned = try parseBatchRequest(alloc, out.written());
+    defer owned.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), owned.writes.len);
+    try std.testing.expect(std.mem.indexOf(u8, owned.writes[0].value, "\"raw_payload\"") != null);
 }
 
 test "batch parser accepts go sync levels" {

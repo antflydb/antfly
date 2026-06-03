@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -338,6 +339,56 @@ func (um *UserManager) RemovePermissionFromUser(
 	return nil
 }
 
+// AddRoleToUser adds a role or group membership for a user in Casbin.
+func (um *UserManager) AddRoleToUser(username, role string) error {
+	um.mu.Lock()
+	defer um.mu.Unlock()
+
+	if _, exists := um.passwordHashes[username]; !exists {
+		return ErrUserNotFound
+	}
+
+	if _, err := um.enforcer.AddGroupingPolicy(username, role); err != nil {
+		return fmt.Errorf("failed to add role %s to user %s: %w", role, username, err)
+	}
+	return nil
+}
+
+// RemoveRoleFromUser removes a role or group membership from a user in Casbin.
+func (um *UserManager) RemoveRoleFromUser(username, role string) error {
+	um.mu.Lock()
+	defer um.mu.Unlock()
+
+	if _, exists := um.passwordHashes[username]; !exists {
+		return ErrUserNotFound
+	}
+
+	removed, err := um.enforcer.RemoveGroupingPolicy(username, role)
+	if err != nil {
+		return fmt.Errorf("failed to remove role %s from user %s: %w", role, username, err)
+	}
+	if !removed {
+		return ErrRoleNotFound
+	}
+	return nil
+}
+
+// GetRolesForUser returns inherited role and group subjects for a user.
+func (um *UserManager) GetRolesForUser(username string) ([]string, error) {
+	um.mu.RLock()
+	defer um.mu.RUnlock()
+
+	if _, exists := um.passwordHashes[username]; !exists {
+		return nil, ErrUserNotFound
+	}
+
+	roles, err := um.enforcer.GetRolesForUser(username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list roles for user %s: %w", username, err)
+	}
+	return roles, nil
+}
+
 // ListUsers returns a list of all usernames in the system.
 func (um *UserManager) ListUsers() ([]string, error) {
 	um.mu.RLock()
@@ -348,6 +399,54 @@ func (um *UserManager) ListUsers() ([]string, error) {
 		users = append(users, username)
 	}
 	return users, nil
+}
+
+// ListAuthSubjects returns unique subjects referenced by user records and Casbin policies.
+func (um *UserManager) ListAuthSubjects() ([]string, error) {
+	um.mu.RLock()
+	defer um.mu.RUnlock()
+
+	subjects := make(map[string]struct{}, len(um.passwordHashes))
+	for username := range um.passwordHashes {
+		subjects[username] = struct{}{}
+	}
+
+	policies, err := um.enforcer.GetPolicy()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list permission subjects: %w", err)
+	}
+	for _, policy := range policies {
+		if len(policy) > 0 {
+			subjects[policy[0]] = struct{}{}
+		}
+	}
+
+	rowFilterPolicies, err := um.enforcer.GetNamedPolicy("p2")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list row filter subjects: %w", err)
+	}
+	for _, policy := range rowFilterPolicies {
+		if len(policy) > 0 {
+			subjects[policy[0]] = struct{}{}
+		}
+	}
+
+	groupingPolicies, err := um.enforcer.GetGroupingPolicy()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list role subjects: %w", err)
+	}
+	for _, policy := range groupingPolicies {
+		for _, subject := range policy {
+			subjects[subject] = struct{}{}
+		}
+	}
+
+	result := make([]string, 0, len(subjects))
+	for subject := range subjects {
+		result = append(result, subject)
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 // GetPermissionsForUser retrieves all roles (permissions) for a user from Casbin.
@@ -506,6 +605,18 @@ func (um *UserManager) SetRowFilter(username, table string, filterJSON json.RawM
 		return ErrUserNotFound
 	}
 
+	return um.setRowFilterLocked(username, table, filterJSON)
+}
+
+// SetSubjectRowFilter stores a row filter for any auth subject on a specific table.
+func (um *UserManager) SetSubjectRowFilter(subject, table string, filterJSON json.RawMessage) error {
+	um.mu.Lock()
+	defer um.mu.Unlock()
+
+	return um.setRowFilterLocked(subject, table, filterJSON)
+}
+
+func (um *UserManager) setRowFilterLocked(subject, table string, filterJSON json.RawMessage) error {
 	// Validate that the filter is valid JSON.
 	var parsed map[string]interface{}
 	if err := json.Unmarshal(filterJSON, &parsed); err != nil {
@@ -513,10 +624,10 @@ func (um *UserManager) SetRowFilter(username, table string, filterJSON json.RawM
 	}
 
 	// Remove any existing filter for this user+table, then add the new one.
-	_, _ = um.enforcer.RemoveFilteredNamedPolicy("p2", 0, username, table)
-	_, err := um.enforcer.AddNamedPolicy("p2", username, table, string(filterJSON))
+	_, _ = um.enforcer.RemoveFilteredNamedPolicy("p2", 0, subject, table)
+	_, err := um.enforcer.AddNamedPolicy("p2", subject, table, string(filterJSON))
 	if err != nil {
-		return fmt.Errorf("failed to set row filter for user %s table %s: %w", username, table, err)
+		return fmt.Errorf("failed to set row filter for subject %s table %s: %w", subject, table, err)
 	}
 	return nil
 }
@@ -530,9 +641,21 @@ func (um *UserManager) RemoveRowFilter(username, table string) error {
 		return ErrUserNotFound
 	}
 
-	removed, err := um.enforcer.RemoveFilteredNamedPolicy("p2", 0, username, table)
+	return um.removeRowFilterLocked(username, table)
+}
+
+// RemoveSubjectRowFilter removes the row filter for any auth subject on a specific table.
+func (um *UserManager) RemoveSubjectRowFilter(subject, table string) error {
+	um.mu.Lock()
+	defer um.mu.Unlock()
+
+	return um.removeRowFilterLocked(subject, table)
+}
+
+func (um *UserManager) removeRowFilterLocked(subject, table string) error {
+	removed, err := um.enforcer.RemoveFilteredNamedPolicy("p2", 0, subject, table)
 	if err != nil {
-		return fmt.Errorf("failed to remove row filter for user %s table %s: %w", username, table, err)
+		return fmt.Errorf("failed to remove row filter for subject %s table %s: %w", subject, table, err)
 	}
 	if !removed {
 		return ErrRowFilterNotFound
@@ -588,9 +711,21 @@ func (um *UserManager) ListRowFilters(username string) ([]rowFilterPolicy, error
 		return nil, ErrUserNotFound
 	}
 
-	policies, err := um.enforcer.GetFilteredNamedPolicy("p2", 0, username)
+	return um.listRowFiltersLocked(username)
+}
+
+// ListSubjectRowFilters returns individual row filter entries for any auth subject.
+func (um *UserManager) ListSubjectRowFilters(subject string) ([]rowFilterPolicy, error) {
+	um.mu.RLock()
+	defer um.mu.RUnlock()
+
+	return um.listRowFiltersLocked(subject)
+}
+
+func (um *UserManager) listRowFiltersLocked(subject string) ([]rowFilterPolicy, error) {
+	policies, err := um.enforcer.GetFilteredNamedPolicy("p2", 0, subject)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list row filters for user %s: %w", username, err)
+		return nil, fmt.Errorf("failed to list row filters for subject %s: %w", subject, err)
 	}
 
 	entries := make([]rowFilterPolicy, 0, len(policies))
@@ -615,9 +750,21 @@ func (um *UserManager) GetRowFilter(username, table string) (json.RawMessage, er
 		return nil, ErrUserNotFound
 	}
 
-	policies, err := um.enforcer.GetFilteredNamedPolicy("p2", 0, username, table)
+	return um.getRowFilterLocked(username, table)
+}
+
+// GetSubjectRowFilter returns the row filter for any auth subject on a specific table.
+func (um *UserManager) GetSubjectRowFilter(subject, table string) (json.RawMessage, error) {
+	um.mu.RLock()
+	defer um.mu.RUnlock()
+
+	return um.getRowFilterLocked(subject, table)
+}
+
+func (um *UserManager) getRowFilterLocked(subject, table string) (json.RawMessage, error) {
+	policies, err := um.enforcer.GetFilteredNamedPolicy("p2", 0, subject, table)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get row filter for user %s table %s: %w", username, table, err)
+		return nil, fmt.Errorf("failed to get row filter for subject %s table %s: %w", subject, table, err)
 	}
 	if len(policies) == 0 {
 		return nil, ErrRowFilterNotFound

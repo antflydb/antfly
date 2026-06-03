@@ -57,10 +57,10 @@ func NewGeneratorConfig(config any) (*GeneratorConfig, error) {
 		if err := modelConfig.FromOpenRouterGeneratorConfig(v); err != nil {
 			return nil, fmt.Errorf("from openrouter generator config: %w", err)
 		}
-	case TermiteGeneratorConfig:
-		provider = GeneratorProviderTermite
-		if err := modelConfig.FromTermiteGeneratorConfig(v); err != nil {
-			return nil, fmt.Errorf("from termite generator config: %w", err)
+	case AntflyGeneratorConfig:
+		provider = GeneratorProviderAntfly
+		if err := modelConfig.FromAntflyGeneratorConfig(v); err != nil {
+			return nil, fmt.Errorf("from antfly generator config: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("unknown generator config type: %T", v)
@@ -136,8 +136,8 @@ func (gc *GeneratorConfig) GetModel() (string, error) {
 			return "", err
 		}
 		return c.Model, nil
-	case GeneratorProviderTermite:
-		c, err := gc.AsTermiteGeneratorConfig()
+	case GeneratorProviderAntfly:
+		c, err := gc.AsAntflyGeneratorConfig()
 		if err != nil {
 			return "", err
 		}

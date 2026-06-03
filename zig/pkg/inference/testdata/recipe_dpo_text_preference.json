@@ -1,0 +1,22 @@
+{
+  "recipe": "dpo",
+  "model": {
+    "path": "/tmp/termite-models/Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "reference_path": "/tmp/termite-models/Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "family": "qwen2",
+    "name": "qwen2.5-0.5b-instruct-local"
+  },
+  "dataset": {
+    "path": "pkg/inference/testdata/dpo_text_preference.jsonl",
+    "format": "text-preference",
+    "max_examples": 2,
+    "max_seq_len": 128
+  },
+  "preference": {
+    "beta": 0.1
+  },
+  "artifacts": {
+    "root": "/tmp/termite-dpo-text-recipe-smoke"
+  },
+  "backend": "auto"
+}

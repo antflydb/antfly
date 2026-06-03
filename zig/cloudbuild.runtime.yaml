@@ -1,0 +1,71 @@
+# Cloud Build config for packaging a prebuilt Antfly Zig runtime artifact.
+#
+# Substitutions:
+#   _ARTIFACT_URI: gs:// URI of a tar.gz containing bin/ and share/
+#   _IMAGE_NAME: image name in the containers repo
+#   _DOCKERFILE: runtime Dockerfile path relative to repo root
+#   _CONTEXT: extracted runtime image build context path
+#   _ALIAS_TAG: optional stable tag, such as zig
+#   _VERSION_TAG: versioned tag, such as zig-v0.1.0-arm64
+#   _PLATFORMS: single build platform, linux/amd64 or linux/arm64
+#   _DESCRIPTION: OCI image description
+
+steps:
+  - name: gcr.io/cloud-builders/gsutil
+    id: fetch-runtime-artifact
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -eux
+        rm -rf "${_CONTEXT}"
+        mkdir -p "${_CONTEXT}"
+        gsutil cp "${_ARTIFACT_URI}" /tmp/antfly-zig-runtime.tar.gz
+        tar -xzf /tmp/antfly-zig-runtime.tar.gz -C "${_CONTEXT}"
+        test -x "${_CONTEXT}/bin/antfly"
+        test -d "${_CONTEXT}/share/antfly"
+
+  - name: gcr.io/cloud-builders/docker
+    id: setup-buildx
+    args:
+      - buildx
+      - create
+      - --use
+      - --name=runtime
+      - --driver=docker-container
+
+  - name: gcr.io/cloud-builders/docker
+    id: build-push
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -eux
+        IMAGE_BASE="us-central1-docker.pkg.dev/$PROJECT_ID/containers/${_IMAGE_NAME}"
+        TAG_ARGS=(-t "$${IMAGE_BASE}:${_VERSION_TAG}")
+        if [ -n "${_ALIAS_TAG}" ] && [ "${_ALIAS_TAG}" != "__skip_alias__" ]; then
+          TAG_ARGS=(-t "$${IMAGE_BASE}:${_ALIAS_TAG}" "$${TAG_ARGS[@]}")
+        fi
+        docker buildx build \
+          --progress=plain \
+          --platform="${_PLATFORMS}" \
+          --push \
+          -f "${_DOCKERFILE}" \
+          "$${TAG_ARGS[@]}" \
+          --label "org.opencontainers.image.description=${_DESCRIPTION}" \
+          "${_CONTEXT}"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1800s
+
+substitutions:
+  _ARTIFACT_URI: gs://antfly-image-artifacts-zig-build-artifacts/zig/latest/antfly-zig-amd64.tar.gz
+  _IMAGE_NAME: antfly
+  _DOCKERFILE: zig/Dockerfile.runtime
+  _CONTEXT: /workspace/.zig-container
+  _ALIAS_TAG: __skip_alias__
+  _VERSION_TAG: zig-latest-amd64
+  _PLATFORMS: linux/amd64
+  _DESCRIPTION: AntflyDB Zig runtime image

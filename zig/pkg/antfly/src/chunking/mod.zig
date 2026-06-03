@@ -15,11 +15,11 @@
 pub const chunk = @import("chunk.zig");
 pub const types = @import("types.zig");
 pub const fixed = @import("fixed.zig");
-pub const termite = @import("termite.zig");
+pub const inference = @import("inference.zig");
 
 test {
     _ = chunk;
     _ = types;
     _ = fixed;
-    _ = termite;
+    _ = inference;
 }

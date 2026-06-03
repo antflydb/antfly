@@ -24,8 +24,8 @@ const QuerySection: React.FC<QuerySectionProps> = ({
     return (
       <div
         className={cn(
-          "border rounded-lg p-6 space-y-4",
-          variant === "default" && "bg-card shadow-sm",
+          "border rounded-none p-6 space-y-4",
+          variant === "default" && "bg-card",
           variant === "muted" && "bg-muted/30",
           className
         )}
@@ -37,7 +37,7 @@ const QuerySection: React.FC<QuerySectionProps> = ({
 
   // With title - use Card components
   return (
-    <Card className={cn("shadow-sm", className)}>
+    <Card className={className}>
       <CardHeader className="pb-4">
         <CardTitle className="text-lg">{title}</CardTitle>
       </CardHeader>

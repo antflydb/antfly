@@ -19,6 +19,7 @@ const document_query = @import("../document_query.zig");
 const search_exec = @import("search_exec.zig");
 
 pub const SpecialFieldSelection = struct {
+    all_artifacts: bool = false,
     all_chunks: bool = false,
     all_embeddings: bool = false,
 };
@@ -36,6 +37,11 @@ pub const SpecialFieldLoader = struct {
         doc_key: []const u8,
     ) anyerror!?std.json.Value,
     load_embeddings: *const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_key: []const u8,
+    ) anyerror!?std.json.Value,
+    load_artifacts: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
         doc_key: []const u8,
@@ -203,7 +209,9 @@ fn parseSpecialFieldSelection(fields: []const []const u8) SpecialFieldSelection 
     var special: SpecialFieldSelection = .{};
     for (fields) |field| {
         if (field.len == 0 or field[0] == '-') continue;
-        if (std.mem.eql(u8, field, "_chunks") or std.mem.eql(u8, field, "_chunks.*")) {
+        if (std.mem.eql(u8, field, "_artifacts") or std.mem.eql(u8, field, "_artifacts.*")) {
+            special.all_artifacts = true;
+        } else if (std.mem.eql(u8, field, "_chunks") or std.mem.eql(u8, field, "_chunks.*")) {
             special.all_chunks = true;
         } else if (std.mem.eql(u8, field, "_embeddings") or std.mem.eql(u8, field, "_embeddings.*")) {
             special.all_embeddings = true;
@@ -246,6 +254,11 @@ fn mergeStoredDocumentWithSpecialFields(
     special: SpecialFieldSelection,
     loader: SpecialFieldLoader,
 ) ![]u8 {
+    const artifact_value = if (special.all_artifacts) try loader.load_artifacts(loader.ctx, alloc, doc_key) else null;
+    errdefer if (artifact_value) |value| {
+        var mutable = value;
+        freeJsonValue(alloc, &mutable);
+    };
     const chunk_value = if (special.all_chunks) try loader.load_chunks(loader.ctx, alloc, doc_key) else null;
     errdefer if (chunk_value) |value| {
         var mutable = value;
@@ -256,7 +269,7 @@ fn mergeStoredDocumentWithSpecialFields(
         var mutable = value;
         freeJsonValue(alloc, &mutable);
     };
-    if (chunk_value == null and embedding_value == null) return try alloc.dupe(u8, raw);
+    if (artifact_value == null and chunk_value == null and embedding_value == null) return try alloc.dupe(u8, raw);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
@@ -268,6 +281,9 @@ fn mergeStoredDocumentWithSpecialFields(
     errdefer freeJsonValue(alloc, &root);
 
     if (root != .object) unreachable;
+    if (artifact_value) |value| {
+        try putOwnedValue(alloc, &root.object, "_artifacts", value);
+    }
     if (chunk_value) |value| {
         try putOwnedValue(alloc, &root.object, "_chunks", value);
     }

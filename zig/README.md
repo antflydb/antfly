@@ -1,6 +1,6 @@
 # antfly-zig
 
-`antfly-zig` is the Zig monorepo for AntflyDB and the Termite inference
+`antfly-zig` is the Zig monorepo for AntflyDB and the inference
 runtime. The repository contains product packages, shared libraries, benchmark
 harnesses, compatibility suites, and Python end-to-end tests that exercise the
 same checked-in source tree.
@@ -12,8 +12,8 @@ pkg/
   antfly/            AntflyDB server, API, metadata, storage, search, raft
   antfly-client/     Zig client package
   antfly-embedded/   Embedded Antfly package and WASM smoke surface
-  termite/           Termite inference runtime, OpenAPI server, tools, web UI
-  termite-client/    Zig Termite client package
+  inference/         Inference runtime, OpenAPI server, tools, web UI
+  inference-client/  Zig inference client package
 
 go/pkg/antfly/lib/
   audio/             Shared audio decode and PCM boundary
@@ -33,7 +33,7 @@ bench/
 
 e2e/
   antfly/            Antfly product-level pytest suite
-  termite/           Termite product-level pytest suite
+  inference/         Inference product-level pytest suite
 
 compat/              Shared compatibility corpus and Go comparison harnesses
 specs/               Formal specifications and model-checking inputs
@@ -44,14 +44,14 @@ testdata/            Shared checked-in fixture data
 
 Root-level Markdown files are design and operating notes for active AntflyDB
 areas. Library-specific design docs live next to their libraries, for example
-`go/pkg/antfly/lib/image/IMAGE.md` and `go/pkg/antfly/lib/audio/AUDIO.md`. Termite-specific design docs
-currently live under `go/pkg/termite/` and `go/pkg/termite/docs/`.
+`go/pkg/antfly/lib/image/IMAGE.md` and `go/pkg/antfly/lib/audio/AUDIO.md`. Inference-specific design docs
+currently live under `pkg/inference/`.
 
 ## Build Requirements
 
 - Zig `0.16.0` or newer.
 - `uv` for Python e2e suites and repository helper scripts.
-- Optional native runtime dependencies for some Termite features, such as MLX,
+- Optional native runtime dependencies for some inference features, such as MLX,
   ONNX Runtime, FFmpeg, or platform GPU support. The build detects available
   local support and exposes flags such as `-Dmlx=...`, `-Dmetal=...`, and
   `-Donnx=...`.
@@ -61,25 +61,25 @@ currently live under `go/pkg/termite/` and `go/pkg/termite/docs/`.
 ```sh
 zig build
 zig build test
-zig build install-antfly
+zig build install -Dedition=full
 zig build antfly -- --help
 ```
 
-Termite also has a package-local build file. From the repository root, use the
+The inference runtime also has a package-local build file. From the repository root, use the
 delegated root steps when possible:
 
 ```sh
-zig build termite-run
-zig build termite-test
-zig build termite-wasm
-zig build termite-bench-linalg
-zig build termite-bench-audio
+zig build inference-run
+zig build inference-test
+zig build inference-wasm
+zig build inference-bench-linalg
+zig build inference-bench-audio
 ```
 
-For package-local Termite work:
+For package-local inference work:
 
 ```sh
-cd go/pkg/termite
+cd pkg/inference
 zig build -Dshared-lib-root=../..
 zig build test -Dshared-lib-root=../..
 ```
@@ -103,25 +103,25 @@ zig build lib-metadata-test
 zig build lib-image-test
 zig build lib-audio-test
 zig build lib-raft-sim-test
-zig build termite-test
+zig build inference-test
 ```
 
 The Python e2e suites are split by product:
 
 ```sh
 uv run --project e2e/antfly pytest -q e2e/antfly
-uv run --project e2e/termite pytest -q e2e/termite
+uv run --project e2e/inference pytest -q e2e/inference
 ```
 
 Some e2e tests start local binaries from `zig-out/bin`; build the relevant
 binary first when running those tests directly:
 
 ```sh
-zig build install-antfly
-(cd go/pkg/termite && zig build -Dshared-lib-root=../..)
+zig build install -Dedition=full
+(cd pkg/inference && zig build -Dshared-lib-root=../..)
 ```
 
-Model-backed Termite tests may require local model fixtures or environment
+Model-backed inference tests may require local model fixtures or environment
 configuration. The suite keeps those tests skippable when the required assets
 are not present.
 
@@ -160,13 +160,13 @@ zig-out/
 .zig-global-cache/
 .pytest_cache/
 e2e/*/.venv/
-go/pkg/termite/.debug/
+pkg/inference/.debug/
 ```
 
 ## Development Notes
 
 - Prefer adding shared, reusable code under `go/pkg/antfly/lib/` and product-specific code
-  under `pkg/antfly` or `go/pkg/termite`.
+  under `pkg/antfly` or `pkg/inference`.
 - Keep package and library README files local when they explain how to use that
   component directly.
 - Keep long-lived design docs near the subsystem they describe. Move stale

@@ -30,10 +30,10 @@ This installs:
 - ServiceAccount and RBAC permissions
 - Operator Deployment
 
-The operator binary defaults `--termite-antfly-image` to
-`ghcr.io/antflydb/antfly:omni`. If you use `spec.termite` and that image is not
-mirrored or available to your cluster, add `--termite-antfly-image=<image>` to
-the deployment args. The image must provide the `/antfly termite` runtime
+The operator binary defaults `--inference-antfly-image` to
+`ghcr.io/antflydb/antfly:omni`. If you use `spec.inference` and that image is not
+mirrored or available to your cluster, add `--inference-antfly-image=<image>` to
+the deployment args. The image must provide the `/antfly inference` runtime
 contract.
 
 For production environments that manage CRDs through GitOps or another platform
@@ -42,10 +42,10 @@ workflow, run the operator with `--skip-crd-install=true` and remove the
 manifest keeps those permissions because startup CRD bootstrap is enabled by
 default.
 
-If `--enable-termite-controllers=false`, the operator disables direct
-TermitePool/TermiteRoute reconciliation and `AntflyCluster.spec.termite`
-management. It does not delete previously owned TermitePool objects while the
-flag is disabled, even if `spec.termite` is removed during that time.
+If `--enable-inference-controllers=false`, the operator disables direct
+InferencePool/InferenceProxy reconciliation and `AntflyCluster.spec.inference`
+management. It does not delete previously owned InferencePool objects while the
+flag is disabled, even if `spec.inference` is removed during that time.
 
 ## Verify Installation
 
@@ -69,8 +69,8 @@ kubectl get crd | grep antfly
 # antflybackups.antfly.io     2025-01-15T00:00:00Z
 # antflyclusters.antfly.io    2025-01-15T00:00:00Z
 # antflyrestores.antfly.io    2025-01-15T00:00:00Z
-# termitepools.antfly.io      2025-01-15T00:00:00Z
-# termiteroutes.antfly.io     2025-01-15T00:00:00Z
+# inferencepools.antfly.io      2025-01-15T00:00:00Z
+# inferenceproxies.antfly.io     2025-01-15T00:00:00Z
 ```
 
 ## What Gets Installed
@@ -83,8 +83,8 @@ The installation creates:
 | CRDs | `antflyclusters.antfly.io` | Cluster definition |
 | CRDs | `antflybackups.antfly.io` | Backup schedules |
 | CRDs | `antflyrestores.antfly.io` | Restore operations |
-| CRDs | `termitepools.antfly.io` | Termite ML pool definition |
-| CRDs | `termiteroutes.antfly.io` | Termite routing definition |
+| CRDs | `inferencepools.antfly.io` | Inference ML pool definition |
+| CRDs | `inferenceproxies.antfly.io` | Inference routing definition |
 | ServiceAccount | `antfly-operator-service-account` | Operator identity |
 | ClusterRole | `antfly-operator-cluster-role` | RBAC permissions |
 | ClusterRoleBinding | `antfly-operator-cluster-role-binding` | Binds role to SA |
@@ -174,7 +174,7 @@ kubectl delete antflyrestores --all-namespaces --all
 kubectl delete -f https://antfly.io/antfly-operator-install.yaml
 
 # Remove CRDs (the operator self-installs these but does not remove them on deletion)
-kubectl delete crd antflyclusters.antfly.io antflybackups.antfly.io antflyrestores.antfly.io termitepools.antfly.io termiteroutes.antfly.io
+kubectl delete crd antflyclusters.antfly.io antflybackups.antfly.io antflyrestores.antfly.io inferencepools.antfly.io inferenceproxies.antfly.io
 
 # Remove PVCs left behind by StatefulSets (retained by default)
 kubectl delete pvc -l app.kubernetes.io/name=antfly-database --all-namespaces

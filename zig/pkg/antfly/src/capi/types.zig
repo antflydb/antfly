@@ -50,6 +50,7 @@ pub const DenseSearchResult = extern struct {
     hits_ptr: ?[*]DenseSearchHit = null,
     hit_count: usize = 0,
     total_hits: u32 = 0,
+    identity_read_generation: u64 = 0,
 };
 
 pub const PackedDenseSearchHit = extern struct {
@@ -64,6 +65,7 @@ pub const PackedDenseSearchResult = extern struct {
     total_hits: u32 = 0,
     ids_ptr: ?[*]u8 = null,
     ids_len: usize = 0,
+    identity_read_generation: u64 = 0,
 };
 
 pub const DenseSearchProfile = extern struct {
@@ -145,7 +147,12 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.VersionConflict => .version_conflict,
         error.IntentConflict, error.DecisionConflict => .intent_conflict,
         error.TxnNotFound, error.NotFound => .txn_not_found,
-        error.InvalidArgument, error.InvalidAggregation, error.UnsupportedAggregation => .invalid_argument,
+        error.InvalidArgument,
+        error.InvalidQueryRequest,
+        error.UnsupportedQueryRequest,
+        error.InvalidAggregation,
+        error.UnsupportedAggregation,
+        => .invalid_argument,
         else => .internal,
     };
 }

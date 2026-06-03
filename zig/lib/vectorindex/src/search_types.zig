@@ -23,6 +23,7 @@ pub const SearchResults = search_results.SearchResults;
 pub const SearchRequest = struct {
     query: []const f32,
     k: usize,
+    rerank_k: ?usize = null,
     search_width: ?u32 = null,
     epsilon: ?f32 = null,
     load_metadata: bool = true,

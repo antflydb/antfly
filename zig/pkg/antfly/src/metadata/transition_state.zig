@@ -48,6 +48,7 @@ pub const MergeTransitionRecord = struct {
     receiver_group_id: u64,
     phase: TransitionPhase = .prepare,
     rollback_reason: ?[]const u8 = null,
+    allow_doc_identity_reassignment: bool = false,
 };
 
 pub const SplitObservation = struct {

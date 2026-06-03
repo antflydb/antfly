@@ -34,7 +34,7 @@ const internal_keys = @import("../storage/internal_keys.zig");
 const table_reads = @import("table_reads.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_writes = @import("table_writes.zig");
-const ai_openapi = @import("antfly_ai_openapi");
+const generating_api_openapi = @import("antfly_generating_api_openapi");
 const transactions_api = @import("transactions.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const public_test_helpers = @import("../public_test_helpers.zig");
@@ -93,23 +93,23 @@ const TestEmbeddingRequest = struct {
     input: std.json.Value,
 };
 
-const TestTermiteChunkRequest = struct {
+const TestAntflyChunkRequest = struct {
     input: std.json.Value,
     config: struct {
         model: []const u8,
     },
 };
 
-const TestTermiteEmbedRequest = struct {
+const TestAntflyEmbedRequest = struct {
     model: []const u8,
     input: std.json.Value,
 };
 
-const TestTermiteRerankRequest = struct {
+const TestAntflyRerankRequest = struct {
     prompts: []const []const u8,
 };
 
-const TestTermiteGenerateRequest = struct {
+const TestAntflyGenerateRequest = struct {
     messages: []const struct {
         content: []const u8,
     },
@@ -317,7 +317,7 @@ fn encodeSparseEmbeddingResponse(
     return try buf.toOwnedSlice(alloc);
 }
 
-const FakeTermiteProvider = struct {
+const FakeAntflyProvider = struct {
     fn executor() http_common.RequestExecutor {
         return .{
             .ptr = undefined,
@@ -331,9 +331,9 @@ const FakeTermiteProvider = struct {
         try std.testing.expectEqual(http_common.Method.POST, req.method);
 
         if (std.mem.endsWith(u8, req.uri, "/api/chunk")) {
-            var parsed_req = try parseJsonBodyIgnoreUnknown(TestTermiteChunkRequest, alloc, req.body);
+            var parsed_req = try parseJsonBodyIgnoreUnknown(TestAntflyChunkRequest, alloc, req.body);
             defer parsed_req.deinit();
-            try std.testing.expectEqualStrings("termite-chunker-v1", parsed_req.value.config.model);
+            try std.testing.expectEqualStrings("antfly-chunker-v1", parsed_req.value.config.model);
             const body = if (jsonValueContainsText(parsed_req.value.input, "beta body"))
                 try alloc.dupe(u8,
                     \\{"object":"list","data":[
@@ -356,9 +356,9 @@ const FakeTermiteProvider = struct {
         }
 
         if (std.mem.endsWith(u8, req.uri, "/embed") or std.mem.endsWith(u8, req.uri, "/embeddings")) {
-            var parsed_req = try parseJsonBodyIgnoreUnknown(TestTermiteEmbedRequest, alloc, req.body);
+            var parsed_req = try parseJsonBodyIgnoreUnknown(TestAntflyEmbedRequest, alloc, req.body);
             defer parsed_req.deinit();
-            if (std.mem.eql(u8, parsed_req.value.model, "termite-sparse-v1")) {
+            if (std.mem.eql(u8, parsed_req.value.model, "antfly-sparse-v1")) {
                 const body = if (jsonValueContainsText(parsed_req.value.input, "alpha body"))
                     try encodeSparseEmbeddingResponse(alloc, &.{ 7, 42 }, &.{ 1.5, 0.5 })
                 else if (jsonValueContainsText(parsed_req.value.input, "beta body"))
@@ -389,7 +389,7 @@ const FakeTermiteProvider = struct {
         }
 
         if (std.mem.endsWith(u8, req.uri, "/rerank")) {
-            var parsed_req = try parseJsonBodyIgnoreUnknown(TestTermiteRerankRequest, alloc, req.body);
+            var parsed_req = try parseJsonBodyIgnoreUnknown(TestAntflyRerankRequest, alloc, req.body);
             defer parsed_req.deinit();
             const scores = if (stringSliceContainsText(parsed_req.value.prompts, "alpha body") and stringSliceContainsText(parsed_req.value.prompts, "beta body"))
                 "[0.1,0.9]"
@@ -404,7 +404,7 @@ const FakeTermiteProvider = struct {
         }
 
         if (std.mem.endsWith(u8, req.uri, "/generate")) {
-            var parsed_req = try parseJsonBodyIgnoreUnknown(TestTermiteGenerateRequest, alloc, req.body);
+            var parsed_req = try parseJsonBodyIgnoreUnknown(TestAntflyGenerateRequest, alloc, req.body);
             defer parsed_req.deinit();
             const content = if (messagesContainText(parsed_req.value.messages, "doc:a") or messagesContainText(parsed_req.value.messages, "hello retrieval"))
                 "Generated answer citing doc:a"
@@ -3194,14 +3194,14 @@ test "public api e2e supports managed sparse embeddings generation" {
     defer listener.deinit();
     try listener.start();
 
-    var termite_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeTermiteProvider.executor());
-    defer termite_listener.deinit();
-    try termite_listener.start();
+    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
+    defer antfly_listener.deinit();
+    try antfly_listener.start();
 
     const base_uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
-    const termite_base_uri = try termite_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(termite_base_uri);
+    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(antfly_base_uri);
 
     var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{});
     defer executor.deinit();
@@ -3217,9 +3217,9 @@ test "public api e2e supports managed sparse embeddings generation" {
         "sparse_idx",
         "body",
         .{
-            .provider = .termite,
-            .model = "termite-sparse-v1",
-            .api_url = termite_base_uri,
+            .provider = .antfly,
+            .model = "antfly-sparse-v1",
+            .api_url = antfly_base_uri,
         },
     );
     defer std.testing.allocator.free(sparse_index_body);
@@ -3309,14 +3309,14 @@ test "public api e2e supports hybrid query pruner and reranker" {
     defer listener.deinit();
     try listener.start();
 
-    var termite_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeTermiteProvider.executor());
-    defer termite_listener.deinit();
-    try termite_listener.start();
+    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
+    defer antfly_listener.deinit();
+    try antfly_listener.start();
 
     const base_uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
-    const termite_base_uri = try termite_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(termite_base_uri);
+    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(antfly_base_uri);
 
     var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{});
     defer executor.deinit();
@@ -3333,9 +3333,9 @@ test "public api e2e supports hybrid query pruner and reranker" {
         "body",
         3,
         .{
-            .provider = .termite,
-            .model = "termite-embed-v1",
-            .api_url = termite_base_uri,
+            .provider = .antfly,
+            .model = "antfly-embed-v1",
+            .api_url = antfly_base_uri,
         },
         null,
     );
@@ -3348,9 +3348,9 @@ test "public api e2e supports hybrid query pruner and reranker" {
         "sparse_idx",
         "body",
         .{
-            .provider = .termite,
-            .model = "termite-sparse-v1",
-            .api_url = termite_base_uri,
+            .provider = .antfly,
+            .model = "antfly-sparse-v1",
+            .api_url = antfly_base_uri,
         },
     );
     defer std.testing.allocator.free(sparse_index_body);
@@ -3373,8 +3373,8 @@ test "public api e2e supports hybrid query pruner and reranker" {
 
     const hybrid_query_body = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"full_text_search\":{{\"match\":{{\"field\":\"body\",\"text\":\"body\"}}}},\"semantic_search\":\"alpha concept\",\"embeddings\":{{\"sparse_idx\":{{\"indices\":[7,42],\"values\":[1.5,0.5]}}}},\"indexes\":[\"semantic_idx\",\"sparse_idx\"],\"merge_config\":{{\"strategy\":\"rsf\",\"window_size\":10}},\"pruner\":{{\"require_multi_index\":true}},\"reranker\":{{\"provider\":\"termite\",\"model\":\"cross-encoder/ms-marco-MiniLM-L-6-v2\",\"url\":{f},\"field\":\"body\",\"top_n\":2}},\"limit\":3}}",
-        .{std.json.fmt(termite_base_uri, .{})},
+        "{{\"full_text_search\":{{\"match\":{{\"field\":\"body\",\"text\":\"body\"}}}},\"semantic_search\":\"alpha concept\",\"embeddings\":{{\"sparse_idx\":{{\"indices\":[7,42],\"values\":[1.5,0.5]}}}},\"indexes\":[\"semantic_idx\",\"sparse_idx\"],\"merge_config\":{{\"strategy\":\"rsf\",\"window_size\":10}},\"pruner\":{{\"require_multi_index\":true}},\"reranker\":{{\"provider\":\"antfly\",\"model\":\"cross-encoder/ms-marco-MiniLM-L-6-v2\",\"url\":{f},\"field\":\"body\",\"top_n\":2}},\"limit\":3}}",
+        .{std.json.fmt(antfly_base_uri, .{})},
     );
     defer std.testing.allocator.free(hybrid_query_body);
 
@@ -3548,14 +3548,14 @@ test "public api e2e supports retrieval agent generation step" {
     defer listener.deinit();
     try listener.start();
 
-    var termite_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeTermiteProvider.executor());
-    defer termite_listener.deinit();
-    try termite_listener.start();
+    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
+    defer antfly_listener.deinit();
+    try antfly_listener.start();
 
     const base_uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
-    const termite_base_uri = try termite_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(termite_base_uri);
+    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(antfly_base_uri);
 
     var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{});
     defer executor.deinit();
@@ -3581,8 +3581,8 @@ test "public api e2e supports retrieval agent generation step" {
 
     const retrieval_body = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"query\":\"find retrieval docs\",\"stream\":false,\"generator\":{{\"provider\":\"termite\",\"model\":\"local-generator\",\"api_url\":{f}}},\"steps\":{{\"generation\":{{\"enabled\":true}}}},\"queries\":[{{\"table\":\"docs\",\"full_text_search\":{{\"query\":\"body:retrieval\"}},\"limit\":5}}]}}",
-        .{std.json.fmt(termite_base_uri, .{})},
+        "{{\"query\":\"find retrieval docs\",\"stream\":false,\"generator\":{{\"provider\":\"antfly\",\"model\":\"local-generator\",\"api_url\":{f}}},\"steps\":{{\"generation\":{{\"enabled\":true}}}},\"queries\":[{{\"table\":\"docs\",\"full_text_search\":{{\"query\":\"body:retrieval\"}},\"limit\":5}}]}}",
+        .{std.json.fmt(antfly_base_uri, .{})},
     );
     defer std.testing.allocator.free(retrieval_body);
     var retrieval = try client.fetchRetrievalAgent(base_uri, retrieval_body);
@@ -3988,14 +3988,14 @@ test "public api e2e supports retrieval agent classification confidence and foll
     defer listener.deinit();
     try listener.start();
 
-    var termite_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeTermiteProvider.executor());
-    defer termite_listener.deinit();
-    try termite_listener.start();
+    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
+    defer antfly_listener.deinit();
+    try antfly_listener.start();
 
     const base_uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
-    const termite_base_uri = try termite_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(termite_base_uri);
+    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(antfly_base_uri);
 
     var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{});
     defer executor.deinit();
@@ -4021,8 +4021,8 @@ test "public api e2e supports retrieval agent classification confidence and foll
 
     const retrieval_body = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"query\":\"How does retrieval work?\",\"stream\":false,\"generator\":{{\"provider\":\"termite\",\"model\":\"local-generator\",\"api_url\":{f}}},\"steps\":{{\"classification\":{{\"enabled\":true,\"with_reasoning\":true}},\"generation\":{{\"enabled\":true}},\"confidence\":{{\"enabled\":true}},\"followup\":{{\"enabled\":true,\"count\":3}}}},\"queries\":[{{\"table\":\"docs\",\"full_text_search\":{{\"query\":\"body:retrieval\"}},\"limit\":5}}]}}",
-        .{std.json.fmt(termite_base_uri, .{})},
+        "{{\"query\":\"How does retrieval work?\",\"stream\":false,\"generator\":{{\"provider\":\"antfly\",\"model\":\"local-generator\",\"api_url\":{f}}},\"steps\":{{\"classification\":{{\"enabled\":true,\"with_reasoning\":true}},\"generation\":{{\"enabled\":true}},\"confidence\":{{\"enabled\":true}},\"followup\":{{\"enabled\":true,\"count\":3}}}},\"queries\":[{{\"table\":\"docs\",\"full_text_search\":{{\"query\":\"body:retrieval\"}},\"limit\":5}}]}}",
+        .{std.json.fmt(antfly_base_uri, .{})},
     );
     defer std.testing.allocator.free(retrieval_body);
     var retrieval = try client.fetchRetrievalAgent(base_uri, retrieval_body);
@@ -4030,8 +4030,8 @@ test "public api e2e supports retrieval agent classification confidence and foll
     var parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, retrieval.body, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.classification != null);
-    try std.testing.expectEqual(ai_openapi.RouteType.question, parsed.value.classification.?.route_type);
-    try std.testing.expectEqual(ai_openapi.QueryStrategy.step_back, parsed.value.classification.?.strategy);
+    try std.testing.expectEqual(generating_api_openapi.RouteType.question, parsed.value.classification.?.route_type);
+    try std.testing.expectEqual(generating_api_openapi.QueryStrategy.step_back, parsed.value.classification.?.strategy);
     try std.testing.expect(parsed.value.classification.?.step_back_query != null);
     try std.testing.expect(parsed.value.classification.?.multi_phrases != null);
     try std.testing.expect(parsed.value.classification.?.reasoning != null);
@@ -4099,14 +4099,14 @@ test "public api e2e supports retrieval agent fixed-body sse streaming" {
     defer listener.deinit();
     try listener.start();
 
-    var termite_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeTermiteProvider.executor());
-    defer termite_listener.deinit();
-    try termite_listener.start();
+    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
+    defer antfly_listener.deinit();
+    try antfly_listener.start();
 
     const base_uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
-    const termite_base_uri = try termite_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(termite_base_uri);
+    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(antfly_base_uri);
 
     var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{});
     defer executor.deinit();
@@ -4132,8 +4132,8 @@ test "public api e2e supports retrieval agent fixed-body sse streaming" {
 
     const retrieval_body = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"query\":\"find retrieval docs\",\"stream\":true,\"generator\":{{\"provider\":\"termite\",\"model\":\"local-generator\",\"api_url\":{f}}},\"steps\":{{\"generation\":{{\"enabled\":true}},\"followup\":{{\"enabled\":true,\"count\":2}}}},\"queries\":[{{\"table\":\"docs\",\"full_text_search\":{{\"query\":\"body:retrieval\"}},\"limit\":5}}]}}",
-        .{std.json.fmt(termite_base_uri, .{})},
+        "{{\"query\":\"find retrieval docs\",\"stream\":true,\"generator\":{{\"provider\":\"antfly\",\"model\":\"local-generator\",\"api_url\":{f}}},\"steps\":{{\"generation\":{{\"enabled\":true}},\"followup\":{{\"enabled\":true,\"count\":2}}}},\"queries\":[{{\"table\":\"docs\",\"full_text_search\":{{\"query\":\"body:retrieval\"}},\"limit\":5}}]}}",
+        .{std.json.fmt(antfly_base_uri, .{})},
     );
     defer std.testing.allocator.free(retrieval_body);
     var retrieval = try client.fetchRetrievalAgent(base_uri, retrieval_body);
@@ -4759,14 +4759,14 @@ test "public api e2e restores managed sparse embeddings from table backup" {
     defer listener.deinit();
     try listener.start();
 
-    var termite_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeTermiteProvider.executor());
-    defer termite_listener.deinit();
-    try termite_listener.start();
+    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
+    defer antfly_listener.deinit();
+    try antfly_listener.start();
 
     const base_uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
-    const termite_base_uri = try termite_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(termite_base_uri);
+    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(antfly_base_uri);
 
     var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{});
     defer executor.deinit();
@@ -4782,9 +4782,9 @@ test "public api e2e restores managed sparse embeddings from table backup" {
         "sparse_idx",
         "body",
         .{
-            .provider = .termite,
-            .model = "termite-sparse-v1",
-            .api_url = termite_base_uri,
+            .provider = .antfly,
+            .model = "antfly-sparse-v1",
+            .api_url = antfly_base_uri,
         },
     );
     defer std.testing.allocator.free(sparse_index_body);
@@ -4955,9 +4955,9 @@ test "public api e2e supports embedding_template remote media helper" {
     defer listener.deinit();
     try listener.start();
 
-    var termite_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeTermiteProvider.executor());
-    defer termite_listener.deinit();
-    try termite_listener.start();
+    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
+    defer antfly_listener.deinit();
+    try antfly_listener.start();
 
     var media_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeRemoteMedia.executor());
     defer media_listener.deinit();
@@ -4965,8 +4965,8 @@ test "public api e2e supports embedding_template remote media helper" {
 
     const base_uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
-    const termite_base_uri = try termite_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(termite_base_uri);
+    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(antfly_base_uri);
     const media_base_uri = try media_listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(media_base_uri);
 
@@ -4985,9 +4985,9 @@ test "public api e2e supports embedding_template remote media helper" {
         "body",
         3,
         .{
-            .provider = .termite,
-            .model = "termite-clip-v1",
-            .api_url = termite_base_uri,
+            .provider = .antfly,
+            .model = "antfly-clip-v1",
+            .api_url = antfly_base_uri,
             .multimodal = true,
         },
         null,
@@ -5330,7 +5330,7 @@ test "public api e2e supports template chunked remote text enrichment and query 
     );
 }
 
-test "public api e2e supports fixed and termite chunked semantic search" {
+test "public api e2e supports fixed and antfly chunked semantic search" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5392,16 +5392,16 @@ test "public api e2e supports fixed and termite chunked semantic search" {
     defer openai_listener.deinit();
     try openai_listener.start();
 
-    var termite_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeTermiteProvider.executor());
-    defer termite_listener.deinit();
-    try termite_listener.start();
+    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
+    defer antfly_listener.deinit();
+    try antfly_listener.start();
 
     const base_uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
     const openai_base_uri = try openai_listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(openai_base_uri);
-    const termite_base_uri = try termite_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(termite_base_uri);
+    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(antfly_base_uri);
 
     var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{});
     defer executor.deinit();
@@ -5431,27 +5431,27 @@ test "public api e2e supports fixed and termite chunked semantic search" {
     var fixed_index_resp = try client.createTableIndex(base_uri, "docs", "semantic_fixed_idx", fixed_chunked_index_body);
     defer fixed_index_resp.deinit(std.testing.allocator);
 
-    const termite_chunk_api = try std.fmt.allocPrint(std.testing.allocator, "{s}/api", .{termite_base_uri});
-    defer std.testing.allocator.free(termite_chunk_api);
-    const termite_chunked_index_body = try test_contract_helpers.encodeManagedEmbeddingsIndexRequest(
+    const antfly_chunk_api = try std.fmt.allocPrint(std.testing.allocator, "{s}/api", .{antfly_base_uri});
+    defer std.testing.allocator.free(antfly_chunk_api);
+    const antfly_chunked_index_body = try test_contract_helpers.encodeManagedEmbeddingsIndexRequest(
         std.testing.allocator,
-        "semantic_termite_idx",
+        "semantic_antfly_idx",
         "body",
         3,
         .{
-            .provider = .termite,
-            .model = "termite-embed-v1",
-            .api_url = termite_base_uri,
+            .provider = .antfly,
+            .model = "antfly-embed-v1",
+            .api_url = antfly_base_uri,
         },
         .{
-            .provider = .termite,
-            .api_url = termite_chunk_api,
-            .model = "termite-chunker-v1",
+            .provider = .antfly,
+            .api_url = antfly_chunk_api,
+            .model = "antfly-chunker-v1",
         },
     );
-    defer std.testing.allocator.free(termite_chunked_index_body);
-    var termite_index_resp = try client.createTableIndex(base_uri, "docs", "semantic_termite_idx", termite_chunked_index_body);
-    defer termite_index_resp.deinit(std.testing.allocator);
+    defer std.testing.allocator.free(antfly_chunked_index_body);
+    var antfly_index_resp = try client.createTableIndex(base_uri, "docs", "semantic_antfly_idx", antfly_chunked_index_body);
+    defer antfly_index_resp.deinit(std.testing.allocator);
 
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
@@ -5473,13 +5473,13 @@ test "public api e2e supports fixed and termite chunked semantic search" {
     defer parsed_fixed.deinit();
     try std.testing.expectEqualStrings("doc:a", parsed_fixed.value.responses.?[0].hits.?.hits.?[0]._id);
 
-    const termite_query_body = try test_contract_helpers.encodeSemanticQueryRequest(std.testing.allocator, "alpha concept", &.{"semantic_termite_idx"}, 5);
-    defer std.testing.allocator.free(termite_query_body);
-    var termite_query = try client.fetchQuery(base_uri, "docs", termite_query_body);
-    defer termite_query.deinit(std.testing.allocator);
-    var parsed_termite = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, termite_query.body, .{});
-    defer parsed_termite.deinit();
-    try std.testing.expectEqualStrings("doc:a", parsed_termite.value.responses.?[0].hits.?.hits.?[0]._id);
+    const antfly_query_body = try test_contract_helpers.encodeSemanticQueryRequest(std.testing.allocator, "alpha concept", &.{"semantic_antfly_idx"}, 5);
+    defer std.testing.allocator.free(antfly_query_body);
+    var antfly_query = try client.fetchQuery(base_uri, "docs", antfly_query_body);
+    defer antfly_query.deinit(std.testing.allocator);
+    var parsed_antfly = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, antfly_query.body, .{});
+    defer parsed_antfly.deinit();
+    try std.testing.expectEqualStrings("doc:a", parsed_antfly.value.responses.?[0].hits.?.hits.?[0]._id);
 
     const projected_ranges = try svc.listProjectedRanges(std.testing.allocator);
     defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
@@ -5495,10 +5495,10 @@ test "public api e2e supports fixed and termite chunked semantic search" {
     defer std.testing.allocator.free(fixed_chunk_zero);
     const fixed_chunk_one = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_fixed_idx_chunks", 1);
     defer std.testing.allocator.free(fixed_chunk_one);
-    const termite_chunk_zero = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_termite_idx_chunks", 0);
-    defer std.testing.allocator.free(termite_chunk_zero);
-    const termite_chunk_one = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_termite_idx_chunks", 1);
-    defer std.testing.allocator.free(termite_chunk_one);
+    const antfly_chunk_zero = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_antfly_idx_chunks", 0);
+    defer std.testing.allocator.free(antfly_chunk_zero);
+    const antfly_chunk_one = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, "doc:a", "semantic_antfly_idx_chunks", 1);
+    defer std.testing.allocator.free(antfly_chunk_one);
 
     const fixed_raw_zero = try db.get(std.testing.allocator, fixed_chunk_zero);
     defer if (fixed_raw_zero) |raw| std.testing.allocator.free(raw);
@@ -5507,12 +5507,12 @@ test "public api e2e supports fixed and termite chunked semantic search" {
     defer if (fixed_raw_one) |raw| std.testing.allocator.free(raw);
     try std.testing.expect(fixed_raw_one != null);
 
-    const termite_raw_zero = try db.get(std.testing.allocator, termite_chunk_zero);
-    defer if (termite_raw_zero) |raw| std.testing.allocator.free(raw);
-    try std.testing.expect(termite_raw_zero != null);
-    const termite_raw_one = try db.get(std.testing.allocator, termite_chunk_one);
-    defer if (termite_raw_one) |raw| std.testing.allocator.free(raw);
-    try std.testing.expect(termite_raw_one != null);
+    const antfly_raw_zero = try db.get(std.testing.allocator, antfly_chunk_zero);
+    defer if (antfly_raw_zero) |raw| std.testing.allocator.free(raw);
+    try std.testing.expect(antfly_raw_zero != null);
+    const antfly_raw_one = try db.get(std.testing.allocator, antfly_chunk_one);
+    defer if (antfly_raw_one) |raw| std.testing.allocator.free(raw);
+    try std.testing.expect(antfly_raw_one != null);
 }
 
 test "public api e2e restores chunked managed embeddings from table backup" {

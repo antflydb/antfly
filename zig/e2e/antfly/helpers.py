@@ -20,6 +20,8 @@ import json
 import time
 from typing import Callable
 
+import requests
+
 
 def json_doc(**fields) -> str:
     return json.dumps(fields, separators=(",", ":"), sort_keys=True)
@@ -43,7 +45,18 @@ def wait_until(
 ) -> dict | None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        result = fn()
+        try:
+            result = fn()
+        except requests.HTTPError as err:
+            response = err.response
+            if (
+                response is not None
+                and response.status_code == 503
+                and "doc identity unavailable" in response.text
+            ):
+                result = None
+            else:
+                raise
         if result:
             return result
         time.sleep(interval_s)

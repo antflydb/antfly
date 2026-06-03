@@ -34,7 +34,10 @@ function Slider({
       <SliderPrimitive.Track
         data-slot="slider-track"
         className={cn(
-          "bg-secondary relative grow overflow-hidden rounded-full border border-border/40 data-[orientation=horizontal]:h-1.5 data-[orientation=horizontal]:w-full data-[orientation=vertical]:h-full data-[orientation=vertical]:w-1.5"
+          // square rail — bg track with amber range fill
+          "bg-secondary relative grow overflow-hidden rounded-none",
+          "data-[orientation=horizontal]:h-[6px] data-[orientation=horizontal]:w-full",
+          "data-[orientation=vertical]:h-full data-[orientation=vertical]:w-[6px]"
         )}
       >
         <SliderPrimitive.Range
@@ -48,7 +51,15 @@ function Slider({
         <SliderPrimitive.Thumb
           data-slot="slider-thumb"
           key={index}
-          className="border-primary bg-background ring-ring/50 block size-4 shrink-0 rounded-full border shadow-sm transition-[color,box-shadow] hover:ring-4 focus-visible:ring-4 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50"
+          className={cn(
+            // square ink-bordered handle — sits on top of the amber range,
+            // bg-background gives high contrast in both light and dark modes
+            "block size-[14px] shrink-0 rounded-none",
+            "bg-background border-[1.5px] border-amber-500",
+            "transition-[box-shadow,border-color] outline-none",
+            "hover:border-ring focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",
+            "disabled:pointer-events-none disabled:opacity-50"
+          )}
         />
       ))}
     </SliderPrimitive.Root>

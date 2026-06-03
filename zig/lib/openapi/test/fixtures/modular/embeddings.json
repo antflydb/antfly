@@ -7,7 +7,7 @@
       "EmbedderProvider": {
         "type": "string",
         "description": "Embedding model provider",
-        "enum": ["openai", "cohere", "bedrock", "termite"]
+        "enum": ["openai", "cohere", "bedrock", "antfly"]
       },
       "EmbedderConfig": {
         "type": "object",

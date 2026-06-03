@@ -24,6 +24,7 @@ const docstore_mod = @import("../docstore.zig");
 const shard_mod = @import("../shard.zig");
 const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
+const doc_identity_mod = @import("doc_identity.zig");
 
 pub const GeoPoint = struct {
     lon: f64,
@@ -175,13 +176,13 @@ pub fn freeIndexConfigs(alloc: Allocator, configs: []IndexConfig) void {
 
 pub const EnrichmentKind = enum {
     chunk,
-    summary,
+    asset,
     embedding,
 };
 
 pub const ArtifactKind = enum {
     chunk,
-    summary,
+    asset,
     embedding,
 };
 
@@ -232,34 +233,40 @@ pub const ArtifactRef = struct {
 pub const EnrichmentConfig = struct {
     name: []const u8,
     kind: EnrichmentKind,
-    source_field: []const u8,
-    source_template: []const u8 = "",
+    field: []const u8 = "",
+    template: []const u8 = "",
     source_artifact_name: []const u8 = "",
     expected_dims: u32 = 0,
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",
+    content_type: []const u8 = "",
+    producer_json: []const u8 = "",
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
         return .{
             .name = try alloc.dupe(u8, cfg.name),
             .kind = cfg.kind,
-            .source_field = try alloc.dupe(u8, cfg.source_field),
-            .source_template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
+            .field = if (cfg.field.len > 0) try alloc.dupe(u8, cfg.field) else "",
+            .template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
             .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
             .expected_dims = cfg.expected_dims,
             .chunk_size = cfg.chunk_size,
             .chunk_overlap = cfg.chunk_overlap,
             .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
+            .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
+            .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
         };
     }
 
     pub fn deinit(self: *EnrichmentConfig, alloc: Allocator) void {
         alloc.free(self.name);
-        alloc.free(self.source_field);
-        if (self.source_template.len > 0) alloc.free(self.source_template);
+        if (self.field.len > 0) alloc.free(self.field);
+        if (self.template.len > 0) alloc.free(self.template);
         if (self.source_artifact_name.len > 0) alloc.free(self.source_artifact_name);
         if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
+        if (self.content_type.len > 0) alloc.free(self.content_type);
+        if (self.producer_json.len > 0) alloc.free(self.producer_json);
         self.* = undefined;
     }
 };
@@ -268,19 +275,6 @@ pub fn freeEnrichmentConfigs(alloc: Allocator, configs: []EnrichmentConfig) void
     for (configs) |*cfg| cfg.deinit(alloc);
     if (configs.len > 0) alloc.free(configs);
 }
-
-pub const EnrichmentSummaryWrite = struct {
-    index_name: []u8,
-    doc_key: []u8,
-    text: []u8,
-
-    pub fn deinit(self: *EnrichmentSummaryWrite, alloc: Allocator) void {
-        alloc.free(self.index_name);
-        alloc.free(self.doc_key);
-        alloc.free(self.text);
-        self.* = undefined;
-    }
-};
 
 pub const EnrichmentDenseEmbeddingWrite = struct {
     index_name: []u8,
@@ -332,7 +326,6 @@ pub const ExtractEnrichmentsResult = struct {
     cleaned_writes: []BatchWrite = &.{},
     dense_embeddings: []EnrichmentDenseEmbeddingWrite = &.{},
     sparse_embeddings: []EnrichmentSparseEmbeddingWrite = &.{},
-    summaries: []EnrichmentSummaryWrite = &.{},
     graph_writes: []GraphEdgeWrite = &.{},
 
     pub fn deinit(self: *ExtractEnrichmentsResult, alloc: Allocator) void {
@@ -347,9 +340,6 @@ pub const ExtractEnrichmentsResult = struct {
 
         for (self.sparse_embeddings) |*embedding| embedding.deinit(alloc);
         if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
-
-        for (self.summaries) |*summary| summary.deinit(alloc);
-        if (self.summaries.len > 0) alloc.free(self.summaries);
 
         for (self.graph_writes) |*write| {
             alloc.free(@constCast(write.index_name));
@@ -922,6 +912,7 @@ pub const SearchRequest = struct {
     filter_query_json: []const u8 = "",
     exclusion_query_json: []const u8 = "",
     full_text_queries: []const NamedFullTextQuery = &.{},
+    doc_filter_bindings: []const NamedDocFilterBinding = &.{},
     dense: ?DenseKnnQuery = null,
     sparse: ?SparseKnnQuery = null,
     dense_queries: []const NamedDenseQuery = &.{},
@@ -949,8 +940,27 @@ pub const SearchRequest = struct {
     filter_doc_ids: []const []const u8 = &.{},
     filter_doc_ids_positive: bool = false,
     exclude_doc_ids: []const []const u8 = &.{},
+    // Internal execution hook. Public callers should use raw document IDs,
+    // filter JSON, or named bindings instead of constructing this pointer.
+    resolved_doc_filter: ?*const anyopaque = null,
+    // Internal text-index execution hook. This is request-local state used to
+    // avoid converting text-native doc nums through shard ordinals and back.
+    resolved_text_doc_filter: ?*const anyopaque = null,
+    resolved_doc_filter_owned: bool = false,
+    resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
+    identity_read_generation: ?u64 = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+};
+
+pub const ResolvedDocFilterWireContext = struct {
+    namespace: doc_identity_mod.Namespace,
+    identity_read_generation: u64,
+};
+
+pub const NamedDocFilterBinding = struct {
+    name: []const u8,
+    filter_query_json: []const u8,
 };
 
 pub const NamedGraphInputSet = struct {
@@ -997,6 +1007,7 @@ pub const MergeConfig = struct {
 
 pub const SearchHit = struct {
     id: []u8,
+    doc_ordinal: ?u32 = null,
     score: ?f32 = null,
     stored_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
@@ -1005,6 +1016,7 @@ pub const SearchHit = struct {
     pub fn clone(self: SearchHit, alloc: Allocator) !SearchHit {
         var cloned = SearchHit{
             .id = try alloc.dupe(u8, self.id),
+            .doc_ordinal = self.doc_ordinal,
             .score = self.score,
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
             .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
@@ -1074,6 +1086,7 @@ pub const SearchResult = struct {
     hits: []SearchHit,
     total_hits: u32,
     total_hits_relation: TotalHitsRelation = .exact,
+    identity_read_generation: ?u64 = null,
     graph_results: []GraphSearchResult = &.{},
 
     pub fn deinit(self: *SearchResult) void {
@@ -1214,11 +1227,21 @@ pub const TextMergeStats = struct {
     pending_indexes: u64 = 0,
     pending_segments: u64 = 0,
     pending_bytes: u64 = 0,
+    pending_heap_bytes: u64 = 0,
+    pending_mmap_bytes: u64 = 0,
     in_flight_merges: u64 = 0,
     in_flight_segments: u64 = 0,
     completed_merges: u64 = 0,
     skipped_stale_merges: u64 = 0,
     failed_merges: u64 = 0,
+    merge_input_segments_total: u64 = 0,
+    merge_input_bytes_total: u64 = 0,
+    merge_output_segments_total: u64 = 0,
+    merge_output_bytes_total: u64 = 0,
+    last_merge_input_segments: u64 = 0,
+    last_merge_input_bytes: u64 = 0,
+    last_merge_output_segments: u64 = 0,
+    last_merge_output_bytes: u64 = 0,
     quarantined_merges: u64 = 0,
     quarantined_segments: u64 = 0,
     last_merge_error: []const u8 = "",
@@ -1230,10 +1253,82 @@ pub const TextMergeStats = struct {
     max_pending_bytes: u64 = 0,
 };
 
+pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void {
+    dst.enabled = dst.enabled or src.enabled;
+    dst.pending_indexes +|= src.pending_indexes;
+    dst.pending_segments +|= src.pending_segments;
+    dst.pending_bytes +|= src.pending_bytes;
+    dst.pending_heap_bytes +|= src.pending_heap_bytes;
+    dst.pending_mmap_bytes +|= src.pending_mmap_bytes;
+    dst.in_flight_merges +|= src.in_flight_merges;
+    dst.in_flight_segments +|= src.in_flight_segments;
+    dst.completed_merges +|= src.completed_merges;
+    dst.skipped_stale_merges +|= src.skipped_stale_merges;
+    dst.failed_merges +|= src.failed_merges;
+    dst.merge_input_segments_total +|= src.merge_input_segments_total;
+    dst.merge_input_bytes_total +|= src.merge_input_bytes_total;
+    dst.merge_output_segments_total +|= src.merge_output_segments_total;
+    dst.merge_output_bytes_total +|= src.merge_output_bytes_total;
+    dst.last_merge_input_segments = @max(dst.last_merge_input_segments, src.last_merge_input_segments);
+    dst.last_merge_input_bytes = @max(dst.last_merge_input_bytes, src.last_merge_input_bytes);
+    dst.last_merge_output_segments = @max(dst.last_merge_output_segments, src.last_merge_output_segments);
+    dst.last_merge_output_bytes = @max(dst.last_merge_output_bytes, src.last_merge_output_bytes);
+    dst.quarantined_merges +|= src.quarantined_merges;
+    dst.quarantined_segments +|= src.quarantined_segments;
+    if (src.last_merge_error.len != 0) dst.last_merge_error = src.last_merge_error;
+    dst.retry_after_ns = @max(dst.retry_after_ns, src.retry_after_ns);
+    dst.deferred_for_pressure +|= src.deferred_for_pressure;
+    dst.backpressure_events +|= src.backpressure_events;
+    dst.backpressure_ns +|= src.backpressure_ns;
+    dst.max_pending_segments = @max(dst.max_pending_segments, src.max_pending_segments);
+    dst.max_pending_bytes = @max(dst.max_pending_bytes, src.max_pending_bytes);
+}
+
+pub const DocIdentityStats = struct {
+    namespace_table_id: u64 = 0,
+    namespace_shard_id: u64 = 0,
+    namespace_range_id: u64 = 0,
+    next_ordinal: u32 = 1,
+    allocated_ordinals: u64 = 0,
+    ordinal_capacity_remaining: u64 = 0,
+    ordinal_capacity_exhausted: bool = false,
+    rebuild_required: bool = false,
+    state_rows: u64 = 0,
+    live_ordinals: u64 = 0,
+    tombstone_ordinals: u64 = 0,
+    min_created_generation: u64 = 0,
+    max_created_generation: u64 = 0,
+    min_deleted_generation: u64 = 0,
+    max_deleted_generation: u64 = 0,
+    scanned_primary_docs: u64 = 0,
+    primary_docs_missing_ordinals: u64 = 0,
+    primary_docs_missing_identity_state: u64 = 0,
+    primary_docs_with_tombstone_ordinals: u64 = 0,
+    complete: bool = false,
+};
+
+pub const DocSetPlanningStats = struct {
+    resolved_set_count: u64 = 0,
+    all_set_count: u64 = 0,
+    none_set_count: u64 = 0,
+    doc_key_list_count: u64 = 0,
+    ordinal_list_count: u64 = 0,
+    ordinal_bitmap_count: u64 = 0,
+    doc_key_list_docs: u64 = 0,
+    ordinal_list_docs: u64 = 0,
+    ordinal_bitmap_docs: u64 = 0,
+    missing_ordinal_coverage_count: u64 = 0,
+    bitmap_promotion_count: u64 = 0,
+    unsupported_filter_shape_count: u64 = 0,
+    stale_identity_generation_rejection_count: u64 = 0,
+};
+
 pub const DBStats = struct {
     doc_count: u64 = 0,
     index_count: u32 = 0,
     indexes: []DBIndexStats = &.{},
+    doc_identity: DocIdentityStats = .{},
+    doc_set_planning: DocSetPlanningStats = .{},
     enrichment: EnrichmentStats = .{},
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},
@@ -1550,6 +1645,8 @@ pub const DenseCatchUpStats = struct {
     current_target_sequence: u64 = 0,
     current_scanned_entries: u64 = 0,
     current_applied_entries: u64 = 0,
+    replay_scan_batches: u64 = 0,
+    replay_hint_filter_skips: u64 = 0,
     progress_updates: u64 = 0,
     bulk_finish_windows: u64 = 0,
     bulk_finish_split_steps: u64 = 0,
@@ -1585,6 +1682,13 @@ pub const StartupCatchUpStats = struct {
     wal_retention_known: bool = false,
     wal_retained_segments: u64 = 0,
     wal_retained_bytes: u64 = 0,
+    wal_checkpoint_oldest_retained_segment: u64 = 0,
+    wal_checkpoint_covered_through_segment: u64 = 0,
+    wal_checkpoint_current_segment: u64 = 0,
+    wal_checkpoint_lag_segments: u64 = 0,
+    wal_replay_retained_segments: u64 = 0,
+    wal_replay_retained_bytes: u64 = 0,
+    wal_replay_current_segment: u64 = 0,
     configured_indexes: u32 = 0,
     configured_dense_indexes: u32 = 0,
     configured_sparse_indexes: u32 = 0,
@@ -1593,10 +1697,24 @@ pub const StartupCatchUpStats = struct {
     opened_indexes: u32 = 0,
     db_open_ns: u64 = 0,
     load_indexes_ns: u64 = 0,
+    lsm_open_stores: u64 = 0,
+    lsm_open_completed: u64 = 0,
+    lsm_open_failed: u64 = 0,
+    lsm_open_total_ns: u64 = 0,
+    lsm_open_initializing_storage_ns: u64 = 0,
+    lsm_open_manifest_ns: u64 = 0,
+    lsm_open_ensuring_dirs_ns: u64 = 0,
+    lsm_open_wal_replay_ns: u64 = 0,
+    lsm_open_mounting_runs_ns: u64 = 0,
+    lsm_open_loaded_runs: u64 = 0,
+    lsm_open_obsolete_paths: u64 = 0,
+    lsm_open_mutable_entries_after_replay: u64 = 0,
+    lsm_open_immutable_memtables_after_replay: u64 = 0,
     wal_replay_records: u64 = 0,
     wal_replay_entries: u64 = 0,
     wal_replay_bytes: u64 = 0,
     wal_replay_ns: u64 = 0,
+    wal_replay_truncated_tail_bytes: u64 = 0,
 };
 
 pub const AsyncIndexingStats = struct {
@@ -1655,6 +1773,8 @@ pub fn accumulateDenseCatchUpStats(dst: *DenseCatchUpStats, src: DenseCatchUpSta
     dst.current_target_sequence = @max(dst.current_target_sequence, src.current_target_sequence);
     dst.current_scanned_entries += src.current_scanned_entries;
     dst.current_applied_entries += src.current_applied_entries;
+    dst.replay_scan_batches += src.replay_scan_batches;
+    dst.replay_hint_filter_skips += src.replay_hint_filter_skips;
     dst.progress_updates += src.progress_updates;
     dst.bulk_finish_windows += src.bulk_finish_windows;
     dst.bulk_finish_split_steps += src.bulk_finish_split_steps;
@@ -1683,6 +1803,13 @@ pub fn accumulateStartupCatchUpStats(dst: *StartupCatchUpStats, src: StartupCatc
     dst.wal_retention_known = dst.wal_retention_known or src.wal_retention_known;
     dst.wal_retained_segments += src.wal_retained_segments;
     dst.wal_retained_bytes += src.wal_retained_bytes;
+    dst.wal_checkpoint_oldest_retained_segment = minNonZeroU64(dst.wal_checkpoint_oldest_retained_segment, src.wal_checkpoint_oldest_retained_segment);
+    dst.wal_checkpoint_covered_through_segment = @max(dst.wal_checkpoint_covered_through_segment, src.wal_checkpoint_covered_through_segment);
+    dst.wal_checkpoint_current_segment = @max(dst.wal_checkpoint_current_segment, src.wal_checkpoint_current_segment);
+    dst.wal_checkpoint_lag_segments += src.wal_checkpoint_lag_segments;
+    dst.wal_replay_retained_segments += src.wal_replay_retained_segments;
+    dst.wal_replay_retained_bytes += src.wal_replay_retained_bytes;
+    dst.wal_replay_current_segment = @max(dst.wal_replay_current_segment, src.wal_replay_current_segment);
     dst.configured_indexes = @max(dst.configured_indexes, src.configured_indexes);
     dst.configured_dense_indexes = @max(dst.configured_dense_indexes, src.configured_dense_indexes);
     dst.configured_sparse_indexes = @max(dst.configured_sparse_indexes, src.configured_sparse_indexes);
@@ -1691,10 +1818,30 @@ pub fn accumulateStartupCatchUpStats(dst: *StartupCatchUpStats, src: StartupCatc
     dst.opened_indexes = @max(dst.opened_indexes, src.opened_indexes);
     dst.db_open_ns = @max(dst.db_open_ns, src.db_open_ns);
     dst.load_indexes_ns = @max(dst.load_indexes_ns, src.load_indexes_ns);
+    dst.lsm_open_stores += src.lsm_open_stores;
+    dst.lsm_open_completed += src.lsm_open_completed;
+    dst.lsm_open_failed += src.lsm_open_failed;
+    dst.lsm_open_total_ns += src.lsm_open_total_ns;
+    dst.lsm_open_initializing_storage_ns += src.lsm_open_initializing_storage_ns;
+    dst.lsm_open_manifest_ns += src.lsm_open_manifest_ns;
+    dst.lsm_open_ensuring_dirs_ns += src.lsm_open_ensuring_dirs_ns;
+    dst.lsm_open_wal_replay_ns += src.lsm_open_wal_replay_ns;
+    dst.lsm_open_mounting_runs_ns += src.lsm_open_mounting_runs_ns;
+    dst.lsm_open_loaded_runs += src.lsm_open_loaded_runs;
+    dst.lsm_open_obsolete_paths += src.lsm_open_obsolete_paths;
+    dst.lsm_open_mutable_entries_after_replay += src.lsm_open_mutable_entries_after_replay;
+    dst.lsm_open_immutable_memtables_after_replay += src.lsm_open_immutable_memtables_after_replay;
     dst.wal_replay_records += src.wal_replay_records;
     dst.wal_replay_entries += src.wal_replay_entries;
     dst.wal_replay_bytes += src.wal_replay_bytes;
     dst.wal_replay_ns += src.wal_replay_ns;
+    dst.wal_replay_truncated_tail_bytes += src.wal_replay_truncated_tail_bytes;
+}
+
+fn minNonZeroU64(lhs: u64, rhs: u64) u64 {
+    if (lhs == 0) return rhs;
+    if (rhs == 0) return lhs;
+    return @min(lhs, rhs);
 }
 
 pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexingStats) void {

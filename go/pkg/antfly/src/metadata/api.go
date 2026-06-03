@@ -14,7 +14,7 @@
 
 //go:build go1.24
 
-//go:generate go tool oapi-codegen --config=cfg.yaml ./api.yaml
+//go:generate go tool oapi-codegen --config=cfg.yaml ../../../../../specs/openapi/antfly/metadata.yaml
 package metadata
 
 import (
@@ -171,9 +171,7 @@ func tableStatusResponse(
 	}
 }
 
-// handleGetStatus returns the current status of all stores and shards
-func (ca *ClusterApi) GetStatus(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+func (ca *ClusterApi) clusterStatus() (ClusterStatus, map[string]any) {
 	stores, shards := ca.ln.tm.Status()
 	health := ClusterHealthHealthy
 	message := ""
@@ -237,14 +235,39 @@ func (ca *ClusterApi) GetStatus(w http.ResponseWriter, r *http.Request) {
 		Message:     message,
 		AuthEnabled: authEnabled,
 		SwarmMode:   ca.ln.config.SwarmMode,
-		AdditionalProperties: map[string]any{
-			"shards":        shards,
-			"stores":        stores,
-			"metadata_info": ca.ln.metadataStore.Info(),
-		},
 	}
+	legacyStatus := map[string]any{
+		"shards":        shards,
+		"stores":        stores,
+		"metadata_info": ca.ln.metadataStore.Info(),
+	}
+	status.AdditionalProperties = legacyStatus
+	return status, legacyStatus
+}
+
+// handleGetStatus returns the current status of all stores and shards.
+func (ca *ClusterApi) GetStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	status, _ := ca.clusterStatus()
 	if err := json.NewEncoder(w).Encode(status); err != nil {
 		ca.ln.logger.Warn("Failed to marshal status", zap.Error(err))
+	}
+}
+
+func (ca *ClusterApi) GetCluster(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	status, legacyStatus := ca.clusterStatus()
+	topology := ClusterTopology{
+		Health:               status.Health,
+		Message:              status.Message,
+		AuthEnabled:          status.AuthEnabled,
+		SwarmMode:            status.SwarmMode,
+		SecretStore:          status.SecretStore,
+		Data:                 ClusterDataStatus{},
+		AdditionalProperties: legacyStatus,
+	}
+	if err := json.NewEncoder(w).Encode(topology); err != nil {
+		ca.ln.logger.Warn("Failed to marshal cluster topology", zap.Error(err))
 	}
 }
 
@@ -683,11 +706,10 @@ func (t *TableApi) CreateIndex(
 		return
 	}
 
-	// Normalize chunker config: infer provider if missing (for backwards compatibility)
+	// Normalize chunker config: infer provider if missing.
 	if embeddingsConfig.Chunker != nil && embeddingsConfig.Chunker.Provider == "" {
-		// Try to unmarshal as TermiteChunkerConfig to check if it's a termite config
-		if _, err := embeddingsConfig.Chunker.AsTermiteChunkerConfig(); err == nil {
-			embeddingsConfig.Chunker.Provider = "termite"
+		if _, err := embeddingsConfig.Chunker.AsAntflyChunkerConfig(); err == nil {
+			embeddingsConfig.Chunker.Provider = "antfly"
 		}
 	}
 
@@ -1558,12 +1580,16 @@ func (t *TableApi) UpdateSchema(w http.ResponseWriter, r *http.Request, tableNam
 	}
 }
 
-// setupRoutes configures the HTTP routes for the leader API
-func (ms *MetadataStore) publicApiRoutes() *http.ServeMux {
+// authApiRoutes configures the public authentication API.
+func (ms *MetadataStore) authApiRoutes() *http.ServeMux {
 	mux := http.NewServeMux()
 	userAPI := usermgr.NewUserApi(ms.logger, ms.um)
 	mux.Handle(
-		"/users",
+		"/auth/v1/me",
+		ms.authnMiddleware(userAPI),
+	)
+	mux.Handle(
+		"/auth/v1/users",
 		ms.authMiddleware(
 			usermgr.ResourceTypeUser,
 			"*",
@@ -1572,7 +1598,7 @@ func (ms *MetadataStore) publicApiRoutes() *http.ServeMux {
 		),
 	)
 	mux.Handle(
-		"/users/",
+		"/auth/v1/users/",
 		ms.authMiddleware(
 			usermgr.ResourceTypeUser,
 			"*",
@@ -1580,7 +1606,30 @@ func (ms *MetadataStore) publicApiRoutes() *http.ServeMux {
 			userAPI.ServeHTTP,
 		),
 	)
+	mux.Handle(
+		"/auth/v1/subjects",
+		ms.authMiddleware(
+			usermgr.ResourceTypeUser,
+			"*",
+			usermgr.PermissionTypeAdmin,
+			userAPI.ServeHTTP,
+		),
+	)
+	mux.Handle(
+		"/auth/v1/subjects/",
+		ms.authMiddleware(
+			usermgr.ResourceTypeUser,
+			"*",
+			usermgr.PermissionTypeAdmin,
+			userAPI.ServeHTTP,
+		),
+	)
+	return mux
+}
 
+// setupRoutes configures the HTTP routes for the leader API
+func (ms *MetadataStore) publicApiRoutes() *http.ServeMux {
+	mux := http.NewServeMux()
 	ms.logger.Debug("Creating table API handler")
 	tableAPI := NewPublicApi(ms.logger, ms, ms.tm)
 	ms.logger.Debug("Mounting table API routes",

@@ -16,6 +16,7 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
+  StatCard,
   Tabs,
   TabsList,
   TabsTrigger,
@@ -31,7 +32,7 @@ import type {
   PathWeightMode,
   QueryRequest,
 } from "@antfly/sdk";
-import { GitBranch, Loader2, Network, RefreshCw, Route, Search } from "lucide-react";
+import { GitBranch, Hash, Loader2, Network, RefreshCw, Route, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useApi } from "@/hooks/use-api-config";
 import JsonViewer from "./JsonViewer";
@@ -214,8 +215,8 @@ function buildGraph(result: GraphQueryResult | null, startKey: string): Explorer
 
 function nodeTypeColors() {
   return {
-    start: { label: "Start", theme: { light: "#0f766e", dark: "#2dd4bf" } },
-    document: { label: "Document", theme: { light: "#2563eb", dark: "#60a5fa" } },
+    start: { label: "Start", color: "var(--chart-1)" },
+    document: { label: "Document", color: "var(--chart-6)" },
   };
 }
 
@@ -388,7 +389,7 @@ export function GraphIndexExplorer({
     return (
       <Card>
         <CardHeader>
-          <CardTitle>Graph Explorer</CardTitle>
+          <CardTitle className="text-lg">Graph Explorer</CardTitle>
         </CardHeader>
         <CardContent className="text-sm text-muted-foreground">
           This table does not have a graph index yet.
@@ -402,8 +403,12 @@ export function GraphIndexExplorer({
       <DashboardToolbar className="items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <Network className="size-4 text-muted-foreground" />
-          <h2>Graph Explorer</h2>
-          {selectedIndex?.status?.rebuilding && <Badge variant="secondary">Rebuilding</Badge>}
+          <h2 className="font-display text-xl tracking-tight">Graph Explorer</h2>
+          {selectedIndex?.status?.rebuilding && (
+            <Badge variant="outline" className="af-status-badge-warning">
+              Rebuilding
+            </Badge>
+          )}
         </div>
         <Button variant="outline" size="sm" onClick={onRefreshIndexes}>
           <RefreshCw className="size-3.5" />
@@ -418,38 +423,32 @@ export function GraphIndexExplorer({
       )}
 
       <div className="grid gap-3 md:grid-cols-4">
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-muted-foreground">Total edges</div>
-            <div className="mt-1 text-2xl font-semibold">
-              {formatNumber(selectedIndex?.status?.total_edges)}
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-muted-foreground">Edge types</div>
-            <div className="mt-1 text-2xl font-semibold">{availableEdgeTypes.length}</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-muted-foreground">Result nodes</div>
-            <div className="mt-1 text-2xl font-semibold">{formatNumber(summary.total)}</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-muted-foreground">Paths</div>
-            <div className="mt-1 text-2xl font-semibold">{formatNumber(summary.paths)}</div>
-          </CardContent>
-        </Card>
+        <StatCard
+          label="Total edges"
+          value={formatNumber(selectedIndex?.status?.total_edges)}
+          icon={<GitBranch className="size-4" />}
+        />
+        <StatCard
+          label="Edge types"
+          value={availableEdgeTypes.length}
+          icon={<Network className="size-4" />}
+        />
+        <StatCard
+          label="Result nodes"
+          value={formatNumber(summary.total)}
+          icon={<Hash className="size-4" />}
+        />
+        <StatCard
+          label="Paths"
+          value={formatNumber(summary.paths)}
+          icon={<Route className="size-4" />}
+        />
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)_320px]">
+      <div className="grid gap-6 xl:grid-cols-[320px_minmax(0,1fr)_320px]">
         <Card className="h-fit">
           <CardHeader>
-            <CardTitle className="text-base">Query</CardTitle>
+            <CardTitle className="text-lg">Query</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-2">
@@ -481,10 +480,10 @@ export function GraphIndexExplorer({
                 <Label htmlFor="graph-start-key">Start key</Label>
                 <Button
                   variant="ghost"
-                  size="sm"
+                  size="xs"
                   onClick={loadSampleKeys}
                   disabled={isLoadingKeys}
-                  className="h-7 px-2"
+                  className="shrink-0"
                 >
                   {isLoadingKeys ? (
                     <Loader2 className="size-3.5 animate-spin" />
@@ -506,8 +505,8 @@ export function GraphIndexExplorer({
                     <Button
                       key={key}
                       variant="outline"
-                      size="sm"
-                      className="h-7 max-w-full px-2 text-xs"
+                      size="xs"
+                      className="max-w-full"
                       onClick={() => setStartKey(key)}
                     >
                       {displayKey(key)}
@@ -608,7 +607,7 @@ export function GraphIndexExplorer({
             {availableEdgeTypes.length > 0 && (
               <div className="space-y-2">
                 <Label>Edge types</Label>
-                <div className="grid gap-2 rounded-md border p-2">
+                <div className="grid gap-2 rounded-none border-[1.5px] border-border-strong bg-muted/30 p-2">
                   {availableEdgeTypes.map((edgeType) => {
                     const checkboxId = controlId("graph-edge-type", edgeType);
                     return (
@@ -654,14 +653,14 @@ export function GraphIndexExplorer({
         </Card>
 
         <Card className="min-h-[620px] overflow-hidden">
-          <CardHeader className="flex flex-row items-center justify-between border-b py-3">
-            <CardTitle className="flex items-center gap-2 text-base">
+          <CardHeader className="flex flex-row items-center justify-between">
+            <CardTitle className="flex items-center gap-2 text-lg">
               <Route className="size-4" />
               {selectedIndexName || "Graph"}
             </CardTitle>
-            <div className="flex gap-2 text-xs text-muted-foreground">
-              <span>{graph.nodes.length} nodes</span>
-              <span>{graph.edges.length} edges</span>
+            <div className="flex gap-2">
+              <Badge variant="secondary">{graph.nodes.length} nodes</Badge>
+              <Badge variant="secondary">{graph.edges.length} edges</Badge>
             </div>
           </CardHeader>
           <CardContent className="h-[560px] p-0">
@@ -669,6 +668,7 @@ export function GraphIndexExplorer({
               data={graph}
               colorConfig={nodeTypeColors()}
               minHeight={560}
+              className="border-0"
               showLegend
               showMinimap
               showSearch
@@ -688,7 +688,7 @@ export function GraphIndexExplorer({
 
         <Card className="h-fit">
           <CardHeader>
-            <CardTitle className="text-base">Inspector</CardTitle>
+            <CardTitle className="text-lg">Inspector</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             {selectedNode ? (
@@ -737,7 +737,10 @@ export function GraphIndexExplorer({
               {graph.edges.length > 0 ? (
                 <div className="max-h-80 space-y-2 overflow-auto pr-1">
                   {graph.edges.slice(0, 40).map((edge) => (
-                    <div key={edge.id} className="rounded-md border p-2 text-xs">
+                    <div
+                      key={edge.id}
+                      className="rounded-none border-[1.5px] border-border-strong bg-muted/30 p-2 text-xs"
+                    >
                       <div className="flex items-center justify-between gap-2">
                         <Badge variant={edge.pathEdge ? "default" : "secondary"}>
                           {edge.type ?? "edge"}
@@ -760,7 +763,7 @@ export function GraphIndexExplorer({
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Index configuration</CardTitle>
+          <CardTitle className="text-lg">Index configuration</CardTitle>
         </CardHeader>
         <CardContent>
           {selectedIndex ? <JsonViewer json={selectedIndex.config} /> : null}

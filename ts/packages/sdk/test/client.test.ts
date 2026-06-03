@@ -60,11 +60,13 @@ describe("AntflyClient", () => {
     it("should normalize local and CloudAF base URLs", () => {
       expect(normalizeBaseUrl("http://localhost:8080")).toBe("http://localhost:8080");
       expect(normalizeBaseUrl("http://localhost:8080/")).toBe("http://localhost:8080");
-      expect(normalizeBaseUrl("http://localhost:8080/api/v1")).toBe("http://localhost:8080");
+      expect(normalizeBaseUrl("http://localhost:8080/db/v1")).toBe("http://localhost:8080");
+      expect(normalizeBaseUrl("http://localhost:8080/auth/v1")).toBe("http://localhost:8080");
+      expect(normalizeBaseUrl("http://localhost:8080/ai/v1")).toBe("http://localhost:8080");
       expect(normalizeBaseUrl("https://platform.antfly.io/cloud/v1/instance")).toBe(
         "https://platform.antfly.io/cloud/v1/instance"
       );
-      expect(normalizeBaseUrl("https://platform.antfly.io/cloud/v1/instance/api/v1")).toBe(
+      expect(normalizeBaseUrl("https://platform.antfly.io/cloud/v1/instance/db/v1")).toBe(
         "https://platform.antfly.io/cloud/v1/instance"
       );
     });
@@ -113,7 +115,7 @@ describe("AntflyClient", () => {
 
       const result = await client.query(request);
       expect(result).toEqual(mockResponse.responses[0]);
-      expect(mockPost).toHaveBeenCalledWith("/api/v1/query", {
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/query", {
         body: request,
       });
     });
@@ -151,7 +153,7 @@ describe("AntflyClient", () => {
 
       const result = await client.query(request);
       expect(result?.hits?.total).toBe(2);
-      expect(mockPost).toHaveBeenCalledWith("/api/v1/query", {
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/query", {
         body: request,
       });
     });
@@ -181,7 +183,7 @@ describe("AntflyClient", () => {
 
       const tables = await client.tables.list();
       expect(tables).toEqual(mockTables);
-      expect(mockGet).toHaveBeenCalledWith("/api/v1/tables", {
+      expect(mockGet).toHaveBeenCalledWith("/db/v1/tables", {
         params: undefined,
       });
     });
@@ -205,7 +207,7 @@ describe("AntflyClient", () => {
 
       const result = await client.tables.create("new_table", config);
       expect(result).toEqual(mockTable);
-      expect(mockPost).toHaveBeenCalledWith("/api/v1/tables/{tableName}", {
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/tables/{tableName}", {
         params: { path: { tableName: "new_table" } },
         body: config,
       });
@@ -239,10 +241,164 @@ describe("AntflyClient", () => {
 
       const result = await client.tables.query("products", request);
       expect(result).toEqual(mockResponse);
-      expect(mockPost).toHaveBeenCalledWith("/api/v1/tables/{tableName}/query", {
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName: "products" } },
         body: request,
       });
+    });
+
+    it("should perform bounded batch writes with fetch", async () => {
+      const mockFetch = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(new Response(JSON.stringify({ inserted: 1 }), { status: 201 }));
+
+      const result = await client.tables.batchWithOptions(
+        "products",
+        {
+          inserts: {
+            "prod:1": { title: "Notebook" },
+          },
+        },
+        {
+          maxRequestBytes: 1024,
+          maxResponseBytes: 1024,
+        }
+      );
+
+      expect(result).toEqual({ inserted: 1 });
+      const requestBody = mockFetch.mock.calls[0]?.[1]?.body;
+      expect(typeof requestBody).toBe("string");
+      expect(new TextEncoder().encode(requestBody as string).byteLength).toBeGreaterThan(0);
+      expect(mockFetch).toHaveBeenCalledWith(
+        "http://localhost:8080/db/v1/tables/products/batch",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({
+            inserts: {
+              "prod:1": { title: "Notebook" },
+            },
+          }),
+        })
+      );
+
+      mockFetch.mockRestore();
+    });
+
+    it("should reject oversized encoded batch requests", async () => {
+      const mockFetch = vi.spyOn(globalThis, "fetch");
+
+      await expect(
+        client.tables.batchWithOptions(
+          "products",
+          {
+            inserts: {
+              "prod:1": { title: "Notebook" },
+            },
+          },
+          { maxRequestBytes: 8 }
+        )
+      ).rejects.toThrow("marshalling batch request: encoded request exceeded 8 bytes");
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      mockFetch.mockRestore();
+    });
+
+    it("should reject oversized batch success responses", async () => {
+      const mockFetch = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(new Response("x".repeat(17), { status: 201 }));
+
+      await expect(
+        client.tables.batchWithOptions(
+          "products",
+          { inserts: { "prod:1": { title: "Notebook" } } },
+          { maxRequestBytes: 1024, maxResponseBytes: 16 }
+        )
+      ).rejects.toThrow("Batch operation failed response exceeded 16 bytes");
+
+      mockFetch.mockRestore();
+    });
+
+    it("should perform bounded linear merge requests", async () => {
+      const mockResponse = {
+        status: "success",
+        upserted: 1,
+        skipped: 0,
+        deleted: 0,
+        next_cursor: "prod:1",
+      };
+      const mockFetch = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(new Response(JSON.stringify(mockResponse), { status: 200 }));
+
+      const result = await client.linearMergeWithOptions(
+        "products",
+        {
+          records: {
+            "prod:1": { title: "Notebook" },
+          },
+        },
+        { maxRequestBytes: 1024, maxResponseBytes: 1024 }
+      );
+
+      expect(result).toEqual(mockResponse);
+      const requestBody = mockFetch.mock.calls[0]?.[1]?.body;
+      expect(typeof requestBody).toBe("string");
+      expect(new TextEncoder().encode(requestBody as string).byteLength).toBeGreaterThan(0);
+      expect(mockFetch).toHaveBeenCalledWith(
+        "http://localhost:8080/db/v1/tables/products/merge",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({
+            records: {
+              "prod:1": { title: "Notebook" },
+            },
+          }),
+        })
+      );
+
+      mockFetch.mockRestore();
+    });
+
+    it("should reject oversized linear merge requests before sending", async () => {
+      const mockFetch = vi.spyOn(globalThis, "fetch");
+
+      await expect(
+        client.linearMergeWithOptions(
+          "products",
+          {
+            records: {
+              "prod:1": { title: "x".repeat(128) },
+            },
+          },
+          { maxRequestBytes: 64 }
+        )
+      ).rejects.toThrow("marshalling linear merge request: encoded request exceeded 64 bytes");
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      mockFetch.mockRestore();
+    });
+
+    it("should reject oversized multi-batch requests before sending", async () => {
+      const mockFetch = vi.spyOn(globalThis, "fetch");
+
+      await expect(
+        client.multiBatchWithOptions(
+          {
+            tables: {
+              products: {
+                inserts: {
+                  "prod:1": { title: "x".repeat(128) },
+                },
+              },
+            },
+          },
+          { maxRequestBytes: 64 }
+        )
+      ).rejects.toThrow("marshalling multi-batch request: encoded request exceeded 64 bytes");
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      mockFetch.mockRestore();
     });
 
     it("should lookup a key without field projection", async () => {
@@ -260,7 +416,7 @@ describe("AntflyClient", () => {
 
       const result = await client.tables.lookup("users", "user:123");
       expect(result).toEqual(mockDocument);
-      expect(mockGet).toHaveBeenCalledWith("/api/v1/tables/{tableName}/lookup/{key}", {
+      expect(mockGet).toHaveBeenCalledWith("/db/v1/tables/{tableName}/lookup/{key}", {
         params: {
           path: { tableName: "users", key: "user:123" },
           query: undefined,
@@ -284,7 +440,7 @@ describe("AntflyClient", () => {
         fields: "name,email",
       });
       expect(result).toEqual(mockDocument);
-      expect(mockGet).toHaveBeenCalledWith("/api/v1/tables/{tableName}/lookup/{key}", {
+      expect(mockGet).toHaveBeenCalledWith("/db/v1/tables/{tableName}/lookup/{key}", {
         params: {
           path: { tableName: "users", key: "user:123" },
           query: { fields: "name,email" },
@@ -359,7 +515,7 @@ describe("AntflyClient", () => {
       expect(results[2]).toEqual({ _key: "user:3", name: "Charlie" });
 
       expect(mockFetch).toHaveBeenCalledWith(
-        "http://localhost:8080/api/v1/tables/users/lookup",
+        "http://localhost:8080/db/v1/tables/users/lookup",
         expect.objectContaining({
           method: "POST",
           body: "{}",
@@ -392,7 +548,7 @@ describe("AntflyClient", () => {
       expect(results).toHaveLength(2);
 
       expect(mockFetch).toHaveBeenCalledWith(
-        "http://localhost:8080/api/v1/tables/users/lookup",
+        "http://localhost:8080/db/v1/tables/users/lookup",
         expect.objectContaining({
           method: "POST",
           body: JSON.stringify({

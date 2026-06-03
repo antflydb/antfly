@@ -171,7 +171,7 @@ function MultiSelectItem({
       <span
         aria-hidden
         className={cn(
-          "size-1.5 shrink-0 rounded-full",
+          "size-1.5 shrink-0",
           isSelected ? "bg-primary" : "bg-transparent",
         )}
       />

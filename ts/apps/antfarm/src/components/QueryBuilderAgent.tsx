@@ -191,7 +191,7 @@ const QueryBuilderAgent: React.FC<QueryBuilderAgentProps> = ({
               )}
             </div>
 
-            <div className="rounded-md border">
+            <div className="rounded-none border">
               <JsonViewer json={result.query} />
             </div>
 
@@ -208,7 +208,7 @@ const QueryBuilderAgent: React.FC<QueryBuilderAgentProps> = ({
                   </Button>
                 </CollapsibleTrigger>
                 <CollapsibleContent>
-                  <p className="text-sm text-muted-foreground p-3 bg-muted/30 rounded-md">
+                  <p className="text-sm text-muted-foreground p-3 bg-muted/30 rounded-none">
                     {result.explanation}
                   </p>
                 </CollapsibleContent>

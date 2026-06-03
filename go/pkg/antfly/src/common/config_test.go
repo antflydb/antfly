@@ -228,7 +228,7 @@ default_shards_per_table: 4
 			},
 		},
 		{
-			name: "config with termite",
+			name: "config with inference",
 			yaml: `
 version: "0.0.1"
 health_port: 4200
@@ -238,7 +238,7 @@ storage:
 metadata:
   orchestration_urls:
     "1": "http://localhost:5001"
-termite:
+inference:
   api_url: "http://localhost:8080"
 replication_factor: 1
 max_shard_size_bytes: 1073741824
@@ -246,8 +246,8 @@ max_shards_per_table: 100
 default_shards_per_table: 4
 `,
 			validate: func(t *testing.T, cfg *Config) {
-				require.NotNil(t, cfg.Termite)
-				assert.Equal(t, "http://localhost:8080", cfg.Termite.ApiUrl)
+				require.NotNil(t, cfg.Inference)
+				assert.Equal(t, "http://localhost:8080", cfg.Inference.ApiUrl)
 			},
 		},
 		{

@@ -17,7 +17,7 @@ NC='\033[0m' # No Color
 
 # Default Postgres URL
 POSTGRES_URL="${POSTGRES_URL:-postgresql://postgres:postgres@localhost:5432/antfly_demo}"
-ANTFLY_URL="${ANTFLY_URL:-http://localhost:8080/api/v1}"
+ANTFLY_URL="${ANTFLY_URL:-http://localhost:8080/db/v1}"
 
 # Parse command line arguments
 SKIP_POSTGRES_CHECK=false

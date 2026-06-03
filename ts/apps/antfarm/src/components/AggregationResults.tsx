@@ -62,9 +62,9 @@ const BarChart: React.FC<{
             <span className="w-28 truncate text-right text-muted-foreground shrink-0" title={label}>
               {label}
             </span>
-            <div className="flex-1 h-5 bg-muted rounded-sm overflow-hidden relative">
+            <div className="flex-1 h-5 bg-muted rounded-none overflow-hidden relative">
               <div
-                className="h-full rounded-sm transition-all"
+                className="h-full rounded-none transition-all"
                 style={{ width: `${pct}%`, backgroundColor: chartSeries[0] }}
               />
             </div>

@@ -59,7 +59,7 @@ export function NoModelsState() {
   return (
     <AntyEmptyState
       title="No models loaded"
-      description="Connect a Termite instance or load models to get started with this playground."
+      description="Connect an Antfly inference runtime or load models to get started with this playground."
     />
   );
 }

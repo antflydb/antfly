@@ -24,7 +24,7 @@ import type React from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { NoTablesState } from "@/components/branded-empty-state";
-import { api } from "../api";
+import { useApi } from "../hooks/use-api-config";
 
 const formatBytes = (bytes: number, decimals = 2) => {
   if (bytes === 0) return "0 Bytes";
@@ -50,6 +50,7 @@ const normalizeTablesResponse = (response: unknown): TableStatus[] => {
 
 const TablesListPage: React.FC = () => {
   const navigate = useNavigate();
+  const api = useApi();
   const [tables, setTables] = useState<TableStatus[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [openDropDialog, setOpenDropDialog] = useState(false);
@@ -68,7 +69,7 @@ const TablesListPage: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [api]);
 
   useEffect(() => {
     fetchTables();
@@ -180,7 +181,7 @@ const TablesListPage: React.FC = () => {
   return (
     <DashboardPage>
       <div className="relative isolate">
-        <GraphPaperBg className="absolute inset-0 -z-10 rounded-xl" />
+        <GraphPaperBg className="absolute inset-0 -z-10 rounded-none" />
         <DashboardPageHeader>
           <div>
             <DashboardPageTitle className="font-aeonik">Tables</DashboardPageTitle>

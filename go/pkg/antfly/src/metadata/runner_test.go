@@ -77,7 +77,7 @@ func TestCombinedAPIServerRouting(t *testing.T) {
 	apiRoutes.Handle("/metadata/v1/", http.StripPrefix("/metadata/v1", metadataMux))
 	apiRoutes.Handle("/internal/v1/", http.StripPrefix("/internal/v1", internalMux))
 	// Compatibility aliases.
-	apiRoutes.Handle("/api/v1/", http.StripPrefix("/api/v1", publicMux))
+	apiRoutes.Handle("/db/v1/", http.StripPrefix("/db/v1", publicMux))
 	apiRoutes.Handle("/_internal/v1/", http.StripPrefix("/_internal/v1", internalMux))
 
 	tests := []struct {
@@ -102,9 +102,9 @@ func TestCombinedAPIServerRouting(t *testing.T) {
 			expectedBody:   "metadata",
 		},
 		{
-			name:           "public route accessible at /api/v1/",
+			name:           "public route accessible at /db/v1/",
 			method:         "GET",
-			path:           "/api/v1/test-public",
+			path:           "/db/v1/test-public",
 			expectedStatus: http.StatusOK,
 			expectedBody:   "public",
 		},

@@ -142,9 +142,9 @@
     {
       "id": "nav-models",
       "type": "navigation",
-      "label": "Models",
-      "description": "View available ML models for embedding and inference",
-      "href": "/models",
+      "label": "Models & Runtime",
+      "description": "View Antfly inference models and runtime status",
+      "href": "/inference/models",
       "icon": "Library",
       "embedding": [
         -0.027897777, -0.20297444, -0.007913871, -0.019472929, 0.09838957, 0.114076875,
@@ -280,9 +280,9 @@
     {
       "id": "play-chunking",
       "type": "navigation",
-      "label": "Chunking Playground",
+      "label": "Data Chunking Playground",
       "description": "Test document chunking strategies for RAG",
-      "href": "/playground/chunking",
+      "href": "/data/playground/chunk",
       "icon": "Scissors",
       "embedding": [
         -0.06970131, 0.09474816, 0.057795558, -0.011022197, 0.00977627, -0.09604803, -0.007939067,
@@ -346,11 +346,11 @@
       ]
     },
     {
-      "id": "play-ner",
+      "id": "play-extraction",
       "type": "navigation",
-      "label": "NER Playground",
+      "label": "Extraction Playground",
       "description": "Named entity recognition and extraction",
-      "href": "/playground/recognize",
+      "href": "/inference/playground/extract",
       "icon": "Tag",
       "embedding": [
         -0.08874562, -0.022256212, -0.009120181, -0.053892467, 0.05053006, -0.018486928,
@@ -416,9 +416,9 @@
     {
       "id": "play-question",
       "type": "navigation",
-      "label": "Question Gen",
+      "label": "Rewriting Playground",
       "description": "Generate questions from documents for evaluation",
-      "href": "/playground/question",
+      "href": "/inference/playground/rewrite",
       "icon": "HelpCircle",
       "embedding": [
         -0.084463075, 0.14094223, -0.04622238, 0.018248912, 0.01543113, 0.026562368, 0.02127763,
@@ -486,7 +486,7 @@
       "type": "navigation",
       "label": "Knowledge Graph",
       "description": "Build and visualize knowledge graphs",
-      "href": "/playground/kg",
+      "href": "/inference/playground/kg",
       "icon": "Network",
       "embedding": [
         0.053930108, -0.013544671, -0.044834528, 0.0062742783, 0.019840378, -0.07216902,
@@ -554,7 +554,7 @@
       "type": "navigation",
       "label": "Evals",
       "description": "Run RAG evaluations and benchmarks",
-      "href": "/playground/evals",
+      "href": "/data/playground/evals",
       "icon": "ClipboardCheck",
       "embedding": [
         -0.09651942, 0.057518497, -0.052242387, 0.011058676, -0.06290196, -0.10746886, -0.01275608,
@@ -623,7 +623,7 @@
       "type": "navigation",
       "label": "RAG Playground",
       "description": "Test retrieval-augmented generation pipelines",
-      "href": "/playground/rag",
+      "href": "/data/playground/rag",
       "icon": "MessageSquare",
       "embedding": [
         -0.08185645, -0.024673104, -0.02928956, 0.009039619, 0.014073962, -0.03198563, -0.019658372,

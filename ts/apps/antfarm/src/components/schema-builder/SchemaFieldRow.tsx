@@ -236,7 +236,7 @@ const SchemaFieldRow: React.FC<SchemaFieldRowProps> = ({
                 <div className="col-span-2 text-sm text-muted-foreground border-t pt-3 mt-1">
                   <p>
                     <span className="font-medium">Example:</span>{" "}
-                    <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
+                    <code className="bg-muted px-1.5 py-0.5 rounded-none text-xs">
                       {truncateValue(detectionInfo.exampleValue)}
                     </code>
                   </p>

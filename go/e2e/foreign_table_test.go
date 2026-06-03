@@ -33,7 +33,7 @@ func TestE2E_AntflyJoin(t *testing.T) {
 
 	ctx := testContext(t, 5*time.Minute)
 
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
+	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
 	t.Cleanup(swarm.Cleanup)
 
 	// ---- Create tables ----
@@ -196,8 +196,8 @@ func TestE2E_ForeignTable_BasicQuery(t *testing.T) {
 	cleanup := setupPGTestData(t, ctx)
 	t.Cleanup(cleanup)
 
-	// Start Antfly (no Termite needed)
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
+	// Start Antfly (no Antfly inference needed)
+	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
 	t.Cleanup(swarm.Cleanup)
 
 	// Query the foreign table — no Antfly table creation needed.
@@ -238,7 +238,7 @@ func TestE2E_ForeignTable_FilteredQuery(t *testing.T) {
 	cleanup := setupPGTestData(t, ctx)
 	t.Cleanup(cleanup)
 
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
+	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
 	t.Cleanup(swarm.Cleanup)
 
 	// Filter for gold tier customers
@@ -280,7 +280,7 @@ func TestE2E_ForeignTable_UnsupportedOps(t *testing.T) {
 	cleanup := setupPGTestData(t, ctx)
 	t.Cleanup(cleanup)
 
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
+	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
 	t.Cleanup(swarm.Cleanup)
 
 	// Unsupported aggregation types on foreign tables should fail with 400
@@ -313,7 +313,7 @@ func TestE2E_ForeignTable_JoinWithAntfly(t *testing.T) {
 	cleanup := setupPGTestData(t, ctx)
 	t.Cleanup(cleanup)
 
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
+	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
 	t.Cleanup(swarm.Cleanup)
 
 	// Create an Antfly table with order data that references customer IDs
@@ -438,7 +438,7 @@ func TestE2E_ForeignTable_CDCJoin(t *testing.T) {
 	conn.Close(ctx)
 
 	// ---- Start Antfly ----
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
+	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
 	t.Cleanup(swarm.Cleanup)
 
 	// Create Antfly table with CDC replication from PG orders

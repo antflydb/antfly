@@ -21,6 +21,7 @@ const foreign_sources_api = @import("foreign_sources.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const tables_api = @import("tables.zig");
 const platform_time = @import("../platform/time.zig");
@@ -1348,7 +1349,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     row_filter_json: ?[]const u8,
     join: SupportedJoinRequest,
     foreign_sources: foreign_mod.PostgresSourceMap,
-) (public_table_http.TableApi.ExecuteQueryError || error{OutOfMemory})![]u8 {
+) (public_table_http.TableApi.ExecuteQueryError || error{ OutOfMemory, DocIdentityNamespaceMismatch })![]u8 {
     const uses_foreign = joinUsesForeignSource(join, foreign_sources);
     var contract_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
     defer contract_request.deinit();
@@ -1369,6 +1370,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     var primary_result = ctx.executePlainQuery(alloc, source, table_name, primary_body, row_filter_json) catch |err| switch (err) {
         error.InvalidQueryRequest => return error.InvalidQueryRequest,
         error.TableNotFound => return error.NotFound,
+        error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         else => return error.InternalFailure,
     };
     defer primary_result.deinit(alloc);
@@ -1379,6 +1381,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     if (hits_ptr.items.len == 0) return alloc.dupe(u8, primary_result.json) catch return error.InternalFailure;
     const plan = planSupportedJoinExecution(ctx, alloc, table_name, join, hits_ptr.items, foreign_sources) catch |err| switch (err) {
         error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+        error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         else => return error.InternalFailure,
     };
 
@@ -1386,6 +1389,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         if (executeSupportedDistributedJoinFinalized(ctx, job_store, alloc, source, join, hits_ptr.items, requested_left_fields, appended_left_field, plan) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.TableNotFound => return error.NotFound,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             else => {
                 std.log.err("distributed shuffle join failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -1403,6 +1407,7 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     var right_result = executeSupportedRightJoinQuery(ctx, job_store, alloc, source, join, hits_ptr.items, plan, foreign_sources) catch |err| switch (err) {
         error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
         error.TableNotFound => return error.NotFound,
+        error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         else => return error.InternalFailure,
     };
     defer right_result.deinit(alloc);
@@ -1730,6 +1735,7 @@ const DistributedRightJoinGroups = struct {
         const group_ids = try rightJoinGroupIdsFromSnapshot(alloc, &snapshot, right_table.table_id);
         errdefer alloc.free(group_ids);
         if (group_ids.len < min_group_count) return null;
+        try validateDistributedJoinDocIdentityReady(&snapshot, right_table.table_id);
         return .{
             .ctx = ctx,
             .alloc = alloc,
@@ -1745,6 +1751,54 @@ const DistributedRightJoinGroups = struct {
         self.* = undefined;
     }
 };
+
+fn validateDistributedJoinDocIdentityReady(
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_id: u64,
+) !void {
+    for (snapshot.ranges) |range| {
+        if (range.table_id != table_id) continue;
+        const status = findJoinMergedGroupStatus(snapshot.merged_group_statuses, range.group_id) orelse continue;
+        if (status.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
+        if (status.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
+        if (status.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;
+        if (!joinRuntimeDocIdentityMatchesRange(status.doc_identity, range)) return error.DocIdentityNamespaceMismatch;
+    }
+}
+
+fn findJoinMergedGroupStatus(
+    statuses: []const metadata_reconciler.MergedGroupStatus,
+    group_id: u64,
+) ?metadata_reconciler.MergedGroupStatus {
+    for (statuses) |status| {
+        if (status.group_id == group_id) return status;
+    }
+    return null;
+}
+
+fn joinRuntimeDocIdentityMatchesRange(
+    stats: metadata_table_manager.RuntimeDocIdentityStatusReport,
+    range: metadata_table_manager.RangeRecord,
+) bool {
+    if (!joinRuntimeDocIdentityHasNamespace(stats)) return true;
+    return stats.namespace_table_id == range.table_id and
+        stats.namespace_shard_id == metadata_table_manager.rangeDocIdentityShardId(range) and
+        stats.namespace_range_id == metadata_table_manager.rangeDocIdentityRangeId(range);
+}
+
+fn joinRuntimeDocIdentityHasNamespace(stats: metadata_table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.namespace_table_id != 0 or
+        stats.namespace_shard_id != 0 or
+        stats.namespace_range_id != 0;
+}
+
+fn joinRuntimeDocIdentityHasOrdinalRows(stats: metadata_table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.next_ordinal != 1 or
+        stats.allocated_ordinals != 0 or
+        stats.state_rows != 0 or
+        stats.live_ordinals != 0 or
+        stats.tombstone_ordinals != 0;
+}
 
 const StatefulShufflePreparedJob = union(enum) {
     cached_result: JoinPartitionExecutionResult,
@@ -1932,6 +1986,7 @@ const StatefulDistributedShuffleEngine = struct {
         const worker_group_ids = try rightJoinGroupIdsFromSnapshot(self.alloc, &snapshot, right_table.table_id);
         errdefer self.alloc.free(worker_group_ids);
         if (worker_group_ids.len <= 1) return null;
+        try validateDistributedJoinDocIdentityReady(&snapshot, right_table.table_id);
         return worker_group_ids;
     }
 
@@ -3078,6 +3133,9 @@ fn appendGroupLocalUnmatchedRightJoinHits(
         if (try source.searchResultGroupLocal(alloc, group_id, table_name, query_req, .read_index)) |search_result_value| {
             var search_result = search_result_value;
             defer search_result.deinit();
+            if (query_req.identity_read_generation == null) {
+                query_req.identity_read_generation = search_result.identity_read_generation;
+            }
             if (total_hits == null) total_hits = search_result.total_hits;
             if (search_result.hits.len == 0) break;
 
@@ -3093,6 +3151,7 @@ fn appendGroupLocalUnmatchedRightJoinHits(
 
             scanned_hits += search_result.hits.len;
             if (scanned_hits >= search_result.total_hits) break;
+            try requireStampedJoinFollowupRequest(query_req);
             query_req.offset = @intCast(scanned_hits);
             continue;
         }
@@ -3119,6 +3178,7 @@ fn appendGroupLocalUnmatchedRightJoinHits(
 
         scanned_hits += hits_ptr.items.len;
         if (scanned_hits >= page_total_hits) break;
+        try requireStampedJoinFollowupRequest(query_req);
         query_req.offset = @intCast(scanned_hits);
     }
 
@@ -4384,8 +4444,8 @@ pub fn mergeJoinedRightHitsAlloc(
         };
 
         try mergeRightHitIntoSource(alloc, source_value, join, matched_right);
-        if (matched_right.object.get("_id")) |matched_id| {
-            if (matched_id == .string) try matched_right_ids.put(alloc, matched_id.string, {});
+        if (join_model.rightHitIdentityKey(matched_right)) |matched_id| {
+            try matched_right_ids.put(alloc, matched_id, {});
         }
         try joined_hits.append(joined_hit);
         stats.rows_matched += 1;
@@ -5041,6 +5101,45 @@ fn scalarJsonValueStringAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
     return try json_helpers.scalarJsonValueStringAlloc(alloc, value);
 }
 
+fn appendSearchHitAsJsonHit(
+    alloc: std.mem.Allocator,
+    hits: *std.json.Array,
+    hit: db_mod.types.SearchHit,
+) !void {
+    var hit_obj = std.json.ObjectMap.empty;
+    errdefer {
+        var it = hit_obj.iterator();
+        while (it.next()) |entry| {
+            alloc.free(@constCast(entry.key_ptr.*));
+            deinitJsonValue(alloc, entry.value_ptr);
+        }
+        hit_obj.deinit(alloc);
+    }
+
+    try hit_obj.put(alloc, try alloc.dupe(u8, "_id"), .{ .string = try alloc.dupe(u8, hit.id) });
+    if (hit.doc_ordinal) |ordinal| {
+        try hit_obj.put(alloc, try alloc.dupe(u8, join_model.internal_doc_identity_key_field), .{ .string = try std.fmt.allocPrint(alloc, "o:{d}", .{ordinal}) });
+    }
+    try hit_obj.put(alloc, try alloc.dupe(u8, "_score"), if (hit.score) |score| .{ .float = score } else .{ .float = 0 });
+    const source_value = if (hit.stored_data) |stored_data| blk: {
+        var parsed = try json_helpers.parseJsonValueAlloc(alloc, stored_data);
+        defer parsed.deinit();
+        break :blk try cloneJsonValue(alloc, parsed.value);
+    } else std.json.Value{ .object = std.json.ObjectMap.empty };
+    try hit_obj.put(alloc, try alloc.dupe(u8, "_source"), source_value);
+    try hits.append(.{ .object = hit_obj });
+}
+
+fn appendSearchHitsAsJsonHits(
+    alloc: std.mem.Allocator,
+    hits: *std.json.Array,
+    search_hits: []const db_mod.types.SearchHit,
+) !void {
+    for (search_hits) |hit| {
+        try appendSearchHitAsJsonHit(alloc, hits, hit);
+    }
+}
+
 fn buildForeignRightJoinHit(
     alloc: std.mem.Allocator,
     foreign_source: foreign_mod.PostgresConfig,
@@ -5077,6 +5176,22 @@ fn appendGroupLocalJoinHits(
     hits: *std.json.Array,
 ) !bool {
     var query_req = req;
+    if (try source.searchResultGroupLocal(alloc, group_id, table_name, query_req, .read_index)) |search_result_value| {
+        var search_result = search_result_value;
+        defer search_result.deinit();
+        if (query_req.identity_read_generation == null) {
+            query_req.identity_read_generation = search_result.identity_read_generation;
+        }
+        if (!explicit_limit and search_result.hits.len < search_result.total_hits) {
+            try requireStampedJoinFollowupRequest(query_req);
+            query_req.limit = search_result.total_hits;
+            search_result.deinit();
+            search_result = (try source.searchResultGroupLocal(alloc, group_id, table_name, query_req, .read_index)) orelse return false;
+        }
+        try appendSearchHitsAsJsonHits(alloc, hits, search_result.hits);
+        return true;
+    }
+
     var response = (try source.queryGroupLocal(alloc, group_id, table_name, query_req, .read_index)) orelse return false;
     defer response.deinit(alloc);
 
@@ -5086,6 +5201,7 @@ fn appendGroupLocalJoinHits(
     const total_hits = try queryTotalHits(parsed.value);
 
     if (!explicit_limit and hits_ptr.items.len < total_hits) {
+        try requireStampedJoinFollowupRequest(query_req);
         query_req.limit = @intCast(total_hits);
         var full_response = (try source.queryGroupLocal(alloc, group_id, table_name, query_req, .read_index)) orelse return false;
         defer full_response.deinit(alloc);
@@ -5098,6 +5214,10 @@ fn appendGroupLocalJoinHits(
         try hits.append(try cloneJsonValue(alloc, hit));
     }
     return true;
+}
+
+fn requireStampedJoinFollowupRequest(req: db_mod.types.SearchRequest) !void {
+    if (req.identity_read_generation == null) return error.UnsupportedQueryRequest;
 }
 
 fn appendJoinHitsAcrossGroups(
@@ -5758,6 +5878,7 @@ test "distributed join unmatched worker pages group-local right hits" {
                     .scan = scan,
                     .query = query,
                     .query_group_local = queryGroupLocal,
+                    .search_result_group_local = searchResultGroupLocal,
                 },
             };
         }
@@ -5774,50 +5895,51 @@ test "distributed join unmatched worker pages group-local right hits" {
             return error.UnsupportedOperation;
         }
 
-        fn buildPageJsonAlloc(alloc: std.mem.Allocator, start: usize, end: usize, total_hits: usize) ![]u8 {
-            var root = std.json.Value{ .object = std.json.ObjectMap.empty };
-            defer json_helpers.deinitJsonValue(alloc, &root);
-
-            var responses = std.json.Array.init(alloc);
-            var response = std.json.Value{ .object = std.json.ObjectMap.empty };
-            var hits_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
-            var hits = std.json.Array.init(alloc);
-
-            for (start..end) |i| {
-                const id = try std.fmt.allocPrint(alloc, "cust:{d}", .{i});
-                errdefer alloc.free(id);
-                const name = try std.fmt.allocPrint(alloc, "User {d}", .{i});
-                errdefer alloc.free(name);
-
-                var source_obj = std.json.ObjectMap.empty;
-                try source_obj.put(alloc, try alloc.dupe(u8, "name"), .{ .string = name });
-
-                var hit_obj = std.json.ObjectMap.empty;
-                try hit_obj.put(alloc, try alloc.dupe(u8, "_id"), .{ .string = id });
-                try hit_obj.put(alloc, try alloc.dupe(u8, "_score"), .{ .float = 0 });
-                try hit_obj.put(alloc, try alloc.dupe(u8, "_source"), .{ .object = source_obj });
-                try hits.append(.{ .object = hit_obj });
-            }
-
-            try hits_obj.object.put(alloc, try alloc.dupe(u8, "total"), .{ .integer = @intCast(total_hits) });
-            try hits_obj.object.put(alloc, try alloc.dupe(u8, "max_score"), .{ .float = 0 });
-            try hits_obj.object.put(alloc, try alloc.dupe(u8, "hits"), .{ .array = hits });
-            try response.object.put(alloc, try alloc.dupe(u8, "hits"), hits_obj);
-            try responses.append(response);
-            try root.object.put(alloc, try alloc.dupe(u8, "responses"), .{ .array = responses });
-            return try json_helpers.stringifyJsonValueAlloc(alloc, root);
+        fn queryGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            _ = ptr;
+            _ = alloc;
+            _ = group_id;
+            _ = table_name;
+            _ = req;
+            return error.UnsupportedOperation;
         }
 
-        fn queryGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+        fn searchResultGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
             var self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(u64, 201), group_id);
             try std.testing.expectEqualStrings("customers", table_name);
+            if (self.calls == 0) {
+                try std.testing.expectEqual(@as(?u64, null), req.identity_read_generation);
+            } else {
+                try std.testing.expectEqual(@as(?u64, 7), req.identity_read_generation);
+            }
             self.calls += 1;
 
             const total_hits: usize = unmatched_right_join_group_chunk_limit + 2;
             const start: usize = req.offset;
             const end: usize = @min(total_hits, start + req.limit);
-            return .{ .json = try buildPageJsonAlloc(alloc, start, end, total_hits) };
+
+            const hits = try alloc.alloc(db_mod.types.SearchHit, end - start);
+            var initialized: usize = 0;
+            errdefer {
+                for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                alloc.free(hits);
+            }
+            for (start..end, 0..) |i, out_idx| {
+                hits[out_idx] = .{
+                    .id = try std.fmt.allocPrint(alloc, "cust:{d}", .{i}),
+                    .score = 0,
+                    .stored_data = try std.fmt.allocPrint(alloc, "{{\"name\":\"User {d}\"}}", .{i}),
+                };
+                initialized += 1;
+            }
+
+            return .{
+                .alloc = alloc,
+                .hits = hits,
+                .total_hits = @intCast(total_hits),
+                .identity_read_generation = 7,
+            };
         }
     };
 
@@ -5849,6 +5971,158 @@ test "distributed join unmatched worker pages group-local right hits" {
     );
 }
 
+test "distributed join follow-up pagination requires stamped identity request" {
+    try std.testing.expectError(error.UnsupportedQueryRequest, requireStampedJoinFollowupRequest(.{}));
+    try requireStampedJoinFollowupRequest(.{ .identity_read_generation = 7 });
+}
+
+test "distributed join group-local hit pagination reuses structured search generation" {
+    const FakeReads = struct {
+        calls: usize = 0,
+        query_fallback_called: bool = false,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .query_group_local = queryGroupLocal,
+                    .search_result_group_local = searchResultGroupLocal,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn queryGroupLocal(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            var self: *@This() = @ptrCast(@alignCast(ptr));
+            self.query_fallback_called = true;
+            return error.UnsupportedOperation;
+        }
+
+        fn searchResultGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
+            var self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 301), group_id);
+            try std.testing.expectEqualStrings("customers", table_name);
+            if (self.calls == 0) {
+                try std.testing.expectEqual(@as(?u64, null), req.identity_read_generation);
+                try std.testing.expectEqual(@as(u32, 10), req.limit);
+            } else {
+                try std.testing.expectEqual(@as(?u64, 9), req.identity_read_generation);
+                try std.testing.expectEqual(@as(u32, 12), req.limit);
+            }
+            self.calls += 1;
+
+            const total_hits: usize = 12;
+            const count: usize = if (req.limit >= total_hits) total_hits else 10;
+            const hits = try alloc.alloc(db_mod.types.SearchHit, count);
+            var initialized: usize = 0;
+            errdefer {
+                for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                alloc.free(hits);
+            }
+            for (0..count) |i| {
+                hits[i] = .{
+                    .id = try std.fmt.allocPrint(alloc, "cust:{d}", .{i}),
+                    .score = 0,
+                    .stored_data = try std.fmt.allocPrint(alloc, "{{\"name\":\"User {d}\"}}", .{i}),
+                };
+                initialized += 1;
+            }
+
+            return .{
+                .alloc = alloc,
+                .hits = hits,
+                .total_hits = @intCast(total_hits),
+                .identity_read_generation = 9,
+            };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var reads = FakeReads{};
+    var hits = std.json.Array.init(alloc);
+    defer {
+        for (hits.items) |*hit| json_helpers.deinitJsonValue(alloc, hit);
+        hits.deinit();
+    }
+
+    try std.testing.expect(try appendGroupLocalJoinHits(
+        alloc,
+        reads.source(),
+        301,
+        "customers",
+        .{},
+        false,
+        &hits,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), reads.calls);
+    try std.testing.expect(!reads.query_fallback_called);
+    try std.testing.expectEqual(@as(usize, 12), hits.items.len);
+    try std.testing.expectEqualStrings("cust:11", hits.items[11].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("User 11", hits.items[11].object.get("_source").?.object.get("name").?.string);
+}
+
+test "distributed right join unmatched tracking uses ordinal identity keys" {
+    const alloc = std.testing.allocator;
+
+    var join = try testSupportedJoinRequestAlloc(alloc);
+    defer join.deinit(alloc);
+    join.join_type = .right;
+
+    var left_source = std.json.Value{ .object = std.json.ObjectMap.empty };
+    defer if (left_source != .null) deinitJsonValue(alloc, &left_source);
+    try putOwnedJsonField(alloc, &left_source.object, "customer_id", .{ .string = try alloc.dupe(u8, "cust:alias-a") });
+    var left_hit = std.json.Value{ .object = std.json.ObjectMap.empty };
+    defer if (left_hit != .null) deinitJsonValue(alloc, &left_hit);
+    try putOwnedJsonField(alloc, &left_hit.object, "_id", .{ .string = try alloc.dupe(u8, "order:1") });
+    try putOwnedJsonField(alloc, &left_hit.object, "_source", left_source);
+    left_source = .null;
+
+    var matched_source = std.json.Value{ .object = std.json.ObjectMap.empty };
+    defer if (matched_source != .null) deinitJsonValue(alloc, &matched_source);
+    try putOwnedJsonField(alloc, &matched_source.object, "name", .{ .string = try alloc.dupe(u8, "Ada") });
+    var matched_right = std.json.Value{ .object = std.json.ObjectMap.empty };
+    defer if (matched_right != .null) deinitJsonValue(alloc, &matched_right);
+    try putOwnedJsonField(alloc, &matched_right.object, "_id", .{ .string = try alloc.dupe(u8, "cust:alias-a") });
+    try putOwnedJsonField(alloc, &matched_right.object, join_model.internal_doc_identity_key_field, .{ .string = try alloc.dupe(u8, "o:7") });
+    try putOwnedJsonField(alloc, &matched_right.object, "_source", matched_source);
+    matched_source = .null;
+
+    var alias_source = std.json.Value{ .object = std.json.ObjectMap.empty };
+    defer if (alias_source != .null) deinitJsonValue(alloc, &alias_source);
+    try putOwnedJsonField(alloc, &alias_source.object, "name", .{ .string = try alloc.dupe(u8, "Ada alias") });
+    var alias_right = std.json.Value{ .object = std.json.ObjectMap.empty };
+    defer if (alias_right != .null) deinitJsonValue(alloc, &alias_right);
+    try putOwnedJsonField(alloc, &alias_right.object, "_id", .{ .string = try alloc.dupe(u8, "cust:alias-b") });
+    try putOwnedJsonField(alloc, &alias_right.object, join_model.internal_doc_identity_key_field, .{ .string = try alloc.dupe(u8, "o:7") });
+    try putOwnedJsonField(alloc, &alias_right.object, "_source", alias_source);
+    alias_source = .null;
+
+    const left_hits = [_]std.json.Value{left_hit};
+    const right_hits = [_]std.json.Value{ matched_right, alias_right };
+    var result = try mergeJoinedRightHitsAlloc(alloc, &left_hits, join, &right_hits, &.{}, false);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(i64, 1), result.stats.rows_matched);
+    try std.testing.expectEqual(@as(i64, 0), result.stats.rows_unmatched_right);
+    try std.testing.expectEqual(@as(usize, 1), result.matched_right_ids.len);
+    try std.testing.expectEqualStrings("o:7", result.matched_right_ids[0]);
+}
+
 test "distributed join unmatched worker prefers local search results over query envelopes" {
     const FakeCtx = struct {
         fn adminSnapshot(_: *anyopaque) !?metadata_api.AdminSnapshot {
@@ -5869,7 +6143,9 @@ test "distributed join unmatched worker prefers local search results over query 
         fn buildOwnedSearchRequest(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value) !query_api.OwnedQueryRequest {
             const body = try json_helpers.stringifyJsonValueAlloc(alloc, query_value);
             defer alloc.free(body);
-            return try query_api.parseQueryRequest(alloc, null, table_name, body);
+            var owned = try query_api.parseQueryRequest(alloc, null, table_name, body);
+            owned.req.identity_read_generation = 7;
+            return owned;
         }
         fn ensureForeignRegistry(_: *anyopaque) !*const foreign_mod.Registry {
             return error.UnsupportedOperation;
@@ -5977,6 +6253,292 @@ test "distributed join unmatched worker prefers local search results over query 
         "User 129",
         extractJoinValueFromHit(response.hits[response.hits.len - 1], "customers.name").?.string,
     );
+}
+
+test "distributed join rejects doc identity rebuild before right-table fanout" {
+    const FakeCtx = struct {
+        statuses: []metadata_reconciler.MergedGroupStatus,
+
+        const tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 42,
+            .name = "customers",
+        }};
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{
+                .group_id = 201,
+                .range_id = 9001,
+                .table_id = 42,
+                .start_key = "",
+                .end_key = "m",
+            },
+            .{
+                .group_id = 202,
+                .range_id = 9002,
+                .table_id = 42,
+                .start_key = "m",
+                .end_key = null,
+                .doc_identity_shard_id = 201,
+                .doc_identity_range_id = 9001,
+            },
+        };
+
+        fn adminSnapshot(ptr: *anyopaque) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{
+                    .metadata_group_id = 1,
+                    .metrics = .{},
+                },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+                .merged_group_statuses = self.statuses,
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8) !query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8) ![]u8 {
+            return error.UnsupportedOperation;
+        }
+        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value) !query_api.OwnedQueryRequest {
+            return error.UnsupportedOperation;
+        }
+        fn ensureForeignRegistry(_: *anyopaque) !*const foreign_mod.Registry {
+            return error.UnsupportedOperation;
+        }
+
+        fn ctx(self: *@This()) JoinContext {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .execute_plain_query = executePlainQuery,
+                    .execute_query_dispatch = executeQueryDispatch,
+                    .build_owned_search_request = buildOwnedSearchRequest,
+                    .ensure_foreign_registry = ensureForeignRegistry,
+                },
+            };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var statuses = [_]metadata_reconciler.MergedGroupStatus{
+        .{
+            .group_id = 201,
+            .doc_identity = .{
+                .namespace_table_id = 42,
+                .namespace_shard_id = 201,
+                .namespace_range_id = 9001,
+                .next_ordinal = 3,
+                .allocated_ordinals = 2,
+                .state_rows = 2,
+                .live_ordinals = 2,
+                .complete = true,
+            },
+        },
+        .{
+            .group_id = 202,
+            .doc_identity = .{
+                .namespace_table_id = 42,
+                .namespace_shard_id = 201,
+                .namespace_range_id = 9001,
+                .next_ordinal = 3,
+                .allocated_ordinals = 2,
+                .state_rows = 2,
+                .live_ordinals = 2,
+                .complete = true,
+            },
+        },
+    };
+    var ctx_source = FakeCtx{ .statuses = statuses[0..] };
+
+    var groups = (try DistributedRightJoinGroups.init(ctx_source.ctx(), alloc, "customers", 2)) orelse return error.TestUnexpectedResult;
+    defer groups.deinit();
+    try std.testing.expectEqual(@as(usize, 2), groups.group_ids.len);
+
+    statuses[1].doc_identity.rebuild_required = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        DistributedRightJoinGroups.init(ctx_source.ctx(), alloc, "customers", 2),
+    );
+    statuses[1].doc_identity.rebuild_required = false;
+
+    statuses[0].doc_identity_reassignment_active = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        DistributedRightJoinGroups.init(ctx_source.ctx(), alloc, "customers", 2),
+    );
+    statuses[0].doc_identity_reassignment_active = false;
+
+    statuses[1].doc_identity = .{
+        .namespace_table_id = 42,
+        .namespace_shard_id = 202,
+        .namespace_range_id = 9002,
+        .complete = true,
+    };
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        DistributedRightJoinGroups.init(ctx_source.ctx(), alloc, "customers", 2),
+    );
+}
+
+test "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch" {
+    const FakeCtx = struct {
+        statuses: []metadata_reconciler.MergedGroupStatus,
+
+        const tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 42,
+            .name = "customers",
+        }};
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{
+                .group_id = 201,
+                .range_id = 9001,
+                .table_id = 42,
+                .start_key = "",
+                .end_key = "m",
+            },
+            .{
+                .group_id = 202,
+                .range_id = 9002,
+                .table_id = 42,
+                .start_key = "m",
+                .end_key = null,
+            },
+        };
+
+        fn adminSnapshot(ptr: *anyopaque) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{
+                    .metadata_group_id = 1,
+                    .metrics = .{},
+                },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+                .merged_group_statuses = self.statuses,
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8) !query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8) ![]u8 {
+            return error.UnsupportedOperation;
+        }
+        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value) !query_api.OwnedQueryRequest {
+            return error.UnsupportedOperation;
+        }
+        fn ensureForeignRegistry(_: *anyopaque) !*const foreign_mod.Registry {
+            return error.UnsupportedOperation;
+        }
+
+        fn ctx(self: *@This()) JoinContext {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .execute_plain_query = executePlainQuery,
+                    .execute_query_dispatch = executeQueryDispatch,
+                    .build_owned_search_request = buildOwnedSearchRequest,
+                    .ensure_foreign_registry = ensureForeignRegistry,
+                },
+            };
+        }
+    };
+
+    const FakeReads = struct {
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var statuses = [_]metadata_reconciler.MergedGroupStatus{
+        .{
+            .group_id = 201,
+            .doc_identity = .{
+                .namespace_table_id = 42,
+                .namespace_shard_id = 201,
+                .namespace_range_id = 9001,
+                .next_ordinal = 3,
+                .allocated_ordinals = 2,
+                .state_rows = 2,
+                .live_ordinals = 2,
+                .complete = true,
+            },
+        },
+        .{
+            .group_id = 202,
+            .doc_identity = .{
+                .namespace_table_id = 42,
+                .namespace_shard_id = 202,
+                .namespace_range_id = 9002,
+                .next_ordinal = 3,
+                .allocated_ordinals = 2,
+                .state_rows = 2,
+                .live_ordinals = 2,
+                .complete = true,
+            },
+        },
+    };
+    var ctx_source = FakeCtx{ .statuses = statuses[0..] };
+    var job_store = JoinJobStore.init(alloc, .{});
+    defer job_store.deinit();
+    var reads = FakeReads{};
+    const join = SupportedJoinRequest{
+        .right_table = @constCast("customers"),
+        .join_type = .right,
+        .left_field = @constCast("customer_id"),
+        .right_field = @constCast("_id"),
+    };
+    const engine = StatefulDistributedShuffleEngine{
+        .ctx = ctx_source.ctx(),
+        .job_store = &job_store,
+        .alloc = alloc,
+        .source = reads.source(),
+        .join = join,
+        .left_hits = &.{},
+        .appended_left_field = false,
+        .plan = .{ .strategy = .shuffle, .shuffle_partitions = 2 },
+    };
+
+    const healthy_groups = (try engine.loadWorkerGroupIdsAlloc()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(healthy_groups);
+    try std.testing.expectEqual(@as(usize, 2), healthy_groups.len);
+
+    statuses[0].doc_identity.rebuild_required = true;
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, engine.loadWorkerGroupIdsAlloc());
 }
 
 test "distributed join partition state restores applies worker result and builds result" {

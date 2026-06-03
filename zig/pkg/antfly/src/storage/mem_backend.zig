@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
+const internal_keys = @import("internal_keys.zig");
 const OwnedEntry = struct {
     namespace_name: ?[]u8,
     key: []u8,
@@ -167,6 +168,7 @@ pub const Backend = struct {
     allocator: Allocator,
     open_options: backend_types.OpenOptions,
     state: State = .{},
+    mutex: std.atomic.Mutex = .unlocked,
 
     const BoundStore = struct {
         backend: *Backend,
@@ -199,6 +201,36 @@ pub const Backend = struct {
         pub fn beginBatchWithOptions(self: *@This(), options: backend_types.BatchOptions) !BoundTxn {
             _ = options;
             return try BoundTxn.open(self.backend, self.namespace, false);
+        }
+
+        pub fn forEachReplayLaneFrom(
+            self: *@This(),
+            lane_ordinal: u8,
+            from_sequence: u64,
+            max_entries: usize,
+            ctx: *anyopaque,
+            callback: backend_erased.Store.ReplayCallback,
+        ) !backend_types.ReplayLaneIterationStats {
+            const lower = internal_keys.replayRangeLower(lane_ordinal, from_sequence);
+            const upper = internal_keys.replayRangeUpper(lane_ordinal);
+
+            lockBackend(self.backend);
+            defer self.backend.mutex.unlock();
+
+            var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
+            var idx = self.backend.state.lowerBound(self.namespace, lower[0..]);
+            while (idx < self.backend.state.entries.items.len) : (idx += 1) {
+                const entry = self.backend.state.entries.items[idx];
+                if (compareNamespace(namespaceOf(entry), self.namespace) != .eq) break;
+                if (std.mem.order(u8, entry.key, upper[0..]) != .lt) break;
+                const sequence = internal_keys.parseReplayEntrySequence(entry.key, lane_ordinal) orelse break;
+                try callback(ctx, sequence, entry.value);
+                stats.scanned_entries += 1;
+                stats.matched_entries += 1;
+                stats.last_sequence = sequence;
+                if (max_entries != 0 and stats.matched_entries >= max_entries) break;
+            }
+            return stats;
         }
     };
 
@@ -300,6 +332,8 @@ pub const Backend = struct {
         state: State,
 
         fn open(backend: *Backend, namespace: backend_types.Namespace, read_only: bool) !BoundTxn {
+            lockBackend(backend);
+            defer backend.mutex.unlock();
             return .{
                 .allocator = backend.allocator,
                 .backend = if (read_only) null else backend,
@@ -315,6 +349,8 @@ pub const Backend = struct {
 
         pub fn commit(self: *@This()) !void {
             const backend = self.backend orelse return error.ReadOnly;
+            lockBackend(backend);
+            defer backend.mutex.unlock();
             var old_state = backend.state;
             backend.state = self.state;
             self.state = .{};
@@ -350,6 +386,8 @@ pub const Backend = struct {
         state: State,
 
         fn open(backend: *Backend, read_only: bool) !NamespaceTxn {
+            lockBackend(backend);
+            defer backend.mutex.unlock();
             return .{
                 .allocator = backend.allocator,
                 .backend = if (read_only) null else backend,
@@ -364,6 +402,8 @@ pub const Backend = struct {
 
         pub fn commit(self: *@This()) !void {
             const backend = self.backend orelse return error.ReadOnly;
+            lockBackend(backend);
+            defer backend.mutex.unlock();
             var old_state = backend.state;
             backend.state = self.state;
             self.state = .{};
@@ -394,7 +434,9 @@ pub const Backend = struct {
     }
 
     pub fn close(self: *Backend) void {
+        lockBackend(self);
         self.state.deinit(self.allocator);
+        self.mutex.unlock();
         self.* = undefined;
     }
 
@@ -445,6 +487,10 @@ pub const Backend = struct {
         });
     }
 };
+
+fn lockBackend(backend: *Backend) void {
+    while (!backend.mutex.tryLock()) std.Thread.yield() catch {};
+}
 
 fn identityNamespace(namespace: backend_types.Namespace) !backend_types.Namespace {
     return namespace;

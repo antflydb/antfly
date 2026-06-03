@@ -32,7 +32,7 @@
         "build.zig",
         "build.zig.zon",
         "e2e/antfly",
-        "e2e/termite",
+        "e2e/inference",
         "lib/audio",
         "lib/chunker",
         "lib/httpx",
@@ -50,7 +50,7 @@
         "lib/structlog",
         "lib/tokenizer",
         "pkg/antfly",
-        "pkg/termite",
-        "pkg/termite-client",
+        "pkg/inference",
+        "pkg/inference-client",
     },
 }

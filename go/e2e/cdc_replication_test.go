@@ -35,7 +35,7 @@ func TestCDCReplication(t *testing.T) {
 	ctx := testContext(t, 5*time.Minute)
 
 	// Start a single Antfly swarm for all sub-tests
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
+	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
 	t.Cleanup(swarm.Cleanup)
 
 	t.Run("Passthrough", func(t *testing.T) {

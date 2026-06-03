@@ -553,7 +553,7 @@ func setupSparseIndexWithPipeline(t *testing.T, withChunker, withSummarizer bool
 	}
 
 	if withChunker {
-		chunkerConfig, err := chunking.NewChunkerConfig(chunking.TermiteChunkerConfig{
+		chunkerConfig, err := chunking.NewChunkerConfig(chunking.AntflyChunkerConfig{
 			ApiUrl: "http://mock",
 			Model:  "semantic",
 		})

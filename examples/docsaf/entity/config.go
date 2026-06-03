@@ -11,10 +11,10 @@ import (
 
 	"github.com/antflydb/antfly/go/pkg/docsaf"
 	docsafentity "github.com/antflydb/antfly/go/pkg/docsaf/entity"
-	termiteclient "github.com/antflydb/antfly/go/pkg/sdk"
+	inferenceclient "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
-const defaultTermiteURL = "http://localhost:8088"
+const defaultInferenceURL = "http://localhost:8088"
 
 var promptTextPattern = regexp.MustCompile(`\{\{\{?\s*Text\b`)
 
@@ -30,7 +30,7 @@ type Config struct {
 	Provider          string
 	Kind              ExtractorKind
 	Model             string
-	TermiteURL        string
+	InferenceURL      string
 	IncludeRelations  bool
 	PromptTemplate    string
 	EntityThreshold   float64
@@ -69,9 +69,9 @@ func RegisterFlags(fs *flag.FlagSet) *Config {
 // DefaultConfig returns the default extraction config for the example CLI.
 func DefaultConfig() Config {
 	return Config{
-		Provider:          "termite",
+		Provider:          "antfly",
 		Kind:              ExtractorKindRecognizer,
-		TermiteURL:        defaultTermiteURL,
+		InferenceURL:      defaultInferenceURL,
 		EntityThreshold:   0.5,
 		RelationThreshold: 0.5,
 		BatchSize:         docsafentity.DefaultBatchSize,
@@ -80,8 +80,8 @@ func DefaultConfig() Config {
 
 // BindFlags registers extraction flags on the given FlagSet.
 func (c *Config) BindFlags(fs *flag.FlagSet) {
-	fs.StringVar(&c.TermiteURL, "termite-url", defaultTermiteURL, "Termite API URL for extraction")
-	fs.StringVar(&c.Provider, "extractor-provider", "termite", "Extractor provider")
+	fs.StringVar(&c.InferenceURL, "inference-url", defaultInferenceURL, "Inference API URL for extraction")
+	fs.StringVar(&c.Provider, "extractor-provider", "antfly", "Extractor provider")
 	fs.StringVar((*string)(&c.Kind), "extractor-kind", string(ExtractorKindRecognizer), "Extractor kind: recognizer or generator")
 	fs.StringVar(&c.Model, "extractor-model", "", "Extractor model name")
 	fs.BoolVar(&c.IncludeRelations, "extractor-relations", false, "Extract relations in addition to entities when supported")
@@ -128,7 +128,7 @@ func (c Config) Validate() error {
 		return nil
 	}
 
-	if c.Provider != "" && c.Provider != "termite" {
+	if c.Provider != "" && c.Provider != "antfly" {
 		return fmt.Errorf("unsupported --extractor-provider %q", c.Provider)
 	}
 
@@ -173,12 +173,12 @@ func (c Config) Run(ctx context.Context, sections []docsaf.DocumentSection) (*do
 		return nil, err
 	}
 
-	tc, err := termiteclient.NewTermiteClient(c.TermiteURL, http.DefaultClient)
+	tc, err := inferenceclient.NewInferenceClient(c.InferenceURL, http.DefaultClient)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create termite client: %w", err)
+		return nil, fmt.Errorf("failed to create inference client: %w", err)
 	}
 
-	extractor, err := buildTermiteExtractor(tc, c)
+	extractor, err := buildInferenceExtractor(tc, c)
 	if err != nil {
 		return nil, err
 	}

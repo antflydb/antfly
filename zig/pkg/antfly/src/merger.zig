@@ -31,8 +31,8 @@ const roaring = @import("encoding/roaring.zig");
 pub const MergePolicy = struct {
     max_segments_per_tier: u32 = 10,
     max_merge_at_once: u32 = 10,
-    max_segment_size: u64 = 5 * 1024 * 1024,
-    floor_segment_size: u64 = 2048,
+    max_segment_size: u64 = 5 * 1024 * 1024 * 1024,
+    floor_segment_size: u64 = 16 * 1024 * 1024,
     skew_weight: f64 = 1.0,
     size_weight: f64 = 1.0,
     delete_reclaim_weight: f64 = 2.0,
@@ -43,13 +43,11 @@ pub const MergePolicy = struct {
         if (segments.len < 2) return null;
 
         var has_deletions = false;
-        var has_floor_segments = false;
         for (segments) |seg| {
             has_deletions = has_deletions or seg.has_deletions;
-            has_floor_segments = has_floor_segments or seg.size <= self.floor_segment_size;
         }
 
-        if (segments.len <= self.max_segments_per_tier and !has_deletions and !has_floor_segments) {
+        if (segments.len <= self.max_segments_per_tier and !has_deletions) {
             return null;
         }
 
@@ -78,7 +76,6 @@ pub const MergePolicy = struct {
             var largest_size: u64 = 0;
             var smallest_size: u64 = std.math.maxInt(u64);
             var has_candidate_deletions = false;
-            var has_candidate_floor_segments = false;
 
             const max_len = @min(max_merge_at_once, candidates.len - start);
             for (0..max_len) |offset| {
@@ -93,11 +90,10 @@ pub const MergePolicy = struct {
                 largest_size = @max(largest_size, effective_size);
                 smallest_size = @min(smallest_size, effective_size);
                 has_candidate_deletions = has_candidate_deletions or candidate.has_deletions;
-                has_candidate_floor_segments = has_candidate_floor_segments or candidate.size <= self.floor_segment_size;
 
                 const len = offset + 1;
                 if (len < 2) continue;
-                if (segments.len <= self.max_segments_per_tier and !has_candidate_deletions and !has_candidate_floor_segments) continue;
+                if (segments.len <= self.max_segments_per_tier and !has_candidate_deletions) continue;
 
                 const skew = if (smallest_size == 0)
                     1.0
@@ -117,11 +113,14 @@ pub const MergePolicy = struct {
                     @as(f64, @floatFromInt(segments.len - max_segments_per_tier)) / @as(f64, @floatFromInt(max_segments_per_tier))
                 else
                     0.0;
+                const width_ratio = @as(f64, @floatFromInt(len)) / @as(f64, @floatFromInt(max_merge_at_once));
+                const backlog_width_bonus = if (budget_pressure > 1.0) (budget_pressure - 1.0) * width_ratio else 0.0;
                 const score = (skew * self.skew_weight) +
                     (size_ratio * self.size_weight) -
                     (delete_ratio * self.delete_reclaim_weight) -
                     floor_bonus -
-                    budget_pressure;
+                    budget_pressure -
+                    backlog_width_bonus;
 
                 if (best == null or score < best.?.score) {
                     best = .{
@@ -203,7 +202,7 @@ pub fn mergeSegmentsBounded(
     if (live_docs == 0) return try alloc.alloc([]u8, 0);
 
     const target_bytes = @max(@as(usize, 1), options.target_segment_bytes);
-    if (live_docs <= 1 or total_input_bytes <= target_bytes) {
+    if (live_docs <= 1) {
         const segments = try alloc.alloc([]u8, 1);
         errdefer alloc.free(segments);
         segments[0] = try segment_mod.mergeSegmentInputs(alloc, inputs);
@@ -224,10 +223,16 @@ pub fn mergeSegmentsBounded(
 
     var window_start: u32 = 0;
     while (window_start < live_docs) {
-        const window_end = @min(live_docs, window_start + docs_per_segment);
-        const segment = try mergeLiveDocWindow(alloc, inputs, window_start, window_end);
+        var window_len = @min(docs_per_segment, live_docs - window_start);
+        const segment = while (true) {
+            const window_end = window_start + window_len;
+            const candidate = try mergeLiveDocWindow(alloc, inputs, window_start, window_end);
+            if (candidate.len <= target_bytes or window_len == 1) break candidate;
+            alloc.free(candidate);
+            window_len = @max(@as(u32, 1), window_len / 2);
+        };
         try outputs.append(alloc, segment);
-        window_start = window_end;
+        window_start += window_len;
     }
 
     return try outputs.toOwnedSlice(alloc);
@@ -547,7 +552,7 @@ test "merge policy reclaims deleted docs within tier budget" {
     try std.testing.expect(std.mem.indexOfScalar(usize, planned, 2) != null);
 }
 
-test "merge policy compacts floor segments within tier budget" {
+test "merge policy does not compact floor segments within tier budget" {
     const alloc = std.testing.allocator;
     const policy = MergePolicy{
         .max_segments_per_tier = 8,
@@ -562,12 +567,30 @@ test "merge policy compacts floor segments within tier budget" {
         .{ .index = 3, .size = 256 * 1024, .doc_count = 100, .has_deletions = false },
     };
 
+    const planned = try policy.plan(alloc, &infos);
+    if (planned) |owned| alloc.free(owned);
+    try std.testing.expect(planned == null);
+}
+
+test "merge policy compacts floor segments under tier pressure" {
+    const alloc = std.testing.allocator;
+    const policy = MergePolicy{
+        .max_segments_per_tier = 3,
+        .max_merge_at_once = 4,
+        .max_segment_size = 1024 * 1024,
+        .floor_segment_size = 2048,
+    };
+    const infos = [_]SegmentInfo{
+        .{ .index = 0, .size = 512, .doc_count = 2, .has_deletions = false },
+        .{ .index = 1, .size = 768, .doc_count = 2, .has_deletions = false },
+        .{ .index = 2, .size = 128 * 1024, .doc_count = 100, .has_deletions = false },
+        .{ .index = 3, .size = 256 * 1024, .doc_count = 100, .has_deletions = false },
+    };
+
     const planned = (try policy.plan(alloc, &infos)).?;
     defer alloc.free(planned);
 
-    try std.testing.expectEqual(@as(usize, 2), planned.len);
-    try std.testing.expect(std.mem.indexOfScalar(usize, planned, 0) != null);
-    try std.testing.expect(std.mem.indexOfScalar(usize, planned, 1) != null);
+    try std.testing.expect(planned.len >= 2);
 }
 
 test "merge direct-copies single-source field sections when eligible" {

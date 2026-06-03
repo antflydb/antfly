@@ -287,6 +287,7 @@ fn cloneMergeRecord(alloc: std.mem.Allocator, record: metadata.MergeTransitionRe
         .receiver_group_id = record.receiver_group_id,
         .phase = record.phase,
         .rollback_reason = if (record.rollback_reason) |reason| try alloc.dupe(u8, reason) else null,
+        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
     };
 }
 

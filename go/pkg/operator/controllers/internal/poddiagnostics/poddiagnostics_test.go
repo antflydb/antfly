@@ -23,7 +23,7 @@ import (
 
 func TestDiagnosePodsClassifiesModelPullFailure(t *testing.T) {
 	pods := []corev1.Pod{{
-		ObjectMeta: metav1.ObjectMeta{Name: "termite-0"},
+		ObjectMeta: metav1.ObjectMeta{Name: "inference-0"},
 		Status: corev1.PodStatus{
 			InitContainerStatuses: []corev1.ContainerStatus{{
 				Name: "model-puller-0",
@@ -45,14 +45,14 @@ func TestDiagnosePodsClassifiesModelPullFailure(t *testing.T) {
 	if !ok {
 		t.Fatal("expected first model pull finding")
 	}
-	if finding.Pod != "termite-0" || finding.Container != "model-puller-0" {
+	if finding.Pod != "inference-0" || finding.Container != "model-puller-0" {
 		t.Fatalf("unexpected finding target: %#v", finding)
 	}
 }
 
 func TestDiagnosePodsIgnoresNormalInitWaitingReasons(t *testing.T) {
 	pods := []corev1.Pod{{
-		ObjectMeta: metav1.ObjectMeta{Name: "termite-0"},
+		ObjectMeta: metav1.ObjectMeta{Name: "inference-0"},
 		Status: corev1.PodStatus{
 			InitContainerStatuses: []corev1.ContainerStatus{{
 				Name: "model-puller-0",
@@ -82,10 +82,10 @@ func TestDiagnosePodsIgnoresNormalInitWaitingReasons(t *testing.T) {
 
 func TestDiagnosePodsClassifiesImagePullFailure(t *testing.T) {
 	pods := []corev1.Pod{{
-		ObjectMeta: metav1.ObjectMeta{Name: "termite-0"},
+		ObjectMeta: metav1.ObjectMeta{Name: "inference-0"},
 		Status: corev1.PodStatus{
 			ContainerStatuses: []corev1.ContainerStatus{{
-				Name: "termite",
+				Name: "inference",
 				State: corev1.ContainerState{
 					Waiting: &corev1.ContainerStateWaiting{
 						Reason:  "ImagePullBackOff",

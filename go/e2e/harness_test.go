@@ -35,8 +35,8 @@ var modelDownloadMu sync.Mutex
 
 // TestMain sets up the e2e test environment.
 func TestMain(m *testing.M) {
-	// Use TERMITE_MODELS_DIR if set, otherwise use repo's models directory
-	testModelsDir = os.Getenv("TERMITE_MODELS_DIR")
+	// Use ANTFLY_INFERENCE_MODELS_DIR if set, otherwise use repo's models directory
+	testModelsDir = os.Getenv("ANTFLY_INFERENCE_MODELS_DIR")
 	if testModelsDir == "" {
 		// Find repository root and use its models directory
 		repoRoot, err := findRepoRootFromDir(".")

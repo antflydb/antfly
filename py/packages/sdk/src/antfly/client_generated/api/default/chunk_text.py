@@ -5,21 +5,21 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.termite_chunk_request import TermiteChunkRequest
-from ...models.termite_chunk_response import TermiteChunkResponse
-from ...models.termite_error import TermiteError
+from ...models.inference_chunk_request import InferenceChunkRequest
+from ...models.inference_chunk_response import InferenceChunkResponse
+from ...models.inference_error import InferenceError
 from ...types import Response
 
 
 def _get_kwargs(
     *,
-    body: TermiteChunkRequest,
+    body: InferenceChunkRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/ml/v1/chunk",
+        "url": "/ai/v1/chunk",
     }
 
     _kwargs["json"] = body.to_dict()
@@ -32,19 +32,19 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> TermiteChunkResponse | TermiteError | None:
+) -> InferenceChunkResponse | InferenceError | None:
     if response.status_code == 200:
-        response_200 = TermiteChunkResponse.from_dict(response.json())
+        response_200 = InferenceChunkResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 400:
-        response_400 = TermiteError.from_dict(response.json())
+        response_400 = InferenceError.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 500:
-        response_500 = TermiteError.from_dict(response.json())
+        response_500 = InferenceError.from_dict(response.json())
 
         return response_500
 
@@ -56,7 +56,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[TermiteChunkResponse | TermiteError]:
+) -> Response[InferenceChunkResponse | InferenceError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -68,8 +68,8 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteChunkRequest,
-) -> Response[TermiteChunkResponse | TermiteError]:
+    body: InferenceChunkRequest,
+) -> Response[InferenceChunkResponse | InferenceError]:
     r"""Chunk text into smaller segments
 
      Splits text into smaller chunks using semantic or fixed-size chunking models.
@@ -91,14 +91,14 @@ def sync_detailed(
     Results are cached in memory for 2 minutes. Cache key includes both config and text content.
 
     Args:
-        body (TermiteChunkRequest):
+        body (InferenceChunkRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteChunkResponse | TermiteError]
+        Response[InferenceChunkResponse | InferenceError]
     """
 
     kwargs = _get_kwargs(
@@ -115,8 +115,8 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteChunkRequest,
-) -> TermiteChunkResponse | TermiteError | None:
+    body: InferenceChunkRequest,
+) -> InferenceChunkResponse | InferenceError | None:
     r"""Chunk text into smaller segments
 
      Splits text into smaller chunks using semantic or fixed-size chunking models.
@@ -138,14 +138,14 @@ def sync(
     Results are cached in memory for 2 minutes. Cache key includes both config and text content.
 
     Args:
-        body (TermiteChunkRequest):
+        body (InferenceChunkRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteChunkResponse | TermiteError
+        InferenceChunkResponse | InferenceError
     """
 
     return sync_detailed(
@@ -157,8 +157,8 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteChunkRequest,
-) -> Response[TermiteChunkResponse | TermiteError]:
+    body: InferenceChunkRequest,
+) -> Response[InferenceChunkResponse | InferenceError]:
     r"""Chunk text into smaller segments
 
      Splits text into smaller chunks using semantic or fixed-size chunking models.
@@ -180,14 +180,14 @@ async def asyncio_detailed(
     Results are cached in memory for 2 minutes. Cache key includes both config and text content.
 
     Args:
-        body (TermiteChunkRequest):
+        body (InferenceChunkRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteChunkResponse | TermiteError]
+        Response[InferenceChunkResponse | InferenceError]
     """
 
     kwargs = _get_kwargs(
@@ -202,8 +202,8 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteChunkRequest,
-) -> TermiteChunkResponse | TermiteError | None:
+    body: InferenceChunkRequest,
+) -> InferenceChunkResponse | InferenceError | None:
     r"""Chunk text into smaller segments
 
      Splits text into smaller chunks using semantic or fixed-size chunking models.
@@ -225,14 +225,14 @@ async def asyncio(
     Results are cached in memory for 2 minutes. Cache key includes both config and text content.
 
     Args:
-        body (TermiteChunkRequest):
+        body (InferenceChunkRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteChunkResponse | TermiteError
+        InferenceChunkResponse | InferenceError
     """
 
     return (

@@ -1526,6 +1526,7 @@ pub fn getMetadataManySortedInTxnWithScratch(
     const lookups = lookup_storage[0..lookup_count];
     const key_views = key_views_storage[0..lookup_count];
     const values = values_storage[0..lookup_count];
+    @memset(values, null);
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
@@ -2120,6 +2121,37 @@ fn scoreLeafMemberIds(
 
     if (fetch_count == 0) return;
 
+    const exact_distances = scratch.distances[0..fetch_count];
+    var external_scored = false;
+    const Index = comptime childType(@TypeOf(self));
+    if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalVectorsSortedWithScratch")) {
+        external_scored = try self.scoreExternalVectorsSortedWithScratch(
+            txn,
+            fetch_member_ids[0..fetch_count],
+            exact_query,
+            exact_query_measure,
+            exact_distances,
+            scratch.metadata,
+            scratch.lookups,
+            scratch.key_views,
+            scratch.values,
+            scratch.vector_batch,
+        );
+    }
+
+    if (external_scored) {
+        for (fetch_member_ids[0..fetch_count], 0..) |member_id, i| {
+            const dist = exact_distances[i];
+            if (!std.math.isFinite(dist)) continue;
+            if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, req, filter_state, false)) {
+                continue;
+            }
+            results.addResult(member_id, dist, 0);
+            profile.exact_vectors_scored += 1;
+        }
+        return;
+    }
+
     const vector_views = scratch.vector_views[0..fetch_count];
     try loadVectorIdsSortedWithScratch(
         self,
@@ -2132,7 +2164,6 @@ fn scoreLeafMemberIds(
         scratch.vector,
         scratch.vector_batch,
     );
-    const exact_distances = scratch.distances[0..fetch_count];
     const scored_positions = scratch.positions[0..fetch_count];
     var scored_count: usize = 0;
     for (vector_views, 0..) |member_vec, i| {
@@ -2182,7 +2213,7 @@ pub fn rerankResults(
     const prepare_start = now_fn_u64();
     search_mod.sortApproxResultsByDistance(ranked_items);
 
-    const rerank_selection = selectRerankCandidatesInto(scratch.flags[0..ranked_items.len], ranked_items, req.k, req, self.config.rerank_policy);
+    const rerank_selection = selectRerankCandidatesInto(scratch.flags[0..ranked_items.len], ranked_items, rerankBoundaryK(req), req, self.config.rerank_policy);
 
     profile.approx_candidate_count = ranked_items.len;
     profile.top_k_count = rerank_selection.top_k_count;
@@ -2356,6 +2387,12 @@ fn selectRerankCandidatesInto(
     return selection;
 }
 
+fn rerankBoundaryK(req: search_types.SearchRequest) usize {
+    const explicit = req.rerank_k orelse return req.k;
+    if (explicit == 0) return 0;
+    return @min(explicit, req.k);
+}
+
 const RerankSelection = struct {
     flags: []bool,
     approx_candidate_count: usize,
@@ -2444,9 +2481,12 @@ fn markBoundaryRerankCandidates(
     }
     if (limit < ranked_items.len) {
         const boundary = ranked_items[boundary_index];
-        for (limit..ranked_items.len) |j| {
+        var boundary_has_overlap = false;
+        for (0..ranked_items.len) |j| {
+            if (j == boundary_index) continue;
             if (!approxIntervalsOverlap(boundary, ranked_items[j])) continue;
             flags[j] = true;
+            boundary_has_overlap = true;
             selection.ambiguous_boundary_pairs += 1;
             const pair = debugPairFromApprox(boundary, ranked_items[j]);
             selection.boundary_tail_error_sum += ranked_items[j].error_bound;
@@ -2461,6 +2501,7 @@ fn markBoundaryRerankCandidates(
                 selection.boundary_pair = pair;
             }
         }
+        if (boundary_has_overlap) flags[boundary_index] = true;
     }
     if (selection.ambiguous_boundary_pairs > 0) {
         const count = @as(f64, @floatFromInt(selection.ambiguous_boundary_pairs));
@@ -2986,7 +3027,7 @@ test "boundary rerank selects only tail candidates overlapping kth candidate" {
     const boundary = try selectRerankCandidates(std.testing.allocator, ranked_items[0..], req.k, req, .boundary);
     defer std.testing.allocator.free(boundary.flags);
     try std.testing.expect(!boundary.flags[0]);
-    try std.testing.expect(!boundary.flags[1]);
+    try std.testing.expect(boundary.flags[1]);
     try std.testing.expect(boundary.flags[2]);
     try std.testing.expect(!boundary.flags[3]);
 
@@ -2997,6 +3038,29 @@ test "boundary rerank selects only tail candidates overlapping kth candidate" {
     const never = try selectRerankCandidates(std.testing.allocator, ranked_items[0..], req.k, req, .never);
     defer std.testing.allocator.free(never.flags);
     for (never.flags) |selected| try std.testing.expect(!selected);
+}
+
+test "boundary rerank uses explicit rerank boundary below candidate window" {
+    const req: search_types.SearchRequest = .{
+        .query = &.{},
+        .k = 1024,
+        .rerank_k = 2,
+    };
+    try std.testing.expectEqual(@as(usize, 2), rerankBoundaryK(req));
+
+    var ranked_items = [_]search_results.ApproxSearchResult{
+        .{ .vector_id = 1, .distance = 0.10, .error_bound = 0.01 },
+        .{ .vector_id = 2, .distance = 0.20, .error_bound = 0.01 },
+        .{ .vector_id = 3, .distance = 0.205, .error_bound = 0.02 },
+        .{ .vector_id = 4, .distance = 0.50, .error_bound = 0.01 },
+    };
+    var flags = [_]bool{false} ** ranked_items.len;
+    const selected = selectRerankCandidatesInto(flags[0..], ranked_items[0..], rerankBoundaryK(req), req, .boundary);
+    try std.testing.expectEqual(@as(usize, 2), selected.top_k_count);
+    try std.testing.expect(!selected.flags[0]);
+    try std.testing.expect(selected.flags[1]);
+    try std.testing.expect(selected.flags[2]);
+    try std.testing.expect(!selected.flags[3]);
 }
 
 test "boundary rerank skips stable ordering and top-k-only ambiguity" {
@@ -3021,7 +3085,9 @@ test "boundary rerank skips stable ordering and top-k-only ambiguity" {
     };
     const top_k_flags = try selectRerankCandidates(std.testing.allocator, top_k_only[0..], req.k, req, .boundary);
     defer std.testing.allocator.free(top_k_flags.flags);
-    for (top_k_flags.flags) |selected| try std.testing.expect(!selected);
+    try std.testing.expect(top_k_flags.flags[0]);
+    try std.testing.expect(top_k_flags.flags[1]);
+    try std.testing.expect(!top_k_flags.flags[2]);
 }
 
 test "boundary rerank ignores non-boundary top-k to tail overlap" {
@@ -3031,7 +3097,7 @@ test "boundary rerank ignores non-boundary top-k to tail overlap" {
     };
 
     var non_boundary_overlap = [_]search_results.ApproxSearchResult{
-        .{ .vector_id = 1, .distance = 0.10, .error_bound = 0.50 },
+        .{ .vector_id = 1, .distance = 0.10, .error_bound = 0.05 },
         .{ .vector_id = 2, .distance = 0.40, .error_bound = 0.01 },
         .{ .vector_id = 3, .distance = 0.55, .error_bound = 0.02 },
     };
@@ -3056,9 +3122,9 @@ test "boundary rerank includes tail interval overlap from candidate uncertainty"
     const selected = try selectRerankCandidates(std.testing.allocator, tail_bound_overlap[0..], req.k, req, .boundary);
     defer std.testing.allocator.free(selected.flags);
     try std.testing.expect(!selected.flags[0]);
-    try std.testing.expect(!selected.flags[1]);
+    try std.testing.expect(selected.flags[1]);
     try std.testing.expect(selected.flags[2]);
-    try std.testing.expectEqual(@as(usize, 1), selected.rerank_candidate_count);
+    try std.testing.expectEqual(@as(usize, 2), selected.rerank_candidate_count);
     try std.testing.expectEqual(@as(usize, 1), selected.ambiguous_boundary_pairs);
 }
 
@@ -3077,10 +3143,10 @@ test "boundary rerank selects boundary overlap band only" {
     const selected = try selectRerankCandidates(std.testing.allocator, boundary_band[0..], req.k, req, .boundary);
     defer std.testing.allocator.free(selected.flags);
     try std.testing.expect(!selected.flags[0]);
-    try std.testing.expect(!selected.flags[1]);
+    try std.testing.expect(selected.flags[1]);
     try std.testing.expect(selected.flags[2]);
     try std.testing.expect(!selected.flags[3]);
-    try std.testing.expectEqual(@as(usize, 1), selected.rerank_candidate_count);
+    try std.testing.expectEqual(@as(usize, 2), selected.rerank_candidate_count);
     try std.testing.expectEqual(@as(usize, 1), selected.ambiguous_boundary_pairs);
 }
 

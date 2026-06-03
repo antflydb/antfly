@@ -11,7 +11,7 @@ import (
 	"time"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
-	termitev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/termite/v1alpha1"
+	inferencev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gstruct"
@@ -237,23 +237,23 @@ func TestApplyDefaults_PublicAPIDefaultsFalse(t *testing.T) {
 	g.Expect(*clusterEnabled.Spec.PublicAPI.Enabled).To(BeTrue(), "Explicitly enabled PublicAPI should remain true")
 }
 
-func TestReconcileTermitePoolCreatesManagedPool(t *testing.T) {
+func TestReconcileInferencePoolCreatesManagedPool(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 	s := newOperatorTestScheme(g)
 	reconciler := &AntflyClusterReconciler{
-		Client:              fake.NewClientBuilder().WithScheme(s).Build(),
-		Scheme:              s,
-		ManageTermitePools:  true,
-		DefaultTermiteImage: "ghcr.io/antflydb/antfly:omni-test",
+		Client:                fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme:                s,
+		ManageInferencePools:  true,
+		DefaultInferenceImage: "ghcr.io/antflydb/antfly:omni-test",
 	}
-	cluster := baseClusterWithTermiteSpec()
+	cluster := baseClusterWithInferenceSpec()
 
-	err := reconciler.reconcileTermitePool(ctx, cluster)
+	err := reconciler.reconcileInferencePool(ctx, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	pool := &termitev1alpha1.TermitePool{}
-	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, pool)
+	pool := &inferencev1alpha1.InferencePool{}
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-inference", Namespace: "default"}, pool)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(pool.Spec.Image).To(Equal("ghcr.io/antflydb/antfly:omni-test"))
 	g.Expect(pool.Labels).To(HaveKeyWithValue("app.kubernetes.io/instance", "test-cluster"))
@@ -261,221 +261,221 @@ func TestReconcileTermitePoolCreatesManagedPool(t *testing.T) {
 	g.Expect(metav1.IsControlledBy(pool, cluster)).To(BeTrue())
 }
 
-func TestReconcileTermitePoolPreservesCustomImage(t *testing.T) {
+func TestReconcileInferencePoolPreservesCustomImage(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 	s := newOperatorTestScheme(g)
 	reconciler := &AntflyClusterReconciler{
-		Client:              fake.NewClientBuilder().WithScheme(s).Build(),
-		Scheme:              s,
-		ManageTermitePools:  true,
-		DefaultTermiteImage: "ghcr.io/antflydb/antfly:omni-test",
+		Client:                fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme:                s,
+		ManageInferencePools:  true,
+		DefaultInferenceImage: "ghcr.io/antflydb/antfly:omni-test",
 	}
-	cluster := baseClusterWithTermiteSpec()
-	cluster.Spec.Termite.ManagedPools[0].Spec.Image = "registry.example.com/antfly:custom-termite"
+	cluster := baseClusterWithInferenceSpec()
+	cluster.Spec.Inference.ManagedPools[0].Spec.Image = "registry.example.com/antfly:custom-inference"
 
-	err := reconciler.reconcileTermitePool(ctx, cluster)
+	err := reconciler.reconcileInferencePool(ctx, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	pool := &termitev1alpha1.TermitePool{}
-	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, pool)
+	pool := &inferencev1alpha1.InferencePool{}
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-inference", Namespace: "default"}, pool)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(pool.Spec.Image).To(Equal("registry.example.com/antfly:custom-termite"))
+	g.Expect(pool.Spec.Image).To(Equal("registry.example.com/antfly:custom-inference"))
 }
 
-func TestReconcileTermitePoolDeletesOnlyManagedPool(t *testing.T) {
+func TestReconcileInferencePoolDeletesOnlyManagedPool(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 	s := newOperatorTestScheme(g)
-	cluster := baseClusterWithTermiteSpec()
-	cluster.Spec.Termite = nil
-	managedPool := &termitev1alpha1.TermitePool{
+	cluster := baseClusterWithInferenceSpec()
+	cluster.Spec.Inference = nil
+	managedPool := &inferencev1alpha1.InferencePool{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-cluster-termite",
+			Name:      "test-cluster-inference",
 			Namespace: "default",
 		},
 	}
 	g.Expect(controllerutil.SetControllerReference(cluster, managedPool, s)).To(Succeed())
-	unmanagedPool := &termitev1alpha1.TermitePool{
+	unmanagedPool := &inferencev1alpha1.InferencePool{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "other-cluster-termite",
+			Name:      "other-cluster-inference",
 			Namespace: "default",
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client:              fake.NewClientBuilder().WithScheme(s).WithObjects(managedPool, unmanagedPool).Build(),
-		Scheme:              s,
-		ManageTermitePools:  true,
-		DefaultTermiteImage: "ghcr.io/antflydb/antfly:omni-test",
+		Client:                fake.NewClientBuilder().WithScheme(s).WithObjects(managedPool, unmanagedPool).Build(),
+		Scheme:                s,
+		ManageInferencePools:  true,
+		DefaultInferenceImage: "ghcr.io/antflydb/antfly:omni-test",
 	}
 
-	err := reconciler.reconcileTermitePool(ctx, cluster)
+	err := reconciler.reconcileInferencePool(ctx, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, &termitev1alpha1.TermitePool{})
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-inference", Namespace: "default"}, &inferencev1alpha1.InferencePool{})
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
-	err = reconciler.Get(ctx, types.NamespacedName{Name: "other-cluster-termite", Namespace: "default"}, &termitev1alpha1.TermitePool{})
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "other-cluster-inference", Namespace: "default"}, &inferencev1alpha1.InferencePool{})
 	g.Expect(err).NotTo(HaveOccurred())
 }
 
-func TestReconcileTermitePoolDoesNotAdoptExistingUnmanagedPool(t *testing.T) {
+func TestReconcileInferencePoolDoesNotAdoptExistingUnmanagedPool(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 	s := newOperatorTestScheme(g)
-	cluster := baseClusterWithTermiteSpec()
-	existingPool := &termitev1alpha1.TermitePool{
+	cluster := baseClusterWithInferenceSpec()
+	existingPool := &inferencev1alpha1.InferencePool{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-cluster-termite",
+			Name:      "test-cluster-inference",
 			Namespace: "default",
 			UID:       "existing-pool",
 		},
-		Spec: termitev1alpha1.TermitePoolSpec{
+		Spec: inferencev1alpha1.InferencePoolSpec{
 			Image: "existing:image",
 		},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client:              fake.NewClientBuilder().WithScheme(s).WithObjects(existingPool).Build(),
-		Scheme:              s,
-		ManageTermitePools:  true,
-		DefaultTermiteImage: "ghcr.io/antflydb/antfly:omni-test",
+		Client:                fake.NewClientBuilder().WithScheme(s).WithObjects(existingPool).Build(),
+		Scheme:                s,
+		ManageInferencePools:  true,
+		DefaultInferenceImage: "ghcr.io/antflydb/antfly:omni-test",
 	}
 
-	err := reconciler.reconcileTermitePool(ctx, cluster)
+	err := reconciler.reconcileInferencePool(ctx, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	pool := &termitev1alpha1.TermitePool{}
-	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, pool)
+	pool := &inferencev1alpha1.InferencePool{}
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-inference", Namespace: "default"}, pool)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(pool.Spec.Image).To(Equal("existing:image"))
 	g.Expect(metav1.IsControlledBy(pool, cluster)).To(BeFalse())
 	g.Expect(cluster.Status.Conditions).To(ContainElement(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
-		"Type":   Equal(antflyv1.TypeTermitePoolReady),
+		"Type":   Equal(antflyv1.TypeInferencePoolReady),
 		"Status": Equal(metav1.ConditionFalse),
-		"Reason": Equal(antflyv1.ReasonTermitePoolNameConflict),
+		"Reason": Equal(antflyv1.ReasonInferencePoolNameConflict),
 	})))
 }
 
-func TestReconcileTermitePoolNoopsWhenManagementDisabled(t *testing.T) {
+func TestReconcileInferencePoolNoopsWhenManagementDisabled(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 	s := newOperatorTestScheme(g)
-	cluster := baseClusterWithTermiteSpec()
+	cluster := baseClusterWithInferenceSpec()
 	reconciler := &AntflyClusterReconciler{
-		Client:             fake.NewClientBuilder().WithScheme(s).Build(),
-		Scheme:             s,
-		ManageTermitePools: false,
+		Client:               fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme:               s,
+		ManageInferencePools: false,
 	}
 
-	err := reconciler.reconcileTermitePool(ctx, cluster)
+	err := reconciler.reconcileInferencePool(ctx, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
-	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, &termitev1alpha1.TermitePool{})
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-inference", Namespace: "default"}, &inferencev1alpha1.InferencePool{})
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 	g.Expect(cluster.Status.Conditions).To(ContainElement(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
-		"Type":   Equal(antflyv1.TypeTermitePoolReady),
+		"Type":   Equal(antflyv1.TypeInferencePoolReady),
 		"Status": Equal(metav1.ConditionUnknown),
-		"Reason": Equal(antflyv1.ReasonTermitePoolManagementDisabled),
+		"Reason": Equal(antflyv1.ReasonInferencePoolManagementDisabled),
 	})))
 }
 
-func TestReconcileTermitePoolManagementDisabledLeavesOwnedPool(t *testing.T) {
+func TestReconcileInferencePoolManagementDisabledLeavesOwnedPool(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 	s := newOperatorTestScheme(g)
-	cluster := baseClusterWithTermiteSpec()
-	managedPool := &termitev1alpha1.TermitePool{
+	cluster := baseClusterWithInferenceSpec()
+	managedPool := &inferencev1alpha1.InferencePool{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-cluster-termite",
+			Name:      "test-cluster-inference",
 			Namespace: "default",
 		},
 	}
 	g.Expect(controllerutil.SetControllerReference(cluster, managedPool, s)).To(Succeed())
 	reconciler := &AntflyClusterReconciler{
-		Client:             fake.NewClientBuilder().WithScheme(s).WithObjects(managedPool).Build(),
-		Scheme:             s,
-		ManageTermitePools: false,
+		Client:               fake.NewClientBuilder().WithScheme(s).WithObjects(managedPool).Build(),
+		Scheme:               s,
+		ManageInferencePools: false,
 	}
 
-	err := reconciler.reconcileTermitePool(ctx, cluster)
+	err := reconciler.reconcileInferencePool(ctx, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	pool := &termitev1alpha1.TermitePool{}
-	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, pool)
+	pool := &inferencev1alpha1.InferencePool{}
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-inference", Namespace: "default"}, pool)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(metav1.IsControlledBy(pool, cluster)).To(BeTrue())
 	g.Expect(cluster.Status.Conditions).To(ContainElement(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
-		"Type":   Equal(antflyv1.TypeTermitePoolReady),
+		"Type":   Equal(antflyv1.TypeInferencePoolReady),
 		"Status": Equal(metav1.ConditionUnknown),
-		"Reason": Equal(antflyv1.ReasonTermitePoolManagementDisabled),
+		"Reason": Equal(antflyv1.ReasonInferencePoolManagementDisabled),
 	})))
 }
 
-func TestReconcileTermitePoolSharedRefDoesNotCreatePool(t *testing.T) {
+func TestReconcileInferencePoolSharedRefDoesNotCreatePool(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 	s := newOperatorTestScheme(g)
-	cluster := baseClusterWithTermiteSpec()
-	cluster.Spec.Termite = &antflyv1.AntflyTermiteSpec{
-		Mode: antflyv1.AntflyTermiteModeSharedRef,
-		SharedPools: []antflyv1.TermitePoolReference{{
+	cluster := baseClusterWithInferenceSpec()
+	cluster.Spec.Inference = &antflyv1.AntflyInferenceSpec{
+		Mode: antflyv1.AntflyInferenceModeSharedRef,
+		SharedPools: []antflyv1.InferencePoolReference{{
 			Name:      "customer-shared-embeddings",
 			Namespace: "inference",
 		}},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client:             fake.NewClientBuilder().WithScheme(s).Build(),
-		Scheme:             s,
-		ManageTermitePools: true,
+		Client:               fake.NewClientBuilder().WithScheme(s).Build(),
+		Scheme:               s,
+		ManageInferencePools: true,
 	}
 
-	err := reconciler.reconcileTermitePool(ctx, cluster)
+	err := reconciler.reconcileInferencePool(ctx, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
-	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, &termitev1alpha1.TermitePool{})
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-inference", Namespace: "default"}, &inferencev1alpha1.InferencePool{})
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 	g.Expect(cluster.Status.Conditions).To(ContainElement(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
-		"Type":   Equal(antflyv1.TypeTermitePoolReady),
+		"Type":   Equal(antflyv1.TypeInferencePoolReady),
 		"Status": Equal(metav1.ConditionTrue),
-		"Reason": Equal(antflyv1.ReasonTermitePoolReady),
+		"Reason": Equal(antflyv1.ReasonInferencePoolReady),
 	})))
 }
 
-func TestReconcileTermitePoolPlatformSharedDeletesOwnedPool(t *testing.T) {
+func TestReconcileInferencePoolPlatformSharedDeletesOwnedPool(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 	s := newOperatorTestScheme(g)
-	cluster := baseClusterWithTermiteSpec()
-	managedPool := &termitev1alpha1.TermitePool{
+	cluster := baseClusterWithInferenceSpec()
+	managedPool := &inferencev1alpha1.InferencePool{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-cluster-termite",
+			Name:      "test-cluster-inference",
 			Namespace: "default",
 		},
 	}
 	g.Expect(controllerutil.SetControllerReference(cluster, managedPool, s)).To(Succeed())
-	cluster.Spec.Termite = &antflyv1.AntflyTermiteSpec{
-		Mode: antflyv1.AntflyTermiteModePlatformShared,
-		PlatformPools: []antflyv1.TermitePoolReference{{
+	cluster.Spec.Inference = &antflyv1.AntflyInferenceSpec{
+		Mode: antflyv1.AntflyInferenceModePlatformShared,
+		PlatformPools: []antflyv1.InferencePoolReference{{
 			Name: "default-embeddings",
 		}},
 	}
 	reconciler := &AntflyClusterReconciler{
-		Client:             fake.NewClientBuilder().WithScheme(s).WithObjects(managedPool).Build(),
-		Scheme:             s,
-		ManageTermitePools: true,
+		Client:               fake.NewClientBuilder().WithScheme(s).WithObjects(managedPool).Build(),
+		Scheme:               s,
+		ManageInferencePools: true,
 	}
 
-	err := reconciler.reconcileTermitePool(ctx, cluster)
+	err := reconciler.reconcileInferencePool(ctx, cluster)
 	g.Expect(err).NotTo(HaveOccurred())
-	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-termite", Namespace: "default"}, &termitev1alpha1.TermitePool{})
+	err = reconciler.Get(ctx, types.NamespacedName{Name: "test-cluster-inference", Namespace: "default"}, &inferencev1alpha1.InferencePool{})
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 }
 
 func newOperatorTestScheme(g *WithT) *runtime.Scheme {
 	s := runtime.NewScheme()
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
-	g.Expect(termitev1alpha1.AddToScheme(s)).To(Succeed())
+	g.Expect(inferencev1alpha1.AddToScheme(s)).To(Succeed())
 	return s
 }
 
-func baseClusterWithTermiteSpec() *antflyv1.AntflyCluster {
+func baseClusterWithInferenceSpec() *antflyv1.AntflyCluster {
 	return &antflyv1.AntflyCluster{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: antflyv1.GroupVersion.String(),
@@ -487,13 +487,13 @@ func baseClusterWithTermiteSpec() *antflyv1.AntflyCluster {
 		},
 		Spec: antflyv1.AntflyClusterSpec{
 			Image: "antfly:test",
-			Termite: &antflyv1.AntflyTermiteSpec{
-				Mode: antflyv1.AntflyTermiteModeManaged,
-				ManagedPools: []antflyv1.ManagedTermitePoolSpec{{
-					Spec: termitev1alpha1.TermitePoolSpec{
-						Models:   termitev1alpha1.ModelConfig{},
-						Replicas: termitev1alpha1.ReplicaConfig{Min: 1, Max: 2},
-						Hardware: termitev1alpha1.HardwareConfig{},
+			Inference: &antflyv1.AntflyInferenceSpec{
+				Mode: antflyv1.AntflyInferenceModeManaged,
+				ManagedPools: []antflyv1.ManagedInferencePoolSpec{{
+					Spec: inferencev1alpha1.InferencePoolSpec{
+						Models:   inferencev1alpha1.ModelConfig{},
+						Replicas: inferencev1alpha1.ReplicaConfig{Min: 1, Max: 2},
+						Hardware: inferencev1alpha1.HardwareConfig{},
 					},
 				}},
 			},
@@ -539,9 +539,9 @@ func TestApplyDefaults_SwarmDefaults(t *testing.T) {
 	g.Expect(cluster.Spec.Swarm.StoreAPI.Port).To(Equal(int32(12380)))
 	g.Expect(cluster.Spec.Swarm.StoreRaft.Port).To(Equal(int32(9021)))
 	g.Expect(cluster.Spec.Swarm.Health.Port).To(Equal(int32(4200)))
-	g.Expect(cluster.Spec.Swarm.Termite).ToNot(BeNil())
-	g.Expect(cluster.Spec.Swarm.Termite.Enabled).To(BeTrue())
-	g.Expect(cluster.Spec.Swarm.Termite.APIURL).To(Equal("http://0.0.0.0:11433"))
+	g.Expect(cluster.Spec.Swarm.Inference).ToNot(BeNil())
+	g.Expect(cluster.Spec.Swarm.Inference.Enabled).To(BeTrue())
+	g.Expect(cluster.Spec.Swarm.Inference.APIURL).To(Equal("http://0.0.0.0:11433"))
 }
 
 func TestReconcilePVCExpansionReportsInProgress(t *testing.T) {
@@ -2938,7 +2938,7 @@ func baseSwarmControllerCluster() *antflyv1.AntflyCluster {
 				StoreAPI:     antflyv1.APISpec{Port: 12380},
 				StoreRaft:    antflyv1.APISpec{Port: 9021},
 				Health:       antflyv1.APISpec{Port: 4200},
-				Termite: &antflyv1.SwarmTermiteSpec{
+				Inference: &antflyv1.SwarmInferenceSpec{
 					Enabled: true,
 					APIURL:  "http://0.0.0.0:11433",
 				},

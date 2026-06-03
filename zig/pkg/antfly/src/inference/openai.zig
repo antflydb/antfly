@@ -122,14 +122,6 @@ pub const Provider = struct {
     fn generateImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
-        const Message = struct {
-            role: []const u8,
-            content: []const u8,
-        };
-        const Request = struct {
-            model: []const u8,
-            messages: []const Message,
-        };
         const Response = struct {
             choices: []const struct {
                 message: struct {
@@ -138,22 +130,9 @@ pub const Provider = struct {
             },
         };
 
-        const api_messages = try alloc.alloc(Message, messages.len);
-        defer alloc.free(api_messages);
-        for (messages, 0..) |msg, i| {
-            api_messages[i] = switch (msg.role) {
-                .system => .{ .role = "system", .content = msg.content },
-                .user => .{ .role = "user", .content = msg.content },
-                .assistant => .{ .role = "assistant", .content = msg.content },
-            };
-        }
-
         const url = try std.fmt.allocPrint(self.allocator, "{s}/chat/completions", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, Request{
-            .model = model,
-            .messages = api_messages,
-        });
+        const json_body = try inference.chatRequestJsonAlloc(self.allocator, model, messages, .openai_compatible);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         defer resp.deinit();
@@ -331,7 +310,7 @@ test "openai generate round trip and empty choices failure" {
             defer provider.deinit();
 
             var gen = provider.generator();
-            var result = gen.generate(a, "gpt-4", &.{.{ .role = .user, .content = "Hi" }}) catch return;
+            var result = gen.generate(a, "gpt-4", &.{.{ .role = .user, .content = .{ .text = "Hi" } }}) catch return;
             defer result.deinit();
 
             ok_out.* = true;
@@ -346,7 +325,7 @@ test "openai generate round trip and empty choices failure" {
             defer provider.deinit();
 
             var gen = provider.generator();
-            _ = gen.generate(a, "gpt-4", &.{.{ .role = .user, .content = "Hi" }}) catch |e| {
+            _ = gen.generate(a, "gpt-4", &.{.{ .role = .user, .content = .{ .text = "Hi" } }}) catch |e| {
                 err_out.* = e;
                 return;
             };

@@ -33,12 +33,37 @@ pub fn resolveTextIndexEstimate(
     const entry = core.textIndexEntry(index_name) orelse return null;
     const chunk_backed = entry.chunk_name != null;
     const persistent = core.textIndex(entry.config.name) orelse return error.IndexNotFound;
+    const indexed_doc_count = persistent.snapshot().global_doc_count;
     return .{
         .name = try alloc.dupe(u8, entry.config.name),
-        .doc_count = persistent.snapshot().global_doc_count,
+        .doc_count = if (indexed_doc_count > 0) indexed_doc_count else try scanPrimaryDocCount(core),
         .chunk_backed = chunk_backed,
         .group_chunk_parents = query_search.shouldGroupChunkParents(req, chunk_backed),
     };
+}
+
+fn scanPrimaryDocCount(core: *db_core.DBCore) !u64 {
+    const byte_range = core.byteRange();
+    const lower = try core.documentRangeLowerAlloc(byte_range.start);
+    defer core.alloc.free(lower);
+    const upper = if (byte_range.end.len > 0) try core.documentRangeUpperAlloc(byte_range.end) else null;
+    defer if (upper) |buf| core.alloc.free(buf);
+
+    var doc_count: u64 = 0;
+    const CountState = struct {
+        doc_count: *u64,
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            _ = value;
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (internal_keys.isPrimaryDocumentKey(key)) state.doc_count.* += 1;
+            return .@"continue";
+        }
+    };
+
+    var state = CountState{ .doc_count = &doc_count };
+    try core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, CountState.scanEntry);
+    return doc_count;
 }
 
 pub fn resolveDenseIndexEstimate(

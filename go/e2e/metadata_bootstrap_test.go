@@ -90,7 +90,7 @@ func TestE2E_ClusteredMetadataBootstrapsWithAuth(t *testing.T) {
 			req, err := http.NewRequestWithContext(
 				ctx,
 				http.MethodGet,
-				apiURLs[nodeID.String()]+"/api/v1/status",
+				apiURLs[nodeID.String()]+"/db/v1/status",
 				nil,
 			)
 			require.NoError(c, err)

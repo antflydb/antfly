@@ -21,7 +21,7 @@ import {
   SelectValue,
   Switch,
 } from "@antfly/design-system";
-import { TermiteClient } from "@antfly/sdk";
+import { InferenceClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   AudioLines,
@@ -101,11 +101,11 @@ function selectPlaceholder(loaded: boolean, count: number, typeName: string): st
 }
 
 const TranscribePlaygroundPage: React.FC = () => {
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
 
-  const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: termiteApiUrl }),
-    [termiteApiUrl]
+  const inferenceClient = useMemo(
+    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
+    [inferenceApiUrl]
   );
 
   // Models
@@ -190,7 +190,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     let cancelled = false;
     const fetchModels = async () => {
       try {
-        const data = await termiteClient.listModels();
+        const data = await inferenceClient.listModels();
         if (cancelled) return;
 
         const transcribers = Object.keys(data.transcribers || {});
@@ -214,7 +214,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [termiteClient]);
+  }, [inferenceClient]);
 
   // Audio file handling
   const processAudioFile = useCallback(
@@ -369,7 +369,7 @@ const TranscribePlaygroundPage: React.FC = () => {
       if (signal.aborted) return;
       const langOpts: { model?: string; language?: string } = { model: transcriberModel };
       if (lang.trim()) langOpts.language = lang.trim();
-      const result = await termiteClient.transcribe(audioBase64, langOpts);
+      const result = await inferenceClient.transcribe(audioBase64, langOpts);
       if (signal.aborted) return;
 
       const rawText = (result.data[0]?.text || "").trim();
@@ -378,7 +378,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         updateSegment(index, { rawText, status: "cleaning" });
 
         try {
-          const resp = await fetchWithRetry(`${termiteApiUrl}/ml/v1/generate`, {
+          const resp = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/generate`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -411,7 +411,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         updateSegment(index, { rawText, status: "done" });
       }
     },
-    [termiteClient, termiteApiUrl, updateSegment]
+    [inferenceClient, inferenceApiUrl, updateSegment]
   );
 
   // Main pipeline
@@ -440,7 +440,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     try {
       if (useVAD && selectedChunkerModel && audioDuration != null && audioDuration > 30) {
         // VAD pipeline: chunk -> transcribe each -> optionally clean up
-        const resp = await fetchWithRetry(`${termiteApiUrl}/ml/v1/chunk`, {
+        const resp = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/chunk`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -519,7 +519,9 @@ const TranscribePlaygroundPage: React.FC = () => {
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
       setError(
-        err instanceof Error ? err.message : `Failed to connect to Termite at ${termiteApiUrl}`
+        err instanceof Error
+          ? err.message
+          : `Failed to connect to Antfly inference at ${inferenceApiUrl}`
       );
     } finally {
       setIsLoading(false);
@@ -534,7 +536,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     useVAD,
     useLLMCleanup,
     vadConfig,
-    termiteApiUrl,
+    inferenceApiUrl,
     processSegment,
   ]);
 
@@ -641,7 +643,7 @@ const TranscribePlaygroundPage: React.FC = () => {
 
               <div className="space-y-2">
                 <Label>Input Source</Label>
-                <div className="flex rounded-md border overflow-hidden h-9">
+                <div className="flex rounded-none border overflow-hidden h-9">
                   <button
                     type="button"
                     className={`flex-1 flex items-center justify-center gap-1.5 text-sm transition-colors ${
@@ -873,7 +875,7 @@ const TranscribePlaygroundPage: React.FC = () => {
 
         {/* Error */}
         {error && (
-          <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+          <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
             {error}
           </div>
         )}
@@ -918,7 +920,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                 <>
                   {/* Drop zone */}
                   <div
-                    className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors ${
+                    className={`border-2 border-dashed rounded-none p-8 text-center cursor-pointer transition-colors ${
                       isDraggingAudio
                         ? "border-primary bg-primary/5"
                         : "border-muted-foreground/25 hover:border-primary/50"
@@ -957,15 +959,17 @@ const TranscribePlaygroundPage: React.FC = () => {
                 </>
               ) : (
                 /* Mic recording */
-                <div className="border-2 border-dashed rounded-lg p-8 text-center transition-colors border-muted-foreground/25">
+                <div className="border-2 border-dashed rounded-none p-8 text-center transition-colors border-muted-foreground/25">
                   {isRecording ? (
                     <div className="space-y-4">
                       <div className="flex items-center justify-center gap-2">
                         <span className="relative flex h-3 w-3">
-                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" />
-                          <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500" />
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-destructive opacity-75" />
+                          <span className="relative inline-flex rounded-full h-3 w-3 bg-destructive" />
                         </span>
-                        <span className="text-sm font-medium text-red-600">Recording</span>
+                        <span className="text-sm font-mono font-medium text-destructive">
+                          Recording
+                        </span>
                         <span className="text-sm font-mono text-muted-foreground">
                           {formatDuration(recordingDuration)}
                         </span>
@@ -992,7 +996,7 @@ const TranscribePlaygroundPage: React.FC = () => {
 
               {/* Audio file info & player */}
               {audioFile && !isRecording && (
-                <div className="p-4 bg-muted/30 rounded-lg border space-y-3">
+                <div className="p-4 bg-muted/30 rounded-none border space-y-3">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2 min-w-0">
                       <Mic className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -1065,7 +1069,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                   {segments.map((seg, i) => (
                     <div
                       key={`seg-${seg.startMs}-${seg.endMs}`}
-                      className="p-3 bg-muted/30 rounded-lg border space-y-2"
+                      className="p-3 bg-muted/30 rounded-none border space-y-2"
                     >
                       {/* Timestamp + copy */}
                       <div className="flex items-center justify-between">

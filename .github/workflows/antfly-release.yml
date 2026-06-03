@@ -12,10 +12,17 @@ permissions:
 
 jobs:
   goreleaser:
-    runs-on: arc-antfly-standard
+    runs-on: arc-antfly-heavy
     env:
       GOEXPERIMENT: simd
+      GOCACHE: /mnt/cache/go-build
+      GOMODCACHE: /mnt/cache/go-mod
+      XDG_CACHE_HOME: /mnt/cache/xdg
+      TMPDIR: /mnt/cache/tmp
     steps:
+      - name: Prepare cache directories
+        run: mkdir -p "$GOCACHE" "$GOMODCACHE" "$XDG_CACHE_HOME" "$TMPDIR"
+
       - name: Checkout
         uses: actions/checkout@v6
         with:

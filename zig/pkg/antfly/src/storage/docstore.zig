@@ -12,22 +12,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! LMDB-backed document key-value store with structured key encoding.
+//! LMDB-backed document key-value store with centralized binary key encoding.
 //!
-//! Foundation for graph indexes, sparse embedding indexes, and shard splitting.
-//! All key semantics are encoded in the key string (flat keyspace), matching
-//! Go antfly's Pebble-based storeutils pattern.
-//!
-//! Key encoding scheme:
-//!   Document:    <docID>
-//!   Embedding:   <docID>:i:<indexName>:e
-//!   Summary:     <docID>:i:<indexName>:s
-//!   Chunk:       <docID>:i:<indexName>:<chunkID>:c
-//!   Enrichment:  <docID>:e:<type>:<name>:...
-//!   Edge out:    <source>:i:<indexName>:out:<edgeType>:<target>:o
-//!   Edge in:     <target>:i:<indexName>:in:<edgeType>:<source>:i
-//!   Range start: <key>:\x00
-//!   Range end:   <key>:\xFF
+//! Public document IDs are raw byte strings. Internal primary, TTL, artifact,
+//! chunk, and graph records are encoded through storage/internal_keys.zig so
+//! user-controlled IDs never share a delimiter namespace with derived records.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -79,6 +68,14 @@ fn replayHintOrdinal(hint: change_journal_mod.TargetHint) u8 {
     return @intCast(@intFromEnum(hint));
 }
 
+fn replayHintFromSingleMask(mask: u8) ?change_journal_mod.TargetHint {
+    if (mask == 0 or (mask & (mask - 1)) != 0) return null;
+    inline for (std.meta.fields(change_journal_mod.TargetHint)) |field| {
+        if (mask == (@as(u8, 1) << @intCast(field.value))) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
 fn encodeReplayNextSequence(sequence: u64) [8]u8 {
     var raw: [8]u8 = undefined;
     std.mem.writeInt(u64, &raw, sequence, .little);
@@ -109,7 +106,7 @@ fn appendReplayArtifactsForHint(
     for (artifact_keys) |key| {
         const keep = switch (hint) {
             .dense_vector, .sparse_vector => isEmbeddingReplayArtifactKey(key),
-            .graph => internal_keys.isGraphEdgeArtifactKey(key),
+            .graph => internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key),
             .enrichment, .full_text, .algebraic => false,
         };
         if (keep) try out.append(alloc, key);
@@ -305,6 +302,15 @@ pub const OwnedKVPair = struct {
     value: []u8,
 };
 
+pub const ReplayIterationStats = struct {
+    scanned_entries: usize = 0,
+    matched_entries: usize = 0,
+    last_sequence: u64 = 0,
+    hint_filter_skips: usize = 0,
+    scan_batches: usize = 0,
+    fallback_used: bool = false,
+};
+
 // ============================================================================
 // ByteRange — shard ownership range
 // ============================================================================
@@ -436,6 +442,7 @@ pub const DocStore = struct {
 
         pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidArgument;
+            @memset(values, null);
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     for (keys, 0..) |key, i| {
@@ -539,6 +546,7 @@ pub const DocStore = struct {
 
             pub fn getManySorted(self: @This(), keys: []const []const u8, values: []?[]const u8) !void {
                 if (keys.len != values.len) return error.InvalidArgument;
+                @memset(values, null);
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
                         for (keys, 0..) |key, i| {
@@ -561,6 +569,13 @@ pub const DocStore = struct {
                     }
                 }
                 try self.runtime.?.put(key, value);
+            }
+
+            pub fn appendPut(self: @This(), key: []const u8, value: []const u8) !void {
+                if (supports_lmdb) {
+                    if (self.raw != null) return error.Unsupported;
+                }
+                try self.runtime.?.appendPut(key, value);
             }
 
             pub fn delete(self: @This(), key: []const u8) !void {
@@ -991,8 +1006,23 @@ pub const DocStore = struct {
                 else => return err,
             };
         }
-        for (writes) |kv| {
-            try txn.put(kv.key, kv.value);
+        var used_bulk_append = false;
+        if (deletes.len == 0 and options.mode == .bulk_ingest) {
+            used_bulk_append = true;
+            for (writes) |kv| {
+                txn.appendPut(kv.key, kv.value) catch |err| switch (err) {
+                    error.Unsupported => {
+                        used_bulk_append = false;
+                        break;
+                    },
+                    else => return err,
+                };
+            }
+        }
+        if (!used_bulk_append) {
+            for (writes) |kv| {
+                try txn.put(kv.key, kv.value);
+            }
         }
         if (replay) |entry| {
             try batch.setReplayOpaque(entry.sequence, entry.payload);
@@ -1213,6 +1243,32 @@ pub const DocStore = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !void {
         if (!(try self.hasReplayEntries())) return error.ReplayIndexUnavailable;
+        _ = try self.forEachReplayLaneFrom(kind_ordinal, from_sequence, 0, ctx, callback);
+    }
+
+    pub fn forEachReplayLaneFrom(
+        self: *DocStore,
+        kind_ordinal: u8,
+        from_sequence: u64,
+        max_entries: usize,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
+    ) !ReplayIterationStats {
+        if (!(try self.hasReplayEntries())) return error.ReplayIndexUnavailable;
+
+        switch (self.kind) {
+            .runtime => {
+                const lane_stats = try self.runtime_store.forEachReplayLaneFrom(kind_ordinal, from_sequence, max_entries, ctx, callback);
+                return .{
+                    .scanned_entries = lane_stats.scanned_entries,
+                    .matched_entries = lane_stats.matched_entries,
+                    .last_sequence = lane_stats.last_sequence,
+                    .scan_batches = lane_stats.scan_batches,
+                    .fallback_used = lane_stats.fallback_used,
+                };
+            },
+            .lmdb => {},
+        }
 
         var txn = try self.beginCurrentScanTxn();
         defer txn.abort();
@@ -1224,12 +1280,18 @@ pub const DocStore = struct {
         const upper = internal_keys.replayRangeUpper(kind_ordinal);
         cur.setUpperBound(upper[0..]);
 
+        var stats = ReplayIterationStats{ .scan_batches = 1 };
         var entry = try cur.seekAtOrAfter(lower[0..]);
         while (entry) |kv| : (entry = try cur.next()) {
             if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
             const sequence = internal_keys.parseReplayEntrySequence(kv.key, kind_ordinal) orelse break;
             try callback(ctx, sequence, kv.value);
+            stats.scanned_entries += 1;
+            stats.matched_entries += 1;
+            stats.last_sequence = sequence;
+            if (max_entries != 0 and stats.matched_entries >= max_entries) break;
         }
+        return stats;
     }
 
     pub fn iterateReplayEntriesFromHint(
@@ -1258,6 +1320,51 @@ pub const DocStore = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !void {
         return try self.forEachReplayEntryFromOrdinal(from_sequence, internal_keys.replay_all_kind, ctx, callback);
+    }
+
+    pub fn forEachReplayFromMatchingHintMask(
+        self: *DocStore,
+        from_sequence: u64,
+        required_hint_mask: u8,
+        callback_ctx: *anyopaque,
+        callback: backend_erased.Store.ReplayCallback,
+    ) !void {
+        var stats = ReplayIterationStats{};
+        return try self.forEachReplayFromMatchingHintMaskWithStats(from_sequence, required_hint_mask, callback_ctx, callback, &stats);
+    }
+
+    pub fn forEachReplayFromMatchingHintMaskWithStats(
+        self: *DocStore,
+        from_sequence: u64,
+        required_hint_mask: u8,
+        callback_ctx: *anyopaque,
+        callback: backend_erased.Store.ReplayCallback,
+        stats: *ReplayIterationStats,
+    ) !void {
+        const Context = struct {
+            callback_ctx: *anyopaque,
+            callback: backend_erased.Store.ReplayCallback,
+
+            fn pass(self_ctx: *@This(), sequence: u64, payload: []const u8) !void {
+                try self_ctx.callback(self_ctx.callback_ctx, sequence, payload);
+            }
+        };
+
+        var ctx = Context{
+            .callback_ctx = callback_ctx,
+            .callback = callback,
+        };
+        const lane_stats = if (required_hint_mask == 0)
+            try self.forEachReplayLaneFrom(internal_keys.replay_all_kind, from_sequence, 0, &ctx, Context.pass)
+        else if (replayHintFromSingleMask(required_hint_mask)) |hint|
+            try self.forEachReplayLaneFrom(replayHintOrdinal(hint), from_sequence, 0, &ctx, Context.pass)
+        else
+            return error.Unsupported;
+        stats.scanned_entries += lane_stats.scanned_entries;
+        stats.matched_entries += lane_stats.matched_entries;
+        stats.last_sequence = lane_stats.last_sequence;
+        stats.scan_batches += lane_stats.scan_batches;
+        stats.fallback_used = lane_stats.fallback_used;
     }
 
     pub fn forEachReplayFromMatchingHint(
@@ -2202,7 +2309,7 @@ test "docstore does not expose commit stats for runtime-backed stores" {
     try std.testing.expect(store.commitStatsSnapshot() == null);
 }
 
-test "docstore runtime lsm exposes large replaying prefix batch immediately after commit" {
+test "docstore runtime lsm exposes large replaying graph artifact prefix batch immediately after commit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2225,9 +2332,11 @@ test "docstore runtime lsm exposes large replaying prefix batch immediately afte
 
     var i: usize = 0;
     while (i < 1500) : (i += 1) {
-        const key = try std.fmt.allocPrint(alloc, "doc:0000:i:gr_v1:out:links:doc:{d:0>4}:o", .{i});
+        const target = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i});
+        defer alloc.free(target);
+        const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:0000", "gr_v1", "links", target);
         errdefer alloc.free(key);
-        const value = try std.fmt.allocPrint(alloc, "{{\"target\":\"doc:{d:0>4}\"}}", .{i});
+        const value = try std.fmt.allocPrint(alloc, "{{\"target\":\"{s}\"}}", .{target});
         errdefer alloc.free(value);
         try writes.append(alloc, .{ .key = key, .value = value });
     }
@@ -2243,7 +2352,9 @@ test "docstore runtime lsm exposes large replaying prefix batch immediately afte
         .payload = "replay:graph",
     });
 
-    const results = try store.scanPrefix(alloc, "doc:0000:i:gr_v1:out:links:");
+    const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(alloc, "doc:0000", "gr_v1");
+    defer alloc.free(prefix);
+    const results = try store.scanPrefix(alloc, prefix);
     defer DocStore.freeResults(alloc, results);
     try std.testing.expectEqual(@as(usize, 1500), results.len);
 }
@@ -2509,12 +2620,14 @@ test "docstore indexes replay rows by hint and truncates them" {
     defer alloc.free(embedding_artifact_key);
     const graph_artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_v1", "links", "doc:b");
     defer alloc.free(graph_artifact_key);
+    const graph_asset_artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(graph_asset_artifact_key);
     const record = change_journal_mod.Record{
         .sequence = 7,
         .changed_doc_keys = &.{"doc:a"},
         .deleted_doc_keys = &.{"doc:deleted"},
         .overwritten_doc_keys = &.{"doc:old"},
-        .changed_artifact_keys = &.{ embedding_artifact_key, graph_artifact_key },
+        .changed_artifact_keys = &.{ embedding_artifact_key, graph_artifact_key, graph_asset_artifact_key },
         .target_hints = &.{ .dense_vector, .full_text, .graph },
     };
     const payload = try change_journal_mod.encodeRecord(alloc, record);
@@ -2583,8 +2696,9 @@ test "docstore indexes replay rows by hint and truncates them" {
     try std.testing.expectEqual(@as(usize, 0), graph_record.record.changed_doc_keys.len);
     try std.testing.expectEqual(@as(usize, 1), graph_record.record.deleted_doc_keys.len);
     try std.testing.expectEqual(@as(usize, 0), graph_record.record.overwritten_doc_keys.len);
-    try std.testing.expectEqual(@as(usize, 1), graph_record.record.changed_artifact_keys.len);
+    try std.testing.expectEqual(@as(usize, 2), graph_record.record.changed_artifact_keys.len);
     try std.testing.expectEqualStrings(graph_artifact_key, graph_record.record.changed_artifact_keys[0]);
+    try std.testing.expectEqualStrings(graph_asset_artifact_key, graph_record.record.changed_artifact_keys[1]);
 
     const sparse_entries = try store.iterateReplayEntriesFromHint(alloc, 7, .sparse_vector);
     defer {
@@ -2641,10 +2755,30 @@ test "docstore runtime lsm hint replay iteration does not clone mutable snapshot
             try std.testing.expect(entry_payload.len > 0);
             self.seen += 1;
         }
+
+        fn handleErased(ptr: *anyopaque, sequence: u64, entry_payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.handle(sequence, entry_payload);
+        }
     };
     var ctx = Context{};
     try store.forEachReplayEntryFromHint(1, .full_text, &ctx, Context.handle);
     try std.testing.expectEqual(@as(usize, 1), ctx.seen);
+
+    var erased_ctx = Context{};
+    var replay_stats = ReplayIterationStats{};
+    try store.forEachReplayFromMatchingHintMaskWithStats(
+        1,
+        change_journal_mod.singleHintMask(.full_text),
+        &erased_ctx,
+        Context.handleErased,
+        &replay_stats,
+    );
+    try std.testing.expectEqual(@as(usize, 1), erased_ctx.seen);
+    try std.testing.expectEqual(@as(usize, 1), replay_stats.scan_batches);
+    try std.testing.expectEqual(@as(usize, 1), replay_stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 1), replay_stats.matched_entries);
+    try std.testing.expectEqual(@as(usize, 0), replay_stats.hint_filter_skips);
     try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().mutable_snapshot_clone_calls);
 }
 

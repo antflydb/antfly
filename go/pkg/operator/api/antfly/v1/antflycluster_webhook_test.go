@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	termitev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/termite/v1alpha1"
+	inferencev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -1423,21 +1423,21 @@ func TestValidateCreate_ProductTierValidClusteredShape(t *testing.T) {
 	}
 }
 
-func TestValidateCreate_ProductTierTermiteTierRequiresTermiteSpec(t *testing.T) {
+func TestValidateCreate_ProductTierInferenceTierRequiresInferenceSpec(t *testing.T) {
 	cluster := baseCluster()
 	cluster.Spec.ProductTier = &ProductTierSpec{
-		Name:        "pro",
-		TermiteTier: "embed-small",
+		Name:          "pro",
+		InferenceTier: "embed-small",
 	}
 	cluster.Spec.MetadataNodes.Resources = ResourceSpec{CPU: "500m", Memory: "1Gi"}
 	cluster.Spec.DataNodes.Resources = ResourceSpec{CPU: "2", Memory: "8Gi"}
 
 	err := cluster.ValidateCreate()
 	if err == nil {
-		t.Fatal("expected termite tier validation error")
+		t.Fatal("expected inference tier validation error")
 	}
-	if !strings.Contains(err.Error(), "spec.termite is required") {
-		t.Fatalf("expected termite spec error, got: %v", err)
+	if !strings.Contains(err.Error(), "spec.inference is required") {
+		t.Fatalf("expected inference spec error, got: %v", err)
 	}
 }
 
@@ -1685,14 +1685,14 @@ func TestDefault_SwarmDefaults(t *testing.T) {
 	if cluster.Spec.Swarm.Health.Port != 4200 {
 		t.Fatalf("expected default swarm health port 4200, got %d", cluster.Spec.Swarm.Health.Port)
 	}
-	if cluster.Spec.Swarm.Termite == nil {
-		t.Fatal("expected default termite configuration to be populated")
+	if cluster.Spec.Swarm.Inference == nil {
+		t.Fatal("expected default inference configuration to be populated")
 	}
-	if !cluster.Spec.Swarm.Termite.Enabled {
-		t.Fatal("expected termite to default enabled for swarm mode")
+	if !cluster.Spec.Swarm.Inference.Enabled {
+		t.Fatal("expected inference to default enabled for swarm mode")
 	}
-	if cluster.Spec.Swarm.Termite.APIURL != "http://0.0.0.0:11433" {
-		t.Fatalf("expected default termite API URL, got %q", cluster.Spec.Swarm.Termite.APIURL)
+	if cluster.Spec.Swarm.Inference.APIURL != "http://0.0.0.0:11433" {
+		t.Fatalf("expected default inference API URL, got %q", cluster.Spec.Swarm.Inference.APIURL)
 	}
 }
 
@@ -1730,41 +1730,41 @@ func TestValidateCreate_SwarmRejectsClusteredFields(t *testing.T) {
 	}
 }
 
-func TestValidateCreate_SwarmRejectsInvalidTermiteURL(t *testing.T) {
+func TestValidateCreate_SwarmRejectsInvalidInferenceURL(t *testing.T) {
 	cluster := baseSwarmCluster()
-	cluster.Spec.Swarm.Termite = &SwarmTermiteSpec{
+	cluster.Spec.Swarm.Inference = &SwarmInferenceSpec{
 		Enabled: true,
 		APIURL:  "localhost:11433",
 	}
 
 	err := cluster.ValidateCreate()
 	if err == nil {
-		t.Fatal("expected error for invalid termite API URL")
+		t.Fatal("expected error for invalid inference API URL")
 	}
-	if !strings.Contains(err.Error(), "spec.swarm.termite.apiURL") {
-		t.Fatalf("expected termite URL validation error, got: %v", err)
+	if !strings.Contains(err.Error(), "spec.swarm.inference.apiURL") {
+		t.Fatalf("expected inference URL validation error, got: %v", err)
 	}
 }
 
-func TestValidateCreate_RejectsInvalidManagedTermiteSpec(t *testing.T) {
+func TestValidateCreate_RejectsInvalidManagedInferenceSpec(t *testing.T) {
 	cluster := baseCluster()
-	cluster.Spec.Termite = &AntflyTermiteSpec{
-		Mode: AntflyTermiteModeManaged,
-		ManagedPools: []ManagedTermitePoolSpec{{
-			Spec: termitev1alpha1.TermitePoolSpec{
-				Models:   termitev1alpha1.ModelConfig{},
-				Replicas: termitev1alpha1.ReplicaConfig{Min: 3, Max: 1},
-				Hardware: termitev1alpha1.HardwareConfig{},
+	cluster.Spec.Inference = &AntflyInferenceSpec{
+		Mode: AntflyInferenceModeManaged,
+		ManagedPools: []ManagedInferencePoolSpec{{
+			Spec: inferencev1alpha1.InferencePoolSpec{
+				Models:   inferencev1alpha1.ModelConfig{},
+				Replicas: inferencev1alpha1.ReplicaConfig{Min: 3, Max: 1},
+				Hardware: inferencev1alpha1.HardwareConfig{},
 			},
 		}},
 	}
 
 	err := cluster.ValidateCreate()
 	if err == nil {
-		t.Fatal("expected error for invalid managed termite spec")
+		t.Fatal("expected error for invalid managed inference spec")
 	}
-	if !strings.Contains(err.Error(), "spec.termite.managedPools[0].spec is invalid") {
-		t.Fatalf("expected managed termite validation error, got: %v", err)
+	if !strings.Contains(err.Error(), "spec.inference.managedPools[0].spec is invalid") {
+		t.Fatalf("expected managed inference validation error, got: %v", err)
 	}
 }
 
@@ -1781,7 +1781,7 @@ func TestValidateUpdate_ModeImmutable(t *testing.T) {
 		StoreAPI:     APISpec{Port: 12380},
 		StoreRaft:    APISpec{Port: 9021},
 		Health:       APISpec{Port: 4200},
-		Termite: &SwarmTermiteSpec{
+		Inference: &SwarmInferenceSpec{
 			Enabled: true,
 			APIURL:  "http://0.0.0.0:11433",
 		},
@@ -1844,7 +1844,7 @@ func baseSwarmCluster() *AntflyCluster {
 				StoreAPI:     APISpec{Port: 12380},
 				StoreRaft:    APISpec{Port: 9021},
 				Health:       APISpec{Port: 4200},
-				Termite: &SwarmTermiteSpec{
+				Inference: &SwarmInferenceSpec{
 					Enabled: true,
 					APIURL:  "http://0.0.0.0:11433",
 				},

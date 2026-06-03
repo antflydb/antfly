@@ -21,7 +21,7 @@
       {"role": "assistant", "content": "Antfly offers hybrid search combining BM25 full-text search with vector semantic search using reciprocal rank fusion (RRF). It also supports reranking, filtering, and RAG for AI-generated answers."},
       {"role": "user", "content": "Tell me more about the reranking part specifically."}
     ],
-    "expected_keywords": ["reranker", "cross-encoder", "relevance", "termite"],
+    "expected_keywords": ["reranker", "cross-encoder", "relevance", "antfly"],
     "description": "Conversational refinement: broad question then narrow to reranking"
   },
   {
@@ -43,10 +43,10 @@
   {
     "messages": [
       {"role": "user", "content": "What embedding providers does Antfly support?"},
-      {"role": "assistant", "content": "Antfly supports multiple embedding providers including OpenAI, Google/Gemini, Ollama, Bedrock, Vertex AI, and Termite for local ONNX inference."},
+      {"role": "assistant", "content": "Antfly supports multiple embedding providers including OpenAI, Google/Gemini, Ollama, Bedrock, Vertex AI, and Antfly inference for local model serving."},
       {"role": "user", "content": "Which one should I use for local development?"}
     ],
-    "expected_keywords": ["ollama", "termite", "local", "onnx"],
+    "expected_keywords": ["ollama", "antfly", "local", "inference"],
     "description": "Multi-turn recommendation: ask about providers then ask for local recommendation"
   },
   {

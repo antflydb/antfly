@@ -158,9 +158,10 @@ func NewPebbleStorage(zl *zap.Logger, dir string, cache *pebbleutils.Cache) (*Pe
 		Logger:          &logger.NoopLoggerAndTracer{},
 		LoggerAndTracer: &logger.NoopLoggerAndTracer{},
 		// Raft log storage is append/compact oriented and does not rely on Pebble's
-		// async table-stats collector. Disabling it avoids shutdown races in Pebble's
-		// background stats goroutine while log storage is being torn down.
-		DisableTableStats: true,
+		// background maintenance. Disabling it avoids shutdown races in Pebble's
+		// background goroutines while log storage is being torn down.
+		DisableTableStats:           true,
+		DisableAutomaticCompactions: true,
 	}
 	cache.Apply(opts, 64<<20) // 64MB fallback
 	if PebbleStorageInMem {

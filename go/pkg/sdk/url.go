@@ -18,18 +18,22 @@ package sdk
 
 import "strings"
 
-const apiV1Path = "/api/v1"
+const apiV1Path = "/db/v1"
+const authV1Path = "/auth/v1"
+const aiV1Path = "/ai/v1"
 
 // NormalizeBaseURL returns the server root URL used by the joined public
-// OpenAPI client. The generated paths already include /api/v1.
+// OpenAPI client. The generated paths already include /db/v1.
 // It accepts either a server root URL or an API-root URL.
 func NormalizeBaseURL(baseURL string) string {
 	trimmed := strings.TrimRight(baseURL, "/")
-	return strings.TrimSuffix(trimmed, apiV1Path)
+	trimmed = strings.TrimSuffix(trimmed, apiV1Path)
+	trimmed = strings.TrimSuffix(trimmed, authV1Path)
+	return strings.TrimSuffix(trimmed, aiV1Path)
 }
 
 // NormalizeServerURL returns the Antfly server root URL for non-OpenAPI
 // endpoints such as internal admin routes.
 func NormalizeServerURL(baseURL string) string {
-	return strings.TrimSuffix(strings.TrimRight(baseURL, "/"), apiV1Path)
+	return NormalizeBaseURL(baseURL)
 }

@@ -65,12 +65,12 @@ import {
   type QuantizationOption,
   type QuantizationType,
   type RecognizerCapability,
-  type TermiteModel,
+  type InferenceModel,
   VARIANT_PRESETS,
   type VariantPreset,
-} from "@/data/termite-models";
+} from "@/data/inference-models";
 import { useApiConfig } from "@/hooks/use-api-config";
-import { useTermiteRegistry } from "@/hooks/use-termite-registry";
+import { useInferenceRegistry } from "@/hooks/use-inference-registry";
 import { cn } from "@/lib/utils";
 
 // Icon mapping for model types
@@ -85,68 +85,15 @@ const MODEL_TYPE_ICONS: Record<ModelType, React.FC<{ className?: string }>> = {
   transcriber: AudioLines,
 };
 
-// Refined color system - bold accent colors with monochrome base
-const MODEL_TYPE_ACCENT: Record<
-  ModelType,
-  { bg: string; text: string; border: string; glow: string }
-> = {
-  embedder: {
-    bg: "bg-blue-500",
-    text: "text-blue-500 dark:text-blue-400",
-    border: "border-blue-500/20 dark:border-blue-400/20",
-    glow: "shadow-blue-500/20",
-  },
-  reranker: {
-    bg: "bg-violet-500",
-    text: "text-violet-500 dark:text-violet-400",
-    border: "border-violet-500/20 dark:border-violet-400/20",
-    glow: "shadow-violet-500/20",
-  },
-  chunker: {
-    bg: "bg-emerald-500",
-    text: "text-emerald-500 dark:text-emerald-400",
-    border: "border-emerald-500/20 dark:border-emerald-400/20",
-    glow: "shadow-emerald-500/20",
-  },
-  recognizer: {
-    bg: "bg-amber-500",
-    text: "text-amber-500 dark:text-amber-400",
-    border: "border-amber-500/20 dark:border-amber-400/20",
-    glow: "shadow-amber-500/20",
-  },
-  rewriter: {
-    bg: "bg-rose-500",
-    text: "text-rose-500 dark:text-rose-400",
-    border: "border-rose-500/20 dark:border-rose-400/20",
-    glow: "shadow-rose-500/20",
-  },
-  generator: {
-    bg: "bg-cyan-500",
-    text: "text-cyan-500 dark:text-cyan-400",
-    border: "border-cyan-500/20 dark:border-cyan-400/20",
-    glow: "shadow-cyan-500/20",
-  },
-  reader: {
-    bg: "bg-orange-500",
-    text: "text-orange-500 dark:text-orange-400",
-    border: "border-orange-500/20 dark:border-orange-400/20",
-    glow: "shadow-orange-500/20",
-  },
-  transcriber: {
-    bg: "bg-teal-500",
-    text: "text-teal-500 dark:text-teal-400",
-    border: "border-teal-500/20 dark:border-teal-400/20",
-    glow: "shadow-teal-500/20",
-  },
-};
+// Model-type chrome is neutral mono — the type is already carried by its
+// icon and name, so it takes no per-type hue (single amber accent language).
+const NEUTRAL_ACCENT = {
+  text: "text-muted-foreground",
+  border: "border-border",
+} as const;
 
-// Capability styling
-const CAPABILITY_STYLES: Record<RecognizerCapability, string> = {
-  labels: "bg-foreground/5 text-foreground/70 border-foreground/10",
-  zeroshot: "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20",
-  relations: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20",
-  answers: "bg-rose-500/10 text-rose-600 dark:text-rose-400 border-rose-500/20",
-};
+// Capability chips are neutral mono — the capability is carried by its label.
+const CAPABILITY_CHIP = "bg-muted text-muted-foreground border-border";
 
 const CAPABILITY_LABELS: Record<RecognizerCapability, string> = {
   labels: "NER",
@@ -163,13 +110,9 @@ const HARDWARE_ICONS: Record<HardwareCapability, React.FC<{ className?: string }
   cpu: Cpu,
 };
 
-// Hardware badge colors
-const HARDWARE_COLORS: Record<HardwareCapability, string> = {
-  "nvidia-gpu": "bg-green-500/10 text-green-600 dark:text-green-400 border-green-500/20",
-  "apple-silicon": "bg-slate-500/10 text-slate-600 dark:text-slate-400 border-slate-500/20",
-  "google-tpu": "bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/20",
-  cpu: "bg-foreground/5 text-foreground/70 border-foreground/10",
-};
+// Hardware badges are neutral mono — each kind is differentiated by its icon
+// (single amber accent language; no per-vendor hue).
+const HARDWARE_CHIP = "bg-muted text-muted-foreground border-border";
 
 // Hardware badges component
 const HardwareBadges: React.FC<{
@@ -190,8 +133,8 @@ const HardwareBadges: React.FC<{
               <TooltipTrigger asChild>
                 <span
                   className={cn(
-                    "inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs border cursor-help",
-                    HARDWARE_COLORS[cap]
+                    "inline-flex items-center gap-1.5 px-2 py-1 rounded-none text-xs font-mono border cursor-help",
+                    HARDWARE_CHIP
                   )}
                 >
                   <Icon className="w-3 h-3" />
@@ -343,8 +286,8 @@ const ModelStats: React.FC<{ source: string; compact?: boolean }> = ({ source, c
   if (loading) {
     return (
       <div className="flex items-center gap-2 text-xs text-muted-foreground/50">
-        <span className="w-8 h-3 bg-muted animate-pulse rounded" />
-        <span className="w-8 h-3 bg-muted animate-pulse rounded" />
+        <span className="w-8 h-3 bg-muted animate-pulse rounded-none" />
+        <span className="w-8 h-3 bg-muted animate-pulse rounded-none" />
       </div>
     );
   }
@@ -373,7 +316,7 @@ const ModelStats: React.FC<{ source: string; compact?: boolean }> = ({ source, c
   }
 
   return (
-    <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted/50 border border-border/50">
+    <div className="flex items-center gap-2 px-3 py-2 rounded-none bg-muted/50 border border-border/50">
       <HFLogo className="w-4 h-4 text-muted-foreground" />
       <div className="flex items-center gap-3 text-xs">
         <span className="flex items-center gap-1.5 text-muted-foreground">
@@ -438,7 +381,7 @@ const TypePill: React.FC<{
       onClick={onClick}
       aria-pressed={selected}
       className={cn(
-        "px-3 py-1.5 rounded-md text-sm transition-colors",
+        "px-3 py-1.5 rounded-none text-sm transition-colors",
         selected
           ? "bg-foreground text-background"
           : "text-muted-foreground hover:text-foreground hover:bg-muted"
@@ -458,7 +401,7 @@ const TypePill: React.FC<{
 };
 
 const ModelCard: React.FC<{
-  model: TermiteModel;
+  model: InferenceModel;
   onClick: () => void;
 }> = ({ model, onClick }) => {
   const Icon = MODEL_TYPE_ICONS[model.type];
@@ -470,14 +413,14 @@ const ModelCard: React.FC<{
       aria-label={`View details for ${model.name}`}
       className={cn(
         "group text-left w-full",
-        "bg-card border border-border rounded-xl p-5",
+        "bg-card border border-border rounded-none p-5",
         "transition-colors duration-150",
         "hover:bg-accent/50",
         "focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:ring-offset-background"
       )}
     >
       <div className="flex items-start gap-3 mb-3">
-        <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-muted shrink-0">
+        <div className="flex items-center justify-center w-9 h-9 rounded-none bg-muted shrink-0">
           <Icon className="w-4 h-4 text-muted-foreground" />
         </div>
         <div className="min-w-0">
@@ -521,7 +464,7 @@ const ModelCard: React.FC<{
 
 // Model detail sheet - refined documentation style
 const ModelDetailSheet: React.FC<{
-  model: TermiteModel | null;
+  model: InferenceModel | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   types: { type: ModelType; name: string }[];
@@ -549,7 +492,7 @@ const ModelDetailSheet: React.FC<{
   if (!model) return null;
 
   const Icon = MODEL_TYPE_ICONS[model.type];
-  const accent = MODEL_TYPE_ACCENT[model.type];
+  const accent = NEUTRAL_ACCENT;
   const typeInfo = types.find((t) => t.type === model.type);
   const command = getDownloadCommand(model, selectedVariant);
 
@@ -572,17 +515,14 @@ const ModelDetailSheet: React.FC<{
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="w-full sm:max-w-md overflow-y-auto p-0">
-        {/* Header with gradient accent */}
+        {/* Header */}
         <div className={cn("relative px-6 pt-6 pb-5", "border-b border-border/50")}>
-          {/* Subtle gradient background */}
-          <div className={cn("absolute inset-0 opacity-[0.03] dark:opacity-[0.06]", accent.bg)} />
-
           <SheetHeader className="relative">
             <div className="flex items-start gap-3.5">
               <div
                 className={cn(
-                  "flex items-center justify-center w-11 h-11 rounded-lg",
-                  "bg-background border shadow-sm",
+                  "flex items-center justify-center w-11 h-11 rounded-none",
+                  "bg-background border",
                   accent.border
                 )}
               >
@@ -602,10 +542,10 @@ const ModelDetailSheet: React.FC<{
             <div className="flex items-center gap-2 mt-4">
               <span
                 className={cn(
-                  "inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-medium border",
+                  "inline-flex items-center gap-1.5 px-2 py-1 rounded-none text-xs font-mono border",
                   accent.text,
                   accent.border,
-                  "bg-background"
+                  "bg-muted"
                 )}
               >
                 <Icon className="w-3 h-3" />
@@ -613,19 +553,19 @@ const ModelDetailSheet: React.FC<{
               </span>
 
               {model.inRegistry ? (
-                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium bg-success-500/10 text-success-600 dark:text-success-400 border border-success-500/20">
+                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-none text-xs font-medium bg-success-500/10 text-success-600 dark:text-success-400 border border-success-500/20">
                   <Zap className="w-3 h-3" />
                   Ready
                 </span>
               ) : (
-                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs bg-muted text-muted-foreground border border-border">
+                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-none text-xs bg-muted text-muted-foreground border border-border">
                   <Package className="w-3 h-3" />
                   Export
                 </span>
               )}
 
               {model.size && (
-                <span className="px-2 py-1 rounded-md text-xs font-mono text-muted-foreground bg-muted/50 border border-border/50">
+                <span className="px-2 py-1 rounded-none text-xs font-mono text-muted-foreground bg-muted/50 border border-border/50">
                   {model.size}
                 </span>
               )}
@@ -653,8 +593,8 @@ const ModelDetailSheet: React.FC<{
                   <span
                     key={cap}
                     className={cn(
-                      "inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs border",
-                      CAPABILITY_STYLES[cap]
+                      "inline-flex items-center gap-1 px-2 py-0.5 rounded-none text-xs font-mono border",
+                      CAPABILITY_CHIP
                     )}
                   >
                     <Check className="w-3 h-3" />
@@ -667,20 +607,23 @@ const ModelDetailSheet: React.FC<{
 
           {/* Download Configuration */}
           {!canShowDownloadCommand ? (
-            <div className="rounded-lg border border-border bg-muted/30 px-4 py-3">
+            <div className="rounded-none border border-border bg-muted/30 px-4 py-3">
               <p className="text-xs text-muted-foreground">
                 {model.sourceUrl ? (
                   <>
-                    Use <code className="font-mono bg-muted px-1 py-0.5 rounded">termite pull</code>{" "}
-                    CLI or the Termite operator to manage models in production deployments.
+                    Use{" "}
+                    <code className="font-mono bg-muted px-1 py-0.5 rounded-none">
+                      antfly inference pull
+                    </code>{" "}
+                    CLI or the Antfly inference operator to manage models in production deployments.
                   </>
                 ) : (
-                  "This model is provided by the running Termite runtime and does not need a download command."
+                  "This model is provided by the running Antfly inference runtime and does not need a download command."
                 )}
               </p>
             </div>
           ) : (
-            <div className="rounded-lg border border-border bg-muted/30 overflow-hidden">
+            <div className="rounded-none border border-border bg-muted/30 overflow-hidden">
               {/* Preset selector */}
               <div className="px-4 py-3 border-b border-border/50">
                 <h4 className="text-xs font-medium text-foreground mb-3">Download variant</h4>
@@ -704,9 +647,9 @@ const ModelDetailSheet: React.FC<{
                           }
                         }}
                         className={cn(
-                          "flex-1 min-w-[100px] px-3 py-2 rounded-lg text-left transition-all",
+                          "flex-1 min-w-[100px] px-3 py-2 rounded-none text-left transition-all",
                           isSelected
-                            ? "bg-foreground text-background shadow-sm"
+                            ? "bg-foreground text-background"
                             : isAvailable
                               ? "bg-background text-foreground border border-border hover:border-foreground/30"
                               : "bg-muted/50 text-muted-foreground/50 border border-border/50 cursor-not-allowed"
@@ -767,7 +710,7 @@ const ModelDetailSheet: React.FC<{
                             setSelectedPreset(null);
                           }}
                           className={cn(
-                            "px-2.5 py-1.5 rounded text-xs text-left transition-all",
+                            "px-2.5 py-1.5 rounded-none text-xs text-left transition-all",
                             selectedVariant === variant.type && selectedPreset === null
                               ? "bg-foreground text-background"
                               : selectedVariant === variant.type
@@ -788,9 +731,9 @@ const ModelDetailSheet: React.FC<{
 
               {/* Command block */}
               <div className="relative">
-                <div className="px-4 py-3 bg-searchaf-11 dark:bg-searchaf-2">
+                <div className="px-4 py-3 bg-muted border border-border">
                   <div className="flex items-start justify-between gap-2">
-                    <code className="text-xs font-mono text-searchaf-1 dark:text-searchaf-11 break-all leading-relaxed">
+                    <code className="text-xs font-mono text-foreground break-all leading-relaxed">
                       {command}
                     </code>
                     <button
@@ -798,9 +741,9 @@ const ModelDetailSheet: React.FC<{
                       onClick={handleCopyCommand}
                       aria-label={copiedCommand ? "Copied!" : "Copy command"}
                       className={cn(
-                        "shrink-0 p-1.5 rounded transition-colors",
-                        "text-searchaf-6 hover:text-searchaf-1 dark:text-searchaf-6 dark:hover:text-searchaf-11",
-                        "hover:bg-searchaf-9/20 dark:hover:bg-searchaf-4/30"
+                        "shrink-0 p-1.5 rounded-none transition-colors",
+                        "text-muted-foreground hover:text-foreground",
+                        "hover:bg-muted"
                       )}
                     >
                       {copiedCommand ? (
@@ -815,7 +758,7 @@ const ModelDetailSheet: React.FC<{
                 {/* Copy feedback toast */}
                 <div
                   className={cn(
-                    "absolute inset-x-4 bottom-full mb-2 py-1.5 px-2 rounded bg-foreground text-background text-xs text-center",
+                    "absolute inset-x-4 bottom-full mb-2 py-1.5 px-2 rounded-none bg-foreground text-background text-xs text-center",
                     "transition-all duration-200",
                     copiedCommand
                       ? "opacity-100 translate-y-0"
@@ -877,7 +820,7 @@ const ModelDetailSheet: React.FC<{
               target="_blank"
               rel="noopener noreferrer"
               className={cn(
-                "flex items-center justify-center gap-2 w-full py-2.5 rounded-lg",
+                "flex items-center justify-center gap-2 w-full py-2.5 rounded-none",
                 "text-sm text-muted-foreground hover:text-foreground",
                 "border border-border hover:border-foreground/20",
                 "transition-colors"
@@ -901,11 +844,11 @@ const TypeContextBanner: React.FC<{
   const Icon = MODEL_TYPE_ICONS[selectedType];
 
   return (
-    <div className="relative isolate mb-8 rounded-xl border border-border overflow-hidden">
+    <div className="relative isolate mb-8 rounded-none border border-border overflow-hidden">
       <GraphPaperBg className="absolute inset-0 -z-10" />
       <div className="p-5">
         <div className="flex items-start gap-4">
-          <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-muted shrink-0">
+          <div className="flex items-center justify-center w-9 h-9 rounded-none bg-muted shrink-0">
             <Icon className="w-4 h-4 text-muted-foreground" />
           </div>
           <div className="flex-1 min-w-0">
@@ -959,12 +902,12 @@ const TypeContextBanner: React.FC<{
 
 // Main page component
 const ModelsPage: React.FC = () => {
-  const { models, types, quantizationOptions, loading, error, retry } = useTermiteRegistry();
-  const { apiUrl, termiteApiUrl } = useApiConfig();
+  const { models, types, quantizationOptions, loading, error, retry } = useInferenceRegistry();
+  const { apiUrl, inferenceApiUrl } = useApiConfig();
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedType, setSelectedType] = useState<ModelType | "all">("all");
-  const [selectedModel, setSelectedModel] = useState<TermiteModel | null>(null);
+  const [selectedModel, setSelectedModel] = useState<InferenceModel | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [allowDownloads, setAllowDownloads] = useState(false);
 
@@ -980,8 +923,8 @@ const ModelsPage: React.FC = () => {
             setAllowDownloads(data.swarm_mode === true);
           }
         } else {
-          // Termite-only build: check allow_downloads from Termite version
-          const response = await fetch(`${termiteApiUrl}/ml/v1/version`);
+          // Inference-only build: check allow_downloads from the model listing metadata.
+          const response = await fetch(`${inferenceApiUrl}/ai/v1/models`);
           if (response.ok) {
             const data = await response.json();
             setAllowDownloads(data.allow_downloads === true);
@@ -992,7 +935,7 @@ const ModelsPage: React.FC = () => {
       }
     };
     checkDownloads();
-  }, [apiUrl, termiteApiUrl]);
+  }, [apiUrl, inferenceApiUrl]);
 
   const filteredModels = useMemo(() => {
     return models.filter((model) => {
@@ -1012,7 +955,7 @@ const ModelsPage: React.FC = () => {
   }, [models, searchQuery, selectedType]);
 
   const modelsByType = useMemo(() => {
-    const grouped: Record<ModelType, TermiteModel[]> = {
+    const grouped: Record<ModelType, InferenceModel[]> = {
       embedder: [],
       reranker: [],
       chunker: [],
@@ -1051,7 +994,7 @@ const ModelsPage: React.FC = () => {
     return counts;
   }, [models]);
 
-  const handleModelClick = (model: TermiteModel) => {
+  const handleModelClick = (model: InferenceModel) => {
     setSelectedModel(model);
     setSheetOpen(true);
   };
@@ -1065,25 +1008,25 @@ const ModelsPage: React.FC = () => {
       <DashboardPage>
         <DashboardPageHeader>
           <div>
-            <div className="mb-3 h-7 w-64 animate-pulse rounded-lg bg-muted" />
-            <div className="h-4 w-full max-w-md animate-pulse rounded-lg bg-muted" />
+            <div className="mb-3 h-7 w-64 animate-pulse rounded-none bg-muted" />
+            <div className="h-4 w-full max-w-md animate-pulse rounded-none bg-muted" />
           </div>
         </DashboardPageHeader>
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
           {Array.from({ length: 6 }).map((_, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: skeleton placeholders are positional
-            <div key={i} className="bg-card border border-border rounded-xl p-5">
+            <div key={i} className="bg-card border border-border rounded-none p-5">
               <div className="flex items-start gap-3 mb-3">
-                <div className="w-10 h-10 bg-muted animate-pulse rounded-lg" />
+                <div className="w-10 h-10 bg-muted animate-pulse rounded-none" />
                 <div className="flex-1">
-                  <div className="h-5 w-32 bg-muted animate-pulse rounded mb-2" />
-                  <div className="h-3 w-24 bg-muted animate-pulse rounded" />
+                  <div className="h-5 w-32 bg-muted animate-pulse rounded-none mb-2" />
+                  <div className="h-3 w-24 bg-muted animate-pulse rounded-none" />
                 </div>
               </div>
-              <div className="h-10 bg-muted animate-pulse rounded mb-4" />
+              <div className="h-10 bg-muted animate-pulse rounded-none mb-4" />
               <div className="flex gap-2">
-                <div className="h-5 w-16 bg-muted animate-pulse rounded" />
-                <div className="h-5 w-12 bg-muted animate-pulse rounded" />
+                <div className="h-5 w-16 bg-muted animate-pulse rounded-none" />
+                <div className="h-5 w-12 bg-muted animate-pulse rounded-none" />
               </div>
             </div>
           ))}
@@ -1097,7 +1040,7 @@ const ModelsPage: React.FC = () => {
     return (
       <DashboardPage className="min-h-full items-center justify-center">
         <ErrorState
-          message="Could not load models from Termite. Check the runtime connection and try again."
+          message="Could not load models from Antfly inference. Check the runtime connection and try again."
           onRetry={retry}
         />
       </DashboardPage>
@@ -1108,10 +1051,10 @@ const ModelsPage: React.FC = () => {
     <DashboardPage>
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Model Directory</DashboardPageTitle>
+          <DashboardPageTitle className="font-aeonik">Models & Runtime</DashboardPageTitle>
           <DashboardPageDescription>
-            Browse {models.length} models reported by Termite. Models run locally through the Zig
-            runtime.
+            Browse {models.length} models reported by Antfly inference. Models run locally through
+            the Zig runtime.
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
@@ -1165,7 +1108,7 @@ const ModelsPage: React.FC = () => {
             onClick={() => setSelectedType("all")}
             aria-pressed={selectedType === "all"}
             className={cn(
-              "px-3 py-1.5 rounded-md text-sm transition-colors",
+              "px-3 py-1.5 rounded-none text-sm transition-colors",
               selectedType === "all"
                 ? "bg-foreground text-background"
                 : "text-muted-foreground hover:text-foreground hover:bg-muted"

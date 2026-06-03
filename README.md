@@ -33,7 +33,7 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 - **SIMD / SME acceleration** — vector operations use hardware intrinsics via [go-highway](https://github.com/ajroetker/go-highway) on x86 and ARM
 - **Distributed** — Raft consensus, automatic sharding and replication, horizontal scaling
 - **Enrichment pipelines** — [configurable pipelines](go/pkg/antfly/src/store/db/indexes/walenricher.go) per index for embeddings, summaries, graph edges, and custom computed fields
-- **Bring your own models** — Ollama, OpenAI, Bedrock, Google, or run models locally with [Termite](go/pkg/termite)
+- **Bring your own models** — Ollama, OpenAI, Bedrock, Google, or run models locally with Antfly inference
 - **Auth** — built-in [user management](go/pkg/antfly/src/usermgr) with API keys, basic auth, and bearer tokens
 - **Backup & restore** — to local disk or S3
 - **Kubernetes operator** — deploy and manage clusters with the [operator](go/pkg/operator)
@@ -61,7 +61,7 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 
 ```sql
 CREATE INDEX idx_content ON docs USING antfly (content)
-  WITH (url = 'http://localhost:8080/api/v1/', collection = 'my_docs');
+  WITH (url = 'http://localhost:8080/db/v1/', collection = 'my_docs');
 
 SELECT * FROM docs WHERE content @@@ 'fix my computer';
 ```
@@ -70,9 +70,9 @@ SELECT * FROM docs WHERE content @@@ 'fix my computer';
 
 [`@antfly/components`](ts/packages/components) gives you drop-in React components for search UIs — `SearchBox`, `Autosuggest`, `Facet`, `Results`, `RAGBox`, `AnswerBox`, plus streaming hooks like `useAnswerStream` and `useCitations`.
 
-### Termite — ML Inference
+### Inference Runtime
 
-[Termite](go/pkg/termite) handles the ML side: embeddings, chunking, reranking, classification, NER, OCR, transcription, generation, and more. It ships as an in-tree module (`go/pkg/termite`) and runs automatically in swarm mode — you don't need to set it up separately.
+Antfly inference handles the ML side: embeddings, chunking, reranking, classification, NER, OCR, transcription, generation, and more. It runs under the `antfly inference` CLI and starts automatically in swarm mode, so you don't need to set it up separately.
 
 ## Libraries & Tools
 
@@ -106,4 +106,4 @@ Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-The core server is [Elastic License 2.0 (ELv2)](LICENSE). That means you can use it, modify it, self-host it, and build products on top of it — you just can't offer Antfly itself as a managed service. Everything else — the [SDKs](go/pkg/sdk), [React components](ts/packages/components), [Termite](go/pkg/termite), [pgaf](rs/pgaf), [docsaf](go/pkg/docsaf), [evalaf](go/pkg/evalaf) — is Apache 2.0. We tried to keep as much as possible under a permissive license.
+The core server is [Elastic License 2.0 (ELv2)](LICENSE). That means you can use it, modify it, self-host it, and build products on top of it — you just can't offer Antfly itself as a managed service. Everything else — the [SDKs](go/pkg/sdk), [React components](ts/packages/components), inference runtime, [pgaf](rs/pgaf), [docsaf](go/pkg/docsaf), [evalaf](go/pkg/evalaf) — is Apache 2.0. We tried to keep as much as possible under a permissive license.

@@ -216,7 +216,7 @@ class EmbeddingsIndexConfig:
             summarizer (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
                  Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
             chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
-                'termite', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
+                'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
             top_k (int | Unset): Default number of results to return from search (sparse only) Default: 10.
             min_weight (float | Unset): Minimum weight threshold for sparse vector entries (sparse only) Default: 0.0.
             chunk_size (int | Unset): Number of documents per posting list chunk (sparse only) Default: 1024.

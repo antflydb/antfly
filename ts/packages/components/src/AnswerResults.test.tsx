@@ -13,7 +13,7 @@ import * as utils from "./utils";
 // Wrapper component to provide required context
 const TestWrapper = ({ children }: { children: React.ReactNode }) => {
   return (
-    <Antfly url="http://localhost:8082/api/v1" table="test">
+    <Antfly url="http://localhost:8082/db/v1" table="test">
       {children}
     </Antfly>
   );

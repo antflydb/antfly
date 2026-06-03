@@ -167,7 +167,7 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
       )}
       {showOrderByAndFacets && (
         <Accordion type="multiple" className="space-y-2">
-          <AccordionItem value="orderby" className="border rounded-lg bg-card/50 px-3">
+          <AccordionItem value="orderby" className="border rounded-none bg-card/50 px-3">
             <AccordionTrigger className="py-2.5 hover:no-underline">
               <span className="font-medium text-sm">Order By</span>
             </AccordionTrigger>
@@ -175,7 +175,7 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
               {orderBy.map((sortField, index) => (
                 <div
                   key={`orderby-${sortField.field}-${sortField.desc}`}
-                  className="flex items-center gap-2 p-2 bg-muted/30 rounded border"
+                  className="flex items-center gap-2 p-2 bg-muted/30 rounded-none border"
                 >
                   <Input
                     placeholder="Field name"
@@ -216,7 +216,7 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
             </AccordionContent>
           </AccordionItem>
 
-          <AccordionItem value="aggregations" className="border rounded-lg bg-card/50 px-3">
+          <AccordionItem value="aggregations" className="border rounded-none bg-card/50 px-3">
             <AccordionTrigger className="py-2.5 hover:no-underline">
               <div className="flex items-center gap-2">
                 <span className="font-medium text-sm">Aggregations</span>

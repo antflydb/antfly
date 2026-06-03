@@ -25,11 +25,15 @@ from .exceptions import AntflyException
 
 
 def normalize_base_url(base_url: str) -> str:
-    """Return the Antfly API base URL for local or CloudAF endpoints."""
+    """Return the Antfly server root URL for local or CloudAF endpoints."""
     trimmed = base_url.rstrip("/")
-    if trimmed.endswith("/api/v1"):
-        return trimmed
-    return f"{trimmed}/api/v1"
+    if trimmed.endswith("/db/v1"):
+        return trimmed[: -len("/db/v1")]
+    if trimmed.endswith("/auth/v1"):
+        return trimmed[: -len("/auth/v1")]
+    if trimmed.endswith("/ai/v1"):
+        return trimmed[: -len("/ai/v1")]
+    return trimmed
 
 
 class AntflyClient:
@@ -152,7 +156,7 @@ class AntflyClient:
 
         return self._request(
             "POST",
-            f"/tables/{quote(name, safe='')}",
+            f"/db/v1/tables/{quote(name, safe='')}",
             json=body,
         )
 
@@ -166,7 +170,7 @@ class AntflyClient:
         Raises:
             AntflyException: If listing tables fails
         """
-        return self._request("GET", "/tables")
+        return self._request("GET", "/db/v1/tables")
 
     def get_table(self, name: str) -> dict[str, Any]:
         """
@@ -181,7 +185,7 @@ class AntflyClient:
         Raises:
             AntflyException: If getting table fails
         """
-        return self._request("GET", f"/tables/{quote(name, safe='')}")
+        return self._request("GET", f"/db/v1/tables/{quote(name, safe='')}")
 
     def drop_table(self, name: str) -> None:
         """
@@ -193,7 +197,7 @@ class AntflyClient:
         Raises:
             AntflyException: If dropping table fails
         """
-        self._request("DELETE", f"/tables/{quote(name, safe='')}")
+        self._request("DELETE", f"/db/v1/tables/{quote(name, safe='')}")
 
     def get(self, table: str, key: str) -> dict[str, Any]:
         """

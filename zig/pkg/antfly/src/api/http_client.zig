@@ -290,7 +290,11 @@ pub const ApiHttpClient = struct {
 
         var resp = try self.executor.execute(self.alloc, .{ .method = .GET, .uri = uri });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
         const version = for (resp.headers) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Version")) break try self.alloc.dupe(u8, header.value);
         } else null;
@@ -461,7 +465,11 @@ pub const ApiHttpClient = struct {
             .body = body orelse "",
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
@@ -540,7 +548,11 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
@@ -686,7 +698,11 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
@@ -715,7 +731,11 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
@@ -744,7 +764,11 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
@@ -773,7 +797,11 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
@@ -802,7 +830,11 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
@@ -831,7 +863,11 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
@@ -860,7 +896,11 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
@@ -892,7 +932,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             404 => return error.UnknownGroup,
-            409 => return error.TopologyChanged,
+            409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -926,7 +966,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             404 => return error.UnknownGroup,
-            409 => return error.TopologyChanged,
+            409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -960,7 +1000,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             404 => return error.UnknownGroup,
-            409 => return error.TopologyChanged,
+            409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -994,7 +1034,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             404 => return error.UnknownGroup,
-            409 => return error.TopologyChanged,
+            409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1361,6 +1401,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
+            if (resp.status == 409) return remoteGroupConflictError(resp.body);
             return error.UnexpectedHttpStatus;
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1394,7 +1435,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => return .{},
             404 => return error.UnknownGroup,
-            409 => if (transactions_api.isTopologyChangedConflictMessage(resp.body)) return error.TopologyChanged else return error.UnexpectedHttpStatus,
+            409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1427,7 +1468,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => return .{},
             404 => return error.UnknownGroup,
-            409 => if (transactions_api.isTopologyChangedConflictMessage(resp.body)) return error.TopologyChanged else return error.IntentConflict,
+            409 => return remoteGroupTxnPrepareConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1467,7 +1508,11 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
@@ -1562,7 +1607,7 @@ pub const ApiHttpClient = struct {
             200 => return .{},
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
-            409 => return error.DecisionConflict,
+            409 => return remoteGroupTxnResolveConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1590,10 +1635,7 @@ pub const ApiHttpClient = struct {
             200 => return try self.alloc.dupe(u8, resp.body),
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
-            409 => {
-                if (transactions_api.isTopologyChangedConflictMessage(resp.body)) return error.TopologyChanged;
-                return error.UnexpectedHttpStatus;
-            },
+            409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1830,6 +1872,7 @@ const EncodedTransitionAction = struct {
     destination_group_id: ?u64 = null,
     donor_group_id: ?u64 = null,
     receiver_group_id: ?u64 = null,
+    allow_doc_identity_reassignment: bool = false,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
 };
@@ -1880,18 +1923,21 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .transition_id = op.transition_id,
             .donor_group_id = op.donor_group_id,
             .receiver_group_id = op.receiver_group_id,
+            .allow_doc_identity_reassignment = op.allow_doc_identity_reassignment,
         },
         .catch_up_merge_receiver => |op| .{
             .kind = .catch_up_merge_receiver,
             .transition_id = op.transition_id,
             .donor_group_id = op.donor_group_id,
             .receiver_group_id = op.receiver_group_id,
+            .allow_doc_identity_reassignment = op.allow_doc_identity_reassignment,
         },
         .finalize_merge => |op| .{
             .kind = .finalize_merge,
             .transition_id = op.transition_id,
             .donor_group_id = op.donor_group_id,
             .receiver_group_id = op.receiver_group_id,
+            .allow_doc_identity_reassignment = op.allow_doc_identity_reassignment,
         },
         .rollback_merge => |op| .{
             .kind = .rollback_merge,
@@ -2019,7 +2065,93 @@ fn remotePreflightError(body: []const u8) anyerror {
     if (std.mem.eql(u8, body, "TableNotFound")) return error.TableNotFound;
     if (std.mem.eql(u8, body, "UnknownGroup")) return error.UnknownGroup;
     if (std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
+    if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
+    if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     return error.UnexpectedHttpStatus;
+}
+
+fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
+    return std.mem.eql(u8, body, "doc identity namespace mismatch") or
+        std.mem.eql(u8, body, "DocIdentityNamespaceMismatch");
+}
+
+fn remoteGroupConflictError(body: []const u8) anyerror {
+    if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
+    if (std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
+    if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
+    return error.UnexpectedHttpStatus;
+}
+
+fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
+    if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
+    if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
+    if (std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
+    if (std.mem.eql(u8, body, "transaction conflict")) return error.IntentConflict;
+    return error.UnexpectedHttpStatus;
+}
+
+fn remoteGroupTxnResolveConflictError(body: []const u8) anyerror {
+    if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
+    if (std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
+    return error.UnexpectedHttpStatus;
+}
+
+test "api http client preserves group doc identity conflicts" {
+    const ConflictExecutor = struct {
+        status: u16,
+        body: []const u8,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = self.status,
+                .body = try alloc.dupe(u8, self.body),
+            };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var conflict_executor = ConflictExecutor{
+        .status = 409,
+        .body = "doc identity namespace mismatch",
+    };
+    var client = ApiHttpClient.init(alloc, conflict_executor.executor());
+    const base_uri = "http://127.0.0.1:1";
+
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupLookup(base_uri, 7, "docs", "a", null));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupQueryPreflight(base_uri, 7, "docs", "{}", 0));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupJoinRows(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupTxnPrepare(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupTxnResolve(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupTxnStatus(base_uri, 7, "docs", "{}"));
+
+    conflict_executor.body = "topology changed";
+    try std.testing.expectError(error.TopologyChanged, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+}
+
+test "api http client encodes merge doc identity reassignment action flag" {
+    const alloc = std.testing.allocator;
+    const body = try encodeTransitionAction(alloc, .{ .finalize_merge = .{
+        .transition_id = 8,
+        .donor_group_id = 10,
+        .receiver_group_id = 9,
+        .allow_doc_identity_reassignment = true,
+    } });
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"allow_doc_identity_reassignment\":true") != null);
 }
 
 test "api http client round-trips public status route" {

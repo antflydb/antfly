@@ -27,7 +27,7 @@ export const PipelineDetailPanel: React.FC<PipelineDetailPanelProps> = ({
     <Collapsible open={open && step !== null}>
       <CollapsibleContent>
         {step && (
-          <div className="mt-4 p-4 rounded-lg border border-border/50 bg-muted/10">
+          <div className="mt-4 p-4 rounded-none border border-border/50 bg-muted/10">
             <div className="flex items-center gap-2 mb-3">
               <h4 className="text-sm font-medium">{step.label}</h4>
               {step.startTime && step.endTime && (
@@ -51,7 +51,7 @@ function renderStepContent(
 ): React.ReactNode {
   if (step.status === "error" && typeof step.data === "string") {
     return (
-      <div className="af-status-text-error af-status-surface-error text-sm p-2 rounded">
+      <div className="af-status-text-error af-status-surface-error text-sm p-2 rounded-none">
         {step.data}
       </div>
     );
@@ -83,7 +83,7 @@ function renderStepContent(
             </div>
           )}
           {c.reasoning && (
-            <div className="p-2 bg-muted/50 rounded text-muted-foreground">{c.reasoning}</div>
+            <div className="p-2 bg-muted/50 rounded-none text-muted-foreground">{c.reasoning}</div>
           )}
         </div>
       );
@@ -97,7 +97,7 @@ function renderStepContent(
           {data.filterApplied && (
             <div>
               <span className="text-muted-foreground">Filter:</span>{" "}
-              <code className="bg-muted px-1 rounded">{data.filterApplied}</code>
+              <code className="bg-muted px-1 rounded-none">{data.filterApplied}</code>
             </div>
           )}
           <div className="flex items-center gap-2">
@@ -108,7 +108,7 @@ function renderStepContent(
           {data.hits.length > 0 && (
             <div className="space-y-1 max-h-48 overflow-y-auto">
               {data.hits.map((hit, i) => (
-                <div key={hit._id || i} className="p-2 rounded border bg-background text-xs">
+                <div key={hit._id || i} className="p-2 rounded-none border bg-background text-xs">
                   <div className="flex items-center justify-between">
                     <span className="font-medium truncate">{hit._id}</span>
                     <Badge variant="secondary" className="text-[10px]">
@@ -237,7 +237,7 @@ function renderStepContent(
               key={q}
               type="button"
               onClick={() => onFollowupClick?.(q)}
-              className="w-full text-left text-sm p-2 rounded hover:bg-muted/50 transition-colors text-muted-foreground hover:text-foreground"
+              className="w-full text-left text-sm p-2 rounded-none hover:bg-muted/50 transition-colors text-muted-foreground hover:text-foreground"
             >
               {q}
             </button>

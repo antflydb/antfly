@@ -3,12 +3,10 @@
     "name": "knn_sparse",
     "request": {
       "index_name": "sp_v1",
-      "query": {
-        "sparse_knn": {
-          "indices": [0],
-          "values": [1.0],
-          "k": 1
-        }
+      "sparse": {
+        "indices": [0],
+        "values": [1.0],
+        "k": 1
       },
       "limit": 1,
       "offset": 0,

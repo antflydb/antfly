@@ -7,7 +7,7 @@ import (
 	"slices"
 	"strings"
 
-	termitev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/termite/v1alpha1"
+	inferencev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -82,16 +82,16 @@ func (r *AntflyCluster) Default() {
 		r.Spec.Swarm.Health.Port = 4200
 	}
 
-	if r.Spec.Swarm.Termite == nil {
-		r.Spec.Swarm.Termite = &SwarmTermiteSpec{
+	if r.Spec.Swarm.Inference == nil {
+		r.Spec.Swarm.Inference = &SwarmInferenceSpec{
 			Enabled: true,
 			APIURL:  "http://0.0.0.0:11433",
 		}
 		return
 	}
 
-	if r.Spec.Swarm.Termite.APIURL == "" {
-		r.Spec.Swarm.Termite.APIURL = "http://0.0.0.0:11433"
+	if r.Spec.Swarm.Inference.APIURL == "" {
+		r.Spec.Swarm.Inference.APIURL = "http://0.0.0.0:11433"
 	}
 }
 
@@ -147,7 +147,7 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 		allErrors = append(allErrors, err.Error())
 	}
 
-	if err := r.validateTermiteSpec(); err != nil {
+	if err := r.validateInferenceSpec(); err != nil {
 		allErrors = append(allErrors, err.Error())
 	}
 
@@ -196,85 +196,85 @@ func (r *AntflyCluster) validateSecretStore() error {
 	return nil
 }
 
-func (r *AntflyCluster) validateTermiteSpec() error {
-	if r.Spec.Termite == nil {
+func (r *AntflyCluster) validateInferenceSpec() error {
+	if r.Spec.Inference == nil {
 		return nil
 	}
 
-	termite := r.Spec.Termite
-	mode := termite.modeOrDefault()
+	inference := r.Spec.Inference
+	mode := inference.modeOrDefault()
 	var validationErrors []string
 
 	switch mode {
-	case AntflyTermiteModeDisabled:
-		if len(termite.ManagedPools) > 0 || len(termite.SharedPools) > 0 || len(termite.PlatformPools) > 0 {
-			validationErrors = append(validationErrors, "spec.termite must not set pools when mode=Disabled")
+	case AntflyInferenceModeDisabled:
+		if len(inference.ManagedPools) > 0 || len(inference.SharedPools) > 0 || len(inference.PlatformPools) > 0 {
+			validationErrors = append(validationErrors, "spec.inference must not set pools when mode=Disabled")
 		}
-	case AntflyTermiteModeManaged:
-		if len(termite.ManagedPools) == 0 {
-			validationErrors = append(validationErrors, "spec.termite.managedPools is required when mode=Managed")
+	case AntflyInferenceModeManaged:
+		if len(inference.ManagedPools) == 0 {
+			validationErrors = append(validationErrors, "spec.inference.managedPools is required when mode=Managed")
 		}
-		if len(termite.SharedPools) > 0 || len(termite.PlatformPools) > 0 {
-			validationErrors = append(validationErrors, "spec.termite shared pool references are only valid when mode=SharedRef or mode=PlatformShared")
+		if len(inference.SharedPools) > 0 || len(inference.PlatformPools) > 0 {
+			validationErrors = append(validationErrors, "spec.inference shared pool references are only valid when mode=SharedRef or mode=PlatformShared")
 		}
-		for i, managed := range termite.ManagedPools {
-			if len(termite.ManagedPools) > 1 && strings.TrimSpace(managed.Name) == "" {
-				validationErrors = append(validationErrors, fmt.Sprintf("spec.termite.managedPools[%d].name is required when multiple managed pools are set", i))
+		for i, managed := range inference.ManagedPools {
+			if len(inference.ManagedPools) > 1 && strings.TrimSpace(managed.Name) == "" {
+				validationErrors = append(validationErrors, fmt.Sprintf("spec.inference.managedPools[%d].name is required when multiple managed pools are set", i))
 			}
-			pool := &termitev1alpha1.TermitePool{
+			pool := &inferencev1alpha1.InferencePool{
 				Spec: *managed.Spec.DeepCopy(),
 			}
-			if err := pool.ValidateTermitePool(); err != nil {
-				validationErrors = append(validationErrors, fmt.Sprintf("spec.termite.managedPools[%d].spec is invalid: %v", i, err))
+			if err := pool.ValidateInferencePool(); err != nil {
+				validationErrors = append(validationErrors, fmt.Sprintf("spec.inference.managedPools[%d].spec is invalid: %v", i, err))
 			}
 		}
-	case AntflyTermiteModeSharedRef:
-		if len(termite.SharedPools) == 0 {
-			validationErrors = append(validationErrors, "spec.termite.sharedPools is required when mode=SharedRef")
+	case AntflyInferenceModeSharedRef:
+		if len(inference.SharedPools) == 0 {
+			validationErrors = append(validationErrors, "spec.inference.sharedPools is required when mode=SharedRef")
 		}
-		if len(termite.ManagedPools) > 0 || len(termite.PlatformPools) > 0 {
-			validationErrors = append(validationErrors, "spec.termite.managedPools and platformPools are not valid when mode=SharedRef")
+		if len(inference.ManagedPools) > 0 || len(inference.PlatformPools) > 0 {
+			validationErrors = append(validationErrors, "spec.inference.managedPools and platformPools are not valid when mode=SharedRef")
 		}
-		validateTermitePoolRefs("spec.termite.sharedPools", termite.SharedPools, &validationErrors)
-	case AntflyTermiteModePlatformShared:
-		if len(termite.PlatformPools) == 0 {
-			validationErrors = append(validationErrors, "spec.termite.platformPools is required when mode=PlatformShared")
+		validateInferencePoolRefs("spec.inference.sharedPools", inference.SharedPools, &validationErrors)
+	case AntflyInferenceModePlatformShared:
+		if len(inference.PlatformPools) == 0 {
+			validationErrors = append(validationErrors, "spec.inference.platformPools is required when mode=PlatformShared")
 		}
-		if len(termite.ManagedPools) > 0 || len(termite.SharedPools) > 0 {
-			validationErrors = append(validationErrors, "spec.termite.managedPools and sharedPools are not valid when mode=PlatformShared")
+		if len(inference.ManagedPools) > 0 || len(inference.SharedPools) > 0 {
+			validationErrors = append(validationErrors, "spec.inference.managedPools and sharedPools are not valid when mode=PlatformShared")
 		}
-		validateTermitePoolRefs("spec.termite.platformPools", termite.PlatformPools, &validationErrors)
+		validateInferencePoolRefs("spec.inference.platformPools", inference.PlatformPools, &validationErrors)
 	default:
-		validationErrors = append(validationErrors, fmt.Sprintf("spec.termite.mode %q is invalid", mode))
+		validationErrors = append(validationErrors, fmt.Sprintf("spec.inference.mode %q is invalid", mode))
 	}
 
 	if len(validationErrors) > 0 {
-		return fmt.Errorf("spec.termite is invalid:\n  - %s", strings.Join(validationErrors, "\n  - "))
+		return fmt.Errorf("spec.inference is invalid:\n  - %s", strings.Join(validationErrors, "\n  - "))
 	}
 
 	return nil
 }
 
-func (s *AntflyTermiteSpec) modeOrDefault() AntflyTermiteMode {
+func (s *AntflyInferenceSpec) modeOrDefault() AntflyInferenceMode {
 	if s == nil {
-		return AntflyTermiteModeDisabled
+		return AntflyInferenceModeDisabled
 	}
 	if s.Mode != "" {
 		return s.Mode
 	}
 	if len(s.SharedPools) > 0 {
-		return AntflyTermiteModeSharedRef
+		return AntflyInferenceModeSharedRef
 	}
 	if len(s.PlatformPools) > 0 {
-		return AntflyTermiteModePlatformShared
+		return AntflyInferenceModePlatformShared
 	}
 	if len(s.ManagedPools) > 0 {
-		return AntflyTermiteModeManaged
+		return AntflyInferenceModeManaged
 	}
-	return AntflyTermiteModeManaged
+	return AntflyInferenceModeManaged
 }
 
-func validateTermitePoolRefs(path string, refs []TermitePoolReference, validationErrors *[]string) {
+func validateInferencePoolRefs(path string, refs []InferencePoolReference, validationErrors *[]string) {
 	for i, ref := range refs {
 		if strings.TrimSpace(ref.Name) == "" {
 			*validationErrors = append(*validationErrors, fmt.Sprintf("%s[%d].name is required", path, i))
@@ -1063,7 +1063,7 @@ func (r *AntflyCluster) validateProductTierMapping() error {
 	validateTierToken("spec.productTier.swarmTier", tier.SwarmTier, false)
 	validateTierToken("spec.productTier.metadataTier", tier.MetadataTier, false)
 	validateTierToken("spec.productTier.dataTier", tier.DataTier, false)
-	validateTierToken("spec.productTier.termiteTier", tier.TermiteTier, false)
+	validateTierToken("spec.productTier.inferenceTier", tier.InferenceTier, false)
 
 	if r.isSwarmMode() {
 		if r.Spec.Swarm == nil {
@@ -1091,15 +1091,15 @@ func (r *AntflyCluster) validateProductTierMapping() error {
 		}
 	}
 
-	if tier.TermiteTier != "" {
-		if r.Spec.Termite == nil {
-			errors = append(errors, "spec.termite is required when spec.productTier.termiteTier is set")
-		} else if r.Spec.Termite.modeOrDefault() != AntflyTermiteModeManaged {
-			errors = append(errors, "spec.termite.mode must be Managed when spec.productTier.termiteTier is set")
+	if tier.InferenceTier != "" {
+		if r.Spec.Inference == nil {
+			errors = append(errors, "spec.inference is required when spec.productTier.inferenceTier is set")
+		} else if r.Spec.Inference.modeOrDefault() != AntflyInferenceModeManaged {
+			errors = append(errors, "spec.inference.mode must be Managed when spec.productTier.inferenceTier is set")
 		} else {
-			for i, pool := range r.Spec.Termite.ManagedPools {
+			for i, pool := range r.Spec.Inference.ManagedPools {
 				if pool.Spec.Resources == nil {
-					errors = append(errors, fmt.Sprintf("spec.termite.managedPools[%d].spec.resources is required when spec.productTier.termiteTier is set", i))
+					errors = append(errors, fmt.Sprintf("spec.inference.managedPools[%d].spec.resources is required when spec.productTier.inferenceTier is set", i))
 				}
 			}
 		}
@@ -1181,17 +1181,17 @@ func (r *AntflyCluster) validateSwarmConfig() error {
 		return nil
 	}
 
-	if swarm.Termite != nil && swarm.Termite.Enabled && strings.TrimSpace(swarm.Termite.APIURL) == "" {
-		return fmt.Errorf("spec.swarm.termite.apiURL must be set when termite is enabled")
+	if swarm.Inference != nil && swarm.Inference.Enabled && strings.TrimSpace(swarm.Inference.APIURL) == "" {
+		return fmt.Errorf("spec.swarm.inference.apiURL must be set when inference is enabled")
 	}
 
-	if swarm.Termite != nil && strings.TrimSpace(swarm.Termite.APIURL) != "" {
-		parsed, err := url.Parse(swarm.Termite.APIURL)
+	if swarm.Inference != nil && strings.TrimSpace(swarm.Inference.APIURL) != "" {
+		parsed, err := url.Parse(swarm.Inference.APIURL)
 		if err != nil {
-			return fmt.Errorf("spec.swarm.termite.apiURL is invalid: %w", err)
+			return fmt.Errorf("spec.swarm.inference.apiURL is invalid: %w", err)
 		}
 		if parsed.Scheme == "" || parsed.Host == "" {
-			return fmt.Errorf("spec.swarm.termite.apiURL must include a scheme and host")
+			return fmt.Errorf("spec.swarm.inference.apiURL must include a scheme and host")
 		}
 	}
 

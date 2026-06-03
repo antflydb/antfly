@@ -19,10 +19,11 @@ const ArrayList = std.ArrayList;
 const backup_codec = @import("backup_codec.zig");
 const internal_keys = @import("internal_keys.zig");
 const docstore_mod = @import("docstore.zig");
+const doc_identity = @import("db/doc_identity.zig");
+const enrichment_artifact_codec = @import("db/enrichment/artifact_codec.zig");
 const DocStore = docstore_mod.DocStore;
 const KeyEncoder = docstore_mod.KeyEncoder;
 const KVPair = docstore_mod.KVPair;
-const OwnedKVPair = docstore_mod.OwnedKVPair;
 
 /// Target batch size in bytes before flushing a document/embedding/edge batch.
 const batch_target_bytes: usize = 4 * 1024 * 1024;
@@ -70,6 +71,10 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     defer doc_batch.deinit(alloc);
     var doc_batch_bytes: usize = 0;
 
+    var identity_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
+    defer identity_batch.deinit(alloc);
+    var identity_batch_bytes: usize = 0;
+
     // Embeddings keyed by index name
     var emb_batches = std.StringHashMapUnmanaged(EmbeddingBatch).empty;
     defer {
@@ -95,6 +100,19 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     var counts = Counts{};
 
     for (pairs) |kv| {
+        if (kv.key.len > 0 and kv.key[0] == internal_keys.identity_namespace) {
+            try identity_batch.append(alloc, .{
+                .key = try alloc.dupe(u8, kv.key),
+                .value = try alloc.dupe(u8, kv.value),
+            });
+            identity_batch_bytes += kv.key.len + kv.value.len;
+            if (identity_batch_bytes >= batch_target_bytes) {
+                try flushIdentityBatch(alloc, out, &identity_batch);
+                identity_batch_bytes = 0;
+            }
+            continue;
+        }
+
         // Binary internal keys (0x01 prefix)
         if (internal_keys.isInternalUserKey(kv.key)) {
             if (internal_keys.isPrimaryDocumentKey(kv.key)) {
@@ -115,6 +133,11 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
                 }
             } else if (internal_keys.isEmbeddingArtifactKey(kv.key)) {
                 try collectEmbedding(alloc, &emb_batches, kv.key, kv.value);
+            } else if (internal_keys.isGraphEdgeArtifactKey(kv.key)) {
+                try collectGraphEdgeArtifact(alloc, &edge_batches, kv.key, kv.value);
+            } else if (try parseStandaloneGraphIndexEdgeKeyAlloc(alloc, kv.key)) |parsed| {
+                defer parsed.deinit(alloc);
+                try appendEdgeBatchEntry(alloc, &edge_batches, parsed.index_name, parsed.source, parsed.target, parsed.edge_type, kv.value);
             }
             // Skip: TTL, summary, chunk, derived embedding keys
             continue;
@@ -125,19 +148,7 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
             // Only export outgoing edges (ending with ":o")
             if (kv.key.len >= 2 and kv.key[kv.key.len - 1] == 'o' and kv.key[kv.key.len - 2] == ':') {
                 const parsed = KeyEncoder.parseEdgeKey(kv.key) orelse continue;
-                const idx_name = try alloc.dupe(u8, parsed.index_name);
-                const gop = try edge_batches.getOrPut(alloc, idx_name);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = EdgeBatch.init();
-                } else {
-                    alloc.free(idx_name);
-                }
-                try gop.value_ptr.entries.append(alloc, .{
-                    .source_key = try alloc.dupe(u8, parsed.source),
-                    .target_key = try alloc.dupe(u8, parsed.target),
-                    .edge_type = try alloc.dupe(u8, parsed.edge_type),
-                    .value = try alloc.dupe(u8, kv.value),
-                });
+                try appendEdgeBatchEntry(alloc, &edge_batches, parsed.index_name, parsed.source, parsed.target, parsed.edge_type, kv.value);
             }
             // Skip incoming edges (":i" suffix)
         }
@@ -147,6 +158,9 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     // Flush remaining documents
     if (doc_batch.items.len > 0) {
         try flushDocBatch(alloc, out, &doc_batch, &counts);
+    }
+    if (identity_batch.items.len > 0) {
+        try flushIdentityBatch(alloc, out, &identity_batch);
     }
 
     // Flush embedding batches
@@ -240,6 +254,66 @@ const EdgeBatch = struct {
     }
 };
 
+const ParsedStandaloneGraphEdgeKey = struct {
+    source: []u8,
+    index_name: []u8,
+    edge_type: []u8,
+    target: []u8,
+
+    fn deinit(self: ParsedStandaloneGraphEdgeKey, alloc: Allocator) void {
+        alloc.free(self.source);
+        alloc.free(self.index_name);
+        alloc.free(self.edge_type);
+        alloc.free(self.target);
+    }
+};
+
+fn parseStandaloneGraphIndexEdgeKeyAlloc(alloc: Allocator, key: []const u8) !?ParsedStandaloneGraphEdgeKey {
+    if (!internal_keys.isInternalUserKey(key)) return null;
+    const doc_term = internal_keys.findComponentTerminator(key, 1) orelse return null;
+    const source = try internal_keys.decodeBodyAlloc(alloc, key[1..doc_term]);
+    var source_owned = true;
+    defer if (source_owned) alloc.free(source);
+
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != internal_keys.artifact_kind) return null;
+    pos += 1;
+
+    if (!internal_keys.componentEquals(key, pos, "graph_index")) return null;
+    pos = (internal_keys.findComponentTerminator(key, pos) orelse return null) + 2;
+
+    const index_term = internal_keys.findComponentTerminator(key, pos) orelse return null;
+    const index_name = try internal_keys.decodeBodyAlloc(alloc, key[pos..index_term]);
+    var index_owned = true;
+    defer if (index_owned) alloc.free(index_name);
+    pos = index_term + 2;
+
+    if (pos >= key.len or key[pos] != internal_keys.graph_edge_record_kind) return null;
+    pos += 1;
+
+    const edge_type_term = internal_keys.findComponentTerminator(key, pos) orelse return null;
+    const edge_type = try internal_keys.decodeBodyAlloc(alloc, key[pos..edge_type_term]);
+    var edge_type_owned = true;
+    defer if (edge_type_owned) alloc.free(edge_type);
+    pos = edge_type_term + 2;
+
+    const target_term = internal_keys.findComponentTerminator(key, pos) orelse return null;
+    if (target_term + 2 != key.len) return null;
+    const target = try internal_keys.decodeBodyAlloc(alloc, key[pos..target_term]);
+    errdefer alloc.free(target);
+
+    source_owned = false;
+    index_owned = false;
+    edge_type_owned = false;
+
+    return .{
+        .source = source,
+        .index_name = index_name,
+        .edge_type = edge_type,
+        .target = target,
+    };
+}
+
 fn flushDocBatch(
     alloc: Allocator,
     out: *ArrayList(u8),
@@ -252,6 +326,22 @@ fn flushDocBatch(
     counts.documents += batch.items.len;
 
     // Free owned entry data
+    for (batch.items) |e| {
+        alloc.free(e.key);
+        alloc.free(e.value);
+    }
+    batch.clearRetainingCapacity();
+}
+
+fn flushIdentityBatch(
+    alloc: Allocator,
+    out: *ArrayList(u8),
+    batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
+) !void {
+    const encoded = try backup_codec.encodeKeyValueBatch(alloc, batch.items);
+    defer alloc.free(encoded);
+    try backup_codec.writeBlock(out, alloc, .doc_identity_batch, encoded);
+
     for (batch.items) |e| {
         alloc.free(e.key);
         alloc.free(e.value);
@@ -298,14 +388,66 @@ fn collectEmbedding(
     });
 }
 
+fn collectGraphEdgeArtifact(
+    alloc: Allocator,
+    batches: *std.StringHashMapUnmanaged(EdgeBatch),
+    key: []const u8,
+    value: []const u8,
+) !void {
+    const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, key)) orelse return;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.index_name);
+        alloc.free(parsed.edge_type);
+        alloc.free(parsed.target_doc_key);
+    }
+
+    try appendEdgeBatchEntry(alloc, batches, parsed.index_name, parsed.doc_key, parsed.target_doc_key, parsed.edge_type, value);
+}
+
+fn appendEdgeBatchEntry(
+    alloc: Allocator,
+    batches: *std.StringHashMapUnmanaged(EdgeBatch),
+    index_name: []const u8,
+    source_key: []const u8,
+    target_key: []const u8,
+    edge_type: []const u8,
+    value: []const u8,
+) !void {
+    const idx_name = try alloc.dupe(u8, index_name);
+    const gop = try batches.getOrPut(alloc, idx_name);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = EdgeBatch.init();
+    } else {
+        alloc.free(idx_name);
+    }
+
+    try gop.value_ptr.entries.append(alloc, .{
+        .source_key = try alloc.dupe(u8, source_key),
+        .target_key = try alloc.dupe(u8, target_key),
+        .edge_type = try alloc.dupe(u8, edge_type),
+        .value = try alloc.dupe(u8, value),
+    });
+}
+
 // ============================================================================
 // Import
 // ============================================================================
 
+pub const ImportOptions = struct {
+    identity_namespace: ?doc_identity.Namespace = null,
+    prefer_existing_identity_namespace: bool = false,
+};
+
 /// Import AFB data into the DocStore.
 pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !void {
+    return try importPortableWithOptions(alloc, store, data, .{});
+}
+
+pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
     var reader = backup_codec.SliceReader.init(data);
     _ = try reader.readHeader();
+    var imported_identity = false;
 
     while (reader.pos < reader.data.len) {
         const block = try reader.readBlock(alloc);
@@ -313,6 +455,10 @@ pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !voi
 
         switch (block.block_type) {
             .document_batch => try importDocumentBatch(alloc, store, block.payload),
+            .doc_identity_batch => {
+                try importIdentityBatch(alloc, store, block.payload);
+                imported_identity = true;
+            },
             .embedding_batch => try importEmbeddingBatch(alloc, store, block.payload),
             .edge_batch => try importEdgeBatch(alloc, store, block.payload),
             // Skip: sparse, summary, chunk, transaction (rebuilt by enrichment)
@@ -320,6 +466,18 @@ pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !voi
             else => {},
         }
     }
+
+    if (imported_identity) {
+        try doc_identity.validateStoreAlloc(alloc, store);
+        try validateImportedIdentityNamespace(store, opts);
+    }
+}
+
+fn validateImportedIdentityNamespace(store: *DocStore, opts: ImportOptions) !void {
+    const expected = opts.identity_namespace orelse return;
+    if (opts.prefer_existing_identity_namespace) return;
+    const stored = (try doc_identity.loadNamespaceFromStore(store)) orelse return error.IdentityNamespaceMismatch;
+    if (!stored.eql(expected)) return error.IdentityNamespaceMismatch;
 }
 
 fn importDocumentBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
@@ -345,6 +503,31 @@ fn importDocumentBatch(alloc: Allocator, store: *DocStore, payload: []const u8) 
         const store_key = try internal_keys.documentKeyAlloc(alloc, e.key);
         try owned_keys.append(alloc, store_key);
         try writes.append(alloc, .{ .key = store_key, .value = e.value });
+    }
+
+    if (writes.items.len > 0) {
+        try store.putBatch(writes.items, &.{});
+    }
+}
+
+fn importIdentityBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer {
+        for (entries) |e| {
+            alloc.free(e.key);
+            alloc.free(e.value);
+        }
+        alloc.free(entries);
+    }
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer writes.deinit(alloc);
+
+    for (entries) |e| {
+        if (e.key.len == 0 or e.key[0] != internal_keys.identity_namespace) {
+            return error.InvalidDocIdentityBatch;
+        }
+        try writes.append(alloc, .{ .key = e.key, .value = e.value });
     }
 
     if (writes.items.len > 0) {
@@ -413,28 +596,40 @@ fn importEdgeBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !voi
 
     var writes = std.ArrayListUnmanaged(KVPair).empty;
     defer writes.deinit(alloc);
-    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    var owned = std.ArrayListUnmanaged([]u8).empty;
     defer {
-        for (owned_keys.items) |k| alloc.free(k);
-        owned_keys.deinit(alloc);
+        for (owned.items) |item| alloc.free(item);
+        owned.deinit(alloc);
     }
 
     for (result.entries) |e| {
-        // Build colon-delimited edge key
-        const key_len = e.source_key.len + 3 + result.index_name.len + 5 + e.edge_type.len + 1 + e.target_key.len + 2;
-        const edge_key = try alloc.alloc(u8, key_len);
-        const written = std.fmt.bufPrint(edge_key, "{s}:i:{s}:out:{s}:{s}:o", .{
-            e.source_key, result.index_name, e.edge_type, e.target_key,
-        }) catch unreachable;
-        const owned_key = try alloc.dupe(u8, written);
-        alloc.free(edge_key);
-        try owned_keys.append(alloc, owned_key);
-        try writes.append(alloc, .{ .key = owned_key, .value = e.value });
+        const owned_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, e.source_key, result.index_name, e.edge_type, e.target_key);
+        errdefer alloc.free(owned_key);
+        const owned_value = try graphArtifactValueFromPortableEdgeValueAlloc(alloc, e.value);
+        errdefer alloc.free(owned_value);
+        try owned.append(alloc, owned_key);
+        try owned.append(alloc, owned_value);
+        try writes.append(alloc, .{ .key = owned_key, .value = owned_value });
     }
 
     if (writes.items.len > 0) {
         try store.putBatch(writes.items, &.{});
     }
+}
+
+fn graphArtifactValueFromPortableEdgeValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
+    if (enrichment_artifact_codec.decodeHeader(value)) |header| {
+        if (header.kind == .graph_edge) return try alloc.dupe(u8, value);
+    } else |_| {}
+
+    if (value.len >= 24) {
+        const weight = @as(f64, @bitCast(std.mem.readInt(u64, value[0..][0..8], .little)));
+        const created_at = std.mem.readInt(u64, value[8..][0..8], .little);
+        const updated_at = std.mem.readInt(u64, value[16..][0..8], .little);
+        return try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, weight, created_at, updated_at, value[24..]);
+    }
+
+    return try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 1.0, 0, 0, value);
 }
 
 /// Decode an edge batch payload (mirrors backup_codec.encodeEdgeBatch).
@@ -523,6 +718,14 @@ fn openTestStore(alloc: Allocator, tmp: *std.testing.TmpDir) !DocStore {
     return DocStore.open(alloc, path_z, .{});
 }
 
+fn freeAllocatedKVPairs(alloc: Allocator, pairs: *std.ArrayListUnmanaged(KVPair)) void {
+    for (pairs.items) |pair| {
+        alloc.free(pair.key);
+        alloc.free(pair.value);
+    }
+    pairs.deinit(alloc);
+}
+
 test "exportPortable empty store" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -581,6 +784,184 @@ test "export and import documents round trip" {
         const val = try dst.get(alloc, store_key);
         defer alloc.free(val);
         try std.testing.expectEqualStrings(expected, val);
+    }
+}
+
+test "export and import preserves doc identity metadata" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    for ([_][]const u8{ "doc:a", "doc:b" }) |doc_id| {
+        const store_key = try internal_keys.documentKeyAlloc(alloc, doc_id);
+        defer alloc.free(store_key);
+        try src.putBatch(&.{.{ .key = store_key, .value = "{\"body\":\"identity\"}" }}, &.{});
+    }
+
+    var initial_identity = std.ArrayListUnmanaged(KVPair).empty;
+    defer freeAllocatedKVPairs(alloc, &initial_identity);
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &src,
+        7,
+        9,
+        10,
+        &initial_identity,
+        &.{ "doc:a", "doc:b" },
+        &.{},
+    );
+    try src.putBatch(initial_identity.items, &.{});
+
+    var tombstone_identity = std.ArrayListUnmanaged(KVPair).empty;
+    defer freeAllocatedKVPairs(alloc, &tombstone_identity);
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &src,
+        7,
+        9,
+        11,
+        &tombstone_identity,
+        &.{},
+        &.{"doc:b"},
+    );
+    try src.putBatch(tombstone_identity.items, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, out.items);
+
+    var txn = try dst.beginProbeTxn();
+    defer txn.abort();
+
+    const namespace = (try doc_identity.loadNamespaceTxn(&txn)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(namespace.eql(.{ .table_id = 7, .shard_id = 9 }));
+    try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 1), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a"));
+    try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 2), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b"));
+
+    const doc_b = (try doc_identity.lookupDocIdTxn(alloc, &txn, 2)) orelse return error.TestExpectedEqual;
+    defer alloc.free(doc_b);
+    try std.testing.expectEqualStrings("doc:b", doc_b);
+
+    const state_b = (try doc_identity.lookupStateTxn(&txn, 2)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 10), state_b.created_generation);
+    try std.testing.expectEqual(@as(u64, 11), state_b.deleted_generation.?);
+    try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 2), try doc_identity.lookupCanonicalOrdinalTxn(&txn, state_b.canonical_doc_id));
+
+    const stats = try doc_identity.fullStatsFromStore(&dst);
+    try std.testing.expectEqual(@as(doc_identity.DocOrdinal, 3), stats.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 2), stats.allocated_ordinals);
+    try std.testing.expectEqual(@as(u64, 1), stats.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 1), stats.tombstone_ordinals);
+}
+
+test "import rejects doc identity metadata with invalid canonical ids" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const doc_id = "doc:corrupt";
+    const store_key = try internal_keys.documentKeyAlloc(alloc, doc_id);
+    defer alloc.free(store_key);
+    try src.putBatch(&.{.{ .key = store_key, .value = "{\"body\":\"identity\"}" }}, &.{});
+
+    var identity_writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer freeAllocatedKVPairs(alloc, &identity_writes);
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &src,
+        7,
+        9,
+        10,
+        &identity_writes,
+        &.{doc_id},
+        &.{},
+    );
+    try src.putBatch(identity_writes.items, &.{});
+
+    const state_key = internal_keys.identityOrdinalStateKey(1);
+    var corrupt_state: [25]u8 = undefined;
+    std.mem.writeInt(u64, corrupt_state[0..8], 0xdead_beef, .big);
+    std.mem.writeInt(u64, corrupt_state[8..16], 10, .big);
+    corrupt_state[16] = 0;
+    @memset(corrupt_state[17..25], 0);
+    try src.putBatch(&.{.{ .key = state_key[0..], .value = corrupt_state[0..] }}, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try std.testing.expectError(error.InvalidDocIdentity, importPortable(alloc, &dst, out.items));
+}
+
+test "import rejects doc identity namespace mismatch unless preserving existing namespace" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const source_namespace = doc_identity.Namespace{ .table_id = 17, .shard_id = 1701, .range_id = 17001 };
+    const target_namespace = doc_identity.Namespace{ .table_id = 17, .shard_id = 1702, .range_id = 17002 };
+    const doc_id = "doc:portable-identity";
+    const store_key = try internal_keys.documentKeyAlloc(alloc, doc_id);
+    defer alloc.free(store_key);
+    try src.putBatch(&.{.{ .key = store_key, .value = "{\"body\":\"identity\"}" }}, &.{});
+
+    var identity_writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer freeAllocatedKVPairs(alloc, &identity_writes);
+    try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+        alloc,
+        &src,
+        source_namespace,
+        10,
+        &identity_writes,
+        &.{doc_id},
+        &.{},
+    );
+    try src.putBatch(identity_writes.items, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    {
+        var tmp_dst = std.testing.tmpDir(.{});
+        defer tmp_dst.cleanup();
+        var dst = try openTestStore(alloc, &tmp_dst);
+        defer dst.close();
+        try std.testing.expectError(error.IdentityNamespaceMismatch, importPortableWithOptions(alloc, &dst, out.items, .{
+            .identity_namespace = target_namespace,
+        }));
+    }
+
+    {
+        var tmp_dst = std.testing.tmpDir(.{});
+        defer tmp_dst.cleanup();
+        var dst = try openTestStore(alloc, &tmp_dst);
+        defer dst.close();
+        try importPortableWithOptions(alloc, &dst, out.items, .{
+            .identity_namespace = target_namespace,
+            .prefer_existing_identity_namespace = true,
+        });
+        const restored_namespace = (try doc_identity.loadNamespaceFromStore(&dst)) orelse return error.TestExpectedEqual;
+        try std.testing.expect(restored_namespace.eql(source_namespace));
     }
 }
 
@@ -643,7 +1024,7 @@ test "export and import embeddings round trip" {
     }
 }
 
-test "export and import edges round trip" {
+test "export and import graph edge artifacts round trip with arbitrary ids" {
     const alloc = std.testing.allocator;
 
     var tmp_src = std.testing.tmpDir(.{});
@@ -652,18 +1033,18 @@ test "export and import edges round trip" {
     defer src.close();
 
     // Write source and target documents
-    for ([_][]const u8{ "alice", "bob" }) |dk| {
+    const source_doc = "alice\x00:i:\xff";
+    const target_doc = "\x00bob:out:\xff";
+    for ([_][]const u8{ source_doc, target_doc }) |dk| {
         const store_key = try internal_keys.documentKeyAlloc(alloc, dk);
         defer alloc.free(store_key);
-        const val = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\"}}", .{dk});
-        defer alloc.free(val);
-        try src.putBatch(&.{.{ .key = store_key, .value = val }}, &.{});
+        try src.putBatch(&.{.{ .key = store_key, .value = "{}" }}, &.{});
     }
 
-    // Write an outgoing edge: alice -> bob
-    var edge_buf: [256]u8 = undefined;
-    const edge_key = KeyEncoder.makeEdgeKey(&edge_buf, "alice", "social", "follows", "bob");
-    const edge_val = "{}";
+    const edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, source_doc, "social\x00idx", "follows:fast", target_doc);
+    defer alloc.free(edge_key);
+    const edge_val = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 2.5, 11, 22, "{\"ok\":true}");
+    defer alloc.free(edge_val);
     try src.putBatch(&.{.{ .key = edge_key, .value = edge_val }}, &.{});
 
     // Export
@@ -678,12 +1059,18 @@ test "export and import edges round trip" {
     defer dst.close();
     try importPortable(alloc, &dst, out.items);
 
-    // Verify edge
+    // Verify edge restored under the structured graph artifact key, not a colon key.
     {
-        const restored_edge_key = KeyEncoder.makeEdgeKey(&edge_buf, "alice", "social", "follows", "bob");
+        const restored_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, source_doc, "social\x00idx", "follows:fast", target_doc);
+        defer alloc.free(restored_edge_key);
         const val = try dst.get(alloc, restored_edge_key);
         defer alloc.free(val);
-        try std.testing.expectEqualStrings("{}", val);
+        var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, val);
+        defer decoded.deinit(alloc);
+        try std.testing.expectApproxEqAbs(@as(f64, 2.5), decoded.weight, 0.001);
+        try std.testing.expectEqual(@as(u64, 11), decoded.created_at);
+        try std.testing.expectEqual(@as(u64, 22), decoded.updated_at);
+        try std.testing.expectEqualStrings("{\"ok\":true}", decoded.metadata_json);
     }
 }
 

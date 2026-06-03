@@ -9,7 +9,7 @@ data:
         "1": "http://antfly-metadata-0.antfly-metadata-svc.default.svc.cluster.local:12377"
         "2": "http://antfly-metadata-1.antfly-metadata-svc.default.svc.cluster.local:12377"
         "3": "http://antfly-metadata-2.antfly-metadata-svc.default.svc.cluster.local:12377"
-    termite:
+    inference:
       api_url: "http://127.0.0.1:11433"
     max_shard_size_bytes: 64000000
     replication_factor: 3

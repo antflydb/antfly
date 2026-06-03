@@ -21,7 +21,7 @@ def _get_kwargs(
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/api/v1/transactions/{transaction_id}/commit".format(
+        "url": "/db/v1/transactions/{transaction_id}/commit".format(
             transaction_id=quote(str(transaction_id), safe=""),
         ),
     }

@@ -195,6 +195,7 @@ pub const CommitConflictKind = enum {
     intent_conflict,
     topology_changed,
     participant_unavailable,
+    doc_identity_unavailable,
     session_lease_lost,
     transaction_conflict,
     torn_state,
@@ -1556,6 +1557,18 @@ pub fn participantUnavailableConflict(table_name: []const u8) CommitConflict {
     };
 }
 
+pub fn docIdentityUnavailableConflict(table_name: []const u8) CommitConflict {
+    return .{
+        .table_name = table_name,
+        .key = "",
+        .message = "doc identity unavailable",
+        .kind = .doc_identity_unavailable,
+        .retryable = true,
+        .retry_after_ms = 100,
+        .retry_scope = "doc_identity",
+    };
+}
+
 pub fn decisionConflict(table_name: []const u8) CommitConflict {
     return .{
         .table_name = table_name,
@@ -1772,6 +1785,7 @@ fn classifyConflictKind(message: []const u8) CommitConflictKind {
     if (std.mem.eql(u8, message, "intent conflict")) return .intent_conflict;
     if (isTopologyChangedConflictMessage(message)) return .topology_changed;
     if (std.mem.eql(u8, message, "participant unavailable")) return .participant_unavailable;
+    if (std.mem.eql(u8, message, "doc identity unavailable")) return .doc_identity_unavailable;
     if (std.mem.eql(u8, message, "session lease lost")) return .session_lease_lost;
     if (std.mem.eql(u8, message, "torn transaction state")) return .torn_state;
     return .transaction_conflict;
@@ -1780,6 +1794,7 @@ fn classifyConflictKind(message: []const u8) CommitConflictKind {
 fn isRetryableConflict(message: []const u8) bool {
     return isTopologyChangedConflictMessage(message) or
         std.mem.eql(u8, message, "participant unavailable") or
+        std.mem.eql(u8, message, "doc identity unavailable") or
         std.mem.eql(u8, message, "session lease lost");
 }
 
@@ -1787,6 +1802,7 @@ fn retryAfterMsForKind(kind: CommitConflictKind) ?u32 {
     return switch (kind) {
         .topology_changed => 100,
         .participant_unavailable => 50,
+        .doc_identity_unavailable => 100,
         .session_lease_lost => 25,
         else => null,
     };
@@ -1796,6 +1812,7 @@ fn retryScopeForKind(kind: CommitConflictKind) ?[]const u8 {
     return switch (kind) {
         .topology_changed => "topology",
         .participant_unavailable => "participant",
+        .doc_identity_unavailable => "doc_identity",
         .session_lease_lost => "session",
         else => null,
     };
@@ -1807,6 +1824,7 @@ fn conflictKindText(kind: CommitConflictKind) []const u8 {
         .intent_conflict => "intent_conflict",
         .topology_changed => "topology_changed",
         .participant_unavailable => "participant_unavailable",
+        .doc_identity_unavailable => "doc_identity_unavailable",
         .session_lease_lost => "session_lease_lost",
         .transaction_conflict => "transaction_conflict",
         .torn_state => "torn_state",
@@ -1948,7 +1966,33 @@ fn findReadSetIndex(items: []const TransactionReadItem, table_name: []const u8, 
 }
 
 fn readSnapshotMapKey(alloc: std.mem.Allocator, table_name: []const u8, key: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ table_name, key });
+    return try tupleMapKeyAlloc(alloc, &.{ table_name, key });
+}
+
+fn tupleMapKeyAlloc(alloc: std.mem.Allocator, components: []const []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    for (components) |component| {
+        if (component.len > std.math.maxInt(u32)) return error.KeyComponentTooLarge;
+        var len_buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(component.len), .big);
+        try out.appendSlice(alloc, &len_buf);
+        try out.appendSlice(alloc, component);
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+test "transaction read snapshot map keys preserve embedded delimiters" {
+    const alloc = std.testing.allocator;
+
+    const left = try readSnapshotMapKey(alloc, "docs\x00a", "key");
+    defer alloc.free(left);
+    const right = try readSnapshotMapKey(alloc, "docs", "a\x00key");
+    defer alloc.free(right);
+
+    try std.testing.expect(!std.mem.eql(u8, left, right));
 }
 
 fn deinitReadSnapshotMap(alloc: std.mem.Allocator, map: *std.StringArrayHashMapUnmanaged(SessionReadSnapshot)) void {
@@ -3024,6 +3068,27 @@ test "transaction session commit response includes retry hints for participant a
     try std.testing.expectEqual(true, conflict.retryable);
     try std.testing.expectEqual(@as(?u32, 50), conflict.retry_after_ms);
     try std.testing.expectEqualStrings("participant", conflict.retry_scope.?);
+    try std.testing.expect(conflict.participant == null);
+}
+
+test "transaction session commit response includes retry hints for doc identity availability conflicts" {
+    const txn_id = newSessionTxnId(16);
+    const encoded = try encodeSessionCommitResponse(
+        std.testing.allocator,
+        txn_id,
+        "aborted",
+        docIdentityUnavailableConflict("docs"),
+        null,
+    );
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(SessionCommitResponse, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const conflict = parsed.value.conflict.?;
+    try std.testing.expectEqualStrings("doc_identity_unavailable", conflict.kind);
+    try std.testing.expectEqual(true, conflict.retryable);
+    try std.testing.expectEqual(@as(?u32, 100), conflict.retry_after_ms);
+    try std.testing.expectEqualStrings("doc_identity", conflict.retry_scope.?);
     try std.testing.expect(conflict.participant == null);
 }
 

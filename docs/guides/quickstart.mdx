@@ -44,10 +44,10 @@ See the [Downloads page](/docs/downloads) for a complete Docker Compose setup wi
 
 ## Start Antfly
 
-Pull a multimodal embedding model for text and image search. [Termite](/docs/guides/termite) is Antfly's built-in ML inference engine — it runs quantized models locally for fast inference, no external APIs needed.
+Pull a multimodal embedding model for text and image search. [Antfly inference](/docs/guides/inference) is Antfly's built-in ML inference engine — it runs quantized models locally for fast inference, no external APIs needed.
 
 ```bash
-antfly termite pull antflydb/clipclap:gguf:Q4_K_M
+antfly inference pull antflydb/clipclap:gguf:Q4_K_M
 ```
 
 Start Antfly in swarm mode:
@@ -63,7 +63,7 @@ brew services start antfly
 ```
 
 <Callout type="info">
-Swarm mode starts metadata, data nodes, and Termite in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
+Swarm mode starts metadata, data nodes, and Antfly inference in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
 </Callout>
 
 ## Download Sample Data
@@ -99,7 +99,7 @@ antfly table create --table wikipedia \
     "type": "embeddings",
     "template": "{{title}} {{body}}",
     "embedder": {
-      "provider": "termite",
+      "provider": "antfly",
       "model": "antflydb/clipclap"
     },
     "chunker": {
@@ -115,7 +115,7 @@ antfly table create --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/tables/wikipedia \
+curl -X POST http://localhost:8080/db/v1/tables/wikipedia \
   -H "Content-Type: application/json" \
   -d '{
     "indexes": {
@@ -123,7 +123,7 @@ curl -X POST http://localhost:8080/api/v1/tables/wikipedia \
         "type": "embeddings",
         "template": "{{title}} {{body}}",
         "embedder": {
-          "provider": "termite",
+          "provider": "antfly",
           "model": "antflydb/clipclap"
         },
         "chunker": {
@@ -153,7 +153,7 @@ await client.tables.create('wikipedia', {
       type: 'embeddings',
       template: '{{title}} {{body}}',
       embedder: {
-        provider: 'termite',
+        provider: 'antfly',
         model: 'antflydb/clipclap',
       },
       chunker: {
@@ -179,7 +179,7 @@ client.create_table(
             'type': 'embeddings',
             'template': '{{title}} {{body}}',
             'embedder': {
-                'provider': 'termite',
+                'provider': 'inference',
                 'model': 'antflydb/clipclap',
             },
             'chunker': {
@@ -214,7 +214,7 @@ _, err = client.CreateTableWithResponse(
 				"type":     "embeddings",
 				"template": "{{title}} {{body}}",
 				"embedder": map[string]interface{}{
-					"provider": "termite",
+					"provider": "antfly",
 					"model":    "antflydb/clipclap",
 				},
 				"chunker": map[string]interface{}{
@@ -244,7 +244,7 @@ client.create_table("wikipedia", &json!({
             "type": "embeddings",
             "template": "{{title}} {{body}}",
             "embedder": {
-                "provider": "termite",
+                "provider": "antfly",
                 "model": "antflydb/clipclap"
             },
             "chunker": {
@@ -293,7 +293,7 @@ antfly load --table wikipedia \
 ```bash
 # The CLI 'load' command handles batching automatically.
 # With cURL, send documents via the batch endpoint:
-curl -X POST http://localhost:8080/api/v1/tables/wikipedia/batch \
+curl -X POST http://localhost:8080/db/v1/tables/wikipedia/batch \
   -H "Content-Type: application/json" \
   -d '{
     "inserts": {
@@ -455,7 +455,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/query \
+curl -X POST http://localhost:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -572,7 +572,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/query \
+curl -X POST http://localhost:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -672,7 +672,7 @@ Hybrid search combines full-text and semantic search using Reciprocal Rank Fusio
 Pull the reranker model:
 
 ```bash
-antfly termite pull --variants i8 mixedbread-ai/mxbai-rerank-base-v1
+antfly inference pull --variants i8 mixedbread-ai/mxbai-rerank-base-v1
 ```
 
 <Callout type="info">
@@ -698,7 +698,7 @@ antfly query --table wikipedia \
   --fields "title,url" \
   --limit 10 \
   --reranker '{
-      "provider": "termite",
+      "provider": "antfly",
       "model": "mixedbread-ai/mxbai-rerank-base-v1",
       "field": "body"
     }' \
@@ -708,7 +708,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/query \
+curl -X POST http://localhost:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -718,7 +718,7 @@ curl -X POST http://localhost:8080/api/v1/query \
     "fields": ["title", "url"],
     "limit": 10,
     "reranker": {
-      "provider": "termite",
+      "provider": "antfly",
       "model": "mixedbread-ai/mxbai-rerank-base-v1",
       "field": "body"
     },
@@ -737,7 +737,7 @@ const results = await client.query({
   fields: ['title', 'url'],
   limit: 10,
   reranker: {
-    provider: 'termite',
+    provider: 'antfly',
     model: 'mixedbread-ai/mxbai-rerank-base-v1',
     field: 'body',
   },
@@ -756,7 +756,7 @@ results = client.query(
     fields=['title', 'url'],
     limit=10,
     reranker={
-        'provider': 'termite',
+        'provider': 'inference',
         'model': 'mixedbread-ai/mxbai-rerank-base-v1',
         'field': 'body',
     },
@@ -779,7 +779,7 @@ resp, err := client.QueryWithResponse(
 		Fields:         &[]string{"title", "url"},
 		Limit:          intPtr(10),
 		Reranker: &antfly.Reranker{
-			Provider: strPtr("termite"),
+			Provider: strPtr("antfly"),
 			Model:    strPtr("mixedbread-ai/mxbai-rerank-base-v1"),
 			Field:    strPtr("body"),
 		},
@@ -805,7 +805,7 @@ let resp = client
         fields: Some(vec!["title".to_string(), "url".to_string()]),
         limit: Some(10),
         reranker: Some(json!({
-            "provider": "termite",
+            "provider": "antfly",
             "model": "mixedbread-ai/mxbai-rerank-base-v1",
             "field": "body"
         })),
@@ -831,7 +831,7 @@ Search by visual content using ClipClap, a multimodal embedding model that under
 ### Confirm the ClipClap model is available
 
 ```bash
-antfly termite pull antflydb/clipclap:gguf:Q4_K_M
+antfly inference pull antflydb/clipclap:gguf:Q4_K_M
 ```
 
 <Callout type="info">
@@ -858,20 +858,20 @@ antfly index create --table wikipedia \
   --index thumbnail \
   --type embeddings \
   --template "{{media url=thumbnail_url}}" \
-  --embedder '{"provider": "termite", "model": "antflydb/clipclap"}' \
+  --embedder '{"provider": "antfly", "model": "antflydb/clipclap"}' \
   --dimension 512
 ```
   </TabsContent>
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/tables/wikipedia/indexes/thumbnail \
+curl -X POST http://localhost:8080/db/v1/tables/wikipedia/indexes/thumbnail \
   -H "Content-Type: application/json" \
   -d '{
     "type": "embeddings",
     "template": "{{media url=thumbnail_url}}",
     "embedder": {
-      "provider": "termite",
+      "provider": "antfly",
       "model": "antflydb/clipclap"
     },
     "dimension": 512,
@@ -886,7 +886,7 @@ await client.tables.addIndex('wikipedia', 'thumbnail', {
   type: 'embeddings',
   template: '{{media url=thumbnail_url}}',
   embedder: {
-    provider: 'termite',
+    provider: 'antfly',
     model: 'antflydb/clipclap',
   },
   dimension: 512,
@@ -903,7 +903,7 @@ client.add_index(
     type='embeddings',
     template='{{media url=thumbnail_url}}',
     embedder={
-        'provider': 'termite',
+        'provider': 'inference',
         'model': 'antflydb/clipclap',
     },
     dimension=512,
@@ -922,7 +922,7 @@ _, err = client.AddIndexWithResponse(
 		Type:     strPtr("embeddings"),
 		Template: strPtr("{{media url=thumbnail_url}}"),
 		Embedder: &map[string]interface{}{
-			"provider": "termite",
+			"provider": "antfly",
 			"model":    "antflydb/clipclap",
 		},
 		Dimension:      intPtr(512),
@@ -939,7 +939,7 @@ client
         "type": "embeddings",
         "template": "{{media url=thumbnail_url}}",
         "embedder": {
-            "provider": "termite",
+            "provider": "antfly",
             "model": "antflydb/clipclap"
         },
         "dimension": 512,
@@ -978,7 +978,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/query \
+curl -X POST http://localhost:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -1062,11 +1062,11 @@ Combine search with LLM-powered classification and generation using the retrieva
 ### Pull a generation model
 
 ```bash
-antfly termite pull ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_K_M
+antfly inference pull ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_K_M
 ```
 
 <Callout type="info">
-`ggml-org/gemma-4-e2b-it-gguf` runs locally via Termite and supports the full quickstart RAG flow — classification, generation, reasoning, and follow-up questions. For alternative providers, see the [next step](#rag-with-alternative-providers).
+`ggml-org/gemma-4-e2b-it-gguf` runs locally via Antfly inference and supports the full quickstart RAG flow — classification, generation, reasoning, and follow-up questions. For alternative providers, see the [next step](#rag-with-alternative-providers).
 </Callout>
 
 ### Classify and generate
@@ -1091,13 +1091,13 @@ antfly agents retrieval --table wikipedia \
   --fields "title,body" \
   --limit 5 \
   --reranker '{
-      "provider": "termite",
+      "provider": "antfly",
       "model": "mixedbread-ai/mxbai-rerank-base-v1",
       "field": "body"
     }' \
   --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
   --generator '{
-    "provider": "termite",
+    "provider": "antfly",
     "model": "ggml-org/gemma-4-e2b-it-gguf"
   }' \
   --max-context-tokens 512 \
@@ -1107,7 +1107,7 @@ antfly agents retrieval --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/agents/retrieval \
+curl -X POST http://localhost:8080/db/v1/agents/retrieval \
   -H "Content-Type: application/json" \
   -d '{
     "queries": [{
@@ -1117,14 +1117,14 @@ curl -X POST http://localhost:8080/api/v1/agents/retrieval \
       "fields": ["title", "body"],
       "limit": 5,
       "reranker": {
-        "provider": "termite",
+        "provider": "antfly",
         "model": "mixedbread-ai/mxbai-rerank-base-v1",
         "field": "body"
       },
       "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
     }],
     "generator": {
-      "provider": "termite",
+      "provider": "antfly",
       "model": "ggml-org/gemma-4-e2b-it-gguf"
     },
     "max_context_tokens": 512,
@@ -1146,14 +1146,14 @@ const result = await client.agents.retrieval({
     fields: ['title', 'body'],
     limit: 5,
     reranker: {
-      provider: 'termite',
+      provider: 'antfly',
       model: 'mixedbread-ai/mxbai-rerank-base-v1',
       field: 'body',
     },
     pruner: { min_score_ratio: 0.6, max_score_gap_percent: 40 },
   }],
   generator: {
-    provider: 'termite',
+    provider: 'antfly',
     model: 'ggml-org/gemma-4-e2b-it-gguf',
   },
   max_context_tokens: 512,
@@ -1175,14 +1175,14 @@ result = client.agents.retrieval(
         'fields': ['title', 'body'],
         'limit': 5,
         'reranker': {
-            'provider': 'termite',
+            'provider': 'inference',
             'model': 'mixedbread-ai/mxbai-rerank-base-v1',
             'field': 'body',
         },
         'pruner': {'min_score_ratio': 0.6, 'max_score_gap_percent': 40},
     }],
     generator={
-        'provider': 'termite',
+        'provider': 'inference',
         'model': 'ggml-org/gemma-4-e2b-it-gguf',
     },
     max_context_tokens=512,
@@ -1206,7 +1206,7 @@ resp, err := client.RetrievalAgentWithResponse(
 			Fields:         &[]string{"title", "body"},
 			Limit:          intPtr(5),
 			Reranker: &antfly.Reranker{
-				Provider: strPtr("termite"),
+				Provider: strPtr("antfly"),
 				Model:    strPtr("mixedbread-ai/mxbai-rerank-base-v1"),
 				Field:    strPtr("body"),
 			},
@@ -1216,7 +1216,7 @@ resp, err := client.RetrievalAgentWithResponse(
 			},
 		}},
 		Generator: &antfly.Generator{
-			Provider: strPtr("termite"),
+			Provider: strPtr("antfly"),
 			Model:    strPtr("ggml-org/gemma-4-e2b-it-gguf"),
 		},
 		MaxContextTokens: intPtr(512),
@@ -1240,14 +1240,14 @@ let resp = client
             "fields": ["title", "body"],
             "limit": 5,
             "reranker": {
-                "provider": "termite",
+                "provider": "antfly",
                 "model": "mixedbread-ai/mxbai-rerank-base-v1",
                 "field": "body"
             },
             "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
         }],
         "generator": {
-            "provider": "termite",
+            "provider": "antfly",
             "model": "ggml-org/gemma-4-e2b-it-gguf"
         },
         "max_context_tokens": 512,
@@ -1269,7 +1269,7 @@ This command searches for semantically similar articles, reranks and prunes resu
 
 ### RAG with alternative providers
 
-The previous step uses Termite for local inference. You can also use cloud APIs or Ollama:
+The previous step uses Antfly inference for local inference. You can also use cloud APIs or Ollama:
 
 <Tabs defaultValue="gemini">
   <TabsList>
@@ -1333,7 +1333,7 @@ antfly agents retrieval --table wikipedia \
 
 <Callout type="info">
 **Choosing a generator model:**
-- **`ggml-org/gemma-4-e2b-it-gguf`** — local GGUF inference via Termite, no API key needed, supports all RAG features
+- **`ggml-org/gemma-4-e2b-it-gguf`** — local GGUF inference via Antfly inference, no API key needed, supports all RAG features
 - **Ollama `gemma3:4b-it-qat`** — local inference via Ollama, quantized for fast CPU/GPU performance
 - **Gemini `gemini-2.5-flash`** — cloud API, fast and high quality, requires API key
 - **OpenAI `gpt-4.1-mini`** — cloud API, fast and high quality, requires API key
@@ -1380,7 +1380,7 @@ Available evaluators:
 
 1. **[Explore the Dashboard](/docs/guides/dashboard)** — Manage tables, run queries, and monitor your cluster at `http://localhost:8080`
 2. **[Image Search with CLIP](/docs/examples/image-search)** — Build a full image search application
-3. **[Browse Models](/termite)** — Discover available embedding, reranking, and generation models with `antfly termite list --remote`
+3. **[Browse Models](/inference)** — Discover available embedding, reranking, and generation models with `antfly inference list --remote`
 4. **[SDKs](/docs/sdks)** — Build applications with Go, TypeScript, Python, or Rust
 5. **[Backup and Restore](/docs/api/data-operations)** — Protect your data
 6. **[Production Deployment](/docs/operator/getting-started/quickstart)** — Deploy on Kubernetes with the Antfly Operator
@@ -1389,7 +1389,7 @@ Available evaluators:
 
 - [Antfly CLI & REST API Documentation](/docs/api)
 - [Hybrid Search Guide](/docs/guides/hybrid-search)
-- [Termite Guide](/docs/guides/termite) — Configure ML inference, embedding providers, and more
+- [Inference Guide](/docs/guides/inference) — Configure ML inference, embedding providers, and more
 - [Configuration Reference](/docs/configuration)
 
 <Questions>
@@ -1397,5 +1397,5 @@ Available evaluators:
 - How do I create my first table and index?
 - How do I load data into Antfly?
 - How do I run a search query?
-- How do I use RAG with Termite for AI-powered answers?
+- How do I use RAG with Antfly inference for AI-powered answers?
 </Questions>

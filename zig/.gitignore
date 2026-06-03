@@ -14,8 +14,8 @@ deps/logs/
 .claude/
 /logs/
 bench/results/
-pkg/termite/electron/node_modules/
-pkg/termite/web/node_modules/
-pkg/termite/scripts/dequant_cli
-pkg/termite/.debug/
-pkg/termite/onnxruntime/
+pkg/inference/electron/node_modules/
+pkg/inference/web/node_modules/
+pkg/inference/scripts/dequant_cli
+pkg/inference/.debug/
+pkg/inference/onnxruntime/

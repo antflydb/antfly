@@ -19,6 +19,7 @@ const metadata_api = @import("api.zig");
 const metadata_admin = @import("admin.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
+const metadata_reconciler = @import("reconciler.zig");
 const metadata_transition_state = @import("transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const http_common = @import("../raft/transport/http_common.zig");
@@ -43,6 +44,7 @@ pub const MergeRequest = struct {
     donor_group_id: u64,
     receiver_group_id: u64,
     transition_id: ?u64 = null,
+    allow_doc_identity_reassignment: bool = false,
 };
 
 pub const NodeShutdownRequest = struct {
@@ -438,6 +440,7 @@ pub const AdminSource = struct {
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
         const source_group_id = req.source_group_id orelse findRangeForKey(snapshot.ranges, table.table_id, req.split_key) orelse return error.RangeNotFound;
         try group_ids.requireDataGroupId(source_group_id);
+        try validateSplitDocIdentityCompatibility(&snapshot, source_group_id);
         const destination_group_id = req.destination_group_id orelse deriveGroupId(table_name, req.split_key, 0x53504c47, source_group_id);
         try group_ids.requireDataGroupId(destination_group_id);
 
@@ -461,6 +464,7 @@ pub const AdminSource = struct {
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
         try group_ids.requireDataGroupId(req.donor_group_id);
         try group_ids.requireDataGroupId(req.receiver_group_id);
+        try validateMergeDocIdentityCompatibility(&snapshot, req.donor_group_id, req.receiver_group_id, req.allow_doc_identity_reassignment);
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
@@ -470,6 +474,7 @@ pub const AdminSource = struct {
             .table_id = table.table_id,
             .donor_group_id = req.donor_group_id,
             .receiver_group_id = req.receiver_group_id,
+            .allow_doc_identity_reassignment = req.allow_doc_identity_reassignment,
         });
         try flushMetadataServiceMutation(svc);
     }
@@ -642,6 +647,7 @@ pub const AdminSource = struct {
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
         const source_group_id = req.source_group_id orelse findRangeForKey(snapshot.ranges, table.table_id, req.split_key) orelse return error.RangeNotFound;
         try group_ids.requireDataGroupId(source_group_id);
+        try validateSplitDocIdentityCompatibility(&snapshot, source_group_id);
         const destination_group_id = req.destination_group_id orelse deriveGroupId(table_name, req.split_key, 0x53504c47, source_group_id);
         try group_ids.requireDataGroupId(destination_group_id);
 
@@ -665,6 +671,7 @@ pub const AdminSource = struct {
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
         try group_ids.requireDataGroupId(req.donor_group_id);
         try group_ids.requireDataGroupId(req.receiver_group_id);
+        try validateMergeDocIdentityCompatibility(&snapshot, req.donor_group_id, req.receiver_group_id, req.allow_doc_identity_reassignment);
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
@@ -674,6 +681,7 @@ pub const AdminSource = struct {
             .table_id = table.table_id,
             .donor_group_id = req.donor_group_id,
             .receiver_group_id = req.receiver_group_id,
+            .allow_doc_identity_reassignment = req.allow_doc_identity_reassignment,
         });
         try flushMetadataHttpServiceMutation(svc);
     }
@@ -863,8 +871,14 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableSplit(req.uri)) |table| {
                     const split_req = parseSplitRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid split request");
                     defer self.alloc.free(split_req.split_key);
+                    validateSplitRequestDocIdentity(self.source, table.table_name, split_req) catch |err| switch (err) {
+                        error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 409, "doc identity namespace mismatch"),
+                        else => return try textResponse(self.alloc, 400, "invalid split request"),
+                    };
                     self.source.requestSplit(self.alloc, table.table_name, split_req) catch |err| switch (err) {
                         error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 409, "doc identity namespace mismatch"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
                         else => return try textResponse(self.alloc, 400, "invalid split request"),
                     };
@@ -872,8 +886,14 @@ pub const MetadataHttpServer = struct {
                 }
                 if (routes.Routes.matchInternalTableMerge(req.uri)) |table| {
                     const merge_req = parseMergeRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid merge request");
+                    validateMergeRequestDocIdentity(self.source, table.table_name, merge_req) catch |err| switch (err) {
+                        error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 409, "doc identity namespace mismatch"),
+                        else => return try textResponse(self.alloc, 400, "invalid merge request"),
+                    };
                     self.source.requestMerge(self.alloc, table.table_name, merge_req) catch |err| switch (err) {
                         error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 409, "doc identity namespace mismatch"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
                         else => return try textResponse(self.alloc, 400, "invalid merge request"),
                     };
@@ -1343,6 +1363,10 @@ fn parseMergeRequest(alloc: std.mem.Allocator, body: []const u8) !MergeRequest {
         .donor_group_id = try parseU64Field(root.get("donor_group_id") orelse return error.InvalidMergeRequest),
         .receiver_group_id = try parseU64Field(root.get("receiver_group_id") orelse return error.InvalidMergeRequest),
         .transition_id = if (root.get("transition_id")) |value| try parseU64Field(value) else null,
+        .allow_doc_identity_reassignment = if (root.get("allow_doc_identity_reassignment")) |value| switch (value) {
+            .bool => |flag| flag,
+            else => return error.InvalidMergeRequest,
+        } else false,
     };
 }
 
@@ -1469,6 +1493,8 @@ const ParsedRuntimeGroupStatus = struct {
     async_startup_active: ?bool = null,
     async_dense_catch_up_active: ?bool = null,
     async_bulk_coalescing_active: ?bool = null,
+    doc_identity: ?metadata_table_manager.RuntimeDocIdentityStatusReport = null,
+    doc_set_planning: ?metadata_table_manager.RuntimeDocSetPlanningStatusReport = null,
     indexes: ?[]ParsedRuntimeIndexStatus = null,
 };
 
@@ -1717,6 +1743,8 @@ fn cloneParsedRuntimeGroupStatus(
         .async_startup_active = parsed.async_startup_active orelse (parsed.async_indexing_active orelse false),
         .async_dense_catch_up_active = parsed.async_dense_catch_up_active orelse (parsed.async_indexing_active orelse false),
         .async_bulk_coalescing_active = parsed.async_bulk_coalescing_active orelse (parsed.async_indexing_active orelse false),
+        .doc_identity = parsed.doc_identity orelse .{},
+        .doc_set_planning = parsed.doc_set_planning orelse .{},
         .indexes = indexes,
     };
 }
@@ -2024,6 +2052,73 @@ fn findRangeForKey(ranges: []const metadata_table_manager.RangeRecord, table_id:
     return null;
 }
 
+fn validateMergeDocIdentityCompatibility(
+    snapshot: *const metadata_api.AdminSnapshot,
+    donor_group_id: u64,
+    receiver_group_id: u64,
+    allow_doc_identity_reassignment: bool,
+) !void {
+    const donor = findMergedGroupStatus(snapshot.merged_group_statuses, donor_group_id) orelse return error.DocIdentityNamespaceMismatch;
+    const receiver = findMergedGroupStatus(snapshot.merged_group_statuses, receiver_group_id) orelse return error.DocIdentityNamespaceMismatch;
+    if (donor.doc_identity_reassignment_active or receiver.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
+    if (donor.doc_identity_namespace_conflict or receiver.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
+    if (donor.doc_identity.rebuild_required or receiver.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;
+    if (donor.doc_identity.ordinal_capacity_exhausted or receiver.doc_identity.ordinal_capacity_exhausted) return error.DocIdentityNamespaceMismatch;
+    if (!runtimeDocIdentityHasOrdinalRows(donor.doc_identity) or !runtimeDocIdentityHasOrdinalRows(receiver.doc_identity)) return;
+    if (allow_doc_identity_reassignment) return;
+    if (!runtimeDocIdentitySameNamespace(donor.doc_identity, receiver.doc_identity)) return error.DocIdentityNamespaceMismatch;
+}
+
+fn validateMergeRequestDocIdentity(source: AdminSource, table_name: []const u8, req: MergeRequest) !void {
+    var snapshot = try source.adminSnapshot();
+    defer source.freeAdminSnapshot(&snapshot);
+    _ = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    try validateMergeDocIdentityCompatibility(&snapshot, req.donor_group_id, req.receiver_group_id, req.allow_doc_identity_reassignment);
+}
+
+fn validateSplitDocIdentityCompatibility(
+    snapshot: *const metadata_api.AdminSnapshot,
+    source_group_id: u64,
+) !void {
+    const source = findMergedGroupStatus(snapshot.merged_group_statuses, source_group_id) orelse return error.DocIdentityNamespaceMismatch;
+    if (source.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
+    if (source.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
+    if (source.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;
+    if (source.doc_identity.ordinal_capacity_exhausted) return error.DocIdentityNamespaceMismatch;
+}
+
+fn validateSplitRequestDocIdentity(source: AdminSource, table_name: []const u8, req: SplitRequest) !void {
+    var snapshot = try source.adminSnapshot();
+    defer source.freeAdminSnapshot(&snapshot);
+    const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const source_group_id = req.source_group_id orelse findRangeForKey(snapshot.ranges, table.table_id, req.split_key) orelse return error.RangeNotFound;
+    try validateSplitDocIdentityCompatibility(&snapshot, source_group_id);
+}
+
+fn findMergedGroupStatus(statuses: []const metadata_reconciler.MergedGroupStatus, group_id: u64) ?metadata_reconciler.MergedGroupStatus {
+    for (statuses) |status| {
+        if (status.group_id == group_id) return status;
+    }
+    return null;
+}
+
+fn runtimeDocIdentityHasOrdinalRows(stats: metadata_table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.next_ordinal != 1 or
+        stats.allocated_ordinals != 0 or
+        stats.state_rows != 0 or
+        stats.live_ordinals != 0 or
+        stats.tombstone_ordinals != 0;
+}
+
+fn runtimeDocIdentitySameNamespace(
+    left: metadata_table_manager.RuntimeDocIdentityStatusReport,
+    right: metadata_table_manager.RuntimeDocIdentityStatusReport,
+) bool {
+    return left.namespace_table_id == right.namespace_table_id and
+        left.namespace_shard_id == right.namespace_shard_id and
+        left.namespace_range_id == right.namespace_range_id;
+}
+
 fn deriveTransitionId(table_name: []const u8, key: []const u8, seed: u64) u64 {
     var hasher = std.hash.Wyhash.init(seed);
     hasher.update(table_name);
@@ -2111,7 +2206,7 @@ test "metadata http server serves status and filtered admin routes" {
                 })[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
                     .{ .group_id = 10, .table_id = 1, .start_key = "doc:a", .end_key = "doc:m" },
-                    .{ .group_id = 11, .table_id = 1, .start_key = "doc:m", .end_key = "doc:z" },
+                    .{ .group_id = 11, .table_id = 1, .doc_identity_shard_id = 10, .doc_identity_range_id = 10, .start_key = "doc:m", .end_key = "doc:z" },
                 })[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{
                     .{ .store_id = 7, .node_id = 1, .role = "data", .health_class = "healthy", .failure_domain = "rack-a", .active_backfills = 2, .backfill_progress_millis = 350 },
@@ -2157,6 +2252,20 @@ test "metadata http server serves status and filtered admin routes" {
                 .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{
                     .{ .transition_id = 9010, .donor_group_id = 11, .receiver_group_id = 10, .phase = .prepare },
                 })[0..]),
+                .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{
+                    .{
+                        .group_id = 10,
+                        .doc_identity_reassignment_active = true,
+                        .doc_identity = .{
+                            .namespace_table_id = 1,
+                            .namespace_shard_id = 10,
+                            .namespace_range_id = 10,
+                            .next_ordinal = 6,
+                            .allocated_ordinals = 5,
+                            .live_ordinals = 5,
+                        },
+                    },
+                })[0..]),
             };
         }
 
@@ -2183,6 +2292,8 @@ test "metadata http server serves status and filtered admin routes" {
     defer ranges_resp.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, ranges_resp.body, "\"group_id\":10") != null);
     try std.testing.expect(std.mem.indexOf(u8, ranges_resp.body, "\"group_id\":11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranges_resp.body, "\"doc_identity_shard_id\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranges_resp.body, "\"doc_identity_range_id\":10") != null);
 
     var placement_resp = try server.handle(.{ .method = .GET, .uri = "/metadata/v1/groups/10/placement" });
     defer placement_resp.deinit(std.testing.allocator);
@@ -2213,6 +2324,11 @@ test "metadata http server serves status and filtered admin routes" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"lag_records\":12") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"lag_millis\":34") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"last_source_commit_at_ms\":1200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"doc_identity_shard_id\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"doc_identity_range_id\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"merged_group_statuses\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"doc_identity_reassignment_active\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_resp.body, "\"namespace_range_id\":10") != null);
 
     var active_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.active_transitions });
     defer active_resp.deinit(std.testing.allocator);
@@ -2937,12 +3053,34 @@ test "metadata http server accepts internal reallocate and split merge routes" {
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
             return .{
                 .status = .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{
+                        .group_id = 9,
+                        .range_id = 9,
+                        .table_id = 1,
+                        .start_key = "doc:a",
+                        .end_key = "doc:m",
+                    },
+                    .{
+                        .group_id = 10,
+                        .range_id = 10,
+                        .table_id = 1,
+                        .start_key = "doc:m",
+                        .end_key = "doc:z",
+                    },
+                })[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{
+                    .{ .group_id = 9 },
+                    .{ .group_id = 10 },
+                })[0..]),
             };
         }
 
@@ -2998,6 +3136,7 @@ test "metadata http server accepts internal reallocate and split merge routes" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(@as(u64, 10), req.donor_group_id);
             try std.testing.expectEqual(@as(u64, 9), req.receiver_group_id);
+            try std.testing.expect(req.allow_doc_identity_reassignment);
             self.merge_count += 1;
         }
     };
@@ -3092,7 +3231,7 @@ test "metadata http server accepts internal reallocate and split merge routes" {
     var merge = try server.handle(.{
         .method = .POST,
         .uri = "/internal/v1/tables/docs/merge",
-        .body = "{\"donor_group_id\":10,\"receiver_group_id\":9}",
+        .body = "{\"donor_group_id\":10,\"receiver_group_id\":9,\"allow_doc_identity_reassignment\":true}",
         .content_type = "application/json",
     });
     defer merge.deinit(std.testing.allocator);
@@ -3105,6 +3244,399 @@ test "metadata http server accepts internal reallocate and split merge routes" {
     try std.testing.expectEqual(@as(usize, 1), source.restore_count);
     try std.testing.expectEqual(@as(usize, 1), source.split_count);
     try std.testing.expectEqual(@as(usize, 1), source.merge_count);
+}
+
+test "metadata http server rejects split and merge during active doc identity reassignment before source mutation" {
+    const FakeSource = struct {
+        split_count: usize = 0,
+        merge_count: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .head = head,
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .request_split = requestSplit,
+                    .request_merge = requestMerge,
+                },
+            };
+        }
+
+        fn head(_: *anyopaque) !metadata_api.MetadataHead {
+            return .{ .metadata_group_id = 1, .metadata_epoch = 2 };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{
+                        .group_id = 9,
+                        .range_id = 9,
+                        .table_id = 1,
+                        .start_key = "doc:a",
+                        .end_key = "doc:m",
+                    },
+                    .{
+                        .group_id = 10,
+                        .range_id = 10,
+                        .table_id = 1,
+                        .start_key = "doc:m",
+                        .end_key = "doc:z",
+                    },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{
+                    .{ .group_id = 9, .doc_identity_reassignment_active = true },
+                    .{ .group_id = 10, .doc_identity_reassignment_active = true },
+                })[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn requestSplit(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: SplitRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.split_count += 1;
+        }
+
+        fn requestMerge(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: MergeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.merge_count += 1;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+
+    var split = try server.handle(.{
+        .method = .POST,
+        .uri = "/internal/v1/tables/docs/split",
+        .body = "{\"split_key\":\"doc:m\"}",
+        .content_type = "application/json",
+    });
+    defer split.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), split.status);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", split.body);
+
+    var merge = try server.handle(.{
+        .method = .POST,
+        .uri = "/internal/v1/tables/docs/merge",
+        .body = "{\"donor_group_id\":10,\"receiver_group_id\":9,\"allow_doc_identity_reassignment\":true}",
+        .content_type = "application/json",
+    });
+    defer merge.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), merge.status);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", merge.body);
+
+    try std.testing.expectEqual(@as(usize, 0), source.split_count);
+    try std.testing.expectEqual(@as(usize, 0), source.merge_count);
+}
+
+test "metadata http server maps source split merge doc identity conflicts" {
+    const FakeSource = struct {
+        split_count: usize = 0,
+        merge_count: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .head = head,
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .request_split = requestSplit,
+                    .request_merge = requestMerge,
+                },
+            };
+        }
+
+        fn head(_: *anyopaque) !metadata_api.MetadataHead {
+            return .{ .metadata_group_id = 1, .metadata_epoch = 2 };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{
+                        .group_id = 9,
+                        .range_id = 9,
+                        .table_id = 1,
+                        .start_key = "doc:a",
+                        .end_key = "doc:m",
+                    },
+                    .{
+                        .group_id = 10,
+                        .range_id = 10,
+                        .table_id = 1,
+                        .start_key = "doc:m",
+                        .end_key = "doc:z",
+                    },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{
+                    .{ .group_id = 9 },
+                    .{ .group_id = 10 },
+                })[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn requestSplit(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: SplitRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:m", req.split_key);
+            self.split_count += 1;
+            return error.DocIdentityNamespaceMismatch;
+        }
+
+        fn requestMerge(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: MergeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(u64, 10), req.donor_group_id);
+            try std.testing.expectEqual(@as(u64, 9), req.receiver_group_id);
+            self.merge_count += 1;
+            return error.DocIdentityNamespaceMismatch;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+
+    var split = try server.handle(.{
+        .method = .POST,
+        .uri = "/internal/v1/tables/docs/split",
+        .body = "{\"split_key\":\"doc:m\"}",
+        .content_type = "application/json",
+    });
+    defer split.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), split.status);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", split.body);
+
+    var merge = try server.handle(.{
+        .method = .POST,
+        .uri = "/internal/v1/tables/docs/merge",
+        .body = "{\"donor_group_id\":10,\"receiver_group_id\":9}",
+        .content_type = "application/json",
+    });
+    defer merge.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), merge.status);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", merge.body);
+
+    try std.testing.expectEqual(@as(usize, 1), source.split_count);
+    try std.testing.expectEqual(@as(usize, 1), source.merge_count);
+}
+
+test "metadata merge request validation rejects incompatible doc identity namespaces" {
+    var statuses = [_]metadata_reconciler.MergedGroupStatus{
+        .{
+            .group_id = 91,
+            .doc_identity = .{
+                .namespace_table_id = 9,
+                .namespace_shard_id = 91,
+                .namespace_range_id = 9001,
+                .next_ordinal = 12,
+                .allocated_ordinals = 11,
+            },
+        },
+        .{
+            .group_id = 92,
+            .doc_identity = .{
+                .namespace_table_id = 9,
+                .namespace_shard_id = 92,
+                .namespace_range_id = 9002,
+                .next_ordinal = 7,
+                .allocated_ordinals = 6,
+            },
+        },
+    };
+    const snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        .merged_group_statuses = @constCast(statuses[0..]),
+    };
+
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateMergeDocIdentityCompatibility(&snapshot, 91, 92, false),
+    );
+    try validateMergeDocIdentityCompatibility(&snapshot, 91, 92, true);
+
+    statuses[0].doc_identity.rebuild_required = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateMergeDocIdentityCompatibility(&snapshot, 91, 92, true),
+    );
+    statuses[0].doc_identity.rebuild_required = false;
+    statuses[1].doc_identity_namespace_conflict = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateMergeDocIdentityCompatibility(&snapshot, 91, 92, true),
+    );
+    statuses[1].doc_identity_namespace_conflict = false;
+    statuses[0].doc_identity_reassignment_active = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateMergeDocIdentityCompatibility(&snapshot, 91, 92, true),
+    );
+    statuses[0].doc_identity_reassignment_active = false;
+    statuses[0].doc_identity.ordinal_capacity_exhausted = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateMergeDocIdentityCompatibility(&snapshot, 91, 92, true),
+    );
+    statuses[0].doc_identity.ordinal_capacity_exhausted = false;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateMergeDocIdentityCompatibility(&snapshot, 91, 93, false),
+    );
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateMergeDocIdentityCompatibility(&snapshot, 91, 93, true),
+    );
+}
+
+test "metadata merge validation handles rolling mixed-version doc identity status fixtures" {
+    var statuses = [_]metadata_reconciler.MergedGroupStatus{
+        .{
+            .group_id = 101,
+            // Old binaries report no ordinal rows. Merge validation must not
+            // require a namespace until both sides advertise DOCID metadata.
+            .doc_identity = .{},
+        },
+        .{
+            .group_id = 102,
+            .doc_identity = .{
+                .namespace_table_id = 10,
+                .namespace_shard_id = 102,
+                .namespace_range_id = 1002,
+                .next_ordinal = 12,
+                .allocated_ordinals = 11,
+            },
+        },
+    };
+    const snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        .merged_group_statuses = @constCast(statuses[0..]),
+    };
+
+    try validateMergeDocIdentityCompatibility(&snapshot, 101, 102, false);
+
+    statuses[0].doc_identity_reassignment_active = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateMergeDocIdentityCompatibility(&snapshot, 101, 102, true),
+    );
+    statuses[0].doc_identity_reassignment_active = false;
+
+    statuses[0].doc_identity = .{
+        .namespace_table_id = 10,
+        .namespace_shard_id = 101,
+        .namespace_range_id = 1001,
+        .next_ordinal = 3,
+        .allocated_ordinals = 2,
+    };
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateMergeDocIdentityCompatibility(&snapshot, 101, 102, false),
+    );
+    try validateMergeDocIdentityCompatibility(&snapshot, 101, 102, true);
+}
+
+test "metadata split request validation rejects stale doc identity namespace" {
+    var statuses = [_]metadata_reconciler.MergedGroupStatus{.{
+        .group_id = 91,
+        .doc_identity = .{
+            .namespace_table_id = 9,
+            .namespace_shard_id = 91,
+            .namespace_range_id = 9001,
+            .next_ordinal = 12,
+            .allocated_ordinals = 11,
+        },
+    }};
+    const snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        .merged_group_statuses = @constCast(statuses[0..]),
+    };
+
+    try validateSplitDocIdentityCompatibility(&snapshot, 91);
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateSplitDocIdentityCompatibility(&snapshot, 92),
+    );
+
+    statuses[0].doc_identity.rebuild_required = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateSplitDocIdentityCompatibility(&snapshot, 91),
+    );
+    statuses[0].doc_identity.rebuild_required = false;
+    statuses[0].doc_identity_namespace_conflict = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateSplitDocIdentityCompatibility(&snapshot, 91),
+    );
+    statuses[0].doc_identity_namespace_conflict = false;
+    statuses[0].doc_identity_reassignment_active = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateSplitDocIdentityCompatibility(&snapshot, 91),
+    );
+    statuses[0].doc_identity_reassignment_active = false;
+    statuses[0].doc_identity.ordinal_capacity_exhausted = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateSplitDocIdentityCompatibility(&snapshot, 91),
+    );
 }
 
 test "metadata http server returns 400 for invalid internal restore backup locations" {

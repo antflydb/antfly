@@ -153,6 +153,69 @@
   .dark .grid-paper {
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='55.42' height='96' viewBox='0 0 55.42 96'%3E%3Cpath d='M27.71,0 L55.42,16 L55.42,48 L27.71,64 L0,48 L0,16 Z M27.71,64 L27.71,96' fill='none' stroke='%23ffffff14' stroke-width='0.5'/%3E%3C/svg%3E");
   }
+
+  /* AntyPixel — amber glow halo + stepped eye blink for the pixel-sprite mascot. */
+  .anty-pixel-glow {
+    inset: -15%;
+    background: var(--anty-glow-inner);
+    opacity: 0.35;
+    filter: blur(1px);
+  }
+  .anty-pixel-eye {
+    animation: anty-pixel-blink 3.2s steps(1) infinite;
+  }
+  @keyframes anty-pixel-blink {
+    0%, 92%, 100% { opacity: 1; }
+    95% { opacity: 0; }
+  }
+
+  /* Kicker — pixel-font emphasis overline for loud brand moments.
+     Sparing use only. Sits above an Aeonik headline in Hero/CTA, on tags
+     and splash captions. Don't sprinkle it through the working UI. */
+  .kicker {
+    font-family: var(--font-pixel);
+    font-size: 0.6875rem; /* 11px */
+    line-height: 1.6;
+    letter-spacing: 0.04em;
+    color: var(--amber-600);
+  }
+  .dark .kicker {
+    color: var(--amber-400);
+  }
+
+  /* Highlight — amber-fill inline marker for accent words inside headlines.
+     Amber is a FILL with ink-on-amber text, not amber text on paper.
+
+     The inline fill box is sized by the font's content area (~1.2em), not by
+     line-height, so we keep no vertical padding to hold the chip as short as
+     possible. Wrapped/stacked highlights are kept from colliding by the
+     headline-leading rule at the end of this file (see `:has(.highlight)`). */
+  .highlight {
+    background: var(--primary);
+    color: var(--primary-foreground);
+    padding: 0 0.12em;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+  }
+
+  /* TypeOn — mono steps() typewriter for brand-moment taglines.
+     The reveal target width is set via the --type-on-target custom property
+     on the element, computed from the text length in <ch>. */
+  .type-on {
+    font-family: var(--font-mono);
+    font-size: 0.875rem; /* 14px */
+    color: var(--muted-foreground);
+    white-space: nowrap;
+    overflow: hidden;
+    display: inline-block;
+    border-right: 2px solid var(--primary);
+  }
+  @keyframes type-on-reveal {
+    to { width: var(--type-on-target, 100%); }
+  }
+  @keyframes type-on-caret {
+    50% { border-color: transparent; }
+  }
 }
 
 /* ============================================================================
@@ -172,4 +235,21 @@
 }
 [data-density="comfortable"] {
   --spacing: 0.3rem;
+}
+
+/* ============================================================================
+   Highlight leading
+   The `.highlight` chip's fill box is font-content-area tall (~1.25em) and
+   can't be shrunk per-span, so a highlighted headline needs enough leading
+   that wrapped lines — and a highlight that wraps onto itself — clear each
+   other's gutters. Display headings ship `line-height: 1`, which collides;
+   scope the extra leading to headings that actually contain a Highlight.
+   Unlayered so it wins over Tailwind's `leading-*` / text-size line-heights.
+   1.3 is the tightest leading that still clears the ~1.2em chip; below ~1.25
+   the box is taller than the line advance and collides again.
+   (Forward-looking: `text-box-trim` will let the chip hug the glyphs directly
+   once browser support is broad enough to drop the leading bump.)
+   ============================================================================ */
+:is(h1, h2, h3):has(.highlight) {
+  line-height: 1.3;
 }

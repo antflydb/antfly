@@ -15,25 +15,176 @@
 // Provider-neutral types and interfaces for ML inference.
 
 const std = @import("std");
+const generating = @import("antfly_generating");
 
-pub const Role = enum {
-    system,
-    user,
-    assistant,
+pub const Role = generating.Role;
+pub const ImageURL = generating.ImageURL;
+pub const MediaContent = generating.MediaContent;
+pub const ContentPart = generating.ContentPart;
+pub const ChatMessageContent = generating.ChatMessageContent;
+pub const ToolCall = generating.ToolCall;
+pub const ChatMessage = generating.ChatMessage;
 
-    pub fn toSlice(self: Role) []const u8 {
-        return switch (self) {
-            .system => "system",
-            .user => "user",
-            .assistant => "assistant",
-        };
+pub const ChatWireFlavor = enum {
+    openai_compatible,
+    termite_native,
+};
+
+pub fn chatRequestJsonAlloc(
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    messages: []const ChatMessage,
+    flavor: ChatWireFlavor,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"model\":");
+    try appendJsonString(alloc, &out, model);
+    try out.appendSlice(alloc, ",\"messages\":[");
+    for (messages, 0..) |message, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try appendChatMessageJson(alloc, &out, message, flavor);
     }
-};
+    try out.appendSlice(alloc, "]}");
+    return try out.toOwnedSlice(alloc);
+}
 
-pub const ChatMessage = struct {
-    role: Role,
-    content: []const u8,
-};
+fn appendChatMessageJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    message: ChatMessage,
+    flavor: ChatWireFlavor,
+) !void {
+    try out.appendSlice(alloc, "{\"role\":");
+    try appendJsonString(alloc, out, message.role.toSlice());
+    if (message.content) |content| {
+        try out.appendSlice(alloc, ",\"content\":");
+        try appendChatMessageContentJson(alloc, out, content, flavor);
+    }
+    if (message.tool_calls) |tool_calls| {
+        try out.appendSlice(alloc, ",\"tool_calls\":[");
+        for (tool_calls, 0..) |tool_call, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try appendToolCallJson(alloc, out, tool_call);
+        }
+        try out.append(alloc, ']');
+    }
+    if (message.tool_call_id) |tool_call_id| {
+        try out.appendSlice(alloc, ",\"tool_call_id\":");
+        try appendJsonString(alloc, out, tool_call_id);
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendChatMessageContentJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    content: ChatMessageContent,
+    flavor: ChatWireFlavor,
+) !void {
+    switch (content) {
+        .text => |text| try appendJsonString(alloc, out, text),
+        .parts => |parts| {
+            try out.append(alloc, '[');
+            for (parts, 0..) |part, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try appendContentPartJson(alloc, out, part, flavor);
+            }
+            try out.append(alloc, ']');
+        },
+    }
+}
+
+fn appendContentPartJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    part: ContentPart,
+    flavor: ChatWireFlavor,
+) !void {
+    switch (part) {
+        .text => |text| {
+            try out.appendSlice(alloc, "{\"type\":\"text\",\"text\":");
+            try appendJsonString(alloc, out, text);
+            try out.append(alloc, '}');
+        },
+        .image_url => |image_url| {
+            try out.appendSlice(alloc, "{\"type\":\"image_url\",\"image_url\":{\"url\":");
+            try appendJsonString(alloc, out, image_url.url);
+            try out.appendSlice(alloc, "}}");
+        },
+        .media => |media| switch (flavor) {
+            .termite_native => {
+                try appendMediaContentPartJson(alloc, out, media);
+            },
+            .openai_compatible => {
+                try appendOpenAiMediaContentPartJson(alloc, out, media);
+            },
+        },
+    }
+}
+
+fn appendOpenAiMediaContentPartJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    media: MediaContent,
+) !void {
+    if (!std.mem.startsWith(u8, media.mime_type, "image/")) return error.UnsupportedOpenAIContentPart;
+    const image_url = if (media.url) |url|
+        url
+    else
+        try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ media.mime_type, media.data });
+    defer if (media.url == null) alloc.free(image_url);
+
+    try out.appendSlice(alloc, "{\"type\":\"image_url\",\"image_url\":{\"url\":");
+    try appendJsonString(alloc, out, image_url);
+    try out.appendSlice(alloc, "}}");
+}
+
+fn appendMediaContentPartJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    media: MediaContent,
+) !void {
+    try out.appendSlice(alloc, "{\"type\":\"media\"");
+    if (media.url) |url| {
+        try out.appendSlice(alloc, ",\"url\":");
+        try appendJsonString(alloc, out, url);
+        if (media.mime_type.len > 0) {
+            try out.appendSlice(alloc, ",\"mime_type\":");
+            try appendJsonString(alloc, out, media.mime_type);
+        }
+    } else {
+        try out.appendSlice(alloc, ",\"data\":");
+        try appendJsonString(alloc, out, media.data);
+        try out.appendSlice(alloc, ",\"mime_type\":");
+        try appendJsonString(alloc, out, media.mime_type);
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendToolCallJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    tool_call: ToolCall,
+) !void {
+    try out.appendSlice(alloc, "{\"id\":");
+    try appendJsonString(alloc, out, tool_call.id);
+    try out.appendSlice(alloc, ",\"type\":\"function\",\"function\":{\"name\":");
+    try appendJsonString(alloc, out, tool_call.name);
+    try out.appendSlice(alloc, ",\"arguments\":");
+    try appendJsonString(alloc, out, tool_call.arguments);
+    try out.appendSlice(alloc, "}}");
+}
+
+fn appendJsonString(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: []const u8,
+) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
 
 pub const EmbedResult = struct {
     /// One f32 vector per input text.
@@ -134,4 +285,33 @@ test "types compile" {
     _ = RerankResult;
     _ = ChatMessage;
     _ = Role;
+}
+
+test "openai compatible chat serialization rejects non-image media" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{.{
+        .role = .user,
+        .content = .{ .parts = &.{
+            .{ .text = "listen" },
+            .{ .media = .{ .mime_type = "audio/wav", .data = "AA==" } },
+            .{ .media = .{ .mime_type = "image/png", .data = "AQ==" } },
+        } },
+    }};
+    try std.testing.expectError(error.UnsupportedOpenAIContentPart, chatRequestJsonAlloc(alloc, "gemma4", &messages, .openai_compatible));
+}
+
+test "openai compatible chat serialization converts image media urls" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{.{
+        .role = .user,
+        .content = .{ .parts = &.{
+            .{ .text = "look" },
+            .{ .media = .{ .mime_type = "image/png", .url = "https://example.test/image.png" } },
+        } },
+    }};
+    const body = try chatRequestJsonAlloc(alloc, "gemma4", &messages, .openai_compatible);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"media\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image_url\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://example.test/image.png\"") != null);
 }

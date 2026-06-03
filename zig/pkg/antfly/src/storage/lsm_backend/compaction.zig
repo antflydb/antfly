@@ -17,10 +17,25 @@ const lsm_table_file = @import("../lsm/table_file.zig");
 const state_mod = @import("state.zig");
 const repository_mod = @import("repository.zig");
 const runtime_mod = @import("runtime.zig");
+const compaction_scheduler_mod = @import("compaction_scheduler.zig");
 
 const State = state_mod.State;
 const Run = repository_mod.Run;
 pub const max_remembered_compaction_run_ids = 64;
+
+const CompactionWork = struct {
+    score: u64,
+    input_runs: usize,
+    input_bytes: u64,
+    io_bytes: u64,
+    run_ids: []u64,
+    key_range: ?compaction_scheduler_mod.KeyRange,
+
+    fn deinit(self: *CompactionWork, allocator: std.mem.Allocator) void {
+        if (self.run_ids.len > 0) allocator.free(self.run_ids);
+        self.* = undefined;
+    }
+};
 
 pub const CompactionPlan = struct {
     source_level: u32,
@@ -35,7 +50,13 @@ pub const RememberedCompaction = struct {
     plan: CompactionPlan,
     run_ids: [max_remembered_compaction_run_ids]u64 = undefined,
     run_count: usize = 0,
+    input_runs: usize = 0,
+    input_bytes: u64 = 0,
     score: u64 = 0,
+};
+
+const CompactionSelectionStats = struct {
+    oversized_skips: u64 = 0,
 };
 
 const PlanScore = struct {
@@ -53,6 +74,17 @@ const PlanScore = struct {
         if (self.target_len != other.target_len) return self.target_len < other.target_len;
         if (self.source_len != other.source_len) return self.source_len < other.source_len;
         return self.source_start < other.source_start;
+    }
+};
+
+const ScoredCompactionPlan = struct {
+    plan: CompactionPlan,
+    priority: u64,
+    tie: PlanScore,
+
+    fn betterThan(self: ScoredCompactionPlan, other: ScoredCompactionPlan) bool {
+        if (self.priority != other.priority) return self.priority > other.priority;
+        return self.tie.betterThan(other.tie);
     }
 };
 
@@ -108,6 +140,8 @@ pub fn maybeCompactRuns(comptime BackendType: type, backend: *BackendType) !void
         backend.options.level_target_runs_multiplier,
         backend.options.level_target_bytes_base,
         backend.options.level_target_bytes_multiplier,
+        0,
+        false,
     )) |plan| {
         try compactPlanAt(BackendType, backend, plan);
     }
@@ -116,7 +150,8 @@ pub fn maybeCompactRuns(comptime BackendType: type, backend: *BackendType) !void
 pub fn maybeCompactRunsScheduled(comptime BackendType: type, backend: *BackendType, score: u64) !bool {
     if (try compactRememberedPlanIfValid(BackendType, backend)) return true;
 
-    const plan = selectCompactionPlan(
+    var selection_stats: CompactionSelectionStats = .{};
+    const plan = selectCompactionPlanWithStats(
         backend.runs.items,
         backend.options.compact_threshold_runs,
         backend.options.l0_overlap_compact_threshold_runs,
@@ -124,9 +159,17 @@ pub fn maybeCompactRunsScheduled(comptime BackendType: type, backend: *BackendTy
         backend.options.level_target_runs_multiplier,
         backend.options.level_target_bytes_base,
         backend.options.level_target_bytes_multiplier,
-    ) orelse return false;
+        backend.options.max_compaction_input_bytes,
+        allowOversizedSingleCompactionInput(backend),
+        &selection_stats,
+    ) orelse {
+        noteCompactionSelectionStats(BackendType, backend, selection_stats);
+        return false;
+    };
+    noteCompactionSelectionStats(BackendType, backend, selection_stats);
 
-    const work = compactionWorkForPlan(backend.runs.items, plan, score);
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    defer work.deinit(backend.allocator);
     var grant = backend.acquireCompactionGrant(work) orelse {
         rememberDeniedCompaction(BackendType, backend, plan, score);
         return false;
@@ -137,20 +180,32 @@ pub fn maybeCompactRunsScheduled(comptime BackendType: type, backend: *BackendTy
 }
 
 pub fn compactOldestPair(comptime BackendType: type, backend: *BackendType) !void {
-    const plan = selectL0Compaction(backend.runs.items, 0) orelse return;
+    const plan = selectL0Compaction(backend.runs.items, 0, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
 }
 
 pub fn compactL0ToLimit(comptime BackendType: type, backend: *BackendType, l0_limit: usize) !void {
-    const plan = selectL0Compaction(backend.runs.items, l0_limit) orelse return;
+    const plan = selectL0Compaction(backend.runs.items, l0_limit, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
 }
 
 pub fn compactL0ToLimitScheduled(comptime BackendType: type, backend: *BackendType, l0_limit: usize, score: u64) !bool {
     if (try compactRememberedPlanIfValid(BackendType, backend)) return true;
 
-    const plan = selectL0Compaction(backend.runs.items, l0_limit) orelse return false;
-    const work = compactionWorkForPlan(backend.runs.items, plan, score);
+    var selection_stats: CompactionSelectionStats = .{};
+    const plan = selectL0CompactionWithStats(
+        backend.runs.items,
+        l0_limit,
+        backend.options.max_compaction_input_bytes,
+        allowOversizedSingleCompactionInput(backend),
+        &selection_stats,
+    ) orelse {
+        noteCompactionSelectionStats(BackendType, backend, selection_stats);
+        return false;
+    };
+    noteCompactionSelectionStats(BackendType, backend, selection_stats);
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    defer work.deinit(backend.allocator);
     var grant = backend.acquireCompactionGrant(work) orelse {
         rememberDeniedCompaction(BackendType, backend, plan, score);
         return false;
@@ -167,11 +222,25 @@ pub fn compactL0ToLimitScheduledWithinBudget(
     score: u64,
     max_input_bytes: ?u64,
 ) !bool {
-    const plan = selectL0Compaction(backend.runs.items, l0_limit) orelse return false;
-    const work = compactionWorkForPlan(backend.runs.items, plan, score);
-    if (max_input_bytes) |limit| {
-        if (work.input_bytes > limit) return false;
-    }
+    const option_limit = backend.options.max_compaction_input_bytes;
+    const effective_limit = if (max_input_bytes) |explicit_limit|
+        if (option_limit > 0) @min(option_limit, explicit_limit) else explicit_limit
+    else
+        option_limit;
+    var selection_stats: CompactionSelectionStats = .{};
+    const plan = selectL0CompactionWithStats(
+        backend.runs.items,
+        l0_limit,
+        effective_limit,
+        max_input_bytes == null and allowOversizedSingleCompactionInput(backend),
+        &selection_stats,
+    ) orelse {
+        noteCompactionSelectionStats(BackendType, backend, selection_stats);
+        return false;
+    };
+    noteCompactionSelectionStats(BackendType, backend, selection_stats);
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    defer work.deinit(backend.allocator);
     var grant = backend.acquireCompactionGrant(work) orelse {
         return false;
     };
@@ -189,27 +258,125 @@ pub fn compactAllRuns(comptime BackendType: type, backend: *BackendType) !void {
         backend.options.level_target_runs_multiplier,
         backend.options.level_target_bytes_base,
         backend.options.level_target_bytes_multiplier,
+        0,
+        false,
     )) |plan| {
         try compactPlanAt(BackendType, backend, plan);
     }
 }
 
-fn compactionWorkForPlan(runs: []const Run, plan: CompactionPlan, score: u64) struct { score: u64, input_runs: usize, input_bytes: u64 } {
+fn allowOversizedSingleCompactionInput(backend: anytype) bool {
+    const OptionsType = @TypeOf(backend.options);
+    if (!@hasField(OptionsType, "max_compaction_input_allow_oversized_single_job")) return false;
+    return backend.options.max_compaction_input_allow_oversized_single_job;
+}
+
+fn compactionWorkForPlan(allocator: std.mem.Allocator, runs: []const Run, plan: CompactionPlan, score: u64) !CompactionWork {
+    const total_runs = plan.source_len + plan.target_len;
+    const run_ids = try allocator.alloc(u64, total_runs);
+    errdefer allocator.free(run_ids);
+
     var input_runs: usize = 0;
     var input_bytes: u64 = 0;
+    var run_count: usize = 0;
+    var key_range: ?compaction_scheduler_mod.KeyRange = null;
     for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
         input_runs += 1;
         input_bytes +|= run.size_bytes;
+        includeRunInWorkKeyRange(&key_range, plan.output_level, run);
+        run_ids[run_count] = run.id;
+        run_count += 1;
     }
     for (runs[plan.target_start .. plan.target_start + plan.target_len]) |run| {
         input_runs += 1;
         input_bytes +|= run.size_bytes;
+        includeRunInWorkKeyRange(&key_range, plan.output_level, run);
+        run_ids[run_count] = run.id;
+        run_count += 1;
     }
     return .{
         .score = score,
         .input_runs = input_runs,
         .input_bytes = input_bytes,
+        .io_bytes = input_bytes +| input_bytes,
+        .run_ids = run_ids,
+        .key_range = key_range,
     };
+}
+
+fn includeRunInWorkKeyRange(key_range: *?compaction_scheduler_mod.KeyRange, output_level: u32, run: Run) void {
+    if (key_range.* == null) {
+        key_range.* = .{
+            .output_level = output_level,
+            .smallest_namespace_name = run.smallest_namespace_name,
+            .smallest_key = run.smallest_key,
+            .largest_namespace_name = run.largest_namespace_name,
+            .largest_key = run.largest_key,
+        };
+        return;
+    }
+    var range = key_range.*.?;
+    if (compareRunBound(run.smallest_namespace_name, run.smallest_key, range.smallest_namespace_name, range.smallest_key) == .lt) {
+        range.smallest_namespace_name = run.smallest_namespace_name;
+        range.smallest_key = run.smallest_key;
+    }
+    if (compareRunBound(run.largest_namespace_name, run.largest_key, range.largest_namespace_name, range.largest_key) == .gt) {
+        range.largest_namespace_name = run.largest_namespace_name;
+        range.largest_key = run.largest_key;
+    }
+    key_range.* = range;
+}
+
+fn planWithinInputBudget(runs: []const Run, plan: CompactionPlan, max_input_bytes: u64) bool {
+    if (max_input_bytes == 0) return true;
+    return compactionInputBytes(runs, plan) <= max_input_bytes;
+}
+
+fn compactionInputBytes(runs: []const Run, plan: CompactionPlan) u64 {
+    var input_bytes: u64 = 0;
+    for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
+        input_bytes +|= run.size_bytes;
+    }
+    for (runs[plan.target_start .. plan.target_start + plan.target_len]) |run| {
+        input_bytes +|= run.size_bytes;
+    }
+    return input_bytes;
+}
+
+fn planScoreForPlan(runs: []const Run, plan: CompactionPlan) PlanScore {
+    const source_bytes = sumRunBytes(runs[plan.source_start .. plan.source_start + plan.source_len]);
+    const target_bytes = sumRunBytes(runs[plan.target_start .. plan.target_start + plan.target_len]);
+    return .{
+        .rewrite_bytes = source_bytes +| target_bytes,
+        .target_bytes = target_bytes,
+        .source_bytes = source_bytes,
+        .source_len = plan.source_len,
+        .target_len = plan.target_len,
+        .source_start = plan.source_start,
+    };
+}
+
+fn scoredPlan(runs: []const Run, plan: CompactionPlan, priority: u64) ScoredCompactionPlan {
+    return .{
+        .plan = plan,
+        .priority = @max(@as(u64, 1), priority),
+        .tie = planScoreForPlan(runs, plan),
+    };
+}
+
+fn maybeAdoptBest(best: *?ScoredCompactionPlan, candidate: ?ScoredCompactionPlan) void {
+    const next = candidate orelse return;
+    if (best.* == null or next.betterThan(best.*.?)) best.* = next;
+}
+
+fn noteOversizedSelectionSkip(stats: ?*CompactionSelectionStats, max_input_bytes: u64) void {
+    if (max_input_bytes == 0) return;
+    if (stats) |selection_stats| selection_stats.oversized_skips +|= 1;
+}
+
+fn noteCompactionSelectionStats(comptime BackendType: type, backend: *BackendType, stats: CompactionSelectionStats) void {
+    if (!@hasField(BackendType, "compaction_scheduler")) return;
+    if (stats.oversized_skips > 0) backend.compaction_scheduler.noteOversizedSkips(stats.oversized_skips);
 }
 
 fn compactRememberedPlanIfValid(comptime BackendType: type, backend: *BackendType) !bool {
@@ -223,7 +390,13 @@ fn compactRememberedPlanIfValid(comptime BackendType: type, backend: *BackendTyp
         return false;
     };
 
-    const work = compactionWorkForPlan(backend.runs.items, plan, remembered.score);
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, remembered.score);
+    defer work.deinit(backend.allocator);
+    if (backend.options.max_compaction_input_bytes > 0 and work.input_bytes > backend.options.max_compaction_input_bytes) {
+        backend.remembered_compaction = null;
+        backend.compaction_scheduler.noteRememberedStale();
+        return false;
+    }
     var grant = backend.acquireCompactionGrant(work) orelse {
         backend.compaction_scheduler.noteConflictDenial();
         return false;
@@ -251,6 +424,8 @@ fn rememberCompactionPlan(runs: []const Run, plan: CompactionPlan, score: u64) ?
     var remembered = RememberedCompaction{
         .plan = plan,
         .run_count = total_runs,
+        .input_runs = total_runs,
+        .input_bytes = compactionInputBytes(runs, plan),
         .score = score,
     };
     var idx: usize = 0;
@@ -291,7 +466,7 @@ fn planInBounds(runs: []const Run, plan: CompactionPlan) bool {
 
 pub fn compactOldestWindow(comptime BackendType: type, backend: *BackendType, window_len: usize) !void {
     _ = window_len;
-    const plan = selectL0Compaction(backend.runs.items, 0) orelse return;
+    const plan = selectL0Compaction(backend.runs.items, 0, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
 }
 
@@ -489,10 +664,10 @@ fn appendPlanRunSnapshots(
 ) !void {
     try out.ensureUnusedCapacity(backend.allocator, plan.source_len + plan.target_len);
     for (backend.runs.items[plan.source_start .. plan.source_start + plan.source_len]) |run| {
-        out.appendAssumeCapacity(try repository_mod.cloneRunSnapshot(backend.allocator, run));
+        out.appendAssumeCapacity(try repository_mod.cloneRunCompactionSnapshot(backend.allocator, run));
     }
     for (backend.runs.items[plan.target_start .. plan.target_start + plan.target_len]) |run| {
-        out.appendAssumeCapacity(try repository_mod.cloneRunSnapshot(backend.allocator, run));
+        out.appendAssumeCapacity(try repository_mod.cloneRunCompactionSnapshot(backend.allocator, run));
     }
 }
 
@@ -663,18 +838,51 @@ fn selectCompactionPlan(
     level_target_runs_multiplier: usize,
     level_target_bytes_base: usize,
     level_target_bytes_multiplier: usize,
+    max_input_bytes: u64,
+    allow_oversized_single_job: bool,
+) ?CompactionPlan {
+    return selectCompactionPlanWithStats(
+        runs,
+        l0_limit,
+        l0_overlap_compact_threshold_runs,
+        level_target_runs_base,
+        level_target_runs_multiplier,
+        level_target_bytes_base,
+        level_target_bytes_multiplier,
+        max_input_bytes,
+        allow_oversized_single_job,
+        null,
+    );
+}
+
+fn selectCompactionPlanWithStats(
+    runs: []const Run,
+    l0_limit: usize,
+    l0_overlap_compact_threshold_runs: usize,
+    level_target_runs_base: usize,
+    level_target_runs_multiplier: usize,
+    level_target_bytes_base: usize,
+    level_target_bytes_multiplier: usize,
+    max_input_bytes: u64,
+    allow_oversized_single_job: bool,
+    selection_stats: ?*CompactionSelectionStats,
 ) ?CompactionPlan {
     if (runs.len < 2) return null;
-    if (selectL0OverlapCompaction(runs, l0_overlap_compact_threshold_runs)) |plan| return plan;
-    if (selectL0Compaction(runs, l0_limit)) |plan| return plan;
-    if (selectLowerLevelRepairCompaction(runs)) |plan| return plan;
-    return selectLowerLevelPressureCompaction(
+    var best: ?ScoredCompactionPlan = null;
+    maybeAdoptBest(&best, selectL0OverlapCompactionCandidateWithStats(runs, l0_overlap_compact_threshold_runs, max_input_bytes, selection_stats));
+    maybeAdoptBest(&best, selectL0CompactionCandidateWithStats(runs, l0_limit, max_input_bytes, allow_oversized_single_job, selection_stats));
+    maybeAdoptBest(&best, selectLowerLevelRepairCompactionCandidateWithStats(runs, max_input_bytes, allow_oversized_single_job, selection_stats));
+    maybeAdoptBest(&best, selectLowerLevelPressureCompactionCandidateWithStats(
         runs,
         level_target_runs_base,
         level_target_runs_multiplier,
         level_target_bytes_base,
         level_target_bytes_multiplier,
-    );
+        max_input_bytes,
+        allow_oversized_single_job,
+        selection_stats,
+    ));
+    return if (best) |candidate| candidate.plan else null;
 }
 
 pub fn largestL0OverlapRunCount(runs: []const Run, threshold: usize) usize {
@@ -692,14 +900,30 @@ pub fn largestL0OverlapRunCount(runs: []const Run, threshold: usize) usize {
     return if (best >= threshold) best else 0;
 }
 
-fn selectL0OverlapCompaction(runs: []const Run, threshold: usize) ?CompactionPlan {
+fn selectL0OverlapCompaction(runs: []const Run, threshold: usize, max_input_bytes: u64) ?CompactionPlan {
+    return selectL0OverlapCompactionWithStats(runs, threshold, max_input_bytes, null);
+}
+
+fn selectL0OverlapCompactionWithStats(
+    runs: []const Run,
+    threshold: usize,
+    max_input_bytes: u64,
+    selection_stats: ?*CompactionSelectionStats,
+) ?CompactionPlan {
+    return if (selectL0OverlapCompactionCandidateWithStats(runs, threshold, max_input_bytes, selection_stats)) |candidate| candidate.plan else null;
+}
+
+fn selectL0OverlapCompactionCandidateWithStats(
+    runs: []const Run,
+    threshold: usize,
+    max_input_bytes: u64,
+    selection_stats: ?*CompactionSelectionStats,
+) ?ScoredCompactionPlan {
     if (threshold == 0) return null;
     const l0_count = countLeadingL0Runs(runs);
     if (l0_count < threshold) return null;
 
-    var best_start: usize = 0;
-    var best_len: usize = 0;
-    var best_bytes: u64 = std.math.maxInt(u64);
+    var best: ?ScoredCompactionPlan = null;
     for (runs[0..l0_count]) |anchor| {
         var start: ?usize = null;
         var end: usize = 0;
@@ -715,14 +939,15 @@ fn selectL0OverlapCompaction(runs: []const Run, threshold: usize) ?CompactionPla
         if (count < threshold) continue;
         const span_start = start.?;
         const span_len = end - span_start;
-        if (best_len == 0 or count > best_len or (count == best_len and bytes < best_bytes)) {
-            best_start = span_start;
-            best_len = span_len;
-            best_bytes = bytes;
+        const plan = buildPlanForSourceRange(runs, 0, span_start, span_len) orelse continue;
+        if (!planWithinInputBudget(runs, plan, max_input_bytes)) {
+            noteOversizedSelectionSkip(selection_stats, max_input_bytes);
+            continue;
         }
+        const priority = @as(u64, @intCast(count)) * 2_000 +| bytes / (64 * 1024);
+        maybeAdoptBest(&best, scoredPlan(runs, plan, priority));
     }
-    if (best_len == 0) return null;
-    return buildPlanForSourceRange(runs, 0, best_start, best_len);
+    return best;
 }
 
 fn countLeadingL0Runs(runs: []const Run) usize {
@@ -731,17 +956,71 @@ fn countLeadingL0Runs(runs: []const Run) usize {
     return l0_count;
 }
 
-fn selectL0Compaction(runs: []const Run, l0_limit: usize) ?CompactionPlan {
+fn selectL0Compaction(runs: []const Run, l0_limit: usize, max_input_bytes: u64, allow_oversized_single_job: bool) ?CompactionPlan {
+    return selectL0CompactionWithStats(runs, l0_limit, max_input_bytes, allow_oversized_single_job, null);
+}
+
+fn selectL0CompactionWithStats(
+    runs: []const Run,
+    l0_limit: usize,
+    max_input_bytes: u64,
+    allow_oversized_single_job: bool,
+    selection_stats: ?*CompactionSelectionStats,
+) ?CompactionPlan {
+    return if (selectL0CompactionCandidateWithStats(runs, l0_limit, max_input_bytes, allow_oversized_single_job, selection_stats)) |candidate| candidate.plan else null;
+}
+
+fn selectL0CompactionCandidateWithStats(
+    runs: []const Run,
+    l0_limit: usize,
+    max_input_bytes: u64,
+    allow_oversized_single_job: bool,
+    selection_stats: ?*CompactionSelectionStats,
+) ?ScoredCompactionPlan {
     const l0_count = countLeadingL0Runs(runs);
     if (l0_count == 0 or l0_count <= l0_limit) return null;
     const target_l0_count = @max(@as(usize, 1), l0_limit / 2);
     const excess_len = @max(@as(usize, 1), l0_count - target_l0_count);
-    const max_window_len = @max(@as(usize, 2), l0_limit / 2);
-    const source_len = @min(excess_len, max_window_len);
-    return buildPlanForSourceRange(runs, 0, l0_count - source_len, source_len);
+    const max_window_len = if (l0_limit == 0)
+        @as(usize, 2)
+    else
+        std.math.mul(usize, @max(@as(usize, 1), l0_limit), 2) catch std.math.maxInt(usize);
+    var source_len = @min(excess_len, max_window_len);
+    var oversized_plan: ?CompactionPlan = null;
+    while (source_len > 0) : (source_len -= 1) {
+        const plan = buildPlanForSourceRange(runs, 0, l0_count - source_len, source_len) orelse continue;
+        const priority = @as(u64, @intCast(l0_count - l0_limit)) * 1_000 +| @as(u64, @intCast(source_len)) * 10;
+        if (planWithinInputBudget(runs, plan, max_input_bytes)) return scoredPlan(runs, plan, priority);
+        if (allow_oversized_single_job and max_input_bytes > 0) {
+            oversized_plan = plan;
+        } else {
+            noteOversizedSelectionSkip(selection_stats, max_input_bytes);
+        }
+    }
+    return if (oversized_plan) |plan| scoredPlan(runs, plan, @as(u64, @intCast(l0_count - l0_limit)) * 1_000) else null;
 }
 
-fn selectLowerLevelRepairCompaction(runs: []const Run) ?CompactionPlan {
+fn selectLowerLevelRepairCompaction(runs: []const Run, max_input_bytes: u64, allow_oversized_single_job: bool) ?CompactionPlan {
+    return selectLowerLevelRepairCompactionWithStats(runs, max_input_bytes, allow_oversized_single_job, null);
+}
+
+fn selectLowerLevelRepairCompactionWithStats(
+    runs: []const Run,
+    max_input_bytes: u64,
+    allow_oversized_single_job: bool,
+    selection_stats: ?*CompactionSelectionStats,
+) ?CompactionPlan {
+    return if (selectLowerLevelRepairCompactionCandidateWithStats(runs, max_input_bytes, allow_oversized_single_job, selection_stats)) |candidate| candidate.plan else null;
+}
+
+fn selectLowerLevelRepairCompactionCandidateWithStats(
+    runs: []const Run,
+    max_input_bytes: u64,
+    allow_oversized_single_job: bool,
+    selection_stats: ?*CompactionSelectionStats,
+) ?ScoredCompactionPlan {
+    var best: ?ScoredCompactionPlan = null;
+    var oversized_plan: ?ScoredCompactionPlan = null;
     var i: usize = 0;
     while (i + 1 < runs.len) : (i += 1) {
         const level = runs[i].level;
@@ -775,9 +1054,18 @@ fn selectLowerLevelRepairCompaction(runs: []const Run) ?CompactionPlan {
                 largest_key = runs[end].largest_key;
             }
         }
-        return buildPlanForSourceRange(runs, level, start, end - start);
+        const plan = buildPlanForSourceRange(runs, level, start, end - start) orelse continue;
+        const plan_score = planScoreForPlan(runs, plan);
+        const priority = @as(u64, @intCast(plan.source_len)) * 750 +| plan_score.rewrite_bytes / (64 * 1024);
+        if (planWithinInputBudget(runs, plan, max_input_bytes)) {
+            maybeAdoptBest(&best, .{ .plan = plan, .priority = priority, .tie = plan_score });
+        } else if (allow_oversized_single_job and max_input_bytes > 0) {
+            maybeAdoptBest(&oversized_plan, .{ .plan = plan, .priority = priority, .tie = plan_score });
+        } else {
+            noteOversizedSelectionSkip(selection_stats, max_input_bytes);
+        }
     }
-    return null;
+    return best orelse oversized_plan;
 }
 
 fn selectLowerLevelPressureCompaction(
@@ -786,7 +1074,54 @@ fn selectLowerLevelPressureCompaction(
     level_target_runs_multiplier: usize,
     level_target_bytes_base: usize,
     level_target_bytes_multiplier: usize,
+    max_input_bytes: u64,
+    allow_oversized_single_job: bool,
 ) ?CompactionPlan {
+    return selectLowerLevelPressureCompactionWithStats(
+        runs,
+        level_target_runs_base,
+        level_target_runs_multiplier,
+        level_target_bytes_base,
+        level_target_bytes_multiplier,
+        max_input_bytes,
+        allow_oversized_single_job,
+        null,
+    );
+}
+
+fn selectLowerLevelPressureCompactionWithStats(
+    runs: []const Run,
+    level_target_runs_base: usize,
+    level_target_runs_multiplier: usize,
+    level_target_bytes_base: usize,
+    level_target_bytes_multiplier: usize,
+    max_input_bytes: u64,
+    allow_oversized_single_job: bool,
+    selection_stats: ?*CompactionSelectionStats,
+) ?CompactionPlan {
+    return if (selectLowerLevelPressureCompactionCandidateWithStats(
+        runs,
+        level_target_runs_base,
+        level_target_runs_multiplier,
+        level_target_bytes_base,
+        level_target_bytes_multiplier,
+        max_input_bytes,
+        allow_oversized_single_job,
+        selection_stats,
+    )) |candidate| candidate.plan else null;
+}
+
+fn selectLowerLevelPressureCompactionCandidateWithStats(
+    runs: []const Run,
+    level_target_runs_base: usize,
+    level_target_runs_multiplier: usize,
+    level_target_bytes_base: usize,
+    level_target_bytes_multiplier: usize,
+    max_input_bytes: u64,
+    allow_oversized_single_job: bool,
+    selection_stats: ?*CompactionSelectionStats,
+) ?ScoredCompactionPlan {
+    var best: ?ScoredCompactionPlan = null;
     var i: usize = 0;
     while (i < runs.len) {
         const level = runs[i].level;
@@ -805,11 +1140,25 @@ fn selectLowerLevelPressureCompaction(
         const need_bytes = target_bytes > 0 and level_bytes > target_bytes;
         if (!need_runs and !need_bytes) continue;
 
+        const run_debt = if (need_runs) level_len - target_runs else 0;
+        const byte_debt = if (need_bytes) level_bytes - target_bytes else 0;
+        const priority = @as(u64, @intCast(run_debt)) * 500 +| byte_debt / (64 * 1024);
         const source_len = if (need_runs) @max(@as(usize, 1), level_len - target_runs) else 1;
         const source_bytes = if (need_bytes) @max(@as(u64, 1), level_bytes - target_bytes) else 0;
-        if (selectLowestOverlapWindow(runs, level, level_start, level_len, source_len, source_bytes)) |plan| return plan;
+        maybeAdoptBest(&best, selectLowestOverlapWindowCandidate(
+            runs,
+            level,
+            level_start,
+            level_len,
+            source_len,
+            source_bytes,
+            max_input_bytes,
+            allow_oversized_single_job,
+            selection_stats,
+            priority,
+        ));
     }
-    return null;
+    return best;
 }
 
 fn selectLowestOverlapWindow(
@@ -819,10 +1168,41 @@ fn selectLowestOverlapWindow(
     level_len: usize,
     source_len: usize,
     source_bytes: u64,
+    max_input_bytes: u64,
+    allow_oversized_single_job: bool,
+    selection_stats: ?*CompactionSelectionStats,
 ) ?CompactionPlan {
+    return if (selectLowestOverlapWindowCandidate(
+        runs,
+        level,
+        level_start,
+        level_len,
+        source_len,
+        source_bytes,
+        max_input_bytes,
+        allow_oversized_single_job,
+        selection_stats,
+        1,
+    )) |candidate| candidate.plan else null;
+}
+
+fn selectLowestOverlapWindowCandidate(
+    runs: []const Run,
+    level: u32,
+    level_start: usize,
+    level_len: usize,
+    source_len: usize,
+    source_bytes: u64,
+    max_input_bytes: u64,
+    allow_oversized_single_job: bool,
+    selection_stats: ?*CompactionSelectionStats,
+    priority: u64,
+) ?ScoredCompactionPlan {
     std.debug.assert(level_len >= source_len);
     var best_plan: ?CompactionPlan = null;
     var best_score: ?PlanScore = null;
+    var oversized_plan: ?CompactionPlan = null;
+    var oversized_score: ?PlanScore = null;
 
     var offset: usize = 0;
     while (offset < level_len) : (offset += 1) {
@@ -844,6 +1224,15 @@ fn selectLowestOverlapWindow(
                 .target_len = plan.target_len,
                 .source_start = source_start,
             };
+            if (!planWithinInputBudget(runs, plan, max_input_bytes)) {
+                if (allow_oversized_single_job and max_input_bytes > 0 and (oversized_score == null or score.betterThan(oversized_score.?))) {
+                    oversized_plan = plan;
+                    oversized_score = score;
+                } else {
+                    noteOversizedSelectionSkip(selection_stats, max_input_bytes);
+                }
+                break;
+            }
             if (best_score == null or score.betterThan(best_score.?)) {
                 best_plan = plan;
                 best_score = score;
@@ -851,7 +1240,9 @@ fn selectLowestOverlapWindow(
             break;
         }
     }
-    return best_plan;
+    if (best_plan) |plan| return .{ .plan = plan, .priority = priority, .tie = best_score.? };
+    if (oversized_plan) |plan| return .{ .plan = plan, .priority = priority, .tie = oversized_score.? };
+    return null;
 }
 
 fn levelRunTarget(level: u32, base: usize, multiplier: usize) usize {
@@ -960,6 +1351,103 @@ fn rangesOverlap(
 ) bool {
     return compareRunBound(lhs_smallest_namespace_name, lhs_smallest_key, rhs_largest_namespace_name, rhs_largest_key) != .gt and
         compareRunBound(lhs_largest_namespace_name, lhs_largest_key, rhs_smallest_namespace_name, rhs_smallest_key) != .lt;
+}
+
+fn testRun(id: u64, level: u32, smallest_key: []const u8, largest_key: []const u8, size_bytes: u64) Run {
+    return .{
+        .id = id,
+        .level = level,
+        .size_bytes = size_bytes,
+        .path = null,
+        .smallest_namespace_name = @constCast("docs"),
+        .smallest_key = @constCast(smallest_key),
+        .largest_namespace_name = @constCast("docs"),
+        .largest_key = @constCast(largest_key),
+        .entry_count = 1,
+        .bloom_filter = null,
+        .encoded_bloom_filter = null,
+        .owns_metadata = false,
+        .owns_bloom_filter = false,
+        .state = null,
+    };
+}
+
+test "lsm compaction lower-level repair can exceed input target for minimum job" {
+    const runs = [_]Run{
+        testRun(1, 1, "doc:a", "doc:m", 100),
+        testRun(2, 1, "doc:h", "doc:z", 100),
+    };
+
+    try std.testing.expect(selectLowerLevelRepairCompaction(&runs, 1, false) == null);
+    const plan = selectLowerLevelRepairCompaction(&runs, 1, true) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), plan.source_level);
+    try std.testing.expectEqual(@as(usize, 0), plan.source_start);
+    try std.testing.expectEqual(@as(usize, 2), plan.source_len);
+    try std.testing.expectEqual(@as(u32, 2), plan.output_level);
+}
+
+test "lsm compaction lower-level pressure can exceed input target for minimum job" {
+    const runs = [_]Run{
+        testRun(1, 1, "doc:a", "doc:b", 100),
+        testRun(2, 1, "doc:c", "doc:d", 100),
+    };
+
+    try std.testing.expect(selectLowerLevelPressureCompaction(&runs, 1, 1, 0, 8, 1, false) == null);
+    const plan = selectLowerLevelPressureCompaction(&runs, 1, 1, 0, 8, 1, true) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), plan.source_level);
+    try std.testing.expectEqual(@as(usize, 1), plan.source_len);
+    try std.testing.expectEqual(@as(u32, 2), plan.output_level);
+}
+
+test "lsm compaction L0 pressure selects a wider assist window" {
+    const runs = [_]Run{
+        testRun(9, 0, "doc:009", "doc:009", 10),
+        testRun(8, 0, "doc:008", "doc:008", 10),
+        testRun(7, 0, "doc:007", "doc:007", 10),
+        testRun(6, 0, "doc:006", "doc:006", 10),
+        testRun(5, 0, "doc:005", "doc:005", 10),
+        testRun(4, 0, "doc:004", "doc:004", 10),
+        testRun(3, 0, "doc:003", "doc:003", 10),
+        testRun(2, 0, "doc:002", "doc:002", 10),
+        testRun(1, 0, "doc:001", "doc:001", 10),
+    };
+
+    const plan = selectL0Compaction(&runs, 4, 0, false) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 0), plan.source_level);
+    try std.testing.expectEqual(@as(usize, 2), plan.source_start);
+    try std.testing.expectEqual(@as(usize, 7), plan.source_len);
+    try std.testing.expectEqual(@as(u32, 1), plan.output_level);
+
+    const oldest_pair = selectL0Compaction(&runs, 0, 0, false) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 7), oldest_pair.source_start);
+    try std.testing.expectEqual(@as(usize, 2), oldest_pair.source_len);
+}
+
+test "lsm compaction plan selection chooses highest scored debt" {
+    const runs = [_]Run{
+        testRun(12, 0, "doc:012", "doc:012", 10),
+        testRun(11, 0, "doc:011", "doc:011", 10),
+        testRun(10, 0, "doc:010", "doc:010", 10),
+        testRun(1, 1, "doc:a", "doc:b", 1024 * 1024),
+        testRun(2, 1, "doc:c", "doc:d", 1024 * 1024),
+        testRun(3, 1, "doc:e", "doc:f", 1024 * 1024),
+        testRun(4, 1, "doc:g", "doc:h", 1024 * 1024),
+        testRun(5, 1, "doc:i", "doc:j", 1024 * 1024),
+    };
+
+    const plan = selectCompactionPlan(
+        &runs,
+        2,
+        0,
+        1,
+        1,
+        0,
+        8,
+        0,
+        false,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), plan.source_level);
+    try std.testing.expectEqual(@as(u32, 2), plan.output_level);
 }
 
 fn rangesOverlapRun(lhs: Run, rhs: Run) bool {
@@ -1109,6 +1597,8 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 expected_entries,
                 backend.options.bloom,
                 backend.options.table_block_compression,
+                backend.options.table_prefix_extractor,
+                backend.options.resource_manager,
             );
             self.writer_active = true;
         }
@@ -1230,7 +1720,8 @@ const PersistedRunCursor = struct {
     }
 
     fn ensureWindowForPosition(self: *PersistedRunCursor, pos: usize) !void {
-        const window = self.index.entryDataWindow(pos, lsm_table_file.default_block_size);
+        const block_index = self.index.findBlockIndexForEntry(pos) orelse return error.InvalidTableFile;
+        const window = self.index.blockWindow(block_index);
         if (self.loaded_window) |loaded| {
             if (loaded.relative_offset == window.relative_offset and
                 loaded.len == window.len and
@@ -1336,6 +1827,8 @@ pub fn makeRuns(comptime BackendType: type, backend: *BackendType, state: *State
 
 pub fn makeRunsFromStateBorrowed(comptime BackendType: type, backend: *BackendType, state: *const State) !std.ArrayListUnmanaged(Run) {
     if (state.entries.items.len == 0) return error.EmptyRun;
+    if (backend.root_dir != null) return try makePersistedRunsFromStateBorrowedAtLevel(BackendType, backend, state, 0);
+
     var scratch_bytes_accounted: u64 = 0;
     if (@hasField(BackendType, "options")) {
         if (backend.options.resource_manager) |manager| {
@@ -1359,6 +1852,39 @@ pub fn makeRunsFromStateBorrowed(comptime BackendType: type, backend: *BackendTy
         };
     }
     return try makeRunsFromSortedTableEntriesAtLevel(BackendType, backend, entries, 0);
+}
+
+fn makePersistedRunsFromStateBorrowedAtLevel(comptime BackendType: type, backend: *BackendType, state: *const State, level: u32) !std.ArrayListUnmanaged(Run) {
+    if (state.entries.items.len == 0) return error.EmptyRun;
+    try validateSortedUniqueOwnedEntries(state.entries.items);
+
+    var runs = std.ArrayListUnmanaged(Run).empty;
+    errdefer deinitRunList(backend.allocator, &runs);
+
+    const target_bytes = targetRunFileBytes(BackendType, backend);
+    var start: usize = 0;
+    while (start < state.entries.items.len) {
+        const end = splitOwnedEntriesEnd(state.entries.items, start, target_bytes);
+        try runs.ensureUnusedCapacity(backend.allocator, 1);
+
+        var output: PersistedOutputRunBuilder(BackendType) = undefined;
+        try output.initInPlace(backend, level, end - start);
+        var output_active = true;
+        errdefer if (output_active) output.deinit();
+
+        for (state.entries.items[start..end]) |entry| {
+            const table_entry = tableEntryFromOwnedEntry(entry);
+            try output.appendEntry(table_entry, estimateOwnedEntryBytes(entry));
+        }
+
+        const run = try output.finish();
+        output.deinit();
+        output_active = false;
+        runs.appendAssumeCapacity(run);
+        start = end;
+    }
+
+    return runs;
 }
 
 pub fn makeRunsFromSortedTableEntries(comptime BackendType: type, backend: *BackendType, entries: []const lsm_table_file.Entry) !std.ArrayListUnmanaged(Run) {
@@ -1457,7 +1983,15 @@ pub fn makeRunAtLevel(comptime BackendType: type, backend: *BackendType, state: 
     errdefer if (run.bloom_filter) |*filter| filter.deinit(backend.allocator);
 
     if (backend.root_dir != null) {
-        run.path = try repository_mod.persistRunFileWithStorage(backend.storage.?, backend.allocator, backend.root_dir.?, &run, backend.options.table_block_compression);
+        run.path = try repository_mod.persistRunFileWithStorageAccounted(
+            backend.storage.?,
+            backend.allocator,
+            backend.root_dir.?,
+            &run,
+            backend.options.table_block_compression,
+            backend.options.table_prefix_extractor,
+            backend.options.resource_manager,
+        );
         if (run.state) |*persisted_state| persisted_state.deinit(backend.allocator);
         run.state = null;
     }
@@ -1497,18 +2031,27 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
     const largest_key = try backend.allocator.dupe(u8, last.key);
     errdefer backend.allocator.free(largest_key);
 
-    var filter = try lsm_table_file.buildFilterAlloc(backend.allocator, entries, backend.options.bloom);
-    errdefer filter.deinit(backend.allocator);
-    const persisted = try repository_mod.persistTableEntriesAsRunFile(
+    var writer: repository_mod.StreamingRunFileWriter = undefined;
+    try writer.initInPlace(
         backend.storage.?,
         backend.allocator,
         backend.root_dir.?,
         run_id,
-        entries,
-        filter,
+        entries.len,
+        backend.options.bloom,
         backend.options.table_block_compression,
+        backend.options.table_prefix_extractor,
+        backend.options.resource_manager,
     );
-    errdefer backend.allocator.free(persisted.path);
+    var writer_active = true;
+    errdefer if (writer_active) writer.deinit();
+    for (entries) |entry| try writer.appendEntry(entry);
+    var persisted = try writer.finish();
+    writer_active = false;
+    errdefer {
+        backend.allocator.free(persisted.path);
+        persisted.filter.deinit(backend.allocator);
+    }
 
     return Run{
         .id = run_id,
@@ -1520,8 +2063,8 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
         .smallest_key = smallest_key,
         .largest_namespace_name = largest_namespace_name,
         .largest_key = largest_key,
-        .entry_count = @intCast(entries.len),
-        .bloom_filter = filter,
+        .entry_count = @intCast(persisted.entry_count),
+        .bloom_filter = persisted.filter,
         .encoded_bloom_filter = null,
         .state = null,
     };
@@ -1532,6 +2075,18 @@ fn validateSortedUniqueTableEntries(entries: []const lsm_table_file.Entry) !void
     var prev = entries[0];
     for (entries[1..]) |entry| {
         switch (compareTableEntry(prev, entry)) {
+            .lt => prev = entry,
+            .eq => return error.DuplicateBulkIngestKey,
+            .gt => return error.UnsortedBulkIngestEntries,
+        }
+    }
+}
+
+fn validateSortedUniqueOwnedEntries(entries: []const state_mod.OwnedEntry) !void {
+    if (entries.len <= 1) return;
+    var prev = entries[0];
+    for (entries[1..]) |entry| {
+        switch (compareOwnedEntry(prev, entry)) {
             .lt => prev = entry,
             .eq => return error.DuplicateBulkIngestKey,
             .gt => return error.UnsortedBulkIngestEntries,
@@ -1636,4 +2191,17 @@ fn estimateTableEntryBytes(entry: lsm_table_file.Entry) usize {
     total +|= entry.key.len;
     total +|= entry.value.len;
     return total;
+}
+
+fn tableEntryFromOwnedEntry(entry: state_mod.OwnedEntry) lsm_table_file.Entry {
+    return .{
+        .namespace_name = entry.namespace_name,
+        .key = entry.key,
+        .value = entry.value,
+        .tombstone = entry.tombstone,
+    };
+}
+
+fn compareOwnedEntry(lhs: state_mod.OwnedEntry, rhs: state_mod.OwnedEntry) std.math.Order {
+    return compareTableEntry(tableEntryFromOwnedEntry(lhs), tableEntryFromOwnedEntry(rhs));
 }

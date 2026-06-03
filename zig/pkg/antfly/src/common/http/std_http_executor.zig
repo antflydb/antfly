@@ -14,12 +14,13 @@
 
 const std = @import("std");
 const common = @import("http_common.zig");
+const std_http_listener = @import("std_http_listener.zig");
 
 pub const StdHttpExecutorConfig = struct {
     read_buffer_size: usize = 8 * 1024,
     write_buffer_size: usize = 1024,
     max_response_bytes: usize = 4 << 20,
-    thread_stack_size: usize = 1 * 1024 * 1024,
+    thread_stack_size: usize = std_http_listener.default_request_stack_size,
     keep_alive: bool = false,
     /// Proactively retire pooled HTTP/1.1 connections before a server-side
     /// keep-alive cap closes them. 0 means unlimited client-side reuse.

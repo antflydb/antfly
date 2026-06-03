@@ -22,7 +22,7 @@ Usage:
 
     # Run stateful tests against an existing server:
     ANTFLY_STATEFUL_URL=http://127.0.0.1:8080 uv run --project e2e/antfly pytest e2e/antfly/test_schema_migration.py
-    # For Go Antfly, also set ANTFLY_STATEFUL_API_ROOT=/api/v1.
+    # For Go Antfly, also set ANTFLY_STATEFUL_API_ROOT=/db/v1.
 
     # Or start the local unified stateful entrypoint automatically:
     ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest e2e/antfly/test_schema_migration.py
@@ -49,9 +49,9 @@ import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
-ANTFLY_PUBLIC_API_ROOT = "/api/v1"
+ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
-TERMITE_PUBLIC_API_ROOT = "/ml/v1"
+INFERENCE_PUBLIC_API_ROOT = "/ai/v1"
 CLIPCLAP_MODEL = "antflydb/clipclap"
 CLIPCLAP_GGUF_FILES = (
     "clipclap-clip.Q4_K.gguf",
@@ -116,8 +116,8 @@ def antfly_internal_api_path(path: str) -> str:
     return prefixed_api_path(ANTFLY_INTERNAL_API_ROOT, path)
 
 
-def termite_public_api_url(base_url: str) -> str:
-    return with_api_root(base_url, TERMITE_PUBLIC_API_ROOT)
+def inference_public_api_url(base_url: str) -> str:
+    return with_api_root(base_url, INFERENCE_PUBLIC_API_ROOT)
 
 
 def find_free_port() -> int:
@@ -696,7 +696,7 @@ class SwarmAntflyServer:
             self.tempdir.cleanup()
 
 
-class TermiteRerankerServer:
+class InferenceRerankerServer:
     def __init__(self, host: str = "127.0.0.1"):
         port = find_free_port()
         self.url = f"http://{host}:{port}"
@@ -739,7 +739,7 @@ class TermiteRerankerServer:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         if not wait_for_listener(self.url):
-            raise RuntimeError(f"Termite reranker server failed to start at {self.url}")
+            raise RuntimeError(f"Inference reranker server failed to start at {self.url}")
 
     def stop(self) -> None:
         self._server.shutdown()
@@ -747,7 +747,7 @@ class TermiteRerankerServer:
         self._thread.join(timeout=5)
 
 
-class TermiteGeneratorServer:
+class InferenceGeneratorServer:
     def __init__(self, host: str = "127.0.0.1"):
         port = find_free_port()
         self.url = f"http://{host}:{port}"
@@ -802,7 +802,7 @@ class TermiteGeneratorServer:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         if not wait_for_listener(self.url):
-            raise RuntimeError(f"Termite generator server failed to start at {self.url}")
+            raise RuntimeError(f"Inference generator server failed to start at {self.url}")
 
     def stop(self) -> None:
         self._server.shutdown()
@@ -1100,11 +1100,11 @@ class PacingSensitiveOpenAiEmbeddingServer:
         self._thread.join(timeout=5)
 
 
-class TermiteEmbeddingServer:
+class InferenceEmbeddingServer:
     def __init__(self, host: str = "127.0.0.1"):
         port = find_free_port()
         self.base_url = f"http://{host}:{port}"
-        self.url = termite_public_api_url(self.base_url)
+        self.url = inference_public_api_url(self.base_url)
 
         outer = self
 
@@ -1114,9 +1114,9 @@ class TermiteEmbeddingServer:
                 raw = self.rfile.read(content_length)
                 payload = json.loads(raw.decode("utf-8") or "{}")
 
-                if self.path in ("/chunk", "/api/chunk", f"{TERMITE_PUBLIC_API_ROOT}/chunk"):
+                if self.path in ("/chunk", "/api/chunk", f"{INFERENCE_PUBLIC_API_ROOT}/chunk"):
                     model = payload.get("config", {}).get("model")
-                    if model != "termite-chunker-v1":
+                    if model != "antfly-chunker-v1":
                         self.send_error(400)
                         return
                     input_value = payload.get("input", "")
@@ -1168,8 +1168,8 @@ class TermiteEmbeddingServer:
                     "/embed",
                     "/embeddings",
                     "/api/embed",
-                    f"{TERMITE_PUBLIC_API_ROOT}/embed",
-                    f"{TERMITE_PUBLIC_API_ROOT}/embeddings",
+                    f"{INFERENCE_PUBLIC_API_ROOT}/embed",
+                    f"{INFERENCE_PUBLIC_API_ROOT}/embeddings",
                 ):
                     model = payload.get("model", "")
                     input_value = payload.get("input", [])
@@ -1178,7 +1178,7 @@ class TermiteEmbeddingServer:
                     else:
                         values = [outer._vector_for_text(str(input_value))]
 
-                    if model == "termite-sparse-v1":
+                    if model == "antfly-sparse-v1":
                         data = [
                             {
                                 "object": "embedding",
@@ -1204,7 +1204,7 @@ class TermiteEmbeddingServer:
                         {
                             "object": "list",
                             "data": data,
-                            "model": model or "termite-embed-v1",
+                            "model": model or "antfly-embed-v1",
                             "usage": {
                                 "prompt_tokens": max(1, len(values)),
                                 "total_tokens": max(1, len(values)),
@@ -1230,7 +1230,7 @@ class TermiteEmbeddingServer:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         if not wait_for_listener(self.url):
-            raise RuntimeError(f"Termite embedding server failed to start at {self.url}")
+            raise RuntimeError(f"Inference embedding server failed to start at {self.url}")
 
     @staticmethod
     def _vector_for_text(text: str) -> list[float]:
@@ -1251,7 +1251,7 @@ class TermiteEmbeddingServer:
 
 def _models_dir() -> Path:
     home = os.environ.get("HOME")
-    return Path(home).expanduser() / ".termite" / "models" if home else Path("./models")
+    return Path(home).expanduser() / ".antfly" / "inference" / "models" if home else Path("./models")
 
 
 def _clipclap_model_dir() -> Path:
@@ -1437,15 +1437,15 @@ def serverless_api(serverless_runtime):
 
 
 @pytest.fixture(scope="function")
-def termite_reranker():
-    server = TermiteRerankerServer()
+def inference_reranker():
+    server = InferenceRerankerServer()
     yield server.url
     server.stop()
 
 
 @pytest.fixture(scope="function")
-def termite_generator():
-    server = TermiteGeneratorServer()
+def inference_generator():
+    server = InferenceGeneratorServer()
     yield server.url
     server.stop()
 
@@ -1484,8 +1484,8 @@ def strict_pacing_sensitive_openai_embedder():
 
 
 @pytest.fixture(scope="function")
-def termite_embedder():
-    server = TermiteEmbeddingServer()
+def inference_embedder():
+    server = InferenceEmbeddingServer()
     yield server.url
     server.stop()
 
@@ -1505,12 +1505,12 @@ def clipclap_model_available():
         pytest.skip(f"Antfly binary not found for model download: {binary}")
 
     subprocess.run(
-        [binary, "termite", "pull", "hf:antflydb/clipclap:gguf:Q4_K", "--tasks", "embed"],
+        [binary, "inference", "pull", "hf:antflydb/clipclap:gguf:Q4_K", "--tasks", "embed"],
         cwd=REPO_ROOT,
         check=True,
     )
     if not model_dir.exists():
-        raise RuntimeError(f"termite pull finished but did not create {model_dir}")
+        raise RuntimeError(f"antfly inference pull finished but did not create {model_dir}")
     if not _clipclap_gguf_available(model_dir):
         raise RuntimeError(f"ClipClap GGUF files are missing from {model_dir}")
     return model_dir
@@ -1695,12 +1695,12 @@ def stateful_api():
         def query_table(self, table_name: str, payload: dict) -> dict:
             return self.post(f"/tables/{table_name}/query", payload)
 
-        def termite_embed(self, model: str, text: str, *, timeout_s: float = 120.0) -> dict:
+        def inference_embed(self, model: str, text: str, *, timeout_s: float = 120.0) -> dict:
             base_url = self.url.removesuffix(ANTFLY_PUBLIC_API_ROOT)
             try:
                 with self._request_lock:
                     response = self.s.post(
-                        f"{base_url}{TERMITE_PUBLIC_API_ROOT}/embed",
+                        f"{base_url}{INFERENCE_PUBLIC_API_ROOT}/embed",
                         json={"model": model, "input": text},
                         timeout=timeout_s,
                     )
@@ -2146,12 +2146,12 @@ def backup_api():
         def query_table(self, table_name: str, payload: dict) -> dict:
             return self.post(f"/tables/{table_name}/query", payload)
 
-        def termite_embed(self, model: str, text: str, *, timeout_s: float = 120.0) -> dict:
+        def inference_embed(self, model: str, text: str, *, timeout_s: float = 120.0) -> dict:
             base_url = self.url.removesuffix(ANTFLY_PUBLIC_API_ROOT)
             try:
                 with self._request_lock:
                     response = self.s.post(
-                        f"{base_url}{TERMITE_PUBLIC_API_ROOT}/embed",
+                        f"{base_url}{INFERENCE_PUBLIC_API_ROOT}/embed",
                         json={"model": model, "input": text},
                         timeout=timeout_s,
                     )

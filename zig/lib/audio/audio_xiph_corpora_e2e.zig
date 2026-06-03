@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite_audio = @import("src/mod.zig");
+const inference_audio = @import("src/mod.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -329,15 +329,15 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), full_path, alloc, .limited(max_fixture_bytes));
     defer alloc.free(bytes);
 
-    const format = termite_audio.detectFormatFromFilename(relative_path) orelse
-        termite_audio.detectFormat(bytes) orelse
+    const format = inference_audio.detectFormatFromFilename(relative_path) orelse
+        inference_audio.detectFormat(bytes) orelse
         return classifyUnsupported(relative_path);
     switch (format) {
         .ogg, .opus, .flac => {},
         else => return classifyUnsupported(relative_path),
     }
 
-    var interleaved = termite_audio.decodeInterleaved(alloc, bytes, .{
+    var interleaved = inference_audio.decodeInterleaved(alloc, bytes, .{
         .file_name_hint = relative_path,
     }) catch |err| switch (err) {
         error.UnsupportedAudioFormat => return classifyUnsupported(relative_path),
@@ -346,7 +346,7 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
     defer interleaved.deinit();
     if (interleaved.sample_rate == 0 or interleaved.channels == 0 or interleaved.samples.len == 0) return .decode_failed;
 
-    var mono = termite_audio.decode(alloc, bytes, .{
+    var mono = inference_audio.decode(alloc, bytes, .{
         .file_name_hint = relative_path,
     }) catch |err| switch (err) {
         error.UnsupportedAudioFormat => return classifyUnsupported(relative_path),
@@ -412,13 +412,13 @@ fn probeOneOpusRfcVectorChannels(
     ref_primary: []const u8,
     ref_alt: []const u8,
 ) !bool {
-    var decoded = termite_audio.opus.decodeInterleavedPacketStreamAlloc(alloc, packet_stream, channels) catch |err| switch (err) {
+    var decoded = inference_audio.opus.decodeInterleavedPacketStreamAlloc(alloc, packet_stream, channels) catch |err| switch (err) {
         error.UnsupportedAudioFormat => return false,
         else => return err,
     };
     defer decoded.deinit();
 
-    termite_audio.normalizePcmInPlace(decoded.samples);
+    inference_audio.normalizePcmInPlace(decoded.samples);
     if (!allFinite(decoded.samples)) return false;
     const primary = matchesReferencePcm16(decoded.samples, channels, ref_primary);
     const alt = matchesReferencePcm16(decoded.samples, channels, ref_alt);
@@ -722,7 +722,7 @@ fn classifyUnsupported(relative_path: []const u8) Outcome {
     return .unsupported;
 }
 
-fn formatName(format: termite_audio.EncodedFormat) []const u8 {
+fn formatName(format: inference_audio.EncodedFormat) []const u8 {
     return switch (format) {
         .ogg => "ogg",
         .opus => "opus",

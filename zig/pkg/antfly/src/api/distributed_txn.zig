@@ -23,6 +23,7 @@ const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
 
 pub const table_participant_prefix = "table:";
+const table_participant_v2_prefix = "table2:";
 pub const group_participant_marker = ":group:";
 
 pub const TxnBeginRequest = struct {
@@ -656,7 +657,8 @@ fn ensureParticipantTxn(
 }
 
 pub fn participantIdForGroup(alloc: std.mem.Allocator, table_name: []const u8, group_id: u64) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}{s}{s}{d}", .{ table_participant_prefix, table_name, group_participant_marker, group_id });
+    if (table_name.len > std.math.maxInt(u32)) return error.TableNameTooLong;
+    return try std.fmt.allocPrint(alloc, "{s}{x:0>8}:{s}:{d}", .{ table_participant_v2_prefix, table_name.len, table_name, group_id });
 }
 
 pub const ParticipantRef = struct {
@@ -665,6 +667,19 @@ pub const ParticipantRef = struct {
 };
 
 pub fn parseParticipantRef(participant: []const u8) ?ParticipantRef {
+    if (std.mem.startsWith(u8, participant, table_participant_v2_prefix)) {
+        const body = participant[table_participant_v2_prefix.len..];
+        if (body.len < 9 or body[8] != ':') return null;
+        const table_name_len = std.fmt.parseUnsigned(u32, body[0..8], 16) catch return null;
+        const table_start: usize = 9;
+        const group_separator = table_start + @as(usize, table_name_len);
+        if (body.len <= group_separator or body[group_separator] != ':') return null;
+        const table_name = body[table_start..group_separator];
+        if (table_name.len == 0) return null;
+        const group_id = std.fmt.parseUnsigned(u64, body[group_separator + 1 ..], 10) catch return null;
+        return .{ .table_name = table_name, .group_id = group_id };
+    }
+
     if (!std.mem.startsWith(u8, participant, table_participant_prefix)) return null;
     const rest = participant[table_participant_prefix.len..];
     const marker_index = std.mem.indexOf(u8, rest, group_participant_marker) orelse return null;
@@ -672,6 +687,22 @@ pub fn parseParticipantRef(participant: []const u8) ?ParticipantRef {
     if (table_name.len == 0) return null;
     const group_id = std.fmt.parseUnsigned(u64, rest[marker_index + group_participant_marker.len ..], 10) catch return null;
     return .{ .table_name = table_name, .group_id = group_id };
+}
+
+test "distributed txn participant ids preserve embedded group markers" {
+    const alloc = std.testing.allocator;
+
+    const table_name = "docs:group:shadow";
+    const participant = try participantIdForGroup(alloc, table_name, 42);
+    defer alloc.free(participant);
+
+    const parsed = parseParticipantRef(participant) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(table_name, parsed.table_name);
+    try std.testing.expectEqual(@as(u64, 42), parsed.group_id);
+
+    const legacy = parseParticipantRef("table:docs:group:42") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("docs", legacy.table_name);
+    try std.testing.expectEqual(@as(u64, 42), legacy.group_id);
 }
 
 pub fn resolveParticipant(

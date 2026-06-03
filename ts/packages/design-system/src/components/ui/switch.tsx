@@ -10,7 +10,17 @@ function Switch({ className, ...props }: React.ComponentProps<typeof SwitchPrimi
     <SwitchPrimitive.Root
       data-slot="switch"
       className={cn(
-        "peer data-[state=checked]:bg-primary data-[state=unchecked]:bg-input focus-visible:border-ring focus-visible:ring-ring/50 dark:data-[state=unchecked]:bg-input/80 inline-flex h-[1.15rem] w-[2rem] shrink-0 items-center rounded-full border border-transparent shadow-xs transition-all outline-none focus-visible:ring-[3px] disabled:cursor-not-allowed disabled:opacity-50",
+        // SQUARE track — both dimensions in fixed pixels so density rescaling
+        // (compact / comfortable) doesn't distort the thumb fit. Flex centers
+        // the thumb vertically; px-[1px] gives the 1px inset on each side.
+        "inline-flex items-center shrink-0 w-[38px] h-[20px] px-[1px]",
+        "rounded-none border-[1.5px] border-input bg-transparent",
+        // checked: amber fill + amber-500 border
+        "data-[state=checked]:bg-primary data-[state=checked]:border-amber-500",
+        // focus
+        "outline-none transition-colors",
+        "focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",
+        "disabled:cursor-not-allowed disabled:opacity-50",
         className
       )}
       {...props}
@@ -18,7 +28,11 @@ function Switch({ className, ...props }: React.ComponentProps<typeof SwitchPrimi
       <SwitchPrimitive.Thumb
         data-slot="switch-thumb"
         className={cn(
-          "bg-background data-[state=checked]:bg-background data-[state=unchecked]:bg-background pointer-events-none block size-[1rem] rounded-full ring-0 transition-transform data-[state=checked]:translate-x-[calc(100%-2px)] data-[state=unchecked]:translate-x-0 dark:data-[state=checked]:bg-background dark:data-[state=unchecked]:bg-white"
+          // square knob, fixed 14×14, horizontal translate only
+          "pointer-events-none block size-[14px] rounded-none",
+          // off: muted ink. on: ink-on-amber.
+          "bg-muted-foreground data-[state=checked]:bg-primary-foreground",
+          "transition-transform data-[state=checked]:translate-x-[19px]"
         )}
       />
     </SwitchPrimitive.Root>

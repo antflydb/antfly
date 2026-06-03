@@ -298,7 +298,7 @@ fn sleepRefreshInterval(io: Io, stop: *std.atomic.Value(bool)) void {
 }
 
 /// Writes a Prometheus text-format metric (HELP, TYPE, value) for a single
-/// scalar counter/gauge. Matches the format used by termite-zig.
+/// scalar counter/gauge. Matches the format used by Antfly inference.
 pub fn appendPromMetric(
     writer: *std.Io.Writer,
     name: []const u8,

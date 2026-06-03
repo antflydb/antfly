@@ -8,13 +8,11 @@ SCRIPTS_PY ?= uv run --project scripts --locked python
 # Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
 GO := GOWORK=off GOEXPERIMENT=simd go
 ANTFLY_GO_MODULE := ./go/pkg/antfly
-
 # Go modules outside of the Antfly product module
 GO_SUBMODULES := \
 	./go/e2e \
 	./go/pkg/sdk \
-	./go/pkg/proxy/antfly \
-	./go/pkg/proxy/termite \
+	./go/pkg/proxy \
 	./go/pkg/libaf \
 	./go/pkg/operator \
 	./go/pkg/docsaf \
@@ -23,8 +21,7 @@ GO_SUBMODULES := \
 	./go/pkg/evalaf/plugins/antfly \
 	./go/pkg/genkit/antfly \
 	./go/pkg/genkit/openrouter \
-	./go/pkg/memoryaf \
-	./go/pkg/termite
+	./go/pkg/memoryaf
 
 # ====================================================================================
 # General Commands
@@ -39,13 +36,14 @@ help:
 	@echo "  build-go           Build the legacy Go antfly binary"
 	@echo "  build-antfarm      Build the antfarm frontend (React admin UI)"
 	@echo "  build-docs         Join OpenAPI specifications"
-	@echo "  generate           Generate code, client SDKs, and all website documentation (API, config, changelog)"
+	@echo "  generate           Generate Zig OpenAPI modules, Go code, client SDKs, and website documentation"
 	@echo "  lint               Run golangci-lint with auto-fix"
 	@echo "  tidy               Run go mod tidy across root and Go submodules"
 	@echo "  tidy-check         Verify go.mod/go.sum are tidy across root and Go submodules"
 	@echo "  zig-build          Build the migrated Zig runtime"
 	@echo "  zig-test           Run the migrated Zig test aggregate"
 	@echo "  zig-generate       Regenerate migrated Zig generated sources"
+	@echo "  zig-openapi-generate  Regenerate migrated Zig OpenAPI modules"
 	@echo "  zig-generated-check  Verify migrated Zig generated sources"
 	@echo "  install-git-hooks  Configure Git to use the repository hooks in .githooks/"
 	@echo "  update-deps        Update Go dependencies"
@@ -89,7 +87,7 @@ help:
 # ====================================================================================
 
 .PHONY: build build-go build-docs generate lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm sim-validate sim-validate-repo sim-soak
-.PHONY: zig-build zig-test zig-unit-test zig-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
+.PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
 
@@ -111,6 +109,7 @@ build-docs:
 	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
 
 generate: build-docs tidy
+	$(MAKE) zig-openapi-generate
 	(cd $(ANTFLY_GO_MODULE) && $(GO) generate ./...)
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Generating in $$mod"; \
@@ -136,6 +135,9 @@ zig-unit-test:
 
 zig-generate:
 	$(ZIG_MAKE) generate
+
+zig-openapi-generate:
+	$(ZIG_MAKE) openapi-generate
 
 zig-generated-check:
 	$(ZIG_MAKE) generated-check
@@ -295,7 +297,7 @@ E2E_MEMLIMIT ?= 16GiB
 e2e-deps: download-omni-deps
 
 e2e: e2e-deps
-	@echo "Running E2E tests with ONNX+XLA build (Termite provider)..."
+	@echo "Running E2E tests with ONNX+XLA build (Antfly inference provider)..."
 	@echo "This will download models on first run (embedder, chunker, reranker, generator)."
 	@echo "Platform: $(E2E_PLATFORM)"
 ifdef E2E_TEST
@@ -311,7 +313,7 @@ endif
 	export LD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
 	export DYLD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
 	export RUN_EVAL_TESTS=true && \
-	export E2E_PROVIDER=termite && \
+	export E2E_PROVIDER=antfly && \
 	cd go/e2e && $(GO) test -v -tags="onnx,ORT,xla,XLA" -timeout $(E2E_TIMEOUT) $(if $(E2E_TEST),-run '$(E2E_TEST)') ./...
 
 
@@ -446,8 +448,8 @@ show-ingress:
 # ====================================================================================
 
 .PHONY: operator-build operator-test operator-docker-build operator-lint \
-        termite-build termite-test termite-lint \
-        termite-client-test termite-client-lint
+        inference-runtime-build inference-runtime-test inference-runtime-lint \
+        sdk-test sdk-lint
 
 operator-build: ## Build the antfly-operator binary
 	(cd ./go/pkg/operator && $(MAKE) build)
@@ -461,17 +463,17 @@ operator-lint: ## Run linter on antfly-operator
 operator-docker-build: ## Build antfly-operator Docker image
 	docker build -t antfly-operator:latest -f ./go/pkg/operator/Dockerfile .
 
-termite-build: ## Build the termite binary (pure Go)
-	(cd ./go/pkg/termite && $(GO) build -o ../../termite ./cmd)
+inference-runtime-build: ## Build the Go inference runtime module
+	(cd $(GO_INFERENCE_RUNTIME_MODULE) && $(GO) build ./...)
 
-termite-test: ## Run termite unit tests (pure Go)
-	(cd ./go/pkg/termite && $(GO) test ./...)
+inference-runtime-test: ## Run Go inference runtime tests
+	(cd $(GO_INFERENCE_RUNTIME_MODULE) && $(GO) test ./...)
 
-termite-lint: ## Run linter on termite
-	(cd ./go/pkg/termite && $(GO) vet ./...)
+inference-runtime-lint: ## Run Go inference runtime linter
+	(cd $(GO_INFERENCE_RUNTIME_MODULE) && $(GO) vet ./...)
 
-termite-client-test: ## Run termite-client tests
+sdk-test: ## Run SDK tests
 	(cd ./go/pkg/sdk && $(GO) test ./...)
 
-termite-client-lint: ## Run linter on termite-client
+sdk-lint: ## Run SDK linter
 	(cd ./go/pkg/sdk && $(GO) vet ./...)

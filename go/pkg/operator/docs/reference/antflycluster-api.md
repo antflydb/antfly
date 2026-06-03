@@ -32,31 +32,31 @@ status:
 | `eks` | [EKSSpec](#eksspec) | No | AWS EKS-specific configuration |
 | `serviceMesh` | [ServiceMeshSpec](#servicemeshspec) | No | Service mesh configuration |
 | `publicAPI` | [PublicAPIConfig](#publicapiconfig) | No | Public API service configuration |
-| `termite` | TermitePoolSpec | No | Operator-managed TermitePool associated with this cluster |
+| `inference` | InferencePoolSpec | No | Operator-managed InferencePool associated with this cluster |
 | `serviceAccountName` | string | No | Kubernetes ServiceAccount for pods |
 
-### Termite Integration
+### Inference Integration
 
-When `spec.termite` is set, the operator creates or updates a `TermitePool`
-named `<cluster-name>-termite` in the same namespace and owned by the
+When `spec.inference` is set, the operator creates or updates a `InferencePool`
+named `<cluster-name>-inference` in the same namespace and owned by the
 `AntflyCluster`.
 
-If `spec.termite.image` is omitted, the operator uses the configured
-`--termite-antfly-image` value for Termite pods. The binary default is
+If `spec.inference.image` is omitted, the operator uses the configured
+`--inference-antfly-image` value for Inference pods. The binary default is
 `ghcr.io/antflydb/antfly:omni`. Override it during deployment if that image is
-unavailable in your environment. The image must provide the `/antfly termite`
+unavailable in your environment. The image must provide the `/antfly inference`
 runtime contract.
 
-`spec.termite` does not create `TermiteRoute` resources. Direct `TermiteRoute`
+`spec.inference` does not create `InferenceProxy` resources. Direct `InferenceProxy`
 manifests remain supported for explicit routing configuration.
 
-When `--enable-termite-controllers=false`, `spec.termite` management is
-disabled and any previously owned TermitePool objects are left unchanged. The
-operator reports this with the `TermitePoolReady` status condition.
+When `--enable-inference-controllers=false`, `spec.inference` management is
+disabled and any previously owned InferencePool objects are left unchanged. The
+operator reports this with the `InferencePoolReady` status condition.
 
-If `spec.termite.autoscaling.enabled=true`, the Termite controller creates a
-HorizontalPodAutoscaler named `<termitepool-name>-hpa`. CPU and memory targets
-use Kubernetes resource metrics. Termite-specific metric types
+If `spec.inference.autoscaling.enabled=true`, the Inference controller creates a
+HorizontalPodAutoscaler named `<inferencepool-name>-hpa`. CPU and memory targets
+use Kubernetes resource metrics. Inference-specific metric types
 (`queue-depth`, `latency-p99`, `latency-p95`, `requests-per-second`, and
 `throughput`) require a Pods metrics adapter that exports metric names exactly
 matching those CRD values. Per-metric `scaleUp` and `scaleDown` settings are

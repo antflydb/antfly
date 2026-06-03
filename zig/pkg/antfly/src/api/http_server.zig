@@ -46,6 +46,7 @@ const table_writes = @import("table_writes.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
+const public_limits = @import("public_limits.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
 const distributed_graph = @import("distributed_graph.zig");
@@ -115,8 +116,9 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var semantic_resolver = SemanticStatusResolver{
             .source = self.server.source,
-            .local_termite_provider = self.server.local_termite_provider,
+            .antfly_provider = self.server.antfly_provider,
             .remote_content = self.server.cfg.remote_content,
+            .inference_api_key = self.server.cfg.inference_api_key,
         };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
@@ -149,8 +151,9 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
     ) !?db_mod.RuntimePreflightSummary {
         var semantic_resolver = SemanticStatusResolver{
             .source = self.server.source,
-            .local_termite_provider = self.server.local_termite_provider,
+            .antfly_provider = self.server.antfly_provider,
             .remote_content = self.server.cfg.remote_content,
+            .inference_api_key = self.server.cfg.inference_api_key,
         };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
@@ -201,8 +204,16 @@ fn parseSseEventsAlloc(alloc: std.mem.Allocator, body: []const u8) ![]TestSseEve
     return try events.toOwnedSlice(alloc);
 }
 
+pub const public_api_max_request_body_bytes: usize = public_limits.max_request_body_bytes;
+
+test "public API request body limit matches Go linear merge contract" {
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), public_api_max_request_body_bytes);
+}
+
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
+    trusted_principal_secret: ?[]const u8 = null,
+    trusted_principal_issuer: ?[]const u8 = null,
     swarm_mode: bool = false,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
@@ -210,6 +221,7 @@ pub const ApiHttpServerConfig = struct {
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    inference_api_key: ?[]const u8 = null,
     user_manager: ?*usermgr.UserManager = null,
     session_router: ?table_router.HostedGroupRouter = null,
     session_executor: ?http_common.RequestExecutor = null,
@@ -225,10 +237,18 @@ pub const ApiHttpServerConfig = struct {
     session_savepoint_limit: ?usize = null,
 };
 
+pub const trusted_principal_header = "X-Antfly-Trusted-Principal";
+
+pub const AuthenticatedRequest = struct {
+    authorization: ?[]const u8 = null,
+    trusted_principal: ?[]const u8 = null,
+};
+
 pub const SemanticStatusResolver = struct {
     source: StatusSource,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    inference_api_key: ?[]const u8 = null,
 
     pub fn iface(self: *SemanticStatusResolver) query_contract.SemanticResolver {
         return .{
@@ -253,8 +273,9 @@ pub const SemanticStatusResolver = struct {
             .ptr = self.source.ptr,
             .admin_snapshot = self.source.vtable.admin_snapshot orelse return error.UnsupportedQueryRequest,
             .free_admin_snapshot = self.source.vtable.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
-            .local_termite_provider = self.local_termite_provider,
+            .antfly_provider = self.antfly_provider,
             .remote_content = self.remote_content,
+            .inference_api_key = self.inference_api_key,
         }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
     }
 };
@@ -810,7 +831,7 @@ pub const ApiHttpServer = struct {
     source: StatusSource,
     table_reads: ?table_reads.TableReadSource = null,
     table_writes: ?table_writes.TableWriteSource = null,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     owned_foreign_registry: ?*foreign_mod.Registry = null,
     txn_sessions: transactions_api.SessionRegistry = .{},
@@ -1282,7 +1303,56 @@ pub const ApiHttpServer = struct {
                     .dense_catch_up = .{ .active = report.async_dense_catch_up_active },
                     .bulk_coalescing = .{ .active_session = report.async_bulk_coalescing_active },
                 },
+                .doc_identity = docIdentityStatsFromRemoteReport(report.doc_identity),
+                .doc_set_planning = docSetPlanningStatsFromRemoteReport(report.doc_set_planning),
             },
+        };
+    }
+
+    fn docIdentityStatsFromRemoteReport(
+        report: metadata_table_manager.RuntimeDocIdentityStatusReport,
+    ) db_mod.types.DocIdentityStats {
+        return .{
+            .namespace_table_id = report.namespace_table_id,
+            .namespace_shard_id = report.namespace_shard_id,
+            .namespace_range_id = report.namespace_range_id,
+            .next_ordinal = report.next_ordinal,
+            .allocated_ordinals = report.allocated_ordinals,
+            .ordinal_capacity_remaining = report.ordinal_capacity_remaining,
+            .ordinal_capacity_exhausted = report.ordinal_capacity_exhausted,
+            .rebuild_required = report.rebuild_required,
+            .state_rows = report.state_rows,
+            .live_ordinals = report.live_ordinals,
+            .tombstone_ordinals = report.tombstone_ordinals,
+            .min_created_generation = report.min_created_generation,
+            .max_created_generation = report.max_created_generation,
+            .min_deleted_generation = report.min_deleted_generation,
+            .max_deleted_generation = report.max_deleted_generation,
+            .scanned_primary_docs = report.scanned_primary_docs,
+            .primary_docs_missing_ordinals = report.primary_docs_missing_ordinals,
+            .primary_docs_missing_identity_state = report.primary_docs_missing_identity_state,
+            .primary_docs_with_tombstone_ordinals = report.primary_docs_with_tombstone_ordinals,
+            .complete = report.complete,
+        };
+    }
+
+    fn docSetPlanningStatsFromRemoteReport(
+        report: metadata_table_manager.RuntimeDocSetPlanningStatusReport,
+    ) db_mod.types.DocSetPlanningStats {
+        return .{
+            .resolved_set_count = report.resolved_set_count,
+            .all_set_count = report.all_set_count,
+            .none_set_count = report.none_set_count,
+            .doc_key_list_count = report.doc_key_list_count,
+            .ordinal_list_count = report.ordinal_list_count,
+            .ordinal_bitmap_count = report.ordinal_bitmap_count,
+            .doc_key_list_docs = report.doc_key_list_docs,
+            .ordinal_list_docs = report.ordinal_list_docs,
+            .ordinal_bitmap_docs = report.ordinal_bitmap_docs,
+            .missing_ordinal_coverage_count = report.missing_ordinal_coverage_count,
+            .bitmap_promotion_count = report.bitmap_promotion_count,
+            .unsupported_filter_shape_count = report.unsupported_filter_shape_count,
+            .stale_identity_generation_rejection_count = report.stale_identity_generation_rejection_count,
         };
     }
 
@@ -1345,7 +1415,14 @@ pub const ApiHttpServer = struct {
         return .{
             .table_name = table_name,
             .empty = doc_count == 0,
+            .lsm = try self.bestEffortLsmStorageStatus(table_name),
         };
+    }
+
+    fn bestEffortLsmStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.LsmStorageStatus {
+        const source = self.table_reads orelse return null;
+        const stats = (try source.lsmStorageStats(table_name)) orelse return null;
+        return tables_api.lsmStorageStatusFromMaintenanceStats(stats.maintenance);
     }
 
     pub fn bestEffortSingleTableStorageStatuses(
@@ -1397,14 +1474,21 @@ pub const ApiHttpServer = struct {
     }
 
     fn requiresAuthentication(self: *const ApiHttpServer, path: []const u8) bool {
-        if (!self.cfg.auth_enabled) return false;
-        if (self.cfg.user_manager == null) return false;
+        if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null) return false;
+        if (self.cfg.user_manager == null and self.cfg.trusted_principal_secret == null) return false;
         if (std.mem.eql(u8, path, routes.Routes.agent_card) or std.mem.eql(u8, path, routes.Routes.agent_card_legacy)) return false;
         return !std.mem.startsWith(u8, path, routes.Routes.internal_groups_prefix);
     }
 
-    pub fn authenticateRequest(self: *ApiHttpServer, authorization: ?[]const u8) !AuthenticatedIdentity {
-        const value = authorization orelse return error.Unauthorized;
+    pub fn authenticateRequest(self: *ApiHttpServer, request: AuthenticatedRequest) !AuthenticatedIdentity {
+        if (request.trusted_principal) |trusted_principal| {
+            const token = std.mem.trim(u8, trusted_principal, " \t\r\n");
+            const secret = self.cfg.trusted_principal_secret orelse return error.Unauthorized;
+            if (secret.len == 0) return error.Unauthorized;
+            return try self.authenticateTrustedPrincipal(token, secret);
+        }
+
+        const value = request.authorization orelse return error.Unauthorized;
         const manager = self.cfg.user_manager orelse return error.Unauthorized;
 
         if (std.mem.startsWith(u8, value, "Basic ")) {
@@ -1445,6 +1529,75 @@ pub const ApiHttpServer = struct {
         return error.Unauthorized;
     }
 
+    fn authenticateTrustedPrincipal(self: *ApiHttpServer, token: []const u8, secret: []const u8) !AuthenticatedIdentity {
+        var parts = std.mem.splitScalar(u8, token, '.');
+        const header_b64 = parts.next() orelse return error.Unauthorized;
+        const payload_b64 = parts.next() orelse return error.Unauthorized;
+        const signature_b64 = parts.next() orelse return error.Unauthorized;
+        if (parts.next() != null or header_b64.len == 0 or payload_b64.len == 0 or signature_b64.len == 0) return error.Unauthorized;
+
+        const signing_input = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ header_b64, payload_b64 });
+        defer self.alloc.free(signing_input);
+
+        var expected_mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(expected_mac[0..], signing_input, secret);
+        const signature = try base64UrlDecodeAlloc(self.alloc, signature_b64);
+        defer self.alloc.free(signature);
+        if (!constantTimeEql(signature, expected_mac[0..])) return error.Unauthorized;
+
+        const header_json = try base64UrlDecodeAlloc(self.alloc, header_b64);
+        defer self.alloc.free(header_json);
+        var parsed_header = try std.json.parseFromSlice(std.json.Value, self.alloc, header_json, .{});
+        defer parsed_header.deinit();
+        const header_obj = switch (parsed_header.value) {
+            .object => |object| object,
+            else => return error.Unauthorized,
+        };
+        if (!std.mem.eql(u8, jsonStringField(header_obj.get("alg")) orelse "", "HS256")) return error.Unauthorized;
+
+        const payload_json = try base64UrlDecodeAlloc(self.alloc, payload_b64);
+        defer self.alloc.free(payload_json);
+        var parsed_payload = try std.json.parseFromSlice(std.json.Value, self.alloc, payload_json, .{});
+        defer parsed_payload.deinit();
+        const payload = switch (parsed_payload.value) {
+            .object => |object| object,
+            else => return error.Unauthorized,
+        };
+        if (self.cfg.trusted_principal_issuer) |expected_issuer| {
+            if (!std.mem.eql(u8, jsonStringField(payload.get("iss")) orelse "", expected_issuer)) return error.Unauthorized;
+        }
+        const subject = jsonStringField(payload.get("sub")) orelse return error.Unauthorized;
+        const exp = jsonIntegerField(payload.get("exp")) orelse return error.Unauthorized;
+        const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+        if (exp < now) return error.Unauthorized;
+        if (jsonIntegerField(payload.get("iat"))) |iat| {
+            if (iat > now + 60) return error.Unauthorized;
+        }
+
+        const permissions = try trustedPrincipalPermissionsFromPayload(self.alloc, payload);
+        errdefer {
+            for (permissions) |*permission| permission.deinit(self.alloc);
+            if (permissions.len > 0) self.alloc.free(permissions);
+        }
+        const row_filters = try trustedPrincipalRowFiltersFromPayload(self.alloc, payload);
+        errdefer {
+            for (row_filters) |*entry| entry.deinit(self.alloc);
+            if (row_filters.len > 0) self.alloc.free(row_filters);
+        }
+        const metadata_json = if (payload.get("metadata")) |metadata|
+            try std.json.Stringify.valueAlloc(self.alloc, metadata, .{})
+        else
+            try self.alloc.dupe(u8, "{}");
+
+        return .{
+            .username = try self.alloc.dupe(u8, subject),
+            .permissions = permissions,
+            .row_filter = row_filters,
+            .metadata_json = metadata_json,
+            .roles = try self.alloc.alloc([]u8, 0),
+        };
+    }
+
     pub fn handleInternalRoute(self: *ApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
         const uri_parts = splitTarget(req.uri);
         if (!std.mem.startsWith(u8, uri_parts.path, routes.Routes.internal_groups_prefix) and
@@ -1474,7 +1627,10 @@ pub const ApiHttpServer = struct {
         }
 
         if (self.requiresAuthentication(uri_parts.path)) {
-            authenticated_identity = self.authenticateRequest(req.authorization) catch |err| switch (err) {
+            authenticated_identity = self.authenticateRequest(.{
+                .authorization = req.authorization,
+                .trusted_principal = req.header(trusted_principal_header),
+            }) catch |err| switch (err) {
                 error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => {
                     return try unauthorizedResponse(self.alloc);
                 },
@@ -1506,6 +1662,32 @@ pub const ApiHttpServer = struct {
             }
             return try jsonResponse(self.alloc, public_status);
         }
+        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.cluster)) {
+            const metadata_status = try self.source.status();
+            var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
+            defer public_status.deinit(self.alloc);
+            public_status.auth_enabled = self.cfg.auth_enabled;
+            public_status.swarm_mode = self.cfg.swarm_mode;
+            if (self.cfg.secret_store) |secret_store| {
+                _ = secret_store.refreshIfChanged() catch |err| {
+                    std.log.warn("secret store status refresh skipped err={}", .{err});
+                };
+                cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+            }
+            var snapshot_opt = try self.source.cachedAdminSnapshot();
+            if (snapshot_opt == null) {
+                snapshot_opt = try self.source.adminSnapshot();
+            }
+            if (snapshot_opt) |*snapshot| {
+                defer self.source.freeAdminSnapshot(snapshot);
+                var topology_status = try cluster.topologyFromStatusAndSnapshot(self.alloc, public_status, snapshot);
+                defer topology_status.deinit(self.alloc);
+                return try jsonResponse(self.alloc, topology_status);
+            }
+            var topology_status = try cluster.topologyFromStatus(self.alloc, public_status);
+            defer topology_status.deinit(self.alloc);
+            return try jsonResponse(self.alloc, topology_status);
+        }
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         try self.runSessionMaintenanceOnce();
@@ -1517,9 +1699,8 @@ pub const ApiHttpServer = struct {
     }
 
     fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        _ = authenticated_identity;
         if ((req.method == .GET or req.method == .POST or req.method == .DELETE) and (std.mem.eql(u8, uri_parts.path, routes.Routes.mcp_v1) or std.mem.startsWith(u8, uri_parts.path, routes.Routes.mcp_v1_prefix))) {
-            return try protocol_adapters.handleMcpRequest(self, req);
+            return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
         }
         if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.a2a)) {
             return try protocol_adapters.handleA2aRequest(self, req);
@@ -2019,8 +2200,9 @@ pub const ApiHttpServer = struct {
             var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
             defer arena_impl.deinit();
             const QueryBuilderGenerationRunner = struct {
-                local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+                antfly_provider: ?managed_embedder.AntflyProvider,
                 secret_store: ?*common_secrets.FileStore,
+                inference_api_key: ?[]const u8,
 
                 fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
                     return .{
@@ -2040,13 +2222,14 @@ pub const ApiHttpServer = struct {
                     defer io_impl.deinit();
                     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
                     defer client.deinit();
-                    return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
+                    return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
                 }
             };
-            var generation_runner = QueryBuilderGenerationRunner{ .local_termite_provider = self.local_termite_provider, .secret_store = self.cfg.secret_store };
+            var generation_runner = QueryBuilderGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .inference_api_key = self.cfg.inference_api_key };
             var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
             const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
                 error.InvalidQueryBuilderRequest => return try jsonErrorResponse(self.alloc, 400, "invalid query builder request"),
+                error.DocIdentityNamespaceMismatch => return try jsonErrorResponse(self.alloc, 503, "doc identity unavailable"),
                 else => return err,
             };
             return try jsonResponse(self.alloc, response);
@@ -2127,6 +2310,17 @@ pub const ApiHttpServer = struct {
                             arena_impl.allocator(),
                             "aborted",
                             transactions_api.decisionConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
+                            null,
+                        );
+                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
+                    },
+                    error.DocIdentityNamespaceMismatch => {
+                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                        defer arena_impl.deinit();
+                        const response = try transactions_api.buildCommitResponse(
+                            arena_impl.allocator(),
+                            "aborted",
+                            transactions_api.docIdentityUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
                             null,
                         );
                         return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
@@ -2401,6 +2595,18 @@ pub const ApiHttpServer = struct {
                         );
                         return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
                     },
+                    error.DocIdentityNamespaceMismatch => {
+                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                        defer arena_impl.deinit();
+                        const response = try transactions_api.buildSessionCommitResponse(
+                            arena_impl.allocator(),
+                            txn_id,
+                            "aborted",
+                            transactions_api.docIdentityUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
+                            null,
+                        );
+                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
+                    },
                     error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                     error.UnknownGroup => {
@@ -2534,8 +2740,9 @@ pub const ApiHttpServer = struct {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
                 var semantic_resolver = SemanticStatusResolver{
                     .source = runner.server.source,
-                    .local_termite_provider = runner.server.local_termite_provider,
+                    .antfly_provider = runner.server.antfly_provider,
                     .remote_content = runner.server.cfg.remote_content,
+                    .inference_api_key = runner.server.cfg.inference_api_key,
                 };
                 var query_req = query_api.parsePublicQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
@@ -2553,6 +2760,7 @@ pub const ApiHttpServer = struct {
                     query_req.req,
                     .read_index,
                 ) catch |err| {
+                    if (err == error.DocIdentityNamespaceMismatch) return err;
                     std.log.err("retrieval query failed table={s} query={s} err={}", .{ table_name, query_json, err });
                     return err;
                 }) orelse error.TableNotFound;
@@ -2591,8 +2799,9 @@ pub const ApiHttpServer = struct {
         };
 
         const RetrievalGenerationRunner = struct {
-            local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
+            inference_api_key: ?[]const u8,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -2612,10 +2821,10 @@ pub const ApiHttpServer = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(inner_alloc, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.local_termite_provider, .secret_store = self.cfg.secret_store };
+        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .inference_api_key = self.cfg.inference_api_key };
 
         var query_runner = RetrievalQueryRunner{
             .server = self,
@@ -2672,6 +2881,10 @@ pub const ApiHttpServer = struct {
                 try queue.status(alloc, task_id, context_id, "failed", "not found");
                 return;
             },
+            error.DocIdentityNamespaceMismatch => {
+                try queue.status(alloc, task_id, context_id, "failed", "doc identity unavailable");
+                return;
+            },
             else => {
                 std.log.err("public retrieval failed err={}", .{err});
                 return err;
@@ -2709,8 +2922,9 @@ pub const ApiHttpServer = struct {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
                 var semantic_resolver = SemanticStatusResolver{
                     .source = runner.server.source,
-                    .local_termite_provider = runner.server.local_termite_provider,
+                    .antfly_provider = runner.server.antfly_provider,
                     .remote_content = runner.server.cfg.remote_content,
+                    .inference_api_key = runner.server.cfg.inference_api_key,
                 };
                 var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
@@ -2728,6 +2942,7 @@ pub const ApiHttpServer = struct {
                     query_req.req,
                     .read_index,
                 ) catch |err| {
+                    if (err == error.DocIdentityNamespaceMismatch) return err;
                     std.log.err("retrieval query failed table={s} query={s} err={}", .{ table_name, query_json, err });
                     return err;
                 }) orelse error.TableNotFound;
@@ -2766,8 +2981,9 @@ pub const ApiHttpServer = struct {
         };
 
         const RetrievalGenerationRunner = struct {
-            local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
+            inference_api_key: ?[]const u8,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -2787,10 +3003,10 @@ pub const ApiHttpServer = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.local_termite_provider, .secret_store = self.cfg.secret_store };
+        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .inference_api_key = self.cfg.inference_api_key };
 
         var query_runner = RetrievalQueryRunner{
             .server = self,
@@ -2799,6 +3015,7 @@ pub const ApiHttpServer = struct {
         const retrieval_resp = retrieval_agent.execute(self.alloc, query_runner.iface(), generation_runner.iface(), req.body) catch |err| switch (err) {
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => return try textResponse(self.alloc, 400, "invalid retrieval agent request"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
             else => {
                 std.log.err("public retrieval failed err={}", .{err});
                 return err;
@@ -2897,7 +3114,7 @@ pub const ApiHttpServer = struct {
                     self.alloc,
                     create_req.indexes_json orelse tables_api.default_indexes_json,
                     .{
-                        .local_termite_provider = self.local_termite_provider,
+                        .antfly_provider = self.antfly_provider,
                         .secret_store = self.cfg.secret_store,
                         .remote_content = self.cfg.remote_content,
                     },
@@ -3086,7 +3303,7 @@ pub const ApiHttpServer = struct {
                 const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, lookup.table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
                 if (row_filter_json) |value| {
-                    if (!(try self.docMatchesRowFilter(source, lookup.table_name, decoded_key, value))) {
+                    if (!(try self.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
                         return try textResponse(self.alloc, 404, "not found");
                     }
                 }
@@ -3211,6 +3428,7 @@ pub const ApiHttpServer = struct {
                 if (!(try self.tableExists(merge_route.table_name))) return try textResponse(self.alloc, 404, "not found");
 
                 var merge_req = linear_merge_api.parseRequest(self.alloc, req.body) catch |err| switch (err) {
+                    error.ValueTooLong => return try textResponse(self.alloc, 413, "value too large"),
                     error.InvalidLinearMergeRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
                     else => return err,
                 };
@@ -3341,6 +3559,7 @@ pub const ApiHttpServer = struct {
         return .{
             .table_name = table_name,
             .empty = result.ndjson.len == 0,
+            .lsm = try self.bestEffortLsmStorageStatus(table_name),
         };
     }
 
@@ -3394,7 +3613,16 @@ pub const ApiHttpServer = struct {
     ) !bool {
         var response = (try source.lookup(self.alloc, table_name, key, .{}, .read_index)) orelse return false;
         defer response.deinit(self.alloc);
-        return try search_pattern_filter.storedDocMatchesPatternFilter(self.alloc, key, response.json, row_filter_json);
+        return try self.docJsonMatchesRowFilter(key, response.json, row_filter_json);
+    }
+
+    pub fn docJsonMatchesRowFilter(
+        self: *ApiHttpServer,
+        key: []const u8,
+        json: []const u8,
+        row_filter_json: []const u8,
+    ) !bool {
+        return try search_pattern_filter.storedDocMatchesPatternFilter(self.alloc, key, json, row_filter_json);
     }
 
     pub fn filterScanResultByRowFilter(
@@ -4200,7 +4428,10 @@ pub const ApiHttpServer = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.alloc);
         if (self.requiresAuthentication(uri_parts.path)) {
-            authenticated_identity = self.authenticateRequest(req.authorization) catch return false;
+            authenticated_identity = self.authenticateRequest(.{
+                .authorization = req.authorization,
+                .trusted_principal = req.header(trusted_principal_header),
+            }) catch return false;
             const identity = authenticated_identity.?;
             if (requiresAdminPermission(uri_parts.path) and !permissionsAllow(identity.permissions, .@"*", "*", .admin)) return false;
             if (requiredPermissionForRequest(req.method, uri_parts.path)) |required| {
@@ -4251,6 +4482,7 @@ pub const ApiHttpServer = struct {
         _ = (source.batch(alloc, table_name, req) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidBatchRequest,
             error.TableNotFound => return error.NotFound,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.EnrichmentRetryInProgress => return error.Backpressured,
             else => {
                 std.log.err("public table batch failed table={s} err={}", .{ table_name, err });
@@ -4268,8 +4500,9 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
-        return self.executePublicTableQueryDispatch(alloc, source, table_name, body, row_filter_json) catch |err| switch (err) {
+        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -4286,6 +4519,39 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
     ) ![]u8 {
         return try self.executePublicTableQueryDispatchWithIdentity(alloc, source, table_name, body, row_filter_json, null);
+    }
+
+    fn executePublicTableQueryDispatchWithReadinessRetry(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        body: []const u8,
+        row_filter_json: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) ![]u8 {
+        const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
+        const retry_poll_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            return self.executePublicTableQueryDispatchWithIdentity(
+                alloc,
+                source,
+                table_name,
+                body,
+                row_filter_json,
+                authenticated_identity,
+            ) catch |err| switch (err) {
+                error.DocIdentityNamespaceMismatch => {
+                    if (retry_timeout_ns > 0 and platform_time.monotonicNs() -| start_ns < retry_timeout_ns) {
+                        sleepNs(retry_poll_ns);
+                        continue;
+                    }
+                    return err;
+                },
+                else => return err,
+            };
+        }
     }
 
     fn executePublicTableQueryDispatchWithIdentity(
@@ -4307,6 +4573,7 @@ pub const ApiHttpServer = struct {
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
                 error.TableNotFound => return error.TableNotFound,
+                error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
                 else => {
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                     return error.InternalFailure;
@@ -4321,6 +4588,7 @@ pub const ApiHttpServer = struct {
 
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             else => {
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -4354,6 +4622,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.TableNotFound => return error.NotFound,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -4695,8 +4964,9 @@ pub const ApiHttpServer = struct {
     ) !query_api.QueryResponse {
         var semantic_resolver = SemanticStatusResolver{
             .source = self.source,
-            .local_termite_provider = self.local_termite_provider,
+            .antfly_provider = self.antfly_provider,
             .remote_content = self.cfg.remote_content,
+            .inference_api_key = self.cfg.inference_api_key,
         };
         var query_req = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, body) catch |err| {
             std.log.warn("public table query parse failed table={s} err={}", .{ table_name, err });
@@ -4743,8 +5013,9 @@ pub const ApiHttpServer = struct {
         defer alloc.free(query_body);
         var semantic_resolver = SemanticStatusResolver{
             .source = self.source,
-            .local_termite_provider = self.local_termite_provider,
+            .antfly_provider = self.antfly_provider,
             .remote_content = self.cfg.remote_content,
+            .inference_api_key = self.cfg.inference_api_key,
         };
         var owned = try query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, query_body);
         errdefer owned.deinit(alloc);
@@ -4885,9 +5156,10 @@ pub const ApiHttpServer = struct {
             index_name,
             expanded_index_json,
             .{
-                .local_termite_provider = self.local_termite_provider,
+                .antfly_provider = self.antfly_provider,
                 .secret_store = self.cfg.secret_store,
                 .remote_content = self.cfg.remote_content,
+                .inference_api_key = self.cfg.inference_api_key,
             },
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
@@ -4896,9 +5168,10 @@ pub const ApiHttpServer = struct {
         defer alloc.free(normalized_index_json);
 
         table_writes.validateIndexConfigWithOptions(alloc, index_name, normalized_index_json, .{
-            .local_termite_provider = self.local_termite_provider,
+            .antfly_provider = self.antfly_provider,
             .secret_store = self.cfg.secret_store,
             .remote_content = self.cfg.remote_content,
+            .inference_api_key = self.cfg.inference_api_key,
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
@@ -5192,7 +5465,7 @@ pub const ApiHttpServer = struct {
         defer if (row_filter_json) |value| self.alloc.free(value);
 
         const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-        const response_body = self.executePublicTableQueryDispatchWithIdentity(
+        const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
             table_name,
@@ -5202,6 +5475,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "query failed");
@@ -5702,6 +5976,126 @@ pub fn permissionsAllow(
         if (permission.type == .admin or permission.type == permission_type) return true;
     }
     return false;
+}
+
+fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
+    const size = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(value) catch return error.Unauthorized;
+    const out = try alloc.alloc(u8, size);
+    errdefer alloc.free(out);
+    std.base64.url_safe_no_pad.Decoder.decode(out, value) catch return error.Unauthorized;
+    return out;
+}
+
+fn constantTimeEql(lhs: []const u8, rhs: []const u8) bool {
+    if (lhs.len != rhs.len) return false;
+    var diff: u8 = 0;
+    for (lhs, rhs) |left, right| diff |= left ^ right;
+    return diff == 0;
+}
+
+fn jsonStringField(value: ?std.json.Value) ?[]const u8 {
+    const present = value orelse return null;
+    return jsonStringValue(present);
+}
+
+fn jsonStringValue(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => |string| string,
+        else => null,
+    };
+}
+
+fn jsonIntegerField(value: ?std.json.Value) ?i64 {
+    const present = value orelse return null;
+    return jsonIntegerValue(present);
+}
+
+fn jsonIntegerValue(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |integer| integer,
+        else => null,
+    };
+}
+
+fn jsonBoolField(value: ?std.json.Value) bool {
+    const present = value orelse return false;
+    return jsonBoolValue(present);
+}
+
+fn jsonBoolValue(value: std.json.Value) bool {
+    return switch (value) {
+        .bool => |boolean| boolean,
+        else => false,
+    };
+}
+
+fn trustedPrincipalPermissionsFromPayload(alloc: std.mem.Allocator, payload: std.json.ObjectMap) ![]usermgr.Permission {
+    var out = std.ArrayList(usermgr.Permission).empty;
+    errdefer {
+        for (out.items) |*permission| permission.deinit(alloc);
+        out.deinit(alloc);
+    }
+
+    if (jsonBoolField(payload.get("admin"))) {
+        try out.append(alloc, try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    const tables_value = payload.get("tables");
+    const operations_value = payload.get("operations");
+    if (operations_value == null or operations_value.? != .array or operations_value.?.array.items.len == 0) {
+        return try out.toOwnedSlice(alloc);
+    }
+
+    if (tables_value == null or tables_value.? != .array or tables_value.?.array.items.len == 0) {
+        try appendTrustedPrincipalPermissionsForTable(alloc, &out, "*", operations_value.?.array.items);
+    } else {
+        for (tables_value.?.array.items) |table_value| {
+            const table = jsonStringValue(table_value) orelse continue;
+            if (table.len == 0) continue;
+            try appendTrustedPrincipalPermissionsForTable(alloc, &out, table, operations_value.?.array.items);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendTrustedPrincipalPermissionsForTable(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(usermgr.Permission),
+    table: []const u8,
+    operation_values: []const std.json.Value,
+) !void {
+    for (operation_values) |operation_value| {
+        const operation = jsonStringValue(operation_value) orelse continue;
+        if (std.mem.eql(u8, operation, "read")) {
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .read));
+        } else if (std.mem.eql(u8, operation, "write")) {
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .write));
+        } else if (std.mem.eql(u8, operation, "admin")) {
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .admin));
+        } else if (std.mem.eql(u8, operation, "*")) {
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .read));
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .write));
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .admin));
+        }
+    }
+}
+
+fn trustedPrincipalRowFiltersFromPayload(alloc: std.mem.Allocator, payload: std.json.ObjectMap) ![]usermgr.RowFilterEntry {
+    const row_filter_value = payload.get("row_filter") orelse return try alloc.alloc(usermgr.RowFilterEntry, 0);
+    if (row_filter_value != .object) return error.Unauthorized;
+    var out = std.ArrayList(usermgr.RowFilterEntry).empty;
+    errdefer {
+        for (out.items) |*entry| entry.deinit(alloc);
+        out.deinit(alloc);
+    }
+    var it = row_filter_value.object.iterator();
+    while (it.next()) |entry| {
+        const filter_json = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{});
+        defer alloc.free(filter_json);
+        try out.append(alloc, try usermgr.RowFilterEntry.initOwned(alloc, entry.key_ptr.*, filter_json));
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 fn applyAuthenticatedIdentityToJoinRequest(
@@ -6741,10 +7135,10 @@ pub fn buildLocalSchemaUpdateStatus(alloc: std.mem.Allocator, table_name: []cons
 }
 
 pub fn stripApiPrefix(path: []const u8) []const u8 {
-    const prefix = "/api/v1";
+    const prefix = "/db/v1";
     if (std.mem.startsWith(u8, path, prefix)) {
         const rest = path[prefix.len..];
-        // "/api/v1" alone or "/api/v1/" → "/"
+        // "/db/v1" alone or "/db/v1/" → "/"
         if (rest.len == 0) return "/";
         return rest;
     }
@@ -6820,6 +7214,15 @@ test "api http server serves status" {
     var parsed = try std.json.parseFromSlice(cluster.ClusterStatus, std.testing.allocator, resp.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(cluster.ClusterHealth.healthy, parsed.value.health);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"data\"") == null);
+
+    var cluster_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.cluster });
+    defer cluster_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), cluster_resp.status);
+    var parsed_cluster = try std.json.parseFromSlice(cluster.ClusterTopology, std.testing.allocator, cluster_resp.body, .{});
+    defer parsed_cluster.deinit();
+    try std.testing.expectEqual(cluster.ClusterHealth.healthy, parsed_cluster.value.health);
+    try std.testing.expectEqual(@as(usize, 0), parsed_cluster.value.data.nodes.len);
 
     var healthz = try server.handle(.{ .method = .GET, .uri = routes.Routes.healthz });
     defer healthz.deinit(std.testing.allocator);
@@ -6833,16 +7236,16 @@ test "api http server serves status" {
     try std.testing.expectEqualStrings("application/json", readyz.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, readyz.body, "\"status\":\"ready\"") != null);
 
-    var prefixed_healthz = try server.handle(.{ .method = .GET, .uri = "/api/v1/healthz" });
+    var prefixed_healthz = try server.handle(.{ .method = .GET, .uri = "/db/v1/healthz" });
     defer prefixed_healthz.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), prefixed_healthz.status);
 
-    var prefixed_readyz = try server.handle(.{ .method = .GET, .uri = "/api/v1/readyz" });
+    var prefixed_readyz = try server.handle(.{ .method = .GET, .uri = "/db/v1/readyz" });
     defer prefixed_readyz.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), prefixed_readyz.status);
 
     const request_stats = server.requestStats();
-    try std.testing.expectEqual(@as(u64, 5), request_stats.request_count);
+    try std.testing.expectEqual(@as(u64, 6), request_stats.request_count);
     try std.testing.expect(request_stats.first_request_started_at_ns >= server.created_at_ns);
 }
 
@@ -6969,6 +7372,55 @@ test "api http server serves mcp and a2a protocol surfaces" {
     try std.testing.expect(std.mem.indexOf(u8, cancel_resp.body, "\"state\":\"canceled\"") != null);
 }
 
+test "api http server authenticates trusted principal" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    const secret = "trusted-principal-test-secret";
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"user:alice","tenant":"inst-1","tables":["docs"],"operations":["read"],"row_filter":{{"docs":{{"term":{{"tenant_id":"t1"}}}}}},"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(payload);
+    const token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, payload);
+    defer std.testing.allocator.free(token);
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{ .trusted_principal_secret = secret, .trusted_principal_issuer = "trusted-upstream" },
+        source.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+    try std.testing.expect(server.requiresAuthentication(routes.Routes.tables));
+
+    var identity = try server.authenticateRequest(.{ .trusted_principal = token });
+    defer identity.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("user:alice", identity.username);
+    try std.testing.expectEqual(@as(usize, 1), identity.permissions.len);
+    try std.testing.expectEqual(usermgr.ResourceType.table, identity.permissions[0].resource_type);
+    try std.testing.expectEqualStrings("docs", identity.permissions[0].resource);
+    try std.testing.expectEqual(usermgr.PermissionType.read, identity.permissions[0].type);
+    try std.testing.expectEqual(@as(usize, 1), identity.row_filter.len);
+    try std.testing.expectEqualStrings("docs", identity.row_filter[0].table);
+    try std.testing.expect(std.mem.indexOf(u8, identity.row_filter[0].filter, "\"tenant_id\":\"t1\"") != null);
+}
+
 fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
     const raw = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ username, password });
     defer alloc.free(raw);
@@ -6977,6 +7429,27 @@ fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, pass
     defer alloc.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, raw);
     return try std.fmt.allocPrint(alloc, "Basic {s}", .{encoded});
+}
+
+fn encodeTrustedPrincipalToken(alloc: std.mem.Allocator, secret: []const u8, payload: []const u8) ![]u8 {
+    const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    const header_size = std.base64.url_safe_no_pad.Encoder.calcSize(header.len);
+    const header_encoded = try alloc.alloc(u8, header_size);
+    defer alloc.free(header_encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(header_encoded, header);
+    const payload_size = std.base64.url_safe_no_pad.Encoder.calcSize(payload.len);
+    const payload_encoded = try alloc.alloc(u8, payload_size);
+    defer alloc.free(payload_encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(payload_encoded, payload);
+    const signing_input = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ header_encoded, payload_encoded });
+    defer alloc.free(signing_input);
+    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(mac[0..], signing_input, secret);
+    const signature_size = std.base64.url_safe_no_pad.Encoder.calcSize(mac.len);
+    const signature_encoded = try alloc.alloc(u8, signature_size);
+    defer alloc.free(signature_encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(signature_encoded, mac[0..]);
+    return try std.fmt.allocPrint(alloc, "{s}.{s}", .{ signing_input, signature_encoded });
 }
 
 const TestAuthManager = struct {
@@ -8240,6 +8713,127 @@ test "api http server decodes percent-encoded lookup keys" {
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 }
 
+test "api http server serves lookup through mcp tool" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-http-mcp-lookup";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "docs/getting-started.md",
+                .value = "{\"title\":\"alpha\",\"body\":\"hello\"}",
+            },
+        },
+        .timestamp_ns = 4321,
+    });
+
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 1, .name = "docs", .placement_role = "data" }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = "" }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{};
+    const trusted_principal_secret = "mcp-lookup-trusted-principal-secret";
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"user:alice","tenant":"inst-1","tables":["docs"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(payload);
+    const token = try encodeTrustedPrincipalToken(std.testing.allocator, trusted_principal_secret, payload);
+    defer std.testing.allocator.free(token);
+
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .auth_enabled = true,
+            .trusted_principal_secret = trusted_principal_secret,
+            .trusted_principal_issuer = "trusted-upstream",
+        },
+        source.iface(),
+        table_source.source(),
+        null,
+    );
+    defer server.deinit();
+    const trusted_principal_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = token },
+    };
+
+    var init_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &trusted_principal_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer init_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), init_resp.status);
+
+    const mcp_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
+        .{ .name = trusted_principal_header, .value = token },
+    };
+    var tools_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}",
+    });
+    defer tools_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") != null);
+
+    var call_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"lookup\",\"arguments\":{\"tableName\":\"docs\",\"key\":\"docs/getting-started.md\",\"fields\":[\"title\"]}}}",
+    });
+    defer call_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), call_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, call_resp.body, "\"structuredContent\":{\"title\":\"alpha\"}") != null);
+}
+
 test "api http server serves table scan as ndjson" {
     const ScanRow = struct {
         key: []const u8,
@@ -8350,6 +8944,16 @@ test "api http server serves table query response envelope" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.responses.?.len);
     try std.testing.expectEqualStrings("doc:a", parsed.value.responses.?[0].hits.?.hits.?[0]._id);
+
+    var internal_field_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/query",
+        .content_type = "application/json",
+        .body = "{\"query\":{\"match_all\":{}},\"_identity_read_generation\":1}",
+    });
+    defer internal_field_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), internal_field_resp.status);
+    try std.testing.expectEqualStrings("invalid query request", internal_field_resp.body);
 }
 
 test "api http server serves table query with SearchAF-shaped terms aggregations" {
@@ -8482,6 +9086,79 @@ test "api http server serves retrieval agent response envelope" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, parsed.value.status);
     try std.testing.expectEqualStrings("doc:a", parsed.value.hits[0]._id);
     try std.testing.expectEqual(metadata_openapi.RetrievalStrategy.bm25, parsed.value.strategy_used.?);
+
+    const internal_query_body =
+        \\{"query":"find hello","stream":false,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"native_doc_id_constraints":{"include_doc_ids":["doc:a"]},"limit":5}]}
+    ;
+    var internal_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/agents/retrieval",
+        .content_type = "application/json",
+        .body = internal_query_body,
+    });
+    defer internal_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), internal_resp.status);
+    try std.testing.expectEqualStrings("invalid retrieval agent request", internal_resp.body);
+}
+
+test "api http server maps retrieval agent doc identity mismatch to unavailable" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeReads = struct {
+        fn source(_: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            return error.DocIdentityNamespaceMismatch;
+        }
+    };
+
+    var source = FakeSource{};
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+    const retrieval_body =
+        \\{"query":"find hello","stream":false,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
+    ;
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/agents/retrieval",
+        .content_type = "application/json",
+        .body = retrieval_body,
+    });
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
 }
 
 test "api http server serves retrieval agent event stream" {
@@ -8761,6 +9438,119 @@ test "api http server query builder infers semantic indexes from table metadata"
     });
     defer invalid_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+}
+
+test "api http server query builder maps doc identity mismatch to unavailable" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .schema_json = "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}}}}",
+                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\",\"fields\":[\"title\",\"body\"]}}",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = null }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .preflight_query = preflightQuery,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn preflightQuery(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+            _: u32,
+        ) anyerror!?db_mod.RuntimePreflightSummary {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return error.DocIdentityNamespaceMismatch;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), FakeReads.source(), null);
+
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.agents_query_builder,
+        .body = "{\"table\":\"docs\",\"intent\":\"find raft architecture\",\"mode\":\"full_text\",\"output\":\"query_request\"}",
+    });
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("{\"error\":\"doc identity unavailable\"}", resp.body);
 }
 
 test "api http server query builder loads structured table index metadata" {
@@ -9850,6 +10640,114 @@ test "api http server surfaces structured decision conflicts for transaction com
     try std.testing.expectEqualStrings("decision conflict", conflict.message);
     try std.testing.expectEqualStrings("transaction_conflict", conflict.kind);
     try std.testing.expectEqual(false, conflict.retryable);
+    try std.testing.expectEqualStrings("docs", conflict.table);
+}
+
+test "api http server surfaces structured doc identity conflicts for transaction commits" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeWrites = struct {
+        fn source(_: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .batch = batch,
+                    .commit_transaction = commitTransaction,
+                    .commit_transaction_with_id = commitTransactionWithId,
+                    .txn_begin_group_local = beginGroup,
+                    .txn_prepare_group_local = prepareGroup,
+                    .txn_resolve_group_local = resolveGroup,
+                    .txn_status_group_local = statusGroup,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn commitTransaction(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            return error.DocIdentityNamespaceMismatch;
+        }
+
+        fn commitTransactionWithId(
+            ptr: *anyopaque,
+            txn_alloc: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            return commitTransaction(ptr, txn_alloc, tables, sync_level);
+        }
+
+        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: []const []const u8) anyerror!?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn prepareGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest) anyerror!?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64) anyerror!?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn statusGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) anyerror!?db_mod.types.TxnStatus {
+            return error.UnsupportedOperation;
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+
+    const commit_body = try test_contract_helpers.encodeTransactionCommitRequest(
+        alloc,
+        &.{},
+        &.{.{ .table_name = "docs", .batch_json = "{\"inserts\":{}}" }},
+        null,
+    );
+    defer alloc.free(commit_body);
+
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.transactions_commit,
+        .content_type = "application/json",
+        .body = commit_body,
+    });
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    var parsed = try std.json.parseFromSlice(transactions_api.CommitResponse, alloc, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("aborted", parsed.value.status);
+    const conflict = parsed.value.conflict.?;
+    try std.testing.expectEqualStrings("doc identity unavailable", conflict.message);
+    try std.testing.expectEqualStrings("doc_identity_unavailable", conflict.kind);
+    try std.testing.expectEqual(true, conflict.retryable);
+    try std.testing.expectEqual(@as(?u32, 100), conflict.retry_after_ms);
+    try std.testing.expectEqualStrings("doc_identity", conflict.retry_scope.?);
     try std.testing.expectEqualStrings("docs", conflict.table);
 }
 
@@ -11105,6 +12003,83 @@ test "api http server handleInternalRoute matches handle for internal group look
     try std.testing.expectEqual(@as(usize, 1), via_internal.headers.len);
     try std.testing.expectEqualStrings(via_handle.headers[0].name, via_internal.headers[0].name);
     try std.testing.expectEqualStrings(via_handle.headers[0].value, via_internal.headers[0].value);
+}
+
+test "api http server maps public query doc identity mismatch to unavailable" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return error.DocIdentityNamespaceMismatch;
+        }
+    };
+
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), null);
+    defer server.deinit();
+
+    var resp = try server.handlePublicTableQuery("docs",
+        \\{"query":{"match_all":{}}}
+    , null);
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
 }
 
 test "api http server serves internal group transaction routes" {
@@ -13393,6 +14368,19 @@ test "remote runtime status reports replay debt separately from active catch-up"
         .doc_count = 56_250,
         .index_count = 1,
         .async_dense_catch_up_active = false,
+        .doc_identity = .{
+            .namespace_table_id = 1,
+            .namespace_shard_id = 10,
+            .namespace_range_id = 1001,
+            .next_ordinal = 44,
+            .rebuild_required = true,
+        },
+        .doc_set_planning = .{
+            .resolved_set_count = 7,
+            .ordinal_list_count = 3,
+            .missing_ordinal_coverage_count = 1,
+            .stale_identity_generation_rejection_count = 2,
+        },
         .indexes = @constCast((&[_]metadata_table_manager.RuntimeIndexStatusReport{.{
             .name = "vec",
             .kind = "dense_vector",
@@ -13415,6 +14403,15 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(false, index.catch_up_active);
     try std.testing.expectEqual(@as(u64, 225), index.catch_up_applied_sequence);
     try std.testing.expectEqual(@as(u64, 300), index.catch_up_target_sequence);
+    try std.testing.expectEqual(@as(u64, 1), status.stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(@as(u64, 10), status.stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(@as(u64, 1001), status.stats.doc_identity.namespace_range_id);
+    try std.testing.expectEqual(@as(u32, 44), status.stats.doc_identity.next_ordinal);
+    try std.testing.expect(status.stats.doc_identity.rebuild_required);
+    try std.testing.expectEqual(@as(u64, 7), status.stats.doc_set_planning.resolved_set_count);
+    try std.testing.expectEqual(@as(u64, 3), status.stats.doc_set_planning.ordinal_list_count);
+    try std.testing.expectEqual(@as(u64, 1), status.stats.doc_set_planning.missing_ordinal_coverage_count);
+    try std.testing.expectEqual(@as(u64, 2), status.stats.doc_set_planning.stale_identity_generation_rejection_count);
 }
 
 test "api index status ignores propagated runtime status from removed owner" {

@@ -1012,7 +1012,8 @@ test "metadata runtime prefers common config raft url for local id when cli bind
     raft_urls[0] = .{ .node_id = 7, .url = try alloc.dupe(u8, "http://127.0.0.1:7011") };
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .speech_to_text = antfly.transcribing.Registry.init(alloc),
+        .transcribers = antfly.transcribing.Registry.init(alloc),
+        .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .metadata = .{
             .raft_urls = raft_urls,
@@ -1032,7 +1033,8 @@ test "metadata runtime resolves paths from common storage base dir" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .speech_to_text = antfly.transcribing.Registry.init(alloc),
+        .transcribers = antfly.transcribing.Registry.init(alloc),
+        .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .storage = .{
             .local_base_dir = try alloc.dupe(u8, "/tmp/antflydb"),
@@ -1050,7 +1052,8 @@ test "metadata runtime resolves paths from common storage base dir" {
 test "metadata runtime derives reconciler config from common shard allocation settings" {
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(std.testing.allocator),
-        .speech_to_text = antfly.transcribing.Registry.init(std.testing.allocator),
+        .transcribers = antfly.transcribing.Registry.init(std.testing.allocator),
+        .readers = antfly.readers.Registry.init(std.testing.allocator),
         .text_to_speech = antfly.synthesizing.Registry.init(std.testing.allocator),
         .shard_allocation = .{
             .max_shard_size_bytes = 2048,

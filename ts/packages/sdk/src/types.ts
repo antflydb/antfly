@@ -58,6 +58,30 @@ export type QueryResponses = components["schemas"]["QueryResponses"];
 export interface BatchRequest {
   inserts?: Record<string, unknown>;
   deletes?: string[];
+  transforms?: components["schemas"]["Transform"][];
+  sync_level?: components["schemas"]["SyncLevel"];
+}
+export type BatchResult = components["schemas"]["BatchResponse"];
+export interface MultiBatchRequest {
+  tables: Record<string, BatchRequest>;
+  sync_level?: components["schemas"]["SyncLevel"];
+}
+export type MultiBatchResult = components["schemas"]["MultiBatchResponse"];
+export type LinearMergeRequest = components["schemas"]["LinearMergeRequest"];
+export type LinearMergeResult = components["schemas"]["LinearMergeResult"];
+export interface WriteOptions {
+  /**
+   * Maximum encoded JSON request body size in bytes.
+   * Non-positive or omitted values use the SDK default.
+   */
+  maxRequestBytes?: number;
+  /**
+   * Maximum success response body size in bytes.
+   * Non-positive or omitted values use the SDK default.
+   */
+  maxResponseBytes?: number;
+  /** AbortSignal to cancel the request. */
+  signal?: AbortSignal;
 }
 
 // Table types
@@ -143,7 +167,7 @@ export type RerankerConfig = components["schemas"]["RerankerConfig"];
 export type GeneratorConfig = components["schemas"]["GeneratorConfig"];
 export type EmbedderProvider = components["schemas"]["EmbedderProvider"];
 export const embedderProviders: components["schemas"]["EmbedderProvider"][] = [
-  "termite",
+  "antfly",
   "ollama",
   "gemini",
   "vertex",
@@ -155,13 +179,13 @@ export const embedderProviders: components["schemas"]["EmbedderProvider"][] = [
 ];
 export type GeneratorProvider = components["schemas"]["GeneratorProvider"];
 export const generatorProviders: components["schemas"]["GeneratorProvider"][] = [
+  "antfly",
   "ollama",
   "gemini",
   "openai",
   "anthropic",
   "vertex",
   "cohere",
-  "termite",
   "openrouter",
 ];
 
@@ -186,8 +210,8 @@ export type QueryBuilderResult = components["schemas"]["QueryBuilderResult"];
 // Chat/Retrieval types (used by retrieval agent's tool-calling mode)
 export type ChatMessage = components["schemas"]["ChatMessage"];
 export type ChatMessageRole = components["schemas"]["ChatMessageRole"];
-export type ChatToolCall = components["schemas"]["ChatToolCall"];
-export type ChatToolResult = components["schemas"]["ChatToolResult"];
+export type ToolCall = components["schemas"]["ToolCall"];
+export type ToolCallFunction = components["schemas"]["ToolCallFunction"];
 export type ChatToolName = components["schemas"]["ChatToolName"];
 export type ChatToolsConfig = components["schemas"]["ChatToolsConfig"];
 export type FilterSpec = components["schemas"]["FilterSpec"];

@@ -16,18 +16,18 @@ const std = @import("std");
 const chunking_types = @import("types.zig");
 const Chunk = @import("chunk.zig").Chunk;
 
-const termite_chunker = @import("termite_chunker");
+const inference_chunker = @import("inference_chunker");
 
 const Allocator = std.mem.Allocator;
 
 pub fn chunkText(alloc: Allocator, text: []const u8, cfg: chunking_types.Config) ![]Chunk {
-    const shared_chunks = try termite_chunker.fixed_text.chunkText(alloc, text, .{
+    const shared_chunks = try inference_chunker.fixed_text.chunkText(alloc, text, .{
         .target_tokens = cfg.defaultedTargetTokens(),
         .overlap_tokens = cfg.defaultedOverlapTokens(),
         .max_chunks = if (cfg.max_chunks > 0) cfg.max_chunks else 50,
         .separator = cfg.defaultedSeparator(),
     });
-    defer termite_chunker.types.freeChunks(alloc, shared_chunks);
+    defer inference_chunker.types.freeChunks(alloc, shared_chunks);
 
     var chunks = try alloc.alloc(Chunk, shared_chunks.len);
     errdefer {

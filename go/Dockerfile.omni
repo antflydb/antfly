@@ -1,8 +1,6 @@
 # Dockerfile for Antfly with ONNX + XLA Backends (Omni)
 #
 # This image enables both ONNX Runtime and XLA/TPU backends with runtime selection.
-# Backend priority can be configured via ANTFLY_TERMITE_BACKEND_PRIORITY.
-# Default priority: [onnx, xla, go]
 #
 # Build:
 #   docker build -f go/Dockerfile.omni -t ghcr.io/antflydb/antfly:omni .
@@ -15,9 +13,7 @@
 #   --build-arg LIBTPU_VERSION=1.12.0        Override libtpu version
 #
 # Runtime environment variables:
-#   ANTFLY_TERMITE_BACKEND_PRIORITY Override backend priority (comma-separated: onnx,xla,go)
-#   ANTFLY_TERMITE_API_URL         Override the termite API listen URL
-#   ANTFLY_TERMITE_MODELS_DIR      Override the termite models directory
+#   ANTFLY_INFERENCE_MODELS_DIR Override the inference models directory
 #   ORT_DYLIB_PATH              Custom ONNX Runtime library path
 #   ORTGENAI_DYLIB_PATH         Custom ONNX Runtime GenAI library path (for LLM generation)
 #   GOMLX_BACKEND               Force XLA backend (xla:tpu, xla:cuda, xla:cpu)
@@ -155,7 +151,7 @@ ENV ORTGENAI_DYLIB_PATH="/usr/local/onnxruntime/go/pkg/antfly/lib/libonnxruntime
 ENV PJRT_PLUGIN_LIBRARY_PATH="/usr/local/go/pkg/antfly/lib/go-xla"
 
 # Model directory (mounted at runtime, contains embedders/, chunkers/, rerankers/ subdirs)
-ENV ANTFLY_TERMITE_MODELS_DIR="/models"
+ENV ANTFLY_INFERENCE_MODELS_DIR="/models"
 
 # Create model directories
 RUN mkdir -p /models/embedders /models/chunkers /models/rerankers && \
@@ -173,6 +169,6 @@ EXPOSE 8080 11433 4200
 ENTRYPOINT ["/antfly"]
 
 # Default to single-node swarm mode for easy local usage.
-# Override with a different subcommand (e.g., "metadata", "store", "termite")
+# Override with a different subcommand (e.g., "metadata", "data", "inference")
 # via Kubernetes Pod args or docker run arguments.
 CMD ["swarm"]

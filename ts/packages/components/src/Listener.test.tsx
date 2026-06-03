@@ -11,7 +11,7 @@ import Results from "./Results";
 // Wrapper component to provide required context
 const TestWrapper = ({ children }: { children: React.ReactNode }) => {
   return (
-    <Antfly url="http://localhost:8082/api/v1" table="test">
+    <Antfly url="http://localhost:8082/db/v1" table="test">
       {children}
     </Antfly>
   );
@@ -463,7 +463,7 @@ describe("Listener", () => {
 
       const { container, rerender } = render(
         <Antfly
-          url="http://localhost:8082/api/v1"
+          url="http://localhost:8082/db/v1"
           table="docs"
           headers={{ Authorization: "ApiKey one" }}
         >
@@ -488,13 +488,13 @@ describe("Listener", () => {
 
       const initialCallCount = msearchSpy.mock.calls.length;
       const firstCall = msearchSpy.mock.calls[initialCallCount - 1];
-      expect(firstCall[0]).toBe("http://localhost:8082/api/v1");
+      expect(firstCall[0]).toBe("http://localhost:8082/db/v1");
       expect(firstCall[2]).toEqual({ Authorization: "ApiKey one" });
       expect(firstCall[1][0].query.table).toBe("docs");
 
       rerender(
         <Antfly
-          url="http://localhost:8083/api/v1"
+          url="http://localhost:8083/db/v1"
           table="docs_v2"
           headers={{ Authorization: "ApiKey two" }}
         >
@@ -513,7 +513,7 @@ describe("Listener", () => {
       });
 
       const latestCall = msearchSpy.mock.calls[msearchSpy.mock.calls.length - 1];
-      expect(latestCall[0]).toBe("http://localhost:8083/api/v1");
+      expect(latestCall[0]).toBe("http://localhost:8083/db/v1");
       expect(latestCall[2]).toEqual({ Authorization: "ApiKey two" });
       expect(latestCall[1][0].query.table).toBe("docs_v2");
 
@@ -620,7 +620,7 @@ describe("Listener", () => {
       const onChange = vi.fn();
 
       const { container } = render(
-        <Antfly url="http://localhost:8082/api/v1" table="test">
+        <Antfly url="http://localhost:8082/db/v1" table="test">
           <Listener onChange={onChange}>
             <QueryBox id="search" mode="live" />
             <Results
@@ -646,7 +646,7 @@ describe("Listener", () => {
       const onChange = vi.fn();
 
       const { container } = render(
-        <Antfly url="http://localhost:8082/api/v1" table="test">
+        <Antfly url="http://localhost:8082/db/v1" table="test">
           <Listener onChange={onChange}>
             <QueryBox id="search" mode="live" />
             <Results

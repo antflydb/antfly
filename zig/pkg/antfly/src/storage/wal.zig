@@ -43,6 +43,11 @@ const large_entry_threshold = 4096;
 const storage_sim_soak = zig_lmdb.storage_sim_soak;
 var wal_tmp_nonce: u64 = 0;
 
+fn lsmOpenDebugLogsEnabled() bool {
+    if (builtin.os.tag == .freestanding) return false;
+    return std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+}
+
 fn nextWalTmpNonce() u64 {
     return @atomicRmw(u64, &wal_tmp_nonce, .Add, 1, .seq_cst);
 }
@@ -727,7 +732,7 @@ pub const WAL = struct {
         const baseline_ns = if (avg_commit_ns > 0)
             avgCommitWindowNs(avg_commit_ns)
         else
-            50 * std.time.ns_per_us;
+            initialCommitWindowNs(self.group_commit_window_ns);
         return @min(self.group_commit_window_ns, baseline_ns);
     }
 
@@ -870,10 +875,28 @@ fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !Stor
             break :blk .{ .lmdb = backend };
         },
         .lsm => blk: {
+            const path_slice = std.mem.span(path);
+            const path_owned = try alloc.dupe(u8, path_slice);
+            defer alloc.free(path_owned);
+            const debug_open = lsmOpenDebugLogsEnabled();
+            if (debug_open) {
+                std.log.info(
+                    "wal lsm open begin path={s} path_ptr=0x{x} owned_ptr=0x{x} storage_provided={any} read_only={any} no_sync={any}",
+                    .{
+                        path_owned,
+                        @intFromPtr(path),
+                        @intFromPtr(path_owned.ptr),
+                        opts.storage != null,
+                        opts.read_only,
+                        opts.no_sync,
+                    },
+                );
+            }
             if (opts.storage == null) {
                 var io_impl = std.Io.Threaded.init(alloc, .{});
                 defer io_impl.deinit();
-                try fs_paths.createDirPathPortable(io_impl.io(), std.mem.span(path));
+                try fs_paths.createDirPathPortable(io_impl.io(), path_owned);
+                if (debug_open) std.log.info("wal lsm open ensured dir path={s}", .{path_owned});
             }
 
             var lsm_options = opts.lsm_options;
@@ -881,7 +904,20 @@ fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !Stor
             if (opts.read_only) lsm_options.backend.create_if_missing = false;
             lsm_options.backend.durability = if (opts.no_sync) .none else lsm_options.backend.durability;
             lsm_options.storage = opts.storage orelse lsm_options.storage;
-            var handle = try lsm_backend.BackendHandle.open(alloc, std.mem.span(path), lsm_options);
+            lsm_options.background_executor = null;
+            if (debug_open) {
+                std.log.info(
+                    "wal lsm backend handle open begin path={s} lsm_storage_provided={any} create_if_missing={any} durability={s}",
+                    .{
+                        path_owned,
+                        lsm_options.storage != null,
+                        lsm_options.backend.create_if_missing,
+                        @tagName(lsm_options.backend.durability),
+                    },
+                );
+            }
+            var handle = try lsm_backend.BackendHandle.open(alloc, path_owned, lsm_options);
+            if (debug_open) std.log.info("wal lsm backend handle open done path={s}", .{path_owned});
             errdefer handle.close();
             break :blk .{ .lsm = handle };
         },
@@ -889,6 +925,7 @@ fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !Stor
             var lsm_options = opts.lsm_options;
             lsm_options.backend.durability = .none;
             lsm_options.storage = opts.storage orelse lsm_options.storage;
+            lsm_options.background_executor = null;
             var handle = try lsm_backend.BackendHandle.init(alloc, lsm_options);
             errdefer handle.close();
             break :blk .{ .lsm = handle };
@@ -976,6 +1013,11 @@ fn avgCommitWindowNs(avg_commit_ns: u64) u64 {
     const min_window = 25 * std.time.ns_per_us;
     const max_window = 250 * std.time.ns_per_us;
     return std.math.clamp(avg_commit_ns / 2, min_window, max_window);
+}
+
+fn initialCommitWindowNs(configured_window_ns: u64) u64 {
+    const max_initial_window = 2 * std.time.ns_per_ms;
+    return @min(configured_window_ns, max_initial_window);
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
@@ -2529,11 +2571,11 @@ test "wal group commit uses injected virtual clock" {
 
     const lsn = try wal.append("virtual-time");
     try std.testing.expectEqual(@as(u64, 1), lsn);
-    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_us), runtime.clock().nowNs());
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), runtime.clock().nowNs());
 
     const stats = wal.statsSnapshot();
-    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_us), stats.total_coalesce_ns);
-    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_us), stats.total_wait_ns);
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), stats.total_coalesce_ns);
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), stats.total_wait_ns);
 }
 
 test "wal can reopen on modeled storage device" {

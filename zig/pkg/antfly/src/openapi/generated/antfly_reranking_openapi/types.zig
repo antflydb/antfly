@@ -7,7 +7,6 @@ const std = @import("std");
 pub const RerankerProvider = enum {
     antfly,
     ollama,
-    termite,
     cohere,
     vertex,
 
@@ -15,7 +14,6 @@ pub const RerankerProvider = enum {
         const s = switch (self) {
             .antfly => "antfly",
             .ollama => "ollama",
-            .termite => "termite",
             .cohere => "cohere",
             .vertex => "vertex",
         };
@@ -30,7 +28,6 @@ pub const RerankerProvider = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "antfly", .antfly },
             .{ "ollama", .ollama },
-            .{ "termite", .termite },
             .{ "cohere", .cohere },
             .{ "vertex", .vertex },
         });
@@ -46,11 +43,11 @@ pub const OllamaRerankerConfig = struct {
     url: ?[]const u8 = null,
 };
 
-/// Configuration for the Termite reranking provider.
-pub const TermiteRerankerConfig = struct {
+/// Configuration for the Antfly inference reranking provider.
+pub const AntflyRerankerConfig = struct {
     /// The name of the reranking model (e.g., cross-encoder model name).
     model: []const u8,
-    /// The URL of the Termite API endpoint.
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
 };
 
@@ -78,9 +75,6 @@ pub const VertexRerankerConfig = struct {
     top_n: ?i64 = null,
 };
 
-/// Configuration for the built-in Antfly reranking provider. Uses an embedded INT8-quantized cross-encoder/ms-marco-MiniLM-L-6-v2 ONNX model bundled directly in the binary. No external service, API key, or model download required. **Model:** cross-encoder/ms-marco-MiniLM-L-6-v2 (6-layer MiniLM cross-encoder) **Features:** - Zero configuration — works out of the box - No network access required - Pure Go inference via GoMLX
-pub const AntflyRerankerConfig = struct {};
-
 /// A unified configuration for a reranking provider.
 pub const RerankerConfig = struct {
     provider: RerankerProvider,
@@ -88,9 +82,9 @@ pub const RerankerConfig = struct {
     field: ?[]const u8 = null,
     /// Handlebars template to render document text for reranking.
     template: ?[]const u8 = null,
-    /// The name of the Ollama model to use for reranking.
+    /// The name of the reranking model (e.g., cross-encoder model name).
     model: ?[]const u8 = null,
-    /// The URL of the Ollama API endpoint.
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,

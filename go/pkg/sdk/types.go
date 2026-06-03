@@ -53,27 +53,24 @@ type (
 	BedrockEmbedderConfig    = oapi.BedrockEmbedderConfig
 	VertexEmbedderConfig     = oapi.VertexEmbedderConfig
 	AntflyEmbedderConfig     = oapi.AntflyEmbedderConfig
-	TermiteEmbedderConfig    = oapi.TermiteEmbedderConfig
 	OllamaGeneratorConfig    = oapi.OllamaGeneratorConfig
 	OpenAIGeneratorConfig    = oapi.OpenAIGeneratorConfig
 	GoogleGeneratorConfig    = oapi.GoogleGeneratorConfig
 	BedrockGeneratorConfig   = oapi.BedrockGeneratorConfig
 	VertexGeneratorConfig    = oapi.VertexGeneratorConfig
 	AnthropicGeneratorConfig = oapi.AnthropicGeneratorConfig
-	TermiteGeneratorConfig   = oapi.TermiteGeneratorConfig
+	AntflyGeneratorConfig    = oapi.AntflyGeneratorConfig
 	RerankerConfig           = oapi.RerankerConfig
 	AntflyRerankerConfig     = oapi.AntflyRerankerConfig
 	OllamaRerankerConfig     = oapi.OllamaRerankerConfig
-	TermiteRerankerConfig    = oapi.TermiteRerankerConfig
 	RerankerProvider         = oapi.RerankerProvider
 	Pruner                   = oapi.Pruner
 
 	// Chunker config types
-	ChunkerProvider      = oapi.ChunkerProvider
-	ChunkerConfig        = oapi.ChunkerConfig
-	TermiteChunkerConfig = oapi.TermiteChunkerConfig
-	AntflyChunkerConfig  = oapi.AntflyChunkerConfig
-	TextChunkOptions     = oapi.TextChunkOptions
+	ChunkerProvider     = oapi.ChunkerProvider
+	ChunkerConfig       = oapi.ChunkerConfig
+	AntflyChunkerConfig = oapi.AntflyChunkerConfig
+	TextChunkOptions    = oapi.TextChunkOptions
 
 	// Sort types
 	SortField = oapi.SortField
@@ -136,23 +133,29 @@ type (
 	ChainCondition                     = oapi.ChainCondition
 
 	// Chat/Agent types (used by retrieval agent)
-	ChatMessage        = oapi.ChatMessage
-	ChatMessageRole    = oapi.ChatMessageRole
-	ChatToolCall       = oapi.ChatToolCall
-	ChatToolResult     = oapi.ChatToolResult
-	ChatToolName       = oapi.ChatToolName
-	ChatToolsConfig    = oapi.ChatToolsConfig
-	FetchConfig        = oapi.FetchConfig
-	WebSearchConfig    = oapi.WebSearchConfig
-	FilterSpec         = oapi.FilterSpec
-	FilterSpecOperator = oapi.FilterSpecOperator
-	AgentDecision      = oapi.AgentDecision
-	AgentQuestion      = oapi.AgentQuestion
-	AgentQuestionKind  = oapi.AgentQuestionKind
-	AgentStatus        = oapi.AgentStatus
-	AgentStep          = oapi.AgentStep
-	AgentStepKind      = oapi.AgentStepKind
-	AgentStepStatus    = oapi.AgentStepStatus
+	ChatMessage         = oapi.ChatMessage
+	ChatMessageContent  = oapi.ChatMessageContent
+	ChatMessageRole     = oapi.ChatMessageRole
+	ContentPart         = oapi.ContentPart
+	TextContentPart     = oapi.TextContentPart
+	ImageURL            = oapi.ImageURL
+	ImageURLContentPart = oapi.ImageURLContentPart
+	MediaContentPart    = oapi.MediaContentPart
+	ToolCall            = oapi.ToolCall
+	ToolCallFunction    = oapi.ToolCallFunction
+	ChatToolName        = oapi.ChatToolName
+	ChatToolsConfig     = oapi.ChatToolsConfig
+	FetchConfig         = oapi.FetchConfig
+	WebSearchConfig     = oapi.WebSearchConfig
+	FilterSpec          = oapi.FilterSpec
+	FilterSpecOperator  = oapi.FilterSpecOperator
+	AgentDecision       = oapi.AgentDecision
+	AgentQuestion       = oapi.AgentQuestion
+	AgentQuestionKind   = oapi.AgentQuestionKind
+	AgentStatus         = oapi.AgentStatus
+	AgentStep           = oapi.AgentStep
+	AgentStepKind       = oapi.AgentStepKind
+	AgentStepStatus     = oapi.AgentStepStatus
 
 	// Query Builder types
 	QueryBuilderRequest = oapi.QueryBuilderRequest
@@ -321,19 +324,17 @@ const (
 	EmbedderProviderGemini     = oapi.EmbedderProviderGemini
 	EmbedderProviderBedrock    = oapi.EmbedderProviderBedrock
 	EmbedderProviderVertex     = oapi.EmbedderProviderVertex
-	EmbedderProviderTermite    = oapi.EmbedderProviderTermite
 	EmbedderProviderMock       = oapi.EmbedderProviderMock
+	GeneratorProviderAntfly    = oapi.GeneratorProviderAntfly
 	GeneratorProviderOllama    = oapi.GeneratorProviderOllama
 	GeneratorProviderOpenai    = oapi.GeneratorProviderOpenai
 	GeneratorProviderGemini    = oapi.GeneratorProviderGemini
 	GeneratorProviderBedrock   = oapi.GeneratorProviderBedrock
 	GeneratorProviderVertex    = oapi.GeneratorProviderVertex
 	GeneratorProviderAnthropic = oapi.GeneratorProviderAnthropic
-	GeneratorProviderTermite   = oapi.GeneratorProviderTermite
 	GeneratorProviderMock      = oapi.GeneratorProviderMock
 	RerankerProviderAntfly     = oapi.RerankerProviderAntfly
 	RerankerProviderOllama     = oapi.RerankerProviderOllama
-	RerankerProviderTermite    = oapi.RerankerProviderTermite
 
 	// MergeStrategy values
 	MergeStrategyRrf      = oapi.MergeStrategyRrf

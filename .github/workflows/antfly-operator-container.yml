@@ -6,11 +6,11 @@ on:
       - "go/pkg/operator/v*"
 
 env:
-  GCP_REGION: us-east5
+  GCP_REGION: us-central1
   GCP_PROJECT: antfly-image-artifacts
-  GCP_REPOSITORY: antfly-labs
+  GCP_REPOSITORY: containers
   IMAGE_NAME: antfly-operator
-  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-east5/workerPools/antfly-container-builders
+  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
 
 jobs:
   publish:

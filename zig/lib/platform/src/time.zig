@@ -13,8 +13,13 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn sleepNs(ns: u64) void {
+    if (comptime builtin.os.tag == .freestanding and (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)) {
+        return;
+    }
+
     var req = std.posix.timespec{
         .sec = @intCast(ns / std.time.ns_per_s),
         .nsec = @intCast(ns % std.time.ns_per_s),
@@ -27,5 +32,29 @@ pub fn sleepNs(ns: u64) void {
 }
 
 pub fn yieldBriefly() void {
+    if (comptime builtin.os.tag == .freestanding and (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)) return;
     sleepNs(100_000);
+}
+
+pub fn monotonicNs() u64 {
+    if (comptime builtin.os.tag == .freestanding and (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)) return 0;
+
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
+}
+
+pub fn residentBytes() usize {
+    if (comptime builtin.os.tag == .freestanding and (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)) return 0;
+
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    if (usage.maxrss <= 0) return 0;
+    const maxrss: usize = @intCast(usage.maxrss);
+    return switch (builtin.os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => maxrss,
+        .linux => std.math.mul(usize, maxrss, 1024) catch std.math.maxInt(usize),
+        else => maxrss,
+    };
 }

@@ -1022,11 +1022,42 @@ fn deinitSparseEmbeddingWrite(alloc: Allocator, embedding: *derived_types.Derive
 }
 
 fn edgeKeyAlloc(alloc: Allocator, source: []const u8, target: []const u8, edge_type: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}\x00{s}\x00{s}", .{ source, target, edge_type });
+    return try tupleKeyAlloc(alloc, &.{ source, target, edge_type });
 }
 
 fn indexDocKeyAlloc(alloc: Allocator, index_name: []const u8, doc_key: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ index_name, doc_key });
+    return try tupleKeyAlloc(alloc, &.{ index_name, doc_key });
+}
+
+fn tupleKeyAlloc(alloc: Allocator, components: []const []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    for (components) |component| {
+        if (component.len > std.math.maxInt(u32)) return error.KeyComponentTooLarge;
+        var len_buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(component.len), .big);
+        try out.appendSlice(alloc, &len_buf);
+        try out.appendSlice(alloc, component);
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+test "replay batcher tuple map keys preserve embedded delimiters" {
+    const alloc = std.testing.allocator;
+
+    const sparse_a = try indexDocKeyAlloc(alloc, "idx\x00doc", "a");
+    defer alloc.free(sparse_a);
+    const sparse_b = try indexDocKeyAlloc(alloc, "idx", "doc\x00a");
+    defer alloc.free(sparse_b);
+    try std.testing.expect(!std.mem.eql(u8, sparse_a, sparse_b));
+
+    const graph_a = try edgeKeyAlloc(alloc, "src\x00dst", "edge", "kind");
+    defer alloc.free(graph_a);
+    const graph_b = try edgeKeyAlloc(alloc, "src", "dst\x00edge", "kind");
+    defer alloc.free(graph_b);
+    try std.testing.expect(!std.mem.eql(u8, graph_a, graph_b));
 }
 
 fn cloneGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) !types.GraphEdgeWrite {

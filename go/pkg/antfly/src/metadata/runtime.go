@@ -65,12 +65,12 @@ type Runtime struct {
 	tableManager  *tablemgr.TableManager
 	userManager   *usermgr.UserManager
 
-	httpClient       *http.Client
-	httpCloser       io.Closer
-	workerPool       *workerpool.Pool
-	embedCache       *ttlcache.Cache[string, []float32]
-	httpHandler      http.Handler
-	termiteMLHandler http.Handler
+	httpClient         *http.Client
+	httpCloser         io.Closer
+	workerPool         *workerpool.Pool
+	embedCache         *ttlcache.Cache[string, []float32]
+	httpHandler        http.Handler
+	inferenceMLHandler http.Handler
 
 	closeOnce   sync.Once
 	closeErr    error
@@ -79,12 +79,11 @@ type Runtime struct {
 
 type RuntimeOptions struct {
 	ExecutionProvider ExecutionProvider
-	// TermiteMLHandler is an optional in-process Termite handler. When set, it
-	// is mounted at /ml/v1/ and also handles /ml/v1/generate as exposed by
-	// go/pkg/termite.TermiteNode.APIMLHandler.
-	// When nil and config.Termite.ApiUrl is set, the metadata server instead
-	// reverse-proxies /termite/* to that URL.
-	TermiteMLHandler http.Handler
+	// InferenceMLHandler is an optional in-process inference handler. When set, it
+	// is mounted at /ai/v1/ and also handles /ai/v1/generate.
+	// When nil and config.Inference.ApiUrl is set, the metadata server instead
+	// reverse-proxies /ai/v1/* to that URL.
+	InferenceMLHandler http.Handler
 }
 
 func NewRuntime(
@@ -202,19 +201,19 @@ func NewRuntime(
 	metadataStore.SetLeaderFactory(newMetadataLeaderFactory(zl, node, metadataStore, replMgr))
 
 	runtime := &Runtime{
-		logger:           zl,
-		config:           config,
-		info:             conf,
-		raft:             rs,
-		metadataStore:    metadataStore,
-		node:             node,
-		tableManager:     tm,
-		userManager:      um,
-		httpClient:       httpClient,
-		httpCloser:       httpCloser,
-		workerPool:       pool,
-		embedCache:       embeddingCache,
-		termiteMLHandler: opts.TermiteMLHandler,
+		logger:             zl,
+		config:             config,
+		info:               conf,
+		raft:               rs,
+		metadataStore:      metadataStore,
+		node:               node,
+		tableManager:       tm,
+		userManager:        um,
+		httpClient:         httpClient,
+		httpCloser:         httpCloser,
+		workerPool:         pool,
+		embedCache:         embeddingCache,
+		inferenceMLHandler: opts.InferenceMLHandler,
 	}
 	runtime.httpHandler = runtime.newHTTPHandler()
 	return runtime, nil
@@ -499,26 +498,23 @@ func (r *Runtime) newHTTPHandler() http.Handler {
 	api.AddMetadataRoutes(metadataMux)
 
 	publicMux := r.node.publicApiRoutes()
+	authMux := r.node.authApiRoutes()
 	apiRoutes := http.NewServeMux()
 	apiRoutes.Handle("/metadata/v1/", http.StripPrefix("/metadata/v1", metadataMux))
 	apiRoutes.Handle("/internal/v1/", http.StripPrefix("/internal/v1", internalMux))
-	// Compatibility aliases for clients using the pre-consolidation path scheme.
-	apiRoutes.Handle("/api/v1/", http.StripPrefix("/api/v1", publicMux))
+	apiRoutes.Handle("/db/v1/", http.StripPrefix("/db/v1", publicMux))
+	apiRoutes.Handle("/auth/v1/", authMux)
 	apiRoutes.Handle("/_internal/v1/", http.StripPrefix("/_internal/v1", internalMux))
 	addAntfarmRoutes(apiRoutes)
 
-	if r.termiteMLHandler != nil {
-		// Mount in-process termite handler at /ml/v1/. The handler's own
-		// mux is already registered with /ml/v1/* routes, so we pass the
+	if r.inferenceMLHandler != nil {
+		// Mount in-process inference handler at /ai/v1/. The handler's own
+		// mux is already registered with /ai/v1/* routes, so we pass the
 		// full path through without stripping.
-		apiRoutes.Handle("/ml/v1/", r.termiteMLHandler)
-		// Also expose the embedded Termite surface under /termite/* so the
-		// Antfly dashboard and existing clients can treat Termite as a stable
-		// sub-service regardless of whether it runs in-process or standalone.
-		apiRoutes.Handle("/termite/", http.StripPrefix("/termite", r.termiteMLHandler))
-		r.logger.Info("In-process Termite ML handler mounted", zap.String("path", "/ml/v1/"))
-	} else if r.config.Termite.ApiUrl != "" {
-		addTermiteProxy(apiRoutes, r.config.Termite.ApiUrl)
+		apiRoutes.Handle("/ai/v1/", r.inferenceMLHandler)
+		r.logger.Info("In-process inference ML handler mounted", zap.String("path", "/ai/v1/"))
+	} else if r.config.Inference.ApiUrl != "" {
+		addInferenceProxy(apiRoutes, r.config.Inference.ApiUrl)
 	}
 
 	mcpAdapter := newMCPAdapter(NewTableApi(r.logger, r.node, r.tableManager))

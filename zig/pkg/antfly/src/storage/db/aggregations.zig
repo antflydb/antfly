@@ -25,6 +25,8 @@ const search_mod = @import("../../search/search.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const geo_mod = @import("../../search/geo.zig");
 const regex_mod = @import("../../search/regex.zig");
+const doc_identity = @import("doc_identity.zig");
+const doc_set = @import("doc_set.zig");
 
 pub const NumericRangeRequest = struct {
     name: []const u8 = "",
@@ -159,20 +161,17 @@ pub fn deinitResults(alloc: Allocator, results: []SearchAggregationResult) void 
 
 pub fn cloneSearchAggregationResultLabelsDeep(alloc: Allocator, result: *SearchAggregationResult) !void {
     if (!result.owns_labels) {
-        const name = try alloc.dupe(u8, result.name);
-        errdefer alloc.free(name);
-        const field = try alloc.dupe(u8, result.field);
-        errdefer alloc.free(field);
-        const agg_type = try alloc.dupe(u8, result.type);
-        errdefer alloc.free(agg_type);
-
-        result.name = name;
-        result.field = field;
-        result.type = agg_type;
+        result.name = try alloc.dupe(u8, result.name);
+        errdefer alloc.free(result.name);
+        result.field = try alloc.dupe(u8, result.field);
+        errdefer alloc.free(result.field);
+        result.type = try alloc.dupe(u8, result.type);
         result.owns_labels = true;
     }
     for (result.buckets) |*bucket| {
-        for (bucket.aggregations) |*child| try cloneSearchAggregationResultLabelsDeep(alloc, child);
+        for (bucket.aggregations) |*child| {
+            try cloneSearchAggregationResultLabelsDeep(alloc, child);
+        }
     }
 }
 
@@ -184,6 +183,7 @@ pub const Context = struct {
     algebraic_scope: AlgebraicScope = .disabled,
     algebraic_available: bool = false,
     algebraic_constraints: []const FixedConstraint = &.{},
+    identity_read_generation: ?u64 = null,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
     distributed_background_text_stats: []const DistributedBackgroundTextStats = &.{},
 };
@@ -354,9 +354,8 @@ fn computeAlgebraicAggregation(
         index.recordPlannerFallback("schema_lifecycle_not_ready", null, null);
         return null;
     }
-
     if (std.mem.eql(u8, request.type, "stats")) {
-        const maybe_result = computeAlgebraicStatsAggregation(alloc, index, store, request, ctx.algebraic_constraints) catch |err| switch (err) {
+        const maybe_result = computeAlgebraicStatsAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx.identity_read_generation) catch |err| switch (err) {
             error.AlgebraicPlannerScanTooLarge => {
                 index.recordPlannerFallback("stats_rollup_too_many_rows", null, null);
                 return null;
@@ -372,7 +371,7 @@ fn computeAlgebraicAggregation(
     }
 
     if (std.mem.eql(u8, request.type, "cardinality")) {
-        const count = (try index.exactCardinalityForFieldAlloc(store, request.field, ctx.algebraic_constraints)) orelse {
+        const count = (try index.exactCardinalityForFieldAtGenerationAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) orelse {
             index.recordPlannerFallback("cardinality_unsupported", null, null);
             return null;
         };
@@ -387,6 +386,20 @@ fn computeAlgebraicAggregation(
 
     if (isAlgebraicMetricType(request.type)) {
         const op = algebraic_mod.algebra.Op.parse(request.type) orelse return null;
+        if (ctx.identity_read_generation != null and request.algebraic_join == null) {
+            if (op != .count and index.resolveMeasureField(request.field) == null) return null;
+            const doc_ids = (try algebraicMetricCandidateDocIdsAtGenerationAlloc(index, store, ctx.algebraic_constraints, ctx.identity_read_generation)) orelse return null;
+            defer index.freeDocIds(doc_ids);
+            const raw = try index.rawMetricForDocIdsAlloc(store, op, request.field, doc_ids);
+            defer if (raw) |bytes| index.alloc.free(bytes);
+            index.recordPlannerSelected(null, null);
+            return .{
+                .name = request.name,
+                .field = request.field,
+                .type = request.type,
+                .value_json = try algebraicMetricValueJsonAlloc(alloc, op, raw),
+            };
+        }
         const query = algebraic_mod.ir.Query{
             .kind = .metric,
             .aggregation_name = request.name,
@@ -397,7 +410,7 @@ fn computeAlgebraicAggregation(
         const plan_result = algebraic_mod.planner.planMetricQuery(index, query);
         const plan = plan_result.metric orelse {
             if (plan_result.derived_join_fold) |derived| {
-                const raw = try algebraicDerivedJoinMetricRawAlloc(index, store, derived);
+                const raw = try algebraicDerivedJoinMetricRawAlloc(index, store, derived, ctx.identity_read_generation);
                 defer if (raw) |bytes| index.alloc.free(bytes);
                 index.recordPlannerSelected(null, null);
                 return .{
@@ -439,7 +452,7 @@ fn computeAlgebraicAggregation(
     }
 
     if (std.mem.eql(u8, request.type, "terms")) {
-        const maybe_result = computeAlgebraicTermsAggregation(alloc, index, store, request, ctx.algebraic_constraints) catch |err| switch (err) {
+        const maybe_result = computeAlgebraicTermsAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx.identity_read_generation) catch |err| switch (err) {
             error.UnsupportedAggregation => {
                 try recordAlgebraicBucketObservation(alloc, index, store, request, ctx.algebraic_constraints, "terms_unsupported");
                 index.recordPlannerFallback("terms_unsupported", null, null);
@@ -467,7 +480,7 @@ fn computeAlgebraicAggregation(
     }
 
     if (std.mem.eql(u8, request.type, "date_histogram")) {
-        const maybe_result = computeAlgebraicDateHistogramAggregation(alloc, index, store, request, ctx.algebraic_constraints) catch |err| switch (err) {
+        const maybe_result = computeAlgebraicDateHistogramAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx.identity_read_generation) catch |err| switch (err) {
             error.UnsupportedAggregation => {
                 try recordAlgebraicBucketObservation(alloc, index, store, request, ctx.algebraic_constraints, "date_histogram_unsupported");
                 index.recordPlannerFallback("date_histogram_unsupported", null, null);
@@ -495,7 +508,7 @@ fn computeAlgebraicAggregation(
     }
 
     if (std.mem.eql(u8, request.type, "histogram")) {
-        const maybe_result = computeAlgebraicHistogramAggregation(alloc, index, store, request, ctx.algebraic_constraints) catch |err| switch (err) {
+        const maybe_result = computeAlgebraicHistogramAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx.identity_read_generation) catch |err| switch (err) {
             error.UnsupportedAggregation => {
                 index.recordPlannerFallback("histogram_unsupported", null, null);
                 return null;
@@ -519,7 +532,7 @@ fn computeAlgebraicAggregation(
     }
 
     if (std.mem.eql(u8, request.type, "range") or std.mem.eql(u8, request.type, "date_range")) {
-        const maybe_result = computeAlgebraicRangeAggregation(alloc, index, store, request, ctx.algebraic_constraints) catch |err| switch (err) {
+        const maybe_result = computeAlgebraicRangeAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx.identity_read_generation) catch |err| switch (err) {
             error.UnsupportedAggregation => {
                 index.recordPlannerFallback("range_unsupported", null, null);
                 return null;
@@ -672,8 +685,20 @@ fn algebraicCandidateCountWithConstraints(
     store: *docstore_mod.DocStore,
     doc_ids: []const []const u8,
     constraints: []const FixedConstraint,
+    generation: ?u64,
 ) !i64 {
-    if (constraints.len == 0) return @intCast(doc_ids.len);
+    if (constraints.len == 0) {
+        if (try algebraicLiveFilteredDocIdsAlloc(index, store, doc_ids, generation)) |filtered| {
+            defer index.freeDocIds(filtered);
+            return @intCast(filtered.len);
+        }
+        return @intCast(doc_ids.len);
+    }
+    if (try index.resolvedDocSetForConstraintsAtGenerationAlloc(store, constraints, generation)) |resolved_constraints| {
+        var constraints_set = resolved_constraints;
+        defer constraints_set.deinit(index.alloc);
+        if (try algebraicCandidateCountWithResolvedSet(index, store, doc_ids, &constraints_set)) |count| return count;
+    }
     const constraint_ids = try index.docIdsForConstraintsAlloc(store, constraints);
     defer index.freeDocIds(constraint_ids);
     var count: i64 = 0;
@@ -690,13 +715,59 @@ fn aggregationContainsDocId(doc_ids: []const []const u8, needle: []const u8) boo
     return false;
 }
 
+fn appendUniqueDocIdRef(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged([]const u8),
+    doc_id: []const u8,
+) !void {
+    for (out.items) |existing| {
+        if (std.mem.eql(u8, existing, doc_id)) return;
+    }
+    try out.append(alloc, doc_id);
+}
+
+fn algebraicCandidateCountWithResolvedSet(
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    doc_ids: []const []const u8,
+    resolved_constraints: *const doc_set.ResolvedDocSet,
+) !?i64 {
+    switch (resolved_constraints.*) {
+        .all => return @intCast(doc_ids.len),
+        .none => return 0,
+        .doc_keys => |keys| {
+            var count: i64 = 0;
+            for (doc_ids) |doc_id| {
+                if (aggregationContainsDocId(keys, doc_id)) count += 1;
+            }
+            return count;
+        },
+        .ordinals, .ordinal_bitmap => {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var count: i64 = 0;
+            for (doc_ids) |doc_id| {
+                const ordinal = (try doc_identity.lookupOrdinalTxn(index.alloc, &txn, doc_id)) orelse return null;
+                if (resolved_constraints.containsOrdinal(ordinal)) count += 1;
+            }
+            return count;
+        },
+    }
+}
+
 fn algebraicConstrainedDocIdsAlloc(
     index: *algebraic_mod.index.Index,
     store: *docstore_mod.DocStore,
     doc_ids: []const []const u8,
     constraints: []const FixedConstraint,
+    generation: ?u64,
 ) !?[][]u8 {
-    if (constraints.len == 0) return null;
+    if (constraints.len == 0) return try algebraicLiveFilteredDocIdsAlloc(index, store, doc_ids, generation);
+    if (try index.resolvedDocSetForConstraintsAtGenerationAlloc(store, constraints, generation)) |resolved_constraints| {
+        var constraints_set = resolved_constraints;
+        defer constraints_set.deinit(index.alloc);
+        if (try algebraicDocIdsFilteredByResolvedSetAlloc(index, store, doc_ids, &constraints_set)) |filtered| return filtered;
+    }
     const constraint_ids = try index.docIdsForConstraintsAlloc(store, constraints);
     defer index.freeDocIds(constraint_ids);
     var out = std.ArrayListUnmanaged([]u8).empty;
@@ -707,6 +778,131 @@ fn algebraicConstrainedDocIdsAlloc(
     for (doc_ids) |doc_id| {
         if (!aggregationContainsDocId(constraint_ids, doc_id)) continue;
         try out.append(index.alloc, try index.alloc.dupe(u8, doc_id));
+    }
+    const owned = try out.toOwnedSlice(index.alloc);
+    out = .empty;
+    errdefer index.freeDocIds(owned);
+    if (try algebraicLiveFilteredDocIdsAlloc(index, store, owned, generation)) |filtered| {
+        index.freeDocIds(owned);
+        return filtered;
+    }
+    return owned;
+}
+
+fn algebraicLiveFilteredDocIdsAlloc(
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    doc_ids: []const []const u8,
+    generation: ?u64,
+) !?[][]u8 {
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    var resolved = try doc_identity.resolvedDocSetForIdsAtGenerationTxn(index.alloc, &txn, doc_ids, generation);
+    defer resolved.deinit(index.alloc);
+
+    const estimated = resolved.estimatedCardinality() orelse return null;
+    if (estimated == doc_ids.len) return null;
+    return try algebraicDocIdsFilteredByResolvedSetAlloc(index, store, doc_ids, &resolved);
+}
+
+fn algebraicDocIdsForResolvedSetAlloc(
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    resolved_set: *const doc_set.ResolvedDocSet,
+    generation: ?u64,
+) !?[][]u8 {
+    var out = std.ArrayListUnmanaged([]u8).empty;
+    errdefer index.freeDocIds(out.items);
+
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+
+    switch (resolved_set.*) {
+        .all => return null,
+        .none => {},
+        .doc_keys => |keys| {
+            for (keys) |key| try out.append(index.alloc, try index.alloc.dupe(u8, key));
+        },
+        .ordinals => |ordinals| {
+            for (ordinals) |ordinal| {
+                if (generation) |at| {
+                    const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return null;
+                    if (!state.isVisibleAt(at)) continue;
+                }
+                const doc_id = (try doc_identity.lookupDocIdTxn(index.alloc, &txn, ordinal)) orelse return null;
+                try out.append(index.alloc, doc_id);
+            }
+        },
+        .ordinal_bitmap => |*bitmap| {
+            var iter = bitmap.iterator();
+            while (iter.next()) |ordinal| {
+                if (generation) |at| {
+                    const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return null;
+                    if (!state.isVisibleAt(at)) continue;
+                }
+                const doc_id = (try doc_identity.lookupDocIdTxn(index.alloc, &txn, ordinal)) orelse return null;
+                try out.append(index.alloc, doc_id);
+            }
+        },
+    }
+    return try out.toOwnedSlice(index.alloc);
+}
+
+fn algebraicMetricCandidateDocIdsAtGenerationAlloc(
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    constraints: []const FixedConstraint,
+    generation: ?u64,
+) !?[][]u8 {
+    if (generation == null) return null;
+
+    if (constraints.len > 0) {
+        const constraint_ids = try index.docIdsForConstraintsAlloc(store, constraints);
+        errdefer index.freeDocIds(constraint_ids);
+        if (try algebraicLiveFilteredDocIdsAlloc(index, store, constraint_ids, generation)) |filtered| {
+            index.freeDocIds(constraint_ids);
+            return filtered;
+        }
+        return constraint_ids;
+    }
+
+    var visible = try doc_identity.visibleDocSetFromStoreAlloc(index.alloc, store, generation);
+    defer visible.deinit(index.alloc);
+    return try algebraicDocIdsForResolvedSetAlloc(index, store, &visible, generation);
+}
+
+fn algebraicDocIdsFilteredByResolvedSetAlloc(
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    doc_ids: []const []const u8,
+    resolved_constraints: *const doc_set.ResolvedDocSet,
+) !?[][]u8 {
+    var out = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (out.items) |doc_id| index.alloc.free(doc_id);
+        out.deinit(index.alloc);
+    }
+
+    switch (resolved_constraints.*) {
+        .all => {
+            for (doc_ids) |doc_id| try out.append(index.alloc, try index.alloc.dupe(u8, doc_id));
+        },
+        .none => {},
+        .doc_keys => |keys| {
+            for (doc_ids) |doc_id| {
+                if (!aggregationContainsDocId(keys, doc_id)) continue;
+                try out.append(index.alloc, try index.alloc.dupe(u8, doc_id));
+            }
+        },
+        .ordinals, .ordinal_bitmap => {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            for (doc_ids) |doc_id| {
+                const ordinal = (try doc_identity.lookupOrdinalTxn(index.alloc, &txn, doc_id)) orelse return null;
+                if (!resolved_constraints.containsOrdinal(ordinal)) continue;
+                try out.append(index.alloc, try index.alloc.dupe(u8, doc_id));
+            }
+        },
     }
     return try out.toOwnedSlice(index.alloc);
 }
@@ -921,11 +1117,12 @@ fn algebraicMetricReadForQueryAlloc(
     index: *algebraic_mod.index.Index,
     store: *docstore_mod.DocStore,
     query: algebraic_mod.ir.Query,
+    generation: ?u64,
 ) !?AlgebraicMetricRead {
     const plan_result = algebraic_mod.planner.planMetricQuery(index, query);
     const plan = plan_result.metric orelse {
         if (plan_result.derived_join_fold) |derived| {
-            const raw = try algebraicDerivedJoinMetricRawAlloc(index, store, derived);
+            const raw = try algebraicDerivedJoinMetricRawAlloc(index, store, derived, generation);
             defer if (raw) |bytes| index.alloc.free(bytes);
             return .{ .raw = if (raw) |bytes| try alloc.dupe(u8, bytes) else null };
         }
@@ -960,16 +1157,38 @@ fn computeAlgebraicStatsAggregation(
     store: *docstore_mod.DocStore,
     request: SearchAggregationRequest,
     constraints: []const FixedConstraint,
+    generation: ?u64,
 ) !?SearchAggregationResult {
     if (request.field.len == 0) return null;
 
-    var avg_read = (try algebraicMetricReadForQueryAlloc(alloc, index, store, algebraicStatsMetricQuery(request, .avg, constraints))) orelse return null;
+    if (generation != null and request.algebraic_join == null) {
+        const resolved = index.resolveMeasureField(request.field) orelse return null;
+        const doc_ids = (try algebraicMetricCandidateDocIdsAtGenerationAlloc(index, store, constraints, generation)) orelse return null;
+        defer index.freeDocIds(doc_ids);
+        const avg_raw = try index.rawMetricForResolvedDocIdsAlloc(store, .avg, resolved, doc_ids);
+        defer if (avg_raw) |bytes| index.alloc.free(bytes);
+        const min_raw = try index.rawMetricForResolvedDocIdsAlloc(store, .min, resolved, doc_ids);
+        defer if (min_raw) |bytes| index.alloc.free(bytes);
+        const max_raw = try index.rawMetricForResolvedDocIdsAlloc(store, .max, resolved, doc_ids);
+        defer if (max_raw) |bytes| index.alloc.free(bytes);
+        const sum_squares_raw = try index.rawMetricForResolvedDocIdsAlloc(store, .sumsquares, resolved, doc_ids);
+        defer if (sum_squares_raw) |bytes| index.alloc.free(bytes);
+
+        return .{
+            .name = request.name,
+            .field = request.field,
+            .type = request.type,
+            .value_json = (try algebraicStatsValueJsonAlloc(alloc, avg_raw, min_raw, max_raw, sum_squares_raw)) orelse return null,
+        };
+    }
+
+    var avg_read = (try algebraicMetricReadForQueryAlloc(alloc, index, store, algebraicStatsMetricQuery(request, .avg, constraints), generation)) orelse return null;
     defer avg_read.deinit(alloc);
-    var min_read = (try algebraicMetricReadForQueryAlloc(alloc, index, store, algebraicStatsMetricQuery(request, .min, constraints))) orelse return null;
+    var min_read = (try algebraicMetricReadForQueryAlloc(alloc, index, store, algebraicStatsMetricQuery(request, .min, constraints), generation)) orelse return null;
     defer min_read.deinit(alloc);
-    var max_read = (try algebraicMetricReadForQueryAlloc(alloc, index, store, algebraicStatsMetricQuery(request, .max, constraints))) orelse return null;
+    var max_read = (try algebraicMetricReadForQueryAlloc(alloc, index, store, algebraicStatsMetricQuery(request, .max, constraints), generation)) orelse return null;
     defer max_read.deinit(alloc);
-    var sum_squares_read = (try algebraicMetricReadForQueryAlloc(alloc, index, store, algebraicStatsMetricQuery(request, .sumsquares, constraints))) orelse return null;
+    var sum_squares_read = (try algebraicMetricReadForQueryAlloc(alloc, index, store, algebraicStatsMetricQuery(request, .sumsquares, constraints), generation)) orelse return null;
     defer sum_squares_read.deinit(alloc);
 
     return .{
@@ -1184,9 +1403,10 @@ fn algebraicDerivedJoinMetricRawAlloc(
     index: *algebraic_mod.index.Index,
     store: *docstore_mod.DocStore,
     request: algebraic_mod.index.DerivedJoinFoldRequest,
+    generation: ?u64,
 ) !?[]u8 {
     const semantic_id = request.measure orelse request.join.name;
-    const entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(index.alloc, index, store, request, semantic_id)) orelse return null;
+    const entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(index.alloc, index, store, request, semantic_id, generation)) orelse return null;
     defer {
         for (entries) |*entry| entry.deinit(index.alloc);
         if (entries.len > 0) index.alloc.free(entries);
@@ -1205,15 +1425,17 @@ fn scanDerivedJoinFoldEntriesWithProgramAlloc(
     store: *docstore_mod.DocStore,
     request: algebraic_mod.index.DerivedJoinFoldRequest,
     semantic_id: []const u8,
+    generation: ?u64,
 ) !?[]algebraic_mod.index.FoldEntry {
     var tensor_program = (try algebraic_mod.planner.planDerivedJoinFoldTensorProgramAlloc(alloc, request, semantic_id)) orelse return null;
     defer tensor_program.deinit(alloc);
-    return try index.scanDerivedJoinFoldEntriesWithTensorProgram(
+    return try index.scanDerivedJoinFoldEntriesWithTensorProgramAtGeneration(
         store,
         request,
         tensor_program.access_paths,
         tensor_program.asProgram(),
         tensor_program.output,
+        generation,
     );
 }
 
@@ -1448,9 +1670,10 @@ fn computeAlgebraicTermsAggregation(
     store: *docstore_mod.DocStore,
     request: SearchAggregationRequest,
     constraints: []const FixedConstraint,
+    generation: ?u64,
 ) !?SearchAggregationResult {
     if (request.fields.len > 1) {
-        return try computeAlgebraicCompositeTermsAggregation(alloc, index, store, request, constraints);
+        return try computeAlgebraicCompositeTermsAggregation(alloc, index, store, request, constraints, generation);
     }
     if (request.field.len == 0 or request.background_query != null) return null;
     const bucket_field = index.fieldConfig(request.field, .group) orelse {
@@ -1458,8 +1681,9 @@ fn computeAlgebraicTermsAggregation(
             const path_child_aggs = try splitAggregationRequests(alloc, request.aggregations);
             defer path_child_aggs.deinit(alloc);
             if (termsChildAggsAllCardinality(path_child_aggs.primary)) {
-                return try computeAlgebraicPathFactTermsCardinalityChildrenAggregation(alloc, index, store, request, constraints, path_child_aggs.primary);
+                return try computeAlgebraicPathFactTermsCardinalityChildrenAggregation(alloc, index, store, request, constraints, path_child_aggs.primary, generation);
             }
+            if (generation != null) return null;
             return try computeAlgebraicPathFactTermsAggregation(alloc, index, store, request, constraints);
         }
         return null;
@@ -1468,7 +1692,7 @@ fn computeAlgebraicTermsAggregation(
     const child_aggs = try splitAggregationRequests(alloc, request.aggregations);
     defer child_aggs.deinit(alloc);
     if (termsChildAggsAllCardinality(child_aggs.primary)) {
-        return try computeAlgebraicTermsCardinalityChildrenAggregation(alloc, index, store, request, bucket_field.name, constraints, child_aggs.primary, child_aggs.pipeline);
+        return try computeAlgebraicTermsCardinalityChildrenAggregation(alloc, index, store, request, bucket_field.name, constraints, child_aggs.primary, child_aggs.pipeline, generation);
     }
     for (child_aggs.primary) |child| {
         if (!isAlgebraicFoldMetricType(child.type)) return null;
@@ -1485,6 +1709,23 @@ fn computeAlgebraicTermsAggregation(
     };
     var plan_result = try algebraic_mod.planner.planBucketQueryAlloc(alloc, index, query);
     defer plan_result.deinit(alloc);
+    if (generation != null) {
+        if (request.algebraic_join == null and (plan_result.join_kind != null or plan_result.derived_join_fold != null)) return null;
+        if (plan_result.derived_join_fold) |derived| {
+            if (request.algebraic_join == null) return null;
+            return try computeDerivedJoinTermsAggregation(
+                alloc,
+                index,
+                store,
+                request,
+                child_aggs.primary,
+                derived,
+                plan_result.derived_child_join_folds,
+                generation,
+            );
+        }
+        return try computeAlgebraicTermsFromVisibleDocFactsAlloc(alloc, index, store, request, bucket_field.name, constraints, child_aggs.primary, child_aggs.pipeline, generation);
+    }
     const count_plan = plan_result.count_metric orelse {
         if (plan_result.derived_join_fold) |derived| {
             return try computeDerivedJoinTermsAggregation(
@@ -1495,6 +1736,7 @@ fn computeAlgebraicTermsAggregation(
                 child_aggs.primary,
                 derived,
                 plan_result.derived_child_join_folds,
+                null,
             );
         }
         return try computeAdaptiveTermsAggregation(alloc, index, store, request, bucket_field.name, constraints, child_aggs.primary, child_aggs.pipeline);
@@ -1621,14 +1863,132 @@ fn computeAlgebraicTermsAggregation(
     };
 }
 
+fn computeAlgebraicTermsFromVisibleDocFactsAlloc(
+    alloc: Allocator,
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    request: SearchAggregationRequest,
+    bucket_field_name: []const u8,
+    constraints: []const FixedConstraint,
+    child_requests: []const SearchAggregationRequest,
+    pipeline_requests: []const SearchAggregationRequest,
+    generation: ?u64,
+) !?SearchAggregationResult {
+    const entries = try index.scalarDocFactEntriesForFieldAlloc(store, .group, bucket_field_name);
+    defer {
+        for (entries) |*entry| entry.deinit(index.alloc);
+        if (entries.len > 0) index.alloc.free(entries);
+    }
+
+    var grouped = std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)).empty;
+    defer {
+        var it_grouped = grouped.iterator();
+        while (it_grouped.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(alloc);
+        }
+        grouped.deinit(alloc);
+    }
+
+    for (entries) |entry| {
+        const key_text = index.scalarTokenTextAlloc(alloc, entry.scalar) catch continue;
+        defer alloc.free(key_text);
+        if (request.term_prefix.len > 0 and !std.mem.startsWith(u8, key_text, request.term_prefix)) continue;
+        if (request.term_pattern.len > 0 and !(try regexMatches(alloc, request.term_pattern, key_text))) continue;
+
+        const gop = try grouped.getOrPut(alloc, entry.scalar);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try alloc.dupe(u8, entry.scalar);
+            gop.value_ptr.* = .empty;
+        }
+        try appendUniqueDocIdRef(alloc, gop.value_ptr, entry.doc_id);
+    }
+
+    var buckets_accum = std.ArrayListUnmanaged(TermsBucketAccum).empty;
+    defer {
+        for (buckets_accum.items) |*item| item.deinit(alloc);
+        buckets_accum.deinit(alloc);
+    }
+    const child_metrics = try algebraicChildMetricsAlloc(alloc, child_requests);
+    defer if (child_metrics.len > 0) alloc.free(child_metrics);
+
+    var grouped_it = grouped.iterator();
+    while (grouped_it.next()) |entry| {
+        const constrained_ids = try algebraicConstrainedDocIdsAlloc(index, store, entry.value_ptr.items, constraints, generation);
+        defer if (constrained_ids) |ids| index.freeDocIds(ids);
+        const effective_ids: []const []const u8 = if (constrained_ids) |ids| ids else entry.value_ptr.items;
+        const count: i64 = @intCast(effective_ids.len);
+        if (count == 0) continue;
+        if (request.min_doc_count > 0 and count < request.min_doc_count) continue;
+
+        var child_folds = try alloc.alloc(AlgebraicMetricFold, child_metrics.len);
+        var child_folds_filled: usize = 0;
+        errdefer {
+            for (child_folds[0..child_folds_filled]) |*fold| fold.deinit(alloc);
+            if (child_folds.len > 0) alloc.free(child_folds);
+        }
+        for (child_metrics, 0..) |child, i| {
+            child_folds[i] = AlgebraicMetricFold.init(child.op);
+            child_folds_filled = i + 1;
+            const raw = if (child.op == .count)
+                try index.rawMetricForDocIdsAlloc(store, child.op, child.field, effective_ids)
+            else blk: {
+                const resolved = index.resolveMeasureField(child.field) orelse return error.UnsupportedAggregation;
+                break :blk try index.rawMetricForResolvedDocIdsAlloc(store, child.op, resolved, effective_ids);
+            };
+            defer if (raw) |bytes| index.alloc.free(bytes);
+            if (raw) |bytes| try child_folds[i].addRaw(alloc, bytes);
+        }
+        try buckets_accum.append(alloc, .{
+            .key = try alloc.dupe(u8, entry.key_ptr.*),
+            .count = count,
+            .child_folds = child_folds,
+        });
+    }
+
+    if (exceedsAlgebraicResultBucketLimit(index, buckets_accum.items.len)) return error.AlgebraicResultBucketLimit;
+    std.mem.sort(TermsBucketAccum, buckets_accum.items, {}, struct {
+        fn lessThan(_: void, lhs: TermsBucketAccum, rhs: TermsBucketAccum) bool {
+            if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+            return lhs.count > rhs.count;
+        }
+    }.lessThan);
+
+    const limit: usize = if (request.size > 0 and @as(usize, @intCast(request.size)) < buckets_accum.items.len) @intCast(request.size) else buckets_accum.items.len;
+    var buckets = try alloc.alloc(SearchAggregationBucket, limit);
+    var buckets_filled: usize = 0;
+    errdefer {
+        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        alloc.free(buckets);
+    }
+    for (buckets_accum.items[0..limit], 0..) |candidate, idx| {
+        buckets[idx] = .{
+            .key_json = try index.scalarTokenJsonAlloc(alloc, candidate.key),
+            .count = candidate.count,
+            .aggregations = try algebraicNestedMetricFoldResults(alloc, child_requests, candidate.child_folds),
+        };
+        buckets_filled = idx + 1;
+    }
+    try applyPipelineAggregations(alloc, pipeline_requests, &buckets);
+
+    return .{
+        .name = request.name,
+        .field = request.field,
+        .type = request.type,
+        .buckets = buckets,
+    };
+}
+
 fn computeAlgebraicCompositeTermsAggregation(
     alloc: Allocator,
     index: *algebraic_mod.index.Index,
     store: *docstore_mod.DocStore,
     request: SearchAggregationRequest,
     constraints: []const FixedConstraint,
+    generation: ?u64,
 ) !?SearchAggregationResult {
     if (request.background_query != null or request.fields.len < 2) return null;
+    if (generation != null) return null;
     if (request.term_prefix.len > 0 or request.term_pattern.len > 0) return null;
     for (request.fields) |field_name| {
         const field = index.fieldConfig(field_name, .group) orelse return null;
@@ -1942,6 +2302,7 @@ fn computeAlgebraicPathFactTermsCardinalityChildrenAggregation(
     request: SearchAggregationRequest,
     constraints: []const FixedConstraint,
     child_requests: []const SearchAggregationRequest,
+    generation: ?u64,
 ) !?SearchAggregationResult {
     const children = try alloc.alloc(algebraic_mod.index.CardinalityChildRequest, child_requests.len);
     defer if (children.len > 0) alloc.free(children);
@@ -1952,7 +2313,7 @@ fn computeAlgebraicPathFactTermsCardinalityChildrenAggregation(
         };
     }
 
-    const partials = (try index.scanDistributedTermsCardinalityPartials(store, request.name, request.field, children, constraints)) orelse return null;
+    const partials = (try index.scanDistributedTermsCardinalityPartials(store, request.name, request.field, children, constraints, generation)) orelse return null;
     defer algebraic_mod.distributed.freePartials(index.alloc, partials);
 
     var merged = try algebraic_mod.distributed.mergePartialsAlloc(alloc, partials);
@@ -1970,6 +2331,7 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
     constraints: []const FixedConstraint,
     child_requests: []const SearchAggregationRequest,
     pipeline_aggs: []const SearchAggregationRequest,
+    generation: ?u64,
 ) !?SearchAggregationResult {
     const entries = try index.scalarDocFactEntriesForFieldAlloc(store, .group, bucket_field);
     defer {
@@ -1978,6 +2340,9 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
     }
     const constraint_ids = if (constraints.len > 0) try index.docIdsForConstraintsAlloc(store, constraints) else null;
     defer if (constraint_ids) |ids| index.freeDocIds(ids);
+    var live_txn: ?docstore_mod.DocStore.Txn = null;
+    if (generation != null) live_txn = try store.beginReadTxn();
+    defer if (live_txn) |*txn| txn.abort();
 
     var buckets_accum = std.ArrayListUnmanaged(TermsCardinalityBucketAccum).empty;
     defer {
@@ -1988,6 +2353,9 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
     for (entries) |entry| {
         if (constraint_ids) |ids| {
             if (!aggregationContainsDocId(ids, entry.doc_id)) continue;
+        }
+        if (live_txn) |*txn| {
+            if (!try index.docVisibleAtGenerationTxn(txn, entry.doc_id, generation)) continue;
         }
         const key_text = index.scalarTokenTextAlloc(alloc, entry.scalar) catch continue;
         defer alloc.free(key_text);
@@ -2040,7 +2408,7 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
             alloc.free(child_results);
         }
         for (child_requests, 0..) |child_request, child_idx| {
-            const value = (try index.exactCardinalityForFieldAlloc(store, child_request.field, child_constraints)) orelse return null;
+            const value = (try index.exactCardinalityForFieldAtGenerationAlloc(store, child_request.field, child_constraints, generation)) orelse return null;
             child_results[child_idx] = .{
                 .name = child_request.name,
                 .field = child_request.field,
@@ -2116,6 +2484,7 @@ fn computeDerivedJoinTermsAggregation(
     child_requests: []const SearchAggregationRequest,
     derived: algebraic_mod.index.DerivedJoinFoldRequest,
     child_derived: []const algebraic_mod.index.DerivedJoinFoldRequest,
+    generation: ?u64,
 ) !?SearchAggregationResult {
     if (derived.op != .count or derived.group_by.len != 1 or derived.measure != null) return null;
     const child_metrics = try algebraicChildMetricsAlloc(alloc, child_requests);
@@ -2127,7 +2496,7 @@ fn computeDerivedJoinTermsAggregation(
         if (child.group_by.len != 1 or !std.mem.eql(u8, child.group_by[0], derived.group_by[0])) return null;
         child_ops[i] = child.op;
     }
-    const entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, derived, request.name)) orelse return null;
+    const entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, derived, request.name, generation)) orelse return null;
     defer {
         for (entries) |*entry| entry.deinit(index.alloc);
         if (entries.len > 0) index.alloc.free(entries);
@@ -2157,7 +2526,7 @@ fn computeDerivedJoinTermsAggregation(
         bucket_accum.count += count;
     }
     for (child_derived, 0..) |child, child_idx| {
-        const child_entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, child, child_metrics[child_idx].name)) orelse continue;
+        const child_entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, child, child_metrics[child_idx].name, generation)) orelse continue;
         defer {
             for (child_entries) |*entry| entry.deinit(index.alloc);
             if (child_entries.len > 0) index.alloc.free(child_entries);
@@ -4717,6 +5086,7 @@ fn computeDerivedJoinHistogramAggregation(
     child_requests: []const SearchAggregationRequest,
     derived: algebraic_mod.index.DerivedJoinFoldRequest,
     child_derived: []const algebraic_mod.index.DerivedJoinFoldRequest,
+    generation: ?u64,
 ) !?SearchAggregationResult {
     if (derived.op != .count or derived.group_by.len != 0 or derived.measure != null) return null;
     if (derived.histogram_field == null or derived.histogram_role == null or derived.histogram_interval <= 0) return null;
@@ -4731,7 +5101,7 @@ fn computeDerivedJoinHistogramAggregation(
         child_ops[i] = child.op;
     }
 
-    const entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, derived, request.name)) orelse return null;
+    const entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, derived, request.name, generation)) orelse return null;
     defer {
         for (entries) |*entry| entry.deinit(index.alloc);
         if (entries.len > 0) index.alloc.free(entries);
@@ -4750,7 +5120,7 @@ fn computeDerivedJoinHistogramAggregation(
         bucket_accum.count += count;
     }
     for (child_derived, 0..) |child, child_idx| {
-        const child_entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, child, child_metrics[child_idx].name)) orelse continue;
+        const child_entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, child, child_metrics[child_idx].name, generation)) orelse continue;
         defer {
             for (child_entries) |*entry| entry.deinit(index.alloc);
             if (child_entries.len > 0) index.alloc.free(child_entries);
@@ -4834,6 +5204,7 @@ fn computeAlgebraicHistogramAggregation(
     store: *docstore_mod.DocStore,
     request: SearchAggregationRequest,
     constraints: []const FixedConstraint,
+    generation: ?u64,
 ) !?SearchAggregationResult {
     if (request.field.len == 0 or request.interval <= 0) return null;
     const child_aggs = try splitAggregationRequests(alloc, request.aggregations);
@@ -4856,6 +5227,7 @@ fn computeAlgebraicHistogramAggregation(
             "",
             children,
             constraints,
+            generation,
         )) orelse return null;
         defer algebraic_mod.distributed.freePartials(index.alloc, partials);
         var merged = try algebraic_mod.distributed.mergePartialsAlloc(alloc, partials);
@@ -4887,6 +5259,7 @@ fn computeAlgebraicHistogramAggregation(
                 child_aggs.primary,
                 derived,
                 plan.derived_child_join_folds,
+                generation,
             );
         }
         return null;
@@ -4929,7 +5302,7 @@ fn computeAlgebraicHistogramAggregation(
     }
     var grouped_it = grouped.iterator();
     while (grouped_it.next()) |entry| {
-        const constrained_ids = try algebraicConstrainedDocIdsAlloc(index, store, entry.value_ptr.items, constraints);
+        const constrained_ids = try algebraicConstrainedDocIdsAlloc(index, store, entry.value_ptr.items, constraints, generation);
         defer if (constrained_ids) |ids| index.freeDocIds(ids);
         const effective_ids: []const []const u8 = if (constrained_ids) |ids| ids else entry.value_ptr.items;
         const count: i64 = @intCast(effective_ids.len);
@@ -5016,6 +5389,7 @@ fn computeAlgebraicRangeAggregation(
     store: *docstore_mod.DocStore,
     request: SearchAggregationRequest,
     constraints: []const FixedConstraint,
+    generation: ?u64,
 ) !?SearchAggregationResult {
     if (request.field.len == 0) return null;
     const child_aggs = try splitAggregationRequests(alloc, request.aggregations);
@@ -5033,7 +5407,7 @@ fn computeAlgebraicRangeAggregation(
     if (exceedsAlgebraicResultBucketLimit(index, bucket_count)) return error.AlgebraicResultBucketLimit;
 
     if (request.algebraic_join != null) {
-        return try computeDerivedJoinRangeAggregation(alloc, index, store, request, child_aggs.primary, child_aggs.pipeline, constraints, has_numeric);
+        return try computeDerivedJoinRangeAggregation(alloc, index, store, request, child_aggs.primary, child_aggs.pipeline, constraints, has_numeric, generation);
     }
 
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_count);
@@ -5053,7 +5427,7 @@ fn computeAlgebraicRangeAggregation(
                 return null;
             };
             defer index.freeDocIds(doc_ids);
-            const constrained_ids = try algebraicConstrainedDocIdsAlloc(index, store, doc_ids, constraints);
+            const constrained_ids = try algebraicConstrainedDocIdsAlloc(index, store, doc_ids, constraints, generation);
             defer if (constrained_ids) |ids| index.freeDocIds(ids);
             const effective_ids: []const []const u8 = if (constrained_ids) |ids| ids else doc_ids;
             const nested = try algebraicDocIdMetricResultsAlloc(alloc, index, store, child_aggs.primary, effective_ids);
@@ -5078,7 +5452,7 @@ fn computeAlgebraicRangeAggregation(
                 return null;
             };
             defer index.freeDocIds(doc_ids);
-            const constrained_ids = try algebraicConstrainedDocIdsAlloc(index, store, doc_ids, constraints);
+            const constrained_ids = try algebraicConstrainedDocIdsAlloc(index, store, doc_ids, constraints, generation);
             defer if (constrained_ids) |ids| index.freeDocIds(ids);
             const effective_ids: []const []const u8 = if (constrained_ids) |ids| ids else doc_ids;
             const nested = try algebraicDocIdMetricResultsAlloc(alloc, index, store, child_aggs.primary, effective_ids);
@@ -5119,6 +5493,7 @@ fn computeDerivedJoinRangeAggregation(
     pipeline_requests: []const SearchAggregationRequest,
     constraints: []const FixedConstraint,
     numeric: bool,
+    generation: ?u64,
 ) !?SearchAggregationResult {
     const range_field = derivedJoinRangeField(index, request.field, if (numeric) .numeric else .date) orelse return null;
     const bucket_count = if (numeric) request.ranges.len else request.date_ranges.len;
@@ -5146,6 +5521,7 @@ fn computeDerivedJoinRangeAggregation(
                 range_spec.name,
                 start_text,
                 end_text,
+                generation,
             ) orelse return null;
             filled = idx + 1;
         }
@@ -5162,6 +5538,7 @@ fn computeDerivedJoinRangeAggregation(
                 range_spec.name,
                 range_spec.start,
                 range_spec.end,
+                generation,
             ) orelse return null;
             filled = idx + 1;
         }
@@ -5187,9 +5564,10 @@ fn computeDerivedJoinRangeBucket(
     range_name: []const u8,
     range_start: ?[]const u8,
     range_end: ?[]const u8,
+    generation: ?u64,
 ) !?SearchAggregationBucket {
     const count_fold = derivedJoinRangeFoldRequest(index, request, constraints, range_field, .{ .name = request.name, .op = .count }, range_start, range_end) orelse return null;
-    const count_raw = try algebraicDerivedJoinMetricRawAlloc(index, store, count_fold);
+    const count_raw = try algebraicDerivedJoinMetricRawAlloc(index, store, count_fold, generation);
     defer if (count_raw) |raw| index.alloc.free(raw);
     const count = if (count_raw) |raw| try algebraic_mod.algebra.parseI64(raw) else 0;
 
@@ -5213,7 +5591,7 @@ fn computeDerivedJoinRangeBucket(
             range_start,
             range_end,
         ) orelse return null;
-        const child_raw = try algebraicDerivedJoinMetricRawAlloc(index, store, child_fold_request);
+        const child_raw = try algebraicDerivedJoinMetricRawAlloc(index, store, child_fold_request, generation);
         defer if (child_raw) |raw| index.alloc.free(raw);
         if (child_raw) |raw| try child_folds[child_idx].addRaw(alloc, raw);
     }
@@ -5311,6 +5689,7 @@ fn computeAlgebraicDateHistogramAggregation(
     store: *docstore_mod.DocStore,
     request: SearchAggregationRequest,
     constraints: []const FixedConstraint,
+    generation: ?u64,
 ) !?SearchAggregationResult {
     if (request.field.len == 0) return null;
     const time_field = index.fieldConfig(request.field, .time) orelse return null;
@@ -5320,6 +5699,20 @@ fn computeAlgebraicDateHistogramAggregation(
     defer child_aggs.deinit(alloc);
     for (child_aggs.primary) |child| {
         if (!isAlgebraicFoldMetricType(child.type)) return null;
+    }
+    if (generation != null and request.algebraic_join == null) {
+        return try computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(
+            alloc,
+            index,
+            store,
+            request,
+            time_field.name,
+            interval,
+            constraints,
+            child_aggs.primary,
+            child_aggs.pipeline,
+            generation,
+        );
     }
     const child_metrics = try algebraicChildMetricsAlloc(alloc, child_aggs.primary);
     defer if (child_metrics.len > 0) alloc.free(child_metrics);
@@ -5345,6 +5738,7 @@ fn computeAlgebraicDateHistogramAggregation(
                 child_aggs.primary,
                 derived,
                 plan_result.derived_child_join_folds,
+                generation,
             );
         }
         return try computeAdaptiveDateHistogramAggregation(alloc, index, store, request, time_field.name, bucket_name, interval, constraints, child_aggs.primary, child_aggs.pipeline);
@@ -5496,6 +5890,108 @@ fn computeAlgebraicDateHistogramAggregation(
     };
 }
 
+fn computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(
+    alloc: Allocator,
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    request: SearchAggregationRequest,
+    time_field_name: []const u8,
+    interval: search_agg_mod.DateInterval,
+    constraints: []const FixedConstraint,
+    child_requests: []const SearchAggregationRequest,
+    pipeline_requests: []const SearchAggregationRequest,
+    generation: ?u64,
+) !?SearchAggregationResult {
+    const entries = try index.scalarDocFactEntriesForFieldAlloc(store, .time, time_field_name);
+    defer {
+        for (entries) |*entry| entry.deinit(index.alloc);
+        if (entries.len > 0) index.alloc.free(entries);
+    }
+
+    var grouped = std.AutoHashMap(u64, std.ArrayListUnmanaged([]const u8)).init(alloc);
+    defer {
+        var it_grouped = grouped.iterator();
+        while (it_grouped.next()) |entry| entry.value_ptr.deinit(alloc);
+        grouped.deinit();
+    }
+
+    for (entries) |entry| {
+        const text = try index.scalarTokenTextAlloc(alloc, entry.scalar);
+        defer alloc.free(text);
+        const ns = (try parseRfc3339ToNs(text)) orelse (std.fmt.parseInt(u64, text, 10) catch continue);
+        const bucket_key = search_agg_mod.truncateToInterval(ns, interval);
+        const grouped_entry = try grouped.getOrPut(bucket_key);
+        if (!grouped_entry.found_existing) grouped_entry.value_ptr.* = .empty;
+        try appendUniqueDocIdRef(alloc, grouped_entry.value_ptr, entry.doc_id);
+    }
+
+    var present_keys = std.ArrayListUnmanaged(u64).empty;
+    defer present_keys.deinit(alloc);
+    var grouped_it = grouped.iterator();
+    while (grouped_it.next()) |entry| {
+        const constrained_ids = try algebraicConstrainedDocIdsAlloc(index, store, entry.value_ptr.items, constraints, generation);
+        defer if (constrained_ids) |ids| index.freeDocIds(ids);
+        const effective_ids: []const []const u8 = if (constrained_ids) |ids| ids else entry.value_ptr.items;
+        const count: i64 = @intCast(effective_ids.len);
+        if (count == 0) continue;
+        if (request.min_doc_count > 0 and count < request.min_doc_count) continue;
+        try present_keys.append(alloc, entry.key_ptr.*);
+    }
+    std.mem.sort(u64, present_keys.items, {}, struct {
+        fn lessThan(_: void, lhs: u64, rhs: u64) bool {
+            return lhs < rhs;
+        }
+    }.lessThan);
+
+    const bucket_keys = if (request.min_doc_count == 0 and present_keys.items.len > 0)
+        try fillDateHistogramBucketKeys(alloc, present_keys.items[0], present_keys.items[present_keys.items.len - 1], interval)
+    else
+        try alloc.dupe(u64, present_keys.items);
+    defer if (bucket_keys.len > 0) alloc.free(bucket_keys);
+    if (exceedsAlgebraicResultBucketLimit(index, bucket_keys.len)) return error.AlgebraicResultBucketLimit;
+
+    var buckets = try alloc.alloc(SearchAggregationBucket, bucket_keys.len);
+    var buckets_filled: usize = 0;
+    errdefer {
+        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        alloc.free(buckets);
+    }
+    for (bucket_keys, 0..) |bucket_key, idx| {
+        const formatted = try formatRfc3339Bucket(alloc, bucket_key);
+        defer alloc.free(formatted);
+        const key_json = try std.json.Stringify.valueAlloc(alloc, formatted, .{});
+        errdefer alloc.free(key_json);
+        var nested: []SearchAggregationResult = &.{};
+        var count: i64 = 0;
+        if (grouped.get(bucket_key)) |doc_ids| {
+            const constrained_ids = try algebraicConstrainedDocIdsAlloc(index, store, doc_ids.items, constraints, generation);
+            defer if (constrained_ids) |ids| index.freeDocIds(ids);
+            const effective_ids: []const []const u8 = if (constrained_ids) |ids| ids else doc_ids.items;
+            count = @intCast(effective_ids.len);
+            if (count > 0) {
+                nested = try algebraicDocIdMetricResultsAlloc(alloc, index, store, child_requests, effective_ids);
+            }
+        }
+        if (nested.len == 0) {
+            nested = try alloc.alloc(SearchAggregationResult, 0);
+        }
+        buckets[idx] = .{
+            .key_json = key_json,
+            .count = count,
+            .aggregations = nested,
+        };
+        buckets_filled = idx + 1;
+    }
+    try applyPipelineAggregations(alloc, pipeline_requests, &buckets);
+
+    return .{
+        .name = request.name,
+        .field = request.field,
+        .type = request.type,
+        .buckets = buckets,
+    };
+}
+
 fn computeDerivedJoinDateHistogramAggregation(
     alloc: Allocator,
     index: *algebraic_mod.index.Index,
@@ -5505,6 +6001,7 @@ fn computeDerivedJoinDateHistogramAggregation(
     child_requests: []const SearchAggregationRequest,
     derived: algebraic_mod.index.DerivedJoinFoldRequest,
     child_derived: []const algebraic_mod.index.DerivedJoinFoldRequest,
+    generation: ?u64,
 ) !?SearchAggregationResult {
     if (derived.op != .count or derived.group_by.len != 0 or derived.measure != null) return null;
     if (derived.time_field == null or derived.time_bucket == null) return null;
@@ -5519,7 +6016,7 @@ fn computeDerivedJoinDateHistogramAggregation(
         child_ops[i] = child.op;
     }
 
-    const entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, derived, request.name)) orelse return null;
+    const entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, derived, request.name, generation)) orelse return null;
     defer {
         for (entries) |*entry| entry.deinit(index.alloc);
         if (entries.len > 0) index.alloc.free(entries);
@@ -5550,7 +6047,7 @@ fn computeDerivedJoinDateHistogramAggregation(
         bucket_accum.count += count;
     }
     for (child_derived, 0..) |child, child_idx| {
-        const child_entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, child, child_metrics[child_idx].name)) orelse continue;
+        const child_entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, child, child_metrics[child_idx].name, generation)) orelse continue;
         defer {
             for (child_entries) |*entry| entry.deinit(index.alloc);
             if (child_entries.len > 0) index.alloc.free(child_entries);
@@ -10535,9 +11032,9 @@ test "algebraic distributed cardinality merges canonical distinct values" {
         .type = "cardinality",
         .field = "customer",
     };
-    const left_customer_partials = (try left_idx.scanDistributedCardinalityPartials(&left_store, customer_request.name, customer_request.field, &.{})).?;
+    const left_customer_partials = (try left_idx.scanDistributedCardinalityPartials(&left_store, customer_request.name, customer_request.field, &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_customer_partials);
-    const right_customer_partials = (try right_idx.scanDistributedCardinalityPartials(&right_store, customer_request.name, customer_request.field, &.{})).?;
+    const right_customer_partials = (try right_idx.scanDistributedCardinalityPartials(&right_store, customer_request.name, customer_request.field, &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_customer_partials);
     var customer_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_customer_partials.len + right_customer_partials.len);
     defer alloc.free(customer_partials);
@@ -10554,9 +11051,9 @@ test "algebraic distributed cardinality merges canonical distinct values" {
         .type = "cardinality",
         .field = "/meta/tier",
     };
-    const left_tier_partials = (try left_idx.scanDistributedCardinalityPartials(&left_store, tier_request.name, tier_request.field, &.{})).?;
+    const left_tier_partials = (try left_idx.scanDistributedCardinalityPartials(&left_store, tier_request.name, tier_request.field, &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_tier_partials);
-    const right_tier_partials = (try right_idx.scanDistributedCardinalityPartials(&right_store, tier_request.name, tier_request.field, &.{})).?;
+    const right_tier_partials = (try right_idx.scanDistributedCardinalityPartials(&right_store, tier_request.name, tier_request.field, &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_tier_partials);
     var tier_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_tier_partials.len + right_tier_partials.len);
     defer alloc.free(tier_partials);
@@ -10573,9 +11070,9 @@ test "algebraic distributed cardinality merges canonical distinct values" {
         .type = "cardinality",
         .field = "/meta",
     };
-    const left_meta_partials = (try left_idx.scanDistributedCardinalityPartials(&left_store, meta_request.name, meta_request.field, &.{})).?;
+    const left_meta_partials = (try left_idx.scanDistributedCardinalityPartials(&left_store, meta_request.name, meta_request.field, &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_meta_partials);
-    const right_meta_partials = (try right_idx.scanDistributedCardinalityPartials(&right_store, meta_request.name, meta_request.field, &.{})).?;
+    const right_meta_partials = (try right_idx.scanDistributedCardinalityPartials(&right_store, meta_request.name, meta_request.field, &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_meta_partials);
     var meta_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_meta_partials.len + right_meta_partials.len);
     defer alloc.free(meta_partials);
@@ -10592,9 +11089,9 @@ test "algebraic distributed cardinality merges canonical distinct values" {
         .type = "cardinality",
         .field = "/tags",
     };
-    const left_tags_partials = (try left_idx.scanDistributedCardinalityPartials(&left_store, tags_request.name, tags_request.field, &.{})).?;
+    const left_tags_partials = (try left_idx.scanDistributedCardinalityPartials(&left_store, tags_request.name, tags_request.field, &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_tags_partials);
-    const right_tags_partials = (try right_idx.scanDistributedCardinalityPartials(&right_store, tags_request.name, tags_request.field, &.{})).?;
+    const right_tags_partials = (try right_idx.scanDistributedCardinalityPartials(&right_store, tags_request.name, tags_request.field, &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_tags_partials);
     var tags_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_tags_partials.len + right_tags_partials.len);
     defer alloc.free(tags_partials);
@@ -10612,9 +11109,9 @@ test "algebraic distributed cardinality merges canonical distinct values" {
         .type = "cardinality",
         .field = "product",
     };
-    const left_product_partials = (try left_idx.scanDistributedCardinalityPartials(&left_store, product_request.name, product_request.field, constraints[0..])).?;
+    const left_product_partials = (try left_idx.scanDistributedCardinalityPartials(&left_store, product_request.name, product_request.field, constraints[0..], null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_product_partials);
-    const right_product_partials = (try right_idx.scanDistributedCardinalityPartials(&right_store, product_request.name, product_request.field, constraints[0..])).?;
+    const right_product_partials = (try right_idx.scanDistributedCardinalityPartials(&right_store, product_request.name, product_request.field, constraints[0..], null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_product_partials);
     var product_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_product_partials.len + right_product_partials.len);
     defer alloc.free(product_partials);
@@ -10634,9 +11131,9 @@ test "algebraic distributed cardinality merges canonical distinct values" {
         .type = "cardinality",
         .field = "product",
     };
-    const left_gold_product_partials = (try left_idx.scanDistributedCardinalityPartials(&left_store, gold_product_request.name, gold_product_request.field, path_constraints[0..])).?;
+    const left_gold_product_partials = (try left_idx.scanDistributedCardinalityPartials(&left_store, gold_product_request.name, gold_product_request.field, path_constraints[0..], null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_gold_product_partials);
-    const right_gold_product_partials = (try right_idx.scanDistributedCardinalityPartials(&right_store, gold_product_request.name, gold_product_request.field, path_constraints[0..])).?;
+    const right_gold_product_partials = (try right_idx.scanDistributedCardinalityPartials(&right_store, gold_product_request.name, gold_product_request.field, path_constraints[0..], null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_gold_product_partials);
     var gold_product_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_gold_product_partials.len + right_gold_product_partials.len);
     defer alloc.free(gold_product_partials);
@@ -11021,9 +11518,9 @@ test "algebraic distributed terms aggregation merges nested exact cardinality" {
         .{ .name = "product_cardinality", .field = "product" },
         .{ .name = "tier_cardinality", .field = "/meta/tier" },
     };
-    const left_partials = (try left_idx.scanDistributedTermsCardinalityPartials(&left_store, "by_customer", "customer", child_exports[0..], &.{})).?;
+    const left_partials = (try left_idx.scanDistributedTermsCardinalityPartials(&left_store, "by_customer", "customer", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_partials);
-    const right_partials = (try right_idx.scanDistributedTermsCardinalityPartials(&right_store, "by_customer", "customer", child_exports[0..], &.{})).?;
+    const right_partials = (try right_idx.scanDistributedTermsCardinalityPartials(&right_store, "by_customer", "customer", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_partials);
     var partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_partials.len + right_partials.len);
     defer alloc.free(partials);
@@ -11055,9 +11552,9 @@ test "algebraic distributed terms aggregation merges nested exact cardinality" {
     try std.testing.expectEqualStrings("{\"value\":2}", aggregation.buckets[1].aggregations[0].value_json.?);
     try std.testing.expectEqualStrings("{\"value\":1}", aggregation.buckets[1].aggregations[1].value_json.?);
 
-    const left_tier_partials = (try left_idx.scanDistributedTermsCardinalityPartials(&left_store, "by_tier", "/meta/tier", child_exports[0..], &.{})).?;
+    const left_tier_partials = (try left_idx.scanDistributedTermsCardinalityPartials(&left_store, "by_tier", "/meta/tier", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_tier_partials);
-    const right_tier_partials = (try right_idx.scanDistributedTermsCardinalityPartials(&right_store, "by_tier", "/meta/tier", child_exports[0..], &.{})).?;
+    const right_tier_partials = (try right_idx.scanDistributedTermsCardinalityPartials(&right_store, "by_tier", "/meta/tier", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_tier_partials);
     var tier_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_tier_partials.len + right_tier_partials.len);
     defer alloc.free(tier_partials);
@@ -11089,9 +11586,9 @@ test "algebraic distributed terms aggregation merges nested exact cardinality" {
         .{ .name = "product_cardinality", .field = "product" },
         .{ .name = "tag_cardinality", .field = "/tags" },
     };
-    const left_tag_partials = (try left_idx.scanDistributedTermsCardinalityPartials(&left_store, "by_tag", "/tags", tag_child_exports[0..], &.{})).?;
+    const left_tag_partials = (try left_idx.scanDistributedTermsCardinalityPartials(&left_store, "by_tag", "/tags", tag_child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_tag_partials);
-    const right_tag_partials = (try right_idx.scanDistributedTermsCardinalityPartials(&right_store, "by_tag", "/tags", tag_child_exports[0..], &.{})).?;
+    const right_tag_partials = (try right_idx.scanDistributedTermsCardinalityPartials(&right_store, "by_tag", "/tags", tag_child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_tag_partials);
     var tag_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_tag_partials.len + right_tag_partials.len);
     defer alloc.free(tag_partials);
@@ -11169,6 +11666,32 @@ test "algebraic distributed range aggregations merge nested exact cardinality" {
         .{ .key = "l3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"product\":\"pen\",\"amount\":30,\"created_at\":\"2026-01-04T00:00:00Z\",\"meta\":{\"tier\":\"silver\"}}" },
     };
     try left_idx.applyBatch(&left_store, .{ .documents = left_docs[0..] });
+    const left_doc_keys = [_][]const u8{ "l1", "l2", "l3" };
+    var left_identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (left_identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        left_identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &left_store,
+        0,
+        0,
+        1,
+        &left_identity_writes,
+        left_doc_keys[0..],
+        &.{},
+    );
+    try left_store.putBatchWithReplay(null, left_identity_writes.items, &.{}, null);
+    {
+        var txn = try left_store.beginWriteTxn();
+        errdefer txn.abort();
+        try doc_identity.markDeletedTxn(alloc, &txn, 3, "l3");
+        try txn.commit();
+    }
     const right_docs = [_]derived_types.DerivedDocument{
         .{ .key = "r1", .action = .upsert, .cleaned_value = "{\"customer\":\"carol\",\"product\":\"book\",\"amount\":15,\"created_at\":\"2026-01-03T12:00:00Z\",\"meta\":{\"tier\":\"gold\"}}" },
         .{ .key = "r2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"product\":\"notebook\",\"amount\":35,\"created_at\":\"2026-01-05T00:00:00Z\",\"meta\":{\"tier\":\"bronze\"}}" },
@@ -11183,9 +11706,9 @@ test "algebraic distributed range aggregations merge nested exact cardinality" {
         .{ .name = "low", .start = "0", .end = "20" },
         .{ .name = "high", .start = "20", .end = "40" },
     };
-    const left_range_partials = (try left_idx.scanDistributedRangeCardinalityPartials(&left_store, "amount_ranges", "amount", .numeric, range_exports[0..], child_exports[0..], &.{})).?;
+    const left_range_partials = (try left_idx.scanDistributedRangeCardinalityPartials(&left_store, "amount_ranges", "amount", .numeric, range_exports[0..], child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_range_partials);
-    const right_range_partials = (try right_idx.scanDistributedRangeCardinalityPartials(&right_store, "amount_ranges", "amount", .numeric, range_exports[0..], child_exports[0..], &.{})).?;
+    const right_range_partials = (try right_idx.scanDistributedRangeCardinalityPartials(&right_store, "amount_ranges", "amount", .numeric, range_exports[0..], child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_range_partials);
     var range_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_range_partials.len + right_range_partials.len);
     defer alloc.free(range_partials);
@@ -11220,9 +11743,23 @@ test "algebraic distributed range aggregations merge nested exact cardinality" {
     try std.testing.expectEqualStrings("{\"value\":2}", range_agg.buckets[1].aggregations[0].value_json.?);
     try std.testing.expectEqualStrings("{\"value\":3}", range_agg.buckets[1].aggregations[1].value_json.?);
 
-    const left_path_range_partials = (try left_idx.scanDistributedRangeCardinalityPartials(&left_store, "path_amount_ranges", "/amount", .numeric, range_exports[0..], child_exports[0..], &.{})).?;
+    const left_live_range_partials = (try left_idx.scanDistributedRangeCardinalityPartials(&left_store, "amount_ranges", "amount", .numeric, range_exports[0..], child_exports[0..], &.{}, 3)).?;
+    defer algebraic_mod.distributed.freePartials(alloc, left_live_range_partials);
+    var left_live_range_merged = try algebraic_mod.distributed.mergePartialsAlloc(alloc, left_live_range_partials);
+    defer left_live_range_merged.deinit(alloc);
+    var left_live_range_agg = (try algebraicRangeAggregationFromDistributedPartialsAlloc(alloc, &left_idx, range_request, &.{}, left_live_range_merged)) orelse return error.TestUnexpectedResult;
+    defer left_live_range_agg.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), left_live_range_agg.buckets.len);
+    try std.testing.expectEqualStrings("\"low\"", left_live_range_agg.buckets[0].key_json);
+    try std.testing.expectEqual(@as(i64, 1), left_live_range_agg.buckets[0].count);
+    try std.testing.expectEqualStrings("\"high\"", left_live_range_agg.buckets[1].key_json);
+    try std.testing.expectEqual(@as(i64, 1), left_live_range_agg.buckets[1].count);
+    try std.testing.expectEqualStrings("{\"value\":1}", left_live_range_agg.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1}", left_live_range_agg.buckets[1].aggregations[1].value_json.?);
+
+    const left_path_range_partials = (try left_idx.scanDistributedRangeCardinalityPartials(&left_store, "path_amount_ranges", "/amount", .numeric, range_exports[0..], child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_path_range_partials);
-    const right_path_range_partials = (try right_idx.scanDistributedRangeCardinalityPartials(&right_store, "path_amount_ranges", "/amount", .numeric, range_exports[0..], child_exports[0..], &.{})).?;
+    const right_path_range_partials = (try right_idx.scanDistributedRangeCardinalityPartials(&right_store, "path_amount_ranges", "/amount", .numeric, range_exports[0..], child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_path_range_partials);
     var path_range_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_path_range_partials.len + right_path_range_partials.len);
     defer alloc.free(path_range_partials);
@@ -11257,9 +11794,9 @@ test "algebraic distributed range aggregations merge nested exact cardinality" {
         .{ .name = "early", .start = "2026-01-02T00:00:00Z", .end = "2026-01-04T00:00:00Z" },
         .{ .name = "late", .start = "2026-01-04T00:00:00Z", .end = "2026-01-06T00:00:00Z" },
     };
-    const left_date_partials = (try left_idx.scanDistributedRangeCardinalityPartials(&left_store, "created_ranges", "created_at", .date, date_exports[0..], child_exports[0..], &.{})).?;
+    const left_date_partials = (try left_idx.scanDistributedRangeCardinalityPartials(&left_store, "created_ranges", "created_at", .date, date_exports[0..], child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_date_partials);
-    const right_date_partials = (try right_idx.scanDistributedRangeCardinalityPartials(&right_store, "created_ranges", "created_at", .date, date_exports[0..], child_exports[0..], &.{})).?;
+    const right_date_partials = (try right_idx.scanDistributedRangeCardinalityPartials(&right_store, "created_ranges", "created_at", .date, date_exports[0..], child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_date_partials);
     var date_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_date_partials.len + right_date_partials.len);
     defer alloc.free(date_partials);
@@ -11290,9 +11827,9 @@ test "algebraic distributed range aggregations merge nested exact cardinality" {
     try std.testing.expectEqualStrings("{\"value\":2}", date_agg.buckets[1].aggregations[0].value_json.?);
     try std.testing.expectEqualStrings("{\"value\":2}", date_agg.buckets[1].aggregations[1].value_json.?);
 
-    const left_path_date_partials = (try left_idx.scanDistributedRangeCardinalityPartials(&left_store, "path_created_ranges", "/created_at", .date, date_exports[0..], child_exports[0..], &.{})).?;
+    const left_path_date_partials = (try left_idx.scanDistributedRangeCardinalityPartials(&left_store, "path_created_ranges", "/created_at", .date, date_exports[0..], child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_path_date_partials);
-    const right_path_date_partials = (try right_idx.scanDistributedRangeCardinalityPartials(&right_store, "path_created_ranges", "/created_at", .date, date_exports[0..], child_exports[0..], &.{})).?;
+    const right_path_date_partials = (try right_idx.scanDistributedRangeCardinalityPartials(&right_store, "path_created_ranges", "/created_at", .date, date_exports[0..], child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_path_date_partials);
     var path_date_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_path_date_partials.len + right_path_date_partials.len);
     defer alloc.free(path_date_partials);
@@ -11371,9 +11908,9 @@ test "algebraic distributed histogram aggregations merge nested exact cardinalit
         .{ .name = "customer_cardinality", .field = "customer" },
         .{ .name = "tier_cardinality", .field = "/meta/tier" },
     };
-    const left_histogram_partials = (try left_idx.scanDistributedHistogramCardinalityPartials(&left_store, "amount_histogram", "amount", .numeric, 10, "", child_exports[0..], &.{})).?;
+    const left_histogram_partials = (try left_idx.scanDistributedHistogramCardinalityPartials(&left_store, "amount_histogram", "amount", .numeric, 10, "", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_histogram_partials);
-    const right_histogram_partials = (try right_idx.scanDistributedHistogramCardinalityPartials(&right_store, "amount_histogram", "amount", .numeric, 10, "", child_exports[0..], &.{})).?;
+    const right_histogram_partials = (try right_idx.scanDistributedHistogramCardinalityPartials(&right_store, "amount_histogram", "amount", .numeric, 10, "", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_histogram_partials);
     var histogram_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_histogram_partials.len + right_histogram_partials.len);
     defer alloc.free(histogram_partials);
@@ -11409,9 +11946,9 @@ test "algebraic distributed histogram aggregations merge nested exact cardinalit
     try std.testing.expectEqualStrings("{\"value\":2}", histogram_agg.buckets[2].aggregations[0].value_json.?);
     try std.testing.expectEqualStrings("{\"value\":2}", histogram_agg.buckets[2].aggregations[1].value_json.?);
 
-    const left_path_histogram_partials = (try left_idx.scanDistributedHistogramCardinalityPartials(&left_store, "path_amount_histogram", "/amount", .numeric, 10, "", child_exports[0..], &.{})).?;
+    const left_path_histogram_partials = (try left_idx.scanDistributedHistogramCardinalityPartials(&left_store, "path_amount_histogram", "/amount", .numeric, 10, "", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_path_histogram_partials);
-    const right_path_histogram_partials = (try right_idx.scanDistributedHistogramCardinalityPartials(&right_store, "path_amount_histogram", "/amount", .numeric, 10, "", child_exports[0..], &.{})).?;
+    const right_path_histogram_partials = (try right_idx.scanDistributedHistogramCardinalityPartials(&right_store, "path_amount_histogram", "/amount", .numeric, 10, "", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_path_histogram_partials);
     var path_histogram_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_path_histogram_partials.len + right_path_histogram_partials.len);
     defer alloc.free(path_histogram_partials);
@@ -11443,9 +11980,9 @@ test "algebraic distributed histogram aggregations merge nested exact cardinalit
     try std.testing.expectEqualStrings("{\"value\":2}", path_histogram_agg.buckets[2].aggregations[0].value_json.?);
     try std.testing.expectEqualStrings("{\"value\":2}", path_histogram_agg.buckets[2].aggregations[1].value_json.?);
 
-    const left_date_partials = (try left_idx.scanDistributedHistogramCardinalityPartials(&left_store, "orders_by_day", "created_at", .date, 0, "day", child_exports[0..], &.{})).?;
+    const left_date_partials = (try left_idx.scanDistributedHistogramCardinalityPartials(&left_store, "orders_by_day", "created_at", .date, 0, "day", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_date_partials);
-    const right_date_partials = (try right_idx.scanDistributedHistogramCardinalityPartials(&right_store, "orders_by_day", "created_at", .date, 0, "day", child_exports[0..], &.{})).?;
+    const right_date_partials = (try right_idx.scanDistributedHistogramCardinalityPartials(&right_store, "orders_by_day", "created_at", .date, 0, "day", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_date_partials);
     var date_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_date_partials.len + right_date_partials.len);
     defer alloc.free(date_partials);
@@ -11481,9 +12018,9 @@ test "algebraic distributed histogram aggregations merge nested exact cardinalit
     try std.testing.expectEqualStrings("{\"value\":1}", date_agg.buckets[3].aggregations[0].value_json.?);
     try std.testing.expectEqualStrings("{\"value\":1}", date_agg.buckets[3].aggregations[1].value_json.?);
 
-    const left_path_date_partials = (try left_idx.scanDistributedHistogramCardinalityPartials(&left_store, "path_orders_by_day", "/created_at", .date, 0, "day", child_exports[0..], &.{})).?;
+    const left_path_date_partials = (try left_idx.scanDistributedHistogramCardinalityPartials(&left_store, "path_orders_by_day", "/created_at", .date, 0, "day", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_path_date_partials);
-    const right_path_date_partials = (try right_idx.scanDistributedHistogramCardinalityPartials(&right_store, "path_orders_by_day", "/created_at", .date, 0, "day", child_exports[0..], &.{})).?;
+    const right_path_date_partials = (try right_idx.scanDistributedHistogramCardinalityPartials(&right_store, "path_orders_by_day", "/created_at", .date, 0, "day", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, right_path_date_partials);
     var path_date_partials = try alloc.alloc(algebraic_mod.distributed.Partial, left_path_date_partials.len + right_path_date_partials.len);
     defer alloc.free(path_date_partials);
@@ -11610,6 +12147,18 @@ test "algebraic aggregation planner can use configured implicit join materializa
     const status_value = index.status();
     try std.testing.expectEqual(@as(u64, 1), status_value.planner_algebraic_selected);
     try std.testing.expectEqual(@as(u64, 0), status_value.planner_fallback_count);
+
+    if (try computeAlgebraicAggregation(alloc, requests[0], .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+        .identity_read_generation = 1,
+    })) |unexpected| {
+        var owned = unexpected;
+        defer owned.deinit(alloc);
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "algebraic aggregation planner can execute derived bounded join metric plan" {
@@ -11653,7 +12202,7 @@ test "algebraic aggregation planner can execute derived bounded join metric plan
         .join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
     });
     try std.testing.expectEqual(algebraic_mod.planner.PlanKind.derived_join_fold, plan.kind);
-    const raw = (try algebraicDerivedJoinMetricRawAlloc(&index, &store, plan.derived_join_fold.?)).?;
+    const raw = (try algebraicDerivedJoinMetricRawAlloc(&index, &store, plan.derived_join_fold.?, null)).?;
     defer alloc.free(raw);
     try std.testing.expectEqual(@as(f64, 30), try algebraic_mod.algebra.parseF64(raw));
 
@@ -11664,7 +12213,7 @@ test "algebraic aggregation planner can execute derived bounded join metric plan
         .join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
     });
     try std.testing.expectEqual(algebraic_mod.planner.PlanKind.derived_join_fold, avg_plan.kind);
-    const avg_raw = (try algebraicDerivedJoinMetricRawAlloc(&index, &store, avg_plan.derived_join_fold.?)).?;
+    const avg_raw = (try algebraicDerivedJoinMetricRawAlloc(&index, &store, avg_plan.derived_join_fold.?, null)).?;
     defer alloc.free(avg_raw);
     const avg = try algebraic_mod.algebra.parseAvg(avg_raw);
     try std.testing.expectEqual(@as(f64, 30), avg.sum);
@@ -11741,6 +12290,7 @@ test "algebraic aggregation planner can execute derived bounded join terms plan"
         child_requests[0..],
         plan.derived_join_fold.?,
         plan.derived_child_join_folds,
+        null,
     )).?;
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), result.buckets.len);
@@ -11777,6 +12327,7 @@ test "algebraic aggregation planner can execute derived bounded join terms plan"
         constrained_child_requests[0..],
         constrained_plan.derived_join_fold.?,
         constrained_plan.derived_child_join_folds,
+        null,
     )).?;
     defer constrained_result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), constrained_result.buckets.len);
@@ -11859,6 +12410,7 @@ test "algebraic aggregation planner can execute derived bounded join date histog
         child_requests[0..],
         plan.derived_join_fold.?,
         plan.derived_child_join_folds,
+        null,
     )).?;
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), result.buckets.len);
@@ -11944,6 +12496,7 @@ test "algebraic aggregation planner can execute derived bounded join histogram p
         child_requests[0..],
         plan.derived_join_fold.?,
         plan.derived_child_join_folds,
+        null,
     )).?;
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), result.buckets.len);
@@ -12950,6 +13503,26 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":20,\"created_at\":\"2026-01-03T00:00:00Z\"}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"amount\":30,\"created_at\":\"2026-01-04T00:00:00Z\"}" },
     };
+    const doc_keys = [_][]const u8{ "o1", "o2", "o3" };
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &identity_writes,
+        doc_keys[0..],
+        &.{},
+    );
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
     try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
 
     const hits = try alloc.alloc(types.SearchHit, 0);
@@ -13055,6 +13628,152 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     defer deinitResults(alloc, date_aggs);
     try std.testing.expectEqual(@as(i64, 2), date_aggs[0].buckets[0].count);
     try std.testing.expectEqualStrings("{\"value\":2}", date_aggs[0].buckets[0].aggregations[0].value_json.?);
+
+    const extra_docs = [_]@import("derived/derived_types.zig").DerivedDocument{
+        .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":40,\"created_at\":\"2026-01-05T00:00:00Z\"}" },
+    };
+    const extra_doc_keys = [_][]const u8{"o4"};
+    var extra_identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (extra_identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        extra_identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &extra_identity_writes,
+        extra_doc_keys[0..],
+        &.{},
+    );
+    try store.putBatchWithReplay(null, extra_identity_writes.items, &.{}, null);
+    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = extra_docs[0..] });
+
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try doc_identity.markDeletedTxn(alloc, &txn, 2, "o3");
+        try doc_identity.markDeletedTxn(alloc, &txn, 2, "o4");
+        try txn.commit();
+    }
+    const stale_root_cardinality_requests = [_]SearchAggregationRequest{.{
+        .name = "live_customers",
+        .type = "cardinality",
+        .field = "customer",
+    }};
+    const live_root_cardinality_aggs = try computeSearchAggregations(alloc, &stale_root_cardinality_requests, result, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+        .identity_read_generation = 2,
+    });
+    defer deinitResults(alloc, live_root_cardinality_aggs);
+    try std.testing.expectEqual(@as(usize, 1), live_root_cardinality_aggs.len);
+    try std.testing.expectEqualStrings("{\"value\":1}", live_root_cardinality_aggs[0].value_json.?);
+
+    const stale_root_metric_requests = [_]SearchAggregationRequest{
+        .{ .name = "live_order_count", .type = "count", .field = "" },
+        .{ .name = "live_amount_sum", .type = "sum", .field = "amount" },
+        .{ .name = "live_amount_stats", .type = "stats", .field = "amount" },
+    };
+    const live_root_metric_aggs = try computeSearchAggregations(alloc, &stale_root_metric_requests, result, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+        .identity_read_generation = 2,
+    });
+    defer deinitResults(alloc, live_root_metric_aggs);
+    try std.testing.expectEqual(@as(usize, 3), live_root_metric_aggs.len);
+    try std.testing.expectEqualStrings("2", live_root_metric_aggs[0].value_json.?);
+    try std.testing.expectEqualStrings("30", live_root_metric_aggs[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"count\":2,\"sum\":30,\"avg\":15,\"min\":10,\"max\":20,\"sum_squares\":500,\"variance\":25,\"std_dev\":5}", live_root_metric_aggs[2].value_json.?);
+
+    const stale_posting_requests = [_]SearchAggregationRequest{.{
+        .name = "amount_ranges_live",
+        .type = "range",
+        .field = "amount",
+        .ranges = &.{
+            .{ .name = "low", .start = 0, .end = 20 },
+            .{ .name = "high", .start = 20, .end = 40 },
+        },
+    }};
+    const live_range_aggs = try computeSearchAggregations(alloc, &stale_posting_requests, result, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+        .identity_read_generation = 2,
+    });
+    defer deinitResults(alloc, live_range_aggs);
+    try std.testing.expectEqual(@as(usize, 2), live_range_aggs[0].buckets.len);
+    try std.testing.expectEqual(@as(i64, 1), live_range_aggs[0].buckets[0].count);
+    try std.testing.expectEqual(@as(i64, 1), live_range_aggs[0].buckets[1].count);
+
+    const stale_cardinality_histogram_requests = [_]SearchAggregationRequest{.{
+        .name = "amount_histogram_live",
+        .type = "histogram",
+        .field = "amount",
+        .interval = 20,
+        .aggregations = &.{.{ .name = "customer_cardinality", .type = "cardinality", .field = "customer" }},
+    }};
+    const live_histogram_aggs = try computeSearchAggregations(alloc, &stale_cardinality_histogram_requests, result, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+        .identity_read_generation = 2,
+    });
+    defer deinitResults(alloc, live_histogram_aggs);
+    try std.testing.expectEqual(@as(usize, 2), live_histogram_aggs[0].buckets.len);
+    try std.testing.expectEqual(@as(i64, 1), live_histogram_aggs[0].buckets[0].count);
+    try std.testing.expectEqualStrings("{\"value\":1}", live_histogram_aggs[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqual(@as(i64, 1), live_histogram_aggs[0].buckets[1].count);
+    try std.testing.expectEqualStrings("{\"value\":1}", live_histogram_aggs[0].buckets[1].aggregations[0].value_json.?);
+
+    const stale_cardinality_terms_requests = [_]SearchAggregationRequest{.{
+        .name = "customer_terms_live",
+        .type = "terms",
+        .field = "customer",
+        .aggregations = &.{.{ .name = "amount_cardinality", .type = "cardinality", .field = "amount" }},
+    }};
+    const live_terms_aggs = try computeSearchAggregations(alloc, &stale_cardinality_terms_requests, result, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+        .identity_read_generation = 2,
+    });
+    defer deinitResults(alloc, live_terms_aggs);
+    try std.testing.expectEqual(@as(usize, 1), live_terms_aggs[0].buckets.len);
+    try std.testing.expectEqualStrings("\"alice\"", live_terms_aggs[0].buckets[0].key_json);
+    try std.testing.expectEqual(@as(i64, 2), live_terms_aggs[0].buckets[0].count);
+    try std.testing.expectEqualStrings("{\"value\":2}", live_terms_aggs[0].buckets[0].aggregations[0].value_json.?);
+
+    const stale_metric_terms_requests = [_]SearchAggregationRequest{.{
+        .name = "customer_terms_metric_live",
+        .type = "terms",
+        .field = "customer",
+        .aggregations = &.{.{ .name = "amount_sum", .type = "sum", .field = "amount" }},
+    }};
+    const live_metric_terms_aggs = try computeSearchAggregations(alloc, &stale_metric_terms_requests, result, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+        .identity_read_generation = 2,
+    });
+    defer deinitResults(alloc, live_metric_terms_aggs);
+    try std.testing.expectEqual(@as(usize, 1), live_metric_terms_aggs[0].buckets.len);
+    try std.testing.expectEqualStrings("\"alice\"", live_metric_terms_aggs[0].buckets[0].key_json);
+    try std.testing.expectEqual(@as(i64, 2), live_metric_terms_aggs[0].buckets[0].count);
+    try std.testing.expectEqualStrings("30", live_metric_terms_aggs[0].buckets[0].aggregations[0].value_json.?);
 
     const status_value = manager.algebraic_indexes.items[0].index.status();
     try std.testing.expect(status_value.planner_algebraic_selected >= 3);
@@ -13240,6 +13959,26 @@ test "algebraic aggregation planner rolls up date cylinders across extra dimensi
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"product\":\"pen\",\"created_at\":\"2026-05-02T09:00:00Z\",\"amount\":5}" },
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"product\":\"pen\",\"created_at\":\"2026-05-01T10:00:00Z\",\"amount\":7}" },
     };
+    const doc_keys = [_][]const u8{ "o1", "o2", "o3", "o4" };
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &identity_writes,
+        doc_keys[0..],
+        &.{},
+    );
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
     try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{.{
@@ -13295,6 +14034,30 @@ test "algebraic aggregation planner rolls up date cylinders across extra dimensi
     try std.testing.expectEqualStrings("\"2026-05-02T00:00:00Z\"", unfiltered[0].buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 1), unfiltered[0].buckets[1].count);
     try std.testing.expectEqualStrings("5", unfiltered[0].buckets[1].aggregations[0].value_json.?);
+
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try doc_identity.markDeletedTxn(alloc, &txn, 2, "o4");
+        try txn.commit();
+    }
+    const live_unfiltered = try computeSearchAggregations(alloc, &requests, result, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+        .identity_read_generation = 2,
+    });
+    defer deinitResults(alloc, live_unfiltered);
+
+    try std.testing.expectEqual(@as(usize, 1), live_unfiltered.len);
+    try std.testing.expectEqual(@as(usize, 2), live_unfiltered[0].buckets.len);
+    try std.testing.expectEqualStrings("\"2026-05-01T00:00:00Z\"", live_unfiltered[0].buckets[0].key_json);
+    try std.testing.expectEqual(@as(i64, 2), live_unfiltered[0].buckets[0].count);
+    try std.testing.expectEqualStrings("30", live_unfiltered[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("\"2026-05-02T00:00:00Z\"", live_unfiltered[0].buckets[1].key_json);
+    try std.testing.expectEqual(@as(i64, 1), live_unfiltered[0].buckets[1].count);
+    try std.testing.expectEqualStrings("5", live_unfiltered[0].buckets[1].aggregations[0].value_json.?);
 }
 
 test "algebraic aggregation planner reads ready adaptive tensor materializations" {

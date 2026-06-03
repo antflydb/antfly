@@ -31,7 +31,7 @@ const (
 	StyleTerminal Style = "terminal"
 )
 
-// Config Logging configuration for Termite services
+// Config Logging configuration for Antfly inference services
 type Config struct {
 	// Level Logging verbosity level
 	Level Level `json:"level,omitempty,omitzero"`
@@ -49,13 +49,13 @@ type Style string
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"H4sIAAAAAAAC/4xSwY7UMAz9lcgg9RJmWe2tEge0NzSCw3BDHDKt28luakeOUyir+XeUdMoOiBXcrPj5",
-	"vZdnP0HHU2RC0gTtE6TuhJOr5T3T4MdS9Zg68VE9E7Sw53H0NJqu9rO48m4GFvMZZfKKJqHMvsMEFqJw",
-	"RFGPlTLgjKEUrwUHaOHVzbP6zUX6Zl9BZwtJl4D/Qh8q6Hy2oEtEaIGPD9hpmd9vaj0OLgeFFjwNDPaF",
-	"D80oR05eF7P6tICUJ2i/QI/HPILdxr85odIVYYGvFvC7m2KxugEuVpKKp7FYOWxfebaiJSxy4UU7nDVm",
-	"LcFOTk0NY2eabaypiXccWPwP7Ms2Ege0pnlITGs3qeROs2BvPhw+fbSmCTwOk65d5UekNzgMvvNIah5x",
-	"eTe7kNFE5yVZ0xBzvDD5gKS7q0iu7BdBsLByg4Uy9nssV+A/oimLq6H955mta//rtRV36rUKvicdwvIL",
-	"snHdX3OBhRklrWrzrQvx5G7Lsjgiueihhbvd291duWKnpwQt5RDOPwMAAP//fudtejIDAAA=",
+	"H4sIAAAAAAAC/4ySwY4TMQyGXyUySL2ELqu9jcQB7QlUwaFHxCFNnWl2M3bkOAPDqu+OMtNhC9ICNyv+",
+	"bX/57SfwPGQmJC3QPUHxJxzcHN4zhdi36IjFS8wamaCDHfd9pN74OV/FtXcTWMx70pAmEymgIHk0BWWM",
+	"HgtYyMIZRSPOvROOmFrwWjBAB69unjFuLgw3u1l0tlB0Svgv9X4Wnc8WdMoIHfDhAb22+t067YjB1aTQ",
+	"QaTAYF/42Yhy4BJ1MgunBaQ6QPcFjnioPdi1/JsTalkRFvhqAb+7ITfUVXBBKSqR+oayX7/yjKIoQySX",
+	"XsThqrlqc3hwamYztmazlm1m6z0nlvgDj20thRNas3koTEu2qFSvVfBoPu4/f7Jmk7gPgy5Z5UekNxhC",
+	"9BFJzSNO70aXKprsohRrNsScL51iQtLtlSVX+G0gWFh6g4VW9rstV+I/rGmLm037z3tb1v73s2uYGnWe",
+	"fBF9+CVa295ftwULI0pZBo+3LuWTu21744zkcoQO7rZvt3ftoJ2eCnRUUzr/DAAA//9GbWruRgMAAA==",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

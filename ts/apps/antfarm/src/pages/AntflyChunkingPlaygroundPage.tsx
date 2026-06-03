@@ -22,7 +22,7 @@ import {
   Separator,
   Textarea,
 } from "@antfly/design-system";
-import { type ChunkResponse, TermiteClient } from "@antfly/sdk";
+import { type ChunkResponse, InferenceClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ClipboardCopy,
@@ -59,7 +59,7 @@ function isTextChunk(chunk: ChunkResult): chunk is TextChunkResult {
 }
 
 const DEFAULT_CONFIG: ChunkConfig = {
-  provider: "termite",
+  provider: "antfly",
   strategy: "fixed",
   model: "fixed",
   target_tokens: 500,
@@ -69,7 +69,7 @@ const DEFAULT_CONFIG: ChunkConfig = {
   threshold: 0.5,
 };
 
-// Color palette for chunk visualization (matches Termite playground)
+// Color palette for chunk visualization (matches Antfly inference playground)
 const CHUNK_COLORS = [
   "af-chart-surface af-chart-surface-1",
   "af-chart-surface af-chart-surface-2",
@@ -108,7 +108,7 @@ function extractDocumentText(source: Record<string, unknown>): string {
 }
 
 const AntflyChunkingPlaygroundPage: React.FC = () => {
-  const { client, termiteApiUrl } = useApiConfig();
+  const { client, inferenceApiUrl } = useApiConfig();
   const { selectedTable, selectedIndex } = useTable();
 
   const [config, setConfig] = useState<ChunkConfig>(DEFAULT_CONFIG);
@@ -127,9 +127,9 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
   const [isSearching, setIsSearching] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: termiteApiUrl }),
-    [termiteApiUrl]
+  const inferenceClient = useMemo(
+    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
+    [inferenceApiUrl]
   );
 
   const estimateTokens = (text: string): number => {
@@ -214,7 +214,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
     try {
       const actualSeparator = config.separator.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
 
-      const data = await termiteClient.chunk(
+      const data = await inferenceClient.chunk(
         inputText,
         {
           model: config.model,
@@ -234,7 +234,9 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
       setError(
-        err instanceof Error ? err.message : `Failed to connect to Termite at ${termiteApiUrl}`
+        err instanceof Error
+          ? err.message
+          : `Failed to connect to Antfly inference at ${inferenceApiUrl}`
       );
     } finally {
       setIsLoading(false);
@@ -302,7 +304,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
       elements.push(
         <span
           key={`chunk-${chunk.id}`}
-          className={`${CHUNK_COLORS[colorIndex]} rounded px-0.5 border`}
+          className={`${CHUNK_COLORS[colorIndex]} rounded-none px-0.5 border`}
           title={`Chunk ${chunk.id}`}
         >
           {inputText.slice(chunk.start_char, chunk.end_char)}
@@ -494,7 +496,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -562,7 +564,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
 
             {/* Table document picker */}
             {docSource === "table" && selectedTable && (
-              <div className="space-y-2 p-3 bg-muted/30 rounded-lg border">
+              <div className="space-y-2 p-3 bg-muted/30 rounded-none border">
                 {/* Search for documents */}
                 <div className="flex gap-2">
                   <Input
@@ -619,7 +621,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                       <button
                         key={sr.id}
                         type="button"
-                        className="w-full text-left p-2 rounded hover:bg-accent text-sm space-y-0.5 transition-colors"
+                        className="w-full text-left p-2 rounded-none hover:bg-accent text-sm space-y-0.5 transition-colors"
                         onClick={() => handleFetchDocument(sr.id)}
                       >
                         <span className="font-mono text-xs text-muted-foreground">{sr.id}</span>
@@ -657,7 +659,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
             {result ? (
               <div className="h-100 overflow-y-auto space-y-4">
                 {/* Highlighted text view */}
-                <div className="p-3 bg-muted/50 rounded-lg border max-h-37.5 overflow-y-auto">
+                <div className="p-3 bg-muted/50 rounded-none border max-h-37.5 overflow-y-auto">
                   {renderHighlightedText()}
                 </div>
 
@@ -670,7 +672,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                     return (
                       <div
                         key={chunk.id}
-                        className={`p-3 rounded-lg border ${CHUNK_COLORS[colorIndex]}`}
+                        className={`p-3 rounded-none border ${CHUNK_COLORS[colorIndex]}`}
                       >
                         <div className="flex items-center justify-between mb-2">
                           <span

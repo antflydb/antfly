@@ -212,18 +212,18 @@ func GetE2EProvider() string {
 	if provider := os.Getenv("E2E_PROVIDER"); provider != "" {
 		return provider
 	}
-	return "termite" // default - uses local ONNX models via Termite
+	return "antfly" // default - uses local ONNX models via Antfly inference
 }
 
-// GetTermiteURL returns the Termite URL from E2E_TERMITE_URL env var
-// This should be set by the test after starting the Termite server
-func GetTermiteURL() string {
-	return os.Getenv("E2E_TERMITE_URL")
+// GetInferenceURL returns the Antfly inference URL from E2E_INFERENCE_URL env var
+// This should be set by the test after starting the Antfly inference server
+func GetInferenceURL() string {
+	return os.Getenv("E2E_INFERENCE_URL")
 }
 
-// SetTermiteURL sets the Termite URL for the test (via environment variable)
-func SetTermiteURL(url string) {
-	_ = os.Setenv("E2E_TERMITE_URL", url)
+// SetInferenceURL sets the Antfly inference URL for the test (via environment variable)
+func SetInferenceURL(url string) {
+	_ = os.Setenv("E2E_INFERENCE_URL", url)
 }
 
 // GetDefaultEmbedderConfig returns embedder config based on E2E_PROVIDER
@@ -235,16 +235,16 @@ func GetDefaultEmbedderConfig(t *testing.T) (*antfly.EmbedderConfig, error) {
 		return antfly.NewEmbedderConfig(antfly.GoogleEmbedderConfig{
 			Model: "gemini-embedding-001",
 		})
-	case "termite":
-		termiteURL := GetTermiteURL()
-		if termiteURL == "" {
-			return nil, fmt.Errorf("E2E_TERMITE_URL not set (required for E2E_PROVIDER=termite)")
+	case "antfly":
+		inferenceURL := GetInferenceURL()
+		if inferenceURL == "" {
+			return nil, fmt.Errorf("E2E_INFERENCE_URL not set (required for E2E_PROVIDER=antfly)")
 		}
 		// Use full-precision model - quantized (-i8) models cause 200x memory
 		// inflation with CoreML on macOS (6-8GB for a 33MB model)
-		return antfly.NewEmbedderConfig(antfly.TermiteEmbedderConfig{
+		return antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
 			Model:  "BAAI/bge-small-en-v1.5",
-			ApiUrl: termiteURL,
+			ApiUrl: inferenceURL,
 		})
 	default: // ollama
 		return antfly.NewEmbedderConfig(antfly.OllamaEmbedderConfig{
@@ -266,14 +266,14 @@ func GetDefaultGeneratorConfig(t *testing.T) antfly.GeneratorConfig {
 			Model:       "gemini-2.5-flash",
 			Temperature: 0.1,
 		})
-	case "termite":
-		termiteURL := GetTermiteURL()
-		if termiteURL == "" {
-			t.Fatalf("E2E_TERMITE_URL not set (required for E2E_PROVIDER=termite)")
+	case "antfly":
+		inferenceURL := GetInferenceURL()
+		if inferenceURL == "" {
+			t.Fatalf("E2E_INFERENCE_URL not set (required for E2E_PROVIDER=antfly)")
 		}
-		config, err = antfly.NewGeneratorConfig(antfly.TermiteGeneratorConfig{
+		config, err = antfly.NewGeneratorConfig(antfly.AntflyGeneratorConfig{
 			Model:       "onnxruntime/Gemma-3-ONNX",
-			ApiUrl:      termiteURL,
+			ApiUrl:      inferenceURL,
 			Temperature: 0.1,
 			MaxTokens:   768, // Lower than production default (2048) to avoid ONNX timeout in tests
 		})
@@ -318,9 +318,9 @@ func SkipIfProviderUnavailable(t *testing.T) {
 	case "gemini":
 		// Already checked above
 		return
-	case "termite":
-		// Termite is started by the test harness, no external check needed
-		// The test will set E2E_TERMITE_URL after starting the server
+	case "antfly":
+		// Antfly inference is started by the test harness, no external check needed
+		// The test will set E2E_INFERENCE_URL after starting the server
 		return
 	default: // ollama
 		SkipIfOllamaUnavailable(t)

@@ -209,7 +209,7 @@ const QueryResultsList: React.FC<QueryResultsListProps> = ({ result, className }
 
         {/* Table View */}
         {viewMode === "table" && (
-          <div className="border rounded-lg overflow-auto max-h-[600px]">
+          <div className="border rounded-none overflow-auto max-h-[600px]">
             <Table>
               <TableHeader>
                 <TableRow>

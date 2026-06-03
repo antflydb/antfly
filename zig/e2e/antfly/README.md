@@ -98,7 +98,7 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - when auto-starting Zig locally, it launches `antfly swarm`
   - configured with `ANTFLY_STATEFUL_URL`
   - optional `ANTFLY_STATEFUL_API_ROOT`
-  - use `/api/v1` for Go Antfly; local Zig `antfly swarm` serves stateful routes at the root
+  - use `/db/v1` for Go Antfly; local Zig `antfly swarm` serves stateful routes at the root
 
 ## Shared vs Serverless-Specific
 

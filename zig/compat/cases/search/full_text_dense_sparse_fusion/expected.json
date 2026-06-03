@@ -6,12 +6,7 @@
         "id": "doc:1",
         "stored_data": {
           "title": "alpha",
-          "body": "machine learning alpha",
-          "embedding": [1.0, 0.0],
-          "sparse_embedding": {
-            "indices": [1],
-            "values": [1.0]
-          }
+          "body": "machine learning alpha"
         }
       }
     ]

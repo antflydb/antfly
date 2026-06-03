@@ -196,9 +196,9 @@ const meta: Meta<typeof GraphIndexExplorer> = {
           setApiUrl: () => undefined,
           client: fakeClient,
           resetToDefault: () => undefined,
-          termiteApiUrl: "",
-          setTermiteApiUrl: () => undefined,
-          resetTermiteApiUrl: () => undefined,
+          inferenceApiUrl: "",
+          setInferenceApiUrl: () => undefined,
+          resetInferenceApiUrl: () => undefined,
         }}
       >
         <div className="af-dashboard min-h-screen bg-background p-6">

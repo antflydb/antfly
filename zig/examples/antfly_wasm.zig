@@ -1,7 +1,7 @@
 const std = @import("std");
 const embedded_db = @import("antfly_embedded_db");
 const embedded_api = @import("antfly_embedded_api");
-const termite = @import("termite_inference");
+const termite = @import("inference_runtime");
 
 comptime {
     _ = termite; // force termite export fn declarations into the binary
