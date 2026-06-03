@@ -47,7 +47,5 @@ EXPOSE 8080 11433 4200
 
 ENTRYPOINT ["/antfly"]
 
-# Default to single-node swarm mode for easy local usage.
-# Override with a different subcommand (e.g., "metadata", "store", "termite")
-# via Kubernetes Pod args or docker run arguments.
-CMD ["swarm"]
+# Intentionally no default CMD: callers must explicitly choose a role
+# (e.g., "swarm", "metadata", "store", or "termite").
