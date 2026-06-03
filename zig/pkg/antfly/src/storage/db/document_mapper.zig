@@ -17,8 +17,10 @@ const Allocator = std.mem.Allocator;
 const vector_codec = @import("antfly_vector").codec;
 const regex_mod = @import("antfly_regex");
 const introducer_mod = @import("../../introducer.zig");
+const segment_mod = @import("../../segment.zig");
 const analysis_mod = @import("../../search/analysis.zig");
 const schema_api = @import("../../schema/mod.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 const runtime_schema = @import("../schema.zig");
 const types = @import("types.zig");
 
@@ -116,11 +118,14 @@ pub const BuildTextSegmentResult = struct {
     }
 };
 
-pub const default_text_segment_target_bytes: usize = 256 * 1024 * 1024;
+pub const default_text_segment_target_bytes: usize = 32 * 1024 * 1024;
 
 pub const BuildTextSegmentsOptions = struct {
     target_segment_bytes: usize = default_text_segment_target_bytes,
+    target_build_memory_bytes: ?usize = null,
+    doc_scratch_retained_bytes: ?usize = null,
     profile: ?*introducer_mod.BuildTextProfile = null,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub const BuildTextSegmentsResult = struct {
@@ -144,6 +149,60 @@ pub const BuildTextSegmentsResult = struct {
 pub const TextProjectionBatch = struct {
     docs: []const introducer_mod.TextDocument,
     observed_field_analyzers: []const ObservedFieldAnalyzer = &.{},
+};
+
+pub const TextProjectionBatchBuilder = struct {
+    arena: Allocator,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    schema: ?runtime_schema.TableSchema,
+    observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
+    text_docs: std.ArrayListUnmanaged(introducer_mod.TextDocument) = .empty,
+
+    pub fn init(
+        arena: Allocator,
+        text_analysis: introducer_mod.TextAnalysisConfig,
+        schema: ?runtime_schema.TableSchema,
+        observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
+    ) TextProjectionBatchBuilder {
+        return .{
+            .arena = arena,
+            .text_analysis = text_analysis,
+            .schema = schema,
+            .observed_field_analyzers = observed_field_analyzers,
+        };
+    }
+
+    pub fn deinit(self: *TextProjectionBatchBuilder) void {
+        self.text_docs.deinit(self.arena);
+        self.* = undefined;
+    }
+
+    pub fn appendSourceDoc(self: *TextProjectionBatchBuilder, doc: TextProjectionSourceDoc) !void {
+        const extraction_root = doc.typed_source orelse doc.root;
+        const extracted = if (self.schema == null and doc.schema_less_fast_projection)
+            ExtractedTextFields{ .fields = doc.schema_less_text_fields }
+        else
+            try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers);
+        if (extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0) return;
+
+        try self.text_docs.append(self.arena, .{
+            .id = doc.key,
+            .stored_data = doc.stored_data,
+            .doc_ordinal = doc.doc_ordinal,
+            .text_fields = extracted.fields,
+            .recursive_typed_fields = extracted.recursive_typed_fields,
+            .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,
+            .typed_fields = extracted.typed_fields orelse if (doc.typed_source == null) &.{} else null,
+            .typed_source = if (extracted.typed_fields == null) doc.typed_source else null,
+        });
+    }
+
+    pub fn batch(self: *const TextProjectionBatchBuilder) TextProjectionBatch {
+        return .{
+            .docs = self.text_docs.items,
+            .observed_field_analyzers = if (self.observed_field_analyzers) |items| items.items else &.{},
+        };
+    }
 };
 
 pub const TextProjectionSourceDoc = struct {
@@ -341,31 +400,14 @@ pub fn buildTextProjectionBatchFromSource(
     schema: ?runtime_schema.TableSchema,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
 ) !TextProjectionBatch {
-    var text_docs = std.ArrayListUnmanaged(introducer_mod.TextDocument).empty;
-    defer text_docs.deinit(arena);
-
+    var builder = TextProjectionBatchBuilder.init(arena, text_analysis, schema, observed_field_analyzers);
+    defer builder.deinit();
     for (source_docs) |doc| {
-        const extraction_root = doc.typed_source orelse doc.root;
-        const extracted = if (schema == null and doc.schema_less_fast_projection)
-            ExtractedTextFields{ .fields = doc.schema_less_text_fields }
-        else
-            try extractTextFieldsFromValue(arena, extraction_root, text_analysis, schema, observed_field_analyzers);
-        if (extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0) continue;
-
-        try text_docs.append(arena, .{
-            .id = doc.key,
-            .stored_data = doc.stored_data,
-            .doc_ordinal = doc.doc_ordinal,
-            .text_fields = extracted.fields,
-            .recursive_typed_fields = extracted.recursive_typed_fields,
-            .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,
-            .typed_fields = extracted.typed_fields orelse if (doc.typed_source == null) &.{} else null,
-            .typed_source = if (extracted.typed_fields == null) doc.typed_source else null,
-        });
+        try builder.appendSourceDoc(doc);
     }
 
     return .{
-        .docs = try arena.dupe(introducer_mod.TextDocument, text_docs.items),
+        .docs = try arena.dupe(introducer_mod.TextDocument, builder.text_docs.items),
         .observed_field_analyzers = if (observed_field_analyzers) |items| items.items else &.{},
     };
 }
@@ -391,6 +433,27 @@ fn buildTextSegmentFromProjectionBatchWithProfile(
     });
 }
 
+fn buildTextOptionsFromSegmentOptions(options: BuildTextSegmentsOptions) introducer_mod.BuildTextOptions {
+    var build_options = introducer_mod.BuildTextOptions{
+        .profile = options.profile,
+        .resource_manager = options.resource_manager,
+    };
+    if (options.target_build_memory_bytes) |target| build_options.build_memory_target_bytes = target;
+    if (options.doc_scratch_retained_bytes) |retained| build_options.doc_scratch_retained_bytes = retained;
+    return build_options;
+}
+
+pub fn writeTextSegmentFromProjectionBatchToSink(
+    alloc: Allocator,
+    projection_batch: TextProjectionBatch,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    build_options: introducer_mod.BuildTextOptions,
+    sink: *segment_mod.SegmentSink,
+) !void {
+    if (projection_batch.docs.len == 0) return;
+    try introducer_mod.writeSegmentFromTextWithAnalysisOptions(alloc, projection_batch.docs, &analysis_mod.default_analyzer, text_analysis, build_options, sink);
+}
+
 pub fn buildTextSegmentsFromProjectionBatch(
     alloc: Allocator,
     projection_batch: TextProjectionBatch,
@@ -406,14 +469,20 @@ pub fn buildTextSegmentsFromProjectionBatch(
     }
 
     const target_bytes = @max(@as(usize, 1), options.target_segment_bytes);
+    const build_options = buildTextOptionsFromSegmentOptions(options);
     var start: usize = 0;
     while (start < projection_batch.docs.len) {
-        const end = splitProjectionDocsEnd(projection_batch.docs, start, target_bytes);
+        const split = introducer_mod.splitTextDocumentsForBuildBudget(projection_batch.docs, start, .{
+            .target_build_memory_bytes = options.target_build_memory_bytes orelse build_options.build_memory_target_bytes,
+            .target_segment_bytes = target_bytes,
+        });
+        const end = split.end;
         const chunk: TextProjectionBatch = .{
             .docs = projection_batch.docs[start..end],
             .observed_field_analyzers = &.{},
         };
-        if (try buildTextSegmentFromProjectionBatchWithProfile(alloc, chunk, text_analysis, options.profile)) |segment| {
+        const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, chunk.docs, &analysis_mod.default_analyzer, text_analysis, build_options);
+        if (segment.len > 0) {
             try segments.append(alloc, segment);
         }
         start = end;
@@ -429,7 +498,7 @@ pub fn freeTextSegments(alloc: Allocator, segments: [][]u8) void {
     if (segments.len > 0) alloc.free(segments);
 }
 
-fn splitProjectionDocsEnd(docs: []const introducer_mod.TextDocument, start: usize, target_bytes: usize) usize {
+pub fn splitProjectionDocsEnd(docs: []const introducer_mod.TextDocument, start: usize, target_bytes: usize) usize {
     var total: usize = 0;
     var end = start;
     while (end < docs.len) : (end += 1) {

@@ -26,6 +26,7 @@ const schema_openapi = @import("antfly_schema_openapi");
 const schema_mod = @import("../schema/mod.zig");
 const runtime_schema_mod = @import("../storage/schema.zig");
 const algebraic_mod = @import("../storage/db/algebraic/mod.zig");
+const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const full_text_indexes = @import("full_text_indexes.zig");
 const json_helpers = @import("json_helpers.zig");
 
@@ -41,10 +42,51 @@ pub fn effectiveSchemaJson(schema_json: ?[]const u8) []const u8 {
 }
 
 pub const ParsedTableSchema = schema_mod.ParsedTableSchema;
+pub const LsmStorageStatus = struct {
+    // Table status intentionally exposes a compact operational snapshot. Full
+    // low-level WAL and scheduler counters remain available through metrics.
+    run_count: u64 = 0,
+    run_bytes: u64 = 0,
+    l0_run_count: u64 = 0,
+    l0_bytes: u64 = 0,
+    wal_retained_bytes: u64 = 0,
+    compaction_backlog_bytes: u64 = 0,
+    active_readers: u64 = 0,
+};
+
 pub const TableStorageStatus = struct {
     table_name: []const u8,
     empty: bool,
+    lsm: ?LsmStorageStatus = null,
 };
+
+pub fn lsmStorageStatusFromMaintenanceStats(maintenance: lsm_backend.Backend.MaintenanceStats) LsmStorageStatus {
+    return .{
+        .run_count = maintenance.total_runs,
+        .run_bytes = maintenance.total_run_bytes,
+        .l0_run_count = maintenance.l0_runs,
+        .l0_bytes = maintenance.l0_bytes,
+        .wal_retained_bytes = maintenance.wal_retained_bytes,
+        .compaction_backlog_bytes = maintenance.compaction_scheduler_remembered_pending_bytes,
+        .active_readers = maintenance.active_readers,
+    };
+}
+
+fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStorageStatus {
+    return .{
+        .run_count = u64ToI64(status.run_count),
+        .run_bytes = u64ToI64(status.run_bytes),
+        .l0_run_count = u64ToI64(status.l0_run_count),
+        .l0_bytes = u64ToI64(status.l0_bytes),
+        .wal_retained_bytes = u64ToI64(status.wal_retained_bytes),
+        .compaction_backlog_bytes = u64ToI64(status.compaction_backlog_bytes),
+        .active_readers = u64ToI64(status.active_readers),
+    };
+}
+
+fn u64ToI64(value: u64) i64 {
+    return if (value > std.math.maxInt(i64)) std.math.maxInt(i64) else @intCast(value);
+}
 
 const RuntimeSchemaDebugBinding = struct {
     index_name: []const u8,
@@ -627,6 +669,10 @@ fn buildTableStatus(
     }
 
     const empty = if (storage_status) |status| status.empty else ranges.len == 0;
+    const lsm_status = if (storage_status) |status|
+        if (status.lsm) |lsm| generatedLsmStorageStatus(lsm) else null
+    else
+        null;
     return .{
         .name = table.name,
         .description = if (table.description.len > 0) table.description else null,
@@ -641,6 +687,7 @@ fn buildTableStatus(
         .storage_status = .{
             .disk_usage = 0,
             .empty = empty,
+            .lsm = lsm_status,
         },
     };
 }
@@ -1850,11 +1897,28 @@ test "metadata.table status encoder honors storage status overrides" {
         .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
         .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
     };
-    const storage_statuses = [_]TableStorageStatus{.{ .table_name = "docs", .empty = true }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = true,
+        .lsm = .{
+            .run_count = 3,
+            .run_bytes = 44,
+            .l0_run_count = 1,
+            .l0_bytes = 33,
+            .wal_retained_bytes = 55,
+            .compaction_backlog_bytes = 10,
+            .active_readers = 2,
+        },
+    }};
 
     const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true,\"lsm\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"run_count\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"l0_bytes\":33") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":55") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_backlog_bytes\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_readers\":2") != null);
 }
 
 test "metadata.table status encoder canonicalizes embeddings indexes without inline names" {

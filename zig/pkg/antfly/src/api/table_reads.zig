@@ -109,6 +109,11 @@ pub const BackgroundTextStatsResponse = struct {
     }
 };
 
+pub const LsmStorageStats = struct {
+    maintenance: lsm_backend.Backend.MaintenanceStats,
+    write: lsm_backend.Backend.WriteStats,
+};
+
 pub const ParsedTextStatsHttpResponse = union(enum) {
     fields: TextStatsResponse,
     background_fields: BackgroundTextStatsResponse,
@@ -1292,6 +1297,10 @@ pub const TableReadSource = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
         ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
+        lsm_storage_stats: ?*const fn (
+            ptr: *anyopaque,
+            table_name: []const u8,
+        ) anyerror!?LsmStorageStats = null,
     };
 
     pub fn lookup(
@@ -1523,6 +1532,14 @@ pub const TableReadSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const fn_ptr = self.vtable.local_runtime_statuses orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn lsmStorageStats(
+        self: TableReadSource,
+        table_name: []const u8,
+    ) !?LsmStorageStats {
+        const fn_ptr = self.vtable.lsm_storage_stats orelse return null;
+        return try fn_ptr(self.ptr, table_name);
     }
 };
 
@@ -1771,7 +1788,20 @@ pub const BoundTableReadSource = struct {
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
                 .graph_edges_group_local = graphEdgesGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .lsm_storage_stats = lsmStorageStats,
             },
+        };
+    }
+
+    fn lsmStorageStats(
+        ptr: *anyopaque,
+        table_name: []const u8,
+    ) !?LsmStorageStats {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return .{
+            .maintenance = self.db.snapshotLsmMaintenanceStats(),
+            .write = self.db.snapshotLsmWriteStats(),
         };
     }
 

@@ -171,6 +171,20 @@ pub const PrimaryStoreOwner = union(enum) {
         };
     }
 
+    pub fn snapshotLsmOpenStats(self: *const PrimaryStoreOwner) ?lsm_backend_mod.Backend.OpenStats {
+        return switch (self.*) {
+            .none, .mem => null,
+            .lsm => |owner| owner.handle.backend.snapshotOpenStats(),
+        };
+    }
+
+    pub fn checkpointLsmWalAfterDurableBoundary(self: *PrimaryStoreOwner) !void {
+        switch (self.*) {
+            .none, .mem => {},
+            .lsm => |owner| try owner.handle.backend.checkpointWalAfterDurableBoundary(),
+        }
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const PrimaryStoreOwner) ?lsm_backend_mod.NativeStorageStats {
         return switch (self.*) {
             .none, .mem => null,

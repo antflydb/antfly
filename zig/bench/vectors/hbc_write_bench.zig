@@ -723,7 +723,7 @@ fn printResult(
     );
     if (maintenance) |stats| {
         try writer.print(
-            ",\"lsm_total_runs\":{d},\"lsm_total_run_bytes\":{d},\"lsm_total_run_logical_entry_bytes\":{d},\"lsm_total_run_physical_entry_bytes\":{d},\"lsm_total_run_compressed_blocks\":{d},\"lsm_total_run_raw_blocks\":{d},\"lsm_total_run_compression_codec_mask\":{d},\"lsm_l0_runs\":{d},\"lsm_l0_bytes\":{d},\"lsm_overlapping_l0_runs\":{d},\"lsm_lower_level_runs\":{d},\"lsm_lower_level_bytes\":{d},\"lsm_max_level\":{d},\"lsm_obsolete_paths\":{d},\"lsm_compaction_scheduler_grants\":{d},\"lsm_compaction_scheduler_denied_capacity\":{d},\"lsm_compaction_scheduler_denied_resource_pressure\":{d},\"lsm_compaction_scheduler_remembered_pending\":{d},\"lsm_compaction_scheduler_remembered_candidates\":{d},\"lsm_compaction_scheduler_remembered_retries\":{d},\"lsm_compaction_scheduler_remembered_hits\":{d},\"lsm_compaction_scheduler_remembered_stale\":{d},\"lsm_compaction_scheduler_conflict_denials\":{d}",
+            ",\"lsm_total_runs\":{d},\"lsm_total_run_bytes\":{d},\"lsm_total_run_logical_entry_bytes\":{d},\"lsm_total_run_physical_entry_bytes\":{d},\"lsm_total_run_compressed_blocks\":{d},\"lsm_total_run_raw_blocks\":{d},\"lsm_total_run_compression_codec_mask\":{d},\"lsm_l0_runs\":{d},\"lsm_l0_bytes\":{d},\"lsm_overlapping_l0_runs\":{d},\"lsm_lower_level_runs\":{d},\"lsm_lower_level_bytes\":{d},\"lsm_max_level\":{d},\"lsm_obsolete_paths\":{d},\"lsm_compaction_scheduler_grants\":{d},\"lsm_compaction_scheduler_denied_capacity\":{d},\"lsm_compaction_scheduler_denied_resource_pressure\":{d},\"lsm_compaction_scheduler_oversized_grants\":{d},\"lsm_compaction_scheduler_oversized_skips\":{d},\"lsm_compaction_scheduler_remembered_pending\":{d},\"lsm_compaction_scheduler_remembered_candidates\":{d},\"lsm_compaction_scheduler_remembered_retries\":{d},\"lsm_compaction_scheduler_remembered_hits\":{d},\"lsm_compaction_scheduler_remembered_stale\":{d},\"lsm_compaction_scheduler_conflict_denials\":{d}",
             .{
                 stats.total_runs,
                 stats.total_run_bytes,
@@ -742,6 +742,8 @@ fn printResult(
                 stats.compaction_scheduler_grants,
                 stats.compaction_scheduler_denied_capacity,
                 stats.compaction_scheduler_denied_resource_pressure,
+                stats.compaction_scheduler_oversized_grants,
+                stats.compaction_scheduler_oversized_skips,
                 stats.compaction_scheduler_remembered_pending,
                 stats.compaction_scheduler_remembered_candidates,
                 stats.compaction_scheduler_remembered_retries,

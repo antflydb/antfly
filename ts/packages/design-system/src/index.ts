@@ -4,13 +4,16 @@ export * from "./components/brand/anty";
 export * from "./components/brand/cta";
 export * from "./components/brand/feature-grid";
 export * from "./components/brand/graph-paper-bg";
+export * from "./components/brand/heading";
 export * from "./components/brand/hero";
 export * from "./components/brand/highlight";
 export * from "./components/brand/kicker";
+export * from "./components/brand/link";
 export * from "./components/brand/lockup";
 export * from "./components/brand/logo";
 // Brand / marketing components
 export * from "./components/brand/mono-label";
+export * from "./components/brand/text";
 export * from "./components/brand/type-on";
 export * from "./components/brand/wordmark";
 export * from "./components/compound/data-table";

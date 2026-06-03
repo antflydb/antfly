@@ -264,7 +264,10 @@ pub fn handleTableBatch(
     api: TableApi,
 ) !OwnedResponse {
     var batch_req = batch_api.parseBatchRequest(alloc, body) catch |err| {
-        return err;
+        switch (err) {
+            error.ValueTooLong => return .{ .status = 413, .body = try alloc.dupe(u8, "value too large") },
+            else => return err,
+        }
     };
     defer batch_req.deinit(alloc);
 

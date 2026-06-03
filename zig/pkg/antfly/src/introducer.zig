@@ -27,6 +27,8 @@ const typed_dv = @import("section/typed_doc_values.zig");
 const analysis_mod = @import("search/analysis.zig");
 const geo_mod = @import("search/geo.zig");
 const platform_time = @import("platform/time.zig");
+const process_memory = @import("platform/process_memory.zig");
+const resource_manager_mod = @import("storage/resource_manager.zig");
 
 /// A batch of documents to index.
 pub const Batch = struct {
@@ -57,18 +59,113 @@ const ExtraSection = struct {
     data: []const u8,
 };
 
+const default_build_memory_target_bytes: usize = 96 * 1024 * 1024;
+const default_doc_scratch_retained_bytes: usize = 1024 * 1024;
+
+const TextBuildScratch = struct {
+    hits: std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit) = .empty,
+    positions: std.ArrayListUnmanaged(u32) = .empty,
+
+    fn reset(self: *TextBuildScratch, alloc: Allocator, retained_bytes: usize) void {
+        resetScratchList(inverted.InvertedIndexBuilder.TermHit, alloc, &self.hits, retained_bytes);
+        resetScratchList(u32, alloc, &self.positions, retained_bytes);
+    }
+
+    fn deinit(self: *TextBuildScratch, alloc: Allocator) void {
+        self.hits.deinit(alloc);
+        self.positions.deinit(alloc);
+    }
+
+    fn estimatedMemoryBytes(self: *const TextBuildScratch) u64 {
+        return (@as(u64, @intCast(self.hits.capacity)) * @sizeOf(inverted.InvertedIndexBuilder.TermHit)) +
+            (@as(u64, @intCast(self.positions.capacity)) * @sizeOf(u32));
+    }
+};
+
+fn resetScratchList(comptime T: type, alloc: Allocator, list: *std.ArrayListUnmanaged(T), retained_bytes: usize) void {
+    const retained: u64 = @intCast(retained_bytes);
+    const capacity_bytes = @as(u64, @intCast(list.capacity)) * @sizeOf(T);
+    if (capacity_bytes > retained) {
+        list.deinit(alloc);
+        list.* = .empty;
+    } else {
+        list.clearRetainingCapacity();
+    }
+}
+
+const FieldPostingsBuilder = struct {
+    active: bool = false,
+    builder: inverted.InvertedIndexBuilder = undefined,
+
+    fn init(alloc: Allocator) !FieldPostingsBuilder {
+        return .{
+            .active = true,
+            .builder = inverted.InvertedIndexBuilder.init(alloc, .{}),
+        };
+    }
+
+    fn deinit(self: *FieldPostingsBuilder, alloc: Allocator) void {
+        _ = alloc;
+        if (!self.active) return;
+        self.builder.deinit();
+        self.active = false;
+        self.builder = undefined;
+    }
+
+    fn addDocument(self: *FieldPostingsBuilder, doc_idx: u32, hits: []const inverted.InvertedIndexBuilder.TermHit) !void {
+        try self.builder.addDocument(doc_idx, hits);
+    }
+
+    fn buildAlloc(self: *FieldPostingsBuilder, output_alloc: Allocator, profile: ?*BuildTextProfile) ![]u8 {
+        if (profile) |p| {
+            var inverted_profile = inverted.InvertedIndexBuildProfile{};
+            const data = try self.builder.buildAllocProfile(output_alloc, &inverted_profile);
+            p.inverted_sort_ns +|= inverted_profile.sort_ns;
+            p.inverted_postings_serialize_ns +|= inverted_profile.postings_serialize_ns;
+            p.inverted_term_dict_ns +|= inverted_profile.term_dict_ns;
+            p.inverted_norms_ns +|= inverted_profile.norms_ns;
+            p.inverted_bloom_finish_ns +|= inverted_profile.bloom_finish_ns;
+            p.inverted_final_assembly_ns +|= inverted_profile.final_assembly_ns;
+            return data;
+        }
+        return try self.builder.buildAlloc(output_alloc);
+    }
+
+    fn estimatedMemoryBytes(self: *const FieldPostingsBuilder) u64 {
+        if (!self.active) return 0;
+        return self.builder.estimatedMemoryBytes();
+    }
+};
+
+fn deinitFieldPostingsBuilders(
+    alloc: Allocator,
+    builders: *std.StringHashMapUnmanaged(FieldPostingsBuilder),
+) void {
+    var it = builders.valueIterator();
+    while (it.next()) |builder| builder.deinit(alloc);
+    builders.deinit(alloc);
+}
+
+fn ensureFieldPostingsBuilder(
+    alloc: Allocator,
+    builders: *std.StringHashMapUnmanaged(FieldPostingsBuilder),
+    field_name: []const u8,
+) !*FieldPostingsBuilder {
+    const gop = try builders.getOrPut(alloc, field_name);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = field_name;
+        gop.value_ptr.* = try FieldPostingsBuilder.init(alloc);
+    }
+    return gop.value_ptr;
+}
+
 fn buildSegmentWithExtraSections(
     alloc: Allocator,
     batch: Batch,
     extra_sections: []const ExtraSection,
 ) ![]u8 {
-    // Group term hits by field
-    var field_builders = std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder).empty;
-    defer {
-        var it = field_builders.valueIterator();
-        while (it.next()) |b| b.deinit();
-        field_builders.deinit(alloc);
-    }
+    var field_builders = std.StringHashMapUnmanaged(FieldPostingsBuilder).empty;
+    defer deinitFieldPostingsBuilders(alloc, &field_builders);
 
     var seg_writer = segment_mod.SegmentWriter.init(alloc);
     defer seg_writer.deinit();
@@ -83,11 +180,8 @@ fn buildSegmentWithExtraSections(
 
         // Process each field's term hits
         for (doc.fields) |field| {
-            const gop = try field_builders.getOrPut(alloc, field.field_name);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = inverted.InvertedIndexBuilder.init(alloc, .{});
-            }
-            try gop.value_ptr.addDocument(@intCast(doc_idx), field.hits);
+            const builder = try ensureFieldPostingsBuilder(alloc, &field_builders, field.field_name);
+            try builder.addDocument(@intCast(doc_idx), field.hits);
 
             // Ensure field exists in segment
             const fi_gop = try field_indices.getOrPut(alloc, field.field_name);
@@ -111,16 +205,18 @@ fn buildSegmentWithExtraSections(
     var fit = field_builders.iterator();
     while (fit.next()) |entry| {
         const field_name = entry.key_ptr.*;
-        const inv_data = try entry.value_ptr.build();
+        const inv_data = try entry.value_ptr.buildAlloc(alloc, null);
         errdefer alloc.free(inv_data);
 
         if (inv_data.len == 0) {
             alloc.free(inv_data);
+            entry.value_ptr.deinit(alloc);
             continue;
         }
 
         const field_idx = field_indices.get(field_name).?;
         try seg_writer.addSectionOwned(field_idx, .inverted_text, inv_data);
+        entry.value_ptr.deinit(alloc);
     }
 
     // Attach any additional field sections, such as typed doc values.
@@ -184,6 +280,11 @@ pub const BuildTextOptions = struct {
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
     profile: ?*BuildTextProfile = null,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    build_memory_target_bytes: usize = default_build_memory_target_bytes,
+    doc_scratch_retained_bytes: usize = default_doc_scratch_retained_bytes,
+    profile_timings: bool = true,
+    profile_working_set: bool = true,
 };
 
 pub const BuildTextProfile = struct {
@@ -198,12 +299,229 @@ pub const BuildTextProfile = struct {
     hit_materialize_ns: u64 = 0,
     typed_collect_ns: u64 = 0,
     typed_build_ns: u64 = 0,
+    inverted_build_ns: u64 = 0,
+    inverted_sort_ns: u64 = 0,
+    inverted_postings_serialize_ns: u64 = 0,
+    inverted_term_dict_ns: u64 = 0,
+    inverted_norms_ns: u64 = 0,
+    inverted_bloom_finish_ns: u64 = 0,
+    inverted_final_assembly_ns: u64 = 0,
     section_attach_ns: u64 = 0,
     stored_doc_attach_ns: u64 = 0,
     stored_compress_ns: u64 = 0,
+    stored_raw_bytes: u64 = 0,
+    stored_compressed_bytes: u64 = 0,
     segment_assembly_ns: u64 = 0,
     segment_encode_ns: u64 = 0,
+    doc_arena_peak_bytes: u64 = 0,
+    field_postings_estimated_bytes: u64 = 0,
+    typed_doc_values_estimated_bytes: u64 = 0,
+    stored_docs_estimated_bytes: u64 = 0,
+    section_bytes: u64 = 0,
+    fst_and_term_metadata_bytes: u64 = 0,
+    segment_sink_bytes: u64 = 0,
+    resource_peak_bytes: u64 = 0,
+    build_memory_target_bytes: u64 = 0,
+    doc_scratch_retained_bytes: u64 = 0,
+    peak_doc_scratch_bytes: u64 = 0,
+    builder_scratch_peak_bytes: u64 = 0,
+    postings_live_bytes: u64 = 0,
+    typed_live_bytes: u64 = 0,
+    section_live_bytes: u64 = 0,
+    sink_live_bytes: u64 = 0,
+    flush_build_memory_count: u64 = 0,
+    flush_segment_bytes_count: u64 = 0,
+    flush_end_count: u64 = 0,
+    oversized_doc_count: u64 = 0,
+    estimated_build_bytes: u64 = 0,
+    estimated_segment_bytes: u64 = 0,
+    rss_before: u64 = 0,
+    rss_after_analyze: u64 = 0,
+    rss_after_postings_build: u64 = 0,
+    rss_after_sections: u64 = 0,
+    rss_after_publish: u64 = 0,
 };
+
+const TextBuildResourceTracker = struct {
+    manager: ?*resource_manager_mod.ResourceManager,
+    profile: ?*BuildTextProfile,
+    current_bytes: u64 = 0,
+
+    fn init(manager: ?*resource_manager_mod.ResourceManager, profile: ?*BuildTextProfile) TextBuildResourceTracker {
+        return .{ .manager = manager, .profile = profile };
+    }
+
+    fn adjust(self: *TextBuildResourceTracker, next: u64) !void {
+        if (self.manager) |manager| {
+            try manager.adjustUsage(.full_text_build_working_set, &self.current_bytes, next);
+        } else {
+            self.current_bytes = next;
+        }
+        if (self.profile) |profile| profile.resource_peak_bytes = @max(profile.resource_peak_bytes, self.current_bytes);
+    }
+
+    fn release(self: *TextBuildResourceTracker) void {
+        if (self.manager) |manager| {
+            manager.releaseBytes(.full_text_build_working_set, self.current_bytes);
+        }
+        self.current_bytes = 0;
+    }
+};
+
+fn estimateTextDocInputBytes(docs: []const TextDocument) u64 {
+    var total: u64 = 0;
+    for (docs) |doc| {
+        total +|= estimateTextDocumentInputBytes(doc);
+    }
+    return total;
+}
+
+fn estimateTextDocumentInputBytes(doc: TextDocument) u64 {
+    var total: u64 = @intCast(doc.id.len + doc.stored_data.len);
+    total +|= @as(u64, @intCast(doc.text_fields.len)) * (@sizeOf(TextField) + 16);
+    for (doc.text_fields) |field| {
+        total +|= @intCast(field.field_name.len + field.text.len);
+    }
+    if (doc.typed_fields) |typed_fields| {
+        total +|= @as(u64, @intCast(typed_fields.len)) * (@sizeOf(TypedFieldValue) + 16);
+    }
+    return total;
+}
+
+pub fn estimateTextDocumentSegmentBytes(doc: TextDocument) u64 {
+    var total: u64 = 64 + @as(u64, @intCast(doc.id.len + doc.stored_data.len));
+    for (doc.text_fields) |field| {
+        total +|= 16 + @as(u64, @intCast(field.field_name.len + field.text.len));
+    }
+    if (doc.typed_fields) |typed_fields| {
+        total +|= @as(u64, @intCast(typed_fields.len)) * 32;
+        for (typed_fields) |field| total +|= @intCast(field.field_name.len);
+    }
+    return total;
+}
+
+pub fn estimateTextDocumentBuildMemoryBytes(doc: TextDocument) u64 {
+    var text_bytes: u64 = 0;
+    for (doc.text_fields) |field| {
+        text_bytes +|= @intCast(field.field_name.len + field.text.len);
+    }
+    const typed_count: u64 = if (doc.typed_fields) |typed_fields| @intCast(typed_fields.len) else 0;
+    const field_count: u64 = @intCast(doc.text_fields.len);
+    return estimateTextDocumentInputBytes(doc) +
+        estimateStoredDocBytes(&.{doc}) +
+        text_bytes * 4 +
+        field_count * 384 +
+        typed_count * 128 +
+        1024;
+}
+
+pub const TextBuildSplitReason = enum {
+    end,
+    build_memory,
+    segment_bytes,
+};
+
+pub const TextBuildSplitOptions = struct {
+    target_build_memory_bytes: usize = default_build_memory_target_bytes,
+    target_segment_bytes: usize = std.math.maxInt(usize),
+};
+
+pub const TextBuildSplit = struct {
+    end: usize,
+    reason: TextBuildSplitReason,
+    estimated_build_bytes: u64,
+    estimated_segment_bytes: u64,
+    oversized_doc: bool = false,
+};
+
+pub fn splitTextDocumentsForBuildBudget(
+    docs: []const TextDocument,
+    start: usize,
+    options: TextBuildSplitOptions,
+) TextBuildSplit {
+    const target_build: u64 = @max(@as(u64, 1), @as(u64, @intCast(options.target_build_memory_bytes)));
+    const target_segment: u64 = @max(@as(u64, 1), @as(u64, @intCast(options.target_segment_bytes)));
+    var end = start;
+    var build_bytes: u64 = 0;
+    var segment_bytes: u64 = 0;
+    while (end < docs.len) {
+        const doc_build_bytes = estimateTextDocumentBuildMemoryBytes(docs[end]);
+        const doc_segment_bytes = estimateTextDocumentSegmentBytes(docs[end]);
+        const next_build_bytes = build_bytes +| doc_build_bytes;
+        const next_segment_bytes = segment_bytes +| doc_segment_bytes;
+        if (end > start and next_build_bytes > target_build) {
+            return .{
+                .end = end,
+                .reason = .build_memory,
+                .estimated_build_bytes = build_bytes,
+                .estimated_segment_bytes = segment_bytes,
+            };
+        }
+        if (end > start and next_segment_bytes > target_segment) {
+            return .{
+                .end = end,
+                .reason = .segment_bytes,
+                .estimated_build_bytes = build_bytes,
+                .estimated_segment_bytes = segment_bytes,
+            };
+        }
+        end += 1;
+        build_bytes = next_build_bytes;
+        segment_bytes = next_segment_bytes;
+        if (end == start + 1 and (build_bytes > target_build or segment_bytes > target_segment)) {
+            return .{
+                .end = end,
+                .reason = if (build_bytes > target_build) .build_memory else .segment_bytes,
+                .estimated_build_bytes = build_bytes,
+                .estimated_segment_bytes = segment_bytes,
+                .oversized_doc = true,
+            };
+        }
+    }
+    return .{
+        .end = end,
+        .reason = .end,
+        .estimated_build_bytes = build_bytes,
+        .estimated_segment_bytes = segment_bytes,
+    };
+}
+
+fn estimateStoredDocBytes(docs: []const TextDocument) u64 {
+    var total: u64 = 0;
+    for (docs) |doc| {
+        total +|= @intCast(doc.id.len + doc.stored_data.len);
+        total +|= 32;
+    }
+    return total;
+}
+
+fn estimateFieldPostingsBuilderBytes(builders: *std.StringHashMapUnmanaged(FieldPostingsBuilder)) u64 {
+    var total: u64 = @as(u64, @intCast(builders.capacity())) * (@sizeOf([]const u8) + @sizeOf(FieldPostingsBuilder) + 24);
+    var it = builders.iterator();
+    while (it.next()) |entry| {
+        total +|= @intCast(entry.key_ptr.*.len);
+        total +|= entry.value_ptr.estimatedMemoryBytes();
+    }
+    return total;
+}
+
+fn estimateTypedDocValuesBytes(typed_fields: *std.StringHashMapUnmanaged(TypedFieldCollector)) u64 {
+    var total: u64 = @as(u64, @intCast(typed_fields.capacity())) * (@sizeOf([]const u8) + @sizeOf(TypedFieldCollector) + 24);
+    var it = typed_fields.iterator();
+    while (it.next()) |entry| {
+        total +|= @intCast(entry.key_ptr.*.len);
+        if (entry.value_ptr.writer) |*writer| total +|= writer.estimatedMemoryBytes();
+    }
+    return total;
+}
+
+fn noteBuildMemorySample(profile: ?*BuildTextProfile, enabled: bool, comptime field: []const u8) void {
+    if (enabled) {
+        const p = profile orelse return;
+        const stats = process_memory.snapshot();
+        @field(p, field) = stats.resident_bytes;
+    }
+}
 
 /// Build a segment from text documents, analyzing each text field.
 /// The default_analyzer is used for fields without an explicit analyzer.
@@ -236,10 +554,35 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
     text_analysis: TextAnalysisConfig,
     options: BuildTextOptions,
 ) ![]u8 {
+    var sink_impl = segment_mod.MemorySegmentSink.init(alloc);
+    errdefer sink_impl.deinit();
+    var sink = sink_impl.sink();
+    try writeSegmentFromTextWithAnalysisOptions(alloc, docs, default_analyzer, text_analysis, options, &sink);
+    return try sink_impl.finishOwned();
+}
+
+pub fn writeSegmentFromTextWithAnalysisOptions(
+    alloc: Allocator,
+    docs: []const TextDocument,
+    default_analyzer: *const analysis_mod.Analyzer,
+    text_analysis: TextAnalysisConfig,
+    options: BuildTextOptions,
+    sink: *segment_mod.SegmentSink,
+) !void {
     const profile = options.profile;
+    const profile_timings = profile != null and options.profile_timings;
+    const profile_working_set = profile != null and options.profile_working_set;
     if (profile) |p| {
         p.doc_count +|= @intCast(docs.len);
+        p.build_memory_target_bytes = @intCast(options.build_memory_target_bytes);
+        p.doc_scratch_retained_bytes = @intCast(options.doc_scratch_retained_bytes);
     }
+    noteBuildMemorySample(profile, profile_working_set, "rss_before");
+
+    var resource_tracker = TextBuildResourceTracker.init(options.resource_manager, profile);
+    defer resource_tracker.release();
+    const input_estimated_bytes = estimateTextDocInputBytes(docs);
+    try resource_tracker.adjust(input_estimated_bytes);
 
     var typed_sections = std.ArrayListUnmanaged(ExtraSection).empty;
     defer {
@@ -247,12 +590,8 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
         typed_sections.deinit(alloc);
     }
 
-    var field_builders = std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder).empty;
-    defer {
-        var it = field_builders.valueIterator();
-        while (it.next()) |b| b.deinit();
-        field_builders.deinit(alloc);
-    }
+    var field_builders = std.StringHashMapUnmanaged(FieldPostingsBuilder).empty;
+    defer deinitFieldPostingsBuilders(alloc, &field_builders);
 
     var seg_writer = segment_mod.SegmentWriter.init(alloc);
     defer seg_writer.deinit();
@@ -281,13 +620,19 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
     var doc_arena_state = std.heap.ArenaAllocator.init(alloc);
     defer doc_arena_state.deinit();
 
+    var scratch = TextBuildScratch{};
+    defer scratch.deinit(alloc);
+
     for (docs, 0..) |text_doc, doc_idx| {
-        _ = doc_arena_state.reset(.retain_capacity);
+        _ = doc_arena_state.reset(.{ .retain_with_limit = options.doc_scratch_retained_bytes });
+        scratch.reset(alloc, options.doc_scratch_retained_bytes);
         const doc_alloc = doc_arena_state.allocator();
 
-        const stored_attach_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+        const stored_attach_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         try seg_writer.addStoredDocBorrowed(text_doc.id, text_doc.stored_data);
-        if (profile) |p| p.stored_doc_attach_ns +|= platform_time.monotonicNs() - stored_attach_start_ns;
+        if (profile_timings) {
+            if (profile) |p| p.stored_doc_attach_ns +|= platform_time.monotonicNs() - stored_attach_start_ns;
+        }
 
         const doc_ordinal = text_doc.doc_ordinal orelse 0;
         has_doc_ordinal = has_doc_ordinal or doc_ordinal != 0;
@@ -307,6 +652,8 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
                     default_analyzer,
                     text_analysis,
                     profile,
+                    profile_timings,
+                    &scratch,
                 );
             }
         } else {
@@ -315,17 +662,17 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
             for (text_doc.text_fields) |tf| {
                 if (profile) |p| p.text_field_count +|= 1;
                 const analyzer = try cachedFieldAnalyzer(alloc, &analyzer_cache, tf, default_analyzer, text_analysis);
-                const analyzer_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+                const analyzer_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
                 const tokens = try analyzer.analyze(doc_alloc, tf.text);
                 if (profile) |p| {
-                    p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
+                    if (profile_timings) p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
                     p.token_count +|= @intCast(tokens.len);
                 }
                 if (tokens.len == 0) {
                     continue;
                 }
 
-                const term_accum_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+                const term_accum_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
                 const field_gop = try field_maps.getOrPut(doc_alloc, tf.field_name);
                 if (!field_gop.found_existing) {
                     field_gop.key_ptr.* = tf.field_name;
@@ -343,18 +690,19 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
                     try gop.value_ptr.positions.append(doc_alloc, base_position + tok.position);
                 }
                 field_gop.value_ptr.token_offset += @intCast(tokens.len);
-                if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
+                if (profile_timings) {
+                    if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
+                }
             }
 
-            const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+            const hit_materialize_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
             var field_it = field_maps.iterator();
             while (field_it.next()) |field_entry| {
-                // Convert to TermHit slice
-                var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
+                scratch.hits.clearRetainingCapacity();
 
                 var it = field_entry.value_ptr.term_map.iterator();
                 while (it.next()) |entry| {
-                    try hits.append(doc_alloc, .{
+                    try scratch.hits.append(alloc, .{
                         .term = entry.key_ptr.*,
                         .freq = entry.value_ptr.freq,
                         .norm = field_entry.value_ptr.token_offset,
@@ -363,15 +711,11 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
                     if (profile) |p| p.term_hit_count +|= 1;
                 }
 
-                if (hits.items.len == 0) continue;
+                if (scratch.hits.items.len == 0) continue;
 
                 const field_name = field_entry.key_ptr.*;
-                const builder_gop = try field_builders.getOrPut(alloc, field_name);
-                if (!builder_gop.found_existing) {
-                    builder_gop.key_ptr.* = field_name;
-                    builder_gop.value_ptr.* = inverted.InvertedIndexBuilder.init(alloc, .{});
-                }
-                try builder_gop.value_ptr.addDocument(@intCast(doc_idx), hits.items);
+                const builder = try ensureFieldPostingsBuilder(alloc, &field_builders, field_name);
+                try builder.addDocument(@intCast(doc_idx), scratch.hits.items);
 
                 const field_index_gop = try field_indices.getOrPut(alloc, field_name);
                 if (!field_index_gop.found_existing) {
@@ -379,7 +723,9 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
                     field_index_gop.value_ptr.* = try seg_writer.addField(field_name);
                 }
             }
-            if (profile) |p| p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
+            if (profile_timings) {
+                if (profile) |p| p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
+            }
         }
 
         var doc_options = options;
@@ -387,7 +733,7 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
         if (text_doc.infer_type_dynamic_paths.len > 0) {
             doc_options.infer_type_dynamic_paths = text_doc.infer_type_dynamic_paths;
         }
-        const typed_collect_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+        const typed_collect_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         if (text_doc.typed_fields) |projected_typed_fields| {
             for (projected_typed_fields) |field| {
                 try appendTypedFieldValue(alloc, &typed_fields, field.field_name, @intCast(doc_idx), .{
@@ -400,44 +746,101 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
         } else {
             try collectTypedFieldValues(alloc, text_doc.stored_data, @intCast(doc_idx), &typed_fields, text_analysis, doc_options);
         }
-        if (profile) |p| p.typed_collect_ns +|= platform_time.monotonicNs() - typed_collect_start_ns;
+        if (profile_timings) {
+            if (profile) |p| p.typed_collect_ns +|= platform_time.monotonicNs() - typed_collect_start_ns;
+        }
+        if (profile_working_set) {
+            if (profile) |p| {
+                p.peak_doc_scratch_bytes = @max(p.peak_doc_scratch_bytes, @as(u64, @intCast(doc_arena_state.queryCapacity())));
+                p.builder_scratch_peak_bytes = @max(p.builder_scratch_peak_bytes, scratch.estimatedMemoryBytes());
+            }
+        }
     }
+    if (profile_working_set) {
+        if (profile) |p| {
+            p.stored_docs_estimated_bytes = estimateStoredDocBytes(docs);
+            p.field_postings_estimated_bytes = estimateFieldPostingsBuilderBytes(&field_builders);
+            p.typed_doc_values_estimated_bytes = estimateTypedDocValuesBytes(&typed_fields);
+            p.postings_live_bytes = p.field_postings_estimated_bytes;
+            p.typed_live_bytes = p.typed_doc_values_estimated_bytes;
+            p.doc_arena_peak_bytes = @max(p.doc_arena_peak_bytes, p.field_postings_estimated_bytes + p.typed_doc_values_estimated_bytes);
+        }
+    }
+    noteBuildMemorySample(profile, profile_working_set, "rss_after_analyze");
+    const stored_docs_estimated_bytes = estimateStoredDocBytes(docs);
+    var remaining_postings_estimated_bytes = estimateFieldPostingsBuilderBytes(&field_builders);
+    const typed_doc_values_estimated_bytes = estimateTypedDocValuesBytes(&typed_fields);
+    try resource_tracker.adjust(input_estimated_bytes +
+        stored_docs_estimated_bytes +
+        remaining_postings_estimated_bytes +
+        typed_doc_values_estimated_bytes);
 
-    const typed_build_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    const typed_build_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
+    var section_bytes: u64 = 0;
     var typed_it = typed_fields.iterator();
     while (typed_it.next()) |entry| {
         if (entry.value_ptr.conflicted or entry.value_ptr.writer == null) continue;
         const writer = &entry.value_ptr.writer.?;
         if (writer.entries.items.len == 0) continue;
         const section_data = try writer.build();
+        section_bytes +|= @intCast(section_data.len);
         try typed_sections.append(alloc, .{
             .field_name = entry.key_ptr.*,
             .section_type = .typed_doc_values,
             .data = section_data,
         });
     }
-    if (profile) |p| p.typed_build_ns +|= platform_time.monotonicNs() - typed_build_start_ns;
+    if (profile_timings) {
+        if (profile) |p| p.typed_build_ns +|= platform_time.monotonicNs() - typed_build_start_ns;
+    }
 
-    const segment_encode_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    const segment_encode_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
 
-    const section_attach_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
     var fit = field_builders.iterator();
     while (fit.next()) |entry| {
         const field_name = entry.key_ptr.*;
-        const inv_data = try entry.value_ptr.build();
+        const builder_estimated_bytes = entry.value_ptr.estimatedMemoryBytes();
+        const inverted_build_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
+        const inv_data = try entry.value_ptr.buildAlloc(alloc, if (profile_timings) profile else null);
+        if (profile_timings) {
+            if (profile) |p| p.inverted_build_ns +|= platform_time.monotonicNs() - inverted_build_start_ns;
+        }
         errdefer alloc.free(inv_data);
+        section_bytes +|= @intCast(inv_data.len);
 
         if (inv_data.len == 0) {
             alloc.free(inv_data);
+            entry.value_ptr.deinit(alloc);
+            remaining_postings_estimated_bytes -|= builder_estimated_bytes;
             continue;
         }
 
         const field_idx = field_indices.get(field_name).?;
+        const section_attach_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         try seg_writer.addSectionOwned(field_idx, .inverted_text, inv_data);
+        if (profile_timings) {
+            if (profile) |p| p.section_attach_ns +|= platform_time.monotonicNs() - section_attach_start_ns;
+        }
+        entry.value_ptr.deinit(alloc);
+        remaining_postings_estimated_bytes -|= builder_estimated_bytes;
+        if (profile_working_set) {
+            if (profile) |p| {
+                p.section_bytes = section_bytes;
+                p.field_postings_estimated_bytes = remaining_postings_estimated_bytes;
+                p.postings_live_bytes = remaining_postings_estimated_bytes;
+                p.fst_and_term_metadata_bytes = @max(p.fst_and_term_metadata_bytes, section_bytes);
+            }
+        }
+        try resource_tracker.adjust(input_estimated_bytes +
+            stored_docs_estimated_bytes +
+            section_bytes +
+            remaining_postings_estimated_bytes +
+            typed_doc_values_estimated_bytes);
     }
 
     for (typed_sections.items) |*section| {
+        const section_attach_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         const gop = try field_indices.getOrPut(alloc, section.field_name);
         if (!gop.found_existing) {
             gop.key_ptr.* = section.field_name;
@@ -446,18 +849,44 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
         const owned = @constCast(section.data);
         try seg_writer.addSectionOwned(gop.value_ptr.*, section.section_type, owned);
         section.data = &.{};
+        if (profile_timings) {
+            if (profile) |p| p.section_attach_ns +|= platform_time.monotonicNs() - section_attach_start_ns;
+        }
     }
-    if (profile) |p| p.section_attach_ns +|= platform_time.monotonicNs() - section_attach_start_ns;
+    if (profile_working_set) {
+        if (profile) |p| {
+            p.section_bytes = section_bytes;
+            p.section_live_bytes = section_bytes;
+            p.field_postings_estimated_bytes = remaining_postings_estimated_bytes;
+            p.typed_doc_values_estimated_bytes = typed_doc_values_estimated_bytes;
+            p.postings_live_bytes = remaining_postings_estimated_bytes;
+            p.typed_live_bytes = typed_doc_values_estimated_bytes;
+            p.fst_and_term_metadata_bytes = @max(p.fst_and_term_metadata_bytes, section_bytes);
+        }
+    }
+    noteBuildMemorySample(profile, profile_working_set, "rss_after_postings_build");
+    try resource_tracker.adjust(input_estimated_bytes + estimateStoredDocBytes(docs) + section_bytes);
 
-    const segment_assembly_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
-    const segment = try seg_writer.build();
+    const segment_assembly_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
+    const segment_start_len = sink.len();
+    try seg_writer.writeToSink(sink);
     if (profile) |p| {
-        p.segment_assembly_ns +|= platform_time.monotonicNs() - segment_assembly_start_ns;
-        p.stored_compress_ns +|= seg_writer.last_stored_compress_ns;
-        p.segment_encode_ns +|= platform_time.monotonicNs() - segment_encode_start_ns;
-        p.segment_bytes +|= @intCast(segment.len);
+        if (profile_timings) {
+            p.segment_assembly_ns +|= platform_time.monotonicNs() - segment_assembly_start_ns;
+            p.stored_compress_ns +|= seg_writer.last_stored_compress_ns;
+            p.segment_encode_ns +|= platform_time.monotonicNs() - segment_encode_start_ns;
+        }
+        p.stored_raw_bytes +|= seg_writer.last_stored_raw_bytes;
+        p.stored_compressed_bytes +|= seg_writer.last_stored_compressed_bytes;
+        p.segment_bytes +|= @intCast(sink.len() - segment_start_len);
+        if (profile_working_set) {
+            p.segment_sink_bytes = @intCast(sink.len() - segment_start_len);
+            p.sink_live_bytes = p.segment_sink_bytes;
+        }
     }
-    return segment;
+    noteBuildMemorySample(profile, profile_working_set, "rss_after_sections");
+    try resource_tracker.adjust(section_bytes + @as(u64, @intCast(sink.len() - segment_start_len)));
+    noteBuildMemorySample(profile, profile_working_set, "rss_after_publish");
 }
 
 const TermAcc = struct {
@@ -498,7 +927,7 @@ fn cachedFieldAnalyzer(
 fn addSingleTextFieldToBuilders(
     alloc: Allocator,
     doc_alloc: Allocator,
-    field_builders: *std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder),
+    field_builders: *std.StringHashMapUnmanaged(FieldPostingsBuilder),
     field_indices: *std.StringHashMapUnmanaged(u16),
     seg_writer: *segment_mod.SegmentWriter,
     analyzer_cache: *std.StringHashMapUnmanaged(*const analysis_mod.Analyzer),
@@ -507,39 +936,46 @@ fn addSingleTextFieldToBuilders(
     default_analyzer: *const analysis_mod.Analyzer,
     text_analysis: TextAnalysisConfig,
     profile: ?*BuildTextProfile,
+    profile_timings: bool,
+    scratch: *TextBuildScratch,
 ) !void {
     if (profile) |p| p.text_field_count +|= 1;
     const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
-    const analyzer_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    const analyzer_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     const tokens = try analyzer.analyze(doc_alloc, field.text);
     if (profile) |p| {
-        p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
+        if (profile_timings) p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
         p.token_count +|= @intCast(tokens.len);
     }
     if (tokens.len == 0) return;
 
-    const term_accum_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    const term_accum_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     if (tokens.len <= 64 and tokenTermsAreUnique(tokens)) {
-        if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
+        if (profile_timings) {
+            if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
+        }
 
-        const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
-        const positions = try doc_alloc.alloc(u32, tokens.len);
-        var hits = try doc_alloc.alloc(inverted.InvertedIndexBuilder.TermHit, tokens.len);
+        const hit_materialize_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
+        scratch.positions.clearRetainingCapacity();
+        scratch.hits.clearRetainingCapacity();
+        try scratch.positions.ensureTotalCapacity(alloc, tokens.len);
+        try scratch.hits.ensureTotalCapacity(alloc, tokens.len);
         const norm: u32 = @intCast(tokens.len);
-        for (tokens, 0..) |tok, i| {
-            positions[i] = tok.position;
-            hits[i] = .{
+        for (tokens) |tok| {
+            scratch.positions.appendAssumeCapacity(tok.position);
+            const pos_index = scratch.positions.items.len - 1;
+            scratch.hits.appendAssumeCapacity(.{
                 .term = tok.term,
                 .freq = 1,
                 .norm = norm,
-                .positions = positions[i .. i + 1],
-            };
+                .positions = scratch.positions.items[pos_index .. pos_index + 1],
+            });
         }
         if (profile) |p| {
-            p.term_hit_count +|= @intCast(hits.len);
-            p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
+            p.term_hit_count +|= @intCast(scratch.hits.items.len);
+            if (profile_timings) p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
         }
-        try addFieldHitsToBuilder(alloc, field_builders, field_indices, seg_writer, doc_idx, field.field_name, hits);
+        try addFieldHitsToBuilder(alloc, field_builders, field_indices, seg_writer, doc_idx, field.field_name, scratch.hits.items);
         return;
     }
 
@@ -554,13 +990,15 @@ fn addSingleTextFieldToBuilders(
         try gop.value_ptr.positions.append(doc_alloc, tok.position);
     }
     field_acc.token_offset = @intCast(tokens.len);
-    if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
+    if (profile_timings) {
+        if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
+    }
 
-    const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
-    var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
+    const hit_materialize_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
+    scratch.hits.clearRetainingCapacity();
     var it = field_acc.term_map.iterator();
     while (it.next()) |entry| {
-        try hits.append(doc_alloc, .{
+        try scratch.hits.append(alloc, .{
             .term = entry.key_ptr.*,
             .freq = entry.value_ptr.freq,
             .norm = field_acc.token_offset,
@@ -568,10 +1006,12 @@ fn addSingleTextFieldToBuilders(
         });
         if (profile) |p| p.term_hit_count +|= 1;
     }
-    if (profile) |p| p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
-    if (hits.items.len == 0) return;
+    if (profile_timings) {
+        if (profile) |p| p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
+    }
+    if (scratch.hits.items.len == 0) return;
 
-    try addFieldHitsToBuilder(alloc, field_builders, field_indices, seg_writer, doc_idx, field.field_name, hits.items);
+    try addFieldHitsToBuilder(alloc, field_builders, field_indices, seg_writer, doc_idx, field.field_name, scratch.hits.items);
 }
 
 fn tokenTermsAreUnique(tokens: []const analysis_mod.Token) bool {
@@ -585,19 +1025,15 @@ fn tokenTermsAreUnique(tokens: []const analysis_mod.Token) bool {
 
 fn addFieldHitsToBuilder(
     alloc: Allocator,
-    field_builders: *std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder),
+    field_builders: *std.StringHashMapUnmanaged(FieldPostingsBuilder),
     field_indices: *std.StringHashMapUnmanaged(u16),
     seg_writer: *segment_mod.SegmentWriter,
     doc_idx: u32,
     field_name: []const u8,
     hits: []const inverted.InvertedIndexBuilder.TermHit,
 ) !void {
-    const builder_gop = try field_builders.getOrPut(alloc, field_name);
-    if (!builder_gop.found_existing) {
-        builder_gop.key_ptr.* = field_name;
-        builder_gop.value_ptr.* = inverted.InvertedIndexBuilder.init(alloc, .{});
-    }
-    try builder_gop.value_ptr.addDocument(doc_idx, hits);
+    const builder = try ensureFieldPostingsBuilder(alloc, field_builders, field_name);
+    try builder.addDocument(doc_idx, hits);
 
     const field_index_gop = try field_indices.getOrPut(alloc, field_name);
     if (!field_index_gop.found_existing) {
@@ -1952,6 +2388,108 @@ test "buildSegmentFromTextWithAnalysisOptions records build profile" {
     try std.testing.expect(profile.token_count > 0);
     try std.testing.expect(profile.term_hit_count > 0);
     try std.testing.expect(profile.segment_bytes > 0);
+    try std.testing.expect(profile.resource_peak_bytes > 0);
+    try std.testing.expect(profile.stored_docs_estimated_bytes > 0);
+    try std.testing.expect(profile.field_postings_estimated_bytes > 0);
+    try std.testing.expect(profile.section_bytes > 0);
+}
+
+test "splitTextDocumentsForBuildBudget flushes on build memory before segment bytes" {
+    const docs = [_]TextDocument{
+        .{
+            .id = "doc1",
+            .stored_data = "{}",
+            .text_fields = &.{.{ .field_name = "body", .text = "alpha beta gamma delta epsilon" }},
+        },
+        .{
+            .id = "doc2",
+            .stored_data = "{}",
+            .text_fields = &.{.{ .field_name = "body", .text = "zeta eta theta iota kappa" }},
+        },
+        .{
+            .id = "doc3",
+            .stored_data = "{}",
+            .text_fields = &.{.{ .field_name = "body", .text = "lambda mu nu xi omicron" }},
+        },
+    };
+    const first_estimate = estimateTextDocumentBuildMemoryBytes(docs[0]);
+    const split = splitTextDocumentsForBuildBudget(&docs, 0, .{
+        .target_build_memory_bytes = @intCast(first_estimate + 1),
+        .target_segment_bytes = std.math.maxInt(usize),
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), split.end);
+    try std.testing.expectEqual(TextBuildSplitReason.build_memory, split.reason);
+    try std.testing.expect(!split.oversized_doc);
+    try std.testing.expect(split.estimated_build_bytes > 0);
+}
+
+test "splitTextDocumentsForBuildBudget keeps oversized single document" {
+    const docs = [_]TextDocument{
+        .{
+            .id = "doc1",
+            .stored_data = "{}",
+            .text_fields = &.{.{ .field_name = "body", .text = "alpha beta gamma delta epsilon" }},
+        },
+    };
+    const split = splitTextDocumentsForBuildBudget(&docs, 0, .{
+        .target_build_memory_bytes = 1,
+        .target_segment_bytes = std.math.maxInt(usize),
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), split.end);
+    try std.testing.expectEqual(TextBuildSplitReason.build_memory, split.reason);
+    try std.testing.expect(split.oversized_doc);
+    try std.testing.expect(split.estimated_build_bytes > 1);
+}
+
+test "buildSegmentFromTextWithAnalysisOptions accounts and releases full text working set" {
+    const alloc = std.testing.allocator;
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var profile = BuildTextProfile{};
+    const seg_bytes = try buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+        .{
+            .id = "doc1",
+            .stored_data = "{\"title\":\"alpha beta\"}",
+            .text_fields = &.{.{ .field_name = "title", .text = "alpha beta gamma" }},
+        },
+    }, &analysis_mod.default_analyzer, .{}, .{
+        .profile = &profile,
+        .resource_manager = &manager,
+    });
+    defer alloc.free(seg_bytes);
+
+    const stats = manager.sliceStats(.full_text_build_working_set);
+    try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
+    try std.testing.expect(stats.peak_bytes > 0);
+    try std.testing.expect(profile.resource_peak_bytes > 0);
+}
+
+test "buildSegmentFromTextWithAnalysisOptions releases full text working set after budget rejection" {
+    const alloc = std.testing.allocator;
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 1,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var profile = BuildTextProfile{};
+    try std.testing.expectError(error.ResourceBudgetExceeded, buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+        .{
+            .id = "doc1",
+            .stored_data = "{\"title\":\"alpha beta\"}",
+            .text_fields = &.{.{ .field_name = "title", .text = "alpha beta gamma" }},
+        },
+    }, &analysis_mod.default_analyzer, .{}, .{
+        .profile = &profile,
+        .resource_manager = &manager,
+    }));
+
+    const stats = manager.sliceStats(.full_text_build_working_set);
+    try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
+    try std.testing.expect(stats.hard_limit_rejections > 0);
 }
 
 test "buildSegmentFromText omits empty inverted sections" {
