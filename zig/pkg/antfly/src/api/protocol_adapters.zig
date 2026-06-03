@@ -15,8 +15,11 @@
 const std = @import("std");
 const routes = @import("http_routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const usermgr = @import("../usermgr/mod.zig");
 const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
+
+const trusted_principal_header = "X-Antfly-Trusted-Principal";
 
 const McpToolKind = enum {
     create_table,
@@ -25,6 +28,7 @@ const McpToolKind = enum {
     create_index,
     drop_index,
     list_indexes,
+    lookup,
     query,
     backup,
     restore,
@@ -103,6 +107,16 @@ const mcp_tool_specs = [_]McpToolSpec{
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{
+        .kind = .lookup,
+        .name = "lookup",
+        .description = "Look up an Antfly document by key",
+        .fields = &.{
+            .{ .name = "tableName", .schema_type = .string, .required = true },
+            .{ .name = "key", .schema_type = .string, .required = true },
+            .{ .name = "fields", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
+        },
+    },
+    .{
         .kind = .query,
         .name = "query",
         .description = "Run an Antfly table query",
@@ -149,11 +163,12 @@ const mcp_tool_specs = [_]McpToolSpec{
     },
 };
 
-pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest) !http_common.HttpResponse {
+pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authenticated_identity: anytype) !http_common.HttpResponse {
     const Server = @TypeOf(server_ptr);
     const ToolContext = struct {
         server: Server,
         authorization: ?[]const u8,
+        trusted_principal: ?[]const u8,
         kind: McpToolKind,
 
         fn handler(ctx: *@This()) mcp.ToolHandler {
@@ -169,6 +184,7 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest) !http
                 .create_index => try ctx.createIndex(alloc, args),
                 .drop_index => try ctx.indexRoute(alloc, args, .DELETE, ""),
                 .list_indexes => try ctx.listIndexes(alloc, args),
+                .lookup => try ctx.lookup(alloc, args),
                 .query => try ctx.query(alloc, args),
                 .backup => try ctx.backupRestore(alloc, args, "backup"),
                 .restore => try ctx.backupRestore(alloc, args, "restore"),
@@ -217,6 +233,33 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest) !http
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes", .{ routes.Routes.tables, table_name });
             return try ctx.simpleRoute(alloc, .GET, uri, "");
+        }
+
+        fn lookup(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const key = jsonStringArg(args, "key") orelse return mcpError(alloc, "missing key");
+
+            var uri = std.ArrayListUnmanaged(u8).empty;
+            errdefer uri.deinit(alloc);
+            try uri.appendSlice(alloc, routes.Routes.tables);
+            try uri.append(alloc, '/');
+            try uri.appendSlice(alloc, table_name);
+            try uri.appendSlice(alloc, routes.Routes.lookup_marker);
+            try appendUriPathSegment(alloc, &uri, key);
+
+            if (jsonValueArg(args, "fields")) |fields| {
+                if (fields != .array) return mcpError(alloc, "fields must be an array");
+                if (fields.array.items.len > 0) {
+                    try uri.appendSlice(alloc, "?fields=");
+                    for (fields.array.items, 0..) |field, i| {
+                        if (field != .string) return mcpError(alloc, "fields must contain strings");
+                        if (i != 0) try uri.append(alloc, ',');
+                        try uri.appendSlice(alloc, field.string);
+                    }
+                }
+            }
+
+            return try ctx.simpleRoute(alloc, .GET, try uri.toOwnedSlice(alloc), "");
         }
 
         fn indexRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, body: []const u8) !mcp.CallToolResult {
@@ -276,9 +319,14 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest) !http
         }
 
         fn simpleRoute(ctx: *@This(), alloc: std.mem.Allocator, method: http_common.Method, uri: []const u8, body: []const u8) !mcp.CallToolResult {
+            const headers: []const http_common.RequestHeader = if (ctx.trusted_principal) |trusted_principal|
+                &[_]http_common.RequestHeader{.{ .name = trusted_principal_header, .value = trusted_principal }}
+            else
+                &.{};
             var resp = try ctx.server.handle(.{
                 .method = method,
                 .uri = uri,
+                .headers = headers,
                 .authorization = ctx.authorization,
                 .content_type = if (body.len == 0) null else "application/json",
                 .body = body,
@@ -290,7 +338,12 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest) !http
 
     var contexts: [mcp_tool_specs.len]ToolContext = undefined;
     for (&contexts, mcp_tool_specs) |*ctx, spec| {
-        ctx.* = .{ .server = server_ptr, .authorization = req.authorization, .kind = spec.kind };
+        ctx.* = .{
+            .server = server_ptr,
+            .authorization = req.authorization,
+            .trusted_principal = req.header(trusted_principal_header),
+            .kind = spec.kind,
+        };
     }
 
     var input_schemas: [mcp_tool_specs.len][]u8 = undefined;
@@ -309,6 +362,7 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest) !http
     };
     defer protocol_server.deinit(server_ptr.alloc);
     for (&contexts, mcp_tool_specs, 0..) |*ctx, spec, i| {
+        if (!mcpToolVisibleForIdentity(spec.kind, authenticated_identity)) continue;
         try protocol_server.addTool(server_ptr.alloc, .{
             .name = spec.name,
             .description = spec.description,
@@ -335,6 +389,40 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest) !http
     };
     defer transport.deinit(server_ptr.alloc);
     return try mcpBodyResponseWithStatus(server_ptr.alloc, transport);
+}
+
+fn mcpToolVisibleForIdentity(kind: McpToolKind, authenticated_identity: anytype) bool {
+    const identity = authenticated_identity orelse return true;
+    return switch (kind) {
+        .list_tables => identityHasPermission(identity.permissions, .table, "*", .read),
+        .query, .lookup, .list_indexes => identityHasAnyPermission(identity.permissions, .table, .read),
+        .batch => identityHasAnyPermission(identity.permissions, .table, .write),
+        .create_table, .drop_table, .create_index, .drop_index, .backup, .restore => identityHasAnyPermission(identity.permissions, .table, .admin),
+    };
+}
+
+fn identityHasAnyPermission(permissions: []const usermgr.Permission, resource_type: usermgr.ResourceType, permission_type: usermgr.PermissionType) bool {
+    for (permissions) |permission| {
+        const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
+        if (!type_match) continue;
+        if (permission.type == .admin or permission.type == permission_type) return true;
+    }
+    return false;
+}
+
+fn identityHasPermission(
+    permissions: []const usermgr.Permission,
+    resource_type: usermgr.ResourceType,
+    resource: []const u8,
+    permission_type: usermgr.PermissionType,
+) bool {
+    for (permissions) |permission| {
+        const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
+        const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource);
+        if (!type_match or !resource_match) continue;
+        if (permission.type == .admin or permission.type == permission_type) return true;
+    }
+    return false;
 }
 
 fn validateMcpSession(server_ptr: anytype, req: http_common.HttpRequest) !?http_common.HttpResponse {
@@ -705,6 +793,26 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     const encoded = try stringifyJsonValue(alloc, .{ .string = text });
     defer alloc.free(encoded);
     try out.appendSlice(alloc, encoded);
+}
+
+fn appendUriPathSegment(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (text) |ch| {
+        if (isUriUnreserved(ch)) {
+            try out.append(alloc, ch);
+        } else {
+            try out.append(alloc, '%');
+            try out.append(alloc, hex[ch >> 4]);
+            try out.append(alloc, hex[ch & 0x0f]);
+        }
+    }
+}
+
+fn isUriUnreserved(ch: u8) bool {
+    return (ch >= 'A' and ch <= 'Z') or
+        (ch >= 'a' and ch <= 'z') or
+        (ch >= '0' and ch <= '9') or
+        ch == '-' or ch == '.' or ch == '_' or ch == '~';
 }
 
 fn mcpError(alloc: std.mem.Allocator, text: []const u8) !mcp.CallToolResult {
