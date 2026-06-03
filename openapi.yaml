@@ -12209,6 +12209,37 @@ components:
           description: Filter by detected JSON type
         mapping:
           $ref: '#/components/schemas/TemplateFieldMapping'
+    ForeignKeyReference:
+      type: object
+      description: Parent side of a relational foreign-key constraint.
+      properties:
+        table:
+          type: string
+          description: Referenced relational table name.
+        columns:
+          type: array
+          items:
+            type: string
+          description: Referenced parent columns. Currently must be exactly ["_id"].
+    ForeignKey:
+      type: object
+      description: Relational foreign-key constraint.
+      properties:
+        name:
+          type: string
+          description: Constraint name, unique within the table schema.
+        columns:
+          type: array
+          items:
+            type: string
+          description: Child columns. Currently exactly one scalar relational column is supported.
+        references:
+          $ref: '#/components/schemas/ForeignKeyReference'
+        on_delete:
+          type: string
+          enum:
+            - restrict
+          description: Delete action. Currently only "restrict" is supported.
     TableSchema:
       type: object
       description: Schema definition for a table with multiple document types
@@ -12268,6 +12299,18 @@ components:
             that don't have explicit mappings and dynamic mapping is enabled, templates are
 
             evaluated in order to determine how those fields should be indexed.
+        foreign_keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/ForeignKey'
+          description: >
+            Relational-mode referential constraints. The first supported shape is
+
+            a single declared child column referencing a parent table's `_id`
+
+            document key with `on_delete: "restrict"`. Unsupported shapes are
+
+            rejected during schema validation.
     Boost:
       type: number
       format: double

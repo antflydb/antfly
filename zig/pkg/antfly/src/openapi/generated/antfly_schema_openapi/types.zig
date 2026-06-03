@@ -70,6 +70,14 @@ pub const DocumentSchema = struct {
     schema: ?std.json.Value = null,
 };
 
+/// Parent side of a relational foreign-key constraint.
+pub const ForeignKeyReference = struct {
+    /// Referenced relational table name.
+    table: ?[]const u8 = null,
+    /// Referenced parent columns. Currently must be exactly ["_id"].
+    columns: ?[]const []const u8 = null,
+};
+
 /// Field mapping to apply when a dynamic template matches
 pub const TemplateFieldMapping = struct {
     type: ?AntflyType = null,
@@ -83,6 +91,17 @@ pub const TemplateFieldMapping = struct {
     include_in_all: ?bool = null,
     /// Whether to enable doc values for sorting/faceting
     doc_values: ?bool = null,
+};
+
+/// Relational foreign-key constraint.
+pub const ForeignKey = struct {
+    /// Constraint name, unique within the table schema.
+    name: ?[]const u8 = null,
+    /// Child columns. Currently exactly one scalar relational column is supported.
+    columns: ?[]const []const u8 = null,
+    references: ?ForeignKeyReference = null,
+    /// Delete action. Currently only "restrict" is supported.
+    on_delete: ?[]const u8 = null,
 };
 
 /// A rule for mapping dynamically detected fields. Templates are checked in order and the first matching template's mapping is used.
@@ -120,4 +139,6 @@ pub const TableSchema = struct {
     ttl_duration: ?[]const u8 = null,
     /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
     dynamic_templates: ?[]const DynamicTemplate = null,
+    /// Relational-mode referential constraints. The first supported shape is a single declared child column referencing a parent table's `_id` document key with `on_delete: "restrict"`. Unsupported shapes are rejected during schema validation.
+    foreign_keys: ?[]const ForeignKey = null,
 };

@@ -134,6 +134,18 @@ pub const RelationalColumn = struct {
     indexed: bool = true,
 };
 
+pub const ForeignKeyAction = enum(u8) {
+    restrict = 0,
+};
+
+pub const ForeignKey = struct {
+    name: []const u8,
+    child_columns: []const []const u8 = &.{},
+    parent_table: []const u8,
+    parent_columns: []const []const u8 = &.{},
+    on_delete: ForeignKeyAction = .restrict,
+};
+
 pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []const RelationalColumn) bool {
     if (current.len != next.len) return false;
     for (current, next) |a, b| {
@@ -142,6 +154,26 @@ pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []
         if (a.field_type != b.field_type) return false;
         if (a.nullable != b.nullable) return false;
         if (a.indexed != b.indexed) return false;
+    }
+    return true;
+}
+
+pub fn foreignKeyCatalogsEqual(current: []const ForeignKey, next: []const ForeignKey) bool {
+    if (current.len != next.len) return false;
+    for (current, next) |a, b| {
+        if (!std.mem.eql(u8, a.name, b.name)) return false;
+        if (!stringSlicesEqual(a.child_columns, b.child_columns)) return false;
+        if (!std.mem.eql(u8, a.parent_table, b.parent_table)) return false;
+        if (!stringSlicesEqual(a.parent_columns, b.parent_columns)) return false;
+        if (a.on_delete != b.on_delete) return false;
+    }
+    return true;
+}
+
+fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |lhs, rhs| {
+        if (!std.mem.eql(u8, lhs, rhs)) return false;
     }
     return true;
 }
@@ -156,6 +188,7 @@ pub const TableSchema = struct {
     dynamic_templates: []const DynamicTemplate = &.{},
     full_text_documents: []const FullTextDocument = &.{},
     relational_columns: []const RelationalColumn = &.{},
+    foreign_keys: []const ForeignKey = &.{},
 };
 
 // ============================================================================
@@ -176,7 +209,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 10); // format version
+    try appendU32(&buf, alloc, 11); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -239,6 +272,18 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, if (column.indexed) 1 else 0);
     }
 
+    // Foreign-key catalog (format version 11+).
+    try appendU32(&buf, alloc, @intCast(schema.foreign_keys.len));
+    for (schema.foreign_keys) |foreign_key| {
+        try appendStr(&buf, alloc, foreign_key.name);
+        try appendU32(&buf, alloc, @intCast(foreign_key.child_columns.len));
+        for (foreign_key.child_columns) |column| try appendStr(&buf, alloc, column);
+        try appendStr(&buf, alloc, foreign_key.parent_table);
+        try appendU32(&buf, alloc, @intCast(foreign_key.parent_columns.len));
+        for (foreign_key.parent_columns) |column| try appendStr(&buf, alloc, column);
+        try buf.append(alloc, @intFromEnum(foreign_key.on_delete));
+    }
+
     const result = try alloc.dupe(u8, buf.items);
     buf.deinit(alloc);
     return result;
@@ -252,7 +297,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version != 1 and fmt_version != 2 and fmt_version != 3 and fmt_version != 4 and fmt_version != 5 and fmt_version != 6 and fmt_version != 7 and fmt_version != 8 and fmt_version != 9 and fmt_version != 10) return error.UnsupportedVersion;
+    if (fmt_version != 1 and fmt_version != 2 and fmt_version != 3 and fmt_version != 4 and fmt_version != 5 and fmt_version != 6 and fmt_version != 7 and fmt_version != 8 and fmt_version != 9 and fmt_version != 10 and fmt_version != 11) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -535,6 +580,38 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         }
         break :blk columns;
     } else &.{};
+    errdefer freeRelationalColumnsSlice(alloc, relational_columns);
+
+    const foreign_keys: []ForeignKey = if (fmt_version >= 11) blk: {
+        const foreign_key_count = readU32(data, &pos);
+        const foreign_keys = try alloc.alloc(ForeignKey, foreign_key_count);
+        var foreign_keys_initialized: usize = 0;
+        errdefer {
+            for (foreign_keys[0..foreign_keys_initialized]) |foreign_key| freeForeignKey(alloc, foreign_key);
+            alloc.free(foreign_keys);
+        }
+        for (foreign_keys) |*foreign_key| {
+            const name = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(name);
+            const child_columns = try readStringSliceAlloc(alloc, data, &pos);
+            errdefer freeStringSlice(alloc, child_columns);
+            const parent_table = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(parent_table);
+            const parent_columns = try readStringSliceAlloc(alloc, data, &pos);
+            errdefer freeStringSlice(alloc, parent_columns);
+            const on_delete: ForeignKeyAction = @enumFromInt(data[pos]);
+            pos += 1;
+            foreign_key.* = .{
+                .name = name,
+                .child_columns = child_columns,
+                .parent_table = parent_table,
+                .parent_columns = parent_columns,
+                .on_delete = on_delete,
+            };
+            foreign_keys_initialized += 1;
+        }
+        break :blk foreign_keys;
+    } else &.{};
 
     return .{
         .version = version,
@@ -546,6 +623,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .dynamic_templates = templates,
         .full_text_documents = full_text_documents,
         .relational_columns = relational_columns,
+        .foreign_keys = foreign_keys,
     };
 }
 
@@ -564,11 +642,33 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
     }
     if (s.dynamic_templates.len > 0) alloc.free(s.dynamic_templates);
     freeFullTextDocumentsSlice(alloc, s.full_text_documents);
-    for (s.relational_columns) |column| {
+    freeRelationalColumnsSlice(alloc, s.relational_columns);
+    freeForeignKeysSlice(alloc, s.foreign_keys);
+}
+
+fn freeRelationalColumnsSlice(alloc: Allocator, columns: []const RelationalColumn) void {
+    for (columns) |column| {
         alloc.free(column.name);
         alloc.free(column.path);
     }
-    if (s.relational_columns.len > 0) alloc.free(s.relational_columns);
+    if (columns.len > 0) alloc.free(columns);
+}
+
+fn freeForeignKeysSlice(alloc: Allocator, foreign_keys: []const ForeignKey) void {
+    for (foreign_keys) |foreign_key| freeForeignKey(alloc, foreign_key);
+    if (foreign_keys.len > 0) alloc.free(foreign_keys);
+}
+
+fn freeForeignKey(alloc: Allocator, foreign_key: ForeignKey) void {
+    alloc.free(foreign_key.name);
+    freeStringSlice(alloc, foreign_key.child_columns);
+    alloc.free(foreign_key.parent_table);
+    freeStringSlice(alloc, foreign_key.parent_columns);
+}
+
+fn freeStringSlice(alloc: Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(value);
+    if (values.len > 0) alloc.free(values);
 }
 
 fn freeFullTextDocumentsSlice(alloc: Allocator, docs: []const FullTextDocument) void {
@@ -952,6 +1052,22 @@ fn readStr(data: []const u8, pos: *usize) []const u8 {
     return s;
 }
 
+fn readStringSliceAlloc(alloc: Allocator, data: []const u8, pos: *usize) ![]const []const u8 {
+    const count = readU32(data, pos);
+    if (count == 0) return &.{};
+    const out = try alloc.alloc([]const u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (out) |*value| {
+        value.* = try alloc.dupe(u8, readStr(data, pos));
+        initialized += 1;
+    }
+    return out;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1084,6 +1200,7 @@ test "schema serialize/deserialize round-trip" {
     // Default document mode round-trips with no relational columns.
     try std.testing.expectEqual(StorageMode.document, loaded.storage_mode);
     try std.testing.expectEqual(@as(usize, 0), loaded.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 0), loaded.foreign_keys.len);
 }
 
 test "schema serialize/deserialize round-trips relational storage mode and columns" {
@@ -1099,6 +1216,14 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
             .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
             .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true },
             .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true, .indexed = false },
+        },
+        .foreign_keys = &.{
+            .{
+                .name = "orders_customer_id_fkey",
+                .child_columns = &.{"customer_id"},
+                .parent_table = "customers",
+                .parent_columns = &.{"_id"},
+            },
         },
     };
 
@@ -1119,6 +1244,12 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expect(loaded.relational_columns[2].nullable);
     try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[3].field_type);
     try std.testing.expect(!loaded.relational_columns[3].indexed);
+    try std.testing.expectEqual(@as(usize, 1), loaded.foreign_keys.len);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", loaded.foreign_keys[0].name);
+    try std.testing.expectEqualStrings("customer_id", loaded.foreign_keys[0].child_columns[0]);
+    try std.testing.expectEqualStrings("customers", loaded.foreign_keys[0].parent_table);
+    try std.testing.expectEqualStrings("_id", loaded.foreign_keys[0].parent_columns[0]);
+    try std.testing.expectEqual(ForeignKeyAction.restrict, loaded.foreign_keys[0].on_delete);
 }
 
 test "schema save/load via DocStore" {

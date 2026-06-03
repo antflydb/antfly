@@ -924,6 +924,9 @@ fn validateRelationalStorageModeUpdateAlloc(
     if (!runtime_schema_mod.relationalColumnCatalogsEqual(current_runtime.relational_columns, next_runtime.relational_columns)) {
         return error.InvalidSchemaUpdateRequest;
     }
+    if (!runtime_schema_mod.foreignKeyCatalogsEqual(current_runtime.foreign_keys, next_runtime.foreign_keys)) {
+        return error.InvalidSchemaUpdateRequest;
+    }
 }
 
 pub fn routeQueryRequestToActiveReadIndex(
@@ -2664,6 +2667,24 @@ test "metadata.schema update rejects relational storage mode and base column cha
             std.testing.allocator,
             &relational_table,
             "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"keyword\"}},\"required\":[\"tenant\"],\"additionalProperties\":false}}}}",
+        ),
+    );
+
+    const relational_fk_table: metadata_table_manager.TableRecord = .{
+        .table_id = 11,
+        .name = "orders",
+        .schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"restrict\"}]}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        applySchemaUpdateRecord(
+            std.testing.allocator,
+            &relational_fk_table,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}}}",
         ),
     );
 }

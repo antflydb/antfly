@@ -1,9 +1,16 @@
 # Foreign Keys
 
-This is a roadmap for adding foreign-key support to relational tables.
-Foreign keys are not a derived-index feature: they are cross-row constraints on
-the committed relational base store, and must be enforced by the same
-transaction boundary that commits relational rows.
+Foreign keys are relational-table constraints over the committed relational base
+store. They are not derived indexes: they must be enforced by the same
+transaction boundary that commits relational rows and their reverse-reference
+metadata.
+
+The implemented production contract is intentionally narrow: single-column
+child references to a parent table's `_id` document key with
+`on_delete: "restrict"`. The schema, runtime catalog, persisted catalog,
+relational write participant, transaction-intent resolution path, reverse
+reference keyspace, and OpenAPI surface all use that shape. Broader SQL
+constraint support remains future work.
 
 ## Goals
 
@@ -25,7 +32,7 @@ transaction boundary that commits relational rows.
 
 ## Public Contract
 
-The first supported shape should be primary-key-only foreign keys with
+The supported shape is primary-key-only foreign keys with
 `on_delete: "restrict"`.
 
 ```json
@@ -73,12 +80,12 @@ For v1:
 - `on_update` is not supported because row identity is the document key.
 - `on_delete` supports only `restrict`.
 
-The API should reject unsupported shapes during schema validation rather than
+The API rejects unsupported shapes during schema validation rather than
 accepting constraints that silently degrade.
 
 ## Runtime Schema
 
-The compiled runtime schema should carry a normalized foreign-key catalog:
+The compiled runtime schema carries a normalized foreign-key catalog:
 
 ```zig
 pub const ForeignKey = struct {
@@ -94,7 +101,7 @@ pub const ForeignKeyAction = enum {
 };
 ```
 
-The runtime representation should use column paths resolved against
+The runtime representation uses column paths resolved against
 `relational_columns`, not raw public JSON pointers. Schema compilation must
 validate that:
 
@@ -105,9 +112,9 @@ validate that:
 - the same child-column set does not produce conflicting constraints.
 
 Changing the FK catalog is a schema/storage change, not a derived-index-only
-change. Until online constraint validation exists, FK additions/removals should
-be treated like relational column-catalog mutations and rejected on existing
-tables or routed through an explicit migration path.
+change. Until online constraint validation exists, FK additions/removals are
+treated like relational column-catalog mutations and rejected on existing tables
+or routed through an explicit migration path.
 
 ## Physical State
 
@@ -115,7 +122,8 @@ Parent existence can be checked by the parent table's relational row key. Parent
 delete protection needs a reverse reference index; otherwise a delete would
 require scanning the child table.
 
-Maintain reverse FK rows transactionally with child rows:
+The relational write participant maintains reverse FK rows transactionally with
+child rows:
 
 ```text
 fkref:<constraint_id>:<parent_table>:<parent_key>:<child_table>:<child_key> -> empty
@@ -137,7 +145,8 @@ corrupt, they must be rebuildable from the committed relational child rows.
 ## Write Path
 
 Foreign-key enforcement belongs in the relational write participant, not only in
-the HTTP/API layer.
+the HTTP/API layer. Batch writes and committed transaction intents both enter
+the same participant semantics.
 
 On child insert/update:
 
@@ -171,8 +180,8 @@ Existing 2PC gives the atomic commit substrate, but it does not by itself define
 foreign-key semantics. FK support still needs constraint-aware participants and
 conflict protection.
 
-For single-shard parent/child writes, the relational participant can validate
-and write reverse rows in the local prepare/commit path.
+For single-shard parent/child writes, the relational participant validates and
+writes reverse rows in the local prepare/commit path.
 
 For cross-shard or cross-table writes:
 
@@ -223,7 +232,8 @@ a rebuild path:
 4. Rewrite the reverse FK row.
 5. Report orphaned child rows instead of silently dropping them.
 
-This should be exposed as an offline/admin repair first. Online schema adoption
+This is not implemented yet. It should be exposed as an offline/admin repair
+first. Online schema adoption
 can later use the same scanner to validate a newly added FK before making it
 enforced.
 
@@ -276,13 +286,12 @@ Minimum coverage:
 - repair rebuilds reverse-reference rows from relational child rows;
 - cross-shard 2PC failure/recovery does not leave dangling references.
 
-## Documentation Changes When Implemented
+## Documentation Status
 
-- `RELATIONAL.md`: move FK support from out-of-scope to the supported
-  constraints section and link to this design.
-- `SCHEMA.md`: document public schema syntax, validation rules, and migration
+- `RELATIONAL.md`: documents FK support in the supported constraints section and
+  links to this design.
+- `SCHEMA.md`: documents public schema syntax, validation rules, and migration
   limits.
-- API/OpenAPI schema: add `foreign_keys` and error responses for
-  `ForeignKeyViolation`.
-- Operational docs: describe repair/rebuild and parent-delete rejection
-  diagnostics.
+- API/OpenAPI schema: exposes `foreign_keys` on `TableSchema`.
+- Remaining operational docs: describe repair/rebuild and parent-delete
+  rejection diagnostics once those admin surfaces exist.

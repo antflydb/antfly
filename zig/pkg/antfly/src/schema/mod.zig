@@ -67,6 +67,8 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
 
     const relational_columns = try deriveRuntimeRelationalColumns(alloc, schema);
     errdefer freeRuntimeRelationalColumns(alloc, relational_columns);
+    const foreign_keys = try deriveRuntimeForeignKeys(alloc, schema);
+    errdefer freeRuntimeForeignKeys(alloc, foreign_keys);
     const storage_mode: storage_schema.StorageMode = switch (schema.storage_mode) {
         .document => .document,
         .relational => .relational,
@@ -92,6 +94,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .dynamic_templates = dynamic_templates,
         .full_text_documents = full_text_documents,
         .relational_columns = relational_columns,
+        .foreign_keys = foreign_keys,
     };
 }
 
@@ -213,6 +216,59 @@ fn freeRuntimeRelationalColumns(alloc: std.mem.Allocator, columns: []storage_sch
         alloc.free(column.path);
     }
     if (columns.len > 0) alloc.free(columns);
+}
+
+fn deriveRuntimeForeignKeys(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.ForeignKey {
+    if (schema.foreign_keys.len == 0) return &.{};
+    const foreign_keys = try alloc.alloc(storage_schema.ForeignKey, schema.foreign_keys.len);
+    var initialized: usize = 0;
+    errdefer {
+        if (initialized > 0) {
+            freeRuntimeForeignKeys(alloc, foreign_keys[0..initialized]);
+        } else {
+            alloc.free(foreign_keys);
+        }
+    }
+    for (schema.foreign_keys) |foreign_key| {
+        foreign_keys[initialized] = .{
+            .name = try alloc.dupe(u8, foreign_key.name),
+            .child_columns = try cloneStringSlice(alloc, foreign_key.columns),
+            .parent_table = try alloc.dupe(u8, foreign_key.references.table),
+            .parent_columns = try cloneStringSlice(alloc, foreign_key.references.columns),
+            .on_delete = switch (foreign_key.on_delete) {
+                .restrict => .restrict,
+            },
+        };
+        initialized += 1;
+    }
+    return foreign_keys;
+}
+
+fn freeRuntimeForeignKeys(alloc: std.mem.Allocator, foreign_keys: []storage_schema.ForeignKey) void {
+    for (foreign_keys) |foreign_key| {
+        alloc.free(foreign_key.name);
+        for (foreign_key.child_columns) |column| alloc.free(column);
+        if (foreign_key.child_columns.len > 0) alloc.free(foreign_key.child_columns);
+        alloc.free(foreign_key.parent_table);
+        for (foreign_key.parent_columns) |column| alloc.free(column);
+        if (foreign_key.parent_columns.len > 0) alloc.free(foreign_key.parent_columns);
+    }
+    if (foreign_keys.len > 0) alloc.free(foreign_keys);
+}
+
+fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (values) |value| {
+        out[initialized] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
 }
 
 fn runtimeRelationalColumnType(property: anytype) ?storage_schema.AntflyType {
@@ -854,7 +910,7 @@ fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?stor
 test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}}}
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
     );
     defer parsed.deinit(alloc);
 
@@ -862,7 +918,7 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     defer storage_schema.freeSchema(alloc, runtime);
 
     try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
-    try std.testing.expectEqual(@as(usize, 5), runtime.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 6), runtime.relational_columns.len);
 
     const id = findRuntimeColumn(runtime, "id").?;
     try std.testing.expectEqual(storage_schema.AntflyType.keyword, id.field_type);
@@ -876,6 +932,11 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     // nested object and json field both become json columns
     try std.testing.expectEqual(storage_schema.AntflyType.json, findRuntimeColumn(runtime, "attrs").?.field_type);
     try std.testing.expectEqual(storage_schema.AntflyType.json, findRuntimeColumn(runtime, "payload").?.field_type);
+    try std.testing.expectEqual(@as(usize, 1), runtime.foreign_keys.len);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", runtime.foreign_keys[0].name);
+    try std.testing.expectEqualStrings("customer_id", runtime.foreign_keys[0].child_columns[0]);
+    try std.testing.expectEqualStrings("customers", runtime.foreign_keys[0].parent_table);
+    try std.testing.expectEqualStrings("_id", runtime.foreign_keys[0].parent_columns[0]);
 }
 
 test "deriveRuntimeTableSchema projects embedded json schema as prefixed document fields" {

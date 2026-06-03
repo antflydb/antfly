@@ -2009,6 +2009,14 @@ pub const AntflyType2 = enum {
     }
 };
 
+/// Parent side of a relational foreign-key constraint.
+pub const ForeignKeyReference = struct {
+    /// Referenced relational table name.
+    table: ?[]const u8 = null,
+    /// Referenced parent columns. Currently must be exactly ["_id"].
+    columns: ?[]const []const u8 = null,
+};
+
 /// A floating-point number used to decrease or increase the relevance scores of a query.
 pub const Boost = f64;
 
@@ -3791,6 +3799,17 @@ pub const TemplateFieldMapping = struct {
     doc_values: ?bool = null,
 };
 
+/// Relational foreign-key constraint.
+pub const ForeignKey = struct {
+    /// Constraint name, unique within the table schema.
+    name: ?[]const u8 = null,
+    /// Child columns. Currently exactly one scalar relational column is supported.
+    columns: ?[]const []const u8 = null,
+    references: ?ForeignKeyReference = null,
+    /// Delete action. Currently only "restrict" is supported.
+    on_delete: ?[]const u8 = null,
+};
+
 pub const TermQuery = struct {
     term: []const u8,
     field: ?[]const u8 = null,
@@ -5220,6 +5239,8 @@ pub const TableSchema = struct {
     ttl_duration: ?[]const u8 = null,
     /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
     dynamic_templates: ?[]const DynamicTemplate = null,
+    /// Relational-mode referential constraints. The first supported shape is a single declared child column referencing a parent table's `_id` document key with `on_delete: "restrict"`. Unsupported shapes are rejected during schema validation.
+    foreign_keys: ?[]const ForeignKey = null,
 };
 
 /// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts: [{"type": "text", "text": "Hello"}]

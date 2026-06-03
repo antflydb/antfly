@@ -261,6 +261,31 @@ secondary-index rebuild path is available. Derived-only changes below an
 existing `json` column remain valid because the base row still stores the same
 JSON cell.
 
+Relational schemas may also declare primary-key-only foreign keys with
+`foreign_keys`:
+
+```json
+{
+  "foreign_keys": [
+    {
+      "name": "orders_customer_id_fkey",
+      "columns": ["customer_id"],
+      "references": { "table": "customers", "columns": ["_id"] },
+      "on_delete": "restrict"
+    }
+  ]
+}
+```
+
+The supported shape is deliberately narrow: one declared scalar child column,
+parent columns exactly `["_id"]`, and `on_delete: "restrict"` only. Nullable
+child values mean "no reference"; required child fields continue to be enforced
+by the row schema. The runtime schema persists the normalized FK catalog and the
+relational participant maintains reverse-reference rows transactionally with the
+child row. FK catalog changes are rejected by ordinary schema updates for the
+same reason relational base-column catalog changes are rejected: adding or
+removing a constraint needs explicit validation or repair over existing rows.
+
 Backup/restore follows that same boundary. Native backups preserve relational
 physical rows and secondary scan entries as a snapshot. Portable logical backups
 are not currently schema-aware for relational tables; they must either reject

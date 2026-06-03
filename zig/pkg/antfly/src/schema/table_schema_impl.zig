@@ -35,6 +35,7 @@ pub const TableSchema = struct {
     enforce_types: bool = false,
     document_schemas: []DocumentSchema = &.{},
     dynamic_templates: []DynamicTemplate = &.{},
+    foreign_keys: []ForeignKey = &.{},
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
         alloc.free(self.default_type);
@@ -43,6 +44,44 @@ pub const TableSchema = struct {
         if (self.document_schemas.len > 0) alloc.free(self.document_schemas);
         for (self.dynamic_templates) |*dynamic_template| dynamic_template.deinit(alloc);
         if (self.dynamic_templates.len > 0) alloc.free(self.dynamic_templates);
+        for (self.foreign_keys) |*foreign_key| foreign_key.deinit(alloc);
+        if (self.foreign_keys.len > 0) alloc.free(self.foreign_keys);
+        self.* = undefined;
+    }
+};
+
+pub const ForeignKeyAction = enum {
+    restrict,
+
+    pub fn fromString(text: []const u8) ?ForeignKeyAction {
+        if (std.mem.eql(u8, text, "restrict")) return .restrict;
+        return null;
+    }
+};
+
+pub const ForeignKeyReference = struct {
+    table: []const u8,
+    columns: [][]const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table);
+        for (self.columns) |column| alloc.free(column);
+        if (self.columns.len > 0) alloc.free(self.columns);
+        self.* = undefined;
+    }
+};
+
+pub const ForeignKey = struct {
+    name: []const u8,
+    columns: [][]const u8 = &.{},
+    references: ForeignKeyReference,
+    on_delete: ForeignKeyAction = .restrict,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        for (self.columns) |column| alloc.free(column);
+        if (self.columns.len > 0) alloc.free(self.columns);
+        self.references.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -645,6 +684,48 @@ fn validateSchemaValue(value: std.json.Value) !void {
     if (root.get("enforce_types")) |enforce_types| if (enforce_types != .null and enforce_types != .bool) return error.InvalidSchemaUpdateRequest;
     if (root.get("document_schemas")) |document_schemas| if (document_schemas != .null) try validateDocumentSchemas(document_schemas);
     if (root.get("dynamic_templates")) |dynamic_templates| if (dynamic_templates != .null) try validateDynamicTemplates(dynamic_templates);
+    if (root.get("foreign_keys")) |foreign_keys| if (foreign_keys != .null) try validateForeignKeys(foreign_keys);
+}
+
+fn validateForeignKeys(value: std.json.Value) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    for (array.items) |item| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        const name = object.get("name") orelse return error.InvalidSchemaUpdateRequest;
+        if (name != .string or name.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        const columns = object.get("columns") orelse return error.InvalidSchemaUpdateRequest;
+        try validateStringArray(columns, true);
+        const references = object.get("references") orelse return error.InvalidSchemaUpdateRequest;
+        const references_object = switch (references) {
+            .object => |references_object| references_object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        const parent_table = references_object.get("table") orelse return error.InvalidSchemaUpdateRequest;
+        if (parent_table != .string or parent_table.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        const parent_columns = references_object.get("columns") orelse return error.InvalidSchemaUpdateRequest;
+        try validateStringArray(parent_columns, true);
+        if (object.get("on_delete")) |on_delete| {
+            if (on_delete != .string or ForeignKeyAction.fromString(on_delete.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("on_update")) |_| return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn validateStringArray(value: std.json.Value, require_non_empty: bool) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    if (require_non_empty and array.items.len == 0) return error.InvalidSchemaUpdateRequest;
+    for (array.items) |item| {
+        if (item != .string or item.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
 }
 
 fn validateDocumentSchemas(value: std.json.Value) !void {
@@ -1431,6 +1512,9 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("dynamic_templates")) |dynamic_templates| {
         if (dynamic_templates != .null) parsed.dynamic_templates = try parseDynamicTemplates(alloc, dynamic_templates);
     }
+    if (root.get("foreign_keys")) |foreign_keys| {
+        if (foreign_keys != .null) parsed.foreign_keys = try parseForeignKeys(alloc, foreign_keys);
+    }
     if (parsed.storage_mode == .relational) {
         if (root.get("enforce_types")) |enforce_types| {
             if (enforce_types != .null and !enforce_types.bool) return error.InvalidSchemaUpdateRequest;
@@ -1474,6 +1558,34 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     }
 
     if (relational_columns == 0) return error.InvalidSchemaUpdateRequest;
+    try validateRelationalForeignKeys(schema);
+}
+
+fn validateRelationalForeignKeys(schema: TableSchema) !void {
+    for (schema.foreign_keys, 0..) |foreign_key, i| {
+        if (foreign_key.columns.len != 1) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.references.columns.len != 1) return error.InvalidSchemaUpdateRequest;
+        if (!std.mem.eql(u8, foreign_key.references.columns[0], "_id")) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.on_delete != .restrict) return error.InvalidSchemaUpdateRequest;
+        const child_property = findDocumentProperty(schema.document_schemas[0].properties, foreign_key.columns[0]) orelse return error.InvalidSchemaUpdateRequest;
+        if (!isRelationalForeignKeyColumn(child_property)) return error.InvalidSchemaUpdateRequest;
+        for (schema.foreign_keys[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, foreign_key.name)) return error.InvalidSchemaUpdateRequest;
+            if (previous.columns.len == foreign_key.columns.len and std.mem.eql(u8, previous.columns[0], foreign_key.columns[0])) {
+                if (!std.mem.eql(u8, previous.references.table, foreign_key.references.table) or
+                    !std.mem.eql(u8, previous.references.columns[0], foreign_key.references.columns[0]))
+                    return error.InvalidSchemaUpdateRequest;
+            }
+        }
+    }
+}
+
+fn isRelationalForeignKeyColumn(property: DocumentProperty) bool {
+    const field_type = property.field_type orelse return false;
+    return std.mem.eql(u8, field_type, "keyword") or
+        std.mem.eql(u8, field_type, "link") or
+        std.mem.eql(u8, field_type, "string") or
+        std.mem.eql(u8, field_type, "text");
 }
 
 fn validateRelationalEmbeddedJsonProperty(property: DocumentProperty) !void {
@@ -2490,6 +2602,50 @@ fn parseDynamicTemplate(alloc: std.mem.Allocator, default_name: []const u8, valu
             else => null,
         } else null,
     };
+}
+
+fn parseForeignKeys(alloc: std.mem.Allocator, value: std.json.Value) ![]ForeignKey {
+    const array = value.array;
+    const foreign_keys = try alloc.alloc(ForeignKey, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (foreign_keys[0..initialized]) |*foreign_key| foreign_key.deinit(alloc);
+        alloc.free(foreign_keys);
+    }
+
+    for (array.items) |item| {
+        const object = item.object;
+        const references = object.get("references").?.object;
+        foreign_keys[initialized] = .{
+            .name = try alloc.dupe(u8, object.get("name").?.string),
+            .columns = try parseStringArrayAlloc(alloc, object.get("columns").?),
+            .references = .{
+                .table = try alloc.dupe(u8, references.get("table").?.string),
+                .columns = try parseStringArrayAlloc(alloc, references.get("columns").?),
+            },
+            .on_delete = if (object.get("on_delete")) |on_delete|
+                ForeignKeyAction.fromString(on_delete.string).?
+            else
+                .restrict,
+        };
+        initialized += 1;
+    }
+    return foreign_keys;
+}
+
+fn parseStringArrayAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
+    const array = value.array;
+    const out = try alloc.alloc([]const u8, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item);
+        alloc.free(out);
+    }
+    for (array.items) |item| {
+        out[initialized] = try alloc.dupe(u8, item.string);
+        initialized += 1;
+    }
+    return out;
 }
 
 fn resolveDocumentSchema(
@@ -3567,6 +3723,43 @@ test "relational embedded document schema is scoped to explicit json columns" {
         parseSchema(
             std.testing.allocator,
             "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"attrs\":{\"type\":\"object\",\"dynamic_templates\":{\"metrics\":{\"path_match\":\"metrics.*\",\"mapping\":{\"type\":\"numeric\"}}}}},\"required\":[\"id\"],\"additionalProperties\":false}}}}",
+        ),
+    );
+}
+
+test "relational schema parses primary-key foreign keys" {
+    var parsed = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\",\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"restrict\"}]}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), parsed.foreign_keys.len);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", parsed.foreign_keys[0].name);
+    try std.testing.expectEqualStrings("customer_id", parsed.foreign_keys[0].columns[0]);
+    try std.testing.expectEqualStrings("customers", parsed.foreign_keys[0].references.table);
+    try std.testing.expectEqualStrings("_id", parsed.foreign_keys[0].references.columns[0]);
+}
+
+test "relational schema rejects unsupported foreign key shapes" {
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"email\"]},\"on_delete\":\"restrict\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"numeric\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"restrict\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"cascade\"}]}",
         ),
     );
 }

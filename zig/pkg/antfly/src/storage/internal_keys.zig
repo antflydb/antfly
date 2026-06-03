@@ -20,6 +20,7 @@ pub const replay_namespace: u8 = 0x02;
 pub const identity_namespace: u8 = 0x03;
 pub const relational_column_index_namespace: u8 = 0x04;
 pub const relational_column_index_by_doc_namespace: u8 = 0x05;
+pub const relational_foreign_key_ref_namespace: u8 = 0x06;
 pub const replay_all_kind: u8 = 0xfe;
 
 pub const primary_kind: u8 = 0x10;
@@ -56,7 +57,10 @@ pub fn isInternalUserKey(key: []const u8) bool {
 }
 
 pub fn isInternalPhysicalTableDataKey(key: []const u8) bool {
-    return isInternalUserKey(key) or isRelationalColumnIndexKey(key) or isRelationalColumnIndexByDocKey(key);
+    return isInternalUserKey(key) or
+        isRelationalColumnIndexKey(key) or
+        isRelationalColumnIndexByDocKey(key) or
+        isRelationalForeignKeyRefKey(key);
 }
 
 pub fn encodedBodyLen(bytes: []const u8) usize {
@@ -241,6 +245,60 @@ pub fn relationalColumnIndexByDocRangeUpperAlloc(alloc: Allocator, doc_key: []co
     const upper = try nextPrefixAlloc(alloc, lower);
     alloc.free(lower);
     return upper;
+}
+
+pub fn relationalForeignKeyRefKeyAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    child_table: []const u8,
+    child_key: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendRelationalForeignKeyParentPrefix(&list, alloc, constraint_name, parent_table, parent_key);
+    try appendEncodedComponent(&list, alloc, child_table);
+    try appendEncodedComponent(&list, alloc, child_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalForeignKeyRefParentPrefixAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendRelationalForeignKeyParentPrefix(&list, alloc, constraint_name, parent_table, parent_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalForeignKeyRefParentPrefixUpperAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+) !?[]u8 {
+    const lower = try relationalForeignKeyRefParentPrefixAlloc(alloc, constraint_name, parent_table, parent_key);
+    errdefer alloc.free(lower);
+    const upper = try nextPrefixAlloc(alloc, lower);
+    alloc.free(lower);
+    return upper;
+}
+
+fn appendRelationalForeignKeyParentPrefix(
+    list: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+) !void {
+    try list.append(alloc, relational_foreign_key_ref_namespace);
+    try appendEncodedComponent(list, alloc, constraint_name);
+    try appendEncodedComponent(list, alloc, parent_table);
+    try appendEncodedComponent(list, alloc, parent_key);
 }
 
 pub fn documentExactPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
@@ -470,6 +528,20 @@ pub fn isRelationalColumnIndexByDocKey(key: []const u8) bool {
     return column_term + 2 == key.len;
 }
 
+pub fn isRelationalForeignKeyRefKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_foreign_key_ref_namespace) return false;
+    const constraint_term = findComponentTerminator(key, 1) orelse return false;
+    const parent_table_start = constraint_term + 2;
+    const parent_table_term = findComponentTerminator(key, parent_table_start) orelse return false;
+    const parent_key_start = parent_table_term + 2;
+    const parent_key_term = findComponentTerminator(key, parent_key_start) orelse return false;
+    const child_table_start = parent_key_term + 2;
+    const child_table_term = findComponentTerminator(key, child_table_start) orelse return false;
+    const child_key_start = child_table_term + 2;
+    const child_key_term = findComponentTerminator(key, child_key_start) orelse return false;
+    return child_key_term + 2 == key.len;
+}
+
 pub fn isStoredDocumentRowKey(key: []const u8) bool {
     return isPrimaryDocumentKey(key) or isRelationalRowKey(key);
 }
@@ -519,6 +591,23 @@ pub const RelationalColumnIndexByDocKey = struct {
     }
 };
 
+pub const RelationalForeignKeyRefKey = struct {
+    constraint_name: []u8,
+    parent_table: []u8,
+    parent_key: []u8,
+    child_table: []u8,
+    child_key: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.constraint_name);
+        alloc.free(self.parent_table);
+        alloc.free(self.parent_key);
+        alloc.free(self.child_table);
+        alloc.free(self.child_key);
+        self.* = undefined;
+    }
+};
+
 pub fn decodeRelationalColumnKeyAlloc(alloc: Allocator, key: []const u8) !?RelationalColumnKey {
     if (!isRelationalColumnKey(key)) return null;
     const doc_term = findComponentTerminator(key, 1).?;
@@ -558,6 +647,35 @@ pub fn decodeRelationalColumnIndexByDocKeyAlloc(alloc: Allocator, key: []const u
     return .{
         .doc_key = doc_key,
         .column_path = column_path,
+    };
+}
+
+pub fn decodeRelationalForeignKeyRefKeyAlloc(alloc: Allocator, key: []const u8) !?RelationalForeignKeyRefKey {
+    if (!isRelationalForeignKeyRefKey(key)) return null;
+    const constraint_term = findComponentTerminator(key, 1).?;
+    const constraint_name = try decodeBodyAlloc(alloc, key[1..constraint_term]);
+    errdefer alloc.free(constraint_name);
+    const parent_table_start = constraint_term + 2;
+    const parent_table_term = findComponentTerminator(key, parent_table_start).?;
+    const parent_table = try decodeBodyAlloc(alloc, key[parent_table_start..parent_table_term]);
+    errdefer alloc.free(parent_table);
+    const parent_key_start = parent_table_term + 2;
+    const parent_key_term = findComponentTerminator(key, parent_key_start).?;
+    const parent_key = try decodeBodyAlloc(alloc, key[parent_key_start..parent_key_term]);
+    errdefer alloc.free(parent_key);
+    const child_table_start = parent_key_term + 2;
+    const child_table_term = findComponentTerminator(key, child_table_start).?;
+    const child_table = try decodeBodyAlloc(alloc, key[child_table_start..child_table_term]);
+    errdefer alloc.free(child_table);
+    const child_key_start = child_table_term + 2;
+    const child_key_term = findComponentTerminator(key, child_key_start).?;
+    const child_key = try decodeBodyAlloc(alloc, key[child_key_start..child_key_term]);
+    return .{
+        .constraint_name = constraint_name,
+        .parent_table = parent_table,
+        .parent_key = parent_key,
+        .child_table = child_table,
+        .child_key = child_key,
     };
 }
 
@@ -1045,6 +1163,12 @@ test "relational row key shares document range but is not primary" {
     defer alloc.free(relational_column_index);
     const relational_column_index_by_doc = try relationalColumnIndexByDocKeyAlloc(alloc, raw, column_path);
     defer alloc.free(relational_column_index_by_doc);
+    const fk_ref = try relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer\x00a", "orders", raw);
+    defer alloc.free(fk_ref);
+    const fk_ref_prefix = try relationalForeignKeyRefParentPrefixAlloc(alloc, "orders_customer_id_fkey", "customers", "customer\x00a");
+    defer alloc.free(fk_ref_prefix);
+    const fk_ref_upper = (try relationalForeignKeyRefParentPrefixUpperAlloc(alloc, "orders_customer_id_fkey", "customers", "customer\x00a")).?;
+    defer alloc.free(fk_ref_upper);
     const lower = try documentRangeLowerAlloc(alloc, "doc");
     defer alloc.free(lower);
     const upper = (try documentRangeUpperAlloc(alloc, "doc")).?;
@@ -1057,12 +1181,15 @@ test "relational row key shares document range but is not primary" {
     try std.testing.expect(isRelationalColumnKey(relational_column));
     try std.testing.expect(isRelationalColumnIndexKey(relational_column_index));
     try std.testing.expect(isRelationalColumnIndexByDocKey(relational_column_index_by_doc));
+    try std.testing.expect(isRelationalForeignKeyRefKey(fk_ref));
     try std.testing.expect(isInternalPhysicalTableDataKey(relational));
     try std.testing.expect(isInternalPhysicalTableDataKey(relational_column));
     try std.testing.expect(isInternalPhysicalTableDataKey(relational_column_index));
     try std.testing.expect(isInternalPhysicalTableDataKey(relational_column_index_by_doc));
+    try std.testing.expect(isInternalPhysicalTableDataKey(fk_ref));
     try std.testing.expect(!isInternalMetadataKey(relational_column_index));
     try std.testing.expect(!isInternalMetadataKey(relational_column_index_by_doc));
+    try std.testing.expect(!isInternalMetadataKey(fk_ref));
     try std.testing.expect(!isStoredDocumentRowKey(relational_column));
     try std.testing.expect(!isStoredDocumentRowKey(relational_column_index));
     try std.testing.expect(!isStoredDocumentRowKey(relational_column_index_by_doc));
@@ -1081,12 +1208,23 @@ test "relational row key shares document range but is not primary" {
     defer decoded_column_index_by_doc.deinit(alloc);
     try std.testing.expectEqualSlices(u8, raw, decoded_column_index_by_doc.doc_key);
     try std.testing.expectEqualSlices(u8, column_path, decoded_column_index_by_doc.column_path);
+    var decoded_fk_ref = (try decodeRelationalForeignKeyRefKeyAlloc(alloc, fk_ref)).?;
+    defer decoded_fk_ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "orders_customer_id_fkey", decoded_fk_ref.constraint_name);
+    try std.testing.expectEqualSlices(u8, "customers", decoded_fk_ref.parent_table);
+    try std.testing.expectEqualSlices(u8, "customer\x00a", decoded_fk_ref.parent_key);
+    try std.testing.expectEqualSlices(u8, "orders", decoded_fk_ref.child_table);
+    try std.testing.expectEqualSlices(u8, raw, decoded_fk_ref.child_key);
+    try std.testing.expect(std.mem.startsWith(u8, fk_ref, fk_ref_prefix));
+    try std.testing.expect(std.mem.order(u8, fk_ref_prefix, fk_ref) != .gt);
+    try std.testing.expect(std.mem.order(u8, fk_ref, fk_ref_upper) == .lt);
     try std.testing.expect(std.mem.order(u8, lower, relational) != .gt);
     try std.testing.expect(std.mem.order(u8, relational, upper) == .lt);
     try std.testing.expect(std.mem.order(u8, lower, relational_column) != .gt);
     try std.testing.expect(std.mem.order(u8, relational_column, upper) == .lt);
     try std.testing.expect(relational_column_index[0] == relational_column_index_namespace);
     try std.testing.expect(relational_column_index_by_doc[0] == relational_column_index_by_doc_namespace);
+    try std.testing.expect(fk_ref[0] == relational_foreign_key_ref_namespace);
 }
 
 test "internal key binary prefix bounds select only matching document ids" {

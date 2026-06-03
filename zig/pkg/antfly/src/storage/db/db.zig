@@ -3437,6 +3437,9 @@ pub const DB = struct {
             &owned_store_values,
             self.relationalColumnIndexPolicyForStore(),
         );
+        if (self.core.schema) |runtime_schema| {
+            relational_participant.configureForeignKeys(runtime_schema.default_type, runtime_schema.foreign_keys, effective_req.deletes);
+        }
         var relational_participant_prepared = false;
         var relational_participant_closed = false;
         defer if (relational_participant_prepared and !relational_participant_closed)
@@ -5107,6 +5110,9 @@ pub const DB = struct {
         if (!schema_mod.relationalColumnCatalogsEqual(current_schema.relational_columns, next_schema.relational_columns)) {
             return error.InvalidSchemaUpdateRequest;
         }
+        if (!schema_mod.foreignKeyCatalogsEqual(current_schema.foreign_keys, next_schema.foreign_keys)) {
+            return error.InvalidSchemaUpdateRequest;
+        }
     }
 
     const ExistingPhysicalStorageMode = enum {
@@ -5363,6 +5369,40 @@ pub const DB = struct {
                     for (mutations) |*mutation| mutation.deinit(self.alloc);
                     if (mutations.len > 0) self.alloc.free(mutations);
                 }
+                var relational_intent_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+                defer relational_intent_delete_keys.deinit(self.alloc);
+                for (mutations) |mutation| {
+                    if (isMetadataKey(mutation.key) or internal_keys.isInternalPhysicalTableDataKey(mutation.key)) continue;
+                    if (mutation.value == null) try relational_intent_delete_keys.append(self.alloc, mutation.key);
+                }
+                var relational_extra_owned_keys = std.ArrayListUnmanaged([]u8).empty;
+                defer {
+                    for (relational_extra_owned_keys.items) |key| self.alloc.free(key);
+                    relational_extra_owned_keys.deinit(self.alloc);
+                }
+                var relational_extra_owned_values = std.ArrayListUnmanaged([]u8).empty;
+                defer {
+                    for (relational_extra_owned_values.items) |value| self.alloc.free(value);
+                    relational_extra_owned_values.deinit(self.alloc);
+                }
+                var relational_participant = relational_store_mod.WriteParticipant.initWithColumnIndexPolicy(
+                    self.alloc,
+                    self.core.store,
+                    &relational_extra_writes,
+                    &relational_extra_deletes,
+                    &relational_extra_owned_keys,
+                    &relational_extra_owned_values,
+                    self.relationalColumnIndexPolicyForStore(),
+                );
+                var relational_table_name: []const u8 = "";
+                if (self.core.schema) |runtime_schema| {
+                    relational_table_name = runtime_schema.default_type;
+                    relational_participant.configureForeignKeys(runtime_schema.default_type, runtime_schema.foreign_keys, relational_intent_delete_keys.items);
+                }
+                var relational_participant_prepared = false;
+                var relational_participant_closed = false;
+                defer if (relational_participant_prepared and !relational_participant_closed)
+                    relational_participant.abort(null);
                 for (mutations) |mutation| {
                     if (isMetadataKey(mutation.key) or internal_keys.isInternalPhysicalTableDataKey(mutation.key)) continue;
                     const skip_key = try self.alloc.dupe(u8, mutation.key);
@@ -5371,25 +5411,18 @@ pub const DB = struct {
                     try relational_skip_intent_keys.append(self.alloc, skip_key);
                     skip_key_owned = false;
 
-                    const primary_key = try internal_keys.documentKeyAlloc(self.alloc, mutation.key);
-                    var primary_key_owned = true;
-                    errdefer if (primary_key_owned) self.alloc.free(primary_key);
-                    try relational_extra_deletes.append(self.alloc, primary_key);
-                    primary_key_owned = false;
-
                     if (mutation.value) |value| {
                         const row_value = try self.alloc.dupe(u8, value);
                         var row_value_owned = true;
                         errdefer if (row_value_owned) self.alloc.free(row_value);
-                        try relational_store_mod.appendUpsertOwnedBatchWithColumnIndexPolicy(
-                            self.alloc,
-                            self.core.store,
-                            &relational_extra_writes,
-                            &relational_extra_deletes,
+                        try relational_participant.prepareUpsert(
+                            relational_table_name,
                             mutation.key,
                             row_value,
-                            self.relationalColumnIndexPolicyForStore(),
+                            txn_id,
                         );
+                        relational_participant_prepared = true;
+                        try relational_extra_owned_values.append(self.alloc, row_value);
                         row_value_owned = false;
                         if (shouldWriteTimestamp(mutation.key)) {
                             const timestamp_key = try makeTimestampKey(self.alloc, mutation.key);
@@ -5398,26 +5431,40 @@ pub const DB = struct {
                             const timestamp_value = try encodeTimestampValue(self.alloc, commit_version);
                             var timestamp_value_owned = true;
                             errdefer if (timestamp_value_owned) self.alloc.free(timestamp_value);
-                            try relational_extra_writes.append(self.alloc, .{ .key = timestamp_key, .value = timestamp_value });
+                            try relational_extra_owned_keys.append(self.alloc, timestamp_key);
                             timestamp_key_owned = false;
+                            try relational_extra_owned_values.append(self.alloc, timestamp_value);
                             timestamp_value_owned = false;
+                            try relational_extra_writes.append(self.alloc, .{ .key = timestamp_key, .value = timestamp_value });
                         }
                     } else {
-                        try relational_store_mod.appendDeleteOwnedBatch(
-                            self.alloc,
-                            self.core.store,
-                            &relational_extra_deletes,
+                        try relational_participant.prepareDelete(
+                            relational_table_name,
                             mutation.key,
+                            txn_id,
                         );
+                        relational_participant_prepared = true;
                         if (shouldWriteTimestamp(mutation.key)) {
                             const timestamp_key = try makeTimestampKey(self.alloc, mutation.key);
                             var timestamp_key_owned = true;
                             errdefer if (timestamp_key_owned) self.alloc.free(timestamp_key);
-                            try relational_extra_deletes.append(self.alloc, timestamp_key);
+                            try relational_extra_owned_keys.append(self.alloc, timestamp_key);
                             timestamp_key_owned = false;
+                            try relational_extra_deletes.append(self.alloc, timestamp_key);
                         }
                     }
+
+                    const primary_key = try internal_keys.documentKeyAlloc(self.alloc, mutation.key);
+                    var primary_key_owned = true;
+                    errdefer if (primary_key_owned) self.alloc.free(primary_key);
+                    try relational_extra_owned_keys.append(self.alloc, primary_key);
+                    primary_key_owned = false;
+                    try relational_extra_deletes.append(self.alloc, primary_key);
                 }
+                try relational_participant.commit(txn_id, commit_version);
+                relational_participant_closed = true;
+                relational_extra_owned_keys.clearRetainingCapacity();
+                relational_extra_owned_values.clearRetainingCapacity();
             }
         }
 
@@ -37401,6 +37448,82 @@ test "db relational transaction commits through relational base rows" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, relational_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "row:txn"));
+}
+
+test "db relational foreign keys enforce parent existence and restrict deletes" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "order:missing", .value = "{\"id\":\"order:missing\",\"customer_id\":\"customer:missing\"}" }},
+    }));
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:a", .value = "{\"id\":\"customer:a\"}" },
+            .{ .key = "order:1", .value = "{\"id\":\"order:1\",\"customer_id\":\"customer:a\"}" },
+        },
+    });
+
+    const fk_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:a", "row", "order:1");
+    defer alloc.free(fk_ref);
+    const ref_value = try db.core.store.get(alloc, fk_ref);
+    defer alloc.free(ref_value);
+    try std.testing.expectEqualStrings("", ref_value);
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"customer:a"},
+    }));
+
+    try db.batch(.{
+        .deletes = &.{ "customer:a", "order:1" },
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, fk_ref));
+    try std.testing.expect((try db.get(alloc, "customer:a")) == null);
+    try std.testing.expect((try db.get(alloc, "order:1")) == null);
+
+    const missing_txn = try db.beginTransaction(10_000);
+    try db.writeIntents(missing_txn, &.{
+        .{ .key = "order:txn-missing", .value = "{\"id\":\"order:txn-missing\",\"customer_id\":\"customer:txn-missing\"}" },
+    }, &.{});
+    try std.testing.expectError(error.ForeignKeyViolation, db.commitTransaction(missing_txn, 10_001));
+    try db.abortTransaction(missing_txn, 10_002);
+
+    const create_txn = try db.beginTransaction(11_000);
+    try db.writeIntents(create_txn, &.{
+        .{ .key = "customer:txn", .value = "{\"id\":\"customer:txn\"}" },
+        .{ .key = "order:txn", .value = "{\"id\":\"order:txn\",\"customer_id\":\"customer:txn\"}" },
+    }, &.{});
+    try db.commitTransaction(create_txn, 11_001);
+
+    const txn_fk_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:txn", "row", "order:txn");
+    defer alloc.free(txn_fk_ref);
+    const txn_ref_value = try db.core.store.get(alloc, txn_fk_ref);
+    defer alloc.free(txn_ref_value);
+    try std.testing.expectEqualStrings("", txn_ref_value);
+
+    const delete_txn = try db.beginTransaction(12_000);
+    try db.writeTransaction(delete_txn, .{
+        .deletes = &.{ "customer:txn", "order:txn" },
+    });
+    try db.commitTransaction(delete_txn, 12_001);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, txn_fk_ref));
 }
 
 test "db transaction intent writes reject new documents at ordinal exhaustion" {

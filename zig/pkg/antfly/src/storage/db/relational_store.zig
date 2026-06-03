@@ -93,6 +93,9 @@ pub const WriteParticipant = struct {
     owned_keys_start: usize,
     owned_values_start: usize,
     column_index_policy: ColumnIndexPolicy = ColumnIndexPolicy.all(),
+    table_name: []const u8 = "",
+    foreign_keys: []const schema_mod.ForeignKey = &.{},
+    planned_delete_keys: []const []const u8 = &.{},
     prepared: bool = false,
     closed: bool = false,
 
@@ -132,6 +135,17 @@ pub const WriteParticipant = struct {
         return participant;
     }
 
+    pub fn configureForeignKeys(
+        self: *WriteParticipant,
+        table_name: []const u8,
+        foreign_keys: []const schema_mod.ForeignKey,
+        planned_delete_keys: []const []const u8,
+    ) void {
+        self.table_name = table_name;
+        self.foreign_keys = foreign_keys;
+        self.planned_delete_keys = planned_delete_keys;
+    }
+
     pub fn prepareUpsert(
         self: *WriteParticipant,
         table: []const u8,
@@ -142,6 +156,7 @@ pub const WriteParticipant = struct {
         _ = table;
         _ = txn_id;
         if (self.closed) return error.ParticipantClosed;
+        try self.prepareForeignKeyUpsert(doc_key, typed_row);
         try appendUpsertWithColumnIndexPolicy(self.alloc, self.store, self.writes, self.deletes, self.owned_keys, self.owned_values, doc_key, typed_row, self.column_index_policy);
         self.prepared = true;
     }
@@ -155,6 +170,7 @@ pub const WriteParticipant = struct {
         _ = table;
         _ = txn_id;
         if (self.closed) return error.ParticipantClosed;
+        try self.prepareForeignKeyDelete(doc_key);
         try appendDelete(self.alloc, self.store, self.deletes, self.owned_keys, doc_key);
         self.prepared = true;
     }
@@ -193,7 +209,158 @@ pub const WriteParticipant = struct {
         _ = read_version;
         return try scanColumnAlloc(self.alloc, self.store, column_path, lower_doc_key, upper_doc_key);
     }
+
+    fn effectiveTableName(self: *const WriteParticipant) []const u8 {
+        return if (self.table_name.len > 0) self.table_name else "_default";
+    }
+
+    fn prepareForeignKeyUpsert(self: *WriteParticipant, doc_key: []const u8, new_row: []const u8) !void {
+        if (self.foreign_keys.len == 0) return;
+        const final_state_deleted = containsKey(self.planned_delete_keys, doc_key);
+        const old_row = try getRawAlloc(self.alloc, self.store, doc_key);
+        defer if (old_row) |row| self.alloc.free(row);
+
+        for (self.foreign_keys) |foreign_key| {
+            const column = foreign_key.child_columns[0];
+            const old_parent = if (old_row) |row| try foreignKeyValue(row, column) else null;
+            const new_parent = if (final_state_deleted) null else try foreignKeyValue(new_row, column);
+            if (optionalBytesEqual(old_parent, new_parent)) continue;
+            if (old_parent) |parent_key| try self.appendForeignKeyRefDelete(foreign_key, parent_key, doc_key);
+            if (new_parent) |parent_key| {
+                try self.requireForeignKeyParentExists(foreign_key, parent_key);
+                try self.appendForeignKeyRefWrite(foreign_key, parent_key, doc_key);
+            }
+        }
+    }
+
+    fn prepareForeignKeyDelete(self: *WriteParticipant, doc_key: []const u8) !void {
+        if (self.foreign_keys.len == 0) return;
+        try self.requireNoRestrictingForeignKeyRefs(doc_key);
+        const old_row = try getRawAlloc(self.alloc, self.store, doc_key) orelse return;
+        defer self.alloc.free(old_row);
+        for (self.foreign_keys) |foreign_key| {
+            const parent_key = (try foreignKeyValue(old_row, foreign_key.child_columns[0])) orelse continue;
+            try self.appendForeignKeyRefDelete(foreign_key, parent_key, doc_key);
+        }
+    }
+
+    fn requireForeignKeyParentExists(self: *WriteParticipant, foreign_key: schema_mod.ForeignKey, parent_key: []const u8) !void {
+        if (containsKey(self.planned_delete_keys, parent_key)) return error.ForeignKeyViolation;
+        const row_key = try rowKeyAlloc(self.alloc, parent_key);
+        defer self.alloc.free(row_key);
+        if (containsBatchDelete(self.deletes.items, row_key)) return error.ForeignKeyViolation;
+        if (containsBatchWrite(self.writes.items, row_key)) return;
+        const raw = try getRawAlloc(self.alloc, self.store, parent_key);
+        if (raw) |value| {
+            self.alloc.free(value);
+            return;
+        }
+        _ = foreign_key;
+        return error.ForeignKeyViolation;
+    }
+
+    fn requireNoRestrictingForeignKeyRefs(self: *WriteParticipant, parent_key: []const u8) !void {
+        for (self.foreign_keys) |foreign_key| {
+            if (foreign_key.on_delete != .restrict) continue;
+            const prefix = try internal_keys.relationalForeignKeyRefParentPrefixAlloc(
+                self.alloc,
+                foreign_key.name,
+                foreign_key.parent_table,
+                parent_key,
+            );
+            defer self.alloc.free(prefix);
+            const upper = try internal_keys.relationalForeignKeyRefParentPrefixUpperAlloc(
+                self.alloc,
+                foreign_key.name,
+                foreign_key.parent_table,
+                parent_key,
+            );
+            defer if (upper) |buf| self.alloc.free(buf);
+
+            for (self.writes.items) |write| {
+                if (!std.mem.startsWith(u8, write.key, prefix)) continue;
+                if (containsBatchDelete(self.deletes.items, write.key)) continue;
+                var decoded = (try internal_keys.decodeRelationalForeignKeyRefKeyAlloc(self.alloc, write.key)) orelse continue;
+                defer decoded.deinit(self.alloc);
+                if (containsKey(self.planned_delete_keys, decoded.child_key)) continue;
+                return error.ForeignKeyViolation;
+            }
+
+            const scanned = try self.store.scanRange(self.alloc, prefix, if (upper) |buf| buf else "");
+            defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+            for (scanned) |entry| {
+                if (containsBatchDelete(self.deletes.items, entry.key)) continue;
+                var decoded = (try internal_keys.decodeRelationalForeignKeyRefKeyAlloc(self.alloc, entry.key)) orelse continue;
+                defer decoded.deinit(self.alloc);
+                if (containsKey(self.planned_delete_keys, decoded.child_key)) continue;
+                return error.ForeignKeyViolation;
+            }
+        }
+    }
+
+    fn appendForeignKeyRefWrite(self: *WriteParticipant, foreign_key: schema_mod.ForeignKey, parent_key: []const u8, child_key: []const u8) !void {
+        const key = try internal_keys.relationalForeignKeyRefKeyAlloc(
+            self.alloc,
+            foreign_key.name,
+            foreign_key.parent_table,
+            parent_key,
+            self.effectiveTableName(),
+            child_key,
+        );
+        var key_owned = true;
+        errdefer if (key_owned) self.alloc.free(key);
+        try self.owned_keys.append(self.alloc, key);
+        key_owned = false;
+        try self.writes.append(self.alloc, .{ .key = key, .value = "" });
+    }
+
+    fn appendForeignKeyRefDelete(self: *WriteParticipant, foreign_key: schema_mod.ForeignKey, parent_key: []const u8, child_key: []const u8) !void {
+        const key = try internal_keys.relationalForeignKeyRefKeyAlloc(
+            self.alloc,
+            foreign_key.name,
+            foreign_key.parent_table,
+            parent_key,
+            self.effectiveTableName(),
+            child_key,
+        );
+        var key_owned = true;
+        errdefer if (key_owned) self.alloc.free(key);
+        try self.owned_keys.append(self.alloc, key);
+        key_owned = false;
+        try self.deletes.append(self.alloc, key);
+    }
 };
+
+fn foreignKeyValue(row_value: []const u8, column_path: []const u8) !?[]const u8 {
+    const cell = (try relational_row_codec.findCellByPath(row_value, column_path)) orelse return null;
+    if (cell.value_type != .bytes_val) return error.InvalidColumnValue;
+    if (cell.value.bytes_val.len == 0) return null;
+    return cell.value.bytes_val;
+}
+
+fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn containsKey(keys: []const []const u8, needle: []const u8) bool {
+    for (keys) |key| {
+        if (std.mem.eql(u8, key, needle)) return true;
+    }
+    return false;
+}
+
+fn containsBatchWrite(writes: []const docstore_mod.KVPair, key: []const u8) bool {
+    for (writes) |write| {
+        if (std.mem.eql(u8, write.key, key)) return true;
+    }
+    return false;
+}
+
+fn containsBatchDelete(deletes: []const []const u8, key: []const u8) bool {
+    return containsKey(deletes, key);
+}
 
 pub fn appendUpsert(
     alloc: Allocator,

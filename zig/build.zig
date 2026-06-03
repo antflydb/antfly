@@ -2960,6 +2960,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db search filters expired",
             "storage.db.db.test.db ttl cleanup",
             "storage.db.db.test.db exposes local transaction lifecycle",
+            "storage.db.db.test.db relational foreign keys",
             "storage.db.db.test.db transaction ",
             "storage.db.db.test.db explicit resolveTransactionIntents",
             "storage.db.db.test.db recoverTransactions",

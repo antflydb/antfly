@@ -134,10 +134,21 @@ schema. Top-level dynamic templates in relational schemas stay invalid; flexible
 fields belong behind an explicit `json` column.
 
 Constraints in scope for v1: primary key is the existing document key;
-`NOT NULL` via `required_fields`. Existing Antfly transaction/2PC semantics still
-apply to relational writes. **Out of scope for v1:** SQL-style cross-document
-unique constraints, foreign-key enforcement, and constraint-driven cascading
-actions (use the `graph` index / join planner for relationships).
+`NOT NULL` via `required_fields`; and single-column foreign keys from a declared
+scalar child column to a parent table's `_id` with `on_delete: "restrict"`.
+Existing Antfly transaction/2PC semantics still apply to relational writes. SQL-
+style unique constraints, foreign keys that target non-primary-key columns, and
+constraint-driven cascading actions remain out of scope for v1; use graph
+indexes and the join planner for relationship queries rather than integrity
+enforcement.
+
+Foreign-key metadata lives in `TableSchema.foreign_keys`, compiles into the
+runtime schema, persists with the runtime schema, and is immutable across
+ordinary same-table schema updates until an explicit constraint-validation
+migration path exists. The relational write participant enforces parent
+existence on child insert/update, maintains reverse-reference rows with child
+rows, rejects parent deletes with live child references, and applies those same
+rules while resolving committed transaction intents. See [FOREIGN_KEYS.md](FOREIGN_KEYS.md).
 
 ## Runtime model
 
@@ -503,6 +514,8 @@ The coverage expected for this feature set is:
 - write -> `DB.get` -> query stored data for all scalar types plus `json`;
 - transform read-modify-write on scalar and nullable columns;
 - delete and overwrite remove old column values from scans;
+- foreign-key child writes, parent-delete rejection, reverse-reference cleanup,
+  and same-transaction parent/child create-delete behavior;
 - read-after-commit through the existing transaction/2PC path;
 - abort and recovery of prepared relational writes;
 - replay/backfill derived text/algebraic/graph/vector/sparse indexes from typed

@@ -6,5 +6,7 @@ pub const types = @import("types.zig");
 pub const AntflyType = types.AntflyType;
 pub const DocumentSchema = types.DocumentSchema;
 pub const TableSchema = types.TableSchema;
+pub const ForeignKeyReference = types.ForeignKeyReference;
+pub const ForeignKey = types.ForeignKey;
 pub const DynamicTemplate = types.DynamicTemplate;
 pub const TemplateFieldMapping = types.TemplateFieldMapping;
