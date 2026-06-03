@@ -59,6 +59,12 @@ The Go implementation uses mature protocol SDKs:
   - The retrieval agent exposes an event-sink execution path for `classification`, `step_progress`, `hit`,
     `generation`, `followup`, `eval`, and `done` milestones. The A2A retrieval skill uses that path directly so
     retrieval progress is forwarded into the A2A queue as it is produced.
+- Trusted-principal auth
+  - Antfly can accept `X-Antfly-Trusted-Principal: <token>` from a trusted upstream proxy when
+    `ANTFLY_TRUSTED_PRINCIPAL_SECRET` is configured.
+  - `ANTFLY_TRUSTED_PRINCIPAL_ISSUER` optionally constrains the token issuer. Issuer names are provider-owned; Antfly
+    only verifies the configured trust boundary and maps the token's permissions, row filters, and metadata into the
+    normal authenticated identity model.
 - Antfly MCP tools
   - `create_table`
   - `drop_table`
@@ -66,6 +72,7 @@ The Go implementation uses mature protocol SDKs:
   - `create_index`
   - `drop_index`
   - `list_indexes`
+  - `lookup`
   - `query`
   - `backup`
   - `restore`

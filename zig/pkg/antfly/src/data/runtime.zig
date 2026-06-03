@@ -48,6 +48,8 @@ const data_raft_batch_leader_retry_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const data_raft_metadata_resync_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_campaign_retry_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_metadata_sync_interval_ms: u64 = 250;
+const trusted_principal_secret_key = "antfly.trusted_principal.secret";
+const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
@@ -7211,6 +7213,12 @@ pub fn runFromIterator(
     defer metadata_api_urls.deinit(alloc);
     if ((cli.node_id == null) != (cli.store_id == null)) return error.InvalidArguments;
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
+    const trusted_principal_secret = try resolveTrustedPrincipalSecret(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+    );
+    defer if (trusted_principal_secret) |value| alloc.free(value);
+    const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
     defer setup_io.deinit();
@@ -7252,6 +7260,12 @@ pub fn runFromIterator(
     defer if (auth_runtime) |*runtime| runtime.deinit();
     defer if (auth_backend) |*backend| backend.close();
 
+    const trusted_principal_issuer = try resolveTrustedPrincipalIssuer(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+    );
+    defer if (trusted_principal_issuer) |value| alloc.free(value);
+
     var data_server = try DataServer.initFromMetadataApiUrls(alloc, .{
         .bind_host = cli.bind_host orelse "127.0.0.1",
         .bind_port = cli.bind_port orelse 0,
@@ -7267,7 +7281,9 @@ pub fn runFromIterator(
             .failure_domain = cli.failure_domain orelse "",
         } else null,
         .api_server_cfg = .{
-            .auth_enabled = auth_enabled,
+            .auth_enabled = effective_auth_enabled,
+            .trusted_principal_secret = trusted_principal_secret,
+            .trusted_principal_issuer = trusted_principal_issuer,
             .user_manager = if (user_manager) |*manager| manager else null,
             .secret_store = if (secret_store_initialized) &secret_store else null,
         },
@@ -7569,6 +7585,47 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
     return false;
 }
 
+fn resolveTrustedPrincipalSecret(
+    alloc: std.mem.Allocator,
+    secret_store: ?*antfly.common.secrets.FileStore,
+) !?[]u8 {
+    return try resolveTrustedPrincipalConfigValue(alloc, secret_store, trusted_principal_secret_key);
+}
+
+fn resolveTrustedPrincipalIssuer(
+    alloc: std.mem.Allocator,
+    secret_store: ?*antfly.common.secrets.FileStore,
+) !?[]u8 {
+    return try resolveTrustedPrincipalConfigValue(alloc, secret_store, trusted_principal_issuer_key);
+}
+
+fn resolveTrustedPrincipalConfigValue(
+    alloc: std.mem.Allocator,
+    secret_store: ?*antfly.common.secrets.FileStore,
+    key: []const u8,
+) !?[]u8 {
+    if (secret_store) |store| {
+        if (try store.getOwned(alloc, key)) |value| {
+            if (std.mem.trim(u8, value, " \t\r\n").len > 0) return value;
+            alloc.free(value);
+            return null;
+        }
+        return null;
+    }
+
+    const env_var = try antfly.common.secrets.envVarForKey(alloc, key);
+    defer alloc.free(env_var);
+    const value = std.process.getEnvVarOwned(alloc, env_var) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    if (value) |raw| {
+        if (std.mem.trim(u8, raw, " \t\r\n").len > 0) return raw;
+        alloc.free(raw);
+    }
+    return null;
+}
+
 fn parseBoolFlag(value: []const u8) ?bool {
     if (std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "false")) return false;
@@ -7783,6 +7840,42 @@ test "data runtime leaves auth disabled unless config or cli enables it" {
 
     cli.auth_enabled = false;
     try std.testing.expect(!resolveAuthEnabled(cli, null));
+}
+
+test "data runtime resolves trusted principal secret from secret store" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/trusted-principal-secrets.json", .{tmp.sub_path});
+    defer alloc.free(store_path);
+
+    var store = try antfly.common.secrets.FileStore.init(alloc, store_path);
+    defer store.deinit();
+    var entry = try store.put(alloc, trusted_principal_secret_key, "cloudaf-shared-secret");
+    defer entry.deinit(alloc);
+
+    const resolved = try resolveTrustedPrincipalSecret(alloc, &store);
+    defer if (resolved) |value| alloc.free(value);
+    try std.testing.expectEqualStrings("cloudaf-shared-secret", resolved.?);
+}
+
+test "data runtime resolves trusted principal issuer from secret store" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/trusted-principal-issuer.json", .{tmp.sub_path});
+    defer alloc.free(store_path);
+
+    var store = try antfly.common.secrets.FileStore.init(alloc, store_path);
+    defer store.deinit();
+    var entry = try store.put(alloc, trusted_principal_issuer_key, "cloudaf");
+    defer entry.deinit(alloc);
+
+    const resolved = try resolveTrustedPrincipalIssuer(alloc, &store);
+    defer if (resolved) |value| alloc.free(value);
+    try std.testing.expectEqualStrings("cloudaf", resolved.?);
 }
 
 test "data runtime local group status uses injected leadership source" {

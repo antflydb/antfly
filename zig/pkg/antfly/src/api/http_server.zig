@@ -212,6 +212,8 @@ test "public API request body limit matches Go linear merge contract" {
 
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
+    trusted_principal_secret: ?[]const u8 = null,
+    trusted_principal_issuer: ?[]const u8 = null,
     swarm_mode: bool = false,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
@@ -233,6 +235,13 @@ pub const ApiHttpServerConfig = struct {
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
+};
+
+pub const trusted_principal_header = "X-Antfly-Trusted-Principal";
+
+pub const AuthenticatedRequest = struct {
+    authorization: ?[]const u8 = null,
+    trusted_principal: ?[]const u8 = null,
 };
 
 pub const SemanticStatusResolver = struct {
@@ -1465,14 +1474,21 @@ pub const ApiHttpServer = struct {
     }
 
     fn requiresAuthentication(self: *const ApiHttpServer, path: []const u8) bool {
-        if (!self.cfg.auth_enabled) return false;
-        if (self.cfg.user_manager == null) return false;
+        if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null) return false;
+        if (self.cfg.user_manager == null and self.cfg.trusted_principal_secret == null) return false;
         if (std.mem.eql(u8, path, routes.Routes.agent_card) or std.mem.eql(u8, path, routes.Routes.agent_card_legacy)) return false;
         return !std.mem.startsWith(u8, path, routes.Routes.internal_groups_prefix);
     }
 
-    pub fn authenticateRequest(self: *ApiHttpServer, authorization: ?[]const u8) !AuthenticatedIdentity {
-        const value = authorization orelse return error.Unauthorized;
+    pub fn authenticateRequest(self: *ApiHttpServer, request: AuthenticatedRequest) !AuthenticatedIdentity {
+        if (request.trusted_principal) |trusted_principal| {
+            const token = std.mem.trim(u8, trusted_principal, " \t\r\n");
+            const secret = self.cfg.trusted_principal_secret orelse return error.Unauthorized;
+            if (secret.len == 0) return error.Unauthorized;
+            return try self.authenticateTrustedPrincipal(token, secret);
+        }
+
+        const value = request.authorization orelse return error.Unauthorized;
         const manager = self.cfg.user_manager orelse return error.Unauthorized;
 
         if (std.mem.startsWith(u8, value, "Basic ")) {
@@ -1513,6 +1529,75 @@ pub const ApiHttpServer = struct {
         return error.Unauthorized;
     }
 
+    fn authenticateTrustedPrincipal(self: *ApiHttpServer, token: []const u8, secret: []const u8) !AuthenticatedIdentity {
+        var parts = std.mem.splitScalar(u8, token, '.');
+        const header_b64 = parts.next() orelse return error.Unauthorized;
+        const payload_b64 = parts.next() orelse return error.Unauthorized;
+        const signature_b64 = parts.next() orelse return error.Unauthorized;
+        if (parts.next() != null or header_b64.len == 0 or payload_b64.len == 0 or signature_b64.len == 0) return error.Unauthorized;
+
+        const signing_input = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ header_b64, payload_b64 });
+        defer self.alloc.free(signing_input);
+
+        var expected_mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(expected_mac[0..], signing_input, secret);
+        const signature = try base64UrlDecodeAlloc(self.alloc, signature_b64);
+        defer self.alloc.free(signature);
+        if (!constantTimeEql(signature, expected_mac[0..])) return error.Unauthorized;
+
+        const header_json = try base64UrlDecodeAlloc(self.alloc, header_b64);
+        defer self.alloc.free(header_json);
+        var parsed_header = try std.json.parseFromSlice(std.json.Value, self.alloc, header_json, .{});
+        defer parsed_header.deinit();
+        const header_obj = switch (parsed_header.value) {
+            .object => |object| object,
+            else => return error.Unauthorized,
+        };
+        if (!std.mem.eql(u8, jsonStringField(header_obj.get("alg")) orelse "", "HS256")) return error.Unauthorized;
+
+        const payload_json = try base64UrlDecodeAlloc(self.alloc, payload_b64);
+        defer self.alloc.free(payload_json);
+        var parsed_payload = try std.json.parseFromSlice(std.json.Value, self.alloc, payload_json, .{});
+        defer parsed_payload.deinit();
+        const payload = switch (parsed_payload.value) {
+            .object => |object| object,
+            else => return error.Unauthorized,
+        };
+        if (self.cfg.trusted_principal_issuer) |expected_issuer| {
+            if (!std.mem.eql(u8, jsonStringField(payload.get("iss")) orelse "", expected_issuer)) return error.Unauthorized;
+        }
+        const subject = jsonStringField(payload.get("sub")) orelse return error.Unauthorized;
+        const exp = jsonIntegerField(payload.get("exp")) orelse return error.Unauthorized;
+        const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+        if (exp < now) return error.Unauthorized;
+        if (jsonIntegerField(payload.get("iat"))) |iat| {
+            if (iat > now + 60) return error.Unauthorized;
+        }
+
+        const permissions = try trustedPrincipalPermissionsFromPayload(self.alloc, payload);
+        errdefer {
+            for (permissions) |*permission| permission.deinit(self.alloc);
+            if (permissions.len > 0) self.alloc.free(permissions);
+        }
+        const row_filters = try trustedPrincipalRowFiltersFromPayload(self.alloc, payload);
+        errdefer {
+            for (row_filters) |*entry| entry.deinit(self.alloc);
+            if (row_filters.len > 0) self.alloc.free(row_filters);
+        }
+        const metadata_json = if (payload.get("metadata")) |metadata|
+            try std.json.Stringify.valueAlloc(self.alloc, metadata, .{})
+        else
+            try self.alloc.dupe(u8, "{}");
+
+        return .{
+            .username = try self.alloc.dupe(u8, subject),
+            .permissions = permissions,
+            .row_filter = row_filters,
+            .metadata_json = metadata_json,
+            .roles = try self.alloc.alloc([]u8, 0),
+        };
+    }
+
     pub fn handleInternalRoute(self: *ApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
         const uri_parts = splitTarget(req.uri);
         if (!std.mem.startsWith(u8, uri_parts.path, routes.Routes.internal_groups_prefix) and
@@ -1542,7 +1627,10 @@ pub const ApiHttpServer = struct {
         }
 
         if (self.requiresAuthentication(uri_parts.path)) {
-            authenticated_identity = self.authenticateRequest(req.authorization) catch |err| switch (err) {
+            authenticated_identity = self.authenticateRequest(.{
+                .authorization = req.authorization,
+                .trusted_principal = req.header(trusted_principal_header),
+            }) catch |err| switch (err) {
                 error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => {
                     return try unauthorizedResponse(self.alloc);
                 },
@@ -1611,9 +1699,8 @@ pub const ApiHttpServer = struct {
     }
 
     fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        _ = authenticated_identity;
         if ((req.method == .GET or req.method == .POST or req.method == .DELETE) and (std.mem.eql(u8, uri_parts.path, routes.Routes.mcp_v1) or std.mem.startsWith(u8, uri_parts.path, routes.Routes.mcp_v1_prefix))) {
-            return try protocol_adapters.handleMcpRequest(self, req);
+            return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
         }
         if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.a2a)) {
             return try protocol_adapters.handleA2aRequest(self, req);
@@ -4341,7 +4428,10 @@ pub const ApiHttpServer = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.alloc);
         if (self.requiresAuthentication(uri_parts.path)) {
-            authenticated_identity = self.authenticateRequest(req.authorization) catch return false;
+            authenticated_identity = self.authenticateRequest(.{
+                .authorization = req.authorization,
+                .trusted_principal = req.header(trusted_principal_header),
+            }) catch return false;
             const identity = authenticated_identity.?;
             if (requiresAdminPermission(uri_parts.path) and !permissionsAllow(identity.permissions, .@"*", "*", .admin)) return false;
             if (requiredPermissionForRequest(req.method, uri_parts.path)) |required| {
@@ -5888,6 +5978,126 @@ pub fn permissionsAllow(
     return false;
 }
 
+fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
+    const size = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(value) catch return error.Unauthorized;
+    const out = try alloc.alloc(u8, size);
+    errdefer alloc.free(out);
+    std.base64.url_safe_no_pad.Decoder.decode(out, value) catch return error.Unauthorized;
+    return out;
+}
+
+fn constantTimeEql(lhs: []const u8, rhs: []const u8) bool {
+    if (lhs.len != rhs.len) return false;
+    var diff: u8 = 0;
+    for (lhs, rhs) |left, right| diff |= left ^ right;
+    return diff == 0;
+}
+
+fn jsonStringField(value: ?std.json.Value) ?[]const u8 {
+    const present = value orelse return null;
+    return jsonStringValue(present);
+}
+
+fn jsonStringValue(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => |string| string,
+        else => null,
+    };
+}
+
+fn jsonIntegerField(value: ?std.json.Value) ?i64 {
+    const present = value orelse return null;
+    return jsonIntegerValue(present);
+}
+
+fn jsonIntegerValue(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |integer| integer,
+        else => null,
+    };
+}
+
+fn jsonBoolField(value: ?std.json.Value) bool {
+    const present = value orelse return false;
+    return jsonBoolValue(present);
+}
+
+fn jsonBoolValue(value: std.json.Value) bool {
+    return switch (value) {
+        .bool => |boolean| boolean,
+        else => false,
+    };
+}
+
+fn trustedPrincipalPermissionsFromPayload(alloc: std.mem.Allocator, payload: std.json.ObjectMap) ![]usermgr.Permission {
+    var out = std.ArrayList(usermgr.Permission).empty;
+    errdefer {
+        for (out.items) |*permission| permission.deinit(alloc);
+        out.deinit(alloc);
+    }
+
+    if (jsonBoolField(payload.get("admin"))) {
+        try out.append(alloc, try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    const tables_value = payload.get("tables");
+    const operations_value = payload.get("operations");
+    if (operations_value == null or operations_value.? != .array or operations_value.?.array.items.len == 0) {
+        return try out.toOwnedSlice(alloc);
+    }
+
+    if (tables_value == null or tables_value.? != .array or tables_value.?.array.items.len == 0) {
+        try appendTrustedPrincipalPermissionsForTable(alloc, &out, "*", operations_value.?.array.items);
+    } else {
+        for (tables_value.?.array.items) |table_value| {
+            const table = jsonStringValue(table_value) orelse continue;
+            if (table.len == 0) continue;
+            try appendTrustedPrincipalPermissionsForTable(alloc, &out, table, operations_value.?.array.items);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendTrustedPrincipalPermissionsForTable(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(usermgr.Permission),
+    table: []const u8,
+    operation_values: []const std.json.Value,
+) !void {
+    for (operation_values) |operation_value| {
+        const operation = jsonStringValue(operation_value) orelse continue;
+        if (std.mem.eql(u8, operation, "read")) {
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .read));
+        } else if (std.mem.eql(u8, operation, "write")) {
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .write));
+        } else if (std.mem.eql(u8, operation, "admin")) {
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .admin));
+        } else if (std.mem.eql(u8, operation, "*")) {
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .read));
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .write));
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .admin));
+        }
+    }
+}
+
+fn trustedPrincipalRowFiltersFromPayload(alloc: std.mem.Allocator, payload: std.json.ObjectMap) ![]usermgr.RowFilterEntry {
+    const row_filter_value = payload.get("row_filter") orelse return try alloc.alloc(usermgr.RowFilterEntry, 0);
+    if (row_filter_value != .object) return error.Unauthorized;
+    var out = std.ArrayList(usermgr.RowFilterEntry).empty;
+    errdefer {
+        for (out.items) |*entry| entry.deinit(alloc);
+        out.deinit(alloc);
+    }
+    var it = row_filter_value.object.iterator();
+    while (it.next()) |entry| {
+        const filter_json = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{});
+        defer alloc.free(filter_json);
+        try out.append(alloc, try usermgr.RowFilterEntry.initOwned(alloc, entry.key_ptr.*, filter_json));
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 fn applyAuthenticatedIdentityToJoinRequest(
     alloc: std.mem.Allocator,
     identity: AuthenticatedIdentity,
@@ -7162,6 +7372,55 @@ test "api http server serves mcp and a2a protocol surfaces" {
     try std.testing.expect(std.mem.indexOf(u8, cancel_resp.body, "\"state\":\"canceled\"") != null);
 }
 
+test "api http server authenticates trusted principal" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    const secret = "trusted-principal-test-secret";
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"user:alice","tenant":"inst-1","tables":["docs"],"operations":["read"],"row_filter":{{"docs":{{"term":{{"tenant_id":"t1"}}}}}},"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(payload);
+    const token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, payload);
+    defer std.testing.allocator.free(token);
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{ .trusted_principal_secret = secret, .trusted_principal_issuer = "trusted-upstream" },
+        source.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+    try std.testing.expect(server.requiresAuthentication(routes.Routes.tables));
+
+    var identity = try server.authenticateRequest(.{ .trusted_principal = token });
+    defer identity.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("user:alice", identity.username);
+    try std.testing.expectEqual(@as(usize, 1), identity.permissions.len);
+    try std.testing.expectEqual(usermgr.ResourceType.table, identity.permissions[0].resource_type);
+    try std.testing.expectEqualStrings("docs", identity.permissions[0].resource);
+    try std.testing.expectEqual(usermgr.PermissionType.read, identity.permissions[0].type);
+    try std.testing.expectEqual(@as(usize, 1), identity.row_filter.len);
+    try std.testing.expectEqualStrings("docs", identity.row_filter[0].table);
+    try std.testing.expect(std.mem.indexOf(u8, identity.row_filter[0].filter, "\"tenant_id\":\"t1\"") != null);
+}
+
 fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
     const raw = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ username, password });
     defer alloc.free(raw);
@@ -7170,6 +7429,27 @@ fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, pass
     defer alloc.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, raw);
     return try std.fmt.allocPrint(alloc, "Basic {s}", .{encoded});
+}
+
+fn encodeTrustedPrincipalToken(alloc: std.mem.Allocator, secret: []const u8, payload: []const u8) ![]u8 {
+    const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    const header_size = std.base64.url_safe_no_pad.Encoder.calcSize(header.len);
+    const header_encoded = try alloc.alloc(u8, header_size);
+    defer alloc.free(header_encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(header_encoded, header);
+    const payload_size = std.base64.url_safe_no_pad.Encoder.calcSize(payload.len);
+    const payload_encoded = try alloc.alloc(u8, payload_size);
+    defer alloc.free(payload_encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(payload_encoded, payload);
+    const signing_input = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ header_encoded, payload_encoded });
+    defer alloc.free(signing_input);
+    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(mac[0..], signing_input, secret);
+    const signature_size = std.base64.url_safe_no_pad.Encoder.calcSize(mac.len);
+    const signature_encoded = try alloc.alloc(u8, signature_size);
+    defer alloc.free(signature_encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(signature_encoded, mac[0..]);
+    return try std.fmt.allocPrint(alloc, "{s}.{s}", .{ signing_input, signature_encoded });
 }
 
 const TestAuthManager = struct {
@@ -8431,6 +8711,127 @@ test "api http server decodes percent-encoded lookup keys" {
     var parsed = try std.json.parseFromSlice(LookupResponse, std.testing.allocator, resp.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
+}
+
+test "api http server serves lookup through mcp tool" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-http-mcp-lookup";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "docs/getting-started.md",
+                .value = "{\"title\":\"alpha\",\"body\":\"hello\"}",
+            },
+        },
+        .timestamp_ns = 4321,
+    });
+
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 1, .name = "docs", .placement_role = "data" }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = "" }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{};
+    const trusted_principal_secret = "mcp-lookup-trusted-principal-secret";
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"user:alice","tenant":"inst-1","tables":["docs"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(payload);
+    const token = try encodeTrustedPrincipalToken(std.testing.allocator, trusted_principal_secret, payload);
+    defer std.testing.allocator.free(token);
+
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .auth_enabled = true,
+            .trusted_principal_secret = trusted_principal_secret,
+            .trusted_principal_issuer = "trusted-upstream",
+        },
+        source.iface(),
+        table_source.source(),
+        null,
+    );
+    defer server.deinit();
+    const trusted_principal_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = token },
+    };
+
+    var init_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &trusted_principal_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer init_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), init_resp.status);
+
+    const mcp_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
+        .{ .name = trusted_principal_header, .value = token },
+    };
+    var tools_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}",
+    });
+    defer tools_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") != null);
+
+    var call_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"lookup\",\"arguments\":{\"tableName\":\"docs\",\"key\":\"docs/getting-started.md\",\"fields\":[\"title\"]}}}",
+    });
+    defer call_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), call_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, call_resp.body, "\"structuredContent\":{\"title\":\"alpha\"}") != null);
 }
 
 test "api http server serves table scan as ndjson" {
