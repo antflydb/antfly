@@ -185,6 +185,73 @@ test "decode rejects unsupported image format" {
     try std.testing.expectError(error.ImageDecodeFailed, decode(alloc, "not-an-image"));
 }
 
+test "clip preprocessing center crops before resize" {
+    var rgb = [_]u8{
+        10, 0, 0,
+        20, 0, 0,
+        30, 0, 0,
+        40, 0, 0,
+        50, 0, 0,
+        60, 0, 0,
+        70, 0, 0,
+        80, 0, 0,
+    };
+    const img = Image{
+        .data = rgb[0..],
+        .width = 4,
+        .height = 2,
+        .channels = 3,
+    };
+    var out: [12]f32 = undefined;
+
+    preprocessDecodedClip(
+        img,
+        &out,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+    );
+
+    try std.testing.expectApproxEqAbs(@as(f32, 20.0 / 255.0), out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 30.0 / 255.0), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 60.0 / 255.0), out[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 70.0 / 255.0), out[3], 1e-6);
+}
+
+test "clip preprocessing uses legacy resize source coordinates" {
+    var rgb = [_]u8{
+        0,   0, 0,
+        10,  0, 0,
+        100, 0, 0,
+        110, 0, 0,
+    };
+    const img = Image{
+        .data = rgb[0..],
+        .width = 2,
+        .height = 2,
+        .channels = 3,
+    };
+    var out: [48]f32 = undefined;
+
+    preprocessDecodedClip(
+        img,
+        &out,
+        4,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+    );
+
+    const expected_red = [_]f32{
+        0.0,   5.0,   10.0,  10.0,
+        50.0,  55.0,  60.0,  60.0,
+        100.0, 105.0, 110.0, 110.0,
+        100.0, 105.0, 110.0, 110.0,
+    };
+    for (expected_red, 0..) |expected, i| {
+        try std.testing.expectApproxEqAbs(expected / 255.0, out[i], 1e-6);
+    }
+}
+
 test "decode png fixture dimensions are stable" {
     const alloc = std.testing.allocator;
     const img = try decode(alloc, &red_png_2x2);
@@ -611,6 +678,88 @@ pub fn preprocessBatch(
     }
 
     return result;
+}
+
+/// Preprocess CLIP embedding images using Antfly's CLIP runtime contract.
+///
+/// The math intentionally matches the legacy Go termite CLIP path in
+/// go/pkg/termite/lib/pipelines/image.go: crop a centered target_size window
+/// capped by source dimensions, resize that crop to target_size using source
+/// coordinates `dst * src_dim / target_dim`, and normalize to CHW f32.
+///
+/// This is not the generic vision preprocessor. Use it only for CLIP/ClipClap
+/// image embeddings that must stay compatible with vectors produced by the
+/// legacy Go runtime.
+pub fn preprocessClipBatch(
+    allocator: std.mem.Allocator,
+    image_list: []const []const u8,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) ![]f32 {
+    const ts: usize = target_size;
+    const per_image = 3 * ts * ts;
+    const result = try allocator.alloc(f32, image_list.len * per_image);
+    errdefer allocator.free(result);
+
+    for (image_list, 0..) |image_bytes, i| {
+        const img = try decode(allocator, image_bytes);
+        defer img.deinit(allocator);
+
+        preprocessDecodedClip(
+            img,
+            result[i * per_image ..][0..per_image],
+            target_size,
+            mean,
+            std_dev,
+        );
+    }
+
+    return result;
+}
+
+fn preprocessDecodedClip(
+    img: Image,
+    result: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) void {
+    std.debug.assert(target_size > 0);
+    std.debug.assert(img.width > 0 and img.height > 0);
+
+    const ts: usize = target_size;
+    const crop_w: u32 = @min(img.width, target_size);
+    const crop_h: u32 = @min(img.height, target_size);
+    const crop_left: u32 = (img.width - crop_w) / 2;
+    const crop_top: u32 = (img.height - crop_h) / 2;
+    const scale_x = @as(f32, @floatFromInt(crop_w)) / @as(f32, @floatFromInt(target_size));
+    const scale_y = @as(f32, @floatFromInt(crop_h)) / @as(f32, @floatFromInt(target_size));
+
+    for (0..ts) |y| {
+        const src_y = @as(f32, @floatFromInt(y)) * scale_y;
+        const y0: u32 = @intFromFloat(@floor(src_y));
+        const y1: u32 = @min(y0 + 1, crop_h - 1);
+        const fy = src_y - @as(f32, @floatFromInt(y0));
+
+        for (0..ts) |x| {
+            const src_x = @as(f32, @floatFromInt(x)) * scale_x;
+            const x0: u32 = @intFromFloat(@floor(src_x));
+            const x1: u32 = @min(x0 + 1, crop_w - 1);
+            const fx = src_x - @as(f32, @floatFromInt(x0));
+
+            for (0..3) |ch| {
+                const p00 = pixelAt(img, crop_left + x0, crop_top + y0, ch);
+                const p10 = pixelAt(img, crop_left + x1, crop_top + y0, ch);
+                const p01 = pixelAt(img, crop_left + x0, crop_top + y1, ch);
+                const p11 = pixelAt(img, crop_left + x1, crop_top + y1, ch);
+                const top = p00 * (1.0 - fx) + p10 * fx;
+                const bottom = p01 * (1.0 - fx) + p11 * fx;
+                const value = top * (1.0 - fy) + bottom * fy;
+                result[ch * ts * ts + y * ts + x] = (value / 255.0 - mean[ch]) / std_dev[ch];
+            }
+        }
+    }
 }
 
 fn toSharedImage(img: Image) ImageU8 {
