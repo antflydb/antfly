@@ -297,7 +297,7 @@ test "provisioned group storage prunes stale visible root generations" {
 
     storage.pruneGroupVisibleRootGenerations(&.{ 11, 33 });
     try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
-    try std.testing.expectEqual(@as(u64, 0), storage.visibleRootGenerationForGroup(22));
+    try std.testing.expectEqual(@as(u64, table_reads.backend_current_root_generation), storage.visibleRootGenerationForGroup(22));
     try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(33));
 }
 

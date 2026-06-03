@@ -18359,7 +18359,7 @@ test "provisioned lookup db opens with identity namespace" {
         .shard_id = 7001,
         .range_id = 7103,
     };
-    var db = try openProvisionedLookupDbForTable(alloc, path, null, 0, null, null, namespace);
+    var db = try openProvisionedLookupDbForTable(alloc, path, null, backend_current_root_generation, null, null, namespace);
     defer db.close();
 
     try std.testing.expect(db.core.identity_namespace.eql(namespace));
@@ -18379,7 +18379,7 @@ test "provisioned warm status db opens with identity namespace" {
         .shard_id = 7001,
         .range_id = 7104,
     };
-    var db = try openProvisionedWarmStatusDbForTable(alloc, path, 0, null, namespace);
+    var db = try openProvisionedWarmStatusDbForTable(alloc, path, backend_current_root_generation, null, namespace);
     defer db.close();
 
     try std.testing.expect(db.core.identity_namespace.eql(namespace));
@@ -18418,7 +18418,7 @@ test "provisioned direct read db opens reject stale identity namespace" {
         });
         db.close();
     }
-    if (openProvisionedLookupDbForTable(alloc, lookup_path, null, 0, null, null, expected_namespace)) |opened| {
+    if (openProvisionedLookupDbForTable(alloc, lookup_path, null, backend_current_root_generation, null, null, expected_namespace)) |opened| {
         var db = opened;
         db.close();
         return error.TestExpectedError;
@@ -18434,7 +18434,7 @@ test "provisioned direct read db opens reject stale identity namespace" {
         });
         db.close();
     }
-    if (openProvisionedWarmStatusDbForTable(alloc, status_path, 0, null, expected_namespace)) |opened| {
+    if (openProvisionedWarmStatusDbForTable(alloc, status_path, backend_current_root_generation, null, expected_namespace)) |opened| {
         var db = opened;
         db.close();
         return error.TestExpectedError;
@@ -18492,7 +18492,7 @@ test "provisioned query runtime db opens with catalog identity namespace" {
     };
 
     var catalog_state = CatalogState{};
-    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog_state.iface(), "docs", 7001, 0, null);
+    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog_state.iface(), "docs", 7001, backend_current_root_generation, null);
     defer db.close();
 
     try std.testing.expect(db.core.identity_namespace.eql(.{
@@ -18569,7 +18569,7 @@ test "provisioned query runtime db rejects stale identity namespace" {
     };
 
     var catalog_state = CatalogState{};
-    if (openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog_state.iface(), "docs", 7001, 0, null)) |opened| {
+    if (openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog_state.iface(), "docs", 7001, backend_current_root_generation, null)) |opened| {
         var db = opened;
         db.close();
         return error.TestExpectedError;

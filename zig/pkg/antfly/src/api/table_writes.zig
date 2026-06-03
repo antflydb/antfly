@@ -17538,7 +17538,7 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     const indexes_json = "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}";
 
     {
-        var db = try openManagedDbWithIndexesJsonAndCacheMode(alloc, path, indexes_json, null, null, 0, null, .default);
+        var db = try openManagedDbWithIndexesJsonAndCacheMode(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null, .default);
         defer db.close();
     }
 
