@@ -266,7 +266,7 @@ const RaftTableApplyStateMachine = struct {
         self.write_source.read_cache = &storage.read_cache;
         self.write_source.write_cache = &self.write_cache;
         self.write_source.runtime_status_cache = &storage.runtime_status_cache;
-        self.write_source.group_visible_root_generation = storage.groupVisibleRootGenerationSource();
+        _ = self.write_source.withGroupVisibleRootGeneration(storage.groupVisibleRootGenerationSource());
         if (storage.backend_runtime) |runtime| self.write_source.backend_runtime = runtime;
     }
 
