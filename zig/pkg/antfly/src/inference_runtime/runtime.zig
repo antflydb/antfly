@@ -119,6 +119,8 @@ pub fn runFromIterator(
         return try listModels(alloc, io, args);
     } else if (std.mem.eql(u8, command, "pull")) {
         return try pullModel(alloc, io, args);
+    } else if (std.mem.eql(u8, command, "convert")) {
+        return try inference.tabular.cli.convertMain(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         printUsage();
     } else {
@@ -235,22 +237,38 @@ fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iter
 fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const ref = args.next() orelse {
         std.debug.print("usage: antfly inference pull <model-ref> [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>]\n", .{});
+        std.debug.print("       antfly inference pull <https-url-to-tabular_model.json> --name <predictor-name> [--models-dir <dir>] [--token <bearer-token>]\n", .{});
         return;
     };
+
+    var argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer argv.deinit(alloc);
+    try argv.append(alloc, ref);
+    while (args.next()) |arg| try argv.append(alloc, arg);
+
+    if (inference.tabular.cli.isHttpUrl(ref)) {
+        return try inference.tabular.cli.pullMain(alloc, io, argv.items, defaultModelsDir(alloc));
+    }
 
     var token: ?[]const u8 = null;
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var tasks_csv: ?[]const u8 = null;
     var capabilities_csv: ?[]const u8 = null;
-    while (args.next()) |arg| {
+    var i: usize = 1;
+    while (i < argv.items.len) : (i += 1) {
+        const arg = argv.items[i];
         if (std.mem.eql(u8, arg, "--token")) {
-            token = args.next();
+            i += 1;
+            if (i < argv.items.len) token = argv.items[i];
         } else if (std.mem.eql(u8, arg, "--models-dir")) {
-            models_dir = args.next() orelse models_dir;
+            i += 1;
+            if (i < argv.items.len) models_dir = argv.items[i];
         } else if (std.mem.eql(u8, arg, "--tasks")) {
-            tasks_csv = args.next();
+            i += 1;
+            if (i < argv.items.len) tasks_csv = argv.items[i];
         } else if (std.mem.eql(u8, arg, "--capabilities")) {
-            capabilities_csv = args.next();
+            i += 1;
+            if (i < argv.items.len) capabilities_csv = argv.items[i];
         }
     }
 
@@ -325,7 +343,8 @@ fn printUsage() void {
         \\  finetune    Run LoRA finetuning
         \\  smoke       Run a model smoke test
         \\  list        List available models
-        \\  pull        Download a model from HuggingFace Hub
+        \\  pull        Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL
+        \\  convert     Convert a native ML model (XGBoost/LightGBM/ONNX) to the antfly tabular IR
         \\
         \\Run options:
         \\  --host <addr>    Listen address (default: 127.0.0.1)
@@ -339,6 +358,9 @@ fn printUsage() void {
         \\
         \\Pull options:
         \\  --token <token>  HuggingFace API token (or set HF_TOKEN env var)
+        \\  --name <name>    Local predictor name when pulling a tabular model URL
+        \\  --tasks <list>   Comma-separated task hints for the pulled model
+        \\  --capabilities <list> Comma-separated capability hints for the pulled model
         \\  --models-dir <dir> Models directory (default: ~/.antfly/inference/models)
         \\
     , .{});
