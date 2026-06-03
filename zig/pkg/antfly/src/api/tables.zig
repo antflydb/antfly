@@ -45,7 +45,6 @@ pub const ParsedTableSchema = schema_mod.ParsedTableSchema;
 pub const LsmStorageStatus = struct {
     // Table status intentionally exposes a compact operational snapshot. Full
     // low-level WAL and scheduler counters remain available through metrics.
-    memory_bytes: u64 = 0,
     run_count: u64 = 0,
     run_bytes: u64 = 0,
     l0_run_count: u64 = 0,
@@ -61,9 +60,8 @@ pub const TableStorageStatus = struct {
     lsm: ?LsmStorageStatus = null,
 };
 
-pub fn lsmStorageStatusFromBackendStats(maintenance: lsm_backend.Backend.MaintenanceStats) LsmStorageStatus {
+pub fn lsmStorageStatusFromMaintenanceStats(maintenance: lsm_backend.Backend.MaintenanceStats) LsmStorageStatus {
     return .{
-        .memory_bytes = maintenance.mutable_bytes +| maintenance.immutable_bytes,
         .run_count = maintenance.total_runs,
         .run_bytes = maintenance.total_run_bytes,
         .l0_run_count = maintenance.l0_runs,
@@ -76,7 +74,6 @@ pub fn lsmStorageStatusFromBackendStats(maintenance: lsm_backend.Backend.Mainten
 
 fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStorageStatus {
     return .{
-        .memory_bytes = u64ToI64(status.memory_bytes),
         .run_count = u64ToI64(status.run_count),
         .run_bytes = u64ToI64(status.run_bytes),
         .l0_run_count = u64ToI64(status.l0_run_count),
@@ -1904,7 +1901,6 @@ test "metadata.table status encoder honors storage status overrides" {
         .table_name = "docs",
         .empty = true,
         .lsm = .{
-            .memory_bytes = 33,
             .run_count = 3,
             .run_bytes = 44,
             .l0_run_count = 1,
@@ -1918,20 +1914,11 @@ test "metadata.table status encoder honors storage status overrides" {
     const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true,\"lsm\":{") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"memory_bytes\":33") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"run_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"l0_bytes\":33") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":55") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_backlog_bytes\":10") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_readers\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mutable_bytes\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_bytes\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_memtables\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_denied_jobs\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"background_io_denied_jobs\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_overloads\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_sync_records\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_current_segment\"") == null);
 }
 
 test "metadata.table status encoder canonicalizes embeddings indexes without inline names" {

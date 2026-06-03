@@ -467,7 +467,6 @@ pub const AlgebraicAggregationJoin = struct {
 
 /// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
 pub const LsmStorageStatus = struct {
-    memory_bytes: ?i64 = null,
     run_count: ?i64 = null,
     run_bytes: ?i64 = null,
     l0_run_count: ?i64 = null,

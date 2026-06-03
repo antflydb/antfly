@@ -6560,9 +6560,6 @@ components:
       description: Compact LSM backend operational status. Detailed low-level counters are available through
         metrics.
       properties:
-        memory_bytes:
-          type: integer
-          format: uint64
         run_count:
           type: integer
           format: uint64
