@@ -12,14 +12,15 @@
 # Elastic License 2.0 for the specific language governing permissions and
 # limitations.
 
-"""End-to-end entity-resolution test over a live multi-Raft swarm.
+"""End-to-end entity-resolution test over a live multi-node raft cluster.
 
 Exercises the full cross-shard loop with no inference dependency: a document's
 ``relations`` field is materialized into an extraction artifact by a graph
 index; the resolution worker blocks candidate entities against a *separate*
 ``entities`` table (cross-shard read) and records a resolution artifact; the
 promoter upserts the canonical entity documents into that table (cross-shard
-write). See zig/RESOLUTION.md.
+write); and the document graph is queried back through the mention edge with
+cross-table entity hydration. See zig/RESOLUTION.md.
 
 Run with the built binary, e.g.:
 
@@ -32,6 +33,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 import pytest
@@ -39,10 +41,9 @@ import requests
 
 from conftest import (
     DEFAULT_ANTFLY_BIN,
-    SwarmAntflyServer,
-    find_free_port,
     resolve_binary_path,
 )
+from test_scaling import MultiNodeScalingCluster
 
 DOCUMENTS_INDEXES = {
     # Materializes each document's `relations` field into the `relations_v1`
@@ -68,6 +69,7 @@ DOCUMENTS_INDEXES = {
             "field": "relations",
             "content_type": "application/json",
         },
+        "edge_types": [{"name": "mentions"}],
         # Prefix blocking links a mention to an existing entity under the same
         # `label/` namespace (cross-shard read of the entities table).
         "resolvers": [
@@ -86,19 +88,21 @@ DOCUMENTS_INDEXES = {
 
 
 @pytest.fixture(scope="function")
-def resolution_swarm():
+def resolution_cluster():
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"Antfly binary not found: {binary} (set ANTFLY_BIN)")
-    server = SwarmAntflyServer(binary, "127.0.0.1", find_free_port())
+    if Path(binary).name != "antfly":
+        pytest.skip("distributed autograph e2e requires the antfly binary")
+    cluster = MultiNodeScalingCluster(binary, initial_data_node_count=3)
     try:
-        yield server
+        yield cluster
     finally:
-        server.stop()
+        cluster.stop()
 
 
 class _Api:
-    def __init__(self, base_url: str, server: SwarmAntflyServer):
+    def __init__(self, base_url: str, server: MultiNodeScalingCluster):
         self.url = base_url.rstrip("/")
         self.s = requests.Session()
         self.s.headers["Content-Type"] = "application/json"
@@ -119,9 +123,17 @@ class _Api:
             payload["indexes"] = indexes
         return self._check(self.s.post(f"{self.url}/tables/{name}", json=payload, timeout=30))
 
-    def insert(self, table: str, doc_id: str, body: dict, *, sync_level: str = "enrichments") -> dict:
+    def insert(self, table: str, doc_id: str, body: dict, *, sync_level: str = "write") -> dict:
         payload = {"inserts": {doc_id: body}, "sync_level": sync_level}
-        return self._check(self.s.post(f"{self.url}/tables/{table}/batch", json=payload, timeout=30))
+        timeout = 120 if sync_level in {"enrichments", "full_index"} else 30
+        try:
+            response = self.s.post(f"{self.url}/tables/{table}/batch", json=payload, timeout=timeout)
+        except requests.RequestException as exc:
+            raise AssertionError(
+                f"batch insert timed out/failed table={table!r} key={doc_id!r} "
+                f"sync_level={sync_level!r}: {exc!r}\n[logs]\n{self._server.debug_logs()}"
+            ) from exc
+        return self._check(response)
 
     def lookup(self, table: str, key: str) -> dict | None:
         response = self.s.get(
@@ -130,6 +142,9 @@ class _Api:
         if response.status_code == 404:
             return None
         return self._check(response)
+
+    def query_table(self, table: str, payload: dict) -> dict:
+        return self._check(self.s.post(f"{self.url}/tables/{table}/query", json=payload, timeout=30))
 
 
 def _wait_for_entity(api: _Api, key: str, *, timeout_s: float = 60.0) -> dict:
@@ -149,14 +164,67 @@ def _doc_text(doc: dict) -> str:
     return json.dumps(doc)
 
 
-def test_swarm_resolves_and_promotes_entities_cross_shard(resolution_swarm):
-    api = _Api(resolution_swarm.api_url, resolution_swarm)
+def _graph_result(result: dict, name: str) -> dict | None:
+    responses = result.get("responses", [])
+    if not responses:
+        return None
+    return responses[0].get("graph_results", {}).get(name)
+
+
+def _wait_for_mention_hydration(api: _Api, *, timeout_s: float = 60.0) -> dict:
+    payload = {
+        "query": {"match_all": {}},
+        "graph_searches": {
+            "mentions": {
+                "type": "neighbors",
+                "index_name": "relations_graph",
+                "start_nodes": {"keys": ["doc:a"]},
+                "params": {
+                    "edge_types": ["mentions"],
+                    "direction": "out",
+                    "max_results": 10,
+                },
+                "include_documents": True,
+                "fields": ["entity_type", "canonical_name", "aliases"],
+            }
+        },
+        "limit": 10,
+    }
+
+    deadline = time.monotonic() + timeout_s
+    last: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        last = api.query_table("documents", payload)
+        graph = _graph_result(last, "mentions")
+        if graph is None:
+            time.sleep(0.5)
+            continue
+        nodes = graph.get("nodes", [])
+        by_key = {node.get("key"): node for node in nodes if isinstance(node, dict)}
+        ada = by_key.get("person/ada_lovelace")
+        antfly = by_key.get("org/antfly")
+        if (
+            isinstance(ada, dict)
+            and isinstance(ada.get("document"), dict)
+            and ada["document"].get("canonical_name") == "Ada Lovelace"
+            and isinstance(antfly, dict)
+            and isinstance(antfly.get("document"), dict)
+            and antfly["document"].get("canonical_name") == "Antfly"
+        ):
+            return graph
+        time.sleep(0.5)
+    raise AssertionError(f"mention graph did not hydrate promoted entities within {timeout_s}s (last={last})")
+
+
+def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_cluster):
+    api = _Api(resolution_cluster.data_api_urls[0], resolution_cluster)
 
     # Entities live in their own table (own shard group); documents are spread
-    # across two shards. Resolution reads entities cross-shard; promotion writes
-    # them cross-shard.
+    # across multiple shards in an explicit multi-node metadata/data raft setup.
+    # Resolution reads entities cross-shard; promotion writes them cross-shard;
+    # graph query hydrates the promoted entity documents through mention edges.
     api.create_table("entities", num_shards=1)
-    api.create_table("documents", num_shards=2, indexes=DOCUMENTS_INDEXES)
+    api.create_table("documents", num_shards=3, indexes=DOCUMENTS_INDEXES)
 
     api.insert(
         "documents",
@@ -191,3 +259,8 @@ def test_swarm_resolves_and_promotes_entities_cross_shard(resolution_swarm):
     time.sleep(2.0)
     ada_again = _wait_for_entity(api, "person/ada_lovelace")
     assert "Ada Lovelace" in _doc_text(ada_again)
+
+    mentions = _wait_for_mention_hydration(api)
+    assert mentions["type"] == "neighbors"
+    node_keys = {node["key"] for node in mentions["nodes"]}
+    assert {"person/ada_lovelace", "org/antfly"} <= node_keys

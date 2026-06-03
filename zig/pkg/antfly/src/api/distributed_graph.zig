@@ -583,7 +583,14 @@ fn selectorUsesResultRef(selector: graph_query_mod.NodeSelector) bool {
 }
 
 fn requireStampedCrossRangeRequest(req: db_mod.types.SearchRequest) !void {
-    if (req.identity_read_generation == null) return error.UnsupportedQueryRequest;
+    if (req.identity_read_generation != null) return;
+    if (req.resolved_doc_filter != null or req.resolved_doc_filter_wire_context != null) return error.UnsupportedQueryRequest;
+    for (req.graph_queries) |graph_query| {
+        if (selectorUsesResultRef(graph_query.query.start_nodes)) return error.UnsupportedQueryRequest;
+        if (graph_query.query.target_nodes) |target_nodes| {
+            if (selectorUsesResultRef(target_nodes)) return error.UnsupportedQueryRequest;
+        }
+    }
 }
 
 pub fn executeCrossRange(
@@ -2982,7 +2989,7 @@ pub fn frontierItemToSearchRequest(
     };
 
     return .{
-        .query = .{ .match_none = {} },
+        .query = .{ .match_all = {} },
         .graph_queries = graph_queries,
         .limit = 0,
         .include_stored = true,
@@ -4414,6 +4421,7 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expectEqual(@as(?u64, 12345), search_req.identity_read_generation);
     try std.testing.expect(search_req.resolved_doc_filter != null);
     try std.testing.expect(search_req.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
+    try std.testing.expect(search_req.query == .match_all);
     try std.testing.expectEqual(@as(f64, 1.25), search_req.graph_queries[0].query.params.min_weight);
     try std.testing.expectEqual(@as(f64, 9.5), search_req.graph_queries[0].query.params.max_weight);
     try std.testing.expect(search_req.graph_queries[0].query.params.algebraic_semiring);
@@ -5154,15 +5162,7 @@ test "distributed graph rejects unstamped result refs before cross-range fanout"
         },
     };
     try rejectUnstampedResultRefs(explicit_keys);
-    try std.testing.expectError(error.UnsupportedQueryRequest, executeCrossRange(
-        std.testing.allocator,
-        table_catalog.emptyCatalogSource(),
-        DummyWorker.iface(),
-        "docs",
-        explicit_keys,
-        base_result,
-        .read_index,
-    ));
+    try requireStampedCrossRangeRequest(explicit_keys);
 }
 
 test "distributed graph supports cross-range traverse target selectors" {

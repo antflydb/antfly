@@ -261,7 +261,7 @@ const RaftTableApplyStateMachine = struct {
         self.write_source.read_cache = &storage.read_cache;
         self.write_source.write_cache = &self.write_cache;
         self.write_source.runtime_status_cache = &storage.runtime_status_cache;
-        self.write_source.group_lsm_generation = storage.groupLsmGenerationSource();
+        self.write_source.group_visible_root_generation = storage.groupVisibleRootGenerationSource();
         if (storage.backend_runtime) |runtime| self.write_source.backend_runtime = runtime;
     }
 
@@ -2564,9 +2564,9 @@ pub const DataServer = struct {
             try group_ids.append(self.alloc, group_id);
         }
 
-        self.provisioned_storage.pruneGroupGenerations(group_ids.items);
+        self.provisioned_storage.pruneGroupVisibleRootGenerations(group_ids.items);
         if (group_ids.items.len == 0) return;
-        try self.provisioned_storage.bumpGroupGenerations(group_ids.items);
+        try self.provisioned_storage.bumpGroupVisibleRootGenerations(group_ids.items);
     }
 
     pub fn refreshVisibleProvisionedReplicaState(self: *DataServer) !void {
@@ -2619,7 +2619,7 @@ pub const DataServer = struct {
 
     fn localFetchMedianKey(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !?[]u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const lsm_root_generation = self.provisioned_storage.generationForGroup(group_id);
+        const lsm_root_generation = self.provisioned_storage.visibleRootGenerationForGroup(group_id);
         const change_generation = self.local_split_key_generation.load(.monotonic);
         if (try self.snapshotCachedLocalSplitKey(alloc, group_id, lsm_root_generation, change_generation)) |cached| {
             return switch (cached) {
@@ -3322,7 +3322,7 @@ pub const DataServer = struct {
                         table.indexes_json,
                         &self.provisioned_storage.lsm_cache,
                         &self.provisioned_storage.hbc_cache,
-                        self.provisioned_storage.generationForGroup(group_id),
+                        self.provisioned_storage.visibleRootGenerationForGroup(group_id),
                         &self.provisioned_storage.resource_manager,
                         try self.ensureBackendRuntime(),
                     );
@@ -3353,7 +3353,7 @@ pub const DataServer = struct {
                 group_id,
                 .{
                     .lsm_cache = &self.provisioned_storage.lsm_cache,
-                    .lsm_root_generation = self.provisioned_storage.generationForGroup(group_id),
+                    .lsm_root_generation = self.provisioned_storage.visibleRootGenerationForGroup(group_id),
                     .resource_manager = &self.provisioned_storage.resource_manager,
                     .backend_runtime = try self.ensureBackendRuntime(),
                 },
@@ -5098,7 +5098,7 @@ pub const DataServer = struct {
             local_group_ids = fallback_group_ids;
         }
         defer self.alloc.free(local_group_ids);
-        self.provisioned_storage.pruneGroupGenerations(local_group_ids);
+        self.provisioned_storage.pruneGroupVisibleRootGenerations(local_group_ids);
         if (local_group_ids.len == 0) {
             self.provisioned_storage.read_cache.clear();
             self.write_source.clearWriteCache();
@@ -5143,7 +5143,7 @@ pub const DataServer = struct {
             snapshot.ranges,
             try self.ensureBackendRuntime(),
         );
-        try self.provisioned_storage.bumpGroupGenerations(local_group_ids);
+        try self.provisioned_storage.bumpGroupVisibleRootGenerations(local_group_ids);
         self.provisioned_storage.read_cache.clear();
         self.write_source.pruneStaleWriteCacheLocked();
         self.last_provision_fingerprint = fingerprint;

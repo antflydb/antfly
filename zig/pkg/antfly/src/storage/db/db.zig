@@ -64,6 +64,7 @@ else
 const chunk_artifact_mod = @import("../../chunking/chunk.zig");
 const chunking_types_mod = @import("../../chunking/types.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
+const enrichment_worker = @import("enrichment/enrichment_worker.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
 const enrichment_types = @import("enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
@@ -161,6 +162,7 @@ pub const OpenOptions = struct {
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     start_index_workers: bool = true,
+    start_optional_runtimes: bool = true,
     enrichment: ?enrichment_runtime_mod.Config = null,
     ttl_cleanup: ttl_runtime_mod.Config = .{},
     transaction_recovery: transaction_runtime_mod.Config = .{},
@@ -874,6 +876,7 @@ pub const BatchProfile = struct {
 const BatchExecutionOptions = struct {
     validate_range_ownership: bool = true,
     store_batch_options: backend_types.BatchOptions = .{},
+    wait_for_sync_level: bool = true,
 };
 
 pub const OpenProfile = struct {
@@ -2478,7 +2481,8 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
-            if (opts.open_mode.allowsOptionalRuntimes()) {
+            const optional_runtimes_enabled = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes;
+            if (optional_runtimes_enabled) {
                 const init_optional_started_ns = monotonicTimeNs();
                 try db.initOptionalRuntimes(opts);
                 profile.init_optional_runtimes_ns = elapsedSince(init_optional_started_ns);
@@ -2507,7 +2511,7 @@ pub const DB = struct {
                 try replayPendingDerivedBatches(&db, null, null);
                 profile.replay_pending_derived_ns = elapsedSince(replay_started_ns);
             }
-            if (opts.open_mode.allowsOptionalRuntimes()) {
+            if (optional_runtimes_enabled) {
                 try db.resumeGeneratedReplayFromJournalIfNeeded();
             }
             if (db.start_index_workers) {
@@ -2518,7 +2522,7 @@ pub const DB = struct {
                 }
                 profile.start_index_workers_ns = elapsedSince(start_workers_started_ns);
             }
-            if (opts.open_mode.allowsOptionalRuntimes()) {
+            if (optional_runtimes_enabled) {
                 const start_optional_started_ns = monotonicTimeNs();
                 try db.startOptionalRuntimes();
                 profile.start_optional_runtimes_ns = elapsedSince(start_optional_started_ns);
@@ -3292,6 +3296,15 @@ pub const DB = struct {
         try self.batchInternal(req, null, .{ .validate_range_ownership = false });
     }
 
+    pub fn batchReplicatedApply(self: *DB, req: types.BatchRequest) anyerror!void {
+        var apply_req = req;
+        apply_req.sync_level = .write;
+        try self.batchInternal(apply_req, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+        });
+    }
+
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const total_start_ns = monotonicTimeNs();
@@ -3829,6 +3842,7 @@ pub const DB = struct {
         apply_mutex_held = false;
         var pressure_ctx = self.batchContext();
         const backlog_pressure_start_ns = monotonicTimeNs();
+        try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
         try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_pressure_ns, backlog_pressure_start_ns);
         const wait_sync_start_ns = monotonicTimeNs();
@@ -3836,11 +3850,13 @@ pub const DB = struct {
             const notify_executor_start_ns = monotonicTimeNs();
             notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, effective_req.sync_level, sequence, sync_targets);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
-            const sync_wait_start_ns = monotonicTimeNs();
-            try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
+            if (opts.wait_for_sync_level) {
+                const sync_wait_start_ns = monotonicTimeNs();
+                try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
+            }
         } else {
-            if (syncLevelRequiresDerivedVisibility(effective_req.sync_level)) {
+            if (opts.wait_for_sync_level and syncLevelRequiresDerivedVisibility(effective_req.sync_level)) {
                 const derived_apply_start_ns = monotonicTimeNs();
                 if (effective_req.sync_level == .full_text) {
                     try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.full_text_indexes, profile);
@@ -3849,11 +3865,13 @@ pub const DB = struct {
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.derived_apply_ns, derived_apply_start_ns);
             }
-            const sync_wait_start_ns = monotonicTimeNs();
-            try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
+            if (opts.wait_for_sync_level) {
+                const sync_wait_start_ns = monotonicTimeNs();
+                try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
+            }
         }
-        if (effective_req.sync_level == .full_index and self.text_merge_runtime == null) {
+        if (opts.wait_for_sync_level and effective_req.sync_level == .full_index and self.text_merge_runtime == null) {
             try self.drainScheduledTextMerges();
         }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.wait_sync_ns, wait_sync_start_ns);
@@ -6567,6 +6585,26 @@ pub const DB = struct {
         }
     }
 
+    fn markPrecomputedEnrichmentAppliedForSync(self: *DB, sync_level: types.SyncLevel, sequence: u64) !void {
+        if (sync_level != .enrichments or sequence == 0) return;
+        const runtime = self.enrichment_runtime orelse return;
+        const runtime_stats = runtime.stats();
+        if (runtime_stats.applied_sequence >= sequence -| 1 or
+            try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence))
+        {
+            try runtime.markAppliedThrough(sequence);
+        }
+    }
+
+    fn noPendingEnrichmentReplayThrough(self: *DB, applied_sequence: u64, sequence: u64) !bool {
+        const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.core.replaySource(), applied_sequence);
+        defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
+        for (pending) |group| {
+            if (group.sequence <= sequence) return false;
+        }
+        return true;
+    }
+
     pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
         var stable_target = sequence;
         while (true) {
@@ -6601,6 +6639,7 @@ pub const DB = struct {
     pub fn waitForCurrentSyncLevel(self: *DB, sync_level: types.SyncLevel) !void {
         try self.executor.failIfUnhealthy();
         const sequence = self.core.nextDerivedSequence();
+        try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
         var sync_targets = try self.currentManagedSyncTargets(sync_level);
         defer sync_targets.deinit(self.alloc);
         if (self.executor.hasWorkers()) {
@@ -14262,6 +14301,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
     defer sync_targets.deinit(ctx.alloc);
     ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+    try markPrecomputedEnrichmentAppliedForSyncContext(ctx, sync_level, sequence);
     try applyDerivedBacklogPressureContext(ctx, sequence, sync_level, sync_targets);
     if (ctx.executor.hasWorkers()) {
         notifyExecutorForSyncLevelWithDenseBulkDeferral(ctx.async_context, ctx.executor, sync_level, sequence, sync_targets);
@@ -14331,6 +14371,10 @@ fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_t
 }
 
 fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequence: u64, sync_level: types.SyncLevel, sync_targets: ManagedSyncTargets) !void {
+    switch (sync_level) {
+        .propose, .write => return,
+        .enrichments, .full_text, .aknn, .full_index => {},
+    }
     if (!ctx.executor.shouldThrottleBacklog()) return;
     if (sync_level == .full_text) {
         try runDerivedUntilTargetsContext(ctx, sequence, sync_targets.full_text_indexes);
@@ -14378,6 +14422,26 @@ fn runEnrichmentUntilContext(ctx: *const BatchExecutionContext, sequence: u64) !
         runtime.notifySequence(sequence);
         try runtime.waitForApplied(sequence);
     }
+}
+
+fn markPrecomputedEnrichmentAppliedForSyncContext(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel, sequence: u64) !void {
+    if (sync_level != .enrichments or sequence == 0) return;
+    const runtime = ctx.enrichment_runtime orelse return;
+    const runtime_stats = runtime.stats();
+    if (runtime_stats.applied_sequence >= sequence -| 1 or
+        try noPendingEnrichmentReplayThroughContext(ctx, runtime_stats.applied_sequence, sequence))
+    {
+        try runtime.markAppliedThrough(sequence);
+    }
+}
+
+fn noPendingEnrichmentReplayThroughContext(ctx: *const BatchExecutionContext, applied_sequence: u64, sequence: u64) !bool {
+    const pending = try enrichment_worker.collectPendingDocumentGroups(ctx.alloc, ctx.replay_source, applied_sequence);
+    defer enrichment_worker.freePendingDocumentGroups(ctx.alloc, pending);
+    for (pending) |group| {
+        if (group.sequence <= sequence) return false;
+    }
+    return true;
 }
 
 fn runMaintenanceUntilContext(ctx: *const BatchExecutionContext, sequence: u64, sync_targets: ManagedSyncTargets) !void {
@@ -25757,6 +25821,41 @@ test "db graph edge artifact replay catches up after reopen" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.8), edges[0].weight, 0.0001);
 }
 
+test "db query_readonly opens empty declared graph index" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json = "{}",
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .query_readonly });
+    defer reopened.close();
+
+    const query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "relations_graph",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{ .edge_types = &.{"mentions"}, .direction = .out },
+    };
+    var result = try reopened.search(alloc, .{ .graph_queries = &.{.{ .name = "mentions", .query = query }} });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(u32, 0), result.graph_results[0].total_hits);
+    try std.testing.expectEqual(@as(usize, 0), result.graph_results[0].nodes.len);
+}
+
 test "db batch marks generated enrichment replay for generator-enabled dense index" {
     const alloc = std.testing.allocator;
 
@@ -25937,6 +26036,7 @@ test "db enrichments precomputes generated enrichments into the committed batch"
         },
         .sync_level = .enrichments,
     });
+    try std.testing.expectEqual(@as(u64, 1), db.enrichment_runtime.?.stats().applied_sequence);
 
     const journal_entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
     defer {
@@ -25955,6 +26055,93 @@ test "db enrichments precomputes generated enrichments into the committed batch"
     try std.testing.expect(journalRecordHasHint(journal_record.record, .sparse_vector));
     try std.testing.expect(!journalRecordHasHint(journal_record.record, .enrichment));
     try std.testing.expect(journal_record.record.changed_artifact_keys.len > 0);
+}
+
+test "db replicated apply decouples client enrichment sync from raft apply execution" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+
+    try db.batchReplicatedApply(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+
+    const journal_entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+    defer {
+        for (journal_entries) |*entry| entry.deinit(alloc);
+        alloc.free(journal_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), journal_entries.len);
+
+    var journal_record = try change_journal_mod.decodeRecord(alloc, journal_entries[0].payload);
+    defer journal_record.deinit();
+
+    try std.testing.expect(journalRecordHasHint(journal_record.record, .enrichment));
+    try std.testing.expect(!journalRecordHasHint(journal_record.record, .dense_vector));
+    try std.testing.expectEqual(@as(usize, 0), journal_record.record.changed_artifact_keys.len);
+}
+
+test "db enrichments precomputed watermark advances across replay entries without enrichment debt" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+        },
+    });
+    defer db.close();
+
+    const inert_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:before"},
+        .target_hints = &.{.full_text},
+    });
+    defer alloc.free(inert_payload);
+    try db.core.store.appendReplayOpaque(alloc, 1, inert_payload);
+    try db.enrichment_runtime.?.resumeFrom(0, 0);
+    try std.testing.expectEqual(@as(u64, 0), db.enrichment_runtime.?.stats().applied_sequence);
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"precomputed dense text\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(db.core.nextDerivedSequence(), db.enrichment_runtime.?.stats().applied_sequence);
 }
 
 const TestAssetProducer = struct {
