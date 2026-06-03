@@ -2193,6 +2193,14 @@ pub const ProvisionedTableReadSource = struct {
         return self;
     }
 
+    pub fn withGroupVisibleRootGeneration(
+        self: *ProvisionedTableReadSource,
+        generation_source: ?GroupVisibleRootGenerationSource,
+    ) *ProvisionedTableReadSource {
+        self.group_visible_root_generation = generation_source;
+        return self;
+    }
+
     pub fn source(self: *ProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
