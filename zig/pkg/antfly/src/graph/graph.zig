@@ -358,6 +358,13 @@ pub const GraphIndex = struct {
                 .lsm => |*handle| try handle.backend.sync(force),
             }
         }
+
+        fn checkpointLsmWalAfterDurableBoundary(self: *ReverseStoreOwner) !void {
+            switch (self.*) {
+                .none, .mem, .lmdb => {},
+                .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
+            }
+        }
     };
 
     const OpenedReverseStore = struct {
@@ -378,6 +385,10 @@ pub const GraphIndex = struct {
 
     pub fn reverseStore(self: *GraphIndex) *backend_erased.Store {
         return &self.reverse_store;
+    }
+
+    pub fn checkpointLsmWalAfterDurableBoundary(self: *GraphIndex) !void {
+        try self.reverse_owner.checkpointLsmWalAfterDurableBoundary();
     }
 
     fn beginWriteOutgoingBatch(self: *GraphIndex) !backend_erased.Batch {
@@ -1135,6 +1146,7 @@ pub const GraphIndex = struct {
         txn_active = false;
         if (rebuild_state) |state| try state.clear();
         try self.rebuildCounterMetadata();
+        try self.checkpointLsmWalAfterDurableBoundary();
         return rebuilt;
     }
 
@@ -1875,4 +1887,42 @@ test "graph reverse store persists on durable lsm backend across reopen" {
         try std.testing.expectEqual(@as(usize, 1), incoming.len);
         try std.testing.expectEqualStrings("doc:a", incoming[0].source);
     }
+}
+
+test "graph reverse lsm durable boundary checkpoint retires retained wal" {
+    const alloc = std.testing.allocator;
+
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-lsm-wal-checkpoint");
+    defer cleanupTmp(store_path);
+
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-lsm-wal-checkpoint");
+    defer cleanupTmp(rev_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{
+        .reverse_backend = .lsm,
+        .reverse_lsm_options = .{ .flush_threshold = 1024 },
+    });
+    defer graph.close();
+
+    const now = platform_time.nowSeconds();
+    try graph.addEdge("doc:a", "doc:b", "link", 1.0, now, now, "");
+
+    const before = switch (graph.reverse_owner) {
+        .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
+        else => return error.ExpectedLsmOwner,
+    };
+    try std.testing.expect(before.wal_retained_bytes > 0);
+
+    try graph.checkpointLsmWalAfterDurableBoundary();
+
+    const after = switch (graph.reverse_owner) {
+        .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
+        else => return error.ExpectedLsmOwner,
+    };
+    try std.testing.expectEqual(@as(u64, 0), after.wal_retained_bytes);
 }

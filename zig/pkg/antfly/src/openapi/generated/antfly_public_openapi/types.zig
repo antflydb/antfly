@@ -423,11 +423,15 @@ pub const IndexStatus = struct {
     status: antfly_indexes_openapi.IndexStats,
 };
 
-pub const StorageStatus = struct {
-    /// Disk usage in bytes.
-    disk_usage: ?i64 = null,
-    /// Whether the table has received data.
-    empty: ?bool = null,
+/// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
+pub const LsmStorageStatus = struct {
+    run_count: ?i64 = null,
+    run_bytes: ?i64 = null,
+    l0_run_count: ?i64 = null,
+    l0_bytes: ?i64 = null,
+    wal_retained_bytes: ?i64 = null,
+    compaction_backlog_bytes: ?i64 = null,
+    active_readers: ?i64 = null,
 };
 
 /// MongoDB-style update operator
@@ -1448,6 +1452,14 @@ pub const AggregationRequest = struct {
     algebraic_join: ?AlgebraicAggregationJoin = null,
     /// Nested sub-aggregations
     sub_aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
+};
+
+pub const StorageStatus = struct {
+    /// Disk usage in bytes.
+    disk_usage: ?i64 = null,
+    /// Whether the table has received data.
+    empty: ?bool = null,
+    lsm: ?LsmStorageStatus = null,
 };
 
 pub const TransformOp = struct {

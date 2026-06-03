@@ -294,7 +294,7 @@ fn collectAndDelete(runtime: *TtlRuntime, now_ns: u64) !ScanSummary {
     };
     ScanState.active = &state;
     defer ScanState.active = null;
-    try backend_scan.scan(&runtime.store, "", "", .{}, &ScanState.cb);
+    try backend_scan.scanCurrent(&runtime.store, "", "", .{}, &ScanState.cb);
 
     if (candidates.items.len == 0) return summary;
     summary.deleted_docs = try runtime.delete_fn(runtime.delete_ctx, candidates.items);

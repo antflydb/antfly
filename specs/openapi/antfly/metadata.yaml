@@ -2261,6 +2261,31 @@ components:
           $ref: "indexes.yaml#/components/schemas/IndexConfig"
         status:
           $ref: "indexes.yaml#/components/schemas/IndexStats"
+    LsmStorageStatus:
+      type: object
+      description: Compact LSM backend operational status. Detailed low-level counters are available through metrics.
+      properties:
+        run_count:
+          type: integer
+          format: uint64
+        run_bytes:
+          type: integer
+          format: uint64
+        l0_run_count:
+          type: integer
+          format: uint64
+        l0_bytes:
+          type: integer
+          format: uint64
+        wal_retained_bytes:
+          type: integer
+          format: uint64
+        compaction_backlog_bytes:
+          type: integer
+          format: uint64
+        active_readers:
+          type: integer
+          format: uint64
     StorageStatus: # common.StorageStats
       type: object
       properties:
@@ -2271,6 +2296,8 @@ components:
         empty:
           type: boolean
           description: Whether the table has received data.
+        lsm:
+          $ref: "#/components/schemas/LsmStorageStatus"
     TableStatus: # common.TableStatus
       allOf:
         - $ref: "#/components/schemas/Table"

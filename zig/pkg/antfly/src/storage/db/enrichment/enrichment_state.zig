@@ -45,7 +45,7 @@ pub fn loadAppliedSequence(alloc: Allocator, store: anytype, scope: []const u8) 
 
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginRead();
+    var txn = try runtime.store.beginProbe();
     defer txn.abort();
     const borrowed = txn.get(key) catch |err| switch (err) {
         error.NotFound => return 0,
@@ -76,7 +76,7 @@ pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !R
 
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginRead();
+    var txn = try runtime.store.beginProbe();
     defer txn.abort();
     const borrowed = txn.get(key) catch |err| switch (err) {
         error.NotFound => return .{},
@@ -174,6 +174,31 @@ test "enrichment apply state works with lsm backend store" {
     try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(std.testing.allocator, runtime, "chunks"));
     try saveAppliedSequence(runtime, "chunks", 23);
     try std.testing.expectEqual(@as(u64, 23), try loadAppliedSequence(std.testing.allocator, runtime, "chunks"));
+}
+
+test "enrichment state lsm point loads do not clone mutable snapshot" {
+    var backend = lsm_backend.Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try saveAppliedSequence(runtime, "chunks", 29);
+    try saveRuntimeStatus(runtime, "generated", .{
+        .target_sequence = 31,
+        .error_count = 1,
+        .retryable_error_count = 2,
+        .fatal_error_count = 3,
+        .retrying = true,
+    });
+
+    const before = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 29), try loadAppliedSequence(std.testing.allocator, runtime, "chunks"));
+    const status = try loadRuntimeStatus(std.testing.allocator, runtime, "generated");
+    try std.testing.expectEqual(@as(u64, 31), status.target_sequence);
+    try std.testing.expect(status.retrying);
+    const after = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
 }
 
 test "enrichment runtime status persists source target sequence" {
