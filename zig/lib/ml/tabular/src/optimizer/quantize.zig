@@ -63,15 +63,14 @@ pub fn run(alloc: std.mem.Allocator, te: *ir.TreeEnsemble) error{OutOfMemory}!vo
             tags[f] = "f32";
             continue;
         }
-        const range = maxs[f] - mins[f];
-        // i8 grid: 255 intervals over [min, max]. Quantisation error per
-        // threshold is at most range / 255 / 2. We require this to be at
-        // most 1 ulp of the largest threshold magnitude — a strong bound
-        // but matches what termite's quantize.go uses.
-        const max_abs = @max(@abs(mins[f]), @abs(maxs[f]));
-        const ulp = if (max_abs == 0) 0 else max_abs * std.math.floatEps(f32);
-        const max_err = range / 255.0 / 2.0;
-        tags[f] = if (max_err <= @as(f64, @floatCast(ulp))) "i8" else "f32";
+        // i8 grid: 255 uniform intervals over [min, max]. The per-threshold
+        // quantisation error is at most range / 510 (half a grid step) —
+        // ~0.2% of the feature's dynamic range, which is well below the
+        // noise floor of decision-tree threshold selection. Tag as i8
+        // unless the feature has so few distinct splits that the saving
+        // is irrelevant. The previous bound compared against an f32 ULP
+        // which was unsatisfiable for any real-world feature.
+        tags[f] = if (counts[f] >= 4) "i8" else "f32";
     }
     te.annotations.threshold_precision = tags;
 }

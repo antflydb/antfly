@@ -26,6 +26,11 @@ const manifest_mod = @import("manifest.zig");
 pub const max_batch_size: usize = 10_000;
 pub const max_upload_bytes: usize = 50 * 1024 * 1024;
 
+/// Per-process counter used to give each upload's tmp file a unique name.
+/// Concurrent uploads of the same model name otherwise race on a shared
+/// `tabular_model.json.tmp`.
+var tmp_counter = std.atomic.Value(u64).init(0);
+
 pub const HttpError = error{
     InvalidJson,
     ModelNotFound,
@@ -63,7 +68,12 @@ pub fn predict(
     defer handle.release();
 
     const p = handle.predictor;
-    if (req.input.len > 0 and req.input[0].len != p.numFeatures()) return HttpError.FeatureMismatch;
+    // Reject ragged batches — every row must declare exactly num_features.
+    // Without this guard the engine indexes off the end of a short row,
+    // which is undefined behaviour in ReleaseFast and a panic in Safe.
+    for (req.input) |row| {
+        if (row.len != p.numFeatures()) return HttpError.FeatureMismatch;
+    }
 
     // Allocate flat output + per-row slices.
     const out_flat = try alloc.alloc(f32, req.input.len * p.numOutputs());
@@ -88,8 +98,10 @@ pub fn predict(
     };
 }
 
-/// Upload a `tabular_model.json` body. Caller has already validated the
-/// model name; this function persists to disk and registers the model.
+/// Upload a `tabular_model.json` body. Validates, persists atomically, and
+/// registers the model. The returned `ModelInfo` is allocated against
+/// `alloc` (the request allocator) — all strings are independent of the
+/// transient `loaded` arena and survive after this function returns.
 pub fn upload(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -105,30 +117,70 @@ pub fn upload(
     var loaded = tabular.loader.parseFromSlice(alloc, body) catch return HttpError.InvalidJson;
     defer loaded.deinit();
 
+    // Build the persisted directory + tmp/final paths. Use a unique tmp
+    // suffix so concurrent uploads of the same name don't clobber each
+    // other (see also the per-name reg.register guard below).
     const target_dir = try std.fs.path.join(alloc, &.{ models_dir, name });
     defer alloc.free(target_dir);
     std.Io.Dir.cwd().createDirPath(io, target_dir) catch return HttpError.IoError;
 
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}/tabular_model.json.tmp", .{target_dir});
+    const tmp_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/tabular_model.json.{d}.tmp",
+        .{ target_dir, tmp_counter.fetchAdd(1, .monotonic) },
+    );
     defer alloc.free(tmp_path);
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = body }) catch return HttpError.IoError;
     const final_path = try std.fmt.allocPrint(alloc, "{s}/tabular_model.json", .{target_dir});
     defer alloc.free(final_path);
+
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = body }) catch return HttpError.IoError;
+    // Clean up the tmp file on any failure between here and the rename.
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
     std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), final_path, io) catch return HttpError.IoError;
 
-    const info: registry_mod.ModelInfo = .{
-        .name = name,
-        .path = target_dir,
-        .task = loaded.model.metadata.task,
-        .num_features = loaded.model.metadata.num_features,
-        .num_outputs = loaded.model.output.num_outputs,
-        .feature_names = loaded.model.metadata.feature_names,
-        .source_framework = loaded.model.metadata.source_framework,
-    };
+    // Build the ModelInfo against the request allocator so it survives
+    // `loaded.deinit()` below. Each field is owned by `alloc`.
+    const info = try buildInfo(alloc, name, target_dir, loaded.model);
+    errdefer registry_mod.freeInfoStrings(alloc, info);
+
     reg.register(info) catch |err| return switch (err) {
         error.OutOfMemory => HttpError.OutOfMemory,
         else => HttpError.IoError,
     };
+    return info;
+}
+
+/// Allocate a ModelInfo whose strings are owned by `alloc`. Used by upload
+/// so the returned info outlives the loader's transient arena.
+fn buildInfo(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    path: []const u8,
+    m: tabular.TabularModel,
+) HttpError!registry_mod.ModelInfo {
+    var info: registry_mod.ModelInfo = .{
+        .name = "",
+        .path = "",
+        .task = m.metadata.task,
+        .num_features = m.metadata.num_features,
+        .num_outputs = m.output.num_outputs,
+        .feature_names = &.{},
+        .source_framework = "",
+    };
+    errdefer registry_mod.freeInfoStrings(alloc, info);
+    info.name = try alloc.dupe(u8, name);
+    info.path = try alloc.dupe(u8, path);
+    info.source_framework = try alloc.dupe(u8, m.metadata.source_framework);
+    const fns = try alloc.alloc([]const u8, m.metadata.feature_names.len);
+    var i: usize = 0;
+    errdefer {
+        var j: usize = 0;
+        while (j < i) : (j += 1) alloc.free(fns[j]);
+        alloc.free(fns);
+    }
+    while (i < m.metadata.feature_names.len) : (i += 1)
+        fns[i] = try alloc.dupe(u8, m.metadata.feature_names[i]);
+    info.feature_names = fns;
     return info;
 }
 

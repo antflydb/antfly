@@ -129,6 +129,11 @@ pub const TreeEngine = struct {
         const VecF = @Vector(L, f32);
         const VecI = @Vector(L, i32);
 
+        // Bounded fallback: if SIMD lanes detect ANY malformed node in this
+        // chunk, drop to the scalar walker for the affected rows. Scalar
+        // walkOne has defensive guards against -1 / OOB indices.
+        const node_count: i32 = @intCast(self.feature_index.len);
+
         var acc: VecF = @splat(@as(f32, @floatCast(self.base_score)));
         var t: u32 = 0;
         while (t < self.num_trees) : (t += 1) {
@@ -137,7 +142,16 @@ pub const TreeEngine = struct {
             var node: VecI = @splat(self.tree_starts[t]);
             var leaf: @Vector(L, bool) = @splat(false);
             var safety: u32 = 0;
+            var fell_back = false;
             while (safety < MAX_DEPTH_SAFETY) : (safety += 1) {
+                // Detect any out-of-range lane: a -1 / overflow has crept in
+                // from a malformed converter. Fall back to scalar for the
+                // whole chunk in that case.
+                inline for (0..L) |k| {
+                    if (!leaf[k] and (node[k] < 0 or node[k] >= node_count)) fell_back = true;
+                }
+                if (fell_back) break;
+
                 // Gather per-lane node attributes.
                 var fi_v: VecI = undefined;
                 var thr_v: VecF = undefined;
@@ -151,7 +165,7 @@ pub const TreeEngine = struct {
                     lc_v[k] = self.left_child[idx];
                     rc_v[k] = self.right_child[idx];
                     const fidx = fi_v[k];
-                    feat_v[k] = if (fidx >= 0) rows[k][@intCast(fidx)] else 0;
+                    feat_v[k] = if (fidx >= 0 and fidx < @as(i32, @intCast(rows[k].len))) rows[k][@intCast(fidx)] else 0;
                 }
 
                 // NaN follows default_left; non-NaN compares against threshold.
@@ -173,6 +187,13 @@ pub const TreeEngine = struct {
                 node = next;
             }
 
+            if (fell_back) {
+                // Restart the entire chunk via scalar walker. Cheap relative
+                // to the typical hot path; only triggered by malformed trees.
+                inline for (0..L) |k| out[k] = self.predictSingleOne(rows[k]);
+                return;
+            }
+
             // Add leaf values to the accumulator.
             var leaf_v: VecF = @splat(0);
             inline for (0..L) |k| {
@@ -189,9 +210,14 @@ pub const TreeEngine = struct {
         var i: i32 = self.tree_starts[tree_idx];
         var safety: u32 = 0;
         while (safety < MAX_DEPTH_SAFETY) : (safety += 1) {
+            // Defensive against malformed trees produced by buggy converters
+            // (validate() catches well-formed IR, but the converters bypass
+            // it). A negative index here would otherwise panic on @intCast.
+            if (i < 0 or @as(usize, @intCast(i)) >= self.feature_index.len) return 0;
             const idx: usize = @intCast(i);
             const fi = self.feature_index[idx];
             if (fi < 0) return self.leaf_value[idx];
+            if (fi >= @as(i32, @intCast(self.num_features))) return 0;
             const fv = feats[@intCast(fi)];
             // `fv != fv` is the IEEE-754 NaN test (fast, no math.h call).
             const go_left = if (fv != fv) self.default_left[idx] else fv < self.threshold32[idx];

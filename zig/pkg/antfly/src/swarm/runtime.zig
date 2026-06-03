@@ -601,6 +601,7 @@ pub fn runFromIterator(
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
     defer antfly_node.deinit();
+    antfly_node.seedAndDiscoverPredictors(init.io);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,

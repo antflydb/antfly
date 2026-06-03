@@ -153,14 +153,8 @@ fn finishTree(
 
     var tree_starts = try alloc.alloc(i32, num_trees);
     @memset(tree_starts, -1);
-    {
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const t: usize = @intCast(treeids[i]);
-            if (tree_starts[t] == -1) tree_starts[t] = @intCast(i);
-        }
-    }
 
+    // Build the (tree_id, intra-tree node id) → global slot map first.
     var per_tree_map = try alloc.alloc(std.AutoHashMap(i64, i32), num_trees);
     var t: usize = 0;
     while (t < num_trees) : (t += 1) per_tree_map[t] = std.AutoHashMap(i64, i32).init(alloc);
@@ -169,8 +163,21 @@ fn finishTree(
     {
         var i: usize = 0;
         while (i < n) : (i += 1) {
+            if (treeids[i] < 0) return Error.MalformedModel;
             const tt: usize = @intCast(treeids[i]);
+            if (tt >= num_trees) return Error.MalformedModel;
             per_tree_map[tt].put(nodeids[i], @intCast(i)) catch return Error.OutOfMemory;
+        }
+    }
+
+    // tree_starts[t] is the global slot of the ROOT (nodes_nodeids == 0).
+    // ONNX-ML does not guarantee root-first ordering, so we look it up
+    // explicitly instead of using the first matching tree-id slot.
+    {
+        var tt: usize = 0;
+        while (tt < num_trees) : (tt += 1) {
+            const root_slot = per_tree_map[tt].get(0) orelse return Error.MalformedModel;
+            tree_starts[tt] = root_slot;
         }
     }
 

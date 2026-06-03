@@ -224,3 +224,73 @@ def test_convert_sklearn_returns_415(base_url):
     assert r.status_code == 415, r.text
     body = r.json()
     assert "termite-convert" in body.get("message", "")
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the bugs surfaced in the code review.
+# ---------------------------------------------------------------------------
+
+
+def test_ragged_batch_rejected(api):
+    """Code-review F2: rows beyond row 0 were not validated → engine OOB."""
+    r = api.post(
+        "/predict",
+        json={"model": "iris-classifier", "input": [[5.1, 3.5, 1.4, 0.2], [5.1]]},
+        retry_on_missing_model=False,
+    )
+    assert r.status_code == 400, r.text
+
+
+def test_listmodels_includes_predictors(api):
+    """Code-review F3: /models must include the predictors bucket."""
+    r = api.get("/models")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "predictors" in body, body
+    assert "iris-classifier" in body["predictors"], body["predictors"]
+    iris = body["predictors"]["iris-classifier"]
+    assert iris["task"] == "multiclass"
+    assert iris["num_features"] == 4
+    assert iris["num_outputs"] == 3
+
+
+def test_hostile_int_does_not_crash_loader(base_url):
+    """Code-review F5: @intCast on out-of-range int would panic; loader
+    must return a structured 400 instead."""
+    malicious = {
+        "schema_version": 1,
+        "metadata": {"name": "x", "num_features": 1, "task": "regression"},
+        "output": {"activation": "identity", "num_outputs": 1},
+        "pipeline": [{
+            "type": "tree_ensemble",
+            "tree_ensemble": {
+                "objective": "x",
+                "num_trees": 2147483648,  # > i32 max
+                "num_features": 1,
+                "max_depth": 1,
+                "nodes": {
+                    "feature_index": [-1],
+                    "threshold": [0],
+                    "left_child": [-1],
+                    "right_child": [-1],
+                    "leaf_value": [1.0],
+                    "default_left": [False],
+                    "tree_starts": [0],
+                },
+            },
+        }],
+    }
+    r = requests.post(
+        f"{base_url}{api_path('/predict/upload')}?name=hostile",
+        data=json.dumps(malicious).encode(),
+        headers={"content-type": "application/octet-stream"},
+    )
+    # Either 400 (validation rejected) or 500 with a structured error —
+    # both are fine; the process must not crash.
+    assert r.status_code in (400, 500), r.text
+    # Subsequent requests must still work.
+    follow = requests.post(
+        f"{base_url}{api_path('/predict')}",
+        json={"model": "iris-classifier", "input": [IRIS_SAMPLE_SETOSA]},
+    )
+    assert follow.status_code == 200, follow.text

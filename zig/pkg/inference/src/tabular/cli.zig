@@ -94,11 +94,14 @@ pub fn convertMain(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
     defer result.deinit();
 
     if (optimize_passes) {
+        // Operate directly on the IR's TreeEnsemble pointer — the previous
+        // version copied to a stack-local `mut` and dropped the mutations
+        // on the floor, making --optimize a silent no-op.
         for (result.model.pipeline) |s| {
             if (s.type == .tree_ensemble) {
-                if (s.tree_ensemble) |te| {
-                    var mut = te.*;
-                    tabular.optimizer.optimizeEnsemble(alloc, &mut, .{
+                if (s.tree_ensemble) |te_const| {
+                    const te_mut: *tabular.ir.TreeEnsemble = @constCast(te_const);
+                    tabular.optimizer.optimizeEnsemble(alloc, te_mut, .{
                         .dead_leaf_threshold_fraction = dead_leaf_threshold,
                     }) catch {};
                 }

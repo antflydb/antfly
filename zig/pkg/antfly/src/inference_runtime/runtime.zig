@@ -163,6 +163,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
     });
     defer node.deinit();
+    node.seedAndDiscoverPredictors(io);
 
     try node.serve(alloc, io, host, port);
 }
@@ -187,6 +188,11 @@ pub fn spawnServerProcess(
     errdefer alloc.destroy(node);
     node.* = try inference.server.Node.init(alloc, node_cfg);
     errdefer node.deinit();
+    // Seed builtin predictors + discover on-disk predictors before
+    // launching the server thread.
+    var seed_io_impl = std.Io.Threaded.init(alloc, .{});
+    defer seed_io_impl.deinit();
+    node.seedAndDiscoverPredictors(seed_io_impl.io());
 
     const host_dup = try alloc.dupe(u8, parsed.host);
     errdefer alloc.free(host_dup);

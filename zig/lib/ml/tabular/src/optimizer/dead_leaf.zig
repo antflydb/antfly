@@ -32,37 +32,112 @@ pub fn run(te: *ir.TreeEnsemble, threshold_fraction: f64) Result {
     var eliminated: u32 = 0;
     if (te.nodes.tree_starts.len == 0) return .{ .leaves_eliminated = 0 };
 
+    // Stack-allocated DFS buffer — bounded to avoid pathological recursion
+    // on adversarial trees. Real ensembles have << 4096 total nodes per
+    // tree; larger trees skip optimisation rather than recurse unbounded.
+    var stack_buf: [4096]usize = undefined;
+
     var t: u32 = 0;
     while (t < te.nodes.tree_starts.len) : (t += 1) {
-        const start: usize = @intCast(te.nodes.tree_starts[t]);
-        const end: usize = if (t + 1 < te.nodes.tree_starts.len)
-            @intCast(te.nodes.tree_starts[t + 1])
-        else
-            te.nodes.leaf_value.len;
+        const raw_start = te.nodes.tree_starts[t];
+        if (raw_start < 0) continue;
+        const start: usize = @intCast(raw_start);
 
+        // First pass: walk this tree's nodes from the root via children
+        // (correct under any node layout, unlike a contiguous-range scan).
         var max_abs: f64 = 0;
-        var i = start;
-        while (i < end) : (i += 1) {
-            if (te.nodes.feature_index[i] < 0) {
-                const av = @abs(te.nodes.leaf_value[i]);
-                if (av > max_abs) max_abs = av;
-            }
-        }
+        if (!findMaxAbs(te, start, &stack_buf, &max_abs)) continue;
         if (max_abs == 0) continue;
 
+        // Second pass: zero leaves below cutoff and count eliminations.
         const cutoff = threshold_fraction * max_abs;
-        i = start;
-        while (i < end) : (i += 1) {
-            if (te.nodes.feature_index[i] < 0 and @abs(te.nodes.leaf_value[i]) < cutoff) {
-                // Avoid eliminating an already-zero leaf as "eliminated".
-                if (te.nodes.leaf_value[i] != 0) eliminated += 1;
-                te.nodes.leaf_value[i] = 0;
-            }
-        }
+        var pass_eliminated: u32 = 0;
+        _ = zeroBelowCutoff(te, start, &stack_buf, cutoff, &pass_eliminated);
+        eliminated += pass_eliminated;
     }
 
     te.annotations.dead_leaves_eliminated +%= eliminated;
     return .{ .leaves_eliminated = eliminated };
+}
+
+/// DFS that finds the maximum |leaf| value in the tree rooted at `root`.
+/// Returns false on structural problems (cycles, OOB).
+fn findMaxAbs(
+    te: *ir.TreeEnsemble,
+    root: usize,
+    stack_buf: []usize,
+    max_abs_out: *f64,
+) bool {
+    const len = te.nodes.feature_index.len;
+    if (root >= len) return false;
+    var sp: usize = 0;
+    stack_buf[sp] = root;
+    sp += 1;
+    var visited: u32 = 0;
+    while (sp > 0) {
+        if (visited > 256 * 1024) return false;
+        visited += 1;
+        sp -= 1;
+        const i = stack_buf[sp];
+        if (i >= len) return false;
+        const fi = te.nodes.feature_index[i];
+        if (fi < 0) {
+            const av = @abs(te.nodes.leaf_value[i]);
+            if (av > max_abs_out.*) max_abs_out.* = av;
+            continue;
+        }
+        const l = te.nodes.left_child[i];
+        const r = te.nodes.right_child[i];
+        if (l < 0 or r < 0) return false;
+        if (sp + 2 > stack_buf.len) return false;
+        stack_buf[sp] = @intCast(l);
+        sp += 1;
+        stack_buf[sp] = @intCast(r);
+        sp += 1;
+    }
+    return true;
+}
+
+/// DFS that zeroes any leaf whose magnitude is below `cutoff`, counting
+/// the eliminations. Same robustness contract as findMaxAbs.
+fn zeroBelowCutoff(
+    te: *ir.TreeEnsemble,
+    root: usize,
+    stack_buf: []usize,
+    cutoff: f64,
+    count_out: *u32,
+) bool {
+    const len = te.nodes.feature_index.len;
+    if (root >= len) return false;
+    var sp: usize = 0;
+    stack_buf[sp] = root;
+    sp += 1;
+    var visited: u32 = 0;
+    while (sp > 0) {
+        if (visited > 256 * 1024) return false;
+        visited += 1;
+        sp -= 1;
+        const i = stack_buf[sp];
+        if (i >= len) return false;
+        const fi = te.nodes.feature_index[i];
+        if (fi < 0) {
+            const v = te.nodes.leaf_value[i];
+            if (@abs(v) < cutoff and v != 0) {
+                te.nodes.leaf_value[i] = 0;
+                count_out.* += 1;
+            }
+            continue;
+        }
+        const l = te.nodes.left_child[i];
+        const r = te.nodes.right_child[i];
+        if (l < 0 or r < 0) return false;
+        if (sp + 2 > stack_buf.len) return false;
+        stack_buf[sp] = @intCast(l);
+        sp += 1;
+        stack_buf[sp] = @intCast(r);
+        sp += 1;
+    }
+    return true;
 }
 
 test "dead-leaf zeroes leaves below cutoff but preserves the big ones" {

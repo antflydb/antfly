@@ -103,6 +103,10 @@ fn predictorInfoToApi(info: tabular_registry_mod.ModelInfo) api.PredictorInfo {
     };
 }
 
+/// Map the OpenAPI `framework` enum to the Zig converter. The spec only
+/// declares {auto, xgboost, lightgbm, onnx}; sklearn/catboost are accepted
+/// here too so requests from non-SDK clients still surface the friendly 415
+/// "use termite-convert" guidance via convertAndUpload.
 fn parseFrameworkParam(s: []const u8) ?ml_tabular.convert.Framework {
     if (std.mem.eql(u8, s, "auto")) return .auto;
     if (std.mem.eql(u8, s, "xgboost")) return .xgboost;
@@ -1628,11 +1632,14 @@ pub const Node = struct {
         defer self.releaseSlotUnits(queue_units);
 
         self.metrics.incRequest("predict");
+        defer self.metrics.decActive();
+
         const result = tabular_http_mod.predict(ctx.io, ctx.allocator, &self.tabular_registry, .{
             .model = body.model,
             .input = body.input,
         }) catch |err| {
             self.metrics.incPredictError();
+            self.metrics.incError();
             return mapTabularHttpErrorPredict(ctx, err);
         };
 
@@ -1654,11 +1661,28 @@ pub const Node = struct {
             .message = "Pass ?name=<predictor-name>",
         });
 
-        const predictors_dir = std.fs.path.join(ctx.allocator, &.{ self.config.models_dir, "predictors" }) catch return ctx.status(500).json(.{ .@"error" = "alloc" });
+        // Body bytes are already buffered; charge queue units proportional to
+        // the upload size so concurrent uploaders can't exhaust the server.
+        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
+
+        self.metrics.incRequest("predict");
+        defer self.metrics.decActive();
+
+        const predictors_dir = std.fs.path.join(ctx.allocator, &.{ self.config.models_dir, "predictors" }) catch {
+            self.metrics.incPredictError();
+            self.metrics.incError();
+            return ctx.status(500).json(.{ .@"error" = "alloc" });
+        };
         defer ctx.allocator.free(predictors_dir);
         std.Io.Dir.cwd().createDirPath(ctx.io, predictors_dir) catch {};
 
-        const info = tabular_http_mod.upload(ctx.io, ctx.allocator, &self.tabular_registry, predictors_dir, name, body) catch |err| return mapTabularHttpErrorUpload(ctx, err);
+        const info = tabular_http_mod.upload(ctx.io, ctx.allocator, &self.tabular_registry, predictors_dir, name, body) catch |err| {
+            self.metrics.incPredictError();
+            self.metrics.incError();
+            return mapTabularHttpErrorUpload(ctx, err);
+        };
         return ctx.status(201).json(predictorInfoToApi(info));
     }
 
@@ -1673,13 +1697,28 @@ pub const Node = struct {
         });
         const framework_str = ctx.query("framework") orelse "auto";
         const framework = parseFrameworkParam(framework_str) orelse
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "framework must be auto|xgboost|lightgbm|onnx|sklearn|catboost" });
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "framework must be auto|xgboost|lightgbm|onnx" });
 
-        const predictors_dir = std.fs.path.join(ctx.allocator, &.{ self.config.models_dir, "predictors" }) catch return ctx.status(500).json(.{ .@"error" = "alloc" });
+        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
+
+        self.metrics.incRequest("predict");
+        defer self.metrics.decActive();
+
+        const predictors_dir = std.fs.path.join(ctx.allocator, &.{ self.config.models_dir, "predictors" }) catch {
+            self.metrics.incPredictError();
+            self.metrics.incError();
+            return ctx.status(500).json(.{ .@"error" = "alloc" });
+        };
         defer ctx.allocator.free(predictors_dir);
         std.Io.Dir.cwd().createDirPath(ctx.io, predictors_dir) catch {};
 
-        const info = tabular_http_mod.convertAndUpload(ctx.io, ctx.allocator, &self.tabular_registry, predictors_dir, name, framework, body) catch |err| return mapTabularHttpErrorConvert(ctx, err);
+        const info = tabular_http_mod.convertAndUpload(ctx.io, ctx.allocator, &self.tabular_registry, predictors_dir, name, framework, body) catch |err| {
+            self.metrics.incPredictError();
+            self.metrics.incError();
+            return mapTabularHttpErrorConvert(ctx, err);
+        };
         return ctx.status(201).json(predictorInfoToApi(info));
     }
 
@@ -4778,6 +4817,34 @@ pub const Node = struct {
 
             try body.append(a, '}');
         }
+
+        // Append the predictors bucket from the tabular registry. This is
+        // separate from model_listing_tasks because predictors don't share
+        // the embedder/reranker/generator manifest schema.
+        try body.appendSlice(a, ",\"predictors\":{");
+        const predictor_infos = self.tabular_registry.list(a) catch &[_]tabular_registry_mod.ModelInfo{};
+        defer if (predictor_infos.len > 0) a.free(predictor_infos);
+        for (predictor_infos, 0..) |info, i| {
+            if (i > 0) try body.append(a, ',');
+            try jsonEncodeString(&body, a, info.name);
+            try body.appendSlice(a, ":{\"task\":\"");
+            try body.appendSlice(a, ml_tabular.ir.taskTypeToString(info.task));
+            try body.appendSlice(a, "\",\"num_features\":");
+            const nf_str = try std.fmt.allocPrint(a, "{d}", .{info.num_features});
+            defer a.free(nf_str);
+            try body.appendSlice(a, nf_str);
+            try body.appendSlice(a, ",\"num_outputs\":");
+            const no_str = try std.fmt.allocPrint(a, "{d}", .{info.num_outputs});
+            defer a.free(no_str);
+            try body.appendSlice(a, no_str);
+            if (info.source_framework.len > 0) {
+                try body.appendSlice(a, ",\"source_framework\":");
+                try jsonEncodeString(&body, a, info.source_framework);
+            }
+            try body.append(a, '}');
+        }
+        try body.append(a, '}');
+
         try buf.appendSlice(a, "{\"object\":\"list\",\"data\":[");
         try buf.appendSlice(a, openai_data.items);
         try buf.appendSlice(a, "],\"allow_downloads\":");

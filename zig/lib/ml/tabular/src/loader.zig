@@ -103,7 +103,7 @@ fn projectModel(alloc: std.mem.Allocator, v: *std.json.Value) LoadError!ir.Tabul
     var m: ir.TabularModel = .{};
 
     if (root.get("schema_version")) |sv| {
-        m.schema_version = @intCast(try expectInt(sv));
+        m.schema_version = try castInt(u32, try expectInt(sv));
     }
     if (m.schema_version != ir.schema_version) return LoadError.UnsupportedSchemaVersion;
 
@@ -135,8 +135,8 @@ fn projectMetadata(alloc: std.mem.Allocator, v: std.json.Value) LoadError!ir.Met
     if (o.get("task")) |x| {
         md.task = ir.taskTypeFromString(try expectString(x)) orelse return LoadError.UnknownTaskType;
     }
-    if (o.get("num_features")) |x| md.num_features = @intCast(try expectInt(x));
-    if (o.get("num_classes")) |x| md.num_classes = @intCast(try expectInt(x));
+    if (o.get("num_features")) |x| md.num_features = try castInt(u32, try expectInt(x));
+    if (o.get("num_classes")) |x| md.num_classes = try castInt(u32, try expectInt(x));
     if (o.get("created_at")) |x| md.created_at = try expectString(x);
 
     if (o.get("feature_names")) |x| {
@@ -163,7 +163,7 @@ fn projectOutput(v: std.json.Value) LoadError!ir.OutputCfg {
     if (o.get("activation")) |x| {
         out.activation = ir.activationFromString(try expectString(x)) orelse return LoadError.UnknownActivation;
     }
-    if (o.get("num_outputs")) |x| out.num_outputs = @intCast(try expectInt(x));
+    if (o.get("num_outputs")) |x| out.num_outputs = try castInt(u32, try expectInt(x));
     if (out.num_outputs == 0) return LoadError.NumOutputsMustBePositive;
     return out;
 }
@@ -229,9 +229,9 @@ fn projectTreeEnsemble(alloc: std.mem.Allocator, v: std.json.Value) LoadError!ir
     var te: ir.TreeEnsemble = .{};
     if (o.get("objective")) |x| te.objective = try expectString(x);
     if (o.get("base_score")) |x| te.base_score = try expectFloat(x);
-    if (o.get("num_trees")) |x| te.num_trees = @intCast(try expectInt(x));
-    if (o.get("num_features")) |x| te.num_features = @intCast(try expectInt(x));
-    if (o.get("max_depth")) |x| te.max_depth = @intCast(try expectInt(x));
+    if (o.get("num_trees")) |x| te.num_trees = try castInt(u32, try expectInt(x));
+    if (o.get("num_features")) |x| te.num_features = try castInt(u32, try expectInt(x));
+    if (o.get("max_depth")) |x| te.max_depth = try castInt(u32, try expectInt(x));
 
     const nodes_v = o.get("nodes") orelse return LoadError.MalformedTreeEnsemble;
     te.nodes = try projectTreeNodes(alloc, nodes_v);
@@ -266,7 +266,7 @@ fn projectTreeAnnotations(alloc: std.mem.Allocator, v: std.json.Value) LoadError
         for (x.array.items, 0..) |item, i| out[i] = try expectString(item);
         a.threshold_precision = out;
     }
-    if (o.get("dead_leaves_eliminated")) |x| a.dead_leaves_eliminated = @intCast(try expectInt(x));
+    if (o.get("dead_leaves_eliminated")) |x| a.dead_leaves_eliminated = try castInt(u32, try expectInt(x));
     if (o.get("branch_order")) |x| a.branch_order = try expectString(x);
     return a;
 }
@@ -292,7 +292,7 @@ fn projectSvm(alloc: std.mem.Allocator, v: std.json.Value) LoadError!ir.SVMModel
     if (o.get("intercept")) |x| sm.intercept = try toF64Slice(alloc, x);
     if (o.get("gamma")) |x| sm.gamma = try expectFloat(x);
     if (o.get("coef0")) |x| sm.coef0 = try expectFloat(x);
-    if (o.get("degree")) |x| sm.degree = @intCast(try expectInt(x));
+    if (o.get("degree")) |x| sm.degree = try castInt(u32, try expectInt(x));
     return sm;
 }
 
@@ -335,7 +335,15 @@ fn expectString(v: std.json.Value) LoadError![]const u8 {
 fn expectInt(v: std.json.Value) LoadError!i64 {
     return switch (v) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| blk: {
+            // Reject NaN/Inf and out-of-range floats — @intFromFloat is
+            // undefined behaviour otherwise.
+            if (!std.math.isFinite(f)) return LoadError.InvalidJson;
+            if (f < @as(f64, @floatFromInt(std.math.minInt(i64))) or
+                f > @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                return LoadError.InvalidJson;
+            break :blk @intFromFloat(f);
+        },
         else => LoadError.InvalidJson,
     };
 }
@@ -348,10 +356,17 @@ fn expectFloat(v: std.json.Value) LoadError!f64 {
     };
 }
 
+/// Safely narrow an i64 to a target signed/unsigned int type, returning a
+/// LoadError on overflow instead of panicking. Used pervasively to reject
+/// hostile input that would otherwise abort the inference process.
+fn castInt(comptime T: type, v: i64) LoadError!T {
+    return std.math.cast(T, v) orelse LoadError.InvalidJson;
+}
+
 fn toI32Slice(alloc: std.mem.Allocator, v: std.json.Value) LoadError![]i32 {
     if (v != .array) return LoadError.InvalidJson;
     var out = try alloc.alloc(i32, v.array.items.len);
-    for (v.array.items, 0..) |x, i| out[i] = @intCast(try expectInt(x));
+    for (v.array.items, 0..) |x, i| out[i] = try castInt(i32, try expectInt(x));
     return out;
 }
 
@@ -435,6 +450,10 @@ fn validateTreeEnsemble(te: ir.TreeEnsemble, num_features: u32) LoadError!void {
     if (te.num_trees != 0 and n.tree_starts.len != te.num_trees) return LoadError.MalformedTreeEnsemble;
     if (len == 0) return LoadError.MalformedTreeEnsemble;
 
+    // Tree starts must be in range. We do NOT require ascending order or
+    // contiguous tree ranges — ONNX-ML exporters sometimes interleave
+    // nodes. dead_leaf and other passes walk trees via children rather
+    // than via index ranges to stay correct under any layout.
     for (n.tree_starts) |ts| {
         if (ts < 0 or @as(usize, @intCast(ts)) >= len) return LoadError.OutOfBoundsTreeIndex;
     }
@@ -446,6 +465,10 @@ fn validateTreeEnsemble(te: ir.TreeEnsemble, num_features: u32) LoadError!void {
         const r = n.right_child[i];
         if (l != -1 and (l < 0 or @as(usize, @intCast(l)) >= len)) return LoadError.OutOfBoundsTreeIndex;
         if (r != -1 and (r < 0 or @as(usize, @intCast(r)) >= len)) return LoadError.OutOfBoundsTreeIndex;
+        // An internal node (feature_index >= 0) must have BOTH children
+        // resolved. Letting one child be -1 means the tree walk steps to
+        // index -1 and crashes — see tree_engine.walkOne/walkChunk.
+        if (fi >= 0 and (l < 0 or r < 0)) return LoadError.OutOfBoundsTreeIndex;
     }
 }
 
