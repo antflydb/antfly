@@ -20,7 +20,7 @@ Covers:
   - Name-allowlist rejects path traversal.
   - Oversized batches return 413.
   - Non-existent model returns 404.
-  - XGBoost / LightGBM / ONNX-ML converter parity (skipped if packages absent).
+  - XGBoost / LightGBM / ONNX-ML converter-to-predictor round trips.
 """
 
 from __future__ import annotations
@@ -141,6 +141,52 @@ STUMP_IR = {
 }
 
 
+XGBOOST_STUMP_JSON = {
+    "learner": {
+        "learner_model_param": {
+            "num_feature": "1",
+            "num_class": "0",
+            "base_score": "0",
+        },
+        "objective": {"name": "reg:squarederror"},
+        "gradient_booster": {
+            "name": "gbtree",
+            "model": {
+                "trees": [
+                    {
+                        "split_indices": [0, 0, 0],
+                        "split_conditions": [0.5, 0.0, 0.0],
+                        "left_children": [1, -1, -1],
+                        "right_children": [2, -1, -1],
+                        "base_weights": [0.0, -1.0, 1.0],
+                        "default_left": [True, True, True],
+                    }
+                ]
+            },
+        },
+    }
+}
+
+
+LIGHTGBM_STUMP_TEXT = """tree
+version=v4
+num_class=1
+objective=regression
+max_feature_idx=0
+
+Tree=0
+num_leaves=2
+num_cat=0
+split_feature=0
+threshold=0.5
+decision_type=2
+left_child=-1
+right_child=-2
+leaf_value=-1 1
+end of trees
+"""
+
+
 class QuietSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002
         pass
@@ -248,39 +294,19 @@ def test_pull_rejects_unsafe_name(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Convert + predict round-trip — requires xgboost / lightgbm to be installed.
+# Convert + predict round-trip.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("framework", ["xgboost", "lightgbm"])
-def test_convert_real_model_predicts(api, framework, tmp_path):
+def test_convert_tree_model_predicts(api, framework, tmp_path):
     command, model_root = _local_cli_models()
     if framework == "xgboost":
-        xgb = pytest.importorskip("xgboost")
-        sklearn_ds = pytest.importorskip("sklearn.datasets")
-        data = sklearn_ds.load_iris()
-        booster = xgb.XGBClassifier(
-            objective="multi:softprob",
-            num_class=3,
-            n_estimators=10,
-            max_depth=3,
-            random_state=0,
-        ).fit(data.data, data.target)
         model_path = tmp_path / "xgb.json"
-        booster.save_model(str(model_path))
+        model_path.write_text(json.dumps(XGBOOST_STUMP_JSON), encoding="utf-8")
     else:
-        lgb = pytest.importorskip("lightgbm")
-        sklearn_ds = pytest.importorskip("sklearn.datasets")
-        data = sklearn_ds.load_iris()
-        booster = lgb.LGBMClassifier(
-            objective="multiclass",
-            num_class=3,
-            n_estimators=10,
-            max_depth=3,
-            random_state=0,
-        ).fit(data.data, data.target)
         model_path = tmp_path / "lgb.txt"
-        booster.booster_.save_model(str(model_path))
+        model_path.write_text(LIGHTGBM_STUMP_TEXT, encoding="utf-8")
 
     model_name = f"e2e-{framework}"
     subprocess.run(
@@ -297,13 +323,11 @@ def test_convert_real_model_predicts(api, framework, tmp_path):
         check=True,
     )
 
-    sample = data.data[0].tolist()
-    pr = _predict(api, model_name, [sample])
+    pr = _predict(api, model_name, [[0.1], [0.9]])
     assert pr.status_code == 200, pr.text
-    probs = pr.json()["predictions"][0]
-    assert len(probs) == 3
-    assert abs(sum(probs) - 1.0) < 1e-3, probs
-    assert np.argmax(probs) == 0, probs  # setosa
+    preds = pr.json()["predictions"]
+    assert abs(preds[0][0] - (-1.0)) < 1e-4
+    assert abs(preds[1][0] - 1.0) < 1e-4
 
 
 def test_convert_onnx_linear_regressor_predicts(api, tmp_path):
