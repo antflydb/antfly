@@ -7162,7 +7162,7 @@ fn openManagedDbForTableWithRuntime(
     table_name: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !db_mod.DB {
-    return try openManagedDbForTableWithCacheAndRuntime(alloc, path, catalog, table_name, null, null, 0, null, backend_runtime);
+    return try openManagedDbForTableWithCacheAndRuntime(alloc, path, catalog, table_name, null, null, table_reads.backend_current_root_generation, null, backend_runtime);
 }
 
 fn openManagedDbForTableGroupWithRuntime(
@@ -7173,7 +7173,7 @@ fn openManagedDbForTableGroupWithRuntime(
     group_id: u64,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !db_mod.DB {
-    return try openManagedDbForTableGroupWithCacheAndRuntime(alloc, path, catalog, table_name, group_id, null, null, 0, null, backend_runtime);
+    return try openManagedDbForTableGroupWithCacheAndRuntime(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime);
 }
 
 fn openManagedDbForTableWithCache(
@@ -7249,7 +7249,7 @@ fn openManagedDbForTableWithIndexesJson(
     path: []const u8,
     indexes_json: ?[]const u8,
 ) !db_mod.DB {
-    return try openManagedDbForTableWithIndexesJsonAndCacheAndRuntime(alloc, path, indexes_json, null, null, 0, null, null);
+    return try openManagedDbForTableWithIndexesJsonAndCacheAndRuntime(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null, null);
 }
 
 fn openManagedDbForTableWithIndexesJsonAndCache(
@@ -7604,7 +7604,7 @@ fn snapshotLocalTableRuntimeStatusesUncached(
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var db = try openManagedDbForStatusWithCache(alloc, path, catalog, table_name, group_id, null, null, 0, null, backend_runtime);
+        var db = try openManagedDbForStatusWithCache(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime);
         errdefer db.close();
         items[initialized] = .{
             .group_id = group_id,
@@ -7622,7 +7622,7 @@ fn openManagedDbWithIndexesJson(
     path: []const u8,
     indexes_json: []const u8,
 ) !db_mod.DB {
-    return try openManagedDbWithIndexesJsonAndCache(alloc, path, indexes_json, null, null, 0, null);
+    return try openManagedDbWithIndexesJsonAndCache(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null);
 }
 
 fn openManagedDbForStatusWithCache(
