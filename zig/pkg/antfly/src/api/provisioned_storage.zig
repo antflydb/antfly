@@ -240,7 +240,7 @@ pub const ProvisionedGroupStorage = struct {
     pub fn visibleRootGenerationForGroup(self: *ProvisionedGroupStorage, group_id: u64) u64 {
         lockAtomic(&self.group_visible_root_generation_mutex);
         defer self.group_visible_root_generation_mutex.unlock();
-        return self.group_visible_root_generations.get(group_id) orelse 0;
+        return self.group_visible_root_generations.get(group_id) orelse table_reads.backend_current_root_generation;
     }
 
     pub fn bumpGroupVisibleRootGenerations(self: *ProvisionedGroupStorage, group_ids: []const u64) !void {

@@ -646,14 +646,17 @@ pub const ReadPreparation = struct {
     }
 };
 
+/// Shared LSM/HBC cache namespace used when callers want the storage backend's
+/// current root instead of a reconciled group-visible root snapshot.
+pub const backend_current_root_generation: u64 = 0;
+
 pub const GroupVisibleRootGenerationSource = struct {
     ptr: *anyopaque,
     visible_root_generation_for_group: *const fn (ptr: *anyopaque, group_id: u64) u64,
 
     /// Shared LSM/HBC cache namespace for the currently visible replica root.
     /// This is advanced when local root/catalog visibility is reconciled; it is
-    /// not the storage engine's physical per-write generation. `0` means the
-    /// backend's current root.
+    /// not the storage engine's physical per-write generation.
     pub fn visibleRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) u64 {
         return self.visible_root_generation_for_group(self.ptr, group_id);
     }
@@ -2250,7 +2253,7 @@ pub const ProvisionedTableReadSource = struct {
     }
 
     fn visibleRootGeneration(self: *const ProvisionedTableReadSource, group_id: u64) u64 {
-        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else 0;
+        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else backend_current_root_generation;
     }
 
     fn lookup(
@@ -2629,7 +2632,7 @@ pub const HostedProvisionedTableReadSource = struct {
     }
 
     fn visibleRootGeneration(self: *const HostedProvisionedTableReadSource, group_id: u64) u64 {
-        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else 0;
+        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else backend_current_root_generation;
     }
 
     pub fn source(self: *HostedProvisionedTableReadSource) TableReadSource {

@@ -1485,7 +1485,7 @@ pub const ProvisionedTableWriteCache = struct {
                 continue;
             }
 
-            const dest_generation = if (generation_source) |source| source.visibleRootGenerationForGroup(entry.group_id) else 0;
+            const dest_generation = if (generation_source) |source| source.visibleRootGenerationForGroup(entry.group_id) else table_reads.backend_current_root_generation;
             try dest.pruneStaleEntriesForGroupTableLocked(entry.group_id, dest_generation, table_name);
             var existing_index: ?usize = null;
             for (dest.entries.items, 0..) |dest_entry, dest_i| {
@@ -2704,7 +2704,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn visibleRootGeneration(self: *const ProvisionedTableWriteSource, group_id: u64) u64 {
-        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else 0;
+        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else table_reads.backend_current_root_generation;
     }
 
     fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) u64 {
@@ -6279,7 +6279,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     }
 
     fn visibleRootGeneration(self: *const HostedProvisionedTableWriteSource, group_id: u64) u64 {
-        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else 0;
+        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else table_reads.backend_current_root_generation;
     }
 
     fn invalidateManagedCache(self: *HostedProvisionedTableWriteSource, table_name: []const u8) void {
