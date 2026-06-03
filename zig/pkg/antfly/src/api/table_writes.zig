@@ -2578,6 +2578,10 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    fn groupVisibleRootGenerationSource(self: *const ProvisionedTableWriteSource) ?table_reads.GroupVisibleRootGenerationSource {
+        return self.group_visible_root_generation;
+    }
+
     pub fn withResolutionCandidateSource(
         self: *ProvisionedTableWriteSource,
         resolution_candidate_source: ?db_mod.CandidateSource,
@@ -3577,7 +3581,7 @@ pub const ProvisionedTableWriteSource = struct {
             lockAtomic(self_mutex);
             defer self_mutex.unlock();
         }
-        return try source_cache.transferAdoptableEntriesForTableLocked(dest_cache, table_name, dest.group_visible_root_generation);
+        return try source_cache.transferAdoptableEntriesForTableLocked(dest_cache, table_name, dest.groupVisibleRootGenerationSource());
     }
 
     pub fn clearStartupWriteCacheLocked(self: *ProvisionedTableWriteSource) void {
