@@ -71,7 +71,7 @@ pub const Executor = struct {
     }
 
     pub fn drain(self: Executor) void {
-        if (self.jobs) |jobs| jobs.drainOwner(self.owner_id);
+        if (self.jobs) |jobs| jobs.closeOwner(self.owner_id);
     }
 
     pub fn poll(self: Executor, max_jobs: usize) !usize {
@@ -135,6 +135,7 @@ test "lsm background executor drains by backend owner id" {
         const vtable = background_runtime.DurableJobLane.VTable{
             .submit = submit,
             .drain_owner = drainOwner,
+            .close_owner = drainOwner,
             .poll = poll,
         };
     };

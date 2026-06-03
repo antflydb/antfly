@@ -40,14 +40,24 @@ const Config = struct {
     flush_threshold: usize = 512,
     flush_threshold_bytes: u64 = 64 * 1024 * 1024,
     bulk_ingest_flush_threshold_multiplier: usize = 8,
-    compact_threshold_runs: usize = 16,
-    level_target_runs_base: usize = 4,
+    compact_threshold_runs: usize = 4,
+    l0_soft_limit_runs: usize = 0,
+    l0_hard_limit_runs: usize = 0,
+    l0_soft_limit_bytes: u64 = 0,
+    l0_hard_limit_bytes: u64 = 0,
+    level_target_runs_base: usize = 32,
     level_target_runs_multiplier: usize = 4,
-    level_target_bytes_base: usize = 128 * 1024,
+    level_target_bytes_base: usize = 1024 * 1024,
     level_target_bytes_multiplier: usize = 8,
+    max_run_file_bytes: usize = 512 * 1024 * 1024,
+    max_compaction_input_bytes: u64 = 0,
+    max_compaction_input_allow_oversized_single_job: bool = true,
+    background_io_budget_bytes: u64 = 0,
+    background_io_allow_oversized_single_job: bool = true,
     bloom_bits_per_key: usize = 10,
     bloom_min_bits: usize = 64,
     lsm_io_runtime: antfly.lsm_backend.IoRuntime = .threaded,
+    wal_sync_on_commit: bool = false,
     readers: usize = 0,
     storage_mode: StorageSelection = .host,
     mode: ModeSelection = .both,
@@ -76,6 +86,7 @@ const ValuePattern = enum {
 const WorkloadSet = enum {
     all,
     hot_overwrite,
+    l0_pressure,
 };
 
 const KeySet = struct {
@@ -404,12 +415,22 @@ const Scenario = struct {
             .flush_threshold_bytes = cfg.flush_threshold_bytes,
             .bulk_ingest_flush_threshold_multiplier = cfg.bulk_ingest_flush_threshold_multiplier,
             .compact_threshold_runs = cfg.compact_threshold_runs,
+            .l0_soft_limit_runs = cfg.l0_soft_limit_runs,
+            .l0_hard_limit_runs = cfg.l0_hard_limit_runs,
+            .l0_soft_limit_bytes = cfg.l0_soft_limit_bytes,
+            .l0_hard_limit_bytes = cfg.l0_hard_limit_bytes,
             .level_target_runs_base = cfg.level_target_runs_base,
             .level_target_runs_multiplier = cfg.level_target_runs_multiplier,
             .level_target_bytes_base = cfg.level_target_bytes_base,
             .level_target_bytes_multiplier = cfg.level_target_bytes_multiplier,
+            .max_run_file_bytes = cfg.max_run_file_bytes,
+            .max_compaction_input_bytes = cfg.max_compaction_input_bytes,
+            .max_compaction_input_allow_oversized_single_job = cfg.max_compaction_input_allow_oversized_single_job,
+            .background_io_budget_bytes = cfg.background_io_budget_bytes,
+            .background_io_allow_oversized_single_job = cfg.background_io_allow_oversized_single_job,
             .bloom = bloomConfig(cfg),
             .io_runtime = cfg.lsm_io_runtime,
+            .wal_sync_on_commit = cfg.wal_sync_on_commit,
         });
         errdefer {
             var cleanup = backend;
@@ -500,7 +521,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     try out.print(
-        "lsm write bench samples={d} keys={d} hot_keys={d} overwrite_rounds={d} value_size={d} value_pattern={s} batch_size={d} update_stride={d} delete_stride={d} flush_threshold={d} flush_threshold_bytes={d} readers={d} storage={s} mode={s} workload_set={s}\n",
+        "lsm write bench samples={d} keys={d} hot_keys={d} overwrite_rounds={d} value_size={d} value_pattern={s} batch_size={d} update_stride={d} delete_stride={d} flush_threshold={d} flush_threshold_bytes={d} compact_threshold_runs={d} l0_soft_limit_runs={d} l0_hard_limit_runs={d} l0_soft_limit_bytes={d} l0_hard_limit_bytes={d} level_target_runs_base={d} level_target_runs_multiplier={d} level_target_bytes_base={d} level_target_bytes_multiplier={d} max_run_file_bytes={d} max_compaction_input_bytes={d} max_compaction_input_allow_oversized_single_job={} background_io_budget_bytes={d} background_io_allow_oversized_single_job={} wal_sync_on_commit={} readers={d} storage={s} mode={s} workload_set={s}\n",
         .{
             cfg.samples,
             cfg.keys,
@@ -513,6 +534,21 @@ pub fn main(init: std.process.Init) !void {
             cfg.delete_stride,
             cfg.flush_threshold,
             cfg.flush_threshold_bytes,
+            cfg.compact_threshold_runs,
+            cfg.l0_soft_limit_runs,
+            cfg.l0_hard_limit_runs,
+            cfg.l0_soft_limit_bytes,
+            cfg.l0_hard_limit_bytes,
+            cfg.level_target_runs_base,
+            cfg.level_target_runs_multiplier,
+            cfg.level_target_bytes_base,
+            cfg.level_target_bytes_multiplier,
+            cfg.max_run_file_bytes,
+            cfg.max_compaction_input_bytes,
+            cfg.max_compaction_input_allow_oversized_single_job,
+            cfg.background_io_budget_bytes,
+            cfg.background_io_allow_oversized_single_job,
+            cfg.wal_sync_on_commit,
             cfg.readers,
             @tagName(cfg.storage_mode),
             @tagName(cfg.mode),
@@ -570,6 +606,26 @@ pub fn main(init: std.process.Init) !void {
                             try benchLoad(ctx, local_keys, local_value, false);
                         }
                     }.run, random_keys, value);
+                }
+
+                if (cfg.workload_set == .l0_pressure) {
+                    var scenario = try Scenario.init(alloc, cfg, sample_index, storage_mode, batch_mode, "l0_pressure");
+                    defer scenario.deinit();
+
+                    try runTimed(out, &stdout_writer, &scenario, "load_l0_runs", keys.keys.len, struct {
+                        fn run(ctx: *Scenario, local_keys: []const []u8, local_value: []const u8) !void {
+                            try benchL0PressureLoad(ctx, local_keys, local_value);
+                        }
+                    }.run, keys.keys, value);
+
+                    if (cfg.hot_maintenance_steps > 0) {
+                        try runTimed(out, &stdout_writer, &scenario, "maintenance_l0", cfg.hot_maintenance_steps, struct {
+                            fn run(ctx: *Scenario, _: []const []u8, _: []const u8) !void {
+                                try benchMaintenance(ctx);
+                            }
+                        }.run, keys.keys, value);
+                    }
+                    continue;
                 }
 
                 {
@@ -674,6 +730,27 @@ fn benchSortedRunIngest(scenario: *Scenario, keys: []const []u8, value: []const 
         };
     }
     try scenario.backend.ingestSortedTableEntries(entries);
+}
+
+fn benchL0PressureLoad(scenario: *Scenario, keys: []const []u8, value: []const u8) !void {
+    const scratch = try scenario.allocator.alloc(u8, if (scenario.cfg.value_pattern == .keyed) scenario.cfg.value_size else 0);
+    defer scenario.allocator.free(scratch);
+
+    var start: usize = 0;
+    var op_index: usize = 0;
+    while (start < keys.len) {
+        const end = @min(start + scenario.cfg.batch_size, keys.len);
+        var txn = try scenario.backend.beginBatchWithOptions(.{ .mode = scenario.batch_mode });
+        errdefer txn.abort();
+        for (keys[start..end]) |key| {
+            const write_value = valueForWrite(scenario.cfg, value, scratch, key, op_index, 0x1357_9bdf);
+            try txn.put(bench_namespace, key, write_value);
+            op_index += 1;
+        }
+        try txn.commit();
+        try scenario.backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true });
+        start = end;
+    }
 }
 
 fn benchOverwrite(scenario: *Scenario, keys: []const []u8, value: []const u8) !void {
@@ -895,9 +972,11 @@ fn printResult(
     const read_delta = ReadStats.delta(after.read, before.read);
     const finalize_ns = @min(scenario.last_finalize_ns, ns);
     const writer_ns = ns - finalize_ns;
+    const effective_l0_soft_limit_runs = effectiveL0SoftLimitRuns(scenario.cfg);
+    const effective_l0_hard_limit_runs = effectiveL0HardLimitRuns(scenario.cfg);
 
     try writer.print(
-        "{{\"scenario\":\"{s}\",\"storage\":\"{s}\",\"mode\":\"{s}\",\"sample\":{d},\"workload\":\"{s}\",\"ops\":{d},\"logical_value_write_bytes\":{d},\"ns\":{d},\"writer_ns\":{d},\"finalize_ns\":{d},\"ops_per_sec\":{d:.2},\"ns_per_op\":{d:.2}",
+        "{{\"scenario\":\"{s}\",\"storage\":\"{s}\",\"mode\":\"{s}\",\"sample\":{d},\"workload\":\"{s}\",\"ops\":{d},\"logical_value_write_bytes\":{d},\"ns\":{d},\"writer_ns\":{d},\"finalize_ns\":{d},\"ops_per_sec\":{d:.2},\"ns_per_op\":{d:.2},\"config_compact_threshold_runs\":{d},\"config_l0_soft_limit_runs\":{d},\"config_l0_hard_limit_runs\":{d},\"config_effective_l0_soft_limit_runs\":{d},\"config_effective_l0_hard_limit_runs\":{d},\"config_l0_soft_limit_bytes\":{d},\"config_l0_hard_limit_bytes\":{d},\"config_level_target_runs_base\":{d},\"config_level_target_runs_multiplier\":{d},\"config_level_target_bytes_base\":{d},\"config_level_target_bytes_multiplier\":{d},\"config_max_run_file_bytes\":{d},\"config_max_compaction_input_bytes\":{d},\"config_max_compaction_input_allow_oversized_single_job\":{},\"config_background_io_budget_bytes\":{d},\"config_background_io_allow_oversized_single_job\":{}",
         .{
             scenario.label,
             @tagName(scenario.storage_kind),
@@ -911,6 +990,22 @@ fn printResult(
             finalize_ns,
             ops_per_sec,
             ns_per_op,
+            scenario.cfg.compact_threshold_runs,
+            scenario.cfg.l0_soft_limit_runs,
+            scenario.cfg.l0_hard_limit_runs,
+            effective_l0_soft_limit_runs,
+            effective_l0_hard_limit_runs,
+            scenario.cfg.l0_soft_limit_bytes,
+            scenario.cfg.l0_hard_limit_bytes,
+            scenario.cfg.level_target_runs_base,
+            scenario.cfg.level_target_runs_multiplier,
+            scenario.cfg.level_target_bytes_base,
+            scenario.cfg.level_target_bytes_multiplier,
+            scenario.cfg.max_run_file_bytes,
+            scenario.cfg.max_compaction_input_bytes,
+            scenario.cfg.max_compaction_input_allow_oversized_single_job,
+            scenario.cfg.background_io_budget_bytes,
+            scenario.cfg.background_io_allow_oversized_single_job,
         },
     );
     try writer.print(
@@ -953,6 +1048,27 @@ fn printResult(
         },
     );
     try writer.print(
+        ",\"lsm_write_pressure_events\":{d},\"lsm_write_pressure_compactions\":{d},\"lsm_write_pressure_compaction_steps\":{d},\"lsm_write_pressure_overloads\":{d},\"lsm_write_pressure_rejections\":{d},\"lsm_write_pressure_ns\":{d},\"lsm_wal_pressure_flushes\":{d},\"lsm_wal_pressure_ns\":{d},\"lsm_wal_append_records\":{d},\"lsm_wal_append_entries\":{d},\"lsm_wal_append_bytes\":{d},\"lsm_wal_append_ns\":{d},\"lsm_wal_sync_records\":{d},\"lsm_wal_sync_ns\":{d},\"lsm_wal_resets\":{d},\"lsm_wal_reset_ns\":{d}",
+        .{
+            write_delta.write_pressure_events,
+            write_delta.write_pressure_compactions,
+            write_delta.write_pressure_compaction_steps,
+            write_delta.write_pressure_overloads,
+            write_delta.write_pressure_rejections,
+            write_delta.write_pressure_ns,
+            write_delta.wal_pressure_flushes,
+            write_delta.wal_pressure_ns,
+            write_delta.wal_append_records,
+            write_delta.wal_append_entries,
+            write_delta.wal_append_bytes,
+            write_delta.wal_append_ns,
+            write_delta.wal_sync_records,
+            write_delta.wal_sync_ns,
+            write_delta.wal_resets,
+            write_delta.wal_reset_ns,
+        },
+    );
+    try writer.print(
         ",\"read_ops\":{d},\"read_misses\":{d},\"read_errors\":{d},\"read_avg_ns\":{d},\"read_p50_ns\":{d},\"read_p95_ns\":{d},\"read_p99_ns\":{d},\"read_max_ns\":{d}",
         .{
             read_delta.ops,
@@ -966,7 +1082,7 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"compactions\":{d},\"compaction_input_runs\":{d},\"compaction_input_bytes\":{d},\"compaction_output_bytes\":{d},\"compaction_ns\":{d},\"runs_after\":{d},\"l0_runs_after\":{d},\"overlapping_l0_runs_after\":{d},\"max_level_after\":{d},\"run_bytes_after\":{d},\"run_entries_after\":{d},\"obsolete_paths_after\":{d},\"mutable_entries_after\":{d},\"compaction_scheduler_grants_after\":{d},\"compaction_scheduler_denied_capacity_after\":{d},\"compaction_scheduler_denied_resource_pressure_after\":{d},\"compaction_scheduler_remembered_pending_after\":{d},\"compaction_scheduler_remembered_candidates_after\":{d},\"compaction_scheduler_remembered_retries_after\":{d},\"compaction_scheduler_remembered_hits_after\":{d},\"compaction_scheduler_remembered_stale_after\":{d},\"compaction_scheduler_conflict_denials_after\":{d}}}\n",
+        ",\"compactions\":{d},\"compaction_input_runs\":{d},\"compaction_input_bytes\":{d},\"compaction_output_bytes\":{d},\"compaction_ns\":{d},\"runs_after\":{d},\"l0_runs_after\":{d},\"overlapping_l0_runs_after\":{d},\"compactable_l0_runs_after\":{d},\"l0_bytes_after\":{d},\"level_overflow_runs_after\":{d},\"level_overflow_bytes_after\":{d},\"max_level_after\":{d},\"run_bytes_after\":{d},\"run_entries_after\":{d},\"obsolete_paths_after\":{d},\"mutable_entries_after\":{d},\"mutable_bytes_after\":{d},\"immutable_entries_after\":{d},\"immutable_bytes_after\":{d}",
         .{
             compaction_delta.compactions,
             compaction_delta.input_runs,
@@ -976,11 +1092,32 @@ fn printResult(
             after.runs.count,
             after.runs.l0_count,
             after.maintenance.overlapping_l0_runs,
+            after.maintenance.compactable_l0_runs,
+            after.maintenance.l0_bytes,
+            after.maintenance.level_overflow_runs,
+            after.maintenance.level_overflow_bytes,
             after.runs.max_level,
             after.runs.bytes,
             after.runs.entries,
             after.obsolete_paths,
             after.mutable_entries,
+            after.maintenance.mutable_bytes,
+            after.maintenance.immutable_entries,
+            after.maintenance.immutable_bytes,
+        },
+    );
+    try writer.print(
+        ",\"wal_retained_segments_after\":{d},\"wal_retained_bytes_after\":{d},\"wal_checkpoint_oldest_retained_segment_after\":{d},\"wal_checkpoint_covered_through_segment_after\":{d},\"wal_checkpoint_current_segment_after\":{d},\"wal_checkpoint_lag_segments_after\":{d},\"wal_replay_retained_segments_after\":{d},\"wal_replay_retained_bytes_after\":{d},\"wal_replay_current_segment_after\":{d},\"compaction_scheduler_grants_after\":{d},\"compaction_scheduler_denied_capacity_after\":{d},\"compaction_scheduler_denied_resource_pressure_after\":{d},\"compaction_scheduler_remembered_pending_after\":{d},\"compaction_scheduler_remembered_candidates_after\":{d},\"compaction_scheduler_remembered_retries_after\":{d},\"compaction_scheduler_remembered_hits_after\":{d},\"compaction_scheduler_remembered_stale_after\":{d},\"compaction_scheduler_conflict_denials_after\":{d}",
+        .{
+            after.maintenance.wal_retained_segments,
+            after.maintenance.wal_retained_bytes,
+            after.maintenance.wal_checkpoint_oldest_retained_segment,
+            after.maintenance.wal_checkpoint_covered_through_segment,
+            after.maintenance.wal_checkpoint_current_segment,
+            after.maintenance.wal_checkpoint_lag_segments,
+            after.maintenance.wal_replay_retained_segments,
+            after.maintenance.wal_replay_retained_bytes,
+            after.maintenance.wal_replay_current_segment,
             after.maintenance.compaction_scheduler_grants,
             after.maintenance.compaction_scheduler_denied_capacity,
             after.maintenance.compaction_scheduler_denied_resource_pressure,
@@ -992,18 +1129,39 @@ fn printResult(
             after.maintenance.compaction_scheduler_conflict_denials,
         },
     );
+    try writer.print(
+        ",\"background_io_budget_bytes_after\":{d},\"background_io_reserved_bytes_after\":{d},\"background_io_denied_jobs_after\":{d},\"background_io_oversized_jobs_after\":{d}}}\n",
+        .{
+            after.maintenance.background_io_budget_bytes,
+            after.maintenance.background_io_reserved_bytes,
+            after.maintenance.background_io_denied_jobs,
+            after.maintenance.background_io_oversized_jobs,
+        },
+    );
 }
 
 fn logicalValueWriteBytes(workload: []const u8, ops: usize, value_size: usize) usize {
     if (std.mem.eql(u8, workload, "load_sorted") or
         std.mem.eql(u8, workload, "load_random") or
         std.mem.eql(u8, workload, "load_base") or
+        std.mem.eql(u8, workload, "load_l0_runs") or
         std.mem.eql(u8, workload, "overwrite_strided") or
         std.mem.eql(u8, workload, "overwrite_hotset"))
     {
         return ops * value_size;
     }
     return 0;
+}
+
+fn effectiveL0SoftLimitRuns(cfg: Config) usize {
+    if (cfg.l0_soft_limit_runs != 0) return cfg.l0_soft_limit_runs;
+    return cfg.compact_threshold_runs;
+}
+
+fn effectiveL0HardLimitRuns(cfg: Config) usize {
+    if (cfg.l0_hard_limit_runs != 0) return cfg.l0_hard_limit_runs;
+    const soft = effectiveL0SoftLimitRuns(cfg);
+    return std.math.mul(usize, @max(@as(usize, 1), soft), 2) catch std.math.maxInt(usize);
 }
 
 fn summarizeRuns(backend: *const antfly.lsm_backend.Backend) RunSummary {
@@ -1051,6 +1209,22 @@ fn diffWriteStats(after: WriteStats, before: WriteStats) WriteStats {
         .manifest_writes = after.manifest_writes - before.manifest_writes,
         .manifest_bytes = after.manifest_bytes - before.manifest_bytes,
         .manifest_ns = after.manifest_ns - before.manifest_ns,
+        .write_pressure_events = after.write_pressure_events - before.write_pressure_events,
+        .write_pressure_compactions = after.write_pressure_compactions - before.write_pressure_compactions,
+        .write_pressure_compaction_steps = after.write_pressure_compaction_steps - before.write_pressure_compaction_steps,
+        .write_pressure_overloads = after.write_pressure_overloads - before.write_pressure_overloads,
+        .write_pressure_rejections = after.write_pressure_rejections - before.write_pressure_rejections,
+        .write_pressure_ns = after.write_pressure_ns - before.write_pressure_ns,
+        .wal_pressure_flushes = after.wal_pressure_flushes - before.wal_pressure_flushes,
+        .wal_pressure_ns = after.wal_pressure_ns - before.wal_pressure_ns,
+        .wal_append_records = after.wal_append_records - before.wal_append_records,
+        .wal_append_entries = after.wal_append_entries - before.wal_append_entries,
+        .wal_append_bytes = after.wal_append_bytes - before.wal_append_bytes,
+        .wal_append_ns = after.wal_append_ns - before.wal_append_ns,
+        .wal_sync_records = after.wal_sync_records - before.wal_sync_records,
+        .wal_sync_ns = after.wal_sync_ns - before.wal_sync_ns,
+        .wal_resets = after.wal_resets - before.wal_resets,
+        .wal_reset_ns = after.wal_reset_ns - before.wal_reset_ns,
     };
 }
 
@@ -1106,6 +1280,14 @@ fn parseArgs(alloc: Allocator, proc_args: std.process.Args) !Config {
             cfg.bulk_ingest_flush_threshold_multiplier = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--compact-threshold-runs")) {
             cfg.compact_threshold_runs = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--l0-soft-limit-runs")) {
+            cfg.l0_soft_limit_runs = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--l0-hard-limit-runs")) {
+            cfg.l0_hard_limit_runs = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--l0-soft-limit-bytes")) {
+            cfg.l0_soft_limit_bytes = try parseNextU64(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--l0-hard-limit-bytes")) {
+            cfg.l0_hard_limit_bytes = try parseNextU64(&args, arg);
         } else if (std.mem.eql(u8, arg, "--level-target-runs-base")) {
             cfg.level_target_runs_base = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--level-target-runs-multiplier")) {
@@ -1114,6 +1296,16 @@ fn parseArgs(alloc: Allocator, proc_args: std.process.Args) !Config {
             cfg.level_target_bytes_base = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--level-target-bytes-multiplier")) {
             cfg.level_target_bytes_multiplier = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-run-file-bytes")) {
+            cfg.max_run_file_bytes = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-compaction-input-bytes")) {
+            cfg.max_compaction_input_bytes = try parseNextU64(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--strict-max-compaction-input-bytes")) {
+            cfg.max_compaction_input_allow_oversized_single_job = false;
+        } else if (std.mem.eql(u8, arg, "--background-io-budget-bytes")) {
+            cfg.background_io_budget_bytes = try parseNextU64(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--background-io-disallow-oversized-single-job")) {
+            cfg.background_io_allow_oversized_single_job = false;
         } else if (std.mem.eql(u8, arg, "--bloom-bits-per-key")) {
             cfg.bloom_bits_per_key = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--bloom-min-bits")) {
@@ -1127,6 +1319,8 @@ fn parseArgs(alloc: Allocator, proc_args: std.process.Args) !Config {
         } else if (std.mem.eql(u8, arg, "--lsm-io")) {
             const value = args.next() orelse return error.InvalidArgument;
             cfg.lsm_io_runtime = std.meta.stringToEnum(antfly.lsm_backend.IoRuntime, value) orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--wal-sync-on-commit")) {
+            cfg.wal_sync_on_commit = true;
         } else if (std.mem.eql(u8, arg, "--readers")) {
             cfg.readers = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--workload-set")) {

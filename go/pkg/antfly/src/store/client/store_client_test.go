@@ -18,9 +18,12 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/storeutils"
 	"github.com/stretchr/testify/assert"
@@ -63,4 +66,45 @@ func TestStoreClientBatch_PropagatesTimestamp(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.Equal(t, timestamp, received.GetTimestamp())
+}
+
+func TestStoreClientBackup_FileLocationDoesNotTruncateStreamSource(t *testing.T) {
+	backupDir := t.TempDir()
+	backupID := "backup"
+	shardID := types.ID(42)
+	backupFileName := common.ShardPortableBackupFileName(backupID, shardID)
+	backupPath := filepath.Join(backupDir, backupFileName)
+	expected := []byte("streamed portable backup")
+	require.NoError(t, os.WriteFile(backupPath, expected, 0o600))
+
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			body, err := os.Open(backupPath)
+			require.NoError(t, err)
+			stat, err := body.Stat()
+			require.NoError(t, err)
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Body:          body,
+				Header:        make(http.Header),
+				ContentLength: stat.Size(),
+			}, nil
+		}),
+	}
+
+	sc := NewStoreClient(httpClient, types.ID(1), "http://store.test")
+	require.NoError(t, sc.Backup(
+		context.Background(),
+		shardID,
+		"file://"+backupDir,
+		backupID,
+		common.BackupFormatPortable,
+	))
+
+	actual, err := os.ReadFile(backupPath)
+	require.NoError(t, err)
+	require.Equal(t, expected, actual)
+	matches, err := filepath.Glob(filepath.Join(backupDir, "."+backupFileName+".tmp-*"))
+	require.NoError(t, err)
+	require.Empty(t, matches)
 }

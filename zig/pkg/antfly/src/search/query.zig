@@ -48,6 +48,7 @@ pub const FilterError = error{
     InvalidAddress,
     InvalidChunk,
     CorruptInput,
+    InvalidSegment,
 };
 
 /// A filter that produces a bitmap of matching document IDs.

@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
+const internal_keys = @import("internal_keys.zig");
 const ordered = @import("mem_ordered.zig");
 
 const State = struct {
@@ -137,6 +138,40 @@ pub const Backend = struct {
         pub fn beginBatchWithOptions(self: *@This(), options: backend_types.BatchOptions) !BoundTxn {
             _ = options;
             return try BoundTxn.open(self.backend, self.namespace, false);
+        }
+
+        pub fn forEachReplayLaneFrom(
+            self: *@This(),
+            lane_ordinal: u8,
+            from_sequence: u64,
+            max_entries: usize,
+            ctx: *anyopaque,
+            callback: backend_erased.Store.ReplayCallback,
+        ) !backend_types.ReplayLaneIterationStats {
+            const lower = internal_keys.replayRangeLower(lane_ordinal, from_sequence);
+            const upper = internal_keys.replayRangeUpper(lane_ordinal);
+
+            lockBackend(self.backend);
+            var snapshot = self.backend.state.?.state.tree.snapshot();
+            self.backend.mutex.unlock();
+            defer snapshot.release(self.backend.allocator);
+
+            var cursor = ordered.Cursor.init(self.backend.allocator);
+            defer cursor.deinit();
+
+            var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
+            var found = try cursor.seekAtOrAfter(snapshot, self.namespace.name, lower[0..]);
+            while (found) |entry| : (found = try cursor.next()) {
+                if (namespaceOrder(entry.name, self.namespace.name) != .eq) break;
+                if (std.mem.order(u8, entry.key, upper[0..]) != .lt) break;
+                const sequence = internal_keys.parseReplayEntrySequence(entry.key, lane_ordinal) orelse break;
+                try callback(ctx, sequence, entry.value);
+                stats.scanned_entries += 1;
+                stats.matched_entries += 1;
+                stats.last_sequence = sequence;
+                if (max_entries != 0 and stats.matched_entries >= max_entries) break;
+            }
+            return stats;
         }
     };
 

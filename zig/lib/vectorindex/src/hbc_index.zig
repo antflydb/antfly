@@ -1526,6 +1526,7 @@ pub fn getMetadataManySortedInTxnWithScratch(
     const lookups = lookup_storage[0..lookup_count];
     const key_views = key_views_storage[0..lookup_count];
     const values = values_storage[0..lookup_count];
+    @memset(values, null);
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
@@ -2120,6 +2121,37 @@ fn scoreLeafMemberIds(
 
     if (fetch_count == 0) return;
 
+    const exact_distances = scratch.distances[0..fetch_count];
+    var external_scored = false;
+    const Index = comptime childType(@TypeOf(self));
+    if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalVectorsSortedWithScratch")) {
+        external_scored = try self.scoreExternalVectorsSortedWithScratch(
+            txn,
+            fetch_member_ids[0..fetch_count],
+            exact_query,
+            exact_query_measure,
+            exact_distances,
+            scratch.metadata,
+            scratch.lookups,
+            scratch.key_views,
+            scratch.values,
+            scratch.vector_batch,
+        );
+    }
+
+    if (external_scored) {
+        for (fetch_member_ids[0..fetch_count], 0..) |member_id, i| {
+            const dist = exact_distances[i];
+            if (!std.math.isFinite(dist)) continue;
+            if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, req, filter_state, false)) {
+                continue;
+            }
+            results.addResult(member_id, dist, 0);
+            profile.exact_vectors_scored += 1;
+        }
+        return;
+    }
+
     const vector_views = scratch.vector_views[0..fetch_count];
     try loadVectorIdsSortedWithScratch(
         self,
@@ -2132,7 +2164,6 @@ fn scoreLeafMemberIds(
         scratch.vector,
         scratch.vector_batch,
     );
-    const exact_distances = scratch.distances[0..fetch_count];
     const scored_positions = scratch.positions[0..fetch_count];
     var scored_count: usize = 0;
     for (vector_views, 0..) |member_vec, i| {

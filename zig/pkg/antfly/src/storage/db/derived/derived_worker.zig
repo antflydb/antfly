@@ -37,6 +37,8 @@ pub const FinishCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager
 pub const CatchUpStats = struct {
     scanned_entries: usize = 0,
     applied_entries: usize = 0,
+    replay_scan_batches: usize = 0,
+    replay_hint_filter_skips: usize = 0,
     last_sequence: u64 = 0,
     window_collect_ns: u64 = 0,
     apply_ns: u64 = 0,
@@ -46,6 +48,8 @@ pub const CatchUpProgress = struct {
     sequence: u64 = 0,
     scanned_entries: u64 = 0,
     applied_entries: u64 = 0,
+    replay_scan_batches: u64 = 0,
+    replay_hint_filter_skips: u64 = 0,
 };
 
 pub const CatchUpOptions = struct {
@@ -201,13 +205,17 @@ pub fn catchUpIndexFromMatchingCursor(
         if (chunk_stats.last_sequence == 0) {
             break;
         }
-        stats.scanned_entries += chunk_stats.matched_entries;
+        stats.scanned_entries += if (chunk_stats.scanned_entries != 0) chunk_stats.scanned_entries else chunk_stats.matched_entries;
+        stats.replay_scan_batches += chunk_stats.scan_batches;
+        stats.replay_hint_filter_skips += chunk_stats.hint_filter_skips;
         stats.last_sequence = chunk_stats.last_sequence;
         if (options.progress_fn) |progress| {
             try progress(options.progress_ctx.?, index_ref.name, .{
                 .sequence = chunk_stats.last_sequence,
                 .scanned_entries = @intCast(stats.scanned_entries),
                 .applied_entries = @intCast(stats.applied_entries),
+                .replay_scan_batches = @intCast(stats.replay_scan_batches),
+                .replay_hint_filter_skips = @intCast(stats.replay_hint_filter_skips),
             });
         }
 
@@ -244,6 +252,8 @@ pub fn catchUpIndexFromMatchingCursor(
                 .sequence = chunk_stats.last_sequence,
                 .scanned_entries = @intCast(stats.scanned_entries),
                 .applied_entries = @intCast(stats.applied_entries),
+                .replay_scan_batches = @intCast(stats.replay_scan_batches),
+                .replay_hint_filter_skips = @intCast(stats.replay_hint_filter_skips),
             });
         }
         if (options.finish_window_fn) |finish_window| {

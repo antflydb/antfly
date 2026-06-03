@@ -27,6 +27,8 @@ const MinSmartLsmCacheBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartLsmCacheBytes: u64 = 1024 * 1024 * 1024;
 const MinSmartLsmCompactionBytes: u64 = 128 * 1024 * 1024;
 const MaxSmartLsmCompactionBytes: u64 = 1024 * 1024 * 1024;
+const MinSmartLsmTableBuilderBytes: u64 = 64 * 1024 * 1024;
+const MaxSmartLsmTableBuilderBytes: u64 = 512 * 1024 * 1024;
 const MinSmartLsmInMemoryStateBytes: u64 = 256 * 1024 * 1024;
 const MaxSmartLsmInMemoryStateBytes: u64 = 2 * 1024 * 1024 * 1024;
 const MinSmartHbcCacheBytes: u64 = 128 * 1024 * 1024;
@@ -37,6 +39,8 @@ const MinSmartReplayWindowBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartReplayWindowBytes: u64 = 256 * 1024 * 1024;
 const MinSmartFullTextPendingBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartFullTextPendingBytes: u64 = 512 * 1024 * 1024;
+const MinSmartFullTextBuildBytes: u64 = 128 * 1024 * 1024;
+const MaxSmartFullTextBuildBytes: u64 = 1024 * 1024 * 1024;
 const MinSmartDerivedBacklogBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartDerivedBacklogBytes: u64 = 512 * 1024 * 1024;
 const MinSmartTextMergeBytes: u64 = 32 * 1024 * 1024;
@@ -113,6 +117,7 @@ fn smartResourceBudgets() SmartResourceBudgets {
 
     const lsm_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCacheBytes, MaxSmartLsmCacheBytes);
     const lsm_compaction_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCompactionBytes, MaxSmartLsmCompactionBytes);
+    const lsm_table_builder_hard = adaptiveSliceHardLimit(total, 32, MinSmartLsmTableBuilderBytes, MaxSmartLsmTableBuilderBytes);
     const lsm_in_memory_state_hard = adaptiveSliceHardLimit(total, 8, MinSmartLsmInMemoryStateBytes, MaxSmartLsmInMemoryStateBytes);
     const lsm_wal_write_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmInMemoryStateBytes, MaxSmartLsmInMemoryStateBytes);
     const hbc_hard = adaptiveSliceHardLimit(total, 12, MinSmartHbcCacheBytes, MaxSmartHbcCacheBytes);
@@ -120,12 +125,14 @@ fn smartResourceBudgets() SmartResourceBudgets {
     const dense_apply_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseApplyBytes, MaxSmartDenseApplyBytes);
     const replay_hard = adaptiveSliceHardLimit(total, 32, MinSmartReplayWindowBytes, MaxSmartReplayWindowBytes);
     const full_text_hard = adaptiveSliceHardLimit(total, 32, MinSmartFullTextPendingBytes, MaxSmartFullTextPendingBytes);
+    const full_text_build_hard = adaptiveSliceHardLimit(total, 24, MinSmartFullTextBuildBytes, MaxSmartFullTextBuildBytes);
     const derived_hard = adaptiveSliceHardLimit(total, 32, MinSmartDerivedBacklogBytes, MaxSmartDerivedBacklogBytes);
     const text_merge_hard = adaptiveSliceHardLimit(total, 64, MinSmartTextMergeBytes, MaxSmartTextMergeBytes);
     const algebraic_tensor_hard = adaptiveSliceHardLimit(total, 64, MinSmartAlgebraicTensorBytes, MaxSmartAlgebraicTensorBytes);
 
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, lsm_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = resourceBudget(3, lsm_table_builder_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = resourceBudget(3, lsm_in_memory_state_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)] = resourceBudget(3, lsm_wal_write_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = resourceBudget(3, hbc_hard);
@@ -134,6 +141,7 @@ fn smartResourceBudgets() SmartResourceBudgets {
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_routing_working_set)] = resourceBudget(3, dense_apply_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = resourceBudget(3, replay_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = resourceBudget(3, full_text_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)] = resourceBudget(2, full_text_build_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = resourceBudget(3, derived_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = resourceBudget(3, text_merge_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);
@@ -196,7 +204,10 @@ pub const ProvisionedGroupStorage = struct {
         self.read_cache.backend_runtime = self.backend_runtime;
         self.read_cache.antfly_provider = read_source.antfly_provider;
         self.read_cache.secret_store = read_source.secret_store;
-        self.write_cache.lsm_cache = &self.lsm_cache;
+        // Keep the shared LSM block cache query-side. Writer DBs should use
+        // transient read buffers during ingest/build work rather than warming
+        // the read cache with blocks that may never be queried.
+        self.write_cache.lsm_cache = null;
         self.write_cache.hbc_cache = &self.hbc_cache;
         self.write_cache.resource_manager = &self.resource_manager;
         self.write_cache.backend_runtime = self.backend_runtime;
@@ -306,6 +317,7 @@ test "provisioned group storage derives all resource budgets" {
     inline for (.{
         resource_manager_mod.Slice.lsm_block_table_cache,
         resource_manager_mod.Slice.lsm_compaction_work,
+        resource_manager_mod.Slice.lsm_table_builder_working_set,
         resource_manager_mod.Slice.lsm_in_memory_state,
         resource_manager_mod.Slice.lsm_wal_write_working_set,
         resource_manager_mod.Slice.hbc_node_metadata_cache,

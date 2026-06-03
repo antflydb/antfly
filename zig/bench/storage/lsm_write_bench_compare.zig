@@ -27,6 +27,8 @@ const Record = struct {
     ns: u64 = 0,
     ops_per_sec: f64 = 0,
     ns_per_op: f64 = 0,
+    config_effective_l0_soft_limit_runs: u64 = 0,
+    config_effective_l0_hard_limit_runs: u64 = 0,
     storage_write_file: u64 = 0,
     storage_write_bytes: u64 = 0,
     storage_manifest_write_file: u64 = 0,
@@ -52,6 +54,22 @@ const Record = struct {
     lsm_manifest_writes: u64 = 0,
     lsm_manifest_bytes: u64 = 0,
     lsm_manifest_ns: u64 = 0,
+    lsm_write_pressure_events: u64 = 0,
+    lsm_write_pressure_compactions: u64 = 0,
+    lsm_write_pressure_compaction_steps: u64 = 0,
+    lsm_write_pressure_overloads: u64 = 0,
+    lsm_write_pressure_rejections: u64 = 0,
+    lsm_write_pressure_ns: u64 = 0,
+    lsm_wal_pressure_flushes: u64 = 0,
+    lsm_wal_pressure_ns: u64 = 0,
+    lsm_wal_append_records: u64 = 0,
+    lsm_wal_append_entries: u64 = 0,
+    lsm_wal_append_bytes: u64 = 0,
+    lsm_wal_append_ns: u64 = 0,
+    lsm_wal_sync_records: u64 = 0,
+    lsm_wal_sync_ns: u64 = 0,
+    lsm_wal_resets: u64 = 0,
+    lsm_wal_reset_ns: u64 = 0,
     compactions: u64 = 0,
     compaction_input_runs: u64 = 0,
     compaction_input_bytes: u64 = 0,
@@ -59,11 +77,40 @@ const Record = struct {
     compaction_ns: u64 = 0,
     runs_after: u64 = 0,
     l0_runs_after: u64 = 0,
+    compactable_l0_runs_after: u64 = 0,
+    l0_bytes_after: u64 = 0,
+    level_overflow_runs_after: u64 = 0,
+    level_overflow_bytes_after: u64 = 0,
     max_level_after: u64 = 0,
     run_bytes_after: u64 = 0,
     run_entries_after: u64 = 0,
     obsolete_paths_after: u64 = 0,
     mutable_entries_after: u64 = 0,
+    mutable_bytes_after: u64 = 0,
+    immutable_entries_after: u64 = 0,
+    immutable_bytes_after: u64 = 0,
+    wal_retained_segments_after: u64 = 0,
+    wal_retained_bytes_after: u64 = 0,
+    wal_checkpoint_oldest_retained_segment_after: u64 = 0,
+    wal_checkpoint_covered_through_segment_after: u64 = 0,
+    wal_checkpoint_current_segment_after: u64 = 0,
+    wal_checkpoint_lag_segments_after: u64 = 0,
+    wal_replay_retained_segments_after: u64 = 0,
+    wal_replay_retained_bytes_after: u64 = 0,
+    wal_replay_current_segment_after: u64 = 0,
+    compaction_scheduler_grants_after: u64 = 0,
+    compaction_scheduler_denied_capacity_after: u64 = 0,
+    compaction_scheduler_denied_resource_pressure_after: u64 = 0,
+    compaction_scheduler_remembered_pending_after: u64 = 0,
+    compaction_scheduler_remembered_candidates_after: u64 = 0,
+    compaction_scheduler_remembered_retries_after: u64 = 0,
+    compaction_scheduler_remembered_hits_after: u64 = 0,
+    compaction_scheduler_remembered_stale_after: u64 = 0,
+    compaction_scheduler_conflict_denials_after: u64 = 0,
+    background_io_budget_bytes_after: u64 = 0,
+    background_io_reserved_bytes_after: u64 = 0,
+    background_io_denied_jobs_after: u64 = 0,
+    background_io_oversized_jobs_after: u64 = 0,
 };
 
 const Config = struct {
@@ -101,6 +148,8 @@ const GroupAgg = struct {
     sample_count: usize = 0,
     ns_per_op: MetricSeries = .{},
     ops_per_sec: MetricSeries = .{},
+    config_effective_l0_soft_limit_runs: MetricSeries = .{},
+    config_effective_l0_hard_limit_runs: MetricSeries = .{},
     storage_write_bytes: MetricSeries = .{},
     storage_manifest_write_bytes: MetricSeries = .{},
     storage_rename: MetricSeries = .{},
@@ -117,13 +166,58 @@ const GroupAgg = struct {
     lsm_sorted_ingest_ns: MetricSeries = .{},
     lsm_manifest_writes: MetricSeries = .{},
     lsm_manifest_bytes: MetricSeries = .{},
+    lsm_write_pressure_events: MetricSeries = .{},
+    lsm_write_pressure_compactions: MetricSeries = .{},
+    lsm_write_pressure_compaction_steps: MetricSeries = .{},
+    lsm_write_pressure_overloads: MetricSeries = .{},
+    lsm_write_pressure_rejections: MetricSeries = .{},
+    lsm_write_pressure_ns: MetricSeries = .{},
+    lsm_wal_pressure_flushes: MetricSeries = .{},
+    lsm_wal_pressure_ns: MetricSeries = .{},
+    lsm_wal_append_records: MetricSeries = .{},
+    lsm_wal_append_entries: MetricSeries = .{},
+    lsm_wal_append_bytes: MetricSeries = .{},
+    lsm_wal_append_ns: MetricSeries = .{},
+    lsm_wal_sync_records: MetricSeries = .{},
+    lsm_wal_sync_ns: MetricSeries = .{},
+    lsm_wal_resets: MetricSeries = .{},
+    lsm_wal_reset_ns: MetricSeries = .{},
     compactions: MetricSeries = .{},
     compaction_input_bytes: MetricSeries = .{},
     compaction_output_bytes: MetricSeries = .{},
     compaction_ns: MetricSeries = .{},
     l0_runs_after: MetricSeries = .{},
+    compactable_l0_runs_after: MetricSeries = .{},
+    l0_bytes_after: MetricSeries = .{},
+    level_overflow_runs_after: MetricSeries = .{},
+    level_overflow_bytes_after: MetricSeries = .{},
     run_bytes_after: MetricSeries = .{},
     obsolete_paths_after: MetricSeries = .{},
+    mutable_entries_after: MetricSeries = .{},
+    mutable_bytes_after: MetricSeries = .{},
+    immutable_entries_after: MetricSeries = .{},
+    immutable_bytes_after: MetricSeries = .{},
+    wal_retained_segments_after: MetricSeries = .{},
+    wal_retained_bytes_after: MetricSeries = .{},
+    wal_checkpoint_oldest_retained_segment_after: MetricSeries = .{},
+    wal_checkpoint_covered_through_segment_after: MetricSeries = .{},
+    wal_checkpoint_current_segment_after: MetricSeries = .{},
+    wal_checkpoint_lag_segments_after: MetricSeries = .{},
+    wal_replay_retained_segments_after: MetricSeries = .{},
+    wal_replay_retained_bytes_after: MetricSeries = .{},
+    wal_replay_current_segment_after: MetricSeries = .{},
+    compaction_scheduler_grants_after: MetricSeries = .{},
+    compaction_scheduler_denied_capacity_after: MetricSeries = .{},
+    compaction_scheduler_denied_resource_pressure_after: MetricSeries = .{},
+    compaction_scheduler_remembered_pending_after: MetricSeries = .{},
+    compaction_scheduler_remembered_candidates_after: MetricSeries = .{},
+    compaction_scheduler_remembered_retries_after: MetricSeries = .{},
+    compaction_scheduler_remembered_hits_after: MetricSeries = .{},
+    compaction_scheduler_remembered_stale_after: MetricSeries = .{},
+    compaction_scheduler_conflict_denials_after: MetricSeries = .{},
+    background_io_reserved_bytes_after: MetricSeries = .{},
+    background_io_denied_jobs_after: MetricSeries = .{},
+    background_io_oversized_jobs_after: MetricSeries = .{},
 
     fn init(allocator: Allocator, scenario: []const u8, workload: []const u8) !GroupAgg {
         return .{
@@ -137,6 +231,8 @@ const GroupAgg = struct {
         allocator.free(self.workload);
         self.ns_per_op.deinit(allocator);
         self.ops_per_sec.deinit(allocator);
+        self.config_effective_l0_soft_limit_runs.deinit(allocator);
+        self.config_effective_l0_hard_limit_runs.deinit(allocator);
         self.storage_write_bytes.deinit(allocator);
         self.storage_manifest_write_bytes.deinit(allocator);
         self.storage_rename.deinit(allocator);
@@ -153,13 +249,58 @@ const GroupAgg = struct {
         self.lsm_sorted_ingest_ns.deinit(allocator);
         self.lsm_manifest_writes.deinit(allocator);
         self.lsm_manifest_bytes.deinit(allocator);
+        self.lsm_write_pressure_events.deinit(allocator);
+        self.lsm_write_pressure_compactions.deinit(allocator);
+        self.lsm_write_pressure_compaction_steps.deinit(allocator);
+        self.lsm_write_pressure_overloads.deinit(allocator);
+        self.lsm_write_pressure_rejections.deinit(allocator);
+        self.lsm_write_pressure_ns.deinit(allocator);
+        self.lsm_wal_pressure_flushes.deinit(allocator);
+        self.lsm_wal_pressure_ns.deinit(allocator);
+        self.lsm_wal_append_records.deinit(allocator);
+        self.lsm_wal_append_entries.deinit(allocator);
+        self.lsm_wal_append_bytes.deinit(allocator);
+        self.lsm_wal_append_ns.deinit(allocator);
+        self.lsm_wal_sync_records.deinit(allocator);
+        self.lsm_wal_sync_ns.deinit(allocator);
+        self.lsm_wal_resets.deinit(allocator);
+        self.lsm_wal_reset_ns.deinit(allocator);
         self.compactions.deinit(allocator);
         self.compaction_input_bytes.deinit(allocator);
         self.compaction_output_bytes.deinit(allocator);
         self.compaction_ns.deinit(allocator);
         self.l0_runs_after.deinit(allocator);
+        self.compactable_l0_runs_after.deinit(allocator);
+        self.l0_bytes_after.deinit(allocator);
+        self.level_overflow_runs_after.deinit(allocator);
+        self.level_overflow_bytes_after.deinit(allocator);
         self.run_bytes_after.deinit(allocator);
         self.obsolete_paths_after.deinit(allocator);
+        self.mutable_entries_after.deinit(allocator);
+        self.mutable_bytes_after.deinit(allocator);
+        self.immutable_entries_after.deinit(allocator);
+        self.immutable_bytes_after.deinit(allocator);
+        self.wal_retained_segments_after.deinit(allocator);
+        self.wal_retained_bytes_after.deinit(allocator);
+        self.wal_checkpoint_oldest_retained_segment_after.deinit(allocator);
+        self.wal_checkpoint_covered_through_segment_after.deinit(allocator);
+        self.wal_checkpoint_current_segment_after.deinit(allocator);
+        self.wal_checkpoint_lag_segments_after.deinit(allocator);
+        self.wal_replay_retained_segments_after.deinit(allocator);
+        self.wal_replay_retained_bytes_after.deinit(allocator);
+        self.wal_replay_current_segment_after.deinit(allocator);
+        self.compaction_scheduler_grants_after.deinit(allocator);
+        self.compaction_scheduler_denied_capacity_after.deinit(allocator);
+        self.compaction_scheduler_denied_resource_pressure_after.deinit(allocator);
+        self.compaction_scheduler_remembered_pending_after.deinit(allocator);
+        self.compaction_scheduler_remembered_candidates_after.deinit(allocator);
+        self.compaction_scheduler_remembered_retries_after.deinit(allocator);
+        self.compaction_scheduler_remembered_hits_after.deinit(allocator);
+        self.compaction_scheduler_remembered_stale_after.deinit(allocator);
+        self.compaction_scheduler_conflict_denials_after.deinit(allocator);
+        self.background_io_reserved_bytes_after.deinit(allocator);
+        self.background_io_denied_jobs_after.deinit(allocator);
+        self.background_io_oversized_jobs_after.deinit(allocator);
         self.* = undefined;
     }
 
@@ -167,6 +308,8 @@ const GroupAgg = struct {
         self.sample_count += 1;
         try self.ns_per_op.append(allocator, record.ns_per_op);
         try self.ops_per_sec.append(allocator, record.ops_per_sec);
+        try self.config_effective_l0_soft_limit_runs.append(allocator, @floatFromInt(record.config_effective_l0_soft_limit_runs));
+        try self.config_effective_l0_hard_limit_runs.append(allocator, @floatFromInt(record.config_effective_l0_hard_limit_runs));
         try self.storage_write_bytes.append(allocator, @floatFromInt(record.storage_write_bytes));
         try self.storage_manifest_write_bytes.append(allocator, @floatFromInt(record.storage_manifest_write_bytes));
         try self.storage_rename.append(allocator, @floatFromInt(record.storage_rename));
@@ -183,13 +326,58 @@ const GroupAgg = struct {
         try self.lsm_sorted_ingest_ns.append(allocator, @floatFromInt(record.lsm_sorted_ingest_ns));
         try self.lsm_manifest_writes.append(allocator, @floatFromInt(record.lsm_manifest_writes));
         try self.lsm_manifest_bytes.append(allocator, @floatFromInt(record.lsm_manifest_bytes));
+        try self.lsm_write_pressure_events.append(allocator, @floatFromInt(record.lsm_write_pressure_events));
+        try self.lsm_write_pressure_compactions.append(allocator, @floatFromInt(record.lsm_write_pressure_compactions));
+        try self.lsm_write_pressure_compaction_steps.append(allocator, @floatFromInt(record.lsm_write_pressure_compaction_steps));
+        try self.lsm_write_pressure_overloads.append(allocator, @floatFromInt(record.lsm_write_pressure_overloads));
+        try self.lsm_write_pressure_rejections.append(allocator, @floatFromInt(record.lsm_write_pressure_rejections));
+        try self.lsm_write_pressure_ns.append(allocator, @floatFromInt(record.lsm_write_pressure_ns));
+        try self.lsm_wal_pressure_flushes.append(allocator, @floatFromInt(record.lsm_wal_pressure_flushes));
+        try self.lsm_wal_pressure_ns.append(allocator, @floatFromInt(record.lsm_wal_pressure_ns));
+        try self.lsm_wal_append_records.append(allocator, @floatFromInt(record.lsm_wal_append_records));
+        try self.lsm_wal_append_entries.append(allocator, @floatFromInt(record.lsm_wal_append_entries));
+        try self.lsm_wal_append_bytes.append(allocator, @floatFromInt(record.lsm_wal_append_bytes));
+        try self.lsm_wal_append_ns.append(allocator, @floatFromInt(record.lsm_wal_append_ns));
+        try self.lsm_wal_sync_records.append(allocator, @floatFromInt(record.lsm_wal_sync_records));
+        try self.lsm_wal_sync_ns.append(allocator, @floatFromInt(record.lsm_wal_sync_ns));
+        try self.lsm_wal_resets.append(allocator, @floatFromInt(record.lsm_wal_resets));
+        try self.lsm_wal_reset_ns.append(allocator, @floatFromInt(record.lsm_wal_reset_ns));
         try self.compactions.append(allocator, @floatFromInt(record.compactions));
         try self.compaction_input_bytes.append(allocator, @floatFromInt(record.compaction_input_bytes));
         try self.compaction_output_bytes.append(allocator, @floatFromInt(record.compaction_output_bytes));
         try self.compaction_ns.append(allocator, @floatFromInt(record.compaction_ns));
         try self.l0_runs_after.append(allocator, @floatFromInt(record.l0_runs_after));
+        try self.compactable_l0_runs_after.append(allocator, @floatFromInt(record.compactable_l0_runs_after));
+        try self.l0_bytes_after.append(allocator, @floatFromInt(record.l0_bytes_after));
+        try self.level_overflow_runs_after.append(allocator, @floatFromInt(record.level_overflow_runs_after));
+        try self.level_overflow_bytes_after.append(allocator, @floatFromInt(record.level_overflow_bytes_after));
         try self.run_bytes_after.append(allocator, @floatFromInt(record.run_bytes_after));
         try self.obsolete_paths_after.append(allocator, @floatFromInt(record.obsolete_paths_after));
+        try self.mutable_entries_after.append(allocator, @floatFromInt(record.mutable_entries_after));
+        try self.mutable_bytes_after.append(allocator, @floatFromInt(record.mutable_bytes_after));
+        try self.immutable_entries_after.append(allocator, @floatFromInt(record.immutable_entries_after));
+        try self.immutable_bytes_after.append(allocator, @floatFromInt(record.immutable_bytes_after));
+        try self.wal_retained_segments_after.append(allocator, @floatFromInt(record.wal_retained_segments_after));
+        try self.wal_retained_bytes_after.append(allocator, @floatFromInt(record.wal_retained_bytes_after));
+        try self.wal_checkpoint_oldest_retained_segment_after.append(allocator, @floatFromInt(record.wal_checkpoint_oldest_retained_segment_after));
+        try self.wal_checkpoint_covered_through_segment_after.append(allocator, @floatFromInt(record.wal_checkpoint_covered_through_segment_after));
+        try self.wal_checkpoint_current_segment_after.append(allocator, @floatFromInt(record.wal_checkpoint_current_segment_after));
+        try self.wal_checkpoint_lag_segments_after.append(allocator, @floatFromInt(record.wal_checkpoint_lag_segments_after));
+        try self.wal_replay_retained_segments_after.append(allocator, @floatFromInt(record.wal_replay_retained_segments_after));
+        try self.wal_replay_retained_bytes_after.append(allocator, @floatFromInt(record.wal_replay_retained_bytes_after));
+        try self.wal_replay_current_segment_after.append(allocator, @floatFromInt(record.wal_replay_current_segment_after));
+        try self.compaction_scheduler_grants_after.append(allocator, @floatFromInt(record.compaction_scheduler_grants_after));
+        try self.compaction_scheduler_denied_capacity_after.append(allocator, @floatFromInt(record.compaction_scheduler_denied_capacity_after));
+        try self.compaction_scheduler_denied_resource_pressure_after.append(allocator, @floatFromInt(record.compaction_scheduler_denied_resource_pressure_after));
+        try self.compaction_scheduler_remembered_pending_after.append(allocator, @floatFromInt(record.compaction_scheduler_remembered_pending_after));
+        try self.compaction_scheduler_remembered_candidates_after.append(allocator, @floatFromInt(record.compaction_scheduler_remembered_candidates_after));
+        try self.compaction_scheduler_remembered_retries_after.append(allocator, @floatFromInt(record.compaction_scheduler_remembered_retries_after));
+        try self.compaction_scheduler_remembered_hits_after.append(allocator, @floatFromInt(record.compaction_scheduler_remembered_hits_after));
+        try self.compaction_scheduler_remembered_stale_after.append(allocator, @floatFromInt(record.compaction_scheduler_remembered_stale_after));
+        try self.compaction_scheduler_conflict_denials_after.append(allocator, @floatFromInt(record.compaction_scheduler_conflict_denials_after));
+        try self.background_io_reserved_bytes_after.append(allocator, @floatFromInt(record.background_io_reserved_bytes_after));
+        try self.background_io_denied_jobs_after.append(allocator, @floatFromInt(record.background_io_denied_jobs_after));
+        try self.background_io_oversized_jobs_after.append(allocator, @floatFromInt(record.background_io_oversized_jobs_after));
     }
 };
 
@@ -326,6 +514,8 @@ fn printComparison(
     });
     try printMetric(writer, allocator, "  ns/op", before.ns_per_op, after.ns_per_op);
     try printMetric(writer, allocator, "  ops/sec", before.ops_per_sec, after.ops_per_sec);
+    try printMetric(writer, allocator, "  effective_l0_soft_limit_runs", before.config_effective_l0_soft_limit_runs, after.config_effective_l0_soft_limit_runs);
+    try printMetric(writer, allocator, "  effective_l0_hard_limit_runs", before.config_effective_l0_hard_limit_runs, after.config_effective_l0_hard_limit_runs);
     try printMetric(writer, allocator, "  storage_write_bytes", before.storage_write_bytes, after.storage_write_bytes);
     try printMetric(writer, allocator, "  storage_manifest_write_bytes", before.storage_manifest_write_bytes, after.storage_manifest_write_bytes);
     try printMetric(writer, allocator, "  storage_rename", before.storage_rename, after.storage_rename);
@@ -342,13 +532,58 @@ fn printComparison(
     try printMetric(writer, allocator, "  lsm_sorted_ingest_ns", before.lsm_sorted_ingest_ns, after.lsm_sorted_ingest_ns);
     try printMetric(writer, allocator, "  lsm_manifest_writes", before.lsm_manifest_writes, after.lsm_manifest_writes);
     try printMetric(writer, allocator, "  lsm_manifest_bytes", before.lsm_manifest_bytes, after.lsm_manifest_bytes);
+    try printMetric(writer, allocator, "  lsm_write_pressure_events", before.lsm_write_pressure_events, after.lsm_write_pressure_events);
+    try printMetric(writer, allocator, "  lsm_write_pressure_compactions", before.lsm_write_pressure_compactions, after.lsm_write_pressure_compactions);
+    try printMetric(writer, allocator, "  lsm_write_pressure_compaction_steps", before.lsm_write_pressure_compaction_steps, after.lsm_write_pressure_compaction_steps);
+    try printMetric(writer, allocator, "  lsm_write_pressure_overloads", before.lsm_write_pressure_overloads, after.lsm_write_pressure_overloads);
+    try printMetric(writer, allocator, "  lsm_write_pressure_rejections", before.lsm_write_pressure_rejections, after.lsm_write_pressure_rejections);
+    try printMetric(writer, allocator, "  lsm_write_pressure_ns", before.lsm_write_pressure_ns, after.lsm_write_pressure_ns);
+    try printMetric(writer, allocator, "  lsm_wal_pressure_flushes", before.lsm_wal_pressure_flushes, after.lsm_wal_pressure_flushes);
+    try printMetric(writer, allocator, "  lsm_wal_pressure_ns", before.lsm_wal_pressure_ns, after.lsm_wal_pressure_ns);
+    try printMetric(writer, allocator, "  lsm_wal_append_records", before.lsm_wal_append_records, after.lsm_wal_append_records);
+    try printMetric(writer, allocator, "  lsm_wal_append_entries", before.lsm_wal_append_entries, after.lsm_wal_append_entries);
+    try printMetric(writer, allocator, "  lsm_wal_append_bytes", before.lsm_wal_append_bytes, after.lsm_wal_append_bytes);
+    try printMetric(writer, allocator, "  lsm_wal_append_ns", before.lsm_wal_append_ns, after.lsm_wal_append_ns);
+    try printMetric(writer, allocator, "  lsm_wal_sync_records", before.lsm_wal_sync_records, after.lsm_wal_sync_records);
+    try printMetric(writer, allocator, "  lsm_wal_sync_ns", before.lsm_wal_sync_ns, after.lsm_wal_sync_ns);
+    try printMetric(writer, allocator, "  lsm_wal_resets", before.lsm_wal_resets, after.lsm_wal_resets);
+    try printMetric(writer, allocator, "  lsm_wal_reset_ns", before.lsm_wal_reset_ns, after.lsm_wal_reset_ns);
     try printMetric(writer, allocator, "  compactions", before.compactions, after.compactions);
     try printMetric(writer, allocator, "  compaction_input_bytes", before.compaction_input_bytes, after.compaction_input_bytes);
     try printMetric(writer, allocator, "  compaction_output_bytes", before.compaction_output_bytes, after.compaction_output_bytes);
     try printMetric(writer, allocator, "  compaction_ns", before.compaction_ns, after.compaction_ns);
     try printMetric(writer, allocator, "  l0_runs_after", before.l0_runs_after, after.l0_runs_after);
+    try printMetric(writer, allocator, "  compactable_l0_runs_after", before.compactable_l0_runs_after, after.compactable_l0_runs_after);
+    try printMetric(writer, allocator, "  l0_bytes_after", before.l0_bytes_after, after.l0_bytes_after);
+    try printMetric(writer, allocator, "  level_overflow_runs_after", before.level_overflow_runs_after, after.level_overflow_runs_after);
+    try printMetric(writer, allocator, "  level_overflow_bytes_after", before.level_overflow_bytes_after, after.level_overflow_bytes_after);
     try printMetric(writer, allocator, "  run_bytes_after", before.run_bytes_after, after.run_bytes_after);
     try printMetric(writer, allocator, "  obsolete_paths_after", before.obsolete_paths_after, after.obsolete_paths_after);
+    try printMetric(writer, allocator, "  mutable_entries_after", before.mutable_entries_after, after.mutable_entries_after);
+    try printMetric(writer, allocator, "  mutable_bytes_after", before.mutable_bytes_after, after.mutable_bytes_after);
+    try printMetric(writer, allocator, "  immutable_entries_after", before.immutable_entries_after, after.immutable_entries_after);
+    try printMetric(writer, allocator, "  immutable_bytes_after", before.immutable_bytes_after, after.immutable_bytes_after);
+    try printMetric(writer, allocator, "  wal_retained_segments_after", before.wal_retained_segments_after, after.wal_retained_segments_after);
+    try printMetric(writer, allocator, "  wal_retained_bytes_after", before.wal_retained_bytes_after, after.wal_retained_bytes_after);
+    try printMetric(writer, allocator, "  wal_checkpoint_oldest_retained_segment_after", before.wal_checkpoint_oldest_retained_segment_after, after.wal_checkpoint_oldest_retained_segment_after);
+    try printMetric(writer, allocator, "  wal_checkpoint_covered_through_segment_after", before.wal_checkpoint_covered_through_segment_after, after.wal_checkpoint_covered_through_segment_after);
+    try printMetric(writer, allocator, "  wal_checkpoint_current_segment_after", before.wal_checkpoint_current_segment_after, after.wal_checkpoint_current_segment_after);
+    try printMetric(writer, allocator, "  wal_checkpoint_lag_segments_after", before.wal_checkpoint_lag_segments_after, after.wal_checkpoint_lag_segments_after);
+    try printMetric(writer, allocator, "  wal_replay_retained_segments_after", before.wal_replay_retained_segments_after, after.wal_replay_retained_segments_after);
+    try printMetric(writer, allocator, "  wal_replay_retained_bytes_after", before.wal_replay_retained_bytes_after, after.wal_replay_retained_bytes_after);
+    try printMetric(writer, allocator, "  wal_replay_current_segment_after", before.wal_replay_current_segment_after, after.wal_replay_current_segment_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_grants_after", before.compaction_scheduler_grants_after, after.compaction_scheduler_grants_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_denied_capacity_after", before.compaction_scheduler_denied_capacity_after, after.compaction_scheduler_denied_capacity_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_denied_resource_pressure_after", before.compaction_scheduler_denied_resource_pressure_after, after.compaction_scheduler_denied_resource_pressure_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_remembered_pending_after", before.compaction_scheduler_remembered_pending_after, after.compaction_scheduler_remembered_pending_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_remembered_candidates_after", before.compaction_scheduler_remembered_candidates_after, after.compaction_scheduler_remembered_candidates_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_remembered_retries_after", before.compaction_scheduler_remembered_retries_after, after.compaction_scheduler_remembered_retries_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_remembered_hits_after", before.compaction_scheduler_remembered_hits_after, after.compaction_scheduler_remembered_hits_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_remembered_stale_after", before.compaction_scheduler_remembered_stale_after, after.compaction_scheduler_remembered_stale_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_conflict_denials_after", before.compaction_scheduler_conflict_denials_after, after.compaction_scheduler_conflict_denials_after);
+    try printMetric(writer, allocator, "  background_io_reserved_bytes_after", before.background_io_reserved_bytes_after, after.background_io_reserved_bytes_after);
+    try printMetric(writer, allocator, "  background_io_denied_jobs_after", before.background_io_denied_jobs_after, after.background_io_denied_jobs_after);
+    try printMetric(writer, allocator, "  background_io_oversized_jobs_after", before.background_io_oversized_jobs_after, after.background_io_oversized_jobs_after);
 }
 
 fn printMetric(writer: anytype, allocator: Allocator, label: []const u8, before: MetricSeries, after: MetricSeries) !void {

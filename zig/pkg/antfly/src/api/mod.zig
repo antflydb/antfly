@@ -17,6 +17,7 @@ const std = @import("std");
 pub const cluster = @import("cluster.zig");
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
+pub const linear_merge = @import("linear_merge.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
 pub const cluster_api_http = @import("cluster_api_http.zig");
@@ -68,6 +69,27 @@ pub const HostedProvisionedTableWriteSource = table_writes.HostedProvisionedTabl
 pub const HostedGroupRouter = table_router.HostedGroupRouter;
 pub const ApiHttpServer = http_server.ApiHttpServer;
 pub const ApiHttpClient = http_client.ApiHttpClient;
+
+test "linear merge request parser accepts raw payload value under public request cap" {
+    const alloc = std.testing.allocator;
+    const payload = try alloc.alloc(u8, 6 * 1024 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("{\"records\":{\"doc:a\":{\"raw_payload\":\"");
+    try writer.writeAll(payload);
+    try writer.writeAll("\"}}}");
+
+    var req = try linear_merge.parseRequest(alloc, out.written());
+    defer req.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), req.writes.len);
+    try std.testing.expect(std.mem.indexOf(u8, req.writes[0].value, "\"raw_payload\"") != null);
+}
 
 test "join inequality: jsonValuesCompare all six operators on integers" {
     const three: std.json.Value = .{ .integer = 3 };

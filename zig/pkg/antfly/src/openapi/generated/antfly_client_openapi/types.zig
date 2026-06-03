@@ -494,11 +494,15 @@ pub const AlgebraicAggregationJoin = struct {
     measure_side: []const u8,
 };
 
-pub const StorageStatus = struct {
-    /// Disk usage in bytes.
-    disk_usage: ?i64 = null,
-    /// Whether the table has received data.
-    empty: ?bool = null,
+/// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
+pub const LsmStorageStatus = struct {
+    run_count: ?i64 = null,
+    run_bytes: ?i64 = null,
+    l0_run_count: ?i64 = null,
+    l0_bytes: ?i64 = null,
+    wal_retained_bytes: ?i64 = null,
+    compaction_backlog_bytes: ?i64 = null,
+    active_readers: ?i64 = null,
 };
 
 /// MongoDB-style update operator
@@ -3341,6 +3345,14 @@ pub const LinearMergeRequest = struct {
     /// If true, returns what would be deleted without making changes. Use cases: - Validate sync behavior before committing - Check which records will be removed - Test key range boundaries Response includes deleted_ids array when dry_run=true.
     dry_run: ?bool = null,
     sync_level: ?SyncLevel = null,
+};
+
+pub const StorageStatus = struct {
+    /// Disk usage in bytes.
+    disk_usage: ?i64 = null,
+    /// Whether the table has received data.
+    empty: ?bool = null,
+    lsm: ?LsmStorageStatus = null,
 };
 
 pub const TransformOp = struct {
