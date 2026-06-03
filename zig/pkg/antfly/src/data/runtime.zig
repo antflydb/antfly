@@ -27,6 +27,7 @@ const data_raft_batch = @import("raft_batch.zig");
 const platform_clock = @import("../platform/clock.zig");
 const process_memory_mod = @import("../platform/process_memory.zig");
 const platform_time = @import("../platform/time.zig");
+const platform = @import("antfly_platform");
 const raft_engine = @import("raft_engine");
 
 const health_metrics = antfly.common.health_server;
@@ -7615,11 +7616,10 @@ fn resolveTrustedPrincipalConfigValue(
 
     const env_var = try antfly.common.secrets.envVarForKey(alloc, key);
     defer alloc.free(env_var);
-    const value = std.process.getEnvVarOwned(alloc, env_var) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        else => return err,
-    };
-    if (value) |raw| {
+    const env_var_z = try alloc.dupeZ(u8, env_var);
+    defer alloc.free(env_var_z);
+    if (platform.env.getenvSlice(env_var_z)) |value| {
+        const raw = try alloc.dupe(u8, value);
         if (std.mem.trim(u8, raw, " \t\r\n").len > 0) return raw;
         alloc.free(raw);
     }
