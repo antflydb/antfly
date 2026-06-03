@@ -36820,6 +36820,7 @@ test "db writes and reads timestamp metadata" {
 
 test "db lookup hides expired documents when ttl schema is configured" {
     const alloc = std.testing.allocator;
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -36831,13 +36832,13 @@ test "db lookup hides expired documents when ttl schema is configured" {
     try db.setSchema(.{
         .version = 1,
         .default_type = "_default",
-        .ttl_duration_ns = 1_000_000_000,
+        .ttl_duration_ns = ttl_duration_ns,
     });
 
     const now_ns = currentTimeNs();
     try db.batch(.{
         .writes = &.{.{ .key = "doc:old", .value = "{\"title\":\"old\"}" }},
-        .timestamp_ns = now_ns - 2_000_000_000,
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
     });
     try db.batch(.{
         .writes = &.{.{ .key = "doc:new", .value = "{\"title\":\"new\"}" }},
@@ -36852,6 +36853,7 @@ test "db lookup hides expired documents when ttl schema is configured" {
 
 test "db search filters expired documents when ttl schema is configured" {
     const alloc = std.testing.allocator;
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -36863,7 +36865,7 @@ test "db search filters expired documents when ttl schema is configured" {
     try db.setSchema(.{
         .version = 1,
         .default_type = "_default",
-        .ttl_duration_ns = 1_000_000_000,
+        .ttl_duration_ns = ttl_duration_ns,
     });
 
     const now_ns = currentTimeNs();
@@ -36872,7 +36874,7 @@ test "db search filters expired documents when ttl schema is configured" {
             .{ .key = "doc:old", .value = "{\"title\":\"alpha\",\"body\":\"common token\"}" },
             .{ .key = "doc:new", .value = "{\"title\":\"beta\",\"body\":\"common token\"}" },
         },
-        .timestamp_ns = now_ns - 2_000_000_000,
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
     });
     try db.batch(.{
         .writes = &.{.{ .key = "doc:fresh", .value = "{\"title\":\"fresh\",\"body\":\"common token\"}" }},
@@ -36905,6 +36907,7 @@ test "db search filters expired documents when ttl schema is configured" {
 
 test "db ttl falls back to write timestamp when ttl field is missing" {
     const alloc = std.testing.allocator;
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -36916,7 +36919,7 @@ test "db ttl falls back to write timestamp when ttl field is missing" {
     try db.setSchema(.{
         .version = 1,
         .default_type = "_default",
-        .ttl_duration_ns = 1_000_000_000,
+        .ttl_duration_ns = ttl_duration_ns,
         .ttl_field = "expires_at",
     });
 
@@ -36925,7 +36928,7 @@ test "db ttl falls back to write timestamp when ttl field is missing" {
         .writes = &.{
             .{ .key = "doc:old", .value = "{\"title\":\"alpha\",\"body\":\"common token\"}" },
         },
-        .timestamp_ns = now_ns - 2_000_000_000,
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
     });
     try db.batch(.{
         .writes = &.{

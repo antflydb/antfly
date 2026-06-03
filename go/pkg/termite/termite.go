@@ -125,15 +125,13 @@ func RunAsTermite(ctx context.Context, zl *zap.Logger, config Config, readyC cha
 		zl.Fatal("Failed to bind address", zap.String("address", u.Host), zap.Error(err))
 	}
 
-	// Signal readiness now that the socket is bound
-	if readyC != nil {
-		close(readyC)
-	}
-
 	// Start server in goroutine
 	serverErr := make(chan error, 1)
 	go func() {
 		zl.Info("Termite's api server starting", zap.String("address", ln.Addr().String()))
+		if readyC != nil {
+			close(readyC)
+		}
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			serverErr <- err
 		}
