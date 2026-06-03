@@ -79,8 +79,7 @@ pub const metrics_mod = @import("metrics.zig");
 const request_queue_mod = @import("request_queue.zig");
 
 // ---------------------------------------------------------------------------
-// Tabular predictor helpers shared by the /predict, /predict/upload, and
-// /predict/convert handlers on Node.
+// Tabular predictor helpers shared by the /ml/v1/predict handler on Node.
 // ---------------------------------------------------------------------------
 
 fn taskTypeToApi(t: ml_tabular.ir.TaskType) api.PredictorTask {
@@ -92,31 +91,6 @@ fn taskTypeToApi(t: ml_tabular.ir.TaskType) api.PredictorTask {
     };
 }
 
-fn predictorInfoToApi(info: tabular_registry_mod.ModelInfo) api.PredictorInfo {
-    return .{
-        .name = info.name,
-        .task = taskTypeToApi(info.task),
-        .num_features = @intCast(info.num_features),
-        .num_outputs = @intCast(info.num_outputs),
-        .feature_names = if (info.feature_names.len > 0) info.feature_names else null,
-        .source_framework = if (info.source_framework.len > 0) info.source_framework else null,
-    };
-}
-
-/// Map the OpenAPI `framework` enum to the Zig converter. The spec only
-/// declares {auto, xgboost, lightgbm, onnx}; sklearn/catboost are accepted
-/// here too so requests from non-SDK clients still surface the friendly 415
-/// "use termite-convert" guidance via convertAndUpload.
-fn parseFrameworkParam(s: []const u8) ?ml_tabular.convert.Framework {
-    if (std.mem.eql(u8, s, "auto")) return .auto;
-    if (std.mem.eql(u8, s, "xgboost")) return .xgboost;
-    if (std.mem.eql(u8, s, "lightgbm")) return .lightgbm;
-    if (std.mem.eql(u8, s, "onnx")) return .onnx_ml;
-    if (std.mem.eql(u8, s, "sklearn")) return .sklearn;
-    if (std.mem.eql(u8, s, "catboost")) return .catboost;
-    return null;
-}
-
 fn mapTabularHttpErrorPredict(ctx: *httpx.Context, err: tabular_http_mod.HttpError) !httpx.Response {
     return switch (err) {
         error.InvalidJson => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "malformed predict body" }),
@@ -125,33 +99,6 @@ fn mapTabularHttpErrorPredict(ctx: *httpx.Context, err: tabular_http_mod.HttpErr
         error.FeatureMismatch => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "feature-count mismatch" }),
         error.LoadFailed => ctx.status(500).json(.{ .@"error" = "LOAD_FAILED", .message = "predictor failed to load" }),
         error.OutOfMemory => ctx.status(500).json(.{ .@"error" = "OOM" }),
-        else => ctx.status(500).json(.{ .@"error" = "INTERNAL" }),
-    };
-}
-
-fn mapTabularHttpErrorUpload(ctx: *httpx.Context, err: tabular_http_mod.HttpError) !httpx.Response {
-    return switch (err) {
-        error.InvalidJson => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "tabular_model.json is malformed or invalid" }),
-        error.InvalidName => ctx.status(400).json(.{ .@"error" = "INVALID_NAME", .message = "name must match [A-Za-z0-9_-]+ (optionally prefixed with local/)" }),
-        error.UploadTooLarge => ctx.status(413).json(.{ .@"error" = "UPLOAD_TOO_LARGE", .message = "max upload size is 50MB" }),
-        error.IoError => ctx.status(500).json(.{ .@"error" = "IO_ERROR" }),
-        error.OutOfMemory => ctx.status(500).json(.{ .@"error" = "OOM" }),
-        else => ctx.status(500).json(.{ .@"error" = "INTERNAL" }),
-    };
-}
-
-fn mapTabularHttpErrorConvert(ctx: *httpx.Context, err: tabular_http_mod.HttpError) !httpx.Response {
-    return switch (err) {
-        error.UnsupportedSource => ctx.status(415).json(.{
-            .@"error" = "UNSUPPORTED_SOURCE",
-            .message = "sklearn / CatBoost are not supported natively; run `termite-convert <framework> ...` to produce tabular_model.json and upload via /predict/upload",
-        }),
-        error.ConvertFailed => ctx.status(400).json(.{ .@"error" = "CONVERT_FAILED", .message = "could not parse the source model" }),
-        error.InvalidName => ctx.status(400).json(.{ .@"error" = "INVALID_NAME", .message = "invalid predictor name" }),
-        error.InvalidJson => ctx.status(400).json(.{ .@"error" = "INVALID_JSON" }),
-        error.IoError => ctx.status(500).json(.{ .@"error" = "IO_ERROR" }),
-        error.OutOfMemory => ctx.status(500).json(.{ .@"error" = "OOM" }),
-        else => ctx.status(500).json(.{ .@"error" = "INTERNAL" }),
     };
 }
 
@@ -186,6 +133,7 @@ pub const NodeConfig = struct {
 };
 
 pub const public_api_prefix = "/ai/v1";
+pub const public_ml_api_prefix = "/ml/v1";
 
 const GenerateBackendSelection = struct {
     native_choice: native_backend_choice.Choice = .auto,
@@ -604,7 +552,17 @@ pub const Node = struct {
         defer self.allocator.free(sub);
         std.Io.Dir.cwd().createDirPath(io, sub) catch {};
         tabular_discovery_mod.seedBuiltins(io, sub) catch {};
-        _ = tabular_discovery_mod.discover(io, self.allocator, &self.tabular_registry, sub) catch 0;
+        self.discoverPredictorsIn(sub, io);
+    }
+
+    fn discoverPredictors(self: *Node, io: std.Io) void {
+        const sub = std.fs.path.join(self.allocator, &.{ self.config.models_dir, "predictors" }) catch return;
+        defer self.allocator.free(sub);
+        self.discoverPredictorsIn(sub, io);
+    }
+
+    fn discoverPredictorsIn(self: *Node, predictors_dir: []const u8, io: std.Io) void {
+        _ = tabular_discovery_mod.discover(io, self.allocator, &self.tabular_registry, predictors_dir) catch 0;
     }
 
     pub fn embedDenseTextsDirect(
@@ -1618,7 +1576,7 @@ pub const Node = struct {
     }
 
     // -----------------------------------------------------------------------
-    // Tabular predictors (POST /predict, /predict/upload, /predict/convert).
+    // Tabular predictors (POST /ml/v1/predict).
     // -----------------------------------------------------------------------
 
     pub fn predict(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -1634,13 +1592,24 @@ pub const Node = struct {
         self.metrics.incRequest("predict");
         defer self.metrics.decActive();
 
-        const result = tabular_http_mod.predict(ctx.io, ctx.allocator, &self.tabular_registry, .{
+        const req: tabular_http_mod.PredictRequest = .{
             .model = body.model,
             .input = body.input,
-        }) catch |err| {
-            self.metrics.incPredictError();
-            self.metrics.incError();
-            return mapTabularHttpErrorPredict(ctx, err);
+        };
+        const result = tabular_http_mod.predict(ctx.io, ctx.allocator, &self.tabular_registry, req) catch |err| switch (err) {
+            error.ModelNotFound => blk: {
+                self.discoverPredictors(ctx.io);
+                break :blk tabular_http_mod.predict(ctx.io, ctx.allocator, &self.tabular_registry, req) catch |retry_err| {
+                    self.metrics.incPredictError();
+                    self.metrics.incError();
+                    return mapTabularHttpErrorPredict(ctx, retry_err);
+                };
+            },
+            else => {
+                self.metrics.incPredictError();
+                self.metrics.incError();
+                return mapTabularHttpErrorPredict(ctx, err);
+            },
         };
 
         const task = taskTypeToApi(result.task);
@@ -1649,77 +1618,6 @@ pub const Node = struct {
             .task = task,
             .predictions = result.predictions,
         });
-    }
-
-    pub fn uploadPredictor(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const body = ctx.request.body orelse return ctx.status(400).json(.{
-            .@"error" = "missing_body",
-            .message = "Body must contain tabular_model.json bytes",
-        });
-        const name = ctx.query("name") orelse return ctx.status(400).json(.{
-            .@"error" = "missing_name",
-            .message = "Pass ?name=<predictor-name>",
-        });
-
-        // Body bytes are already buffered; charge queue units proportional to
-        // the upload size so concurrent uploaders can't exhaust the server.
-        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        defer self.releaseSlotUnits(queue_units);
-
-        self.metrics.incRequest("predict");
-        defer self.metrics.decActive();
-
-        const predictors_dir = std.fs.path.join(ctx.allocator, &.{ self.config.models_dir, "predictors" }) catch {
-            self.metrics.incPredictError();
-            self.metrics.incError();
-            return ctx.status(500).json(.{ .@"error" = "alloc" });
-        };
-        defer ctx.allocator.free(predictors_dir);
-        std.Io.Dir.cwd().createDirPath(ctx.io, predictors_dir) catch {};
-
-        const info = tabular_http_mod.upload(ctx.io, ctx.allocator, &self.tabular_registry, predictors_dir, name, body) catch |err| {
-            self.metrics.incPredictError();
-            self.metrics.incError();
-            return mapTabularHttpErrorUpload(ctx, err);
-        };
-        return ctx.status(201).json(predictorInfoToApi(info));
-    }
-
-    pub fn convertPredictor(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const body = ctx.request.body orelse return ctx.status(400).json(.{
-            .@"error" = "missing_body",
-            .message = "Body must contain native model bytes",
-        });
-        const name = ctx.query("name") orelse return ctx.status(400).json(.{
-            .@"error" = "missing_name",
-            .message = "Pass ?name=<predictor-name>",
-        });
-        const framework_str = ctx.query("framework") orelse "auto";
-        const framework = parseFrameworkParam(framework_str) orelse
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "framework must be auto|xgboost|lightgbm|onnx" });
-
-        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        defer self.releaseSlotUnits(queue_units);
-
-        self.metrics.incRequest("predict");
-        defer self.metrics.decActive();
-
-        const predictors_dir = std.fs.path.join(ctx.allocator, &.{ self.config.models_dir, "predictors" }) catch {
-            self.metrics.incPredictError();
-            self.metrics.incError();
-            return ctx.status(500).json(.{ .@"error" = "alloc" });
-        };
-        defer ctx.allocator.free(predictors_dir);
-        std.Io.Dir.cwd().createDirPath(ctx.io, predictors_dir) catch {};
-
-        const info = tabular_http_mod.convertAndUpload(ctx.io, ctx.allocator, &self.tabular_registry, predictors_dir, name, framework, body) catch |err| {
-            self.metrics.incPredictError();
-            self.metrics.incError();
-            return mapTabularHttpErrorConvert(ctx, err);
-        };
-        return ctx.status(201).json(predictorInfoToApi(info));
     }
 
     pub fn chunkText(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -4821,6 +4719,7 @@ pub const Node = struct {
         // Append the predictors bucket from the tabular registry. This is
         // separate from model_listing_tasks because predictors don't share
         // the embedder/reranker/generator manifest schema.
+        self.discoverPredictors(ctx.io);
         try body.appendSlice(a, ",\"predictors\":{");
         const predictor_infos = self.tabular_registry.list(a) catch &[_]tabular_registry_mod.ModelInfo{};
         defer if (predictor_infos.len > 0) a.free(predictor_infos);
@@ -6091,7 +5990,11 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         inner: *Inner,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.inner.post(prefix ++ path, handler);
+            if (comptime (std.mem.eql(u8, prefix, public_api_prefix) and std.mem.eql(u8, path, "/predict"))) {
+                try self.inner.post(public_ml_api_prefix ++ path, handler);
+            } else {
+                try self.inner.post(prefix ++ path, handler);
+            }
         }
 
         pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
@@ -6200,6 +6103,10 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
 
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embed"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embeddings"));
+    try std.testing.expect(server.hasRoute(.post, public_ml_api_prefix ++ "/predict"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/predict"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/predict/upload"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/predict/convert"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
@@ -6257,6 +6164,7 @@ test "registerRoutesOn supports alternate prefixes through the shared router" {
 
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embed"));
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embeddings"));
+    try std.testing.expect(server.hasRoute(.post, "/custom/v9/predict"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/models"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/metrics"));
 }

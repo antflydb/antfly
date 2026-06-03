@@ -1,8 +1,8 @@
 # Tabular ML Inference
 
 Antfly's Zig inference subsystem can serve "traditional" ML models —
-tree ensembles (XGBoost, LightGBM, sklearn random forests + GBMs, CatBoost,
-ONNX-ML), linear / logistic regression, and SVMs — alongside the neural
+tree ensembles (XGBoost, LightGBM, ONNX-ML), linear / logistic regression,
+and SVMs — alongside the neural
 network paths (ONNX, MLX, CUDA, Native).
 
 The implementation lives in two layers:
@@ -21,7 +21,7 @@ A single, framework-agnostic JSON file describing the full pipeline:
   "schema_version": 1,
   "metadata": {
     "name": "iris-classifier",
-    "source_framework": "sklearn",
+    "source_framework": "xgboost",
     "task": "multiclass",
     "num_features": 4,
     "num_classes": 3,
@@ -57,15 +57,14 @@ runtime.
 
 ## Producing models
 
-Three paths, depending on the source framework:
+Two paths, depending on the source format:
 
 | Source | Tool | Status |
 | --- | --- | --- |
 | XGBoost (JSON) | `antfly inference convert <model.json> -o <dir> --framework xgboost` | Native Zig |
 | LightGBM (text) | `antfly inference convert <model.txt> -o <dir> --framework lightgbm` | Native Zig |
-| ONNX-ML | `antfly inference convert <model.onnx> -o <dir> --framework onnx` | Stub (PR6 follow-up); use `termite-convert onnx` in the meantime |
-| sklearn (joblib/pickle) | `termite-convert sklearn <model.pkl> -o <dir>` | Python only (pickle requires Python runtime) |
-| CatBoost | `termite-convert catboost <model.cbm> -o <dir>` | Python only |
+| ONNX-ML | `antfly inference convert <model.onnx> -o <dir> --framework onnx` | Native Zig |
+| Hosted `tabular_model.json` IR | `antfly inference pull <url> --name <name>` | Validated CLI pull |
 
 `--optimize` runs the dead-leaf-elimination + threshold-precision passes
 before writing the IR. Equivalent to termite's `--optimize`.
@@ -76,24 +75,30 @@ Models are auto-discovered from `~/.antfly/inference/predictors/<name>/`.
 On first run a built-in iris classifier is seeded (`@embedFile`-backed) so
 the catalog is non-empty even on a fresh install.
 
-HTTP routes (extension of the existing inference OpenAPI surface):
+HTTP routes:
 
 ```text
-POST /ai/v1/predict          # batched prediction
-POST /ai/v1/predict/upload   # upload validated tabular_model.json
-POST /ai/v1/predict/convert  # convert + register (XGBoost / LightGBM / ONNX)
+POST /ml/v1/predict          # batched prediction
 GET  /ai/v1/models           # predictors listed alongside embedders/rerankers
 ```
 
 ```sh
-curl -s -X POST http://localhost:8080/ai/v1/predict \
+curl -s -X POST http://localhost:8080/ml/v1/predict \
   -H 'content-type: application/json' \
   -d '{"model":"iris-classifier","input":[[5.1,3.5,1.4,0.2]]}'
 # → {"model":"iris-classifier","task":"multiclass","predictions":[[0.97,0.02,0.01]]}
 ```
 
-Limits (matching termite): max batch 10 000 rows, max upload 50 MB. Names
-are restricted to `[A-Za-z0-9_-]+` plus an optional `local/` prefix.
+Install hosted IRs with the CLI:
+
+```sh
+antfly inference pull https://example.com/models/iris/tabular_model.json \
+  --name iris-classifier
+```
+
+Limits: max batch 10 000 rows, max pull 50 MB. Names are restricted to
+`[A-Za-z0-9_-]+`. The HTTP API does not accept model uploads; conversion and
+pulling are CLI responsibilities.
 
 ## In-process use from antfly DB
 
@@ -122,9 +127,8 @@ cd zig
 # Run the engine's unit tests.
 zig build lib-ml-tabular-test
 
-# Once the inference build graph is wired (see TODO below):
-zig build inference-test                   # registry + http handlers
-zig build inference-bench-tabular          # latency benchmarks
+zig build inference-test -Dmetal=false     # registry + HTTP handlers
+zig build fuzz-tabular-loader              # loader fuzz target
 ```
 
 ## What's wired today
@@ -147,9 +151,8 @@ Service layer (`pkg/inference/src/tabular/`) — **fully wired, tested end-to-en
 - `discovery.zig` — scans `<models-dir>/predictors/<name>/tabular_model.json`,
   seeds the builtin iris classifier via `@embedFile`
 - `manifest.zig` — optional `model_manifest.json` reader
-- `http.zig` — predict / upload / convert handler logic with safe-name
-  allowlist
-- `cli.zig` — `antfly inference convert` subcommand
+- `http.zig` — predict handler logic
+- `cli.zig` — `antfly inference convert` and URL `pull` subcommands
 - OpenAPI extensions (`specs/openapi/inference/api.yaml`) plus matching
   type definitions in the checked-in generated `inference_api` module
 - Prometheus metrics: `antfly_inference_endpoint_requests_predict`,
@@ -163,4 +166,4 @@ End-to-end coverage:
 - `e2e/inference/test_tabular.py` — Python pytest suite that spins up a
   real `antfly inference run`, runs the iris classifier end-to-end, and
   trains + converts + predicts XGBoost / LightGBM models against the
-  source framework. 10 tests pass on the reference machine.
+  source framework, plus an ONNX-ML linear-regressor conversion path.

@@ -72,9 +72,9 @@ pub fn parse(parent: std.mem.Allocator, bytes: []const u8) Error!Parsed {
     const objective = (objective_obj.get("name") orelse return Error.NotXgboost);
     if (objective != .string) return Error.InvalidJson;
 
-    const num_feature: u32 = @intCast(parseUintLikeString(lmp.get("num_feature") orelse return Error.NotXgboost));
-    const num_class_raw: u32 = @intCast(parseUintLikeString(lmp.get("num_class") orelse std.json.Value{ .string = "0" }));
-    const base_score: f64 = parseFloatLikeString(lmp.get("base_score") orelse std.json.Value{ .string = "0.5" });
+    const num_feature = try parseU32Like(lmp.get("num_feature") orelse return Error.NotXgboost);
+    const num_class_raw = try parseU32Like(lmp.get("num_class") orelse std.json.Value{ .string = "0" });
+    const base_score = try parseBaseScore(lmp.get("base_score") orelse std.json.Value{ .string = "0.5" });
 
     const map = try mapObjective(objective.string, num_class_raw);
 
@@ -157,7 +157,7 @@ fn buildEnsemble(
 
     var off: usize = 0;
     for (trees, 0..) |t, ti| {
-        starts[ti] = @intCast(off);
+        starts[ti] = try usizeToI32(off);
         const obj = t.object;
         const si = (obj.get("split_indices") orelse return Error.MalformedTree).array.items;
         const sc = (obj.get("split_conditions") orelse return Error.MalformedTree).array.items;
@@ -171,22 +171,23 @@ fn buildEnsemble(
 
         var i: usize = 0;
         while (i < si.len) : (i += 1) {
-            const left_local = jsonAsI64(li[i]);
-            const right_local = jsonAsI64(ri[i]);
+            const left_local = try jsonAsI64(li[i]);
+            const right_local = try jsonAsI64(ri[i]);
             const is_leaf = left_local < 0 and right_local < 0;
-            const f_idx = jsonAsI64(si[i]);
+            const f_idx = try jsonAsI64(si[i]);
             if (is_leaf) {
                 feat[off + i] = -1;
-                lv[off + i] = jsonAsF64(bw[i]);
+                lv[off + i] = try jsonAsF64(bw[i]);
                 thr[off + i] = 0;
                 lc[off + i] = -1;
                 rc[off + i] = -1;
             } else {
-                if (f_idx < 0 or @as(u32, @intCast(f_idx)) >= num_features) return Error.MalformedTree;
-                feat[off + i] = @intCast(f_idx);
-                thr[off + i] = jsonAsF64(sc[i]);
-                lc[off + i] = if (left_local < 0) -1 else @intCast(@as(i64, @intCast(off)) + left_local);
-                rc[off + i] = if (right_local < 0) -1 else @intCast(@as(i64, @intCast(off)) + right_local);
+                const feature_index = try i64ToU32(f_idx);
+                if (feature_index >= num_features) return Error.MalformedTree;
+                feat[off + i] = try u32ToI32(feature_index);
+                thr[off + i] = try jsonAsF64(sc[i]);
+                lc[off + i] = try resolveChild(off, left_local);
+                rc[off + i] = try resolveChild(off, right_local);
                 lv[off + i] = 0;
             }
             dl[off + i] = if (dl_arr) |arr| (if (i < arr.len) jsonAsBool(arr[i]) else true) else true;
@@ -197,7 +198,7 @@ fn buildEnsemble(
     return .{
         .objective = "",
         .base_score = base_score,
-        .num_trees = @intCast(trees.len),
+        .num_trees = try usizeToU32(trees.len),
         .num_features = num_features,
         .max_depth = 0,
         .nodes = .{
@@ -217,39 +218,68 @@ fn buildEnsemble(
 // back to numeric values too for forward compatibility.
 // ---------------------------------------------------------------------------
 
-fn parseUintLikeString(v: std.json.Value) i64 {
+fn parseI64Like(v: std.json.Value) Error!i64 {
     return switch (v) {
-        .string => |s| std.fmt.parseInt(i64, s, 10) catch 0,
+        .string => |s| std.fmt.parseInt(i64, s, 10) catch return Error.MalformedTree,
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
-        else => 0,
+        .float => |f| {
+            if (!std.math.isFinite(f)) return Error.MalformedTree;
+            if (f < @as(f64, @floatFromInt(std.math.minInt(i64))) or
+                f > @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                return Error.MalformedTree;
+            return @intFromFloat(f);
+        },
+        else => Error.MalformedTree,
     };
 }
 
-fn parseFloatLikeString(v: std.json.Value) f64 {
-    return switch (v) {
-        .string => |s| std.fmt.parseFloat(f64, s) catch 0.0,
-        .float => |f| f,
-        .integer => |i| @floatFromInt(i),
-        else => 0.0,
-    };
+fn parseU32Like(v: std.json.Value) Error!u32 {
+    return i64ToU32(try parseI64Like(v));
 }
 
-fn jsonAsI64(v: std.json.Value) i64 {
-    return switch (v) {
-        .integer => |i| i,
-        .float => |f| @intFromFloat(f),
-        .string => |s| std.fmt.parseInt(i64, s, 10) catch 0,
-        else => 0,
-    };
-}
-fn jsonAsF64(v: std.json.Value) f64 {
-    return switch (v) {
+fn parseF64Like(v: std.json.Value) Error!f64 {
+    const out: f64 = switch (v) {
+        .string => |s| std.fmt.parseFloat(f64, s) catch return Error.MalformedTree,
         .float => |f| f,
         .integer => |i| @floatFromInt(i),
-        .string => |s| std.fmt.parseFloat(f64, s) catch 0.0,
-        else => 0.0,
+        else => return Error.MalformedTree,
     };
+    if (!std.math.isFinite(out)) return Error.MalformedTree;
+    return out;
+}
+
+fn parseBaseScore(v: std.json.Value) Error!f64 {
+    if (v == .string) {
+        const s = std.mem.trim(u8, v.string, " \t\r\n");
+        if (std.mem.startsWith(u8, s, "[")) return parseUniformBaseScoreVector(s);
+    }
+    return parseF64Like(v);
+}
+
+fn parseUniformBaseScoreVector(s: []const u8) Error!f64 {
+    if (s.len < 2 or s[0] != '[' or s[s.len - 1] != ']') return Error.MalformedTree;
+    const inner = s[1 .. s.len - 1];
+    var it = std.mem.splitScalar(u8, inner, ',');
+    var first: ?f64 = null;
+    while (it.next()) |raw| {
+        const tok = std.mem.trim(u8, raw, " \t\r\n");
+        if (tok.len == 0) return Error.MalformedTree;
+        const v = std.fmt.parseFloat(f64, tok) catch return Error.MalformedTree;
+        if (!std.math.isFinite(v)) return Error.MalformedTree;
+        if (first) |f| {
+            if (@abs(v - f) > 1e-12) return Error.UnsupportedObjective;
+        } else {
+            first = v;
+        }
+    }
+    return first orelse Error.MalformedTree;
+}
+
+fn jsonAsI64(v: std.json.Value) Error!i64 {
+    return parseI64Like(v);
+}
+fn jsonAsF64(v: std.json.Value) Error!f64 {
+    return parseF64Like(v);
 }
 fn jsonAsBool(v: std.json.Value) bool {
     return switch (v) {
@@ -266,6 +296,29 @@ fn getObject(v: std.json.Value, key: []const u8) ?*std.json.ObjectMap {
     return &child.object;
 }
 
+fn i64ToU32(v: i64) Error!u32 {
+    return std.math.cast(u32, v) orelse Error.MalformedTree;
+}
+
+fn u32ToI32(v: u32) Error!i32 {
+    return std.math.cast(i32, v) orelse Error.MalformedTree;
+}
+
+fn usizeToU32(v: usize) Error!u32 {
+    return std.math.cast(u32, v) orelse Error.MalformedTree;
+}
+
+fn usizeToI32(v: usize) Error!i32 {
+    return std.math.cast(i32, v) orelse Error.MalformedTree;
+}
+
+fn resolveChild(off: usize, local: i64) Error!i32 {
+    if (local < 0) return -1;
+    const off_i64 = std.math.cast(i64, off) orelse return Error.MalformedTree;
+    const global = std.math.add(i64, off_i64, local) catch return Error.MalformedTree;
+    return std.math.cast(i32, global) orelse Error.MalformedTree;
+}
+
 test "objective mapping covers core cases" {
     try std.testing.expectEqual(ir.TaskType.binary_classification, (try mapObjective("binary:logistic", 0)).task);
     try std.testing.expectEqual(ir.TaskType.regression, (try mapObjective("reg:squarederror", 0)).task);
@@ -273,4 +326,20 @@ test "objective mapping covers core cases" {
     try std.testing.expectEqual(ir.TaskType.ranking, (try mapObjective("rank:ndcg", 0)).task);
     try std.testing.expectError(Error.UnsupportedObjective, mapObjective("survival:cox", 0));
     try std.testing.expectError(Error.UnsupportedObjective, mapObjective("multi:softprob", 1));
+}
+
+test "hostile xgboost integer metadata is rejected without narrowing panic" {
+    const bad =
+        \\{"learner":{
+        \\  "learner_model_param":{"num_feature":"4294967296","num_class":"0","base_score":"0.5"},
+        \\  "objective":{"name":"reg:squarederror"},
+        \\  "gradient_booster":{"model":{"trees":[]}}
+        \\}}
+    ;
+    try std.testing.expectError(Error.MalformedTree, parse(std.testing.allocator, bad));
+}
+
+test "xgboost vector base score accepts uniform class bias" {
+    try std.testing.expectApproxEqAbs(@as(f64, 0), try parseBaseScore(.{ .string = "[0E0,0E0,0E0]" }), 1e-12);
+    try std.testing.expectError(Error.UnsupportedObjective, parseBaseScore(.{ .string = "[0,1,0]" }));
 }

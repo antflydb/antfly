@@ -28,9 +28,9 @@
 //!   - LinearRegressor
 //!   - LinearClassifier
 //!
-//! Not yet supported: SVMRegressor / SVMClassifier (the same protobuf
-//! shape works, but the attribute set differs; falls through to
-//! UnsupportedNode and the CLI tells the user to run termite-convert).
+//! Not yet supported: SVMRegressor / SVMClassifier. The same protobuf
+//! shape works, but the attribute set differs; unsupported nodes are
+//! rejected by the converter.
 
 const std = @import("std");
 const ir = @import("../ir.zig");
@@ -149,7 +149,8 @@ fn finishTree(
     for (treeids) |t| if (t > max_tree) {
         max_tree = t;
     };
-    const num_trees: u32 = @intCast(max_tree + 1);
+    if (max_tree < 0) return Error.MalformedModel;
+    const num_trees = try i64PlusOneToU32(max_tree);
 
     var tree_starts = try alloc.alloc(i32, num_trees);
     @memset(tree_starts, -1);
@@ -164,9 +165,9 @@ fn finishTree(
         var i: usize = 0;
         while (i < n) : (i += 1) {
             if (treeids[i] < 0) return Error.MalformedModel;
-            const tt: usize = @intCast(treeids[i]);
+            const tt = try i64ToUsize(treeids[i]);
             if (tt >= num_trees) return Error.MalformedModel;
-            per_tree_map[tt].put(nodeids[i], @intCast(i)) catch return Error.OutOfMemory;
+            per_tree_map[tt].put(nodeids[i], try usizeToI32(i)) catch return Error.OutOfMemory;
         }
     }
 
@@ -192,7 +193,8 @@ fn finishTree(
     {
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const tt: usize = @intCast(treeids[i]);
+            const tt = try i64ToUsize(treeids[i]);
+            if (tt >= num_trees) return Error.MalformedModel;
             const mode = modes[i];
             if (std.mem.eql(u8, mode, "LEAF")) {
                 feature_index[i] = -1;
@@ -200,7 +202,8 @@ fn finishTree(
                 left_child[i] = -1;
                 right_child[i] = -1;
             } else {
-                feature_index[i] = @intCast(featureids[i]);
+                feature_index[i] = try i64ToI32(featureids[i]);
+                if (feature_index[i] < 0) return Error.MalformedModel;
                 // BRANCH_LEQ ("<=") nudged to "<" for engine compatibility.
                 threshold[i] = if (std.mem.eql(u8, mode, "BRANCH_LEQ"))
                     std.math.nextAfter(f64, values[i], std.math.inf(f64))
@@ -230,18 +233,26 @@ fn finishTree(
         const target_weights = bag.floats("target_weights") orelse bag.floats("class_weights");
         if (target_treeids == null or target_nodeids == null or target_ids == null or target_weights == null)
             return Error.MalformedModel;
+        if (target_treeids.?.len != target_weights.?.len or target_nodeids.?.len != target_weights.?.len or
+            target_ids.?.len != target_weights.?.len)
+            return Error.MalformedModel;
         var max_out: i64 = 0;
-        for (target_ids.?) |o| if (o > max_out) {
-            max_out = o;
-        };
-        num_outputs = @intCast(max_out + 1);
+        for (target_ids.?) |o| {
+            if (o < 0) return Error.MalformedModel;
+            if (o > max_out) {
+                max_out = o;
+            }
+        }
+        num_outputs = try i64PlusOneToU32(max_out);
 
         var i: usize = 0;
         while (i < target_weights.?.len) : (i += 1) {
-            const tt: usize = @intCast(target_treeids.?[i]);
+            if (target_treeids.?[i] < 0) return Error.MalformedModel;
+            const tt = try i64ToUsize(target_treeids.?[i]);
+            if (tt >= num_trees) return Error.MalformedModel;
             const local = target_nodeids.?[i];
             const slot = per_tree_map[tt].get(local) orelse return Error.MalformedModel;
-            leaf_value[@intCast(slot)] = target_weights.?[i];
+            leaf_value[try i32ToUsize(slot)] = target_weights.?[i];
         }
     }
 
@@ -296,9 +307,9 @@ fn finishLinear(
 ) Error!Parsed {
     const coefficients = bag.floats("coefficients") orelse return Error.MalformedModel;
     const intercepts = bag.floats("intercepts") orelse return Error.MalformedModel;
-    const num_outputs: u32 = @intCast(intercepts.len);
+    const num_outputs = try usizeToU32(intercepts.len);
     if (num_outputs == 0 or coefficients.len % num_outputs != 0) return Error.MalformedModel;
-    const num_features: u32 = @intCast(coefficients.len / num_outputs);
+    const num_features = try usizeToU32(coefficients.len / num_outputs);
 
     var weights = try alloc.alloc([]const f64, num_outputs);
     var biases = try alloc.alloc(f64, num_outputs);
@@ -345,7 +356,38 @@ fn inferNumFeatures(feature_index: []const i32) u32 {
     for (feature_index) |f| if (f > max_f) {
         max_f = f;
     };
-    return if (max_f < 0) 1 else @intCast(max_f + 1);
+    if (max_f < 0) return 1;
+    const plus_one = std.math.add(i64, @as(i64, max_f), 1) catch return 1;
+    return std.math.cast(u32, plus_one) orelse 1;
+}
+
+fn i64ToU32(v: i64) Error!u32 {
+    return std.math.cast(u32, v) orelse Error.MalformedModel;
+}
+
+fn i64PlusOneToU32(v: i64) Error!u32 {
+    const plus_one = std.math.add(i64, v, 1) catch return Error.MalformedModel;
+    return i64ToU32(plus_one);
+}
+
+fn i64ToUsize(v: i64) Error!usize {
+    return std.math.cast(usize, v) orelse Error.MalformedModel;
+}
+
+fn i64ToI32(v: i64) Error!i32 {
+    return std.math.cast(i32, v) orelse Error.MalformedModel;
+}
+
+fn i32ToUsize(v: i32) Error!usize {
+    return std.math.cast(usize, v) orelse Error.MalformedModel;
+}
+
+fn usizeToU32(v: usize) Error!u32 {
+    return std.math.cast(u32, v) orelse Error.MalformedModel;
+}
+
+fn usizeToI32(v: usize) Error!i32 {
+    return std.math.cast(i32, v) orelse Error.MalformedModel;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +425,8 @@ const ProtoReader = struct {
 
     fn readTag(self: *ProtoReader) error{Truncated}!Tag {
         const v = try self.readVarint();
-        return .{ .field_num = @intCast(v >> 3), .wire_type = @intCast(v & 0x7) };
+        const field_num = std.math.cast(u32, v >> 3) orelse return error.Truncated;
+        return .{ .field_num = field_num, .wire_type = @intCast(v & 0x7) };
     }
 
     fn readFixed32(self: *ProtoReader) error{Truncated}!u32 {
@@ -402,9 +445,10 @@ const ProtoReader = struct {
 
     fn readBytes(self: *ProtoReader) error{Truncated}![]const u8 {
         const len = try self.readVarint();
-        if (self.pos + len > self.buf.len) return error.Truncated;
-        const out = self.buf[self.pos .. self.pos + len];
-        self.pos += @intCast(len);
+        const n = std.math.cast(usize, len) orelse return error.Truncated;
+        if (n > self.buf.len - self.pos) return error.Truncated;
+        const out = self.buf[self.pos .. self.pos + n];
+        self.pos += n;
         return out;
     }
 

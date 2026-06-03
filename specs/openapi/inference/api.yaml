@@ -723,7 +723,7 @@ paths:
       description: |
         Run a tabular predictor (tree ensemble, linear, or SVM) on a batch of
         feature vectors. Models are loaded from `<models_dir>/predictors/<name>/`
-        and identified by name. See `/models` for the list of available
+        and identified by name. Use the model catalog for the list of available
         predictors and their feature schemas.
       operationId: predict
       requestBody:
@@ -757,98 +757,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-  /predict/upload:
-    post:
-      summary: Upload a tabular_model.json IR file
-      description: |
-        Persist a validated `tabular_model.json` to the predictors directory
-        and register it for immediate use. The IR is validated server-side
-        before any filesystem write.
-      operationId: uploadPredictor
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required: [file, name]
-              properties:
-                file:
-                  type: string
-                  format: binary
-                  description: The tabular_model.json contents
-                name:
-                  type: string
-                  description: |
-                    Model name. Alphanumeric + `-`/`_` only. Stored under
-                    `<models_dir>/predictors/<name>/`.
-      responses:
-        '201':
-          description: Predictor registered
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PredictorInfo'
-        '400':
-          description: Invalid IR or unsafe name
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '413':
-          description: Upload exceeds 50MB limit
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-  /predict/convert:
-    post:
-      summary: Convert a native model and register it
-      description: |
-        Convert a native XGBoost / LightGBM / ONNX-ML model to the IR using
-        the built-in Zig converter, then persist + register it. sklearn and
-        CatBoost are not supported here — use `termite-convert` from the
-        termite repository to produce a `tabular_model.json` and upload it
-        through `/predict/upload`.
-      operationId: convertPredictor
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required: [file, name]
-              properties:
-                file:
-                  type: string
-                  format: binary
-                name:
-                  type: string
-                framework:
-                  type: string
-                  enum: [auto, xgboost, lightgbm, onnx]
-                  default: auto
-      responses:
-        '201':
-          description: Predictor converted and registered
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PredictorInfo'
-        '400':
-          description: Conversion or validation failed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '415':
-          description: |
-            Unsupported source framework. sklearn / CatBoost: install
-            `termite-convert` and produce `tabular_model.json` first.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
 components:
   schemas:
     Error:
@@ -865,7 +773,7 @@ components:
       properties:
         model:
           type: string
-          description: Predictor name. Use `/models` to list available predictors.
+          description: Predictor name from the model catalog.
         input:
           type: array
           description: Batch of feature vectors. Max 10000 rows.
@@ -881,8 +789,7 @@ components:
         model:
           type: string
         task:
-          type: string
-          enum: [regression, binary_classification, multiclass, ranking]
+          $ref: '#/components/schemas/PredictorTask'
         predictions:
           type: array
           description: |
@@ -893,25 +800,10 @@ components:
             items:
               type: number
               format: float
-    PredictorInfo:
-      type: object
-      required: [name, task, num_features]
-      properties:
-        name:
-          type: string
-        task:
-          type: string
-          enum: [regression, binary_classification, multiclass, ranking]
-        num_features:
-          type: integer
-        num_outputs:
-          type: integer
-        feature_names:
-          type: array
-          items:
-            type: string
-        source_framework:
-          type: string
+    PredictorTask:
+      type: string
+      description: Task type for tabular predictors.
+      enum: [regression, binary_classification, multiclass, ranking]
     TextContentPart:
       $ref: '../shared/generating.yaml#/components/schemas/TextContentPart'
     ImageURL:

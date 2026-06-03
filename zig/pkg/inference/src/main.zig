@@ -226,9 +226,14 @@ fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
 fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, args: []const []const u8) !void {
     if (args.len == 0) {
         print("usage: {s} pull <owner/name|hf:owner/name>[:gguf|:gguf:Q4_K_M|:mmproj] [--token <hf-token>] [--models-dir <dir>] [--tasks <task1,task2>] [--capabilities <cap1,cap2>]\n", .{usage_name});
+        print("       {s} pull <https-url-to-tabular_model.json> --name <predictor-name> [--models-dir <dir>] [--token <bearer-token>]\n", .{usage_name});
         return;
     }
     const ref = args[0];
+    if (inference.tabular.cli.isHttpUrl(ref)) {
+        try inference.tabular.cli.pullMain(allocator, io, args, defaultModelsDir(allocator));
+        return;
+    }
 
     // Parse optional --token flag
     var token: ?[]const u8 = null;
@@ -299,7 +304,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  finetune  Run fine-tuning recipes, datasets, adapters, train/eval, and workflows
         \\  smoke     Run a native GGUF/SafeTensors smoke test
         \\  list      List available models
-        \\  pull      Download a model from HuggingFace Hub
+        \\  pull      Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL
         \\  convert   Convert a native ML model (XGBoost/LightGBM/ONNX) to the antfly tabular IR
         \\
         \\Run options:
@@ -309,6 +314,7 @@ fn printUsage(usage_name: []const u8) void {
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)
+        \\  --name <name>     Local predictor name when pulling a tabular model URL
         \\  --tasks <list>    Comma-separated task hints for the pulled model
         \\  --capabilities <list> Comma-separated capability hints for the pulled model
         \\  --models-dir <dir>    Models directory (default: ~/.antfly/inference/models)

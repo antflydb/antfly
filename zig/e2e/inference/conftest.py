@@ -43,6 +43,7 @@ import requests
 from .models import bootstrap_models_for_listing, inference_command, maybe_pull_missing_model, models_dir
 
 API_PREFIX = "/ai/v1"
+ML_API_PREFIX = "/ml/v1"
 
 
 def env_first(*names: str) -> str | None:
@@ -56,8 +57,12 @@ def env_first(*names: str) -> str | None:
 def api_path(path: str) -> str:
     """Resolve bare API paths against the current antfly prefix."""
 
+    if path.startswith(ML_API_PREFIX + "/") or path == ML_API_PREFIX:
+        return path
     if path.startswith(API_PREFIX + "/") or path == API_PREFIX:
         return path
+    if path == "/predict" or path.startswith("/predict/"):
+        return ML_API_PREFIX + path
     if path.startswith("/"):
         return API_PREFIX + path
     return API_PREFIX + "/" + path

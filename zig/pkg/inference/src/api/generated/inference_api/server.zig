@@ -88,8 +88,6 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/models", .operation_id = "listModels" },
     .{ .method = "POST", .path = "/embeddings", .operation_id = "createEmbedding" },
     .{ .method = "POST", .path = "/predict", .operation_id = "predict" },
-    .{ .method = "POST", .path = "/predict/upload", .operation_id = "uploadPredictor" },
-    .{ .method = "POST", .path = "/predict/convert", .operation_id = "convertPredictor" },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -116,8 +114,6 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "listModels")) @compileError("ServerRouter: Impl missing required method 'listModels'");
         if (!@hasDecl(Impl, "createEmbedding")) @compileError("ServerRouter: Impl missing required method 'createEmbedding'");
         if (!@hasDecl(Impl, "predict")) @compileError("ServerRouter: Impl missing required method 'predict'");
-        if (!@hasDecl(Impl, "uploadPredictor")) @compileError("ServerRouter: Impl missing required method 'uploadPredictor'");
-        if (!@hasDecl(Impl, "convertPredictor")) @compileError("ServerRouter: Impl missing required method 'convertPredictor'");
     }
 
     return struct {
@@ -145,8 +141,6 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/models", listModels);
             try server.post("/embeddings", createEmbedding);
             try server.post("/predict", predict);
-            try server.post("/predict/upload", uploadPredictor);
-            try server.post("/predict/convert", convertPredictor);
         }
 
         /// Create embeddings (alias of `/embeddings`)
@@ -233,25 +227,11 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.createEmbedding(ctx);
         }
 
-        /// Run a tabular predictor
+        /// Run a traditional ML predictor
         /// POST /predict
         fn predict(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             return impl.predict(ctx);
-        }
-
-        /// Upload a tabular_model.json IR file
-        /// POST /predict/upload
-        fn uploadPredictor(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.uploadPredictor(ctx);
-        }
-
-        /// Convert a native model and register it
-        /// POST /predict/convert
-        fn convertPredictor(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.convertPredictor(ctx);
         }
     };
 }
@@ -270,3 +250,4 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn extract(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listModels(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createEmbedding(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn predict(self: *Impl, ctx: *httpx.Context) !httpx.Response

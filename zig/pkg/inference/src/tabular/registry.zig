@@ -60,6 +60,20 @@ pub const Error = error{
     LoadFailed,
 };
 
+/// Conservative model-name allowlist: alphanumeric, hyphen, underscore.
+/// Blocks path separators, traversal, leading dots, empty names, and names
+/// too large to use comfortably as local directory names.
+pub fn isSafeName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    if (name[0] == '.') return false;
+    for (name) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '-' or c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 pub const Registry = struct {
     alloc: std.mem.Allocator,
     /// Spin mutex (std.Thread.Mutex was removed in Zig 0.16). Held only
@@ -272,4 +286,15 @@ pub fn freeInfoStrings(alloc: std.mem.Allocator, info: ModelInfo) void {
     if (info.source_framework.len > 0) alloc.free(info.source_framework);
     for (info.feature_names) |fn_str| if (fn_str.len > 0) alloc.free(fn_str);
     if (info.feature_names.len > 0) alloc.free(info.feature_names);
+}
+
+test "isSafeName accepts simple names and rejects traversal" {
+    try std.testing.expect(isSafeName("iris-classifier"));
+    try std.testing.expect(isSafeName("Model_42"));
+    try std.testing.expect(!isSafeName(""));
+    try std.testing.expect(!isSafeName("local/iris-classifier"));
+    try std.testing.expect(!isSafeName("../etc/passwd"));
+    try std.testing.expect(!isSafeName("a/b"));
+    try std.testing.expect(!isSafeName(".hidden"));
+    try std.testing.expect(!isSafeName("a b"));
 }

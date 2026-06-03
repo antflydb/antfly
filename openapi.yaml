@@ -3,7 +3,7 @@ info:
   title: Antfly Public API
   version: v1alpha1
   description: Joined public contract for the Antfly server. Antfly APIs are served under `/db/v1`, auth
-    APIs under `/auth/v1`, and inference APIs under `/ai/v1`.
+    APIs under `/auth/v1`, inference APIs under `/ai/v1`, and ML prediction APIs under `/ml/v1`.
 servers:
   - url: /
 tags:
@@ -5583,6 +5583,49 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ml/v1/predict:
+    post:
+      summary: Run a traditional ML predictor
+      description: >
+        Run a tabular predictor (tree ensemble, linear, or SVM) on a batch of
+
+        feature vectors. Models are loaded from `<models_dir>/predictors/<name>/`
+
+        and identified by name. Use the model catalog for the list of available
+
+        predictors and their feature schemas.
+      operationId: predict
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferencePredictRequest'
+      responses:
+        '200':
+          description: Predictions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferencePredictResponse'
+        '400':
+          description: Invalid request (malformed body, feature-count mismatch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '404':
+          description: Predictor not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Batch too large (> 10000 rows)
           content:
             application/json:
               schema:
@@ -14708,6 +14751,53 @@ components:
         error:
           type: string
           description: Error message
+    InferencePredictRequest:
+      type: object
+      required:
+        - model
+        - input
+      properties:
+        model:
+          type: string
+          description: Predictor name from the model catalog.
+        input:
+          type: array
+          description: Batch of feature vectors. Max 10000 rows.
+          items:
+            type: array
+            items:
+              type: number
+              format: float
+    InferencePredictResponse:
+      type: object
+      required:
+        - model
+        - task
+        - predictions
+      properties:
+        model:
+          type: string
+        task:
+          $ref: '#/components/schemas/InferencePredictorTask'
+        predictions:
+          type: array
+          description: >
+            Per-row prediction arrays. Length equals the model's `num_outputs`
+
+            (1 for regression / binary, `num_classes` for multiclass).
+          items:
+            type: array
+            items:
+              type: number
+              format: float
+    InferencePredictorTask:
+      type: string
+      description: Task type for tabular predictors.
+      enum:
+        - regression
+        - binary_classification
+        - multiclass
+        - ranking
     InferenceTextContentPart:
       $ref: '#/components/schemas/TextContentPart'
     InferenceImageURL:

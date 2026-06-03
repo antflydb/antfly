@@ -65,10 +65,10 @@ pub fn parse(parent: std.mem.Allocator, bytes: []const u8) Error!Parsed {
     // `max_feature_idx` is 0-based; num_features = max_feature_idx + 1.
     const mfi_str = headerValue(header, "max_feature_idx") orelse "-1";
     const mfi: i64 = std.fmt.parseInt(i64, firstToken(mfi_str), 10) catch return Error.NotLightgbm;
-    const num_features_real: u32 = if (mfi < 0) 1 else @intCast(mfi + 1);
+    const num_features_real: u32 = if (mfi < 0) 1 else try i64PlusOneToU32(mfi);
     const num_class_str = headerValue(header, "num_class") orelse "1";
     const num_class_raw: i64 = std.fmt.parseInt(i64, firstToken(num_class_str), 10) catch 1;
-    const num_class: u32 = @intCast(num_class_raw);
+    const num_class = try i64ToU32(num_class_raw);
 
     const map = try mapObjective(objective, num_class);
 
@@ -105,7 +105,7 @@ pub fn parse(parent: std.mem.Allocator, bytes: []const u8) Error!Parsed {
 
     var off: usize = 0;
     for (trees.items, 0..) |chunk, ti| {
-        starts[ti] = @intCast(off);
+        starts[ti] = try usizeToI32(off);
         const num_leaves_str = treeValue(chunk, "num_leaves") orelse return Error.MalformedTree;
         const num_leaves = std.fmt.parseInt(usize, num_leaves_str, 10) catch return Error.MalformedTree;
 
@@ -127,11 +127,12 @@ pub fn parse(parent: std.mem.Allocator, bytes: []const u8) Error!Parsed {
         // Layout: internal nodes [0..num_internal), then leaves [num_internal..total_tree).
         var i: usize = 0;
         while (i < num_internal) : (i += 1) {
+            if (split_feat[i] < 0 or @as(u32, @intCast(split_feat[i])) >= num_features_real) return Error.MalformedTree;
             feat[off + i] = split_feat[i];
             thr[off + i] = threshold[i];
             dl[off + i] = (decision[i] & 0x2) != 0; // bit 1 = "default left"
-            lc[off + i] = resolveChild(left_child[i], off, num_internal);
-            rc[off + i] = resolveChild(right_child[i], off, num_internal);
+            lc[off + i] = try resolveChild(left_child[i], off, num_internal, num_leaves);
+            rc[off + i] = try resolveChild(right_child[i], off, num_internal, num_leaves);
             lv[off + i] = 0;
         }
         var j: usize = 0;
@@ -151,7 +152,7 @@ pub fn parse(parent: std.mem.Allocator, bytes: []const u8) Error!Parsed {
     te_ptr.* = .{
         .objective = try alloc.dupe(u8, objective),
         .base_score = 0,
-        .num_trees = @intCast(trees.items.len),
+        .num_trees = try usizeToU32(trees.items.len),
         .num_features = num_features_real,
         .max_depth = 0,
         .nodes = .{
@@ -207,13 +208,38 @@ fn mapObjective(name: []const u8, num_class: u32) Error!ObjectiveMap {
     return Error.UnsupportedObjective;
 }
 
-fn resolveChild(value: i32, off: usize, num_internal: usize) i32 {
+fn resolveChild(value: i32, off: usize, num_internal: usize, num_leaves: usize) Error!i32 {
     if (value < 0) {
         // LightGBM encodes leaf-references as ~leaf_idx (i.e. -leaf_idx - 1).
         const leaf_idx: usize = @intCast(-(value + 1));
-        return @intCast(off + num_internal + leaf_idx);
+        if (leaf_idx >= num_leaves) return Error.MalformedTree;
+        return checkedOffset(off, num_internal + leaf_idx);
     }
-    return @intCast(off + @as(usize, @intCast(value)));
+    const internal_idx: usize = @intCast(value);
+    if (internal_idx >= num_internal) return Error.MalformedTree;
+    return checkedOffset(off, internal_idx);
+}
+
+fn checkedOffset(off: usize, local: usize) Error!i32 {
+    const global = std.math.add(usize, off, local) catch return Error.MalformedTree;
+    return std.math.cast(i32, global) orelse Error.MalformedTree;
+}
+
+fn i64ToU32(v: i64) Error!u32 {
+    return std.math.cast(u32, v) orelse Error.MalformedTree;
+}
+
+fn i64PlusOneToU32(v: i64) Error!u32 {
+    const plus_one = std.math.add(i64, v, 1) catch return Error.MalformedTree;
+    return i64ToU32(plus_one);
+}
+
+fn usizeToU32(v: usize) Error!u32 {
+    return std.math.cast(u32, v) orelse Error.MalformedTree;
+}
+
+fn usizeToI32(v: usize) Error!i32 {
+    return std.math.cast(i32, v) orelse Error.MalformedTree;
 }
 
 fn headerValue(header: []const u8, key: []const u8) ?[]const u8 {
@@ -273,4 +299,9 @@ test "objective mapping" {
     try std.testing.expectEqual(ir.TaskType.regression, (try mapObjective("regression", 0)).task);
     try std.testing.expectEqual(ir.TaskType.multiclass, (try mapObjective("multiclass", 3)).task);
     try std.testing.expectEqual(ir.TaskType.ranking, (try mapObjective("lambdarank", 0)).task);
+}
+
+test "resolveChild rejects malformed child references without narrowing panic" {
+    try std.testing.expectError(Error.MalformedTree, resolveChild(2, 0, 2, 1));
+    try std.testing.expectError(Error.MalformedTree, resolveChild(-3, 0, 1, 1));
 }

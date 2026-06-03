@@ -12,11 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Auto-detecting dispatch front-end for the framework parsers.
-//! sklearn / CatBoost remain Python-only because their on-disk formats are
-//! pickle / proprietary binary; for those the dispatch returns a clear
-//! `UnsupportedSource` and the caller (HTTP / CLI) tells the user to run
-//! termite-convert.
+//! Auto-detecting dispatch front-end for the native framework parsers.
 
 const std = @import("std");
 const ir = @import("../ir.zig");
@@ -30,14 +26,11 @@ pub const Framework = enum {
     xgboost,
     lightgbm,
     onnx_ml,
-    sklearn,
-    catboost,
 };
 
 pub const Error = error{
     OutOfMemory,
     UnknownFormat,
-    UnsupportedSource,
     XgboostFailed,
     LightgbmFailed,
     OnnxFailed,
@@ -70,7 +63,6 @@ pub fn convert(parent: std.mem.Allocator, bytes: []const u8, hint: Framework) Er
             const p = onnx_ml.parse(parent, bytes) catch return Error.OnnxFailed;
             return .{ .arena = p.arena, .model = p.model, .framework = .onnx_ml };
         },
-        .sklearn, .catboost => return Error.UnsupportedSource,
         .auto => unreachable,
     }
 }
@@ -117,8 +109,4 @@ test "detect picks lightgbm text" {
 test "detect picks onnx by proto magic" {
     const s = &[_]u8{ 0x08, 0x07 };
     try std.testing.expectEqual(Framework.onnx_ml, try detect(s));
-}
-
-test "sklearn pickle rejected with clear error" {
-    try std.testing.expectError(Error.UnsupportedSource, convert(std.testing.allocator, "\x80\x04...", .sklearn));
 }

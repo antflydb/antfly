@@ -2,7 +2,7 @@
   "schema_version": 1,
   "metadata": {
     "name": "iris-classifier",
-    "source_framework": "sklearn",
+    "source_framework": "antfly_builtin",
     "task": "multiclass",
     "num_features": 4,
     "num_classes": 3,
