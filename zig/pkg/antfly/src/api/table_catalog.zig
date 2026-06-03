@@ -133,6 +133,13 @@ pub fn resolveGroupForKey(
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
     if (ranges.len == 0) return null;
+    return resolveGroupForKeyFromRanges(ranges, key);
+}
+
+pub fn resolveGroupForKeyFromRanges(
+    ranges: []const *const metadata_table_manager.RangeRecord,
+    key: []const u8,
+) ?u64 {
     for (ranges) |range| {
         if (rangeContainsKey(range.*, key)) return range.group_id;
     }

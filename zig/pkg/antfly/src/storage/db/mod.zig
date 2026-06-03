@@ -63,6 +63,7 @@ pub const apply_rw_lock = @import("apply_rw_lock.zig");
 pub const ChangeJournal = @import("derived/change_journal.zig").Journal;
 pub const DerivedLog = @import("derived/derived_log.zig").DerivedLog;
 pub const IndexManager = @import("catalog/index_manager.zig").IndexManager;
+pub const TextMemoryAttributionStats = @import("catalog/index_manager.zig").TextMemoryAttributionStats;
 pub const DenseSplitHandoff = @import("catalog/index_manager.zig").DenseSplitHandoff;
 pub const TextSplitHandoff = @import("catalog/index_manager.zig").TextSplitHandoff;
 pub const SparseSplitHandoff = @import("catalog/index_manager.zig").SparseSplitHandoff;

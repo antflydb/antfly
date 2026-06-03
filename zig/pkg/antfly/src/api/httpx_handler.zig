@@ -203,9 +203,15 @@ pub const AntflyApiHandler = struct {
                 return error.UnsupportedMethod;
             },
         };
+        const trusted_principal_headers: []const http_common.RequestHeader = if (ctx.header(http_server_mod.trusted_principal_header)) |trusted_principal| blk: {
+            const headers = try ctx.allocator.alloc(http_common.RequestHeader, 1);
+            headers[0] = .{ .name = http_server_mod.trusted_principal_header, .value = trusted_principal };
+            break :blk headers;
+        } else &.{};
         return .{
             .method = method,
             .uri = ctx.request.uri.raw,
+            .headers = trusted_principal_headers,
             .authorization = ctx.header("authorization"),
             .content_type = ctx.header("content-type"),
             .body = body_data,
@@ -217,9 +223,11 @@ pub const AntflyApiHandler = struct {
     // ---------------------------------------------------------------
 
     fn authenticate(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
-        if (!self.api_server.cfg.auth_enabled) return null;
-        const auth_header = ctx.header("authorization");
-        return self.api_server.authenticateRequest(auth_header) catch |err| switch (err) {
+        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null) return null;
+        return self.api_server.authenticateRequest(.{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }) catch |err| switch (err) {
             error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => {
                 return null;
             },
@@ -228,7 +236,7 @@ pub const AntflyApiHandler = struct {
     }
 
     fn requireAuth(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
-        if (!self.api_server.cfg.auth_enabled) return null;
+        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null) return null;
         const identity = (try self.authenticate(ctx)) orelse {
             return error.Unauthorized;
         };
@@ -266,11 +274,14 @@ pub const AntflyApiHandler = struct {
 
     fn authorizeRequest(self: *AntflyApiHandler, ctx: *httpx.Context, identity: *?AuthenticatedIdentity) !?httpx.Response {
         identity.* = null;
-        if (!self.api_server.cfg.auth_enabled) return null;
-        if (self.api_server.cfg.user_manager == null) return null;
+        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null) return null;
+        if (self.api_server.cfg.user_manager == null and self.api_server.cfg.trusted_principal_secret == null) return null;
 
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
-        identity.* = self.api_server.authenticateRequest(ctx.header("authorization")) catch |err| switch (err) {
+        identity.* = self.api_server.authenticateRequest(.{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }) catch |err| switch (err) {
             error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => {
                 return try unauthorizedResponse(ctx);
             },
@@ -1893,7 +1904,7 @@ pub const AntflyApiHandler = struct {
         const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| {
-            if (!(try self.api_server.docMatchesRowFilter(source, table_name, decoded_key, value))) {
+            if (!(try self.api_server.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
                 _ = ctx.status(404);
                 return ctx.text("not found");
             }

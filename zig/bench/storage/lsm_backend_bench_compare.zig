@@ -36,12 +36,24 @@ const Record = struct {
     storage_file_size: u64,
     read_point_gets: u64,
     read_run_probes: u64,
-    read_bloom_negatives: u64,
+    read_point_run_prechecks: u64 = 0,
+    read_point_run_precheck_survivors: u64 = 0,
+    read_point_run_survivor_reads: u64 = 0,
+    read_point_run_survivor_hits: u64 = 0,
+    read_point_run_survivor_misses: u64 = 0,
+    read_point_run_survivor_tombstones: u64 = 0,
+    read_bloom_negatives: u64 = 0,
+    read_prefix_bloom_negatives: u64 = 0,
+    read_block_prefix_bloom_negatives: u64 = 0,
     read_mutable_hits: u64,
     read_l0_hits: u64,
     read_level_hits: u64,
     read_cursor_block_loads: u64 = 0,
     read_cursor_block_reuses: u64 = 0,
+    read_cursor_value_borrows: u64 = 0,
+    read_cursor_value_copies: u64 = 0,
+    read_point_value_borrows: u64 = 0,
+    read_point_value_copies: u64 = 0,
     read_table_entry_parses: u64 = 0,
     read_table_entry_parse_ns: u64 = 0,
     read_table_index_loads: u64 = 0,
@@ -104,9 +116,21 @@ const GroupAgg = struct {
     storage_read_trailer: MetricSeries = .{},
     storage_file_size: MetricSeries = .{},
     read_run_probes: MetricSeries = .{},
+    read_point_run_prechecks: MetricSeries = .{},
+    read_point_run_precheck_survivors: MetricSeries = .{},
+    read_point_run_survivor_reads: MetricSeries = .{},
+    read_point_run_survivor_hits: MetricSeries = .{},
+    read_point_run_survivor_misses: MetricSeries = .{},
+    read_point_run_survivor_tombstones: MetricSeries = .{},
     read_bloom_negatives: MetricSeries = .{},
+    read_prefix_bloom_negatives: MetricSeries = .{},
+    read_block_prefix_bloom_negatives: MetricSeries = .{},
     read_cursor_block_loads: MetricSeries = .{},
     read_cursor_block_reuses: MetricSeries = .{},
+    read_cursor_value_borrows: MetricSeries = .{},
+    read_cursor_value_copies: MetricSeries = .{},
+    read_point_value_borrows: MetricSeries = .{},
+    read_point_value_copies: MetricSeries = .{},
     read_table_entry_parses: MetricSeries = .{},
     read_table_entry_parse_ns: MetricSeries = .{},
     read_table_index_loads: MetricSeries = .{},
@@ -141,9 +165,21 @@ const GroupAgg = struct {
         self.storage_read_trailer.deinit(allocator);
         self.storage_file_size.deinit(allocator);
         self.read_run_probes.deinit(allocator);
+        self.read_point_run_prechecks.deinit(allocator);
+        self.read_point_run_precheck_survivors.deinit(allocator);
+        self.read_point_run_survivor_reads.deinit(allocator);
+        self.read_point_run_survivor_hits.deinit(allocator);
+        self.read_point_run_survivor_misses.deinit(allocator);
+        self.read_point_run_survivor_tombstones.deinit(allocator);
         self.read_bloom_negatives.deinit(allocator);
+        self.read_prefix_bloom_negatives.deinit(allocator);
+        self.read_block_prefix_bloom_negatives.deinit(allocator);
         self.read_cursor_block_loads.deinit(allocator);
         self.read_cursor_block_reuses.deinit(allocator);
+        self.read_cursor_value_borrows.deinit(allocator);
+        self.read_cursor_value_copies.deinit(allocator);
+        self.read_point_value_borrows.deinit(allocator);
+        self.read_point_value_copies.deinit(allocator);
         self.read_table_entry_parses.deinit(allocator);
         self.read_table_entry_parse_ns.deinit(allocator);
         self.read_table_index_loads.deinit(allocator);
@@ -172,9 +208,21 @@ const GroupAgg = struct {
         try self.storage_read_trailer.append(allocator, @floatFromInt(record.storage_read_trailer));
         try self.storage_file_size.append(allocator, @floatFromInt(record.storage_file_size));
         try self.read_run_probes.append(allocator, @floatFromInt(record.read_run_probes));
+        try self.read_point_run_prechecks.append(allocator, @floatFromInt(record.read_point_run_prechecks));
+        try self.read_point_run_precheck_survivors.append(allocator, @floatFromInt(record.read_point_run_precheck_survivors));
+        try self.read_point_run_survivor_reads.append(allocator, @floatFromInt(record.read_point_run_survivor_reads));
+        try self.read_point_run_survivor_hits.append(allocator, @floatFromInt(record.read_point_run_survivor_hits));
+        try self.read_point_run_survivor_misses.append(allocator, @floatFromInt(record.read_point_run_survivor_misses));
+        try self.read_point_run_survivor_tombstones.append(allocator, @floatFromInt(record.read_point_run_survivor_tombstones));
         try self.read_bloom_negatives.append(allocator, @floatFromInt(record.read_bloom_negatives));
+        try self.read_prefix_bloom_negatives.append(allocator, @floatFromInt(record.read_prefix_bloom_negatives));
+        try self.read_block_prefix_bloom_negatives.append(allocator, @floatFromInt(record.read_block_prefix_bloom_negatives));
         try self.read_cursor_block_loads.append(allocator, @floatFromInt(record.read_cursor_block_loads));
         try self.read_cursor_block_reuses.append(allocator, @floatFromInt(record.read_cursor_block_reuses));
+        try self.read_cursor_value_borrows.append(allocator, @floatFromInt(record.read_cursor_value_borrows));
+        try self.read_cursor_value_copies.append(allocator, @floatFromInt(record.read_cursor_value_copies));
+        try self.read_point_value_borrows.append(allocator, @floatFromInt(record.read_point_value_borrows));
+        try self.read_point_value_copies.append(allocator, @floatFromInt(record.read_point_value_copies));
         try self.read_table_entry_parses.append(allocator, @floatFromInt(record.read_table_entry_parses));
         try self.read_table_entry_parse_ns.append(allocator, @floatFromInt(record.read_table_entry_parse_ns));
         try self.read_table_index_loads.append(allocator, @floatFromInt(record.read_table_index_loads));
@@ -345,12 +393,36 @@ fn printComparison(
     const after_size = try after.storage_file_size.median(allocator);
     const before_probes = try before.read_run_probes.median(allocator);
     const after_probes = try after.read_run_probes.median(allocator);
+    const before_prechecks = try before.read_point_run_prechecks.median(allocator);
+    const after_prechecks = try after.read_point_run_prechecks.median(allocator);
+    const before_precheck_survivors = try before.read_point_run_precheck_survivors.median(allocator);
+    const after_precheck_survivors = try after.read_point_run_precheck_survivors.median(allocator);
+    const before_survivor_reads = try before.read_point_run_survivor_reads.median(allocator);
+    const after_survivor_reads = try after.read_point_run_survivor_reads.median(allocator);
+    const before_survivor_hits = try before.read_point_run_survivor_hits.median(allocator);
+    const after_survivor_hits = try after.read_point_run_survivor_hits.median(allocator);
+    const before_survivor_misses = try before.read_point_run_survivor_misses.median(allocator);
+    const after_survivor_misses = try after.read_point_run_survivor_misses.median(allocator);
+    const before_survivor_tombstones = try before.read_point_run_survivor_tombstones.median(allocator);
+    const after_survivor_tombstones = try after.read_point_run_survivor_tombstones.median(allocator);
     const before_bloom = try before.read_bloom_negatives.median(allocator);
     const after_bloom = try after.read_bloom_negatives.median(allocator);
+    const before_prefix_bloom = try before.read_prefix_bloom_negatives.median(allocator);
+    const after_prefix_bloom = try after.read_prefix_bloom_negatives.median(allocator);
+    const before_block_prefix_bloom = try before.read_block_prefix_bloom_negatives.median(allocator);
+    const after_block_prefix_bloom = try after.read_block_prefix_bloom_negatives.median(allocator);
     const before_cursor_loads = try before.read_cursor_block_loads.median(allocator);
     const after_cursor_loads = try after.read_cursor_block_loads.median(allocator);
     const before_cursor_reuses = try before.read_cursor_block_reuses.median(allocator);
     const after_cursor_reuses = try after.read_cursor_block_reuses.median(allocator);
+    const before_cursor_borrows = try before.read_cursor_value_borrows.median(allocator);
+    const after_cursor_borrows = try after.read_cursor_value_borrows.median(allocator);
+    const before_cursor_copies = try before.read_cursor_value_copies.median(allocator);
+    const after_cursor_copies = try after.read_cursor_value_copies.median(allocator);
+    const before_point_borrows = try before.read_point_value_borrows.median(allocator);
+    const after_point_borrows = try after.read_point_value_borrows.median(allocator);
+    const before_point_copies = try before.read_point_value_copies.median(allocator);
+    const after_point_copies = try after.read_point_value_copies.median(allocator);
     const before_table_parses = try before.read_table_entry_parses.median(allocator);
     const after_table_parses = try after.read_table_entry_parses.median(allocator);
     const before_table_blocks = try before.read_table_block_loads.median(allocator);
@@ -406,6 +478,37 @@ fn printComparison(
     try writePercentDelta(writer, after_probes, before_probes);
     try writer.print(")  bloom_neg {d:.0} -> {d:.0} (", .{ before_bloom, after_bloom });
     try writePercentDelta(writer, after_bloom, before_bloom);
+    if (before_prefix_bloom > 0 or after_prefix_bloom > 0 or before_block_prefix_bloom > 0 or after_block_prefix_bloom > 0) {
+        try writer.print(")  prefix/block_prefix_neg {d:.0}/{d:.0} -> {d:.0}/{d:.0} (", .{
+            before_prefix_bloom,
+            before_block_prefix_bloom,
+            after_prefix_bloom,
+            after_block_prefix_bloom,
+        });
+        try writePercentDelta(writer, after_prefix_bloom + after_block_prefix_bloom, before_prefix_bloom + before_block_prefix_bloom);
+    }
+    if (before_prechecks > 0 or after_prechecks > 0 or before_precheck_survivors > 0 or after_precheck_survivors > 0) {
+        try writer.print(")  precheck/survive {d:.0}/{d:.0} -> {d:.0}/{d:.0} (", .{
+            before_prechecks,
+            before_precheck_survivors,
+            after_prechecks,
+            after_precheck_survivors,
+        });
+        try writePercentDelta(writer, after_precheck_survivors, before_precheck_survivors);
+    }
+    if (before_survivor_reads > 0 or after_survivor_reads > 0 or before_survivor_hits > 0 or after_survivor_hits > 0 or before_survivor_misses > 0 or after_survivor_misses > 0 or before_survivor_tombstones > 0 or after_survivor_tombstones > 0) {
+        try writer.print(")  survivor read/hit/miss/tomb {d:.0}/{d:.0}/{d:.0}/{d:.0} -> {d:.0}/{d:.0}/{d:.0}/{d:.0} (", .{
+            before_survivor_reads,
+            before_survivor_hits,
+            before_survivor_misses,
+            before_survivor_tombstones,
+            after_survivor_reads,
+            after_survivor_hits,
+            after_survivor_misses,
+            after_survivor_tombstones,
+        });
+        try writePercentDelta(writer, after_survivor_reads, before_survivor_reads);
+    }
     try writer.print(")  cursor_loads {d:.0} -> {d:.0} (", .{ before_cursor_loads, after_cursor_loads });
     try writePercentDelta(writer, after_cursor_loads, before_cursor_loads);
     try writer.print(")  cursor_reuses {d:.0} -> {d:.0} (", .{ before_cursor_reuses, after_cursor_reuses });
@@ -444,6 +547,19 @@ fn printComparison(
             before_local_block_misses,
             after_local_block_hits,
             after_local_block_misses,
+        });
+    }
+
+    if (before_cursor_borrows > 0 or after_cursor_borrows > 0 or before_cursor_copies > 0 or after_cursor_copies > 0 or before_point_borrows > 0 or after_point_borrows > 0 or before_point_copies > 0 or after_point_copies > 0) {
+        try writer.print("  cursor value borrow/copy {d:.0}/{d:.0} -> {d:.0}/{d:.0}  point value borrow/copy {d:.0}/{d:.0} -> {d:.0}/{d:.0}\n", .{
+            before_cursor_borrows,
+            before_cursor_copies,
+            after_cursor_borrows,
+            after_cursor_copies,
+            before_point_borrows,
+            before_point_copies,
+            after_point_borrows,
+            after_point_copies,
         });
     }
 

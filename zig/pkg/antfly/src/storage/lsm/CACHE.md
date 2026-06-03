@@ -55,7 +55,9 @@ The current cache no longer treats a run table as one opaque cached value. Share
 
 - `run_table_raw`: the raw table bytes
 - `run_table_index`: decoded entry offsets plus the bloom filter bytes
-- `run_table_block`: cached entry-data windows for point-read hot paths
+- `run_table_block`: decoded entry-data windows for iterator/block-window paths
+- `run_table_physical_block`: compressed physical block payloads used by
+  prefix-compressed point reads that direct-search restart windows
 - `run_state`: decoded state for state-based callers
 
 Backend-local `CachedRunTable` values now pin raw and index handles together and expose a lightweight borrowed table view. This keeps the ownership model simple while letting index/filter metadata stay hot independently of whole-table decode churn.

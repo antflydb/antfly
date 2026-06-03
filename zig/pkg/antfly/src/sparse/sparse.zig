@@ -1179,6 +1179,13 @@ pub const SparseIndex = struct {
                 .lsm => |*handle| try handle.backend.sync(force),
             }
         }
+
+        fn checkpointLsmWalAfterDurableBoundary(self: *StoreOwner) !void {
+            switch (self.*) {
+                .none, .mem, .lmdb => {},
+                .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
+            }
+        }
     };
 
     const OpenedStore = struct {
@@ -1280,6 +1287,10 @@ pub const SparseIndex = struct {
 
     pub fn finishBulkIngestSessionWithOptions(self: *SparseIndex, options: backend_types.BulkIngestFinishOptions) !void {
         try self.store.finishBulkIngestSessionWithOptions(options);
+    }
+
+    pub fn checkpointLsmWalAfterDurableBoundary(self: *SparseIndex) !void {
+        try self.owner.checkpointLsmWalAfterDurableBoundary();
     }
 
     pub fn abortBulkIngestSession(self: *SparseIndex) void {
@@ -4456,6 +4467,39 @@ test "sparse bulk append builds searchable postings" {
 
     try std.testing.expectEqual(@as(usize, 2), results.len);
     try std.testing.expectEqualStrings("doc1", results[0].doc_id);
+}
+
+test "sparse lsm durable boundary checkpoint retires retained wal" {
+    const alloc = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "s2-lsm-wal-checkpoint");
+    defer cleanupTmp(path);
+
+    var idx = try SparseIndex.open(alloc, path, .{
+        .backend = .lsm,
+        .lsm_options = .{ .flush_threshold = 1024 },
+    });
+    defer idx.close();
+
+    const writes = [_]SparseWrite{
+        .{ .doc_id = "doc1", .vec = .{ .indices = &.{1}, .values = &.{1.0} } },
+        .{ .doc_id = "doc2", .vec = .{ .indices = &.{2}, .values = &.{0.5} } },
+    };
+    try idx.batch(&writes, &.{});
+
+    const before = switch (idx.owner) {
+        .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
+        else => return error.ExpectedLsmOwner,
+    };
+    try std.testing.expect(before.wal_retained_bytes > 0);
+
+    try idx.checkpointLsmWalAfterDurableBoundary();
+
+    const after = switch (idx.owner) {
+        .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
+        else => return error.ExpectedLsmOwner,
+    };
+    try std.testing.expectEqual(@as(u64, 0), after.wal_retained_bytes);
 }
 
 test "sparse bulk append extends existing partial chunk" {
