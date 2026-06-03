@@ -86,3 +86,7 @@ pub const Style = types.Style;
 pub const SchemasConfig = types.SchemasConfig;
 pub const EmbeddingObject = types.EmbeddingObject;
 pub const EmbeddingUsage = types.EmbeddingUsage;
+pub const PredictRequest = types.PredictRequest;
+pub const PredictResponse = types.PredictResponse;
+pub const PredictorInfo = types.PredictorInfo;
+pub const PredictorTask = types.PredictorTask;

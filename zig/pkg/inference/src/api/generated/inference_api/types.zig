@@ -929,3 +929,37 @@ pub const GenerateChunk = struct {
     model: []const u8,
     choices: []const GenerateChunkChoice,
 };
+
+/// Task type for tabular predictors.
+pub const PredictorTask = enum {
+    regression,
+    binary_classification,
+    multiclass,
+    ranking,
+};
+
+/// Request to run a tabular predictor.
+pub const PredictRequest = struct {
+    /// Predictor name. Use `/models` to list available predictors.
+    model: []const u8,
+    /// Batch of feature vectors. Max 10000 rows.
+    input: []const []const f32,
+};
+
+/// Response from a tabular prediction call.
+pub const PredictResponse = struct {
+    model: []const u8,
+    task: PredictorTask,
+    /// Per-row prediction arrays. Length equals the model's `num_outputs`.
+    predictions: []const []const f32,
+};
+
+/// Metadata describing a registered predictor.
+pub const PredictorInfo = struct {
+    name: []const u8,
+    task: PredictorTask,
+    num_features: i64,
+    num_outputs: i64,
+    feature_names: ?[]const []const u8 = null,
+    source_framework: ?[]const u8 = null,
+};

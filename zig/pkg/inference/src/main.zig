@@ -127,6 +127,8 @@ pub fn runFromArgs(
         try listModels(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "pull")) {
         try pullModel(allocator, init.io, usage_name, command_args);
+    } else if (std.mem.eql(u8, command, "convert")) {
+        try inference.tabular.cli.convertMain(allocator, init.io, command_args);
     } else {
         print("unknown command: {s}\n", .{command});
         printUsage(usage_name);
@@ -197,6 +199,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
+    node.seedAndDiscoverPredictors(io);
 
     try node.serve(allocator, io, host, port);
 
@@ -297,6 +300,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  smoke     Run a native GGUF/SafeTensors smoke test
         \\  list      List available models
         \\  pull      Download a model from HuggingFace Hub
+        \\  convert   Convert a native ML model (XGBoost/LightGBM/ONNX) to the antfly tabular IR
         \\
         \\Run options:
         \\  --host <addr>     Listen address (default: 127.0.0.1)

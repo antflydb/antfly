@@ -59,6 +59,10 @@ const onnx_decoder_only_vlm = @import("../pipelines/onnx_decoder_only_vlm.zig");
 const tool_parser_mod = @import("../pipelines/tool_parser.zig");
 const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
+const tabular_registry_mod = @import("../tabular/registry.zig");
+const tabular_discovery_mod = @import("../tabular/discovery.zig");
+const tabular_http_mod = @import("../tabular/http.zig");
+const ml_tabular = @import("ml_tabular");
 const c_file = @import("../util/c_file.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
@@ -73,6 +77,79 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 };
 pub const metrics_mod = @import("metrics.zig");
 const request_queue_mod = @import("request_queue.zig");
+
+// ---------------------------------------------------------------------------
+// Tabular predictor helpers shared by the /predict, /predict/upload, and
+// /predict/convert handlers on Node.
+// ---------------------------------------------------------------------------
+
+fn taskTypeToApi(t: ml_tabular.ir.TaskType) api.PredictorTask {
+    return switch (t) {
+        .regression => .regression,
+        .binary_classification => .binary_classification,
+        .multiclass => .multiclass,
+        .ranking => .ranking,
+    };
+}
+
+fn predictorInfoToApi(info: tabular_registry_mod.ModelInfo) api.PredictorInfo {
+    return .{
+        .name = info.name,
+        .task = taskTypeToApi(info.task),
+        .num_features = @intCast(info.num_features),
+        .num_outputs = @intCast(info.num_outputs),
+        .feature_names = if (info.feature_names.len > 0) info.feature_names else null,
+        .source_framework = if (info.source_framework.len > 0) info.source_framework else null,
+    };
+}
+
+fn parseFrameworkParam(s: []const u8) ?ml_tabular.convert.Framework {
+    if (std.mem.eql(u8, s, "auto")) return .auto;
+    if (std.mem.eql(u8, s, "xgboost")) return .xgboost;
+    if (std.mem.eql(u8, s, "lightgbm")) return .lightgbm;
+    if (std.mem.eql(u8, s, "onnx")) return .onnx_ml;
+    if (std.mem.eql(u8, s, "sklearn")) return .sklearn;
+    if (std.mem.eql(u8, s, "catboost")) return .catboost;
+    return null;
+}
+
+fn mapTabularHttpErrorPredict(ctx: *httpx.Context, err: tabular_http_mod.HttpError) !httpx.Response {
+    return switch (err) {
+        error.InvalidJson => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "malformed predict body" }),
+        error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "no predictor by that name" }),
+        error.BatchTooLarge => ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = "max batch size is 10000" }),
+        error.FeatureMismatch => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "feature-count mismatch" }),
+        error.LoadFailed => ctx.status(500).json(.{ .@"error" = "LOAD_FAILED", .message = "predictor failed to load" }),
+        error.OutOfMemory => ctx.status(500).json(.{ .@"error" = "OOM" }),
+        else => ctx.status(500).json(.{ .@"error" = "INTERNAL" }),
+    };
+}
+
+fn mapTabularHttpErrorUpload(ctx: *httpx.Context, err: tabular_http_mod.HttpError) !httpx.Response {
+    return switch (err) {
+        error.InvalidJson => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "tabular_model.json is malformed or invalid" }),
+        error.InvalidName => ctx.status(400).json(.{ .@"error" = "INVALID_NAME", .message = "name must match [A-Za-z0-9_-]+ (optionally prefixed with local/)" }),
+        error.UploadTooLarge => ctx.status(413).json(.{ .@"error" = "UPLOAD_TOO_LARGE", .message = "max upload size is 50MB" }),
+        error.IoError => ctx.status(500).json(.{ .@"error" = "IO_ERROR" }),
+        error.OutOfMemory => ctx.status(500).json(.{ .@"error" = "OOM" }),
+        else => ctx.status(500).json(.{ .@"error" = "INTERNAL" }),
+    };
+}
+
+fn mapTabularHttpErrorConvert(ctx: *httpx.Context, err: tabular_http_mod.HttpError) !httpx.Response {
+    return switch (err) {
+        error.UnsupportedSource => ctx.status(415).json(.{
+            .@"error" = "UNSUPPORTED_SOURCE",
+            .message = "sklearn / CatBoost are not supported natively; run `termite-convert <framework> ...` to produce tabular_model.json and upload via /predict/upload",
+        }),
+        error.ConvertFailed => ctx.status(400).json(.{ .@"error" = "CONVERT_FAILED", .message = "could not parse the source model" }),
+        error.InvalidName => ctx.status(400).json(.{ .@"error" = "INVALID_NAME", .message = "invalid predictor name" }),
+        error.InvalidJson => ctx.status(400).json(.{ .@"error" = "INVALID_JSON" }),
+        error.IoError => ctx.status(500).json(.{ .@"error" = "IO_ERROR" }),
+        error.OutOfMemory => ctx.status(500).json(.{ .@"error" = "OOM" }),
+        else => ctx.status(500).json(.{ .@"error" = "INTERNAL" }),
+    };
+}
 
 pub const BudgetOverrides = struct {
     host_limit_bytes: usize = 0,
@@ -491,6 +568,7 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
     request_queue: request_queue_mod.RequestQueue,
+    tabular_registry: tabular_registry_mod.Registry,
 
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
 
@@ -504,6 +582,7 @@ pub const Node = struct {
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
             .request_queue = request_queue_mod.RequestQueue.init(config.max_concurrent_requests),
+            .tabular_registry = tabular_registry_mod.Registry.init(allocator),
         };
     }
 
@@ -511,6 +590,17 @@ pub const Node = struct {
         self.model_manager.deinit();
         self.registry.deinit();
         self.embed_cache.deinit();
+        self.tabular_registry.deinit();
+    }
+
+    /// Convenience for callers that want to seed the builtin iris classifier
+    /// and scan the predictors directory at startup.
+    pub fn seedAndDiscoverPredictors(self: *Node, io: std.Io) void {
+        const sub = std.fs.path.join(self.allocator, &.{ self.config.models_dir, "predictors" }) catch return;
+        defer self.allocator.free(sub);
+        std.Io.Dir.cwd().createDirPath(io, sub) catch {};
+        tabular_discovery_mod.seedBuiltins(io, sub) catch {};
+        _ = tabular_discovery_mod.discover(io, self.allocator, &self.tabular_registry, sub) catch 0;
     }
 
     pub fn embedDenseTextsDirect(
@@ -1521,6 +1611,76 @@ pub const Node = struct {
         const http_response = try ctx.json(response);
         logEmbedTiming("embed.response_json", inputs.total_count, response_json_start);
         return http_response;
+    }
+
+    // -----------------------------------------------------------------------
+    // Tabular predictors (POST /predict, /predict/upload, /predict/convert).
+    // -----------------------------------------------------------------------
+
+    pub fn predict(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var parsed = (try ctx.parseJson(api.PredictRequest)) orelse
+            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        defer parsed.deinit();
+        const body = parsed.value;
+
+        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
+
+        self.metrics.incRequest("predict");
+        const result = tabular_http_mod.predict(ctx.io, ctx.allocator, &self.tabular_registry, .{
+            .model = body.model,
+            .input = body.input,
+        }) catch |err| {
+            self.metrics.incPredictError();
+            return mapTabularHttpErrorPredict(ctx, err);
+        };
+
+        const task = taskTypeToApi(result.task);
+        return ctx.json(api.PredictResponse{
+            .model = result.model,
+            .task = task,
+            .predictions = result.predictions,
+        });
+    }
+
+    pub fn uploadPredictor(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const body = ctx.request.body orelse return ctx.status(400).json(.{
+            .@"error" = "missing_body",
+            .message = "Body must contain tabular_model.json bytes",
+        });
+        const name = ctx.query("name") orelse return ctx.status(400).json(.{
+            .@"error" = "missing_name",
+            .message = "Pass ?name=<predictor-name>",
+        });
+
+        const predictors_dir = std.fs.path.join(ctx.allocator, &.{ self.config.models_dir, "predictors" }) catch return ctx.status(500).json(.{ .@"error" = "alloc" });
+        defer ctx.allocator.free(predictors_dir);
+        std.Io.Dir.cwd().createDirPath(ctx.io, predictors_dir) catch {};
+
+        const info = tabular_http_mod.upload(ctx.io, ctx.allocator, &self.tabular_registry, predictors_dir, name, body) catch |err| return mapTabularHttpErrorUpload(ctx, err);
+        return ctx.status(201).json(predictorInfoToApi(info));
+    }
+
+    pub fn convertPredictor(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const body = ctx.request.body orelse return ctx.status(400).json(.{
+            .@"error" = "missing_body",
+            .message = "Body must contain native model bytes",
+        });
+        const name = ctx.query("name") orelse return ctx.status(400).json(.{
+            .@"error" = "missing_name",
+            .message = "Pass ?name=<predictor-name>",
+        });
+        const framework_str = ctx.query("framework") orelse "auto";
+        const framework = parseFrameworkParam(framework_str) orelse
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "framework must be auto|xgboost|lightgbm|onnx|sklearn|catboost" });
+
+        const predictors_dir = std.fs.path.join(ctx.allocator, &.{ self.config.models_dir, "predictors" }) catch return ctx.status(500).json(.{ .@"error" = "alloc" });
+        defer ctx.allocator.free(predictors_dir);
+        std.Io.Dir.cwd().createDirPath(ctx.io, predictors_dir) catch {};
+
+        const info = tabular_http_mod.convertAndUpload(ctx.io, ctx.allocator, &self.tabular_registry, predictors_dir, name, framework, body) catch |err| return mapTabularHttpErrorConvert(ctx, err);
+        return ctx.status(201).json(predictorInfoToApi(info));
     }
 
     pub fn chunkText(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -6178,6 +6338,7 @@ test "download remote content accepts data uri" {
         .embed_cache = undefined,
         .metrics = undefined,
         .request_queue = undefined,
+        .tabular_registry = undefined,
     };
     var downloaded = try downloadRemoteContent(&node, alloc, "data:text/plain;base64,aGVsbG8=");
     defer downloaded.deinit(alloc);
@@ -6196,6 +6357,7 @@ test "download remote content blocks private ip urls when configured" {
         .embed_cache = undefined,
         .metrics = undefined,
         .request_queue = undefined,
+        .tabular_registry = undefined,
     };
     try std.testing.expectError(error.PrivateIpBlocked, downloadRemoteContent(&node, alloc, "http://127.0.0.1/test.png"));
 }
@@ -6212,6 +6374,7 @@ test "download remote content blocks hosts outside allowlist" {
         .embed_cache = undefined,
         .metrics = undefined,
         .request_queue = undefined,
+        .tabular_registry = undefined,
     };
     try std.testing.expectError(error.HostNotAllowed, downloadRemoteContent(&node, alloc, "https://example.com/a.png"));
 }
