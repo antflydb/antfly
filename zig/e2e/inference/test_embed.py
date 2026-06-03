@@ -17,16 +17,27 @@
 Matches Go antfly's embedders_test.go and clip_test.go patterns.
 """
 
+import base64
+import json
+import subprocess
+
 import pytest
 from .helpers import (
     TINY_PNG_URI,
     can_make_spoken_wav,
     cosine_similarity,
     l2_norm,
+    make_clip_contract_png_uri,
     make_solid_png_uri,
     make_text_png_uri,
     make_spoken_wav_uri,
     make_wav_b64,
+)
+from .models import (
+    ensure_model_by_name,
+    inference_command,
+    inference_download_enabled,
+    local_model_exists,
 )
 
 pytestmark = pytest.mark.model_integration
@@ -153,6 +164,10 @@ def _assert_distinct_rows(*embs):
             assert delta > 1e-5
 
 
+def _weighted_embedding_sum(emb):
+    return sum((i + 1) * value for i, value in enumerate(emb))
+
+
 @pytest.mark.multimodal
 def test_image_embedding(api):
     """Image embedding via image_url content part."""
@@ -161,6 +176,60 @@ def test_image_embedding(api):
     embs = [item["embedding"] for item in resp["data"]]
     assert len(embs) == 1
     assert len(embs[0]) >= 1, "Image embedding should be non-empty"
+
+
+@pytest.mark.multimodal
+@pytest.mark.verification
+def test_clipclap_image_embedding_golden_contract(tmp_path):
+    """ClipClap image embeddings should keep the CLIP preprocessing contract stable."""
+    if not local_model_exists(CLIPCLAP_MODEL, "embedders") and not inference_download_enabled():
+        pytest.skip(f"{CLIPCLAP_MODEL} is not available")
+
+    model_dir = ensure_model_by_name(CLIPCLAP_MODEL, "embedders")
+    if model_dir is None:
+        pytest.skip(f"{CLIPCLAP_MODEL} is not available")
+
+    image_uri = make_clip_contract_png_uri()
+    image_path = tmp_path / "clip-contract.png"
+    image_path.write_bytes(base64.b64decode(image_uri.split(",", 1)[1]))
+
+    result = subprocess.run(
+        [
+            *inference_command(),
+            "embed",
+            str(model_dir),
+            "--backend",
+            "native",
+            "--image",
+            str(image_path),
+        ],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    combined = [*result.stdout.splitlines(), *result.stderr.splitlines()]
+    response_line = next(line for line in reversed(combined) if line.startswith("{") and "\"embeddings\"" in line)
+    emb = json.loads(response_line)["embeddings"][0]
+
+    assert len(emb) == 512
+    assert abs(l2_norm(emb) - 1.0) < 1e-4
+
+    expected_weighted_sum = -107.44091905420602
+    expected_prefix = [
+        0.041707344,
+        0.03681396,
+        -0.034344856,
+        0.024631007,
+        0.019223439,
+        0.03514648,
+        0.0022730897,
+        0.094304845,
+    ]
+
+    assert abs(_weighted_embedding_sum(emb) - expected_weighted_sum) < 1e-4
+    for i, expected in enumerate(expected_prefix):
+        assert abs(emb[i] - expected) < 1e-4
 
 
 @pytest.mark.multimodal

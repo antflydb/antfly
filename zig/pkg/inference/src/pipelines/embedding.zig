@@ -44,6 +44,11 @@ pub const PoolingStrategy = enum {
     last,
 };
 
+pub const ImagePreprocessProfile = enum {
+    default,
+    clip,
+};
+
 pub const EmbeddingConfig = struct {
     normalize: bool = true,
     pooling: PoolingStrategy = .mean,
@@ -64,6 +69,8 @@ pub const EmbeddingConfig = struct {
     resident_qwen3_embedding: bool = false,
     /// For CLIP/SigLIP multimodal models: image size for vision encoder.
     image_size: u32 = 224,
+    /// Model-selected image preprocessing contract.
+    image_preprocess_profile: ImagePreprocessProfile = .default,
     /// For CLAP audio models: mel spectrogram configuration.
     audio_config: audio.AudioConfig = audio.CLAP_CONFIG,
 };
@@ -439,13 +446,22 @@ pub const EmbeddingPipeline = struct {
 
         // Preprocess all images to [batch, 3, H, W]
         const preprocess_start = embedTimingStart(self.print_timing);
-        const pixel_values = try image.preprocessBatch(
-            alloc,
-            images,
-            img_size,
-            image.IMAGENET_MEAN,
-            image.IMAGENET_STD,
-        );
+        const pixel_values = switch (self.config.image_preprocess_profile) {
+            .default => try image.preprocessBatch(
+                alloc,
+                images,
+                img_size,
+                image.IMAGENET_MEAN,
+                image.IMAGENET_STD,
+            ),
+            .clip => try image.preprocessClipBatch(
+                alloc,
+                images,
+                img_size,
+                image.IMAGENET_MEAN,
+                image.IMAGENET_STD,
+            ),
+        };
         defer alloc.free(pixel_values);
         logEmbedTiming("image.preprocess", batch, preprocess_start);
 

@@ -733,11 +733,16 @@ pub const LoadedModel = struct {
             .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest),
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
         });
+        if (usesClipImagePreprocessProfile(&self.manifest)) {
+            pipeline.config.image_preprocess_profile = .clip;
+        }
         if (session_factory.getClipConfig(self.session)) |cfg| {
             pipeline.config.image_size = cfg.image_size;
+            if (cfg.family == .clip) pipeline.config.image_preprocess_profile = .clip;
         } else if (self.vision_session) |vs| {
             if (session_factory.getClipConfig(vs)) |cfg| {
                 pipeline.config.image_size = cfg.image_size;
+                if (cfg.family == .clip) pipeline.config.image_preprocess_profile = .clip;
             }
         }
         pipeline.vision_session = self.vision_session;
@@ -896,6 +901,12 @@ pub const LoadedModel = struct {
 fn isJinaStyleEmbeddingManifest(manifest: *const manifest_mod.ModelManifest) bool {
     return std.mem.eql(u8, manifest.config_model_arch, "jina_embeddings_v5") or
         (manifest.pooling == .last and std.mem.eql(u8, manifest.embedding_text_prefix, "Document: "));
+}
+
+fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) bool {
+    return std.mem.eql(u8, manifest.config_model_arch, "clip") or
+        std.mem.eql(u8, manifest.config_model_arch, "clipclap") or
+        manifest.isClipclapGgufBundle();
 }
 
 pub const ModelManager = struct {
@@ -1349,6 +1360,20 @@ test "isManifestPotentiallyLoadableInCurrentBuild hides incomplete colqwen bundl
 
     colqwen.processor_config_path = try allocator.dupe(u8, "processor_config.json");
     try std.testing.expect(isManifestPotentiallyLoadableInCurrentBuild(colqwen));
+}
+
+test "ClipClap manifest selects CLIP image preprocessing profile" {
+    const allocator = std.testing.allocator;
+    var clipclap = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer clipclap.deinit();
+
+    clipclap.config_model_arch = try allocator.dupe(u8, "clipclap");
+    try std.testing.expect(usesClipImagePreprocessProfile(&clipclap));
+
+    var siglip = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer siglip.deinit();
+    siglip.config_model_arch = try allocator.dupe(u8, "siglip");
+    try std.testing.expect(!usesClipImagePreprocessProfile(&siglip));
 }
 
 test "ModelManager loads split gliner bundle and exposes runtime pipeline" {

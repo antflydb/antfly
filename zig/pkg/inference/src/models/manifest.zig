@@ -1400,6 +1400,7 @@ fn parseInferenceBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocat
             manifest.native_arch_hint = .clip;
             if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
             manifest.config_model_arch = allocator.dupe(u8, "clipclap") catch "";
+            try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
         }
     }
 }
@@ -1478,6 +1479,28 @@ fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Alloc
     manifest.native_arch_hint = .clip;
     if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
     manifest.config_model_arch = arch;
+    try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
+}
+
+fn setManifestInputs(allocator: std.mem.Allocator, manifest: *ModelManifest, inputs: []const []const u8) !void {
+    if (manifest.inputs.len > 0) {
+        for (manifest.inputs) |input| allocator.free(input);
+        allocator.free(manifest.inputs);
+        manifest.inputs = &.{};
+    }
+
+    const owned = try allocator.alloc([]const u8, inputs.len);
+    errdefer allocator.free(owned);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |input| allocator.free(input);
+    }
+
+    for (inputs, 0..) |input, i| {
+        owned[i] = try allocator.dupe(u8, input);
+        initialized += 1;
+    }
+    manifest.inputs = owned;
 }
 
 const ResolvedClipclapGgufPair = struct {
@@ -1952,6 +1975,9 @@ test "manifest parses clipclap gguf bundle marker" {
     try std.testing.expect(manifest.audio_model_path != null);
     try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_path.?, "/tmp/clipclap-q4_k/clip.gguf"));
     try std.testing.expect(std.mem.endsWith(u8, manifest.audio_model_path.?, "/tmp/clipclap-q4_k/clap.gguf"));
+    try std.testing.expect(manifest.hasInput("text"));
+    try std.testing.expect(manifest.hasInput("image"));
+    try std.testing.expect(manifest.hasInput("audio"));
 }
 
 test "manifest discovers clip onnx variants and prefers f16 over i8" {
@@ -2049,6 +2075,9 @@ test "manifest parses clipclap variants gguf pair" {
     try std.testing.expectEqualStrings("clipclap", manifest.config_model_arch);
     try std.testing.expectEqualStrings(clip_path, manifest.gguf_path.?);
     try std.testing.expectEqualStrings(clap_path, manifest.audio_model_path.?);
+    try std.testing.expect(manifest.hasInput("text"));
+    try std.testing.expect(manifest.hasInput("image"));
+    try std.testing.expect(manifest.hasInput("audio"));
 }
 
 test "manifest ignores stale clipclap variants with missing gguf files" {
