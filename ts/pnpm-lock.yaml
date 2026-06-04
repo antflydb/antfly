@@ -305,14 +305,14 @@ importers:
   packages/cli:
     optionalDependencies:
       '@antfly/cli-darwin-arm64':
-        specifier: 0.0.0
-        version: 0.0.0
+        specifier: workspace:*
+        version: link:../cli-darwin-arm64
       '@antfly/cli-linux-arm64':
-        specifier: 0.0.0
-        version: 0.0.0
+        specifier: workspace:*
+        version: link:../cli-linux-arm64
       '@antfly/cli-linux-x64':
-        specifier: 0.0.0
-        version: 0.0.0
+        specifier: workspace:*
+        version: link:../cli-linux-x64
 
   packages/cli-darwin-arm64: {}
 
@@ -702,21 +702,6 @@ packages:
   '@alloc/quick-lru@5.2.0':
     resolution: {integrity: sha512-UrcABB+4bUrFABwbluTIBErXwvbsU/V7TZWfmbgJfbkwiBuziS9gxdODUyuiecfdGQ85jglMW6juS3+z5TsKLw==}
     engines: {node: '>=10'}
-
-  '@antfly/cli-darwin-arm64@0.0.0':
-    resolution: {integrity: sha512-PZMYlFvuq3OQ4td+6GbVekWDR3Bncaiv065h7K4IXGe3z9oylTKV+YZSTUCSLTP74hq9ygC/dr6c/ljSUcDbhA==}
-    cpu: [arm64]
-    os: [darwin]
-
-  '@antfly/cli-linux-arm64@0.0.0':
-    resolution: {integrity: sha512-oAUYi3S2zL46y5BN0avLsTussw6fTWr/LK2f4Is6CCfcwm3VW/bosUkrNIpzFSZsUAhFe9+DHP+ijtYTEUNBRQ==}
-    cpu: [arm64]
-    os: [linux]
-
-  '@antfly/cli-linux-x64@0.0.0':
-    resolution: {integrity: sha512-xswiflgE/lox7nsuAHxHTWE792uDycQ79adm03SGPw6Xjmjnuq3ZvOBKwWFRXi7Lv1atLaBNegVQ9LSlIewF6w==}
-    cpu: [x64]
-    os: [linux]
 
   '@antfu/install-pkg@1.1.0':
     resolution: {integrity: sha512-MGQsmw10ZyI+EJo45CdSER4zEb+p31LpDAFp2Z3gkSd1yqVZGi0Ebx++YTEMonJy4oChEMLsxZ64j8FH6sSqtQ==}
@@ -6987,15 +6972,6 @@ snapshots:
       json-schema: 0.4.0
 
   '@alloc/quick-lru@5.2.0': {}
-
-  '@antfly/cli-darwin-arm64@0.0.0':
-    optional: true
-
-  '@antfly/cli-linux-arm64@0.0.0':
-    optional: true
-
-  '@antfly/cli-linux-x64@0.0.0':
-    optional: true
 
   '@antfu/install-pkg@1.1.0':
     dependencies:
