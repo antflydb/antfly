@@ -13,7 +13,7 @@
   },
   "homepage": "https://antfly.io",
   "bin": {
-    "antfly": "./bin/antfly.js"
+    "antfly": "bin/antfly.js"
   },
   "files": [
     "bin",
