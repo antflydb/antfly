@@ -286,7 +286,8 @@ pub const PromotionRuntime = struct {
     error_count: std.atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
-    worker_started: std.atomic.Value(bool),
+    worker_started: std.atomic.Value(bool) = .init(false),
+    worker_wake_generation: std.atomic.Value(u64) = .init(0),
     worker_mutex: Io.Mutex = .init,
     worker_cond: Io.Condition = .init,
     io_impl: ?*background_runtime_mod.IoImpl,
@@ -318,6 +319,7 @@ pub const PromotionRuntime = struct {
             .error_count = .init(0),
             .shutdown_flag = .init(false),
             .worker_started = .init(false),
+            .worker_wake_generation = .init(0),
             .io_impl = backend_runtime.io_impl,
             .future = null,
         };
@@ -417,8 +419,19 @@ pub const PromotionRuntime = struct {
         const io_impl = self.io_impl orelse return;
         const io = io_impl.io();
         self.worker_mutex.lockUncancelable(io);
+        self.recordWorkerWake();
         self.worker_cond.broadcast(io);
         self.worker_mutex.unlock(io);
+    }
+
+    fn recordWorkerWake(self: *PromotionRuntime) void {
+        _ = self.worker_wake_generation.fetchAdd(1, .release);
+    }
+
+    fn shouldWaitForBlockedRetry(self: *PromotionRuntime, observed_wake_generation: u64) bool {
+        return !self.shutdown_flag.load(.acquire) and
+            self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire) and
+            self.worker_wake_generation.load(.acquire) == observed_wake_generation;
     }
 
     /// Drain applied -> target. Serialized so the background worker and a
@@ -506,6 +519,7 @@ pub const PromotionRuntime = struct {
             if (self.shutdown_flag.load(.acquire)) break;
 
             if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
+                const wake_generation = self.worker_wake_generation.load(.acquire);
                 self.catchUp() catch |err| {
                     std.log.warn("promotion catch-up failed: {s}", .{@errorName(err)});
                     io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
@@ -513,9 +527,7 @@ pub const PromotionRuntime = struct {
                 };
                 if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
                     self.worker_mutex.lockUncancelable(io);
-                    if (!self.shutdown_flag.load(.acquire) and
-                        self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire))
-                    {
+                    if (self.shouldWaitForBlockedRetry(wake_generation)) {
                         self.worker_cond.waitUncancelable(io, &self.worker_mutex);
                     }
                     self.worker_mutex.unlock(io);
@@ -1047,6 +1059,68 @@ test "PromotionRuntime missing sink blocks only on pending resolution artifacts"
     try testing.expect(stats_snapshot.catch_up_required);
     try testing.expect(stats_snapshot.blocked);
     try testing.expectEqualStrings("missing_entity_sink", stats_snapshot.blocked_reason);
+
+    runtime.store_handle = undefined;
+}
+
+test "PromotionRuntime blocked wait observes sink wake generation" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    try map.put(resolution_key, sample_resolution);
+
+    const payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 9,
+        .changed_artifact_keys = &.{resolution_key},
+        .target_hints = &.{.promotion},
+    });
+    defer alloc.free(payload);
+
+    var fake_source = FakeSource{ .records = &.{.{ .sequence = 9, .payload = payload }} };
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+    var store_handle = try resolution_runtime.initRuntimeStore(alloc, map.backendStore());
+    defer store_handle.deinit();
+
+    var runtime = PromotionRuntime{
+        .alloc = alloc,
+        .store_handle = store_handle,
+        .replay_source = fake_source.source(),
+        .owner = null,
+        .sink = null,
+        .sink_available = .init(false),
+        .missing_sink_blocked = .init(false),
+        .missing_sink_policy = .wait,
+        .applied_sequence = .init(1),
+        .target_sequence = .init(1),
+        .error_count = .init(0),
+        .shutdown_flag = .init(false),
+        .io_impl = null,
+        .future = null,
+    };
+
+    runtime.notifySequence(9);
+    const observed_wake_generation = runtime.worker_wake_generation.load(.acquire);
+    try runtime.catchUp();
+
+    const blocked_stats = runtime.stats();
+    try testing.expect(blocked_stats.blocked);
+    try testing.expectEqualStrings("missing_entity_sink", blocked_stats.blocked_reason);
+    try testing.expectEqual(@as(usize, 0), capture.keys.items.len);
+    try testing.expect(runtime.shouldWaitForBlockedRetry(observed_wake_generation));
+
+    runtime.sink = capture.sink();
+    runtime.sink_available.store(true, .release);
+    runtime.missing_sink_blocked.store(false, .release);
+    runtime.recordWorkerWake();
+
+    try testing.expect(!runtime.shouldWaitForBlockedRetry(observed_wake_generation));
+    try runtime.catchUp();
+    try testing.expectEqual(@as(u64, 9), runtime.applied_sequence.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
 
     runtime.store_handle = undefined;
 }
