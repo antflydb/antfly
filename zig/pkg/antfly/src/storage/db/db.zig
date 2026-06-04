@@ -2732,9 +2732,9 @@ pub const DB = struct {
     }
 
     fn initResolutionRuntime(self: *DB) !void {
-        // Always constructed: with io a background loop drives catch-up; without
-        // io it is driven synchronously via runUntilIdle. Replay stays durable
-        // regardless.
+        // Always constructed so catalog/status/runUntilIdle APIs can observe
+        // and drain replay. The background worker is started lazily only while
+        // the resolver catalog is non-empty.
         const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
         errdefer self.runtime_alloc.destroy(append_ctx);
         const resources = self.core.batchExecutionResources();
@@ -2778,10 +2778,9 @@ pub const DB = struct {
     }
 
     fn initPromotionRuntime(self: *DB) !void {
-        // Always constructed (like the resolution runtime): with io a background
-        // loop drives catch-up, otherwise runUntilIdle drives it synchronously.
-        // The promoter consumes the resolution-artifact records the resolution
-        // stage journals, so it must exist whenever resolution can run.
+        // Always constructed (like the resolution runtime) so synchronous
+        // drains and status APIs remain available. The background worker is
+        // started lazily only while resolver replay can produce promotion work.
         const runtime = try self.runtime_alloc.create(promotion_runtime_mod.PromotionRuntime);
         errdefer self.runtime_alloc.destroy(runtime);
         runtime.* = try promotion_runtime_mod.PromotionRuntime.init(
@@ -2928,13 +2927,32 @@ pub const DB = struct {
     }
 
     fn startOptionalRuntimes(self: *DB) !void {
-        if (self.resolution_runtime) |runtime| try runtime.start();
-        if (self.promotion_runtime) |runtime| try runtime.start();
+        try self.startResolverReplayRuntimesIfConfigured();
         if (self.enrichment_runtime) |runtime| try runtime.start();
         if (self.ttl_runtime) |runtime| try runtime.start();
         if (self.transaction_runtime) |runtime| try runtime.start();
         if (self.text_merge_runtime) |runtime| try runtime.start();
         if (self.sparse_compaction_runtime) |runtime| try runtime.start();
+    }
+
+    fn hasConfiguredResolvers(self: *const DB) bool {
+        return self.core.index_manager.resolvers.items.len > 0;
+    }
+
+    fn startResolverReplayRuntimesIfConfigured(self: *DB) !void {
+        if (!self.hasConfiguredResolvers()) return;
+        try self.startResolverReplayRuntimes();
+    }
+
+    fn startResolverReplayRuntimes(self: *DB) !void {
+        if (self.resolution_runtime) |runtime| try runtime.start();
+        if (self.promotion_runtime) |runtime| try runtime.start();
+    }
+
+    fn stopResolverReplayRuntimesIfUnconfigured(self: *DB) void {
+        if (self.hasConfiguredResolvers()) return;
+        if (self.resolution_runtime) |runtime| runtime.stop();
+        if (self.promotion_runtime) |runtime| runtime.stop();
     }
 
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
@@ -5649,6 +5667,7 @@ pub const DB = struct {
             defer self.core.unlockApply();
             try self.core.addResolver(cfg);
         }
+        try self.startResolverReplayRuntimes();
         try self.backfillResolverCorpus();
     }
 
@@ -5676,6 +5695,7 @@ pub const DB = struct {
         };
         switch (upsert_result) {
             .inserted, .updated_backfill_required => {
+                try self.startResolverReplayRuntimes();
                 if (options.drain_backfill) {
                     try self.backfillResolverCorpus();
                 } else if (self.resolution_runtime) |runtime| {
@@ -5683,6 +5703,7 @@ pub const DB = struct {
                 }
             },
             .updated_no_backfill => {
+                try self.startResolverReplayRuntimesIfConfigured();
                 if (options.drain_backfill and self.resolution_runtime != null) {
                     const runtime = self.resolution_runtime.?;
                     if (try runtime.hasReresolveBacklog()) {
@@ -5703,6 +5724,7 @@ pub const DB = struct {
     }
 
     pub fn drainResolverBackfill(self: *DB) !void {
+        try self.startResolverReplayRuntimesIfConfigured();
         try self.backfillResolverCorpus();
     }
 
@@ -5749,6 +5771,7 @@ pub const DB = struct {
             if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
             try self.runUntilIdle();
         }
+        self.stopResolverReplayRuntimesIfUnconfigured();
         return true;
     }
 
@@ -24348,6 +24371,50 @@ const FixedVectorEmbedder = struct {
         return v;
     }
 };
+
+test "db starts resolver replay workers only while resolver catalog is configured" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expect(db.resolution_runtime != null);
+    try std.testing.expect(db.promotion_runtime != null);
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try db.addResolver(.{
+        .name = "kg_lifecycle",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_lifecycle_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try std.testing.expect(db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try std.testing.expect(try db.removeResolver("kg_lifecycle"));
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+}
 
 test "db backfills a mention name embedding so ann/cosine resolution links end-to-end" {
     const alloc = std.testing.allocator;

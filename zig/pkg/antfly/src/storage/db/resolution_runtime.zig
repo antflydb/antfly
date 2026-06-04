@@ -1402,6 +1402,9 @@ pub const ResolutionRuntime = struct {
     target_sequence: std.atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
+    worker_started: std.atomic.Value(bool),
+    worker_mutex: Io.Mutex = .init,
+    worker_cond: Io.Condition = .init,
     future: ?Io.Future(void),
 
     pub fn init(
@@ -1431,6 +1434,7 @@ pub const ResolutionRuntime = struct {
             .applied_sequence = .init(applied),
             .target_sequence = .init(applied),
             .shutdown_flag = .init(false),
+            .worker_started = .init(false),
             .future = null,
         };
     }
@@ -1443,10 +1447,15 @@ pub const ResolutionRuntime = struct {
 
     /// Raise the catch-up target; the worker loop drains toward it.
     pub fn notifySequence(self: *ResolutionRuntime, sequence: u64) void {
+        var advanced = false;
         var cur = self.target_sequence.load(.monotonic);
         while (sequence > cur) {
-            cur = self.target_sequence.cmpxchgWeak(cur, sequence, .monotonic, .monotonic) orelse break;
+            cur = self.target_sequence.cmpxchgWeak(cur, sequence, .monotonic, .monotonic) orelse {
+                advanced = true;
+                break;
+            };
         }
+        if (advanced) self.wakeWorker();
     }
 
     pub fn stats(self: *ResolutionRuntime) types.ReplayStageStats {
@@ -1469,23 +1478,47 @@ pub const ResolutionRuntime = struct {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         self.candidate_source = src;
+        self.wakeWorker();
     }
 
     pub fn start(self: *ResolutionRuntime) !void {
         // Without io there is no background thread; the stage is then driven
         // synchronously via catchUp (e.g. from runUntilIdle).
         const io_impl = self.io_impl orelse return;
-        self.future = try io_impl.io().concurrent(workerMain, .{self});
+        const io = io_impl.io();
+        self.worker_mutex.lockUncancelable(io);
+        defer self.worker_mutex.unlock(io);
+        if (self.worker_started.load(.acquire)) return;
+        self.shutdown_flag.store(false, .release);
+        self.future = try io.concurrent(workerMain, .{self});
+        self.worker_started.store(true, .release);
+        self.worker_cond.broadcast(io);
     }
 
     pub fn stop(self: *ResolutionRuntime) void {
         self.shutdown_flag.store(true, .release);
+        if (self.io_impl) |io_impl| {
+            const io = io_impl.io();
+            self.worker_mutex.lockUncancelable(io);
+            self.worker_cond.broadcast(io);
+            self.worker_mutex.unlock(io);
+        }
         if (self.future) |*future| {
             if (self.io_impl) |io_impl| {
                 _ = future.await(io_impl.io());
             }
             self.future = null;
         }
+        self.worker_started.store(false, .release);
+    }
+
+    fn wakeWorker(self: *ResolutionRuntime) void {
+        if (!self.worker_started.load(.acquire)) return;
+        const io_impl = self.io_impl orelse return;
+        const io = io_impl.io();
+        self.worker_mutex.lockUncancelable(io);
+        self.worker_cond.broadcast(io);
+        self.worker_mutex.unlock(io);
     }
 
     /// Drain applied -> target. Serialized so the background worker and a
@@ -1646,13 +1679,20 @@ pub const ResolutionRuntime = struct {
     fn workerMain(self: *ResolutionRuntime) void {
         const io = (self.io_impl orelse return).io();
         while (!self.shutdown_flag.load(.acquire)) {
+            self.worker_mutex.lockUncancelable(io);
+            while (!self.shutdown_flag.load(.acquire) and
+                self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire))
+            {
+                self.worker_cond.waitUncancelable(io, &self.worker_mutex);
+            }
+            self.worker_mutex.unlock(io);
+            if (self.shutdown_flag.load(.acquire)) break;
+
             if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
                 self.catchUp() catch |err| {
                     std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
                     io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
                 };
-            } else {
-                io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
             }
         }
         self.catchUp() catch {};
