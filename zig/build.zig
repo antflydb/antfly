@@ -6065,6 +6065,7 @@ pub fn build(b: *std.Build) void {
         mod.addImport("raft_engine", raft_engine_mod);
         mod.addImport("structlog", structlog_mod);
         mod.addImport("antfly_platform", platform_mod);
+        mod.addImport("handlebars", handlebars_mod);
         mod.addOptions("build_options", build_options);
         break :blk mod;
     } else blk: {

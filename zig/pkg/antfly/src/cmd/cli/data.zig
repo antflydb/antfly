@@ -15,6 +15,7 @@
 const std = @import("std");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
+const hbs = @import("handlebars");
 
 const default_batch_size: usize = 1000;
 const default_max_batches: usize = 100;
@@ -94,6 +95,8 @@ const LoadOptions = struct {
     batch_size: usize = default_batch_size,
     max_batches: usize = default_max_batches,
     id_field: ?[]const u8 = null,
+    id_template: ?[]const u8 = null,
+    sync_level: ?antfly_client.types.SyncLevel = null,
     read_buffer_bytes: usize = default_read_buffer_bytes,
     max_line_bytes: usize = default_max_line_bytes,
     batch_bytes: usize = default_batch_bytes,
@@ -133,6 +136,8 @@ const LoadCheckpoint = struct {
     source_mtime_ns: i128,
     table_name: []const u8,
     id_field: ?[]const u8 = null,
+    id_template: ?[]const u8 = null,
+    sync_level: ?[]const u8 = null,
     offset: u64 = 0,
     line_number: u64 = 0,
     loaded: u64 = 0,
@@ -355,6 +360,7 @@ const LoadProcessor = struct {
     checkpoint_path: ?[]const u8 = null,
     batch: BatchBuilder,
     line_arena: std.heap.ArenaAllocator,
+    id_template: ?hbs.Template = null,
 
     fn init(
         alloc: std.mem.Allocator,
@@ -364,7 +370,7 @@ const LoadProcessor = struct {
         file_meta: FileMetadata,
         checkpoint_path: ?[]const u8,
         start: ?LoadCheckpoint,
-    ) LoadProcessor {
+    ) !LoadProcessor {
         var processor = LoadProcessor{
             .alloc = alloc,
             .io = io,
@@ -377,6 +383,10 @@ const LoadProcessor = struct {
             .batch = BatchBuilder.init(alloc),
             .line_arena = std.heap.ArenaAllocator.init(alloc),
         };
+        errdefer processor.deinit();
+        if (opts.id_template) |template_source| {
+            processor.id_template = try hbs.Template.init(alloc, template_source);
+        }
         if (start) |cp| {
             processor.stats.loaded = cp.loaded;
             processor.stats.committed = cp.committed;
@@ -390,6 +400,7 @@ const LoadProcessor = struct {
     }
 
     fn deinit(self: *LoadProcessor) void {
+        if (self.id_template) |*template| template.deinit();
         self.line_arena.deinit();
         self.batch.deinit();
     }
@@ -477,6 +488,26 @@ const LoadProcessor = struct {
             return try batch_alloc.dupe(u8, val.string);
         }
 
+        if (self.id_template) |*template| {
+            const line_alloc = self.line_arena.allocator();
+            const context = try jsonToHandlebarsValue(line_alloc, parsed);
+            const rendered = template.renderSimple(line_alloc, context) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    self.stats.bad_id += 1;
+                    try self.checkErrorLimit();
+                    return error.BadDocumentId;
+                },
+            };
+            const trimmed = std.mem.trim(u8, rendered, " \t\r\n");
+            if (trimmed.len == 0) {
+                self.stats.bad_id += 1;
+                try self.checkErrorLimit();
+                return error.BadDocumentId;
+            }
+            return try batch_alloc.dupe(u8, trimmed);
+        }
+
         const hash = std.hash.Wyhash.hash(0, line);
         return try std.fmt.allocPrint(batch_alloc, "{x}", .{hash});
     }
@@ -498,6 +529,7 @@ const LoadProcessor = struct {
         if (!self.opts.dry_run) {
             var resp = try self.client.?.batch(self.opts.table_name, .{
                 .inserts = self.batch.inserts,
+                .sync_level = self.opts.sync_level,
             });
             defer resp.deinit();
             self.stats.committed += @intCast(self.batch.docs);
@@ -524,6 +556,8 @@ const LoadProcessor = struct {
             .source_mtime_ns = self.file_meta.mtime_ns,
             .table_name = self.opts.table_name,
             .id_field = self.opts.id_field,
+            .id_template = self.opts.id_template,
+            .sync_level = if (self.opts.sync_level) |level| syncLevelName(level) else null,
             .offset = self.last_committed_offset,
             .line_number = self.last_committed_line,
             .loaded = self.stats.loaded,
@@ -556,6 +590,8 @@ fn parseLoadOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterat
     var batch_size: usize = default_batch_size;
     var max_batches: usize = default_max_batches;
     var id_field: ?[]const u8 = null;
+    var id_template: ?[]const u8 = null;
+    var sync_level: ?antfly_client.types.SyncLevel = null;
     var read_buffer_bytes: usize = default_read_buffer_bytes;
     var max_line_bytes: usize = default_max_line_bytes;
     var batch_bytes: usize = default_batch_bytes;
@@ -576,6 +612,11 @@ fn parseLoadOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterat
             max_batches = parsePositive(usize, args.next(), default_max_batches, "--batches");
         } else if (std.mem.eql(u8, arg, "--id-field")) {
             id_field = args.next();
+        } else if (std.mem.eql(u8, arg, "--id-template")) {
+            id_template = args.next();
+        } else if (std.mem.eql(u8, arg, "--sync-level")) {
+            sync_level = parseSyncLevel(args.next() orelse cli.fatal("--sync-level requires a value", .{})) orelse
+                cli.fatal("invalid --sync-level", .{});
         } else if (std.mem.eql(u8, arg, "--read-buffer-bytes")) {
             read_buffer_bytes = parsePositive(usize, args.next(), default_read_buffer_bytes, "--read-buffer-bytes");
         } else if (std.mem.eql(u8, arg, "--max-line-bytes")) {
@@ -601,6 +642,7 @@ fn parseLoadOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterat
     _ = allocator;
 
     if (!checkpoint_enabled and resume_load) cli.fatal("--resume cannot be used with --no-checkpoint", .{});
+    if (id_field != null and id_template != null) cli.fatal("--id-field and --id-template are mutually exclusive", .{});
     if (batch_size == 0) cli.fatal("--size must be greater than zero", .{});
     if (max_batches == 0) cli.fatal("--batches must be greater than zero", .{});
     if (read_buffer_bytes == 0) cli.fatal("--read-buffer-bytes must be greater than zero", .{});
@@ -613,6 +655,8 @@ fn parseLoadOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterat
         .batch_size = batch_size,
         .max_batches = max_batches,
         .id_field = id_field,
+        .id_template = id_template,
+        .sync_level = sync_level,
         .read_buffer_bytes = read_buffer_bytes,
         .max_line_bytes = max_line_bytes,
         .batch_bytes = batch_bytes,
@@ -627,6 +671,27 @@ fn parseLoadOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterat
 fn parsePositive(comptime T: type, raw: ?[]const u8, default: T, flag: []const u8) T {
     const text = raw orelse cli.fatal("{s} requires a value", .{flag});
     return std.fmt.parseInt(T, text, 10) catch default;
+}
+
+fn parseSyncLevel(text: []const u8) ?antfly_client.types.SyncLevel {
+    if (std.mem.eql(u8, text, "propose")) return .propose;
+    if (std.mem.eql(u8, text, "write")) return .write;
+    if (std.mem.eql(u8, text, "full_text")) return .full_text;
+    if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
+    if (std.mem.eql(u8, text, "aknn")) return .aknn;
+    if (std.mem.eql(u8, text, "full_index")) return .full_index;
+    return null;
+}
+
+fn syncLevelName(level: antfly_client.types.SyncLevel) []const u8 {
+    return switch (level) {
+        .propose => "propose",
+        .write => "write",
+        .full_text => "full_text",
+        .enrichments => "enrichments",
+        .aknn => "aknn",
+        .full_index => "full_index",
+    };
 }
 
 fn runLoad(
@@ -657,7 +722,7 @@ fn runLoad(
     var reader = file.reader(io, &.{});
     try reader.seekTo(start_offset);
 
-    var processor = LoadProcessor.init(allocator, io, client, opts, file_meta, checkpoint_path, checkpoint);
+    var processor = try LoadProcessor.init(allocator, io, client, opts, file_meta, checkpoint_path, checkpoint);
     defer processor.deinit();
 
     var scanner = LineScanner.init(allocator, opts.max_line_bytes, start_offset, start_line);
@@ -726,6 +791,9 @@ fn validateCheckpoint(cp: LoadCheckpoint, opts: LoadOptions, meta: FileMetadata)
     if (cp.source_size != meta.size or cp.source_mtime_ns != meta.mtime_ns) return error.InvalidLoadCheckpoint;
     if (!std.mem.eql(u8, cp.table_name, opts.table_name)) return error.InvalidLoadCheckpoint;
     if (!optionalStringEql(cp.id_field, opts.id_field)) return error.InvalidLoadCheckpoint;
+    if (!optionalStringEql(cp.id_template, opts.id_template)) return error.InvalidLoadCheckpoint;
+    const opts_sync_level = if (opts.sync_level) |level| syncLevelName(level) else null;
+    if (!optionalStringEql(cp.sync_level, opts_sync_level)) return error.InvalidLoadCheckpoint;
     if (cp.offset > meta.size) return error.InvalidLoadCheckpoint;
 }
 
@@ -733,6 +801,32 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+fn jsonToHandlebarsValue(arena: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.Error!hbs.Value {
+    return switch (value) {
+        .null => .null,
+        .bool => |b| .{ .boolean = b },
+        .integer => |i| .{ .integer = i },
+        .float => |f| .{ .float = f },
+        .number_string => |s| .{ .string = s },
+        .string => |s| .{ .string = s },
+        .array => |arr| blk: {
+            const items = try arena.alloc(hbs.Value, arr.items.len);
+            for (arr.items, 0..) |item, i| {
+                items[i] = try jsonToHandlebarsValue(arena, item);
+            }
+            break :blk .{ .array = items };
+        },
+        .object => |obj| blk: {
+            var map: hbs.ValueMap = .{};
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                try map.put(arena, entry.key_ptr.*, try jsonToHandlebarsValue(arena, entry.value_ptr.*));
+            }
+            break :blk .{ .map = map };
+        },
+    };
 }
 
 fn writeCheckpointAtomically(alloc: std.mem.Allocator, io: std.Io, path: []const u8, checkpoint: LoadCheckpoint) !void {
@@ -810,7 +904,7 @@ test "load processor allocates parsed strings independent of streaming buffer" {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    var processor = LoadProcessor.init(alloc, io, null, .{
+    var processor = try LoadProcessor.init(alloc, io, null, .{
         .table_name = "t",
         .file_path = "in.ndjson",
         .id_field = "id",
@@ -846,7 +940,7 @@ test "load processor rejects malformed json and bad ids" {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    var processor = LoadProcessor.init(alloc, io, null, .{
+    var processor = try LoadProcessor.init(alloc, io, null, .{
         .table_name = "t",
         .file_path = "in.ndjson",
         .id_field = "id",
@@ -864,6 +958,58 @@ test "load processor rejects malformed json and bad ids" {
     try std.testing.expectEqual(@as(u64, 1), processor.stats.bad_id);
 }
 
+test "load processor renders ids from handlebars template" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var processor = try LoadProcessor.init(alloc, io, null, .{
+        .table_name = "t",
+        .file_path = "in.ndjson",
+        .id_template = "{{tenant}}:{{nested.id}}",
+        .dry_run = true,
+        .checkpoint_enabled = false,
+    }, .{ .size = 100, .mtime_ns = 1 }, null, null);
+    defer processor.deinit();
+
+    try processor.handleLine(.{ .bytes = "{\"tenant\":\"acme\",\"nested\":{\"id\":\"doc-7\"},\"body\":\"ok\"}", .line_number = 1, .start_offset = 0, .end_offset = 55 });
+
+    try std.testing.expectEqual(@as(u64, 1), processor.stats.loaded);
+    try std.testing.expect(processor.batch.inserts.map.contains("acme:doc-7"));
+}
+
+test "load processor rejects empty rendered id template" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var processor = try LoadProcessor.init(alloc, io, null, .{
+        .table_name = "t",
+        .file_path = "in.ndjson",
+        .id_template = "{{missing}}",
+        .dry_run = true,
+        .checkpoint_enabled = false,
+    }, .{ .size = 100, .mtime_ns = 1 }, null, null);
+    defer processor.deinit();
+
+    try processor.handleLine(.{ .bytes = "{\"id\":\"doc-1\"}", .line_number = 1, .start_offset = 0, .end_offset = 14 });
+
+    try std.testing.expectEqual(@as(u64, 0), processor.stats.loaded);
+    try std.testing.expectEqual(@as(u64, 1), processor.stats.bad_id);
+}
+
+test "load sync level parser supports public values" {
+    try std.testing.expectEqual(antfly_client.types.SyncLevel.propose, parseSyncLevel("propose").?);
+    try std.testing.expectEqual(antfly_client.types.SyncLevel.write, parseSyncLevel("write").?);
+    try std.testing.expectEqual(antfly_client.types.SyncLevel.full_text, parseSyncLevel("full_text").?);
+    try std.testing.expectEqual(antfly_client.types.SyncLevel.enrichments, parseSyncLevel("enrichments").?);
+    try std.testing.expectEqual(antfly_client.types.SyncLevel.aknn, parseSyncLevel("aknn").?);
+    try std.testing.expectEqual(antfly_client.types.SyncLevel.full_index, parseSyncLevel("full_index").?);
+    try std.testing.expect(parseSyncLevel("full-text") == null);
+}
+
 test "checkpoint validation rejects changed source and load config" {
     const cp = LoadCheckpoint{
         .source_path = "a.ndjson",
@@ -871,22 +1017,51 @@ test "checkpoint validation rejects changed source and load config" {
         .source_mtime_ns = 99,
         .table_name = "t",
         .id_field = "id",
+        .sync_level = "write",
         .offset = 4,
     };
     try validateCheckpoint(cp, .{
         .table_name = "t",
         .file_path = "a.ndjson",
         .id_field = "id",
+        .sync_level = .write,
     }, .{ .size = 10, .mtime_ns = 99 });
     try std.testing.expectError(error.InvalidLoadCheckpoint, validateCheckpoint(cp, .{
         .table_name = "other",
         .file_path = "a.ndjson",
         .id_field = "id",
+        .sync_level = .write,
     }, .{ .size = 10, .mtime_ns = 99 }));
     try std.testing.expectError(error.InvalidLoadCheckpoint, validateCheckpoint(cp, .{
         .table_name = "t",
         .file_path = "a.ndjson",
         .id_field = null,
+        .sync_level = .write,
+    }, .{ .size = 10, .mtime_ns = 99 }));
+    try std.testing.expectError(error.InvalidLoadCheckpoint, validateCheckpoint(cp, .{
+        .table_name = "t",
+        .file_path = "a.ndjson",
+        .id_field = "id",
+        .sync_level = .full_text,
+    }, .{ .size = 10, .mtime_ns = 99 }));
+
+    const template_cp = LoadCheckpoint{
+        .source_path = "a.ndjson",
+        .source_size = 10,
+        .source_mtime_ns = 99,
+        .table_name = "t",
+        .id_template = "{{tenant}}:{{id}}",
+        .offset = 4,
+    };
+    try validateCheckpoint(template_cp, .{
+        .table_name = "t",
+        .file_path = "a.ndjson",
+        .id_template = "{{tenant}}:{{id}}",
+    }, .{ .size = 10, .mtime_ns = 99 });
+    try std.testing.expectError(error.InvalidLoadCheckpoint, validateCheckpoint(template_cp, .{
+        .table_name = "t",
+        .file_path = "a.ndjson",
+        .id_template = "{{id}}",
     }, .{ .size = 10, .mtime_ns = 99 }));
 }
 
