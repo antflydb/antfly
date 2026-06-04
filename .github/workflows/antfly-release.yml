@@ -56,10 +56,10 @@ jobs:
       - name: Install protoc-gen-go
         run: go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10
 
-      - name: Install ARM64 cross-compiler
+      - name: Install release dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu xz-utils
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -108,22 +108,29 @@ jobs:
 
       - name: Set macOS SDK path
         run: |
-          echo "SDK_PATH=/tmp/macos-sdk/MacOSX15.5.sdk" >> $GITHUB_ENV
+          echo "SDK_PATH=/tmp/macos-sdk/MacOSX15.5.sdk" >> "$GITHUB_ENV"
           # Verify required headers exist (mach headers are in Kernel.framework, not usr/include)
           echo "Checking for mach headers in Kernel.framework..."
-          ls -la /tmp/macos-sdk/MacOSX15.5.sdk/System/Library/Frameworks/Kernel.framework/Versions/A/Headers/mach/ | head -20 || echo "WARNING: mach headers not found in Kernel.framework"
-          ls /tmp/macos-sdk/MacOSX15.5.sdk/System/Library/Frameworks/Kernel.framework/Versions/A/Headers/mach/mach_vm.h || echo "WARNING: mach_vm.h not found"
+          mach_headers="/tmp/macos-sdk/MacOSX15.5.sdk/System/Library/Frameworks/Kernel.framework/Versions/A/Headers/mach"
+          if [ -d "$mach_headers" ]; then
+            find "$mach_headers" -maxdepth 1 -mindepth 1 -print | head -20
+          else
+            echo "WARNING: mach headers not found in Kernel.framework"
+          fi
+          test -f "$mach_headers/mach_vm.h" || echo "WARNING: mach_vm.h not found"
 
       - name: Configure Go for private modules
         run: |
-          echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
-          echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
-          echo "ONNXRUNTIME_ROOT=${{ github.workspace }}/onnxruntime" >> $GITHUB_ENV
-          echo "PJRT_ROOT=${{ github.workspace }}/pjrt" >> $GITHUB_ENV
+          {
+            echo "GONOPROXY=github.com/antflydb/antfly"
+            echo "GOPRIVATE=github.com/antflydb/antfly"
+            echo "ONNXRUNTIME_ROOT=${{ github.workspace }}/onnxruntime"
+            echo "PJRT_ROOT=${{ github.workspace }}/pjrt"
+          } >> "$GITHUB_ENV"
 
       - name: Extract version from tag
         run: |
-          echo "GORELEASER_CURRENT_TAG=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          echo "GORELEASER_CURRENT_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
           echo "Release version: ${GITHUB_REF_NAME}"
 
       - name: Run GoReleaser

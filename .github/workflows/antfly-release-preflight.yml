@@ -1,0 +1,84 @@
+name: Release Preflight
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/antfly-release.yml"
+      - ".github/workflows/antfly-release-preflight.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zig-setup:
+    name: Verify Zig setup on release runner
+    runs-on: arc-antfly-heavy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install release dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu xz-utils
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Cache macOS SDK
+        id: cache-macos-sdk
+        uses: actions/cache@v5
+        with:
+          path: /tmp/macos-sdk
+          key: macos-sdk-15.5
+
+      - name: Download macOS SDK for cross-compilation
+        if: steps.cache-macos-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/macos-sdk
+          curl -fsSL https://github.com/joseluisq/macosx-sdks/releases/download/15.5/MacOSX15.5.sdk.tar.xz | tar -xJf - -C /tmp/macos-sdk
+
+      - name: Set macOS SDK path
+        run: echo "SDK_PATH=/tmp/macos-sdk/MacOSX15.5.sdk" >> "$GITHUB_ENV"
+
+      - name: Verify tools
+        run: |
+          command -v xz
+          xz --version
+          zig version
+
+      - name: Build Linux arm64 Zig target
+        working-directory: zig
+        run: |
+          zig build \
+            -Dtarget=aarch64-linux-gnu \
+            -Doptimize=ReleaseFast \
+            -Dcpu=baseline \
+            -Dantfly-bin-name=antfly \
+            -Dantfly-version=0.0.0-preflight \
+            -Donnx=false \
+            -Dmlx=false \
+            -Dmetal=false \
+            -Dsystem-blas=false \
+            install
+
+      - name: Build macOS Metal Zig target
+        working-directory: zig
+        run: |
+          zig build \
+            -Dtarget=aarch64-macos \
+            -Doptimize=ReleaseFast \
+            -Dcpu=baseline \
+            -Dantfly-bin-name=antfly \
+            -Dantfly-version=0.0.0-preflight \
+            -Donnx=false \
+            -Dmlx=false \
+            -Dmetal=true \
+            -Dsystem-blas=true \
+            --sysroot "$SDK_PATH" \
+            install
