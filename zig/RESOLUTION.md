@@ -596,8 +596,8 @@ Open/index/enrichment validation should reject:
          Because the worker only queries the source when a resolver declares
          `candidate_search`, injection is unconditional and needs no open-time
          config discovery. Compiles + passes `public-api-parity-test`; the live
-         link across a real shard boundary still needs the multi-node harness to
-         exercise (no behavior change until a resolver + entity table exist).
+         multi-node e2e exercises the link across a real shard boundary (no
+         behavior change until a resolver + entity table exist).
    - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
          per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
          / `listResolvers` through DB -> DBCore -> IndexManager (verified by a

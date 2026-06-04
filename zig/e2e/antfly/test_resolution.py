@@ -121,15 +121,32 @@ class _Api:
             )
         return response.json() if response.content else {}
 
-    def create_table(self, name: str, *, num_shards: int = 1, indexes: dict | None = None) -> dict:
+    def create_table(
+        self,
+        name: str,
+        *,
+        num_shards: int = 1,
+        indexes: dict | None = None,
+        deadline: "_Deadline | None" = None,
+    ) -> dict:
         payload: dict = {"num_shards": num_shards}
         if indexes is not None:
             payload["indexes"] = indexes
-        return self._check(self.s.post(f"{self.url}/tables/{name}", json=payload, timeout=30))
+        timeout = deadline.request_timeout(30.0) if deadline is not None else 30.0
+        return self._check(self.s.post(f"{self.url}/tables/{name}", json=payload, timeout=timeout))
 
-    def insert(self, table: str, doc_id: str, body: dict, *, sync_level: str = "write") -> dict:
+    def insert(
+        self,
+        table: str,
+        doc_id: str,
+        body: dict,
+        *,
+        sync_level: str = "write",
+        deadline: "_Deadline | None" = None,
+    ) -> dict:
         payload = {"inserts": {doc_id: body}, "sync_level": sync_level}
-        timeout = 120 if sync_level in {"enrichments", "full_index"} else 30
+        max_timeout = 120.0 if sync_level in {"enrichments", "full_index"} else 30.0
+        timeout = deadline.request_timeout(max_timeout) if deadline is not None else max_timeout
         try:
             response = self.s.post(f"{self.url}/tables/{table}/batch", json=payload, timeout=timeout)
         except requests.RequestException as exc:
@@ -162,8 +179,11 @@ class _Deadline:
     def expired(self) -> bool:
         return self.remaining() <= 0.0
 
-    def request_timeout(self) -> float:
-        return max(0.1, min(POLL_REQUEST_TIMEOUT_S, self.remaining()))
+    def request_timeout(self, max_timeout_s: float = POLL_REQUEST_TIMEOUT_S) -> float:
+        remaining = self.remaining()
+        if remaining <= 0.0:
+            raise AssertionError(f"deadline expired after {self.timeout_s}s")
+        return max(0.1, min(max_timeout_s, remaining))
 
     def sleep(self) -> None:
         remaining = self.remaining()
@@ -267,8 +287,8 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
     # across multiple shards in an explicit multi-node metadata/data raft setup.
     # Resolution reads entities cross-shard; promotion writes them cross-shard;
     # graph query hydrates the promoted entity documents through mention edges.
-    api.create_table("entities", num_shards=1)
-    api.create_table("documents", num_shards=3, indexes=DOCUMENTS_INDEXES)
+    api.create_table("entities", num_shards=1, deadline=deadline)
+    api.create_table("documents", num_shards=3, indexes=DOCUMENTS_INDEXES, deadline=deadline)
 
     api.insert(
         "documents",
@@ -281,6 +301,7 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
                 ]
             }
         },
+        deadline=deadline,
     )
 
     # The promoter upserts a canonical entity document per resolved mention into
@@ -301,6 +322,7 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
         "documents",
         "doc:b",
         {"relations": {"entities": [{"id": "e0", "label": "person", "text": "Ada Lovelace"}]}},
+        deadline=deadline,
     )
 
     mentions = _wait_for_mention_hydration(
