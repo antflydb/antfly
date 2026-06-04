@@ -7,7 +7,7 @@ name = "antfly-sdk"
 version = "0.0.2-dev2"
 description = "Python SDK for Antfly distributed key-value store and search engine"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Antfly, Inc.", email = "ajroetker@antfly.io"},
@@ -18,7 +18,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -44,7 +43,7 @@ dev = [
     "requests>=2.32.5",
     "ruff>=0.13.0",
     "openapi-python-client>=0.26.1",
-    "pyright>=1.1.405",
+    "pyright>=1.1.410",
 ]
 
 [tool.hatch.build.targets.wheel]

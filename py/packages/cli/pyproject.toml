@@ -7,7 +7,7 @@ name = "antfly-cli"
 version = "0.0.0"
 description = "Native Antfly CLI installer package"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "Elastic-2.0"}
 authors = [
     {name = "Antfly, Inc.", email = "ajroetker@antfly.io"},
