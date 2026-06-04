@@ -15,6 +15,9 @@
 const std = @import("std");
 const table_manager = @import("table_manager.zig");
 
+const status_heartbeat_refresh_ms: u64 = 30 * std.time.ms_per_s;
+const runtime_status_heartbeat_refresh_ns: u64 = 30 * std.time.ns_per_s;
+
 pub const StoreObservation = table_manager.StoreStatusReport;
 pub const PlacementStatusTag = enum {
     preferred,
@@ -139,7 +142,7 @@ fn groupStatusEqual(
         lhs.disk_bytes == rhs.disk_bytes and
         lhs.empty == rhs.empty and
         lhs.created_at_millis == rhs.created_at_millis and
-        lhs.updated_at_millis == rhs.updated_at_millis and
+        timestampMillisCoalesced(lhs.updated_at_millis, rhs.updated_at_millis) and
         lhs.local_leader == rhs.local_leader and
         lhs.local_voter == rhs.local_voter and
         lhs.voter_count == rhs.voter_count and
@@ -171,7 +174,7 @@ fn runtimeStatusEqual(
         lhs.group_id != rhs.group_id or
         lhs.store_id != rhs.store_id or
         lhs.node_id != rhs.node_id or
-        lhs.updated_at_ns != rhs.updated_at_ns or
+        !timestampNanosCoalesced(lhs.updated_at_ns, rhs.updated_at_ns) or
         !std.mem.eql(u8, lhs.source, rhs.source) or
         !std.mem.eql(u8, lhs.freshness, rhs.freshness) or
         lhs.topology_generation != rhs.topology_generation or
@@ -212,6 +215,16 @@ fn runtimeStatusEqual(
         }
     }
     return true;
+}
+
+fn timestampMillisCoalesced(lhs: u64, rhs: u64) bool {
+    const delta = if (lhs > rhs) lhs - rhs else rhs - lhs;
+    return delta < status_heartbeat_refresh_ms;
+}
+
+fn timestampNanosCoalesced(lhs: u64, rhs: u64) bool {
+    const delta = if (lhs > rhs) lhs - rhs else rhs - lhs;
+    return delta < runtime_status_heartbeat_refresh_ns;
 }
 
 pub fn classifyStore(record: table_manager.StoreRecord) PlacementStatus {
@@ -373,6 +386,66 @@ test "store observer applies multiple observations in place" {
     try std.testing.expectEqual(@as(u32, 8), records[1].write_load);
     try std.testing.expectEqual(@as(u32, 0), records[1].active_backfills);
     try std.testing.expectEqual(@as(u16, 1000), records[1].backfill_progress_millis);
+}
+
+test "store observer coalesces status heartbeat timestamps" {
+    var existing_groups = [_]table_manager.GroupStatusReport{.{
+        .group_id = 101,
+        .doc_count = 7,
+        .disk_bytes = 4096,
+        .empty = false,
+        .created_at_millis = 100,
+        .updated_at_millis = 1_000,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 3,
+    }};
+    var fresh_groups = [_]table_manager.GroupStatusReport{.{
+        .group_id = 101,
+        .doc_count = 7,
+        .disk_bytes = 4096,
+        .empty = false,
+        .created_at_millis = 100,
+        .updated_at_millis = 1_000 + 5 * std.time.ms_per_s,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 3,
+    }};
+    var stale_groups = [_]table_manager.GroupStatusReport{.{
+        .group_id = 101,
+        .doc_count = 7,
+        .disk_bytes = 4096,
+        .empty = false,
+        .created_at_millis = 100,
+        .updated_at_millis = 1_000 + 31 * std.time.ms_per_s,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 3,
+    }};
+
+    const existing = table_manager.StoreRecord{
+        .store_id = 21,
+        .node_id = 1,
+        .role = "data",
+        .failure_domain = "rack-a",
+        .live = true,
+        .health_class = "healthy",
+        .capacity_bytes = 1024,
+        .available_bytes = 900,
+        .group_statuses = existing_groups[0..],
+    };
+    var observation = StoreObservation{
+        .store_id = 21,
+        .live = true,
+        .health_class = "healthy",
+        .capacity_bytes = 1024,
+        .available_bytes = 900,
+        .group_statuses = fresh_groups[0..],
+    };
+    try std.testing.expect(!observationChangesRecord(existing, observation));
+
+    observation.group_statuses = stale_groups[0..];
+    try std.testing.expect(observationChangesRecord(existing, observation));
 }
 
 test "store observer classifies placement status from health and pressure" {
