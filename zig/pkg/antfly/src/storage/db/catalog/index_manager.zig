@@ -30,6 +30,8 @@ const change_journal_mod = @import("../derived/change_journal.zig");
 const derived_types = @import("../derived/derived_types.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const enrichment_catalog = @import("enrichment_catalog.zig");
+const resolver_catalog = @import("resolver_catalog.zig");
+pub const ResolverConfig = resolver_catalog.ResolverConfig;
 const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("../enrichment/artifact_codec.zig");
 const backfill_state_mod = @import("../backfill_state.zig");
@@ -72,6 +74,7 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 
 const index_catalog_key = "\x00\x00__metadata__:indexes";
 const enrichment_catalog_key = "\x00\x00__metadata__:enrichments";
+const resolver_catalog_key = "\x00\x00__metadata__:resolvers";
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
 var bench_hbc_tree_counter: platform.atomic.Value(u64) = .init(0);
 var hbc_coalesce_bulk_writes_cache: std.atomic.Value(u8) = .init(0);
@@ -752,6 +755,7 @@ pub const IndexManager = struct {
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
     algebraic_indexes: std.ArrayListUnmanaged(AlgebraicIndex),
     enrichments: std.ArrayListUnmanaged(enrichment_catalog.EnrichmentConfig),
+    resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
     cached_has_generated_enrichment_targets: std.atomic.Value(bool),
     status_only_index_configs: []types.IndexConfig,
 
@@ -1554,12 +1558,14 @@ pub const IndexManager = struct {
         }
         self.clearStatusOnlyIndexConfigs();
         for (self.enrichments.items) |*entry| entry.deinit(self.alloc);
+        for (self.resolvers.items) |*entry| entry.deinit(self.alloc);
         self.text_indexes.deinit(self.alloc);
         self.dense_indexes.deinit(self.alloc);
         self.sparse_indexes.deinit(self.alloc);
         self.graph_indexes.deinit(self.alloc);
         self.algebraic_indexes.deinit(self.alloc);
         self.enrichments.deinit(self.alloc);
+        self.resolvers.deinit(self.alloc);
         self.alloc.free(self.base_path);
         self.* = undefined;
     }
@@ -2210,6 +2216,7 @@ pub const IndexManager = struct {
         self.bindPrimaryStore(store);
         self.clearStatusOnlyIndexConfigs();
         try self.loadEnrichmentCatalog(store);
+        try self.loadResolverCatalog(store);
 
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -2260,6 +2267,7 @@ pub const IndexManager = struct {
     pub fn loadCatalogOnly(self: *IndexManager, store: anytype) !void {
         self.bindPrimaryStore(store);
         try self.loadEnrichmentCatalog(store);
+        try self.loadResolverCatalog(store);
 
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -2511,6 +2519,120 @@ pub const IndexManager = struct {
             return true;
         }
         return false;
+    }
+
+    pub fn getResolver(self: *const IndexManager, name: []const u8) ?*const resolver_catalog.ResolverConfig {
+        for (self.resolvers.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry;
+        }
+        return null;
+    }
+
+    fn resolverResolutionArtifactInUse(self: *const IndexManager, resolution_artifact: []const u8, except_name: ?[]const u8) bool {
+        for (self.resolvers.items) |entry| {
+            if (except_name) |name| {
+                if (std.mem.eql(u8, entry.name, name)) continue;
+            }
+            if (std.mem.eql(u8, entry.resolution_artifact, resolution_artifact)) return true;
+        }
+        return false;
+    }
+
+    pub const ResolverUpsertResult = enum {
+        inserted,
+        updated_backfill_required,
+        updated_no_backfill,
+    };
+
+    fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
+        return !std.mem.eql(u8, existing.table, next.table) or
+            !std.mem.eql(u8, existing.key_template, next.key_template) or
+            existing.type_must_match != next.type_must_match or
+            !std.mem.eql(u8, existing.scorer_json, next.scorer_json) or
+            !std.mem.eql(u8, existing.candidate_search, next.candidate_search) or
+            !std.mem.eql(u8, existing.candidate_ann_index, next.candidate_ann_index) or
+            existing.candidate_limit != next.candidate_limit or
+            !std.mem.eql(u8, existing.name_embedding, next.name_embedding) or
+            existing.name_embedding_dims != next.name_embedding_dims or
+            !std.mem.eql(u8, existing.fusion_combine, next.fusion_combine) or
+            existing.fusion_trust != next.fusion_trust or
+            existing.fusion_prior != next.fusion_prior or
+            existing.fusion_prior_weight != next.fusion_prior_weight or
+            existing.config_generation != next.config_generation;
+    }
+
+    pub fn addResolver(self: *IndexManager, store: anytype, cfg: resolver_catalog.ResolverConfig) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (self.getResolver(cfg.name) != null) return error.ResolverAlreadyExists;
+        if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
+
+        const checkpoint = self.resolvers.items.len;
+        errdefer self.truncateResolvers(checkpoint);
+        try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        try self.persistResolverCatalog(store, .mark_reresolve_dirty);
+    }
+
+    /// Add or replace a resolver by name. Source/output artifact stream bindings
+    /// are immutable for an existing resolver; material resolver/scorer config
+    /// changes ask the caller to re-resolve existing extraction artifacts because
+    /// their incremental replay hints will not fire on their own.
+    pub fn upsertResolver(self: *IndexManager, store: anytype, cfg: resolver_catalog.ResolverConfig) !ResolverUpsertResult {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        for (self.resolvers.items) |*entry| {
+            if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
+            if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) return error.ResolverSourceArtifactImmutable;
+            if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
+            if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
+            const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
+            var replacement = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
+            errdefer replacement.deinit(self.alloc);
+            entry.deinit(self.alloc);
+            entry.* = replacement;
+            try self.persistResolverCatalog(store, if (material_changed) .mark_reresolve_dirty else .catalog_only);
+            return if (material_changed) .updated_backfill_required else .updated_no_backfill;
+        }
+        if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
+        const checkpoint = self.resolvers.items.len;
+        errdefer self.truncateResolvers(checkpoint);
+        try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        try self.persistResolverCatalog(store, .mark_reresolve_dirty);
+        return .inserted;
+    }
+
+    pub fn removeResolver(self: *IndexManager, store: anytype, name: []const u8) !bool {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        for (self.resolvers.items, 0..) |*entry, i| {
+            if (!std.mem.eql(u8, entry.name, name)) continue;
+            entry.deinit(self.alloc);
+            _ = self.resolvers.orderedRemove(i);
+            try self.persistResolverCatalog(store, .catalog_only);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn listResolvers(self: *const IndexManager, alloc: Allocator) ![]resolver_catalog.ResolverConfig {
+        const out = try alloc.alloc(resolver_catalog.ResolverConfig, self.resolvers.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*cfg| cfg.deinit(alloc);
+            alloc.free(out);
+        }
+        for (self.resolvers.items, 0..) |cfg, i| {
+            out[i] = try resolver_catalog.ResolverConfig.clone(alloc, cfg);
+            initialized += 1;
+        }
+        return out;
+    }
+
+    fn truncateResolvers(self: *IndexManager, len: usize) void {
+        while (self.resolvers.items.len > len) {
+            self.resolvers.items[self.resolvers.items.len - 1].deinit(self.alloc);
+            _ = self.resolvers.pop();
+        }
     }
 
     pub fn remove(self: *IndexManager, store: anytype, name: []const u8) !bool {
@@ -5800,6 +5922,52 @@ pub const IndexManager = struct {
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
         try txn.put(enrichment_catalog_key, data);
+        try txn.commit();
+    }
+
+    fn loadResolverCatalog(self: *IndexManager, store: anytype) !void {
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginRead();
+        defer txn.abort();
+        const data = txn.get(resolver_catalog_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+
+        const configs = try resolver_catalog.deserializeCatalog(self.alloc, data);
+        defer {
+            for (configs) |*cfg| cfg.deinit(self.alloc);
+            self.alloc.free(configs);
+        }
+        for (configs) |cfg| {
+            try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        }
+    }
+
+    const ResolverCatalogPersistMode = enum {
+        catalog_only,
+        mark_reresolve_dirty,
+    };
+
+    fn persistResolverCatalog(self: *IndexManager, store: anytype, mode: ResolverCatalogPersistMode) !void {
+        const data = try resolver_catalog.serializeCatalog(self.alloc, self.resolvers.items);
+        defer self.alloc.free(data);
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(resolver_catalog_key, data);
+        if (mode == .mark_reresolve_dirty) {
+            _ = txn.get(resolver_catalog.reresolve_resume_key) catch |err| switch (err) {
+                error.NotFound => try txn.put(resolver_catalog.reresolve_resume_key, ""),
+                else => return err,
+            };
+            _ = txn.get(resolver_catalog.reresolve_repair_resume_key) catch |err| switch (err) {
+                error.NotFound => try txn.put(resolver_catalog.reresolve_repair_resume_key, ""),
+                else => return err,
+            };
+        }
         try txn.commit();
     }
 
@@ -11136,6 +11304,11 @@ pub const GraphArtifactSource = struct {
     path: []u8 = "",
     format: GraphArtifactFormat = .extraction_relation,
     mapping: GraphArtifactMapping = .{},
+    /// When set, resolution-artifact replay emits
+    /// `doc --<mention_edge_type>--> entity` provenance edges for canonical
+    /// resolver decisions, targeting the resolved DocRef key. Empty disables
+    /// mention-edge provenance.
+    mention_edge_type: []u8 = "",
 
     pub fn clone(alloc: Allocator, source: GraphArtifactSource) !GraphArtifactSource {
         return .{
@@ -11143,6 +11316,7 @@ pub const GraphArtifactSource = struct {
             .path = if (source.path.len > 0) try alloc.dupe(u8, source.path) else "",
             .format = source.format,
             .mapping = try GraphArtifactMapping.clone(alloc, source.mapping),
+            .mention_edge_type = if (source.mention_edge_type.len > 0) try alloc.dupe(u8, source.mention_edge_type) else "",
         };
     }
 
@@ -11150,6 +11324,7 @@ pub const GraphArtifactSource = struct {
         alloc.free(self.artifact_name);
         if (self.path.len > 0) alloc.free(self.path);
         self.mapping.deinit(alloc);
+        if (self.mention_edge_type.len > 0) alloc.free(self.mention_edge_type);
         self.* = undefined;
     }
 };
@@ -11895,10 +12070,16 @@ fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtif
         return error.InvalidIndexConfig;
     } else GraphArtifactFormat.extraction_relation;
 
+    const mention_edge_type = if (source.object.get("mention_edge_type")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        break :blk value.string;
+    } else "";
+
     var out = GraphArtifactSource{
         .artifact_name = try alloc.dupe(u8, artifact.string),
         .path = if (path.len > 0) try alloc.dupe(u8, path) else "",
         .format = format,
+        .mention_edge_type = if (mention_edge_type.len > 0) try alloc.dupe(u8, mention_edge_type) else "",
     };
     errdefer out.deinit(alloc);
     out.mapping = try parseGraphArtifactMapping(alloc, root);

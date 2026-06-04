@@ -105,8 +105,8 @@ if [[ "$manifest" == true ]]; then
     --region="$gcp_region" \
     --worker-pool="$worker_pool" \
     --config=zig/cloudbuild.manifest.yaml \
-    --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=zig-${tag},_ALIAS_TAG=__skip_alias__,_AMD64_TAG=zig-${tag}-amd64,_ARM64_TAG=zig-${tag}-arm64"
-  inspect_image "${image_base}:zig-${tag}"
+    --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${tag},_ALIAS_TAG=__skip_alias__,_AMD64_TAG=${tag}-amd64,_ARM64_TAG=${tag}-arm64"
+  inspect_image "${image_base}:${tag}"
   exit 0
 fi
 
@@ -140,19 +140,19 @@ tar -C "$out_dir" -czf "$tmpdir/antfly-zig-${arch}.tar.gz" bin share
 echo "Uploading $artifact_uri"
 gcloud storage cp "$tmpdir/antfly-zig-${arch}.tar.gz" "$artifact_uri" --project="$gcp_project"
 
-echo "Packaging ${image_base}:zig-${tag}-${arch}"
+echo "Packaging ${image_base}:${tag}-${arch}"
 gcloud builds submit "$repo_root" \
   --project="$gcp_project" \
   --region="$gcp_region" \
   --worker-pool="$worker_pool" \
   --config=zig/cloudbuild.runtime.yaml \
-  --substitutions="_ARTIFACT_URI=${artifact_uri},_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=zig-${tag}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
+  --substitutions="_ARTIFACT_URI=${artifact_uri},_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${tag}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
 
-inspect_image "${image_base}:zig-${tag}-${arch}"
+inspect_image "${image_base}:${tag}-${arch}"
 
 cat <<EOF
 
-Pushed: ${image_base}:zig-${tag}-${arch}
+Pushed: ${image_base}:${tag}-${arch}
 
 To create the multi-arch tag after both arch images exist:
   scripts/publish-zig-runtime-dev.sh --tag ${tag} --manifest

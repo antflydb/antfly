@@ -437,6 +437,7 @@ pub const LsmStorageStatus = struct {
 /// MongoDB-style update operator
 pub const TransformOpType = enum {
     @"$set",
+    @"$set_on_insert",
     @"$unset",
     @"$inc",
     @"$push",
@@ -452,6 +453,7 @@ pub const TransformOpType = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .@"$set" => "$set",
+            .@"$set_on_insert" => "$setOnInsert",
             .@"$unset" => "$unset",
             .@"$inc" => "$inc",
             .@"$push" => "$push",
@@ -474,6 +476,7 @@ pub const TransformOpType = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "$set", .@"$set" },
+            .{ "$setOnInsert", .@"$set_on_insert" },
             .{ "$unset", .@"$unset" },
             .{ "$inc", .@"$inc" },
             .{ "$push", .@"$push" },
@@ -1466,7 +1469,7 @@ pub const TransformOp = struct {
     op: TransformOpType,
     /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
     path: []const u8,
-    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set, etc.)
+    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
     value: ?std.json.Value = null,
 };
 

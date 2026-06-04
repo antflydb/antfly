@@ -69,15 +69,23 @@ jobs:
     runs-on: arc-antfly-heavy
     env:
       PNPM_STORE_PATH: /mnt/cache/pnpm-store
-      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
-      XDG_CACHE_HOME: ${{ runner.temp }}/xdg
-      TMPDIR: ${{ runner.temp }}/tmp
     defaults:
       run:
         working-directory: ts
     steps:
-      - name: Prepare cache directories
-        run: mkdir -p "$PNPM_STORE_PATH" "$PLAYWRIGHT_BROWSERS_PATH" "$XDG_CACHE_HOME" "$TMPDIR"
+      - name: Configure cache directories
+        run: |
+          playwright_browsers_path="${RUNNER_TEMP}/playwright-browsers"
+          xdg_cache_home="${RUNNER_TEMP}/xdg"
+          tmpdir="${RUNNER_TEMP}/tmp"
+
+          {
+            echo "PLAYWRIGHT_BROWSERS_PATH=${playwright_browsers_path}"
+            echo "XDG_CACHE_HOME=${xdg_cache_home}"
+            echo "TMPDIR=${tmpdir}"
+          } >> "$GITHUB_ENV"
+
+          mkdir -p "$PNPM_STORE_PATH" "$playwright_browsers_path" "$xdg_cache_home" "$tmpdir"
         working-directory: .
 
       - uses: actions/checkout@v6

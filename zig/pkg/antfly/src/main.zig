@@ -90,6 +90,10 @@ fn runAntflyCloud(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
 }
 
 fn runAntflyCloudArgv(io: std.Io, argv: []const []const u8) !u8 {
+    return runAntflyCloudArgvMaybeReport(io, argv, true);
+}
+
+fn runAntflyCloudArgvMaybeReport(io: std.Io, argv: []const []const u8, report_missing: bool) !u8 {
     var child = std.process.spawn(io, .{
         .argv = argv,
         .stdin = .inherit,
@@ -97,7 +101,7 @@ fn runAntflyCloudArgv(io: std.Io, argv: []const []const u8) !u8 {
         .stderr = .inherit,
     }) catch |err| switch (err) {
         error.FileNotFound => {
-            printMissingAntflyCloud();
+            if (report_missing) printMissingAntflyCloud();
             return 127;
         },
         else => return err,
@@ -221,7 +225,7 @@ test "cloud shim argv starts with antfly-cloud and preserves args" {
 }
 
 test "cloud shim reports missing antfly-cloud as 127" {
-    const code = try runAntflyCloudArgv(std.testing.io, &.{"definitely-missing-antfly-cloud-for-test"});
+    const code = try runAntflyCloudArgvMaybeReport(std.testing.io, &.{"definitely-missing-antfly-cloud-for-test"}, false);
     try std.testing.expectEqual(@as(u8, 127), code);
 }
 

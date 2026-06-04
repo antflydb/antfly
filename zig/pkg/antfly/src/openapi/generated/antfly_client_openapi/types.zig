@@ -479,6 +479,7 @@ pub const LsmStorageStatus = struct {
 /// MongoDB-style update operator
 pub const TransformOpType = enum {
     @"$set",
+    @"$set_on_insert",
     @"$unset",
     @"$inc",
     @"$push",
@@ -494,6 +495,7 @@ pub const TransformOpType = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .@"$set" => "$set",
+            .@"$set_on_insert" => "$setOnInsert",
             .@"$unset" => "$unset",
             .@"$inc" => "$inc",
             .@"$push" => "$push",
@@ -516,6 +518,7 @@ pub const TransformOpType = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "$set", .@"$set" },
+            .{ "$setOnInsert", .@"$set_on_insert" },
             .{ "$unset", .@"$unset" },
             .{ "$inc", .@"$inc" },
             .{ "$push", .@"$push" },
@@ -2858,35 +2861,6 @@ pub const InferenceRerankObject = struct {
     score: f32,
 };
 
-pub const InferenceRecognizeEntity = struct {
-    /// The entity text
-    text: []const u8,
-    /// Entity type (PER, ORG, LOC, MISC)
-    label: []const u8,
-    /// Character offset where entity begins
-    start: i64,
-    /// Character offset where entity ends (exclusive)
-    end: i64,
-    /// Confidence score (0.0 to 1.0)
-    score: f32,
-};
-
-/// Configuration for entity resolution. When present in a RecognizeRequest, the response entities and relations are deduplicated via entity resolution (e.g., "Elon Musk" and "Musk" are merged into a single entity).
-pub const InferenceResolverConfig = struct {
-    /// Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
-    similarity_threshold: ?f32 = null,
-    /// Whether entity types must match for merging
-    type_must_match: ?bool = null,
-    /// Minimum confidence score for entities to be included
-    min_entity_confidence: ?f32 = null,
-    /// Minimum confidence score for relations to be included
-    min_relation_confidence: ?f32 = null,
-    /// Whether to deduplicate relations after entity resolution
-    deduplicate_relations: ?bool = null,
-    /// Whether to track mention provenance for resolved entities
-    track_provenance: ?bool = null,
-};
-
 pub const InferenceRewriteRequest = struct {
     /// Name of Seq2Seq rewriter model from models_dir/rewriters/
     model: []const u8,
@@ -2900,97 +2874,6 @@ pub const InferenceRewriteObject = struct {
     index: i64,
     /// Rewritten texts for this input, one per beam.
     texts: []const []const u8,
-};
-
-pub const InferenceClassifyRequest = struct {
-    /// Name of classifier model from models_dir/classifiers/
-    model: []const u8,
-    /// Texts to classify
-    texts: []const []const u8,
-    /// Candidate labels for zero-shot classification. The model will predict which label(s) best describe each text.
-    labels: []const []const u8,
-    /// Custom hypothesis template for NLI-based classification. Use "{}" as placeholder for the label. Default: "This example is {}."
-    hypothesis_template: ?[]const u8 = null,
-    /// If true, allows multiple labels per text (independent scoring). If false (default), scores are normalized across labels.
-    multi_label: ?bool = null,
-};
-
-pub const InferenceClassifyResult = struct {
-    /// The predicted class/category
-    label: []const u8,
-    /// Confidence score (0.0 to 1.0)
-    score: f32,
-};
-
-pub const InferenceDocumentClassificationRequest = struct {
-    /// Name or path of the document classification model directory or checkpoint
-    model: []const u8,
-    /// Absolute or server-local path to the page image
-    image_path: []const u8,
-    /// Number of OCR/text tokens associated with the page
-    num_tokens: i64,
-    /// Labels in the same order expected by the checkpoint output head
-    labels: []const []const u8,
-    /// Optional tensor prefix inside the safetensors checkpoint
-    prefix: ?[]const u8 = null,
-};
-
-pub const InferenceDocumentClassificationFeatures = struct {
-    num_tokens: i64,
-    image_width: i64,
-    image_height: i64,
-    image_components: i64,
-    mean_darkness: f32,
-    std_darkness: f32,
-    top_darkness: f32,
-    bottom_darkness: f32,
-    left_darkness: f32,
-    right_darkness: f32,
-    center_darkness: f32,
-};
-
-pub const InferenceDocumentClassificationResult = struct {
-    label: []const u8,
-    score: f32,
-};
-
-pub const InferenceDocumentTokenBox = struct {
-    text: []const u8,
-    /// Bounding box normalized to the same 0-1000 layout space used by training
-    bbox: []const i64,
-};
-
-pub const InferenceDocumentTokenClassificationFeatures = struct {
-    text_length: i64,
-    bbox: []const i64,
-    width: f32,
-    height: f32,
-    relative_position: f32,
-    bbox_phase_sin: f32,
-};
-
-pub const InferenceDocumentTokenClassificationResult = struct {
-    label: []const u8,
-    score: f32,
-};
-
-pub const InferenceExtractFieldValue = struct {
-    /// The extracted text value
-    value: []const u8,
-    /// Confidence score (only present when include_confidence=true)
-    score: ?f32 = null,
-    /// Character offset where value begins (only present when include_spans=true)
-    start: ?i64 = null,
-    /// Character offset where value ends (only present when include_spans=true)
-    end: ?i64 = null,
-};
-
-pub const InferenceExtractObject = struct {
-    object: []const u8,
-    /// Original input index.
-    index: i64,
-    /// Extraction result for this input. Maps structure names to arrays of extracted instances. Each instance maps field names to ExtractFieldValue (for ::str fields) or arrays of ExtractFieldValue (for ::list fields).
-    results: std.json.ArrayHashMap([]const std.json.Value),
 };
 
 pub const InferenceTextRegion = struct {
@@ -3366,7 +3249,7 @@ pub const TransformOp = struct {
     op: TransformOpType,
     /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
     path: []const u8,
-    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set, etc.)
+    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
     value: ?std.json.Value = null,
 };
 
@@ -4203,67 +4086,6 @@ pub const InferenceAudioChunkConfig = struct {
     vad: ?InferenceVADOptions = null,
 };
 
-pub const InferenceRelation = struct {
-    /// The subject/head entity in the relationship
-    head: InferenceRecognizeEntity,
-    /// The object/tail entity in the relationship
-    tail: InferenceRecognizeEntity,
-    /// The relationship type
-    label: []const u8,
-    /// Confidence score for the relation (0.0 to 1.0)
-    score: f32,
-};
-
-pub const InferenceRecognizeRequest = struct {
-    /// Name of recognizer model from models_dir/recognizers/
-    model: []const u8,
-    /// Texts to extract entities from
-    texts: []const []const u8,
-    /// Custom entity labels to extract (GLiNER models only). When using a GLiNER model, you can specify any entity types to extract, enabling zero-shot NER without model retraining. If not provided, the model's default labels are used.
-    labels: ?[]const []const u8 = null,
-    /// Relation types to extract (for models with 'relations' capability). Only used when the model supports relation extraction (GLiNER multitask, REBEL). Relation extraction runs only when this array is provided and non-empty. GLiNER labels may be relation names (works_for), head-qualified labels (person::works_for), or head/tail-qualified labels (person::works_for::organization).
-    relation_labels: ?[]const []const u8 = null,
-    resolver: ?InferenceResolverConfig = null,
-};
-
-pub const InferenceClassifyObject = struct {
-    object: []const u8,
-    /// Original input text index.
-    index: i64,
-    /// Classification results for this input text.
-    classifications: []const InferenceClassifyResult,
-};
-
-pub const InferenceDocumentClassificationObject = struct {
-    object: []const u8,
-    index: i64,
-    checkpoint_path: []const u8,
-    prefix: []const u8,
-    input: std.json.Value,
-    features: InferenceDocumentClassificationFeatures,
-    best: ?std.json.Value = null,
-    scores: []const InferenceDocumentClassificationResult,
-};
-
-pub const InferenceDocumentTokenClassificationRequest = struct {
-    /// Name or path of the document token classification model directory or checkpoint
-    model: []const u8,
-    /// Labels in the same order expected by the checkpoint output head
-    labels: []const []const u8,
-    tokens: []const InferenceDocumentTokenBox,
-    /// Optional tensor prefix inside the safetensors checkpoint
-    prefix: ?[]const u8 = null,
-};
-
-pub const InferenceDocumentTokenClassificationPrediction = struct {
-    token_index: i64,
-    text: []const u8,
-    bbox: []const i64,
-    features: InferenceDocumentTokenClassificationFeatures,
-    best: ?std.json.Value = null,
-    scores: []const InferenceDocumentTokenClassificationResult,
-};
-
 pub const InferenceReadResult = struct {
     /// Extracted text from the image
     text: []const u8,
@@ -4303,16 +4125,6 @@ pub const InferenceRewriteResponse = struct {
     /// Rewritten text objects, one per input.
     data: []const InferenceRewriteObject,
     /// Name of model used for rewriting
-    model: []const u8,
-    usage: InferenceGenerateUsage,
-};
-
-pub const InferenceExtractResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Extraction result objects, one per input.
-    data: []const InferenceExtractObject,
-    /// Name of model used for extraction
     model: []const u8,
     usage: InferenceGenerateUsage,
 };
@@ -4856,30 +4668,6 @@ pub const ContentPart = union(enum) {
 
 pub const InferenceImageURLContentPart = ImageURLContentPart;
 
-/// Exactly one of `texts` or `images` must be provided. When using `images`, the server selects a compatible reader internally and processes the request as: read document text -> run structured extraction.
-pub const InferenceExtractRequest = struct {
-    /// Name of extractor model with 'extraction' capability
-    model: []const u8,
-    /// Texts to extract structured data from
-    texts: ?[]const []const u8 = null,
-    /// Optional images to extract structured data from. When provided, the server first reads document text with a compatible reader and then runs schema extraction on the read text.
-    images: ?[]const InferenceImageURL = null,
-    /// Optional read-stage prompt used only when `images` are provided. Passed through to the reader before schema extraction.
-    prompt: ?[]const u8 = null,
-    /// Maximum tokens for the read stage when `images` are provided. Ignored for text-only extraction requests.
-    max_tokens: ?i64 = null,
-    /// Extraction schema mapping structure names to field definitions. Each field is defined as "field_name::type" where type is "str" or "list". Optional choice fields: "field_name::[opt1|opt2]::str". If no type is specified, defaults to "str".
-    schema: std.json.ArrayHashMap([]const []const u8),
-    /// Score threshold for span extraction (0.0-1.0)
-    threshold: ?f32 = null,
-    /// If true, don't allow nested/overlapping entities
-    flat_ner: ?bool = null,
-    /// If true, include confidence scores in output
-    include_confidence: ?bool = null,
-    /// If true, include character offset spans in output
-    include_spans: ?bool = null,
-};
-
 pub const InferenceReadRequest = struct {
     /// Name of reader model from models_dir/readers/
     model: []const u8,
@@ -4949,44 +4737,6 @@ pub const InferenceChunkConfig = struct {
     threshold: ?f32 = null,
     text: ?InferenceTextChunkOptions = null,
     audio: ?InferenceAudioChunkConfig = null,
-};
-
-pub const InferenceRecognizeObject = struct {
-    object: []const u8,
-    /// Original input text index.
-    index: i64,
-    /// Entities recognized for this input text.
-    entities: []const InferenceRecognizeEntity,
-    /// Relations recognized for this input text. Only present when using a model with 'relations' capability (GLiNER multitask, REBEL).
-    relations: ?[]const InferenceRelation = null,
-};
-
-pub const InferenceClassifyResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Classification result objects, one per input text.
-    data: []const InferenceClassifyObject,
-    /// Name of model used for classification
-    model: []const u8,
-    usage: InferenceGenerateUsage,
-};
-
-pub const InferenceDocumentClassificationResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    data: []const InferenceDocumentClassificationObject,
-    model: []const u8,
-    usage: InferenceGenerateUsage,
-};
-
-pub const InferenceDocumentTokenClassificationObject = struct {
-    object: []const u8,
-    index: i64,
-    checkpoint_path: []const u8,
-    prefix: []const u8,
-    num_tokens: i64,
-    /// Token classification predictions sorted by score descending.
-    predictions: []const InferenceDocumentTokenClassificationPrediction,
 };
 
 pub const InferenceReadObject = struct {
@@ -5275,9 +5025,6 @@ pub const InferenceEmbedRequest = struct {
     input_type: ?[]const u8 = null,
 };
 
-/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
-pub const InferenceChatMessageContent = std.json.Value;
-
 pub const InferenceGenerateChoice = struct {
     /// Index of this choice in the list
     index: i64,
@@ -5293,24 +5040,6 @@ pub const InferenceChunkRequest = struct {
     /// DEPRECATED: Use 'input' instead. Text to chunk.
     text: ?[]const u8 = null,
     config: ?InferenceChunkConfig = null,
-};
-
-pub const InferenceRecognizeResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Recognition result objects, one per input text.
-    data: []const InferenceRecognizeObject,
-    /// Name of model used for NER
-    model: []const u8,
-    usage: InferenceGenerateUsage,
-};
-
-pub const InferenceDocumentTokenClassificationResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    data: []const InferenceDocumentTokenClassificationObject,
-    model: []const u8,
-    usage: InferenceGenerateUsage,
 };
 
 pub const InferenceReadResponse = struct {

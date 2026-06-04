@@ -1,0 +1,41 @@
+{
+  "name": "@antfly/cli",
+  "version": "0.0.0",
+  "description": "Native Antfly CLI installer package",
+  "license": "Elastic-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antflydb/antfly.git",
+    "directory": "ts/packages/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/antflydb/antfly/issues"
+  },
+  "homepage": "https://antfly.io",
+  "bin": {
+    "antfly": "bin/antfly.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --check ./bin/antfly.js"
+  },
+  "optionalDependencies": {
+    "@antfly/cli-darwin-arm64": "workspace:*",
+    "@antfly/cli-linux-arm64": "workspace:*",
+    "@antfly/cli-linux-x64": "workspace:*"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ]
+}

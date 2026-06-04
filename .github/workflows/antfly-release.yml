@@ -11,7 +11,100 @@ permissions:
   id-token: write # Required for keyless OIDC signing in container workflow
 
 jobs:
+  build-zig-runtime-archives:
+    name: Build Zig archive (${{ matrix.artifact_name }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_name: antfly-zig-linux-amd64
+            runner: arc-antfly-publish
+            os: linux
+            zig_arch: x86_64
+            zig_target: x86_64-linux-musl
+            archive_os: Linux
+            archive_arch: x86_64
+            metal: "false"
+            system_blas: "false"
+            zig_optimize: ReleaseFast
+            zig_jobs: ""
+          - artifact_name: antfly-zig-linux-arm64
+            runner: arc-antfly-publish-arm64
+            os: linux
+            zig_arch: aarch64
+            zig_target: aarch64-linux-musl
+            archive_os: Linux
+            archive_arch: arm64
+            metal: "false"
+            system_blas: "false"
+            zig_optimize: ReleaseSmall
+            zig_jobs: "1"
+          - artifact_name: antfly-zig-darwin-arm64
+            runner: macos-15
+            os: darwin
+            zig_target: aarch64-macos
+            archive_os: Darwin
+            archive_arch: arm64
+            metal: "true"
+            system_blas: "true"
+            zig_optimize: ReleaseFast
+            zig_jobs: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install Linux build dependencies
+        if: ${{ matrix.os == 'linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates
+
+      - name: Install Zig (Linux)
+        if: ${{ matrix.os == 'linux' }}
+        run: |
+          curl -L "https://ziglang.org/download/0.16.0/zig-${{ matrix.zig_arch }}-linux-0.16.0.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Install Zig (macOS)
+        if: ${{ matrix.os == 'darwin' }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build archive
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="antfly_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}.tar.gz"
+          jobs_arg=()
+          if [ -n "${{ matrix.zig_jobs }}" ]; then
+            jobs_arg=(--jobs "${{ matrix.zig_jobs }}")
+          fi
+          scripts/packaging/build_zig_release_archive.sh \
+            --version "$version" \
+            --target "${{ matrix.zig_target }}" \
+            --optimize "${{ matrix.zig_optimize }}" \
+            "${jobs_arg[@]}" \
+            --archive-name "$archive" \
+            --out-dir dist/release-archives \
+            --metal "${{ matrix.metal }}" \
+            --system-blas "${{ matrix.system_blas }}"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/release-archives/*.tar.gz
+          if-no-files-found: error
+
   goreleaser:
+    needs: build-zig-runtime-archives
     runs-on: arc-antfly-heavy
     env:
       GOEXPERIMENT: simd
@@ -43,6 +136,18 @@ jobs:
         with:
           node-version: lts/*
 
+      - name: Download native Zig runtime archives
+        uses: actions/download-artifact@v6
+        with:
+          pattern: antfly-zig-*
+          merge-multiple: true
+          path: prebuilt-zig
+
+      - name: Generate native Zig archive checksums
+        run: |
+          cd prebuilt-zig
+          shasum -a 256 antfly_*.tar.gz > antfly_zig_checksums.txt
+
       - name: Install protoc
         run: |
           # Install protoc 33.1 (supports Protobuf Editions)
@@ -56,10 +161,10 @@ jobs:
       - name: Install protoc-gen-go
         run: go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10
 
-      - name: Install ARM64 cross-compiler
+      - name: Install release dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu xz-utils
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -108,22 +213,29 @@ jobs:
 
       - name: Set macOS SDK path
         run: |
-          echo "SDK_PATH=/tmp/macos-sdk/MacOSX15.5.sdk" >> $GITHUB_ENV
+          echo "SDK_PATH=/tmp/macos-sdk/MacOSX15.5.sdk" >> "$GITHUB_ENV"
           # Verify required headers exist (mach headers are in Kernel.framework, not usr/include)
           echo "Checking for mach headers in Kernel.framework..."
-          ls -la /tmp/macos-sdk/MacOSX15.5.sdk/System/Library/Frameworks/Kernel.framework/Versions/A/Headers/mach/ | head -20 || echo "WARNING: mach headers not found in Kernel.framework"
-          ls /tmp/macos-sdk/MacOSX15.5.sdk/System/Library/Frameworks/Kernel.framework/Versions/A/Headers/mach/mach_vm.h || echo "WARNING: mach_vm.h not found"
+          mach_headers="/tmp/macos-sdk/MacOSX15.5.sdk/System/Library/Frameworks/Kernel.framework/Versions/A/Headers/mach"
+          if [ -d "$mach_headers" ]; then
+            find "$mach_headers" -maxdepth 1 -mindepth 1 -print | head -20
+          else
+            echo "WARNING: mach headers not found in Kernel.framework"
+          fi
+          test -f "$mach_headers/mach_vm.h" || echo "WARNING: mach_vm.h not found"
 
       - name: Configure Go for private modules
         run: |
-          echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
-          echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
-          echo "ONNXRUNTIME_ROOT=${{ github.workspace }}/onnxruntime" >> $GITHUB_ENV
-          echo "PJRT_ROOT=${{ github.workspace }}/pjrt" >> $GITHUB_ENV
+          {
+            echo "GONOPROXY=github.com/antflydb/antfly"
+            echo "GOPRIVATE=github.com/antflydb/antfly"
+            echo "ONNXRUNTIME_ROOT=${{ github.workspace }}/onnxruntime"
+            echo "PJRT_ROOT=${{ github.workspace }}/pjrt"
+          } >> "$GITHUB_ENV"
 
       - name: Extract version from tag
         run: |
-          echo "GORELEASER_CURRENT_TAG=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          echo "GORELEASER_CURRENT_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
           echo "Release version: ${GITHUB_REF_NAME}"
 
       - name: Run GoReleaser
@@ -139,10 +251,178 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
 
+  package-cli-artifacts:
+    name: Build CLI package artifacts
+    needs:
+      - build-zig-runtime-archives
+      - goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release archives
+        uses: actions/download-artifact@v6
+        with:
+          pattern: antfly-zig-*
+          merge-multiple: true
+          path: dist/release-archives
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+          registry-url: https://registry.npmjs.org/
+
+      - name: Build wheels and populate npm packages
+        run: |
+          python scripts/packaging/package_cli_release.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --archive-dir dist/release-archives \
+            --out-dir dist/cli-packages
+
+      - name: Smoke check package wrappers
+        run: |
+          python -m compileall -q py/packages/cli/src/antfly_cli
+          node --check ts/packages/cli/bin/antfly.js
+
+      - name: Pack npm packages
+        run: |
+          set -euo pipefail
+          mkdir -p dist/cli-packages/npm
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-darwin-arm64
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-arm64
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-x64
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli
+
+      - name: Upload Python wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: antfly-cli-wheels
+          path: dist/cli-packages/python/*.whl
+
+      - name: Upload npm tarballs
+        uses: actions/upload-artifact@v6
+        with:
+          name: antfly-cli-npm
+          path: dist/cli-packages/npm/*.tgz
+
+  publish-cli-pypi:
+    name: Publish antfly-cli to PyPI
+    needs: package-cli-artifacts
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/antfly-cli
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: antfly-cli-wheels
+          path: dist/
+
+      - name: Publish wheels
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-cli-npm:
+    name: Publish @antfly/cli to npm
+    needs: package-cli-artifacts
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: antfly-cli-npm
+          path: dist/
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+          registry-url: https://registry.npmjs.org/
+
+      - name: Upgrade npm for OIDC support
+        run: npm install -g npm@latest
+
+      - name: Publish npm packages
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          npm_tag="latest"
+          case "$version" in
+            *-*) npm_tag="next" ;;
+          esac
+          echo "Publishing CLI npm packages with dist-tag: ${npm_tag}"
+          npm publish dist/antfly-cli-darwin-arm64-*.tgz --access public --provenance --tag "$npm_tag"
+          npm publish dist/antfly-cli-linux-arm64-*.tgz --access public --provenance --tag "$npm_tag"
+          npm publish dist/antfly-cli-linux-x64-*.tgz --access public --provenance --tag "$npm_tag"
+          npm publish dist/antfly-cli-[0-9]*.tgz --access public --provenance --tag "$npm_tag"
+
+  publish-zig-homebrew:
+    name: Publish antfly Homebrew formula
+    needs:
+      - build-zig-runtime-archives
+      - goreleaser
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download release archives
+        uses: actions/download-artifact@v6
+        with:
+          pattern: antfly-zig-*
+          merge-multiple: true
+          path: dist/release-archives
+
+      - name: Render formula
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python scripts/packaging/render_homebrew_antfly_formula.py \
+            --version "$version" \
+            --tag "$GITHUB_REF_NAME" \
+            --archive-dir dist/release-archives \
+            --out "$RUNNER_TEMP/antfly.rb"
+
+      - name: Push formula to tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          tap_dir="$RUNNER_TEMP/homebrew-taps"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/antflydb/homebrew-taps.git" "$tap_dir"
+          cp "$RUNNER_TEMP/antfly.rb" "$tap_dir/Formula/antfly.rb"
+          cd "$tap_dir"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Formula/antfly.rb; then
+            echo "Formula unchanged"
+            exit 0
+          fi
+          git add Formula/antfly.rb
+          git commit -m "Update antfly to ${GITHUB_REF_NAME}"
+          git push origin HEAD:main
+
   # Build and publish container images after release
   publish-container:
-    needs: goreleaser
+    needs:
+      - build-zig-runtime-archives
+      - goreleaser
+      - publish-cli-pypi
+      - publish-cli-npm
     uses: ./.github/workflows/antfly-container.yml
     with:
       tag_name: ${{ github.ref_name }}
+      artifact_source: github
     secrets: inherit

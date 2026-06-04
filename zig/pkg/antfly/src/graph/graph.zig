@@ -359,6 +359,18 @@ pub const GraphIndex = struct {
             }
         }
 
+        fn ensureDurableEmptyManifest(self: *ReverseStoreOwner) !void {
+            switch (self.*) {
+                .none, .mem, .lmdb => {},
+                .lsm => |*handle| {
+                    if (handle.backend.options.backend.read_only) return;
+                    if (handle.backend.manifest_backing != null) return;
+                    if (handle.backend.runs.items.len != 0) return;
+                    try handle.backend.persistManifest();
+                },
+            }
+        }
+
         fn checkpointLsmWalAfterDurableBoundary(self: *ReverseStoreOwner) !void {
             switch (self.*) {
                 .none, .mem, .lmdb => {},
@@ -657,6 +669,8 @@ pub const GraphIndex = struct {
             reverse_store.store.deinit();
             reverse_store.owner.close(alloc);
         }
+        try outgoing_store.owner.ensureDurableEmptyManifest();
+        try reverse_store.owner.ensureDurableEmptyManifest();
         const loaded_stats = try loadGraphCounters(&reverse_store.store);
 
         return .{

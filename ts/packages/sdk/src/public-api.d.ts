@@ -2295,6 +2295,23 @@ export interface components {
             config: components["schemas"]["IndexConfig"];
             status: components["schemas"]["IndexStats"];
         };
+        /** @description Compact LSM backend operational status. Detailed low-level counters are available through metrics. */
+        LsmStorageStatus: {
+            /** Format: uint64 */
+            run_count?: number;
+            /** Format: uint64 */
+            run_bytes?: number;
+            /** Format: uint64 */
+            l0_run_count?: number;
+            /** Format: uint64 */
+            l0_bytes?: number;
+            /** Format: uint64 */
+            wal_retained_bytes?: number;
+            /** Format: uint64 */
+            compaction_backlog_bytes?: number;
+            /** Format: uint64 */
+            active_readers?: number;
+        };
         StorageStatus: {
             /**
              * Format: uint64
@@ -2303,6 +2320,7 @@ export interface components {
             disk_usage?: number;
             /** @description Whether the table has received data. */
             empty?: boolean;
+            lsm?: components["schemas"]["LsmStorageStatus"];
         };
         TableStatus: components["schemas"]["Table"] & {
             storage_status: components["schemas"]["StorageStatus"];
@@ -8134,293 +8152,6 @@ export interface components {
             /** @description Rewritten texts for this input, one per beam. */
             texts: string[];
         };
-        InferenceDocumentClassificationRequest: {
-            /**
-             * @description Name or path of the document classification model directory or checkpoint
-             * @example acme/layoutdoc-invoice-sequence
-             */
-            model: string;
-            /**
-             * @description Absolute or server-local path to the page image
-             * @example /tmp/page.png
-             */
-            image_path: string;
-            /**
-             * @description Number of OCR/text tokens associated with the page
-             * @example 42
-             */
-            num_tokens: number;
-            /**
-             * @description Labels in the same order expected by the checkpoint output head
-             * @example [
-             *       "invoice",
-             *       "form",
-             *       "email"
-             *     ]
-             */
-            labels: string[];
-            /**
-             * @description Optional tensor prefix inside the safetensors checkpoint
-             * @default layoutdoc_sequence_head
-             * @example layoutdoc_sequence_head
-             */
-            prefix?: string;
-        };
-        InferenceDocumentClassificationFeatures: {
-            num_tokens: number;
-            image_width: number;
-            image_height: number;
-            image_components: number;
-            /** Format: float */
-            mean_darkness: number;
-            /** Format: float */
-            std_darkness: number;
-            /** Format: float */
-            top_darkness: number;
-            /** Format: float */
-            bottom_darkness: number;
-            /** Format: float */
-            left_darkness: number;
-            /** Format: float */
-            right_darkness: number;
-            /** Format: float */
-            center_darkness: number;
-        };
-        InferenceDocumentClassificationResult: {
-            label: string;
-            /** Format: float */
-            score: number;
-        };
-        InferenceDocumentClassificationResponse: {
-            /**
-             * @description Object type, always "list"
-             * @enum {string}
-             */
-            object: "list";
-            data: components["schemas"]["InferenceDocumentClassificationObject"][];
-            model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
-        };
-        InferenceDocumentClassificationObject: {
-            /** @enum {string} */
-            object: "document.classification";
-            index: number;
-            checkpoint_path: string;
-            prefix: string;
-            input: {
-                image_path: string;
-                num_tokens: number;
-            };
-            features: components["schemas"]["InferenceDocumentClassificationFeatures"];
-            best?: components["schemas"]["InferenceDocumentClassificationResult"] | null;
-            scores: components["schemas"]["InferenceDocumentClassificationResult"][];
-        };
-        InferenceDocumentTokenBox: {
-            text: string;
-            /**
-             * @description Bounding box normalized to the same 0-1000 layout space used by training
-             * @example [
-             *       0,
-             *       0,
-             *       120,
-             *       24
-             *     ]
-             */
-            bbox: number[];
-        };
-        InferenceDocumentTokenClassificationRequest: {
-            /**
-             * @description Name or path of the document token classification model directory or checkpoint
-             * @example acme/layoutdoc-token-tags
-             */
-            model: string;
-            /**
-             * @description Labels in the same order expected by the checkpoint output head
-             * @example [
-             *       "O",
-             *       "B-KEY",
-             *       "I-KEY"
-             *     ]
-             */
-            labels: string[];
-            tokens: components["schemas"]["InferenceDocumentTokenBox"][];
-            /**
-             * @description Optional tensor prefix inside the safetensors checkpoint
-             * @default layoutdoc_token_head
-             * @example layoutdoc_token_head
-             */
-            prefix?: string;
-        };
-        InferenceDocumentTokenClassificationFeatures: {
-            text_length: number;
-            bbox: number[];
-            /** Format: float */
-            width: number;
-            /** Format: float */
-            height: number;
-            /** Format: float */
-            relative_position: number;
-            /** Format: float */
-            bbox_phase_sin: number;
-        };
-        InferenceDocumentTokenClassificationResult: {
-            label: string;
-            /** Format: float */
-            score: number;
-        };
-        InferenceDocumentTokenClassificationPrediction: {
-            token_index: number;
-            text: string;
-            bbox: number[];
-            features: components["schemas"]["InferenceDocumentTokenClassificationFeatures"];
-            best?: components["schemas"]["InferenceDocumentTokenClassificationResult"] | null;
-            scores: components["schemas"]["InferenceDocumentTokenClassificationResult"][];
-        };
-        InferenceDocumentTokenClassificationResponse: {
-            /**
-             * @description Object type, always "list"
-             * @enum {string}
-             */
-            object: "list";
-            data: components["schemas"]["InferenceDocumentTokenClassificationObject"][];
-            model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
-        };
-        InferenceDocumentTokenClassificationObject: {
-            /** @enum {string} */
-            object: "document.token_classification";
-            index: number;
-            checkpoint_path: string;
-            prefix: string;
-            num_tokens: number;
-            /** @description Token classification predictions sorted by score descending. */
-            predictions: components["schemas"]["InferenceDocumentTokenClassificationPrediction"][];
-        };
-        /**
-         * @description Exactly one of `texts` or `images` must be provided.
-         *     When using `images`, the server selects a compatible reader internally
-         *     and processes the request as: read document text -> run structured extraction.
-         */
-        InferenceExtractRequest: {
-            /**
-             * @description Name of extractor model with 'extraction' capability
-             * @example fastino/gliner2-base-v1
-             */
-            model: string;
-            /**
-             * @description Texts to extract structured data from
-             * @example [
-             *       "John Smith is 30 years old and works at Google."
-             *     ]
-             */
-            texts?: string[];
-            /**
-             * @description Optional images to extract structured data from.
-             *     When provided, the server first reads document text with a compatible reader
-             *     and then runs schema extraction on the read text.
-             */
-            images?: components["schemas"]["InferenceImageURL"][];
-            /**
-             * @description Optional read-stage prompt used only when `images` are provided.
-             *     Passed through to the reader before schema extraction.
-             * @example <OCR>
-             */
-            prompt?: string;
-            /**
-             * @description Maximum tokens for the read stage when `images` are provided.
-             *     Ignored for text-only extraction requests.
-             * @default 256
-             */
-            max_tokens?: number;
-            /**
-             * @description Extraction schema mapping structure names to field definitions.
-             *     Each field is defined as "field_name::type" where type is "str" or "list".
-             *     Optional choice fields: "field_name::[opt1|opt2]::str".
-             *     If no type is specified, defaults to "str".
-             * @example {
-             *       "person": [
-             *         "name::str",
-             *         "age::str",
-             *         "company::str"
-             *       ]
-             *     }
-             */
-            schema: {
-                [key: string]: string[];
-            };
-            /**
-             * Format: float
-             * @description Score threshold for span extraction (0.0-1.0)
-             * @default 0.3
-             */
-            threshold?: number;
-            /**
-             * @description If true, don't allow nested/overlapping entities
-             * @default true
-             */
-            flat_ner?: boolean;
-            /**
-             * @description If true, include confidence scores in output
-             * @default false
-             */
-            include_confidence?: boolean;
-            /**
-             * @description If true, include character offset spans in output
-             * @default false
-             */
-            include_spans?: boolean;
-        };
-        InferenceExtractFieldValue: {
-            /**
-             * @description The extracted text value
-             * @example John Smith
-             */
-            value: string;
-            /**
-             * Format: float
-             * @description Confidence score (only present when include_confidence=true)
-             * @example 0.95
-             */
-            score?: number;
-            /**
-             * @description Character offset where value begins (only present when include_spans=true)
-             * @example 0
-             */
-            start?: number;
-            /**
-             * @description Character offset where value ends (only present when include_spans=true)
-             * @example 10
-             */
-            end?: number;
-        };
-        InferenceExtractResponse: {
-            /**
-             * @description Object type, always "list"
-             * @enum {string}
-             */
-            object: "list";
-            /** @description Extraction result objects, one per input. */
-            data: components["schemas"]["InferenceExtractObject"][];
-            /** @description Name of model used for extraction */
-            model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
-        };
-        InferenceExtractObject: {
-            /** @enum {string} */
-            object: "extraction";
-            /** @description Original input index. */
-            index: number;
-            /**
-             * @description Extraction result for this input. Maps structure names to arrays of extracted instances.
-             *     Each instance maps field names to ExtractFieldValue (for ::str fields)
-             *     or arrays of ExtractFieldValue (for ::list fields).
-             */
-            results: {
-                [key: string]: {
-                    [key: string]: unknown;
-                }[];
-            };
-        };
         InferenceReadRequest: {
             /**
              * @description Name of reader model from models_dir/readers/
@@ -8684,12 +8415,6 @@ export interface components {
          * @enum {string}
          */
         InferenceFinishReason: "stop" | "length" | "tool_calls" | "content_filter" | "function_call";
-        /**
-         * @description Message content. Supports two formats:
-         *     - Simple string: "Hello, how are you?"
-         *     - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
-         */
-        InferenceChatMessageContent: string | components["schemas"]["ContentPart"][];
         InferenceChatMessage: {
             role: components["schemas"]["InferenceRole"];
             content?: components["schemas"]["ChatMessageContent"];

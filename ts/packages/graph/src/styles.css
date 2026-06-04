@@ -17,21 +17,21 @@
 
 .antfly-graph .react-flow__minimap {
   background-color: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border: 1.5px solid var(--border-strong);
+  border-radius: 0;
   overflow: hidden;
 }
 
 .antfly-graph .react-flow__controls {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border: 1.5px solid var(--border-strong);
+  border-radius: 0;
   overflow: hidden;
-  box-shadow: var(--shadow-sm);
+  box-shadow: none;
 }
 
 .antfly-graph .react-flow__controls button {
   background-color: var(--background);
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1.5px solid var(--border);
   color: var(--foreground);
   width: 28px;
   height: 28px;

@@ -390,6 +390,18 @@ export function AppSidebar({
                 </SidebarMenuItem>
                 <SidebarMenuItem>
                   <SidebarMenuButton
+                    isActive={isOnTablePage && currentSection === "graph"}
+                    tooltip="Graph Explorer"
+                    disabled={!selectedTable}
+                    className="disabled:opacity-50"
+                    onClick={() => handleSectionClick("graph")}
+                  >
+                    <Network className="size-4" />
+                    <span>Graph Explorer</span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
                     asChild
                     isActive={location.pathname === "/data/playground/rag"}
                     tooltip="RAG"

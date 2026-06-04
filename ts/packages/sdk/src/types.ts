@@ -113,6 +113,7 @@ export type GraphResultNode = components["schemas"]["GraphResultNode"];
 export type GraphQueryType = components["schemas"]["GraphQueryType"];
 export type GraphNodeSelector = components["schemas"]["GraphNodeSelector"];
 export type GraphQueryParams = components["schemas"]["GraphQueryParams"];
+export type PathWeightMode = components["schemas"]["PathWeightMode"];
 
 // User and permission types
 export type User = components["schemas"]["User"];

@@ -2311,6 +2311,7 @@ components:
       type: string
       enum:
         - $set
+        - $setOnInsert
         - $unset
         - $inc
         - $push
@@ -2336,7 +2337,7 @@ components:
           description: JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
           example: "$.views"
         value:
-          description: Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set, etc.)
+          description: Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
 
     Transform:
       type: object

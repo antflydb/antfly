@@ -31,6 +31,10 @@ const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
 const shard_mod = @import("../shard.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
+const resolver_catalog_mod = @import("catalog/resolver_catalog.zig");
+const resolution_runtime_mod = @import("resolution_runtime.zig");
+const promotion_runtime_mod = @import("promotion_runtime.zig");
+const resolver_lib = @import("antfly_resolver");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
 const types = @import("types.zig");
@@ -61,6 +65,7 @@ else
 const chunk_artifact_mod = @import("../../chunking/chunk.zig");
 const chunking_types_mod = @import("../../chunking/types.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
+const enrichment_worker = @import("enrichment/enrichment_worker.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
 const enrichment_types = @import("enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
@@ -158,11 +163,32 @@ pub const OpenOptions = struct {
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     start_index_workers: bool = true,
+    start_optional_runtimes: bool = true,
     enrichment: ?enrichment_runtime_mod.Config = null,
     ttl_cleanup: ttl_runtime_mod.Config = .{},
     transaction_recovery: transaction_runtime_mod.Config = .{},
     text_merge: text_merge_runtime_mod.Config = .{},
     sparse_compaction: sparse_compaction_runtime_mod.Config = .{},
+    /// Optional cross-shard candidate source for entity resolution blocking,
+    /// injected by the serving layer (see `api/distributed_candidate_source.zig`).
+    /// Null means local-only blocking against the worker's own store. Must
+    /// outlive the DB.
+    resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
+    /// Optional cross-shard entity sink for the promoter, injected by the serving
+    /// layer (see `api/distributed_entity_sink.zig`). Must outlive the DB.
+    entity_sink: ?promotion_runtime_mod.EntitySink = null,
+    /// Optional ownership guard for promotion. Raft apply-side DBs set this so
+    /// only the source shard leader emits entity writes; standalone DBs leave it
+    /// null and are treated as local owners.
+    promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
+    /// What the promoter does when no sink is currently available. The safe
+    /// default holds replay so a later sink injection or routing repair can retry.
+    entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
+    /// Optional name embedder for resolution: backfills a mention's name
+    /// embedding (for cosine/ann blocking) when a resolver declares a
+    /// `name_embedding` model and the extraction artifact carries no vector.
+    /// Caller-owned; must outlive the DB. Null disables backfill.
+    resolution_embedder: ?embedder_mod.DenseEmbedder = null,
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
@@ -240,6 +266,8 @@ const AsyncContext = struct {
     dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
     stats: AsyncContentionStats = .{},
 
@@ -670,6 +698,8 @@ const EnrichmentAppendContext = struct {
     executor: *derived_executor_mod.Executor,
     async_context: ?*AsyncContext,
     log_mutex: *std.atomic.Mutex,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
 
     fn batchContext(self: *const EnrichmentAppendContext) BatchExecutionContext {
         return .{
@@ -688,9 +718,22 @@ const EnrichmentAppendContext = struct {
             .io = if (self.async_context) |ctx| ctx.io else null,
             .async_context = self.async_context,
             .enrichment_runtime = null,
+            .resolution_runtime = self.resolution_runtime,
+            .promotion_runtime = self.promotion_runtime,
         };
     }
 };
+
+fn notifyResolverReplayRuntimesForCatalog(
+    index_manager: *const index_manager_mod.IndexManager,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime,
+    sequence: u64,
+) void {
+    if (index_manager.resolvers.items.len == 0) return;
+    if (resolution_runtime) |runtime| runtime.notifySequence(sequence);
+    if (promotion_runtime) |runtime| runtime.notifySequence(sequence);
+}
 
 const BatchExecutionContext = struct {
     alloc: Allocator,
@@ -707,6 +750,8 @@ const BatchExecutionContext = struct {
     artifact_cleanup_maybe: ?*std.atomic.Value(bool) = null,
     executor: *derived_executor_mod.Executor,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     async_context: ?*AsyncContext = null,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
 };
@@ -897,6 +942,7 @@ pub const BatchProfile = struct {
 const BatchExecutionOptions = struct {
     validate_range_ownership: bool = true,
     store_batch_options: backend_types.BatchOptions = .{},
+    wait_for_sync_level: bool = true,
 };
 
 pub const OpenProfile = struct {
@@ -2301,6 +2347,14 @@ pub const DB = struct {
     remote_content: ?*const scraping.RemoteContentConfig,
     enrichment_append_context: ?*EnrichmentAppendContext,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
+    resolution_append_context: ?*EnrichmentAppendContext = null,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
+    resolution_embedder: ?embedder_mod.DenseEmbedder = null,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
+    entity_sink: ?promotion_runtime_mod.EntitySink = null,
+    promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
+    entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
@@ -2343,6 +2397,8 @@ pub const DB = struct {
             .executor = self.executor,
             .io = self.backend_runtime.io(),
             .enrichment_runtime = self.enrichment_runtime,
+            .resolution_runtime = self.resolution_runtime,
+            .promotion_runtime = self.promotion_runtime,
             .async_context = self.async_context,
         };
     }
@@ -2484,6 +2540,11 @@ pub const DB = struct {
                 .remote_content = opts.remote_content,
                 .enrichment_append_context = null,
                 .enrichment_runtime = null,
+                .resolution_candidate_source = opts.resolution_candidate_source,
+                .resolution_embedder = opts.resolution_embedder,
+                .entity_sink = opts.entity_sink,
+                .promotion_owner = opts.promotion_owner,
+                .entity_sink_missing_policy = opts.entity_sink_missing_policy,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
                 .transaction_recovery_identity_context = null,
@@ -2502,7 +2563,8 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
-            if (opts.open_mode.allowsOptionalRuntimes()) {
+            const optional_runtimes_enabled = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes;
+            if (optional_runtimes_enabled) {
                 const init_optional_started_ns = monotonicTimeNs();
                 try db.initOptionalRuntimes(opts);
                 profile.init_optional_runtimes_ns = elapsedSince(init_optional_started_ns);
@@ -2531,7 +2593,7 @@ pub const DB = struct {
                 try replayPendingDerivedBatches(&db, null, null);
                 profile.replay_pending_derived_ns = elapsedSince(replay_started_ns);
             }
-            if (opts.open_mode.allowsOptionalRuntimes()) {
+            if (optional_runtimes_enabled) {
                 try db.resumeGeneratedReplayFromJournalIfNeeded();
             }
             if (db.start_index_workers) {
@@ -2542,7 +2604,7 @@ pub const DB = struct {
                 }
                 profile.start_index_workers_ns = elapsedSince(start_workers_started_ns);
             }
-            if (opts.open_mode.allowsOptionalRuntimes()) {
+            if (optional_runtimes_enabled) {
                 const start_optional_started_ns = monotonicTimeNs();
                 try db.startOptionalRuntimes();
                 profile.start_optional_runtimes_ns = elapsedSince(start_optional_started_ns);
@@ -2657,6 +2719,8 @@ pub const DB = struct {
             .executor = self.executor,
             .async_context = self.async_context,
             .log_mutex = resources.log_mutex,
+            .resolution_runtime = self.resolution_runtime,
+            .promotion_runtime = self.promotion_runtime,
         };
 
         const runtime = try self.runtime_alloc.create(enrichment_runtime_mod.EnrichmentRuntime);
@@ -2679,6 +2743,78 @@ pub const DB = struct {
         self.enrichment_runtime = runtime;
     }
 
+    fn initResolutionRuntime(self: *DB) !void {
+        // Always constructed so catalog/status/runUntilIdle APIs can observe
+        // and drain replay. The background worker is started lazily only while
+        // the resolver catalog is non-empty.
+        const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
+        errdefer self.runtime_alloc.destroy(append_ctx);
+        const resources = self.core.batchExecutionResources();
+        append_ctx.* = .{
+            .alloc = self.runtime_alloc,
+            .store = resources.store,
+            .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
+            .shard_manager = resources.shard_manager,
+            .index_manager = resources.index_manager,
+            .apply_mutex = resources.apply_mutex,
+            .change_journal = resources.change_journal,
+            .replay_source = resources.replay_source,
+            .executor = self.executor,
+            .async_context = self.async_context,
+            .log_mutex = resources.log_mutex,
+        };
+
+        const runtime = try self.runtime_alloc.create(resolution_runtime_mod.ResolutionRuntime);
+        errdefer self.runtime_alloc.destroy(runtime);
+        runtime.* = try resolution_runtime_mod.ResolutionRuntime.init(
+            self.runtime_alloc,
+            self.core.batchExecutionResources().store,
+            self.core.replaySource(),
+            self.core.batchExecutionResources().index_manager,
+            append_ctx,
+            appendDerivedBatchFromEnrichment,
+            self.backend_runtime,
+            // Cross-shard blocking source when the serving layer injected one
+            // (via OpenOptions); null means local-only blocking against this
+            // worker's own store.
+            self.resolution_candidate_source,
+            // Optional name embedder for mention-embedding backfill.
+            self.resolution_embedder,
+        );
+        errdefer runtime.deinit();
+        append_ctx.resolution_runtime = runtime;
+        self.resolution_append_context = append_ctx;
+        self.resolution_runtime = runtime;
+        self.async_context.resolution_runtime = runtime;
+        if (self.enrichment_append_context) |ctx| ctx.resolution_runtime = runtime;
+    }
+
+    fn initPromotionRuntime(self: *DB) !void {
+        // Always constructed (like the resolution runtime) so synchronous
+        // drains and status APIs remain available. The background worker is
+        // started lazily only while resolver replay can produce promotion work.
+        const runtime = try self.runtime_alloc.create(promotion_runtime_mod.PromotionRuntime);
+        errdefer self.runtime_alloc.destroy(runtime);
+        runtime.* = try promotion_runtime_mod.PromotionRuntime.init(
+            self.runtime_alloc,
+            self.core.batchExecutionResources().store,
+            self.core.replaySource(),
+            self.backend_runtime,
+            self.promotion_owner,
+            // Cross-shard entity sink when the serving layer injected one (via
+            // OpenOptions or setEntitySink); the missing-sink policy decides
+            // whether null means wait or explicit no-op.
+            self.entity_sink,
+            self.entity_sink_missing_policy,
+        );
+        errdefer runtime.deinit();
+        self.promotion_runtime = runtime;
+        self.async_context.promotion_runtime = runtime;
+        // Patch the resolution stage's append context so journaling a resolution
+        // artifact (tagged with the promotion hint) wakes the promoter.
+        if (self.resolution_append_context) |ctx| ctx.promotion_runtime = runtime;
+    }
+
     fn initOptionalTtlRuntime(self: *DB, cfg: ttl_runtime_mod.Config) !void {
         const ttl_ctx = try self.runtime_alloc.create(TtlCleanupContext);
         errdefer self.runtime_alloc.destroy(ttl_ctx);
@@ -2697,6 +2833,8 @@ pub const DB = struct {
                 .identity_namespace = batch_resources.identity_namespace,
                 .executor = self.executor,
                 .enrichment_runtime = self.enrichment_runtime,
+                .resolution_runtime = self.resolution_runtime,
+                .promotion_runtime = self.promotion_runtime,
             },
             .grace_period_ns = cfg.grace_period_ns,
         };
@@ -2778,6 +2916,12 @@ pub const DB = struct {
     }
 
     fn initOptionalRuntimes(self: *DB, opts: OpenOptions) !void {
+        // Created before enrichment so the enrichment append context can notify
+        // it when extraction artifacts land.
+        try self.initResolutionRuntime();
+        // Created after the resolution runtime so it can patch the resolution
+        // append context to wake the promoter when resolution artifacts land.
+        try self.initPromotionRuntime();
         if (opts.enrichment) |raw_enrichment_cfg| {
             var enrichment_cfg = raw_enrichment_cfg;
             if (enrichment_cfg.secret_store == null) enrichment_cfg.secret_store = opts.secret_store;
@@ -2795,11 +2939,55 @@ pub const DB = struct {
     }
 
     fn startOptionalRuntimes(self: *DB) !void {
+        try self.startResolverReplayRuntimesIfConfigured();
         if (self.enrichment_runtime) |runtime| try runtime.start();
         if (self.ttl_runtime) |runtime| try runtime.start();
         if (self.transaction_runtime) |runtime| try runtime.start();
         if (self.text_merge_runtime) |runtime| try runtime.start();
         if (self.sparse_compaction_runtime) |runtime| try runtime.start();
+    }
+
+    fn hasConfiguredResolvers(self: *const DB) bool {
+        return self.core.index_manager.resolvers.items.len > 0;
+    }
+
+    fn resolverReplayNeedsDrain(self: *DB) bool {
+        if (self.hasConfiguredResolvers()) return true;
+        if (self.resolution_runtime) |runtime| {
+            const replay_stats = runtime.stats();
+            if (replay_stats.catch_up_required or replay_stats.blocked) return true;
+        }
+        if (self.promotion_runtime) |runtime| {
+            const replay_stats = runtime.stats();
+            if (replay_stats.catch_up_required or replay_stats.blocked) return true;
+        }
+        return false;
+    }
+
+    fn notifyResolverReplayRuntimes(self: *DB, sequence: u64) void {
+        if (!self.hasConfiguredResolvers()) return;
+        self.notifyResolverReplayRuntimesForced(sequence);
+    }
+
+    fn notifyResolverReplayRuntimesForced(self: *DB, sequence: u64) void {
+        if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
+        if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+    }
+
+    fn startResolverReplayRuntimesIfConfigured(self: *DB) !void {
+        if (!self.hasConfiguredResolvers()) return;
+        try self.startResolverReplayRuntimes();
+    }
+
+    fn startResolverReplayRuntimes(self: *DB) !void {
+        if (self.resolution_runtime) |runtime| try runtime.start();
+        if (self.promotion_runtime) |runtime| try runtime.start();
+    }
+
+    fn stopResolverReplayRuntimesIfUnconfigured(self: *DB) void {
+        if (self.hasConfiguredResolvers()) return;
+        if (self.resolution_runtime) |runtime| runtime.stop();
+        if (self.promotion_runtime) |runtime| runtime.stop();
     }
 
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
@@ -2826,6 +3014,20 @@ pub const DB = struct {
             self.runtime_alloc.destroy(runtime);
         }
         if (self.enrichment_append_context) |ctx| self.runtime_alloc.destroy(ctx);
+        if (self.resolution_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+        }
+        self.async_context.resolution_runtime = null;
+        // After the resolution runtime (its final catch-up may journal
+        // resolution artifacts that notify the promoter) but before the
+        // resolution append context the promoter is wired into is destroyed.
+        if (self.promotion_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+        }
+        self.async_context.promotion_runtime = null;
+        if (self.resolution_append_context) |ctx| self.runtime_alloc.destroy(ctx);
         if (executor_ready) self.executor.deinit(self.runtime_alloc);
         self.runtime_alloc.destroy(self.executor);
         if (self.text_merge_runtime) |runtime| {
@@ -3282,6 +3484,15 @@ pub const DB = struct {
         try self.batchInternal(req, null, .{ .validate_range_ownership = false });
     }
 
+    pub fn batchReplicatedApply(self: *DB, req: types.BatchRequest) anyerror!void {
+        var apply_req = req;
+        apply_req.sync_level = .write;
+        try self.batchInternal(apply_req, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+        });
+    }
+
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const total_start_ns = monotonicTimeNs();
@@ -3691,6 +3902,15 @@ pub const DB = struct {
         {
             try self.core.appendArtifactPresenceMarker(&store_writes);
         }
+        try appendAssetArtifactSourceIndexMutations(
+            self.alloc,
+            &store_writes,
+            deleted_artifact_keys,
+            &delete_keys,
+            &owned_store_keys,
+            &owned_store_values,
+            &owned_delete_keys,
+        );
 
         var sync_targets: ManagedSyncTargets = .{};
         defer sync_targets.deinit(self.alloc);
@@ -3810,6 +4030,7 @@ pub const DB = struct {
         apply_mutex_held = false;
         var pressure_ctx = self.batchContext();
         const backlog_pressure_start_ns = monotonicTimeNs();
+        try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
         try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_pressure_ns, backlog_pressure_start_ns);
         const wait_sync_start_ns = monotonicTimeNs();
@@ -3817,11 +4038,13 @@ pub const DB = struct {
             const notify_executor_start_ns = monotonicTimeNs();
             notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, effective_req.sync_level, sequence, sync_targets);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
-            const sync_wait_start_ns = monotonicTimeNs();
-            try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
+            if (opts.wait_for_sync_level) {
+                const sync_wait_start_ns = monotonicTimeNs();
+                try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
+            }
         } else {
-            if (syncLevelRequiresDerivedVisibility(effective_req.sync_level)) {
+            if (opts.wait_for_sync_level and syncLevelRequiresDerivedVisibility(effective_req.sync_level)) {
                 const derived_apply_start_ns = monotonicTimeNs();
                 if (effective_req.sync_level == .full_text) {
                     try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.full_text_indexes, profile);
@@ -3830,11 +4053,13 @@ pub const DB = struct {
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.derived_apply_ns, derived_apply_start_ns);
             }
-            const sync_wait_start_ns = monotonicTimeNs();
-            try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
+            if (opts.wait_for_sync_level) {
+                const sync_wait_start_ns = monotonicTimeNs();
+                try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
+            }
         }
-        if (effective_req.sync_level == .full_index and self.text_merge_runtime == null) {
+        if (opts.wait_for_sync_level and effective_req.sync_level == .full_index and self.text_merge_runtime == null) {
             try self.drainScheduledTextMerges();
         }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.wait_sync_ns, wait_sync_start_ns);
@@ -3843,6 +4068,34 @@ pub const DB = struct {
             runtime.notifySequence(sequence);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
         }
+        self.notifyResolverReplayRuntimes(sequence);
+    }
+
+    /// Inject (or clear) the cross-shard entity-resolution candidate source on
+    /// an already-open DB. The serving layer (managed write cache) calls this
+    /// right after a DB is opened, since managed DBs open lazily and cannot
+    /// thread the source through `OpenOptions`. No-op when this DB has no
+    /// resolution runtime (e.g. read-only / status opens).
+    pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) void {
+        self.resolution_candidate_source = src;
+        if (self.resolution_runtime) |runtime| runtime.setCandidateSource(src);
+    }
+
+    /// Inject (or clear) the cross-shard entity sink on an already-open DB. The
+    /// serving layer (managed write cache) calls this right after a DB is opened,
+    /// since managed DBs open lazily and cannot thread the sink through
+    /// `OpenOptions`. No-op when this DB has no promotion runtime.
+    pub fn setEntitySink(self: *DB, sink: ?promotion_runtime_mod.EntitySink) void {
+        self.entity_sink = sink;
+        if (self.promotion_runtime) |runtime| runtime.setSink(sink);
+    }
+
+    /// Inject (or clear) the source-shard promotion owner on an already-open DB.
+    /// Serving-layer managed DBs use this to keep follower raft apply from
+    /// turning replay into public entity-table writes.
+    pub fn setPromotionOwner(self: *DB, owner: ?promotion_runtime_mod.PromotionOwner) void {
+        self.promotion_owner = owner;
+        if (self.promotion_runtime) |runtime| runtime.setOwner(owner);
     }
 
     fn failIfIdentityOrdinalExhaustedForNewUpserts(self: *DB, doc_ids: []const []const u8) !void {
@@ -5442,6 +5695,357 @@ pub const DB = struct {
         try self.core.addEnrichment(cfg);
     }
 
+    pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+        {
+            lockApply(self);
+            defer self.core.unlockApply();
+            try self.core.addResolver(cfg);
+        }
+        try self.startResolverReplayRuntimes();
+        try self.backfillResolverCorpus();
+    }
+
+    pub const ResolverUpsertOptions = struct {
+        /// When false, persist the catalog mutation and mark the resolver backlog
+        /// dirty, but leave the actual re-resolution drain to the caller. Managed
+        /// table opens use this so DB runtime hooks are installed before
+        /// cross-shard candidate blocking or promotion can run.
+        drain_backfill: bool = true,
+    };
+
+    /// Add or replace a resolver. Inserts and material config changes re-resolve
+    /// the existing corpus so the new resolver/scorer behavior applies to
+    /// documents already ingested (the extraction artifacts did not change, so
+    /// the incremental hint would not fire on its own).
+    pub fn upsertResolverWithResultOptions(
+        self: *DB,
+        cfg: index_manager_mod.ResolverConfig,
+        options: ResolverUpsertOptions,
+    ) !index_manager_mod.IndexManager.ResolverUpsertResult {
+        const upsert_result = blk: {
+            lockApply(self);
+            defer self.core.unlockApply();
+            break :blk try self.core.upsertResolver(cfg);
+        };
+        switch (upsert_result) {
+            .inserted, .updated_backfill_required => {
+                try self.startResolverReplayRuntimes();
+                if (options.drain_backfill) {
+                    try self.backfillResolverCorpus();
+                } else if (self.resolution_runtime) |runtime| {
+                    try runtime.requestReresolveBacklog();
+                }
+            },
+            .updated_no_backfill => {
+                try self.startResolverReplayRuntimesIfConfigured();
+                if (options.drain_backfill and self.resolution_runtime != null) {
+                    const runtime = self.resolution_runtime.?;
+                    if (try runtime.hasReresolveBacklog()) {
+                        try self.backfillResolverCorpus();
+                    }
+                }
+            },
+        }
+        return upsert_result;
+    }
+
+    pub fn upsertResolverWithResult(self: *DB, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
+        return try self.upsertResolverWithResultOptions(cfg, .{});
+    }
+
+    pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+        _ = try self.upsertResolverWithResult(cfg);
+    }
+
+    pub fn drainResolverBackfill(self: *DB) !void {
+        try self.startResolverReplayRuntimesIfConfigured();
+        try self.backfillResolverCorpus();
+    }
+
+    fn backfillResolverCorpus(self: *DB) !void {
+        if (!self.hasConfiguredResolvers()) return;
+        if (self.resolution_runtime) |runtime| {
+            try runtime.requestReresolveBacklog();
+            while (true) {
+                var tick = try runtime.runReresolveBacklogWindow();
+                const queued = tick.queued;
+                const complete = tick.complete;
+                tick.deinit(self.runtime_alloc);
+                // Drive the enqueued extraction artifacts through resolution,
+                // promotion, and graph materialization before queuing more.
+                if (queued > 0) try self.runUntilIdle();
+                if (complete) break;
+            }
+        }
+    }
+
+    pub fn removeResolver(self: *DB, name: []const u8) !bool {
+        try self.retireResolverReplayBeforeCatalogRemoval();
+
+        var removed = false;
+        const retirement_sequence = blk: {
+            lockApply(self);
+            defer self.core.unlockApply();
+
+            const cfg = (try self.resolverConfigByNameAlloc(name)) orelse break :blk null;
+            defer {
+                var owned = cfg;
+                owned.deinit(self.alloc);
+            }
+
+            const sequence = try self.retireResolverArtifactsLocked(cfg);
+            if (!try self.core.removeResolver(name)) return false;
+            removed = true;
+            break :blk sequence;
+        };
+
+        if (!removed) return false;
+        if (retirement_sequence) |sequence| {
+            self.executor.notifySequence(sequence);
+            self.notifyResolverReplayRuntimesForced(sequence);
+            try self.runUntilIdle();
+        }
+        self.stopResolverReplayRuntimesIfUnconfigured();
+        return true;
+    }
+
+    fn resolverConfigByNameAlloc(self: *DB, name: []const u8) !?index_manager_mod.ResolverConfig {
+        const resolvers = try self.core.listResolvers(self.alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(self.alloc);
+            if (resolvers.len > 0) self.alloc.free(resolvers);
+        }
+        for (resolvers) |cfg| {
+            if (std.mem.eql(u8, cfg.name, name)) {
+                return try index_manager_mod.ResolverConfig.clone(self.alloc, cfg);
+            }
+        }
+        return null;
+    }
+
+    fn retireResolverArtifactsLocked(self: *DB, cfg: index_manager_mod.ResolverConfig) !?u64 {
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (deletes.items) |key| self.alloc.free(@constCast(key));
+            deletes.deinit(self.alloc);
+        }
+        var changed = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (changed.items) |key| self.alloc.free(key);
+            changed.deinit(self.alloc);
+        }
+
+        const marker_prefix = try internal_keys.assetArtifactSourceIndexPrefixAlloc(self.alloc, cfg.source_artifact);
+        defer self.alloc.free(marker_prefix);
+        const markers = try self.core.store.scanPrefix(self.alloc, marker_prefix);
+        defer docstore_mod.DocStore.freeResults(self.alloc, markers);
+
+        for (markers) |marker| {
+            const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(self.alloc, marker.value)) orelse continue;
+            defer {
+                self.alloc.free(parsed.doc_key);
+                self.alloc.free(parsed.artifact_name);
+            }
+            if (!std.mem.eql(u8, parsed.artifact_name, cfg.source_artifact)) continue;
+
+            const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(self.alloc, parsed.doc_key, cfg.resolution_artifact);
+            var resolution_key_owned = true;
+            errdefer if (resolution_key_owned) self.alloc.free(resolution_key);
+            if (!containsDeleteKey(deletes.items, resolution_key)) {
+                try deletes.append(self.alloc, resolution_key);
+                resolution_key_owned = false;
+                try appendUniqueOwnedKey(self.alloc, &changed, resolution_key);
+            } else {
+                self.alloc.free(resolution_key);
+                resolution_key_owned = false;
+            }
+
+            try self.collectResolverMentionArtifactsForDocLocked(cfg, parsed.doc_key, &deletes, &changed);
+        }
+
+        if (deletes.items.len == 0 and changed.items.len == 0) return null;
+
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
+            .sequence = sequence,
+            .changed_artifact_keys = changed.items,
+        }, sequence);
+        defer self.alloc.free(replay_payload);
+
+        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), &.{}, deletes.items, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        return sequence;
+    }
+
+    fn collectResolverMentionArtifactsForDocLocked(
+        self: *DB,
+        cfg: index_manager_mod.ResolverConfig,
+        doc_key: []const u8,
+        deletes: *std.ArrayListUnmanaged([]const u8),
+        changed: *std.ArrayListUnmanaged([]u8),
+    ) !void {
+        for (self.core.graphIndexes()) |graph_entry| {
+            const source = graph_entry.artifact_source orelse continue;
+            if (source.mention_edge_type.len == 0) continue;
+            if (!std.mem.eql(u8, source.artifact_name, cfg.source_artifact)) continue;
+
+            const state_name = try mentionGraphStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
+            defer self.alloc.free(state_name);
+            const state_key = try graphAssetStateKeyAlloc(self.alloc, doc_key, graph_entry.config.name, state_name);
+            var state_key_owned = true;
+            errdefer if (state_key_owned) self.alloc.free(state_key);
+
+            if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
+                defer freeOwnedConstKeySlice(self.alloc, previous_keys);
+                for (previous_keys) |previous_key| {
+                    if (containsDeleteKey(deletes.items, previous_key)) continue;
+                    const owned_key = try self.alloc.dupe(u8, previous_key);
+                    try deletes.append(self.alloc, owned_key);
+                    try appendUniqueOwnedKey(self.alloc, changed, previous_key);
+                }
+            }
+
+            if (!containsDeleteKey(deletes.items, state_key)) {
+                try deletes.append(self.alloc, state_key);
+                state_key_owned = false;
+            } else {
+                self.alloc.free(state_key);
+                state_key_owned = false;
+            }
+        }
+    }
+
+    fn retireResolverReplayBeforeCatalogRemoval(self: *DB) !void {
+        try self.runUntilIdle();
+        const resolution_stats = self.resolutionStageStats();
+        if (resolution_stats.catch_up_required or resolution_stats.blocked) return error.ResolverReplayPending;
+        const promotion_stats = self.promotionStageStats();
+        if (promotion_stats.catch_up_required or promotion_stats.blocked) return error.ResolverReplayPending;
+    }
+
+    /// The review queue: review-band mentions awaiting human curation. Empty
+    /// when no resolution runtime is active. Caller owns the result
+    /// (`resolution_runtime_mod.freePendingReviews`).
+    pub fn listPendingReviews(self: *DB, alloc: Allocator) ![]resolution_runtime_mod.PendingReview {
+        const runtime = self.resolution_runtime orelse return try alloc.alloc(resolution_runtime_mod.PendingReview, 0);
+        return try runtime.pendingReviews(alloc);
+    }
+
+    /// Persist a human curation decision for one review-band mention and enqueue
+    /// the document for ordinary replay-driven resolution/promotion.
+    pub fn recordReviewDecision(
+        self: *DB,
+        doc_key: []const u8,
+        source_artifact: []const u8,
+        resolution_artifact: []const u8,
+        local_id: []const u8,
+        decision: resolver_lib.Decision,
+        table: []const u8,
+        key: []const u8,
+    ) !u64 {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.executor.failIfUnhealthy();
+
+        lockApply(self);
+        var apply_mutex_held = true;
+        errdefer if (apply_mutex_held) self.core.unlockApply();
+
+        const resolvers = try self.core.listResolvers(self.alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(self.alloc);
+            if (resolvers.len > 0) self.alloc.free(resolvers);
+        }
+        for (resolvers) |cfg| {
+            if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and
+                std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact))
+            {
+                break;
+            }
+        } else return error.ResolverNotFound;
+
+        const override_key = try resolution_runtime_mod.reviewOverrideArtifactKeyAlloc(self.alloc, doc_key, source_artifact, resolution_artifact);
+        defer self.alloc.free(override_key);
+        const existing = self.core.store.get(self.alloc, override_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (existing) |raw| self.alloc.free(raw);
+        const override_bytes = try resolution_runtime_mod.buildReviewDecisionBytesAlloc(self.alloc, existing, local_id, decision, table, key);
+        defer self.alloc.free(override_bytes);
+
+        const source_key = try internal_keys.artifactNamedPrefixAlloc(self.alloc, doc_key, "asset", source_artifact);
+        defer self.alloc.free(source_key);
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const changed_artifact_keys = [_][]const u8{source_key};
+        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
+            .sequence = sequence,
+            .changed_artifact_keys = changed_artifact_keys[0..],
+        }, sequence);
+        defer self.alloc.free(replay_payload);
+
+        const writes = [_]docstore_mod.KVPair{.{
+            .key = override_key,
+            .value = override_bytes,
+        }};
+        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..], &.{}, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.core.unlockApply();
+        apply_mutex_held = false;
+
+        if (self.executor.hasWorkers()) {
+            self.executor.forceSequence(sequence);
+        } else {
+            self.executor.notifySequence(sequence);
+        }
+        self.notifyResolverReplayRuntimes(sequence);
+        return sequence;
+    }
+
+    /// Eager edge rewrite for an entity merge: repoint every inbound edge of
+    /// `old_key` (the merged-away entity) at `new_key` (the survivor) in the
+    /// given graph index, preserving edge type, weight, and metadata. Already
+    /// materialized provenance mention edges do not follow `merged_into` on their
+    /// own; this brings the graph in line with a merge.
+    /// Returns the number of edges rewritten.
+    pub fn rewriteEntityEdges(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        old_key: []const u8,
+        new_key: []const u8,
+    ) !usize {
+        if (std.mem.eql(u8, old_key, new_key)) return 0;
+        const inbound = try self.getEdges(alloc, index_name, old_key, "", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        if (inbound.len == 0) return 0;
+
+        var writes = try alloc.alloc(types.GraphEdgeWrite, inbound.len);
+        defer alloc.free(writes);
+        var deletes = try alloc.alloc(types.GraphEdgeDelete, inbound.len);
+        defer alloc.free(deletes);
+        for (inbound, 0..) |edge, i| {
+            deletes[i] = .{ .index_name = index_name, .source = edge.source, .target = old_key, .edge_type = edge.edge_type };
+            writes[i] = .{
+                .index_name = index_name,
+                .source = edge.source,
+                .target = new_key,
+                .edge_type = edge.edge_type,
+                .weight = edge.weight,
+                .created_at = edge.created_at,
+                .updated_at = edge.updated_at,
+                .metadata_json = edge.metadata,
+            };
+        }
+        try self.batch(.{ .graph_writes = writes, .graph_deletes = deletes, .sync_level = .write });
+        return inbound.len;
+    }
+
     pub fn hasIndex(self: *DB, name: []const u8) bool {
         return self.core.hasIndex(name);
     }
@@ -5749,6 +6353,12 @@ pub const DB = struct {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return try self.core.listEnrichments(alloc);
+    }
+
+    pub fn listResolvers(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.core.listResolvers(alloc);
     }
 
     fn resolveDocSetForIdsAlloc(self: *DB, alloc: Allocator, doc_ids: []const []const u8) !doc_set.ResolvedDocSet {
@@ -6095,8 +6705,32 @@ pub const DB = struct {
             .derived_target_sequence = self.core.nextDerivedSequence(),
             .has_async_indexes = self.executor.hasWorkers(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
         };
+    }
+
+    fn persistedReplayStageStats(self: *DB, scope_name: []const u8, force_enabled: bool) !types.ReplayStageStats {
+        const resources = self.core.batchExecutionResources();
+        const applied = try enrichment_state.loadAppliedSequence(self.alloc, resources.store, scope_name);
+        const target = @max(applied, self.core.nextDerivedSequence());
+        return .{
+            .enabled = force_enabled or target > 0 or applied < target,
+            .target_sequence = target,
+            .applied_sequence = applied,
+            .catch_up_required = applied < target,
+        };
+    }
+
+    fn resolutionStageStats(self: *DB) types.ReplayStageStats {
+        if (self.resolution_runtime) |runtime| return runtime.stats();
+        return self.persistedReplayStageStats(resolution_runtime_mod.scope_name, false) catch .{};
+    }
+
+    fn promotionStageStats(self: *DB) types.ReplayStageStats {
+        if (self.promotion_runtime) |runtime| return runtime.stats();
+        return self.persistedReplayStageStats(promotion_runtime_mod.scope_name, false) catch .{};
     }
 
     fn persistedEnrichmentStats(self: *DB) !types.EnrichmentStats {
@@ -6142,6 +6776,26 @@ pub const DB = struct {
         }
     }
 
+    fn markPrecomputedEnrichmentAppliedForSync(self: *DB, sync_level: types.SyncLevel, sequence: u64) !void {
+        if (sync_level != .enrichments or sequence == 0) return;
+        const runtime = self.enrichment_runtime orelse return;
+        const runtime_stats = runtime.stats();
+        if (runtime_stats.applied_sequence >= sequence -| 1 or
+            try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence))
+        {
+            try runtime.markAppliedThrough(sequence);
+        }
+    }
+
+    fn noPendingEnrichmentReplayThrough(self: *DB, applied_sequence: u64, sequence: u64) !bool {
+        const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.core.replaySource(), applied_sequence);
+        defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
+        for (pending) |group| {
+            if (group.sequence <= sequence) return false;
+        }
+        return true;
+    }
+
     pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
         var stable_target = sequence;
         while (true) {
@@ -6176,6 +6830,7 @@ pub const DB = struct {
     pub fn waitForCurrentSyncLevel(self: *DB, sync_level: types.SyncLevel) !void {
         try self.executor.failIfUnhealthy();
         const sequence = self.core.nextDerivedSequence();
+        try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
         var sync_targets = try self.currentManagedSyncTargets(sync_level);
         defer sync_targets.deinit(self.alloc);
         if (self.executor.hasWorkers()) {
@@ -6239,12 +6894,42 @@ pub const DB = struct {
         try replayPendingDerivedBatches(self, progress_ctx, progress_hook);
     }
 
-    pub fn runUntilIdle(self: *DB) !void {
+    const run_until_idle_max_replay_rounds: usize = 16;
+
+    fn currentMaintenanceTargetSequence(self: *DB) u64 {
         var target_sequence = self.core.nextDerivedSequence();
         if (self.enrichment_runtime) |runtime| {
             target_sequence = @max(target_sequence, runtime.stats().target_sequence);
         }
-        try self.runMaintenanceUntil(target_sequence, .{});
+        return target_sequence;
+    }
+
+    fn drainReplayStagesUntilStable(self: *DB) !void {
+        var rounds: usize = 0;
+        while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
+            try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
+            const drained_sequence = self.core.nextDerivedSequence();
+
+            if (self.resolverReplayNeedsDrain()) {
+                if (self.resolution_runtime) |runtime| {
+                    if (drained_sequence > 0) runtime.notifySequence(drained_sequence - 1);
+                    try runtime.catchUp();
+                }
+
+                if (self.promotion_runtime) |runtime| {
+                    const latest = self.core.nextDerivedSequence();
+                    if (latest > 0) runtime.notifySequence(latest - 1);
+                    try runtime.catchUp();
+                }
+            }
+
+            if (self.core.nextDerivedSequence() <= drained_sequence) return;
+        }
+        return error.RunUntilIdleDidNotConverge;
+    }
+
+    pub fn runUntilIdle(self: *DB) !void {
+        try self.drainReplayStagesUntilStable();
         _ = try self.evaluateAlgebraicAdaptiveCandidates();
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
@@ -7025,6 +7710,7 @@ pub const DB = struct {
             const sequence = try appendDerivedBatchRecord(self, pending_batch);
             self.executor.notifySequence(sequence);
             if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+            self.notifyResolverReplayRuntimes(sequence);
         }
         return generated_ref_count;
     }
@@ -7456,6 +8142,8 @@ pub const DB = struct {
             runtime.stats()
         else
             self.persistedEnrichmentStats() catch runtime_stats.enrichment;
+        runtime_stats.resolution = self.resolutionStageStats();
+        runtime_stats.promotion = self.promotionStageStats();
         runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
         runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
 
@@ -7647,6 +8335,8 @@ pub const DB = struct {
                 .async_indexing = self.snapshotAsyncIndexingStats(),
                 .doc_set_planning = self.snapshotDocSetPlanningStats(),
                 .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+                .resolution = self.resolutionStageStats(),
+                .promotion = self.promotionStageStats(),
                 .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
                 .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             };
@@ -7859,6 +8549,8 @@ pub const DB = struct {
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot(),
@@ -8025,6 +8717,8 @@ pub const DB = struct {
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try self.persistedEnrichmentStats(),
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
@@ -8108,6 +8802,8 @@ pub const DB = struct {
             .indexes = index_stats[0..index_count],
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
             .async_indexing = self.async_context.stats.snapshot(),
         };
     }
@@ -11313,6 +12009,9 @@ fn encodeThinReplayRecordPayload(
     for (changed_artifact_keys) |key| {
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
         if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
+        if (internal_keys.isAssetArtifactKey(key)) {
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
+        }
     }
 
     for (req.graph_writes) |write| {
@@ -11339,6 +12038,7 @@ fn encodeThinReplayRecordPayload(
         if (internal_keys.isAssetArtifactKey(key) or internal_keys.isGraphEdgeArtifactKey(key)) {
             try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
             try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
+            if (internal_keys.isAssetArtifactKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
         }
     }
 
@@ -11375,6 +12075,13 @@ fn strippedStoredDocumentValueAlloc(
 }
 
 fn containsOwnedKey(list: []const []u8, key: []const u8) bool {
+    for (list) |existing| {
+        if (std.mem.eql(u8, existing, key)) return true;
+    }
+    return false;
+}
+
+fn containsDeleteKey(list: []const []const u8, key: []const u8) bool {
     for (list) |existing| {
         if (std.mem.eql(u8, existing, key)) return true;
     }
@@ -12141,6 +12848,89 @@ fn containsStoreWriteKey(list: []const docstore_mod.KVPair, key: []const u8) boo
     return false;
 }
 
+fn appendAssetArtifactSourceIndexMutations(
+    alloc: Allocator,
+    store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deleted_artifact_keys: []const []const u8,
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_store_keys: *std.ArrayListUnmanaged([]u8),
+    owned_store_values: *std.ArrayListUnmanaged([]u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const original_write_count = store_writes.items.len;
+    var write_index: usize = 0;
+    while (write_index < original_write_count) : (write_index += 1) {
+        const write = store_writes.items[write_index];
+        try appendAssetArtifactSourceIndexWrite(alloc, write.key, store_writes, owned_store_keys, owned_store_values);
+    }
+
+    const original_delete_count = delete_keys.items.len;
+    var delete_index: usize = 0;
+    while (delete_index < original_delete_count) : (delete_index += 1) {
+        const key = delete_keys.items[delete_index];
+        try appendAssetArtifactSourceIndexDelete(alloc, key, store_writes.items, delete_keys, owned_delete_keys);
+    }
+    for (deleted_artifact_keys) |key| {
+        try appendAssetArtifactSourceIndexDelete(alloc, key, store_writes.items, delete_keys, owned_delete_keys);
+    }
+}
+
+fn appendAssetArtifactSourceIndexWrite(
+    alloc: Allocator,
+    artifact_key: []const u8,
+    store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_store_keys: *std.ArrayListUnmanaged([]u8),
+    owned_store_values: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, artifact_key)) orelse return;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.artifact_name);
+    }
+
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, parsed.artifact_name, parsed.doc_key);
+    var marker_key_owned = false;
+    errdefer if (!marker_key_owned) alloc.free(marker_key);
+    if (containsStoreWriteKey(store_writes.items, marker_key)) return;
+
+    const marker_value = try alloc.dupe(u8, artifact_key);
+    var marker_value_owned = false;
+    errdefer if (!marker_value_owned) alloc.free(marker_value);
+
+    try owned_store_keys.append(alloc, marker_key);
+    marker_key_owned = true;
+    try owned_store_values.append(alloc, marker_value);
+    marker_value_owned = true;
+    try store_writes.append(alloc, .{
+        .key = marker_key,
+        .value = marker_value,
+    });
+}
+
+fn appendAssetArtifactSourceIndexDelete(
+    alloc: Allocator,
+    artifact_key: []const u8,
+    store_writes: []const docstore_mod.KVPair,
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, artifact_key)) orelse return;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.artifact_name);
+    }
+
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, parsed.artifact_name, parsed.doc_key);
+    var marker_key_owned = false;
+    errdefer if (!marker_key_owned) alloc.free(marker_key);
+    if (containsStoreWriteKey(store_writes, marker_key)) return;
+    if (containsOwnedKey(owned_delete_keys.items, marker_key)) return;
+
+    try owned_delete_keys.append(alloc, marker_key);
+    marker_key_owned = true;
+    try delete_keys.append(alloc, marker_key);
+}
+
 const GraphArtifactClear = struct {
     doc_key: []u8,
     index_name: []u8,
@@ -12727,11 +13517,14 @@ fn appendPrecomputedGraphSourceArtifactKey(
                 try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, previous_key);
             }
         } else {
+            const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(self.alloc, self.core.store, self.core.index_manager, artifact_ref.document_id, graph_entry.config.name, source);
+            defer freeOwnedConstKeySlice(self.alloc, protected_keys);
             const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, artifact_ref.document_id, graph_entry.config.name);
             defer docstore_mod.DocStore.freeResults(self.alloc, existing);
             for (existing) |entry| {
                 if (containsStoreWriteKey(graph_store_writes.items, entry.key)) continue;
                 if (containsOwnedKey(owned_delete_keys.items, entry.key)) continue;
+                if (containsDeleteKey(protected_keys, entry.key)) continue;
                 const owned_key = try self.alloc.dupe(u8, entry.key);
                 try owned_delete_keys.append(self.alloc, owned_key);
                 try delete_keys.append(self.alloc, owned_key);
@@ -13621,6 +14414,16 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
 
     var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer store_writes.deinit(ctx.alloc);
+    var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_store_keys.items) |key| ctx.alloc.free(key);
+        owned_store_keys.deinit(ctx.alloc);
+    }
+    var owned_store_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_store_values.items) |value| ctx.alloc.free(value);
+        owned_store_values.deinit(ctx.alloc);
+    }
     var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer {
         for (identity_writes.items) |item| {
@@ -13682,6 +14485,15 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         keys,
     );
     try store_writes.appendSlice(ctx.alloc, identity_writes.items);
+    try appendAssetArtifactSourceIndexMutations(
+        ctx.alloc,
+        &store_writes,
+        deleted_artifact_keys.items,
+        &delete_keys,
+        &owned_store_keys,
+        &owned_store_values,
+        &owned_delete_keys,
+    );
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
     try ctx.store.putBatchWithReplay(ctx.io, store_writes.items, delete_keys.items, .{
@@ -13691,6 +14503,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
     defer sync_targets.deinit(ctx.alloc);
     ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+    try markPrecomputedEnrichmentAppliedForSyncContext(ctx, sync_level, sequence);
     try applyDerivedBacklogPressureContext(ctx, sequence, sync_level, sync_targets);
     if (ctx.executor.hasWorkers()) {
         notifyExecutorForSyncLevelWithDenseBulkDeferral(ctx.async_context, ctx.executor, sync_level, sequence, sync_targets);
@@ -13708,6 +14521,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         try waitForSyncLevelContext(ctx, sync_level, sequence, sync_targets);
     }
     if (ctx.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+    notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
 }
 
 fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const ttl_runtime_mod.DeleteCandidate) !u32 {
@@ -13758,6 +14572,10 @@ fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_t
 }
 
 fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequence: u64, sync_level: types.SyncLevel, sync_targets: ManagedSyncTargets) !void {
+    switch (sync_level) {
+        .propose, .write => return,
+        .enrichments, .full_text, .aknn, .full_index => {},
+    }
     if (!ctx.executor.shouldThrottleBacklog()) return;
     if (sync_level == .full_text) {
         try runDerivedUntilTargetsContext(ctx, sequence, sync_targets.full_text_indexes);
@@ -13805,6 +14623,26 @@ fn runEnrichmentUntilContext(ctx: *const BatchExecutionContext, sequence: u64) !
         runtime.notifySequence(sequence);
         try runtime.waitForApplied(sequence);
     }
+}
+
+fn markPrecomputedEnrichmentAppliedForSyncContext(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel, sequence: u64) !void {
+    if (sync_level != .enrichments or sequence == 0) return;
+    const runtime = ctx.enrichment_runtime orelse return;
+    const runtime_stats = runtime.stats();
+    if (runtime_stats.applied_sequence >= sequence -| 1 or
+        try noPendingEnrichmentReplayThroughContext(ctx, runtime_stats.applied_sequence, sequence))
+    {
+        try runtime.markAppliedThrough(sequence);
+    }
+}
+
+fn noPendingEnrichmentReplayThroughContext(ctx: *const BatchExecutionContext, applied_sequence: u64, sequence: u64) !bool {
+    const pending = try enrichment_worker.collectPendingDocumentGroups(ctx.alloc, ctx.replay_source, applied_sequence);
+    defer enrichment_worker.freePendingDocumentGroups(ctx.alloc, pending);
+    for (pending) |group| {
+        if (group.sequence <= sequence) return false;
+    }
+    return true;
 }
 
 fn runMaintenanceUntilContext(ctx: *const BatchExecutionContext, sequence: u64, sync_targets: ManagedSyncTargets) !void {
@@ -14350,6 +15188,7 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     var batch_ctx = ctx.batchContext();
     const sequence = try appendDerivedBatchRecordContext(&batch_ctx, batch);
+    notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
         return sequence;
@@ -15106,6 +15945,17 @@ fn batchAffectsManagedIndex(
                     var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
                     defer artifact_ref.deinit(index_manager.alloc);
                     if (artifact_ref.kind == .asset and index_manager.graphIndexConsumesAssetArtifact(index_ref.name, artifact_ref.name)) return true;
+                    continue;
+                }
+                if (internal_keys.isResolutionArtifactKey(artifact_key)) {
+                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
+                    if (source.mention_edge_type.len == 0) continue;
+                    const parsed = (internal_keys.parseResolutionArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
+                    defer {
+                        index_manager.alloc.free(parsed.doc_key);
+                        index_manager.alloc.free(parsed.artifact_name);
+                    }
+                    if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return true;
                     continue;
                 }
                 if (internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
@@ -16018,6 +16868,10 @@ fn materializeGraphSourceArtifactsForIndex(
     errdefer freeOwnedKeySlice(alloc, changed.items);
 
     for (changed_artifact_keys) |artifact_key| {
+        if (internal_keys.isResolutionArtifactKey(artifact_key)) {
+            try materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key);
+            continue;
+        }
         if (!internal_keys.isAssetArtifactKey(artifact_key)) continue;
         var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, artifact_key)) orelse continue;
         defer artifact_ref.deinit(alloc);
@@ -16073,10 +16927,13 @@ fn materializeGraphSourceArtifactsForIndex(
                 try appendUniqueOwnedKey(alloc, &changed, previous_key);
             }
         } else {
+            const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source);
+            defer freeOwnedConstKeySlice(alloc, protected_keys);
             const existing = try collectGraphArtifactsForDocIndex(alloc, store, artifact_ref.document_id, index_name);
             defer docstore_mod.DocStore.freeResults(alloc, existing);
             for (existing) |entry| {
                 if (containsStoreWriteKey(writes.items, entry.key)) continue;
+                if (containsDeleteKey(protected_keys, entry.key)) continue;
                 try deletes.append(alloc, try alloc.dupe(u8, entry.key));
                 try appendUniqueOwnedKey(alloc, &changed, entry.key);
             }
@@ -16099,6 +16956,96 @@ fn materializeGraphSourceArtifactsForIndex(
     return try changed.toOwnedSlice(alloc);
 }
 
+fn materializeMentionEdgesForResolutionKey(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    changed: *std.ArrayListUnmanaged([]u8),
+    index_name: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+    resolution_key: []const u8,
+) !void {
+    if (source.mention_edge_type.len == 0) return;
+    const parsed_key = (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, resolution_key)) orelse return;
+    defer alloc.free(parsed_key.doc_key);
+    defer alloc.free(parsed_key.artifact_name);
+
+    const cfg = resolverConfigForResolution(index_manager, source.artifact_name, parsed_key.artifact_name) orelse return;
+    const state_name = try mentionGraphStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
+    defer alloc.free(state_name);
+    const state_key = try graphAssetStateKeyAlloc(alloc, parsed_key.doc_key, index_name, state_name);
+    defer alloc.free(state_key);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        writes.deinit(alloc);
+    }
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| alloc.free(@constCast(key));
+        deletes.deinit(alloc);
+    }
+
+    const raw_resolution = store.get(alloc, resolution_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (raw_resolution) |raw| alloc.free(raw);
+
+    if (raw_resolution) |raw| {
+        const raw_extraction = loadSourceExtractionForResolution(alloc, store, parsed_key.doc_key, cfg.source_artifact) catch null;
+        defer if (raw_extraction) |raw_src| alloc.free(raw_src);
+        const mention_writes = try mentionEdgeWritesFromResolutionAlloc(
+            alloc,
+            index_name,
+            parsed_key.doc_key,
+            raw,
+            raw_extraction,
+            source.mention_edge_type,
+            cfg,
+        );
+        defer freeGraphWrites(alloc, mention_writes);
+        for (mention_writes) |write| {
+            const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+            var key_owned = true;
+            errdefer if (key_owned) alloc.free(key);
+            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+            var payload_owned = true;
+            errdefer if (payload_owned) alloc.free(payload);
+            try writes.append(alloc, .{ .key = key, .value = payload });
+            key_owned = false;
+            payload_owned = false;
+            try appendUniqueOwnedKey(alloc, changed, key);
+        }
+    }
+
+    if (try loadGraphAssetStateKeysAlloc(alloc, store, state_key)) |previous_keys| {
+        defer freeOwnedConstKeySlice(alloc, previous_keys);
+        for (previous_keys) |previous_key| {
+            if (containsStoreWriteKey(writes.items, previous_key)) continue;
+            try deletes.append(alloc, try alloc.dupe(u8, previous_key));
+            try appendUniqueOwnedKey(alloc, changed, previous_key);
+        }
+    }
+
+    const state_value = try encodeGraphAssetStateKeysAlloc(alloc, writes.items);
+    var state_value_owned = true;
+    defer if (state_value_owned) alloc.free(state_value);
+    try writes.append(alloc, .{
+        .key = try alloc.dupe(u8, state_key),
+        .value = state_value,
+    });
+    state_value_owned = false;
+
+    if (writes.items.len > 0 or deletes.items.len > 0) {
+        try store.putBatch(writes.items, deletes.items);
+    }
+}
+
 fn freeGraphWrites(alloc: Allocator, writes: []types.GraphEdgeWrite) void {
     for (writes) |write| {
         alloc.free(@constCast(write.index_name));
@@ -16108,6 +17055,145 @@ fn freeGraphWrites(alloc: Allocator, writes: []types.GraphEdgeWrite) void {
         if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
     }
     if (writes.len > 0) alloc.free(writes);
+}
+
+fn resolverConfigForResolution(
+    index_manager: *index_manager_mod.IndexManager,
+    source_artifact: []const u8,
+    resolution_artifact: []const u8,
+) ?*const index_manager_mod.ResolverConfig {
+    for (index_manager.resolvers.items) |*cfg| {
+        if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and
+            std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact))
+        {
+            return cfg;
+        }
+    }
+    return null;
+}
+
+fn mentionGraphStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mentions\x1f{s}", .{ source_artifact, resolution_artifact });
+}
+
+fn resolutionMentionStateKeysForGraphSourceAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    doc_key: []const u8,
+    index_name: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+) ![][]const u8 {
+    if (source.mention_edge_type.len == 0) return try alloc.alloc([]const u8, 0);
+
+    var protected = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (protected.items) |key| alloc.free(@constCast(key));
+        protected.deinit(alloc);
+    }
+
+    for (index_manager.resolvers.items) |cfg| {
+        if (!std.mem.eql(u8, cfg.source_artifact, source.artifact_name)) continue;
+
+        const state_name = try mentionGraphStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
+        defer alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(alloc, doc_key, index_name, state_name);
+        defer alloc.free(state_key);
+
+        const state_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key) orelse continue;
+        defer freeOwnedConstKeySlice(alloc, state_keys);
+        for (state_keys) |key| {
+            try protected.append(alloc, try alloc.dupe(u8, key));
+        }
+    }
+
+    return try protected.toOwnedSlice(alloc);
+}
+
+fn loadSourceExtractionForResolution(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    source_artifact: []const u8,
+) !?[]u8 {
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", source_artifact);
+    defer alloc.free(extraction_key);
+    return store.get(alloc, extraction_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+}
+
+fn extractionConfidenceForLocalId(entities: []const resolver_lib.ExtractedEntity, local_id: []const u8) ?f64 {
+    for (entities) |entity| {
+        if (std.mem.eql(u8, entity.local_id, local_id)) return entity.confidence;
+    }
+    return null;
+}
+
+fn resolutionDecisionCreatesCanonicalEdge(decision: resolver_lib.Decision) bool {
+    return switch (decision) {
+        .new, .match => true,
+        .review => false,
+    };
+}
+
+/// Build `doc -> entity` mention edges (provenance) from the durable resolution
+/// artifact for canonical decisions. The target is the resolved DocRef, so
+/// prefix/ANN matches, merge redirects, and curator overrides are reflected in
+/// graph state. Review-band decisions remain visible through the review queue,
+/// not as ordinary resolved provenance. The optional extraction artifact is
+/// consulted only for the original mention confidence used by provenance weight
+/// calibration.
+fn mentionEdgeWritesFromResolutionAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    doc_key: []const u8,
+    resolution_raw: []const u8,
+    extraction_raw: ?[]const u8,
+    mention_edge_type: []const u8,
+    cfg: *const index_manager_mod.ResolverConfig,
+) ![]types.GraphEdgeWrite {
+    var parsed_resolution = resolver_lib.parseResolution(alloc, resolution_raw) catch return try alloc.alloc(types.GraphEdgeWrite, 0);
+    defer parsed_resolution.deinit();
+    var parsed_extraction: ?resolver_lib.ParsedEntities = if (extraction_raw) |raw|
+        resolver_lib.parseExtractionEntities(alloc, raw) catch null
+    else
+        null;
+    defer if (parsed_extraction) |*parsed| parsed.deinit();
+
+    var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
+    errdefer freeGraphWrites(alloc, writes.items);
+    for (parsed_resolution.entities) |entity| {
+        if (!resolutionDecisionCreatesCanonicalEdge(entity.decision)) continue;
+        if (entity.doc_ref.key.len == 0) continue;
+        // One mention edge per distinct entity even if mentioned repeatedly.
+        var duplicate = false;
+        for (writes.items) |existing| {
+            if (std.mem.eql(u8, existing.target, entity.doc_ref.key)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        // Record the resolved DocRef target table so the endpoint can be
+        // hydrated cross-table; same-table hydration ignores it.
+        const metadata = try std.fmt.allocPrint(alloc, "{{\"target_table\":{f}}}", .{std.json.fmt(entity.doc_ref.table, .{})});
+        errdefer alloc.free(metadata);
+        const mention_confidence = if (parsed_extraction) |parsed|
+            extractionConfidenceForLocalId(parsed.entities, entity.local_id) orelse entity.confidence
+        else
+            entity.confidence;
+        try writes.append(alloc, .{
+            .index_name = try alloc.dupe(u8, index_name),
+            .source = try alloc.dupe(u8, doc_key),
+            .target = try alloc.dupe(u8, entity.doc_ref.key),
+            .edge_type = try alloc.dupe(u8, mention_edge_type),
+            .weight = cfg.fusedMentionWeight(mention_confidence),
+            .metadata_json = metadata,
+        });
+    }
+    return try writes.toOwnedSlice(alloc);
 }
 
 fn graphWritesFromArtifactValueAlloc(
@@ -16792,9 +17878,36 @@ fn truncateReplayLogs(ctx: *const BatchExecutionContext, up_to_sequence: u64) !v
     ctx.executor.releaseBacklogThrough(up_to_sequence);
 }
 
+fn resolverReplayRetentionRequired(index_manager: *const index_manager_mod.IndexManager, stats: types.ReplayStageStats) bool {
+    if (stats.blocked) return true;
+    return index_manager.resolvers.items.len > 0;
+}
+
+fn clampReplayTruncationForReplayStage(
+    effective: u64,
+    index_manager: *const index_manager_mod.IndexManager,
+    stats: types.ReplayStageStats,
+) u64 {
+    if (!resolverReplayRetentionRequired(index_manager, stats)) return effective;
+    return @min(effective, stats.applied_sequence);
+}
+
 fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
-    try ctx.store.truncateReplayUpTo(ctx.alloc, sequence);
+    var effective = sequence;
+    // The resolution/promotion stages consume the replay journal but are not
+    // executor workers. Clamp truncation to their applied watermarks whenever a
+    // resolver is configured, even before the synchronous driver has raised the
+    // stage target for the newest write. Resolver removal drains or refuses
+    // pending stage work before deleting catalog state, so a never-configured
+    // resolver pipeline does not pin generic replay hints.
+    if (ctx.resolution_runtime) |runtime| {
+        effective = clampReplayTruncationForReplayStage(effective, ctx.index_manager, runtime.stats());
+    }
+    if (ctx.promotion_runtime) |runtime| {
+        effective = clampReplayTruncationForReplayStage(effective, ctx.index_manager, runtime.stats());
+    }
+    try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
 }
 
 fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
@@ -16824,6 +17937,18 @@ fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
             enrichment_runtime_mod.scope_name,
         );
         min_applied = @min(min_applied, enrichment_applied);
+    }
+    if (ctx.resolution_runtime) |runtime| {
+        const stats = runtime.stats();
+        if (resolverReplayRetentionRequired(ctx.index_manager, stats)) {
+            min_applied = @min(min_applied, stats.applied_sequence);
+        }
+    }
+    if (ctx.promotion_runtime) |runtime| {
+        const stats = runtime.stats();
+        if (resolverReplayRetentionRequired(ctx.index_manager, stats)) {
+            min_applied = @min(min_applied, stats.applied_sequence);
+        }
     }
     if (min_applied == 0 or min_applied == std.math.maxInt(u64)) return;
     try truncateReplayLogs(ctx, min_applied);
@@ -23257,6 +24382,576 @@ test "db _edges writes record graph artifacts in the replay stream instead of gr
     }
 }
 
+/// Embedder that returns a fixed vector for any text, so a backfilled mention
+/// embedding deterministically matches a candidate's name_embedding.
+const FixedVectorEmbedder = struct {
+    fn interface(self: *FixedVectorEmbedder) embedder_mod.DenseEmbedder {
+        return .{ .ptr = self, .dense_embed_fn = embed };
+    }
+    fn embed(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32 {
+        _ = ptr;
+        _ = embedding_name;
+        _ = text;
+        _ = dims;
+        const v = try alloc.alloc(f32, 4);
+        v[0] = 1.0;
+        v[1] = 0.0;
+        v[2] = 0.0;
+        v[3] = 0.0;
+        return v;
+    }
+};
+
+test "db starts resolver replay workers only while resolver catalog is configured" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expect(db.resolution_runtime != null);
+    try std.testing.expect(db.promotion_runtime != null);
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:no-resolver",
+            .value = "{\"title\":\"ordinary write\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    const no_resolver_pending = db.pendingWorkStats();
+    try std.testing.expect(!no_resolver_pending.resolution.enabled);
+    try std.testing.expect(!no_resolver_pending.resolution.catch_up_required);
+    try std.testing.expect(!no_resolver_pending.promotion.enabled);
+    try std.testing.expect(!no_resolver_pending.promotion.catch_up_required);
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+    try db.drainResolverBackfill();
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolver_catalog_mod.reresolve_resume_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolver_catalog_mod.reresolve_repair_resume_key));
+
+    try db.addResolver(.{
+        .name = "kg_lifecycle",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_lifecycle_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try std.testing.expect(db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try std.testing.expect(try db.removeResolver("kg_lifecycle"));
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+}
+
+test "db backfills a mention name embedding so ann/cosine resolution links end-to-end" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var embedder = FixedVectorEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .resolution_embedder = embedder.interface() });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]",
+        \\    "format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    // Resolver backfills a name embedding for each mention (no embedding in the
+    // extraction artifact), then prefix-blocks + cosine-scores against the entity.
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .name_embedding = "name",
+        .name_embedding_dims = 4,
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "emb", "left": "name_embedding", "right": "name_embedding",
+        \\  "levels": [ { "when": "cosine > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    });
+
+    // An existing entity under a different key, carrying the matching vector.
+    const entity_doc_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(entity_doc_key);
+    try db.core.store.put(entity_doc_key,
+        \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [1.0, 0.0, 0.0, 0.0] }
+    );
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"A. Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    // The mention had no embedding; the backfilled vector cosine-matched the
+    // entity, so it linked instead of minting a new key.
+    try std.testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
+}
+
+test "db resolves extracted entities into a resolution artifact end-to-end" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // A graph index drives production of the relations_v1 asset (extraction)
+    // artifact; the resolver consumes the same artifact.
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "knowledge_graph",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("config_generation").?.integer);
+    const entities = parsed.value.object.get("entities").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), entities.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", entities[0].object.get("doc_ref").?.object.get("key").?.string);
+    try std.testing.expectEqualStrings("org/antfly", entities[1].object.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "db re-resolves the corpus when upsertResolver bumps the config generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    {
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+    }
+
+    // Bump the resolver's config generation: the document was already ingested,
+    // so only the corpus backfill (triggered by upsertResolver) re-resolves it.
+    try db.upsertResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 2,
+    });
+
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":2") != null);
+}
+
+test "db re-resolves existing corpus when upsertResolver inserts a new resolver" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    {
+        const asset_raw = try db.core.store.get(alloc, asset_key);
+        defer alloc.free(asset_raw);
+        try std.testing.expect(std.mem.indexOf(u8, asset_raw, "Ada Lovelace") != null);
+    }
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, "relations_v1", "doc:a");
+    defer alloc.free(marker_key);
+    {
+        const marker_raw = try db.core.store.get(alloc, marker_key);
+        defer alloc.free(marker_raw);
+        try std.testing.expectEqualStrings(asset_key, marker_raw);
+    }
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_inserted_v1");
+    defer alloc.free(resolution_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+
+    try db.upsertResolver(.{
+        .name = "kg_inserted",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_inserted_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+}
+
+test "db drains pending resolver backfill when retrying a no-op upsertResolver" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_retry_v1");
+    defer alloc.free(resolution_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+
+    const cfg: index_manager_mod.ResolverConfig = .{
+        .name = "kg_retry",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_retry_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    };
+
+    {
+        lockApply(&db);
+        defer db.core.unlockApply();
+        try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.inserted, try db.core.upsertResolver(cfg));
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+    try std.testing.expect(try db.resolution_runtime.?.hasReresolveBacklog());
+
+    // Retrying the same catalog config is a material no-op, but the durable
+    // dirty cursor from the first attempt must still be drained.
+    try db.upsertResolver(cfg);
+
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+    try std.testing.expect(!try db.resolution_runtime.?.hasReresolveBacklog());
+}
+
+test "db refuses resolver removal while resolution or promotion replay is pending" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg_pending_remove",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_pending_remove_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+
+    // The default standalone DB has no entity sink and waits rather than
+    // advancing promotion replay. Removing the resolver here would otherwise
+    // erase the catalog signal that older retention logic used.
+    try std.testing.expectError(error.ResolverReplayPending, db.removeResolver("kg_pending_remove"));
+    try std.testing.expect(db.promotionStageStats().catch_up_required);
+}
+
+/// Thread-safe capturing entity sink for the promotion integration test.
+const FakePromotionSink = struct {
+    const Upsert = struct { table: []u8, key: []u8, doc: []u8 };
+    alloc: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    upserts: std.ArrayListUnmanaged(Upsert) = .empty,
+
+    fn deinit(self: *FakePromotionSink) void {
+        for (self.upserts.items) |u| {
+            self.alloc.free(u.table);
+            self.alloc.free(u.key);
+            self.alloc.free(u.doc);
+        }
+        self.upserts.deinit(self.alloc);
+    }
+
+    fn sink(self: *FakePromotionSink) promotion_runtime_mod.EntitySink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable = promotion_runtime_mod.EntitySink.VTable{ .upsert = upsertFn };
+
+    fn upsertFn(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
+        _ = allocator;
+        const self: *FakePromotionSink = @ptrCast(@alignCast(ptr));
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        const t = try self.alloc.dupe(u8, table);
+        errdefer self.alloc.free(t);
+        const k = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(k);
+        const d = try self.alloc.dupe(u8, doc_json);
+        errdefer self.alloc.free(d);
+        try self.upserts.append(self.alloc, .{ .table = t, .key = k, .doc = d });
+    }
+
+    fn findKey(self: *FakePromotionSink, key: []const u8) ?[]const u8 {
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        for (self.upserts.items) |u| {
+            if (std.mem.eql(u8, u.key, key)) return u.doc;
+        }
+        return null;
+    }
+};
+
+test "db promotes resolved entities into entity-document upserts end-to-end" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var sink = FakePromotionSink{ .alloc = alloc };
+    defer sink.deinit();
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "knowledge_graph",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.resolution.enabled);
+    try std.testing.expect(stats.promotion.enabled);
+    try std.testing.expectEqual(stats.resolution.target_sequence, stats.resolution.applied_sequence);
+    try std.testing.expectEqual(stats.promotion.target_sequence, stats.promotion.applied_sequence);
+    try std.testing.expect(!stats.promotion.blocked);
+
+    // The promoter upserted a canonical entity document per resolved mention,
+    // keyed by the rendered canonical key, into the entity table.
+    const ada = sink.findKey("person/ada_lovelace") orelse return error.MissingAdaUpsert;
+    try std.testing.expect(std.mem.indexOf(u8, ada, "\"canonical_name\":\"Ada Lovelace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ada, "\"entity_type\":\"person\"") != null);
+    const antfly = sink.findKey("org/antfly") orelse return error.MissingAntflyUpsert;
+    try std.testing.expect(std.mem.indexOf(u8, antfly, "\"canonical_name\":\"Antfly\"") != null);
+
+    // Replay is idempotent: draining again promotes nothing new.
+    const count_before = sink.upserts.items.len;
+    try db.runUntilIdle();
+    try std.testing.expectEqual(count_before, sink.upserts.items.len);
+}
+
 test "db graph index materializes relation asset artifacts into graph edge artifacts" {
     const alloc = std.testing.allocator;
 
@@ -23301,6 +24996,499 @@ test "db graph index materializes relation asset artifacts into graph edge artif
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("doc:b", edges[0].target);
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), edges[0].weight, 0.0001);
+}
+
+test "db materializes doc->entity mention edges as provenance and clears them on delete" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // The graph index materializes the relations_v1 extraction asset and, with
+    // mention_edge_type set, emits doc->entity provenance edges from the durable
+    // resolution artifact.
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    {
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"decision\":\"new\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "org/antfly") != null);
+    }
+
+    const ada_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
+    defer alloc.free(ada_edge_key);
+    {
+        const raw = try db.core.store.get(alloc, ada_edge_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"target_table\":\"entities\"") != null);
+    }
+
+    // Outbound: doc:a mentions both canonical entities.
+    {
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 2), out.len);
+        // Each mention edge records the resolved DocRef target table so the
+        // endpoint can be hydrated cross-table.
+        for (out) |edge| {
+            try std.testing.expect(std.mem.indexOf(u8, edge.metadata, "\"target_table\":\"entities\"") != null);
+        }
+    }
+    // Inbound provenance: "which documents mention this entity" == inbound edges.
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 1), inbound.len);
+        try std.testing.expectEqualStrings("doc:a", inbound[0].source);
+        try std.testing.expectEqualStrings("person/ada_lovelace", inbound[0].target);
+    }
+
+    // Deleting the source document clears its mention edges (delete-on-source-delete).
+    try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    {
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 0), inbound.len);
+    }
+}
+
+test "db resolver removal retires resolution artifacts and mention graph state" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var sink = FakePromotionSink{ .alloc = alloc };
+    defer sink.deinit();
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    {
+        const raw = try db.core.store.get(alloc, asset_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "Ada Lovelace") != null);
+    }
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    {
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+    }
+
+    const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
+    defer alloc.free(graph_edge_key);
+    {
+        const raw = try db.core.store.get(alloc, graph_edge_key);
+        defer alloc.free(raw);
+        try std.testing.expect(raw.len > 0);
+    }
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    }
+
+    try std.testing.expect(try db.removeResolver("kg"));
+
+    const resolvers = try db.listResolvers(alloc);
+    defer {
+        for (resolvers) |*cfg| cfg.deinit(alloc);
+        alloc.free(resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 0), resolvers.len);
+
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, graph_edge_key));
+    {
+        const raw = try db.core.store.get(alloc, asset_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "Ada Lovelace") != null);
+    }
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 0), inbound.len);
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+    }
+}
+
+test "db does not materialize review-band resolution as canonical mention edges" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "name", "left": "canonical_text", "right": "canonical_name",
+        \\  "levels": [
+        \\    { "when": "exact", "weight": 8.0 },
+        \\    { "when": "jaro_winkler > 0.92", "weight": 5.0 },
+        \\    { "when": "jaro_winkler > 0.85", "weight": 2.0 },
+        \\    { "else": true, "weight": -6.0 }
+        \\  ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9, "review": 0.6 } }
+        ,
+        .config_generation = 1,
+    });
+
+    const existing_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovlace");
+    defer alloc.free(existing_key);
+    try db.core.store.put(existing_key,
+        \\{"canonical_name":"Ada Lovlace","label":"person"}
+    );
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try std.testing.expectEqualStrings("review", ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+
+    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+
+    _ = try db.recordReviewDecision("doc:a", "relations_v1", "resolution_v1", "e0", .match, "entities", "person/ada_lovelace");
+    try db.runUntilIdle();
+
+    const curated_raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(curated_raw);
+    var curated = try std.json.parseFromSlice(std.json.Value, alloc, curated_raw, .{});
+    defer curated.deinit();
+    const curated_ent = curated.value.object.get("entities").?.array.items[0].object;
+    try std.testing.expectEqualStrings("match", curated_ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", curated_ent.get("doc_ref").?.object.get("key").?.string);
+
+    const curated_edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, curated_edges);
+    try std.testing.expectEqual(@as(usize, 1), curated_edges.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", curated_edges[0].target);
+}
+
+test "db mention edge weight is fused from extractor trust and mention confidence" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    // A resolver declaring noisy_or fusion: this extractor is trusted 0.9, no
+    // graph prior. The mention asserts confidence 0.8, so the edge weight is
+    // fuse(noisy_or, [{0.8, 0.9}], prior=0, prior_weight=0) = 1-(1-0.72) = 0.72.
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .fusion_combine = "noisy_or",
+        .fusion_trust = 0.9,
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace","confidence":0.8}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, out);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", out[0].target);
+    // Calibrated weight, not the legacy 1.0.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.72), out[0].weight, 1e-9);
+}
+
+test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    // The mention edge points at the resolved DocRef from the resolution artifact.
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    }
+
+    // Merge person/ada_lovelace into a canonical survivor: rewrite its edges.
+    const rewritten = try db.rewriteEntityEdges(alloc, "prov_graph", "person/ada_lovelace", "person/ada_canonical");
+    try std.testing.expectEqual(@as(usize, 1), rewritten);
+    try db.runUntilIdle();
+
+    // Inbound edges moved from the merged-away key to the survivor.
+    {
+        const old_inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, old_inbound);
+        try std.testing.expectEqual(@as(usize, 0), old_inbound.len);
+
+        const new_inbound = try db.getEdges(alloc, "prov_graph", "person/ada_canonical", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, new_inbound);
+        try std.testing.expectEqual(@as(usize, 1), new_inbound.len);
+        try std.testing.expectEqualStrings("doc:a", new_inbound[0].source);
+        try std.testing.expectEqualStrings("person/ada_canonical", new_inbound[0].target);
+    }
+}
+
+test "db graph hydration fails closed for a not-yet-promoted entity node" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const mention_query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "prov_graph",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{ .edge_types = &.{"mentions"}, .direction = .out, .max_depth = 1 },
+        .include_documents = true,
+    };
+
+    // The mention edge points at person/ada_lovelace, but that entity document
+    // has not been promoted into this store: the node is returned as a graph
+    // result with its key, hydrated to nothing (fail closed), never fabricated.
+    {
+        var result = try db.search(alloc, .{ .graph_queries = &.{.{ .name = "m", .query = mention_query }} });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+        const hits = result.graph_results[0].hits;
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", hits[0].id);
+        try std.testing.expect(hits[0].stored_data == null);
+
+        // The reached node records its home table (from the mention edge's
+        // `target_table` metadata) so the api can route hydration to the
+        // entities table instead of failing closed against the query table.
+        const nodes = result.graph_results[0].nodes;
+        try std.testing.expectEqual(@as(usize, 1), nodes.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", nodes[0].key);
+        try std.testing.expect(nodes[0].table != null);
+        try std.testing.expectEqualStrings("entities", nodes[0].table.?);
+    }
+
+    // Once the entity document exists (promoter wrote it; here co-located for the
+    // single-store test), the same node hydrates instead of failing closed.
+    try db.batch(.{
+        .writes = &.{.{ .key = "person/ada_lovelace", .value =
+        \\{"entity_type":"person","canonical_name":"Ada Lovelace"}
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    {
+        var result = try db.search(alloc, .{ .graph_queries = &.{.{ .name = "m", .query = mention_query }} });
+        defer result.deinit();
+        const hits = result.graph_results[0].hits;
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", hits[0].id);
+        try std.testing.expect(hits[0].stored_data != null);
+        try std.testing.expect(std.mem.indexOf(u8, hits[0].stored_data.?, "Ada Lovelace") != null);
+    }
 }
 
 test "db graph relation artifact materializer uses mapping templates" {
@@ -23542,6 +25730,73 @@ test "db graph artifact source lifecycle reuses and protects asset enrichments" 
         tmp.deinit(alloc);
     }
     try std.testing.expectEqualStrings("relations", still_present.field);
+}
+
+test "db resolver catalog persists across reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.addResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ lower _entity.label }}/{{ slug _entity.canonical_text }}",
+            .config_generation = 3,
+        });
+        try std.testing.expectError(error.ResolverAlreadyExists, db.addResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "x",
+        }));
+        try std.testing.expectError(error.ResolverArtifactAlreadyExists, db.addResolver(.{
+            .name = "duplicate_output",
+            .table = "entities",
+            .source_artifact = "other_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "x",
+        }));
+        try std.testing.expectError(error.ResolverSourceArtifactImmutable, db.upsertResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "other_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "x",
+        }));
+        try std.testing.expectError(error.ResolverArtifactImmutable, db.upsertResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "other_resolution_v1",
+            .key_template = "x",
+        }));
+    }
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const resolvers = try db.listResolvers(alloc);
+    defer {
+        for (resolvers) |*r| r.deinit(alloc);
+        alloc.free(resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+    try std.testing.expectEqualStrings("knowledge_graph", resolvers[0].name);
+    try std.testing.expectEqualStrings("entities", resolvers[0].table);
+    try std.testing.expectEqual(@as(u64, 3), resolvers[0].config_generation);
+
+    try std.testing.expect(try db.removeResolver("knowledge_graph"));
+    const after = try db.listResolvers(alloc);
+    defer alloc.free(after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
 }
 
 test "db graph artifact source reuses user enrichment and rejects incompatible shorthand" {
@@ -23786,6 +26041,108 @@ test "db async asset producer graph source materializes through replay" {
     try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"content_type\":\"application/json\"") != null);
 }
 
+test "db async asset producer mention edges come from resolution artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{
+        .extractor_output =
+        \\{"entities":[{"id":"e0","label":"person","text":"A. Lovelace"}],"relations":[]}
+        ,
+    };
+    var embedder = FixedVectorEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+        .resolution_embedder = embedder.interface(),
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]",
+        \\    "format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .name_embedding = "name",
+        .name_embedding_dims = 4,
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "emb", "left": "name_embedding", "right": "name_embedding",
+        \\  "levels": [ { "when": "cosine > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    });
+
+    const entity_doc_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(entity_doc_key);
+    try db.core.store.put(entity_doc_key,
+        \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [1.0, 0.0, 0.0, 0.0] }
+    );
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"Ada mention\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try std.testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+
+    const edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"target_table\":\"entities\"") != null);
+
+    const deterministic_edges = try db.getEdges(alloc, "prov_graph", "person/a_lovelace", "mentions", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, deterministic_edges);
+    try std.testing.expectEqual(@as(usize, 0), deterministic_edges.len);
+
+    const relation_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "prov_graph", "relations_v1");
+    defer alloc.free(relation_state_key);
+    try db.core.store.delete(relation_state_key);
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    const changed = try materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph");
+    defer freeOwnedKeySlice(alloc, changed);
+
+    const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
+    defer alloc.free(graph_edge_key);
+    const edge_raw = try db.core.store.get(alloc, graph_edge_key);
+    defer alloc.free(edge_raw);
+}
+
 test "db graph artifact source replay catches up after reopen" {
     const alloc = std.testing.allocator;
 
@@ -23883,6 +26240,41 @@ test "db graph edge artifact replay catches up after reopen" {
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("doc:b", edges[0].target);
     try std.testing.expectApproxEqAbs(@as(f64, 0.8), edges[0].weight, 0.0001);
+}
+
+test "db query_readonly opens empty declared graph index" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json = "{}",
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .query_readonly });
+    defer reopened.close();
+
+    const query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "relations_graph",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{ .edge_types = &.{"mentions"}, .direction = .out },
+    };
+    var result = try reopened.search(alloc, .{ .graph_queries = &.{.{ .name = "mentions", .query = query }} });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(u32, 0), result.graph_results[0].total_hits);
+    try std.testing.expectEqual(@as(usize, 0), result.graph_results[0].nodes.len);
 }
 
 test "db batch marks generated enrichment replay for generator-enabled dense index" {
@@ -24065,6 +26457,7 @@ test "db enrichments precomputes generated enrichments into the committed batch"
         },
         .sync_level = .enrichments,
     });
+    try std.testing.expectEqual(@as(u64, 1), db.enrichment_runtime.?.stats().applied_sequence);
 
     const journal_entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
     defer {
@@ -24085,12 +26478,100 @@ test "db enrichments precomputes generated enrichments into the committed batch"
     try std.testing.expect(journal_record.record.changed_artifact_keys.len > 0);
 }
 
+test "db replicated apply decouples client enrichment sync from raft apply execution" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+
+    try db.batchReplicatedApply(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+
+    const journal_entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+    defer {
+        for (journal_entries) |*entry| entry.deinit(alloc);
+        alloc.free(journal_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), journal_entries.len);
+
+    var journal_record = try change_journal_mod.decodeRecord(alloc, journal_entries[0].payload);
+    defer journal_record.deinit();
+
+    try std.testing.expect(journalRecordHasHint(journal_record.record, .enrichment));
+    try std.testing.expect(!journalRecordHasHint(journal_record.record, .dense_vector));
+    try std.testing.expectEqual(@as(usize, 0), journal_record.record.changed_artifact_keys.len);
+}
+
+test "db enrichments precomputed watermark advances across replay entries without enrichment debt" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+        },
+    });
+    defer db.close();
+
+    const inert_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:before"},
+        .target_hints = &.{.full_text},
+    });
+    defer alloc.free(inert_payload);
+    try db.core.store.appendReplayOpaque(alloc, 1, inert_payload);
+    try db.enrichment_runtime.?.resumeFrom(0, 0);
+    try std.testing.expectEqual(@as(u64, 0), db.enrichment_runtime.?.stats().applied_sequence);
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"precomputed dense text\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(db.core.nextDerivedSequence(), db.enrichment_runtime.?.stats().applied_sequence);
+}
+
 const TestAssetProducer = struct {
     calls: usize = 0,
     generator_calls: usize = 0,
     reader_calls: usize = 0,
     transcriber_calls: usize = 0,
     extractor_calls: usize = 0,
+    extractor_output: ?[]const u8 = null,
 
     fn producer(self: *@This()) asset_producer_mod.Producer {
         return .{
@@ -24110,6 +26591,7 @@ const TestAssetProducer = struct {
             .extractor => self.extractor_calls += 1,
         }
         if (request.producer_type == .extractor) {
+            if (self.extractor_output) |output| return try alloc.dupe(u8, output);
             return try std.fmt.allocPrint(alloc, "{{\"relations\":[{{\"type\":\"mentions\",\"target\":{{\"document_id\":{f}}}}}]}}", .{std.json.fmt(request.source_text, .{})});
         }
         return try std.fmt.allocPrint(alloc, "{s}:{s}", .{ @tagName(request.producer_type), request.source_text });
@@ -24202,10 +26684,15 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
 
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "generated_title_v1");
     defer alloc.free(asset_key);
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, "generated_title_v1", "doc:a");
+    defer alloc.free(marker_key);
     const state_key = try assetStateKeyAlloc(alloc, "doc:a", "generated_title_v1");
     defer alloc.free(state_key);
     const stored_asset = try db.core.store.get(alloc, asset_key);
     alloc.free(stored_asset);
+    const stored_marker = try db.core.store.get(alloc, marker_key);
+    defer alloc.free(stored_marker);
+    try std.testing.expectEqualStrings(asset_key, stored_marker);
     const stored_state = try db.core.store.get(alloc, state_key);
     alloc.free(stored_state);
 
@@ -24214,6 +26701,7 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
         .sync_level = .write,
     });
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, asset_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
 }
 
