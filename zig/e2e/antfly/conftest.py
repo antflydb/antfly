@@ -137,7 +137,8 @@ def wait_for_server(
     consecutive_successes = 0
     while time.monotonic() < deadline:
         try:
-            resp = requests.get(f"{url}{path}", timeout=2)
+            request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
+            resp = requests.get(f"{url}{path}", timeout=request_timeout)
             if resp.ok:
                 consecutive_successes += 1
                 if consecutive_successes >= 2:

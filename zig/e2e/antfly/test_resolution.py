@@ -45,7 +45,7 @@ from conftest import (
 )
 from test_scaling import MultiNodeScalingCluster
 
-JOURNEY_TIMEOUT_S = 90.0
+AUTOGRAPH_E2E_TIMEOUT_S = 115.0
 POLL_INTERVAL_S = 0.5
 POLL_REQUEST_TIMEOUT_S = 5.0
 
@@ -98,9 +98,14 @@ def resolution_cluster():
         pytest.skip(f"Antfly binary not found: {binary} (set ANTFLY_BIN)")
     if Path(binary).name != "antfly":
         pytest.skip("distributed autograph e2e requires the antfly binary")
-    cluster = MultiNodeScalingCluster(binary, initial_data_node_count=3)
+    deadline = _Deadline(AUTOGRAPH_E2E_TIMEOUT_S)
+    cluster = MultiNodeScalingCluster(
+        binary,
+        initial_data_node_count=3,
+        startup_deadline_at=deadline.expires_at,
+    )
     try:
-        yield cluster
+        yield cluster, deadline
     finally:
         cluster.stop()
 
@@ -280,8 +285,8 @@ def _wait_for_mention_hydration(
 
 
 def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_cluster):
-    api = _Api(resolution_cluster.data_api_urls[0], resolution_cluster)
-    deadline = _Deadline(JOURNEY_TIMEOUT_S)
+    cluster, deadline = resolution_cluster
+    api = _Api(cluster.data_api_urls[0], cluster)
 
     # Entities live in their own table (own shard group); documents are spread
     # across multiple shards in an explicit multi-node metadata/data raft setup.
