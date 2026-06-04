@@ -35,6 +35,7 @@ jobs:
         run: uv sync
 
       - name: Verify generated client
+        if: matrix.python-version == '3.13'
         working-directory: py/packages/sdk
         run: |
           make generate
