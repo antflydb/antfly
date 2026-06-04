@@ -723,6 +723,17 @@ const EnrichmentAppendContext = struct {
     }
 };
 
+fn notifyResolverReplayRuntimesForCatalog(
+    index_manager: *const index_manager_mod.IndexManager,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime,
+    sequence: u64,
+) void {
+    if (index_manager.resolvers.items.len == 0) return;
+    if (resolution_runtime) |runtime| runtime.notifySequence(sequence);
+    if (promotion_runtime) |runtime| runtime.notifySequence(sequence);
+}
+
 const BatchExecutionContext = struct {
     alloc: Allocator,
     io: ?std.Io = null,
@@ -2939,6 +2950,29 @@ pub const DB = struct {
         return self.core.index_manager.resolvers.items.len > 0;
     }
 
+    fn resolverReplayNeedsDrain(self: *DB) bool {
+        if (self.hasConfiguredResolvers()) return true;
+        if (self.resolution_runtime) |runtime| {
+            const replay_stats = runtime.stats();
+            if (replay_stats.catch_up_required or replay_stats.blocked) return true;
+        }
+        if (self.promotion_runtime) |runtime| {
+            const replay_stats = runtime.stats();
+            if (replay_stats.catch_up_required or replay_stats.blocked) return true;
+        }
+        return false;
+    }
+
+    fn notifyResolverReplayRuntimes(self: *DB, sequence: u64) void {
+        if (!self.hasConfiguredResolvers()) return;
+        self.notifyResolverReplayRuntimesForced(sequence);
+    }
+
+    fn notifyResolverReplayRuntimesForced(self: *DB, sequence: u64) void {
+        if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
+        if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+    }
+
     fn startResolverReplayRuntimesIfConfigured(self: *DB) !void {
         if (!self.hasConfiguredResolvers()) return;
         try self.startResolverReplayRuntimes();
@@ -4033,8 +4067,7 @@ pub const DB = struct {
             runtime.notifySequence(sequence);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
         }
-        if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
-        if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+        self.notifyResolverReplayRuntimes(sequence);
     }
 
     /// Inject (or clear) the cross-shard entity-resolution candidate source on
@@ -5767,8 +5800,7 @@ pub const DB = struct {
         if (!removed) return false;
         if (retirement_sequence) |sequence| {
             self.executor.notifySequence(sequence);
-            if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
-            if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+            self.notifyResolverReplayRuntimesForced(sequence);
             try self.runUntilIdle();
         }
         self.stopResolverReplayRuntimesIfUnconfigured();
@@ -5969,8 +6001,7 @@ pub const DB = struct {
         } else {
             self.executor.notifySequence(sequence);
         }
-        if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
-        if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+        self.notifyResolverReplayRuntimes(sequence);
         return sequence;
     }
 
@@ -6877,15 +6908,17 @@ pub const DB = struct {
             try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
             const drained_sequence = self.core.nextDerivedSequence();
 
-            if (self.resolution_runtime) |runtime| {
-                if (drained_sequence > 0) runtime.notifySequence(drained_sequence - 1);
-                try runtime.catchUp();
-            }
+            if (self.resolverReplayNeedsDrain()) {
+                if (self.resolution_runtime) |runtime| {
+                    if (drained_sequence > 0) runtime.notifySequence(drained_sequence - 1);
+                    try runtime.catchUp();
+                }
 
-            if (self.promotion_runtime) |runtime| {
-                const latest = self.core.nextDerivedSequence();
-                if (latest > 0) runtime.notifySequence(latest - 1);
-                try runtime.catchUp();
+                if (self.promotion_runtime) |runtime| {
+                    const latest = self.core.nextDerivedSequence();
+                    if (latest > 0) runtime.notifySequence(latest - 1);
+                    try runtime.catchUp();
+                }
             }
 
             if (self.core.nextDerivedSequence() <= drained_sequence) return;
@@ -7675,8 +7708,7 @@ pub const DB = struct {
             const sequence = try appendDerivedBatchRecord(self, pending_batch);
             self.executor.notifySequence(sequence);
             if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
-            if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
-            if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+            self.notifyResolverReplayRuntimes(sequence);
         }
         return generated_ref_count;
     }
@@ -14487,8 +14519,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         try waitForSyncLevelContext(ctx, sync_level, sequence, sync_targets);
     }
     if (ctx.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
-    if (ctx.resolution_runtime) |runtime| runtime.notifySequence(sequence);
-    if (ctx.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+    notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
 }
 
 fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const ttl_runtime_mod.DeleteCandidate) !u32 {
@@ -15155,10 +15186,7 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     var batch_ctx = ctx.batchContext();
     const sequence = try appendDerivedBatchRecordContext(&batch_ctx, batch);
-    if (ctx.resolution_runtime) |runtime| runtime.notifySequence(sequence);
-    // The resolution stage journals its resolution artifacts through this path;
-    // wake the promoter so it upserts the canonical entity documents.
-    if (ctx.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+    notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
         return sequence;
@@ -24397,6 +24425,22 @@ test "db starts resolver replay workers only while resolver catalog is configure
         \\}
         ,
     });
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:no-resolver",
+            .value = "{\"title\":\"ordinary write\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    const no_resolver_pending = db.pendingWorkStats();
+    try std.testing.expect(!no_resolver_pending.resolution.enabled);
+    try std.testing.expect(!no_resolver_pending.resolution.catch_up_required);
+    try std.testing.expect(!no_resolver_pending.promotion.enabled);
+    try std.testing.expect(!no_resolver_pending.promotion.catch_up_required);
     try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
     try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
 

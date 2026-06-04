@@ -303,7 +303,7 @@ const RaftTableApplyStateMachine = struct {
         for (committed_entries) |entry| {
             if (entry.index > last_index) last_index = entry.index;
             if (entry.entry_type != .normal) continue;
-            if (!std.mem.startsWith(u8, entry.data, "{\"table\"")) continue;
+            if (!data_raft_batch.looksLikeEnvelope(entry.data)) continue;
             var decoded = try data_raft_batch.decode(self.alloc, entry.data);
             defer decoded.deinit(self.alloc);
             _ = try self.write_source.applyReplicatedBatchGroupLocal(
@@ -2786,8 +2786,13 @@ pub const DataServer = struct {
     pub fn reconcileVisibleProvisionedReplicaState(self: *DataServer) !void {
         try self.refreshVisibleProvisionedReplicaState();
         lockAtomic(self.write_source.localDbMutex());
-        defer self.write_source.localDbMutex().unlock();
         self.write_source.pruneStaleWriteCacheLocked();
+        self.write_source.localDbMutex().unlock();
+        if (self.data_raft_apply) |apply_sm| {
+            lockAtomic(apply_sm.write_source.localDbMutex());
+            defer apply_sm.write_source.localDbMutex().unlock();
+            apply_sm.write_source.pruneStaleWriteCacheLocked();
+        }
     }
 
     fn collectLocalGroupStatusesForMetadataService(
@@ -5353,6 +5358,11 @@ pub const DataServer = struct {
         try self.provisioned_storage.bumpGroupVisibleRootGenerations(local_group_ids);
         self.provisioned_storage.read_cache.clear();
         self.write_source.pruneStaleWriteCacheLocked();
+        if (self.data_raft_apply) |apply_sm| {
+            lockAtomic(apply_sm.write_source.localDbMutex());
+            defer apply_sm.write_source.localDbMutex().unlock();
+            apply_sm.write_source.pruneStaleWriteCacheLocked();
+        }
         self.last_provision_fingerprint = fingerprint;
         self.last_provision_metadata_epoch = head.metadata_epoch;
         self.invalidateLocalGroupStatusCache();
