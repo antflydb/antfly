@@ -5396,7 +5396,8 @@ fn openProvisionedQueryDbForTableWithCache(
         .identity_namespace = identity_namespace,
         .prefer_existing_identity_namespace = identity_namespace != null,
     });
-    errdefer db.close();
+    var db_open = true;
+    errdefer if (db_open) db.close();
     try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
 
     const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
@@ -5408,6 +5409,7 @@ fn openProvisionedQueryDbForTableWithCache(
         // index or resolver from metadata. Reopen after reconcile so searches
         // run against the stabilized post-reconcile index-manager state.
         db.close();
+        db_open = false;
         enrichments = try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
         db = if (enrichments.enabled()) blk: {
             const enrichment_cfg = enrichments.config();
@@ -5438,6 +5440,7 @@ fn openProvisionedQueryDbForTableWithCache(
             .identity_namespace = identity_namespace,
             .prefer_existing_identity_namespace = identity_namespace != null,
         });
+        db_open = true;
         try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
         const reopened_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
             .drain_resolver_backfill = false,
