@@ -12,21 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Inference-side predictor surface: registry, discovery, HTTP handlers,
-//! CLI subcommand. Bridges `lib/ml/tabular` to the inference server.
+//! Shared size guards for tabular predictor ingestion.
 
-pub const manifest = @import("manifest.zig");
-pub const limits = @import("limits.zig");
-pub const registry = @import("registry.zig");
-pub const discovery = @import("discovery.zig");
-pub const http = @import("http.zig");
-pub const cli = @import("cli.zig");
-
-test {
-    _ = manifest;
-    _ = limits;
-    _ = registry;
-    _ = discovery;
-    _ = http;
-    _ = cli;
-}
+/// The tabular JSON loader currently buffers the whole document before
+/// projecting it into the typed IR, so every ingestion path uses the same
+/// conservative cap. This is not a predictor engine limit.
+pub const max_model_json_bytes: usize = 256 * 1024 * 1024;

@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const tabular = @import("ml_tabular");
+const limits = @import("limits.zig");
 const registry_mod = @import("registry.zig");
 
 const builtin_iris_bytes = @embedFile("builtin/models/iris-classifier/tabular_model.json");
@@ -38,7 +39,7 @@ pub fn discover(io: std.Io, alloc: std.mem.Allocator, reg: *registry_mod.Registr
         const json_path = try std.fs.path.join(alloc, &.{ base_dir, entry.name, "tabular_model.json" });
         defer alloc.free(json_path);
 
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, json_path, alloc, .limited(64 * 1024 * 1024)) catch continue;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, json_path, alloc, .limited(limits.max_model_json_bytes)) catch continue;
         defer alloc.free(bytes);
 
         var loaded = tabular.loader.parseFromSlice(alloc, bytes) catch continue;

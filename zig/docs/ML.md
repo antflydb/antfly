@@ -1,4 +1,4 @@
-# Tabular ML Inference
+# Traditional ML Inference
 
 Antfly's Zig inference subsystem can serve "traditional" ML models —
 tree ensembles (XGBoost, LightGBM, ONNX-ML), linear / logistic regression,
@@ -99,9 +99,11 @@ Use `--ml-dir <dir>` or `ANTFLY_INFERENCE_ML_DIR` to override the ML predictor
 root. `--models-dir` / `ANTFLY_INFERENCE_MODELS_DIR` remains reserved for the
 AI model bundle catalog used by `/ai/v1/*`.
 
-Limits: max batch 10 000 rows, max pull 50 MB. Names are restricted to
-`[A-Za-z0-9_-]+`. The HTTP API does not accept model uploads; conversion and
-pulling are CLI responsibilities.
+Limits: max batch 10 000 rows, max model JSON 256 MB. The JSON cap applies to
+the buffered CLI pull, local conversion input, discovery scan, and lazy-load
+paths; it is an ingestion guard for the current in-memory parser, not a tree
+engine constraint. Names are restricted to `[A-Za-z0-9_-]+`. The HTTP API does
+not accept model uploads; conversion and pulling are CLI responsibilities.
 
 ## In-process use from antfly DB
 

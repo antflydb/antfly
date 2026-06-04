@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const tabular = @import("ml_tabular");
+const limits = @import("limits.zig");
 const manifest_mod = @import("manifest.zig");
 
 pub const default_keep_alive_ns: i64 = 5 * std.time.ns_per_min;
@@ -195,7 +196,7 @@ pub const Registry = struct {
         const json_path = std.fs.path.join(self.alloc, &.{ e.info.path, "tabular_model.json" }) catch return Error.OutOfMemory;
         defer self.alloc.free(json_path);
 
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, json_path, self.alloc, .limited(64 * 1024 * 1024)) catch return Error.LoadFailed;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, json_path, self.alloc, .limited(limits.max_model_json_bytes)) catch return Error.LoadFailed;
         defer self.alloc.free(bytes);
 
         var loaded = tabular.loader.parseFromSlice(self.alloc, bytes) catch return Error.LoadFailed;

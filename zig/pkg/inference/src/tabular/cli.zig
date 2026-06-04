@@ -21,10 +21,10 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const tabular = @import("ml_tabular");
+const limits = @import("limits.zig");
 const registry_mod = @import("registry.zig");
 
 const print = std.debug.print;
-const max_pull_bytes: usize = 50 * 1024 * 1024;
 var tmp_counter = std.atomic.Value(u64).init(0);
 
 const PullInstallError = error{
@@ -96,7 +96,7 @@ pub fn pullMain(
     print("pulling {s}...\n", .{url});
     var client = httpx.Client.initWithConfig(alloc, io, .{
         .keep_alive = false,
-        .max_response_size = max_pull_bytes,
+        .max_response_size = limits.max_model_json_bytes,
     });
     defer client.deinit();
 
@@ -174,7 +174,7 @@ pub fn convertMain(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
         return;
     }
 
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, input_path.?, alloc, .limited(256 * 1024 * 1024)) catch {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, input_path.?, alloc, .limited(limits.max_model_json_bytes)) catch {
         print("convert: cannot read {s}\n", .{input_path.?});
         return;
     };
@@ -234,7 +234,7 @@ fn installPulledModel(
     name: []const u8,
     body: []const u8,
 ) PullInstallError!void {
-    if (body.len > max_pull_bytes) return PullInstallError.InvalidModel;
+    if (body.len > limits.max_model_json_bytes) return PullInstallError.InvalidModel;
     if (!registry_mod.isSafeName(name)) return PullInstallError.InvalidName;
 
     var loaded = tabular.loader.parseFromSlice(alloc, body) catch return PullInstallError.InvalidModel;
