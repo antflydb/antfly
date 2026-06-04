@@ -2128,7 +2128,7 @@ fn fuseReduceAxisMerge(allocator: std.mem.Allocator, work: *Graph, reachable: []
 
         // Build the union of axes; bail on overlap (would double-count
         // for mean / repeat work for sum).
-        var present: [shape_mod.max_rank]bool = .{false} ** shape_mod.max_rank;
+        var present: [shape_mod.max_rank]bool = @splat(false);
         var merged: node_mod.ReduceAttrs = .{};
         var n_merged: u8 = 0;
         var disjoint = true;

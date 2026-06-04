@@ -560,14 +560,14 @@ test "pattern match supports linear alias bindings and cycles" {
 
     const dir_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-pattern", .{tmp.sub_path});
     defer alloc.free(dir_path);
-    const dir = try alloc.dupeZ(u8, dir_path);
+    const dir = try alloc.dupeSentinel(u8, dir_path, 0);
     defer alloc.free(dir);
     var doc_store = try @import("../storage/docstore.zig").DocStore.open(arena.allocator(), dir, .{});
     defer doc_store.close();
 
     const reverse_dir_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-pattern-rev", .{tmp.sub_path});
     defer alloc.free(reverse_dir_path);
-    const reverse_dir = try alloc.dupeZ(u8, reverse_dir_path);
+    const reverse_dir = try alloc.dupeSentinel(u8, reverse_dir_path, 0);
     defer alloc.free(reverse_dir);
     var graph_index = try graph_mod.GraphIndex.open(alloc, &doc_store, reverse_dir, "g", .{});
     defer graph_index.close();

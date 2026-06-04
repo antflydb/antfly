@@ -50,7 +50,7 @@ const method_count = @typeInfo(types.Method).@"enum".fields.len;
 pub const Router = struct {
     allocator: Allocator,
     /// Per-method route lists indexed by @intFromEnum(method).
-    method_routes: [method_count]std.ArrayListUnmanaged(Route) = [_]std.ArrayListUnmanaged(Route){.empty} ** method_count,
+    method_routes: [method_count]std.ArrayListUnmanaged(Route) = @as([method_count]std.ArrayListUnmanaged(Route), @splat(.empty)),
     const Self = @This();
 
     /// Creates a new router.

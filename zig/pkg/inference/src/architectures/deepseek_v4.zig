@@ -97,12 +97,12 @@ pub fn inferSchedulesFromGgufNames(config: *gpt_config.Config, all_names: []cons
     const max_layers: usize = @min(@as(usize, @intCast(config.num_hidden_layers)), gpt_config.deepseek_v4_max_layers);
     if (max_layers == 0) return;
 
-    var saw_layer = [_]bool{false} ** gpt_config.deepseek_v4_max_layers;
-    var saw_compressor = [_]bool{false} ** gpt_config.deepseek_v4_max_layers;
-    var saw_indexer = [_]bool{false} ** gpt_config.deepseek_v4_max_layers;
-    var saw_mlp = [_]bool{false} ** gpt_config.deepseek_v4_max_layers;
-    var saw_hash_gate = [_]bool{false} ** gpt_config.deepseek_v4_max_layers;
-    var saw_router_bias = [_]bool{false} ** gpt_config.deepseek_v4_max_layers;
+    var saw_layer = @as([gpt_config.deepseek_v4_max_layers]bool, @splat(false));
+    var saw_compressor = @as([gpt_config.deepseek_v4_max_layers]bool, @splat(false));
+    var saw_indexer = @as([gpt_config.deepseek_v4_max_layers]bool, @splat(false));
+    var saw_mlp = @as([gpt_config.deepseek_v4_max_layers]bool, @splat(false));
+    var saw_hash_gate = @as([gpt_config.deepseek_v4_max_layers]bool, @splat(false));
+    var saw_router_bias = @as([gpt_config.deepseek_v4_max_layers]bool, @splat(false));
     var observed_layers: usize = 0;
 
     for (all_names) |name| {

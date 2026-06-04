@@ -489,7 +489,7 @@ test "GLiNER2 inference: fixed text produces deterministic token logits" {
     try std.testing.expectEqualSlices(f32, weight_slot.weights, reloaded_head.weight);
     try std.testing.expectEqualSlices(f32, bias_slot.weights, reloaded_head.bias);
 
-    const zero_hidden = [_]f32{0.0} ** (2 * HIDDEN);
+    const zero_hidden = @as([(2 * HIDDEN)]f32, @splat(0.0));
     const reloaded_logits = try reloaded_head.scoreRowsAlloc(allocator, &zero_hidden);
     defer allocator.free(reloaded_logits);
     for (0..2) |row_idx| {

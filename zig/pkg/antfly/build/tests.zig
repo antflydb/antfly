@@ -69,16 +69,15 @@ pub fn chainLabeledFilteredTests(
     return tail.?;
 }
 
+/// Zig 0.17's split build system removed the ability to observe the post-`--`
+/// passthru args (`b.args`) at configure time, so compile-time test filtering
+/// moves to a repeatable `-Dtest-filter=...` option instead of
+/// `zig build test -- [--test-filter] <name>`. The option is declared once by
+/// the caller (`b.option` panics if declared twice) and the resolved value is
+/// threaded in here.
 pub fn selectTestFilters(
-    b: *std.Build,
+    override: ?[]const []const u8,
     default_filters: []const []const u8,
 ) []const []const u8 {
-    const args = b.args orelse return default_filters;
-    if (args.len == 0) return default_filters;
-
-    if (std.mem.eql(u8, args[0], "--test-filter")) {
-        if (args.len <= 1) return default_filters;
-        return args[1..];
-    }
-    return args;
+    return override orelse default_filters;
 }

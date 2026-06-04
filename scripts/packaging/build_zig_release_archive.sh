@@ -99,6 +99,32 @@ if [ -d /mnt/cache ] && [ -w /mnt/cache ]; then
   cache_root=/mnt/cache/zig
 fi
 
+run_with_heartbeat() {
+  local interval="${ANTFLY_RELEASE_BUILD_HEARTBEAT_INTERVAL:-60}"
+  "$@" &
+  local cmd_pid=$!
+
+  (
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+      sleep "$interval"
+      if kill -0 "$cmd_pid" 2>/dev/null; then
+        printf '[%s] still building native Zig release archive...\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      fi
+    done
+  ) &
+  local heartbeat_pid=$!
+
+  local status=0
+  if wait "$cmd_pid"; then
+    status=0
+  else
+    status=$?
+  fi
+  kill "$heartbeat_pid" 2>/dev/null || true
+  wait "$heartbeat_pid" 2>/dev/null || true
+  return "$status"
+}
+
 rm -rf "$work_root"
 mkdir -p "$prefix" "$stage" "$cache_root/global" "$out_dir"
 
@@ -121,9 +147,9 @@ zig_build_args=(
 (
   cd "$repo_root/zig"
   if [ -n "$jobs" ]; then
-    zig build "-j$jobs" "${zig_build_args[@]}"
+    run_with_heartbeat zig build "-j$jobs" "${zig_build_args[@]}"
   else
-    zig build "${zig_build_args[@]}"
+    run_with_heartbeat zig build "${zig_build_args[@]}"
   fi
 )
 

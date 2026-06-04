@@ -193,7 +193,7 @@ fn writeAbsoluteFile(
     path: []const u8,
     data: []const u8,
 ) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = c_file.c.open(path_z.ptr, c_file.c.O_WRONLY | c_file.c.O_CREAT | c_file.c.O_TRUNC, @as(c_file.c.mode_t, 0o644));

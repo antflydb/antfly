@@ -874,7 +874,7 @@ test "png adler32 fast path matches std adler32" {
     chunked = adler32FastUpdate(chunked, bytes[31..]);
     try std.testing.expectEqual(std.hash.Adler32.hash(bytes), chunked);
 
-    const long = [_]u8{0xf3} ** 7000;
+    const long = @as([7000]u8, @splat(0xf3));
     try std.testing.expectEqual(std.hash.Adler32.hash(&long), adler32FastUpdate(adler32FastInit(), &long));
 }
 

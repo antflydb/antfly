@@ -1654,7 +1654,7 @@ fn resolveOptionalConfigString(
 }
 
 fn resolveOptionalEnv(alloc: std.mem.Allocator, env_name: []const u8) ?[]u8 {
-    const name_z = alloc.dupeZ(u8, env_name) catch return null;
+    const name_z = alloc.dupeSentinel(u8, env_name, 0) catch return null;
     defer alloc.free(name_z);
     const value_z = getenv(name_z.ptr) orelse return null;
     return alloc.dupe(u8, std.mem.span(value_z)) catch null;

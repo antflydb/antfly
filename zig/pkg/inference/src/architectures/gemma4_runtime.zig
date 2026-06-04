@@ -19,7 +19,7 @@ const gpt_arch = @import("gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
 
-const c_std = @cImport(@cInclude("stdlib.h"));
+const c_std = @import("../util/c_env.zig");
 
 pub const max_runtime_layers = 256;
 

@@ -24,9 +24,9 @@ pub const GpuKvKeyFormat = wasm_compute.GpuKvKeyFormat;
 pub const GpuKvValueFormat = wasm_compute.GpuKvValueFormat;
 
 pub const CacheState = struct {
-    kv_caches: [max_caches]?WasmKvCache = [_]?WasmKvCache{null} ** max_caches,
-    gpu_kv_caches: [max_caches]?GpuKvCache = [_]?GpuKvCache{null} ** max_caches,
-    t5_cross_caches: [max_caches]?t5_arch.T5CrossCache = [_]?t5_arch.T5CrossCache{null} ** max_caches,
+    kv_caches: [max_caches]?WasmKvCache = @as([max_caches]?WasmKvCache, @splat(null)),
+    gpu_kv_caches: [max_caches]?GpuKvCache = @as([max_caches]?GpuKvCache, @splat(null)),
+    t5_cross_caches: [max_caches]?t5_arch.T5CrossCache = @as([max_caches]?t5_arch.T5CrossCache, @splat(null)),
 
     pub fn createGpt(
         self: *CacheState,

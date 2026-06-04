@@ -1026,8 +1026,8 @@ test "graph bridge mlp classifier one step updates head" {
     defer graph_bundle.deinit();
     var head = MlpHead{
         .allocator = allocator,
-        .dense_weight = try allocator.dupe(f32, &([_]f32{ 0.1, 0.2, 0.3 } ** 5)),
-        .dense_bias = try allocator.dupe(f32, &([_]f32{0.0} ** 5)),
+        .dense_weight = try allocator.dupe(f32, &@as([15]f32, @bitCast(@as([5][3]f32, @splat([3]f32{ 0.1, 0.2, 0.3 }))))),
+        .dense_bias = try allocator.dupe(f32, &(@as([5]f32, @splat(0.0)))),
         .out_weight = try allocator.dupe(f32, &([_]f32{ 0.2, -0.1, 0.05, 0.03, 0.07, -0.2, 0.1, -0.05, 0.02, -0.03 })),
         .out_bias = try allocator.dupe(f32, &([_]f32{ 0.0, 0.0 })),
         .input_dim = 3,

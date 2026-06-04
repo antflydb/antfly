@@ -39,8 +39,8 @@ pub fn hybridShortBlock(input: []const f32, output: []f32) !void {
 
     @memset(output, 0);
 
-    var short_input: [6]f32 = [_]f32{0} ** 6;
-    var short_output: [12]f32 = [_]f32{0} ** 12;
+    var short_input: [6]f32 = @as([6]f32, @splat(0));
+    var short_output: [12]f32 = @as([12]f32, @splat(0));
     const window = shortWindow();
 
     for (0..3) |window_index| {
@@ -77,7 +77,7 @@ fn inverseMdctGeneric(comptime n: usize, input: []const f32, output: []f32) void
 }
 
 fn longWindow(block_type: u2) [36]f32 {
-    var window: [36]f32 = [_]f32{0} ** 36;
+    var window: [36]f32 = @as([36]f32, @splat(0));
     const pi = std.math.pi;
 
     switch (block_type) {
@@ -116,7 +116,7 @@ fn longWindow(block_type: u2) [36]f32 {
 }
 
 fn shortWindow() [12]f32 {
-    var window: [12]f32 = [_]f32{0} ** 12;
+    var window: [12]f32 = @as([12]f32, @splat(0));
     const pi = std.math.pi;
 
     for (0..12) |i| {
@@ -128,8 +128,8 @@ fn shortWindow() [12]f32 {
 }
 
 test "inverse mdct rejects invalid dimensions" {
-    var output36: [36]f32 = [_]f32{0} ** 36;
-    var output12: [12]f32 = [_]f32{0} ** 12;
+    var output36: [36]f32 = @as([36]f32, @splat(0));
+    var output12: [12]f32 = @as([12]f32, @splat(0));
 
     try std.testing.expectError(error.InvalidDimensions, inverseMdct36(&.{ 0, 1 }, output36[0..]));
     try std.testing.expectError(error.InvalidDimensions, inverseMdct12(&.{ 0, 1 }, output12[0..]));
@@ -138,10 +138,10 @@ test "inverse mdct rejects invalid dimensions" {
 }
 
 test "inverse mdct of zero coefficients stays zero" {
-    const input36 = [_]f32{0} ** 18;
-    const input12 = [_]f32{0} ** 6;
-    var output36: [36]f32 = [_]f32{1} ** 36;
-    var output12: [12]f32 = [_]f32{1} ** 12;
+    const input36 = @as([18]f32, @splat(0));
+    const input12 = @as([6]f32, @splat(0));
+    var output36: [36]f32 = @as([36]f32, @splat(1));
+    var output12: [12]f32 = @as([12]f32, @splat(1));
 
     try inverseMdct36(input36[0..], output36[0..]);
     try inverseMdct12(input12[0..], output12[0..]);
@@ -151,7 +151,7 @@ test "inverse mdct of zero coefficients stays zero" {
 }
 
 test "hybrid long start window zeros the trailing tail" {
-    var input: [18]f32 = [_]f32{0} ** 18;
+    var input: [18]f32 = @as([18]f32, @splat(0));
     input[0] = 1;
 
     var output: [36]f32 = undefined;
@@ -163,7 +163,7 @@ test "hybrid long start window zeros the trailing tail" {
 }
 
 test "hybrid long stop window zeros the leading head" {
-    var input: [18]f32 = [_]f32{0} ** 18;
+    var input: [18]f32 = @as([18]f32, @splat(0));
     input[0] = 1;
 
     var output: [36]f32 = undefined;
@@ -175,7 +175,7 @@ test "hybrid long stop window zeros the leading head" {
 }
 
 test "hybrid short block stays within central 24 samples" {
-    const input: [18]f32 = [_]f32{1} ** 18;
+    const input: [18]f32 = @as([18]f32, @splat(1));
     var output: [36]f32 = undefined;
 
     try hybridShortBlock(input[0..], output[0..]);

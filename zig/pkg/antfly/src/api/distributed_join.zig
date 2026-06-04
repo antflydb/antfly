@@ -119,7 +119,7 @@ pub const OpenedJoinJobStore = struct {
     docstore: *docstore_mod.DocStore,
 
     pub fn open(alloc: std.mem.Allocator, path: []const u8) !OpenedJoinJobStore {
-        const path_z = try alloc.dupeZ(u8, path);
+        const path_z = try alloc.dupeSentinel(u8, path, 0);
         errdefer alloc.free(path_z);
         const docstore = try alloc.create(docstore_mod.DocStore);
         errdefer alloc.destroy(docstore);

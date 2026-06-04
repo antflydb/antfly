@@ -124,7 +124,7 @@ pub const FeatureDBReads = struct {
 test "feature db reads honor per-read consistency" {
     const Recorder = struct {
         group_ids: [3]u64 = .{ 0, 0, 0 },
-        contexts: [3][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 3,
+        contexts: [3][32]u8 = @as([3][32]u8, @splat(@as([32]u8, @splat(0)))),
         context_lens: [3]usize = .{ 0, 0, 0 },
         count: usize = 0,
 

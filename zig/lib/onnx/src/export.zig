@@ -3133,7 +3133,7 @@ test "exportGraphWithExternalData emits q8_0 block parameter via DequantizeLinea
     const weight = try builder.parameter("weight", Shape.init(.f32, &.{ 2, 32 }));
     try graph.markOutput(weight);
 
-    const values = [_]u8{128} ** 64;
+    const values = @as([64]u8, @splat(128));
     const scales = [_]f32{ 0.25, 0.5 };
     const init = ParameterInitializer{
         .name = "weight",
@@ -3198,7 +3198,7 @@ test "exportGraph rejects inline q8_0 block parameter initializers" {
     const weight = try builder.parameter("weight", Shape.init(.f32, &.{ 1, 32 }));
     try graph.markOutput(weight);
 
-    const values = [_]u8{128} ** 32;
+    const values = @as([32]u8, @splat(128));
     const scales = [_]f32{0.25};
     const init = ParameterInitializer{
         .name = "weight",

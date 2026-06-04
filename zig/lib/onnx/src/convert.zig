@@ -596,7 +596,7 @@ pub const Model = struct {
         errdefer _ = converted.remove(name);
 
         // Recursively convert all inputs (up to 16 for ops like BatchNorm with 5)
-        var input_ids: [16]NodeId = .{null_node} ** 16;
+        var input_ids: [16]NodeId = @splat(null_node);
         for (node.inputs, 0..) |input_name, i| {
             if (i >= 16) break;
             if (input_name.len == 0) {
@@ -622,7 +622,7 @@ pub const Model = struct {
         // Pass the parent `converted` map as an outer scope so that
         // If/Loop/Scan bodies can resolve implicit captures by name.
         const num_inputs = @min(node.inputs.len, 16);
-        var extra_outputs: [7]NodeId = .{null_node} ** 7;
+        var extra_outputs: [7]NodeId = @splat(null_node);
         const extra_slice = if (node.outputs.len > 1) extra_outputs[0..@min(node.outputs.len - 1, 7)] else extra_outputs[0..0];
         const parent_scope = ops.NameScope{ .map = converted };
         const result_id = ops.convertNodeWithScope(
@@ -672,7 +672,7 @@ fn inputShapeWithOverrides(info: *const ValueInfoProto, overrides: ?*const DimOv
     const dtype = tensor_mod.onnxDTypeToTermite(tensor_type.elem_type) catch return null;
 
     if (shape_proto.dims.len > 8) return null;
-    var dims: [8]i64 = .{0} ** 8;
+    var dims: [8]i64 = @splat(0);
     for (shape_proto.dims, 0..) |d, i| {
         // Prefer an explicit override keyed by dim_param name when provided.
         if (d.dim_param.len > 0) {

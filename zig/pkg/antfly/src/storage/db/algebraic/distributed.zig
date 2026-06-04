@@ -442,8 +442,8 @@ test "distributed validated envelope merge ignores shard local symbol id assignm
     const alloc = std.testing.allocator;
     const axis = try token.canonicalTupleAlloc(alloc, &.{ "tenant:t1", "customer:alice" });
     defer alloc.free(axis);
-    const local_a = [_]u8{0x11} ** symbol.id_len;
-    const local_b = [_]u8{0x42} ** symbol.id_len;
+    const local_a = @as([symbol.id_len]u8, @splat(0x11));
+    const local_b = @as([symbol.id_len]u8, @splat(0x42));
     const merge_a = try symbol.shardMergeKeyFromResolvedSymbolAlloc(alloc, local_a[0..], axis);
     defer alloc.free(merge_a);
     const merge_b = try symbol.shardMergeKeyFromResolvedSymbolAlloc(alloc, local_b[0..], axis);

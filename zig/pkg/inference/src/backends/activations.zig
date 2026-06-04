@@ -628,7 +628,7 @@ test "vectorized activations match libm scalar reference" {
 }
 
 test "vectorized activations handle non-finite lanes" {
-    var sigmoid_data = [_]f32{0.0} ** VEC_LEN;
+    var sigmoid_data = @as([VEC_LEN]f32, @splat(0.0));
     sigmoid_data[0] = std.math.inf(f32);
     sigmoid_data[1] = -std.math.inf(f32);
     sigmoid_data[2] = std.math.nan(f32);
@@ -637,7 +637,7 @@ test "vectorized activations handle non-finite lanes" {
     try std.testing.expectEqual(@as(f32, 0.0), sigmoid_data[1]);
     try std.testing.expect(std.math.isNan(sigmoid_data[2]));
 
-    var silu_data = [_]f32{0.0} ** VEC_LEN;
+    var silu_data = @as([VEC_LEN]f32, @splat(0.0));
     silu_data[0] = std.math.inf(f32);
     silu_data[1] = -std.math.inf(f32);
     silu_data[2] = std.math.nan(f32);
@@ -646,7 +646,7 @@ test "vectorized activations handle non-finite lanes" {
     try std.testing.expect(std.math.isNan(silu_data[1]));
     try std.testing.expect(std.math.isNan(silu_data[2]));
 
-    var quick_gelu_data = [_]f32{0.0} ** VEC_LEN;
+    var quick_gelu_data = @as([VEC_LEN]f32, @splat(0.0));
     quick_gelu_data[0] = std.math.inf(f32);
     quick_gelu_data[1] = -std.math.inf(f32);
     quick_gelu_data[2] = std.math.nan(f32);
@@ -702,7 +702,7 @@ test "silu" {
 }
 
 test "silu remains finite for larger positive activation range" {
-    var data = [_]f32{0.0} ** (VEC_LEN * 2);
+    var data = @as([(VEC_LEN * 2)]f32, @splat(0.0));
     data[0] = 11.367456;
     data[VEC_LEN] = 11.367456;
     silu(&data);

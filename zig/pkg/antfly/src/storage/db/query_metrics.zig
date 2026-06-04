@@ -34,7 +34,7 @@ pub const QueryType = enum {
 const Entry = struct {
     name: []u8,
     query_type: QueryType,
-    buckets: [bucket_bounds.len + 1]u64 = [_]u64{0} ** (bucket_bounds.len + 1),
+    buckets: [bucket_bounds.len + 1]u64 = @as([(bucket_bounds.len + 1)]u64, @splat(0)),
     sum: f64 = 0,
     count: u64 = 0,
 };

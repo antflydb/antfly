@@ -517,7 +517,7 @@ test "lsm backend simulation immutable flush write fault keeps wal-backed state 
     var lsm_backend = try lsm_backend_mod.Backend.open(std.testing.allocator, root_dir, open_options);
     defer lsm_backend.close();
 
-    const large_value = [_]u8{'v'} ** 256;
+    const large_value = @as([256]u8, @splat('v'));
     try putBoth(&mem_backend, &lsm_backend, .{ .name = "docs" }, "doc:a", large_value[0..]);
     try std.testing.expectEqual(@as(usize, 1), lsm_backend.immutable_memtables.items.len);
     try std.testing.expectEqual(@as(usize, 0), lsm_backend.runs.items.len);

@@ -57,7 +57,7 @@ pub fn onnxDTypeToTermite(dt: DataType) !DType {
 pub fn tensorShape(tensor: *const TensorProto) !Shape {
     const dtype = try onnxDTypeToTermite(tensor.data_type);
     if (tensor.dims.len > 8) return error.TooManyDimensions;
-    var dims: [8]i64 = .{0} ** 8;
+    var dims: [8]i64 = @splat(0);
     for (tensor.dims, 0..) |d, i| dims[i] = d;
     return Shape{
         .dtype = dtype,
@@ -692,9 +692,9 @@ test "extractFloat32WithExternal honors offset and length" {
     const allocator = std.testing.allocator;
 
     // Write [header: 16 bytes, f32 payload: 3 values, trailer: 4 bytes] to a file.
-    const header = [_]u8{0xAA} ** 16;
+    const header = @as([16]u8, @splat(0xAA));
     const values = [_]f32{ 10.0, 20.0, 30.0 };
-    const trailer = [_]u8{0xBB} ** 4;
+    const trailer = @as([4]u8, @splat(0xBB));
     const payload = std.mem.sliceAsBytes(&values);
 
     var composed: [16 + 3 * 4 + 4]u8 = undefined;

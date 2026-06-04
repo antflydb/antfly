@@ -783,14 +783,14 @@ fn secretKeyForEnvVar(alloc: std.mem.Allocator, env_var: []const u8) ?[]u8 {
 
 fn hasEnvVar(env_var: []const u8) bool {
     if (!builtin.link_libc) return false;
-    const env_var_z = std.heap.smp_allocator.dupeZ(u8, env_var) catch return false;
+    const env_var_z = std.heap.smp_allocator.dupeSentinel(u8, env_var, 0) catch return false;
     defer std.heap.smp_allocator.free(env_var_z);
     return std.c.getenv(env_var_z.ptr) != null;
 }
 
 fn envValueOwned(alloc: std.mem.Allocator, env_var: []const u8) ?[]u8 {
     if (!builtin.link_libc) return null;
-    const env_var_z = alloc.dupeZ(u8, env_var) catch return null;
+    const env_var_z = alloc.dupeSentinel(u8, env_var, 0) catch return null;
     defer alloc.free(env_var_z);
     const raw = std.c.getenv(env_var_z.ptr) orelse return null;
     return alloc.dupe(u8, std.mem.span(raw)) catch null;

@@ -58,9 +58,9 @@ const CompiledTarget = graph_mod.compiled_backend.AttachmentTarget;
 const Options = struct {
     model_dir: []const u8,
     prompt: []const u8,
-    image_paths: [8][]const u8 = .{""} ** 8,
+    image_paths: [8][]const u8 = @splat(""),
     image_count: usize = 0,
-    audio_paths: [8][]const u8 = .{""} ** 8,
+    audio_paths: [8][]const u8 = @splat(""),
     audio_count: usize = 0,
     backend: BackendChoice = .auto,
     max_tokens: i32 = 128,

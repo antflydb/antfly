@@ -1534,7 +1534,7 @@ fn openAlgebraicBackend(
             else
                 try std.fmt.allocPrint(alloc, "/tmp/antfly-algebraic-lmdb-{d}", .{nowNs()});
             errdefer alloc.free(path);
-            const path_z = try alloc.dupeZ(u8, path);
+            const path_z = try alloc.dupeSentinel(u8, path, 0);
             defer alloc.free(path_z);
             const backend = try antfly.lmdb_backend.Backend.open(alloc, path_z.ptr, .{
                 .backend = .{ .create_if_missing = true },

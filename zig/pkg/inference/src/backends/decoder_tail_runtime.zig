@@ -17,7 +17,7 @@ const gpt_arch = @import("../architectures/gpt.zig");
 const model_runtime = @import("../graph/model_runtime.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
-const c_std = @cImport(@cInclude("stdlib.h"));
+const c_std = @import("../util/c_env.zig");
 
 pub const TimingStats = struct {
     greedy_calls: u64 = 0,

@@ -38,29 +38,29 @@ pub const Part2Info = struct {
 
 pub const RawScalefactors = struct {
     count: usize = 0,
-    values: [39]u8 = [_]u8{0} ** 39,
+    values: [39]u8 = @as([39]u8, @splat(0)),
 };
 
 pub const invalid_intensity_position: u8 = 0xFF;
 
 pub const RawIntensityPositions = struct {
     count: usize = 0,
-    values: [39]u8 = [_]u8{invalid_intensity_position} ** 39,
+    values: [39]u8 = @as([39]u8, @splat(invalid_intensity_position)),
 };
 
 pub const BandScalefactors = struct {
-    long: [21]u8 = [_]u8{0} ** 21,
-    short: [3][13]u8 = [_][13]u8{[_]u8{0} ** 13} ** 3,
-    intensity_long: [21]u8 = [_]u8{invalid_intensity_position} ** 21,
-    intensity_short: [3][13]u8 = [_][13]u8{[_]u8{invalid_intensity_position} ** 13} ** 3,
+    long: [21]u8 = @as([21]u8, @splat(0)),
+    short: [3][13]u8 = @as([3][13]u8, @splat(@as([13]u8, @splat(0)))),
+    intensity_long: [21]u8 = @as([21]u8, @splat(invalid_intensity_position)),
+    intensity_short: [3][13]u8 = @as([3][13]u8, @splat(@as([13]u8, @splat(invalid_intensity_position)))),
     long_band_count: usize = 0,
     short_band_start: usize = 12,
     short_band_count: usize = 0,
 };
 
 pub const BandScalePlan = struct {
-    long: [21]f32 = [_]f32{0} ** 21,
-    short: [3][13]f32 = [_][13]f32{[_]f32{0} ** 13} ** 3,
+    long: [21]f32 = @as([21]f32, @splat(0)),
+    short: [3][13]f32 = @as([3][13]f32, @splat(@as([13]f32, @splat(0)))),
     long_band_count: usize = 0,
     short_band_start: usize = 12,
     short_band_count: usize = 0,
@@ -692,7 +692,7 @@ pub fn reorderShortCoefficients(
     if (coefficients.len < 576) return;
 
     const short_bands = scalefactorBandShort(sample_rate);
-    var reordered: [576]f32 = [_]f32{0} ** 576;
+    var reordered: [576]f32 = @as([576]f32, @splat(0));
 
     var source_offset: usize = 0;
     var dest_offset: usize = 0;
@@ -1160,7 +1160,7 @@ test "requantize long big values uses band scales and preserves sign" {
         .{ .x = 1, .y = -8 },
         .{ .x = 0, .y = 2 },
     };
-    var coeffs = [_]f32{0} ** 8;
+    var coeffs = @as([8]f32, @splat(0));
     const progress = try requantizeBigValuePairsLong(16000, &pairs, scales, &coeffs);
     try std.testing.expectEqual(@as(usize, 4), progress.samples_decoded);
     try std.testing.expect(progress.unsupported_sample_index == null);
@@ -1211,7 +1211,7 @@ test "requantize short big values reorders by band and window" {
         .{ .x = 1, .y = 2 }, .{ .x = 3, .y = 4 },  .{ .x = 5, .y = 6 },
         .{ .x = 7, .y = 8 }, .{ .x = 9, .y = 10 }, .{ .x = 11, .y = 12 },
     };
-    var coeffs = [_]f32{0} ** 64;
+    var coeffs = @as([64]f32, @splat(0));
     const progress = try requantizeBigValuePairs(header, info, &pairs, scales, &coeffs);
     try std.testing.expectEqual(@as(usize, 12), progress.samples_decoded);
     try std.testing.expect(progress.unsupported_sample_index == null);
@@ -1260,7 +1260,7 @@ test "requantize mixed big values keeps first 36 samples long and reorders remai
     for (0..24) |i| {
         pairs[i] = .{ .x = @intCast(i * 2 + 1), .y = @intCast(i * 2 + 2) };
     }
-    var coeffs = [_]f32{0} ** 128;
+    var coeffs = @as([128]f32, @splat(0));
     const progress = try requantizeBigValuePairs(
         .{
             .version = .mpeg2,
@@ -1299,7 +1299,7 @@ test "alias reduction changes long block boundary coefficients" {
         .scalefac_scale = false,
         .count1table_select = false,
     };
-    var coeffs = [_]f32{0} ** 576;
+    var coeffs = @as([576]f32, @splat(0));
     coeffs[17] = 1;
     coeffs[18] = 2;
 
@@ -1326,7 +1326,7 @@ test "alias reduction skips pure short blocks" {
         .scalefac_scale = false,
         .count1table_select = false,
     };
-    var coeffs = [_]f32{0} ** 576;
+    var coeffs = @as([576]f32, @splat(0));
     coeffs[17] = 1;
     coeffs[18] = 2;
 
@@ -1353,7 +1353,7 @@ test "alias reduction on mixed blocks only touches first long boundary" {
         .scalefac_scale = false,
         .count1table_select = false,
     };
-    var coeffs = [_]f32{0} ** 576;
+    var coeffs = @as([576]f32, @splat(0));
     coeffs[17] = 1;
     coeffs[18] = 2;
     coeffs[35] = 3;

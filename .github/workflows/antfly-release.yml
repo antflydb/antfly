@@ -67,7 +67,7 @@ jobs:
       - name: Install Zig (Linux)
         if: ${{ matrix.os == 'linux' }}
         run: |
-          curl -L "https://ziglang.org/download/0.16.0/zig-${{ matrix.zig_arch }}-linux-0.16.0.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          curl -L "https://ziglang.org/builds/zig-${{ matrix.zig_arch }}-linux-0.17.0-dev.607+456b2ec07.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
@@ -76,7 +76,7 @@ jobs:
         if: ${{ matrix.os == 'darwin' }}
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.16.0"
+          version: "0.17.0-dev.607+456b2ec07"
 
       - name: Build archive
         run: |

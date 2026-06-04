@@ -661,8 +661,8 @@ test "8-bit AdamW approximates fp32 AdamW" {
     defer state8.deinit();
 
     // Reference fp32 Adam state.
-    var m32: [64]f32 = [_]f32{0} ** 64;
-    var v32: [64]f32 = [_]f32{0} ** 64;
+    var m32: [64]f32 = @as([64]f32, @splat(0));
+    var v32: [64]f32 = @as([64]f32, @splat(0));
 
     const lr: f32 = 0.001;
     const steps: u32 = 10;

@@ -2617,9 +2617,9 @@ test "colqwen2 bootstrap and inspect lora bundle" {
         .data = "{\"model_type\":\"colqwen2\",\"hidden_size\":128}",
     });
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "vlm.model.language_model.layers.0.self_attn.q_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "vlm.model.language_model.layers.0.self_attn.v_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "embedding_proj_layer.weight", .shape = &.{ 128, 1536 }, .data = &[_]f32{0} ** (128 * 1536) },
+        .{ .name = "vlm.model.language_model.layers.0.self_attn.q_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "vlm.model.language_model.layers.0.self_attn.v_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "embedding_proj_layer.weight", .shape = &.{ 128, 1536 }, .data = &@as([(128 * 1536)]f32, @splat(0)) },
     });
 
     const out_dir = try std.fs.path.join(allocator, &.{ root, "lora" });
@@ -2663,8 +2663,8 @@ test "colqwen2 lora bundle load and save round-trip" {
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_path, .data = "{}" });
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = special_tokens_path, .data = "{\"image_token\":\"<|image_pad|>\"}" });
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "vlm.model.language_model.layers.0.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** (8 * 8) },
-        .{ .name = "embedding_proj_layer.weight", .shape = &.{ 8, 16 }, .data = &[_]f32{0} ** (8 * 16) },
+        .{ .name = "vlm.model.language_model.layers.0.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &@as([(8 * 8)]f32, @splat(0)) },
+        .{ .name = "embedding_proj_layer.weight", .shape = &.{ 8, 16 }, .data = &@as([(8 * 16)]f32, @splat(0)) },
     });
 
     const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });
@@ -2792,7 +2792,7 @@ test "colqwen2 one step train and eval" {
     defer allocator.free(checkpoint_path);
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = "{\"model_type\":\"colqwen2\",\"hidden_size\":8}" });
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "vlm.model.language_model.layers.27.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** (8 * 8) },
+        .{ .name = "vlm.model.language_model.layers.27.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &@as([(8 * 8)]f32, @splat(0)) },
     });
 
     const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });
@@ -2852,7 +2852,7 @@ test "colqwen2 train prepared examples epoch updates bundle" {
     defer allocator.free(checkpoint_path);
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = "{\"model_type\":\"colqwen2\",\"hidden_size\":8}" });
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "vlm.model.language_model.layers.27.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** (8 * 8) },
+        .{ .name = "vlm.model.language_model.layers.27.self_attn.q_proj.weight", .shape = &.{ 8, 8 }, .data = &@as([(8 * 8)]f32, @splat(0)) },
     });
 
     const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });

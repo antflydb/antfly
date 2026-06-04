@@ -418,7 +418,7 @@ test "shuffle buffer returns same set (possibly reordered)" {
 
     try testing.expectEqual(@as(usize, n), all.items.len);
 
-    var seen = [_]bool{false} ** n;
+    var seen = @as([n]bool, @splat(false));
     for (all.items) |rec| {
         const idx = try extractIdx(rec);
         try testing.expect(idx < n);

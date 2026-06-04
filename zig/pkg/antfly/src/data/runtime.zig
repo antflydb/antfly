@@ -7710,7 +7710,7 @@ fn resolveTrustedPrincipalConfigValue(
 
     const env_var = try antfly.common.secrets.envVarForKey(alloc, key);
     defer alloc.free(env_var);
-    const env_var_z = try alloc.dupeZ(u8, env_var);
+    const env_var_z = try alloc.dupeSentinel(u8, env_var, 0);
     defer alloc.free(env_var_z);
     if (platform.env.getenvSlice(env_var_z)) |value| {
         const raw = try alloc.dupe(u8, value);

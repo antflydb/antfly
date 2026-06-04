@@ -205,7 +205,7 @@ pub const Builder = struct {
         const in_shape = self.graph.node(input).output_shape;
         if (axis >= in_shape.rank()) return error.ShapeMismatch;
 
-        var out_dims: [shape_mod.max_rank]i64 = .{0} ** shape_mod.max_rank;
+        var out_dims: [shape_mod.max_rank]i64 = @splat(0);
         var out_rank: usize = 0;
         if (keepdims) {
             out_rank = in_shape.rank();
@@ -274,7 +274,7 @@ pub const Builder = struct {
         @memcpy(attrs.perm[0..perm.len], perm);
 
         const in_shape = self.graph.node(input).output_shape;
-        var out_dims: [shape_mod.max_rank]i64 = .{0} ** shape_mod.max_rank;
+        var out_dims: [shape_mod.max_rank]i64 = @splat(0);
         for (perm, 0..) |p, i| {
             out_dims[i] = in_shape.dims[p];
         }

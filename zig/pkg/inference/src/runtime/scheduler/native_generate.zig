@@ -1371,7 +1371,7 @@ test "scheduler drains a multi-lease workload without leaking pending work" {
     var step = std.ArrayListUnmanaged(StepItem).empty;
     defer step.deinit(allocator);
 
-    var seen = [_]bool{false} ** total_items;
+    var seen = @as([total_items]bool, @splat(false));
     var steps_taken: usize = 0;
     const safety_iter_cap: usize = total_items * 8;
     var safety_iter: usize = 0;

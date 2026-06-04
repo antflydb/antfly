@@ -552,7 +552,7 @@ test "shared backend context retains exact compute backend identity" {
 }
 
 fn metalShaderValidationEnabledForTest() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     return c_std.getenv("MTL_SHADER_VALIDATION") != null;
 }
 

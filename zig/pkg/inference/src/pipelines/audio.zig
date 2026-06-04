@@ -416,7 +416,7 @@ fn clapLogMelSpectrogramForFramesNaiveTestOnly(
 }
 
 test "whisper mel from pcm returns whisper-shaped output" {
-    const samples = [_]f32{0.0} ** 1600;
+    const samples = @as([1600]f32, @splat(0.0));
     const mel = try whisperMelFromPcm(std.testing.allocator, &samples, WHISPER_SAMPLE_RATE);
     defer std.testing.allocator.free(mel);
     try std.testing.expectEqual(@as(usize, WHISPER_N_MELS * WHISPER_N_FRAMES), mel.len);

@@ -34,7 +34,7 @@ pub const Coords = [max_rank]i64;
 
 /// Row-major strides for a static-shape tensor of rank `rank`.
 pub fn computeStrides(dims: [max_rank]i64, rank: u8) Strides {
-    var strides: Strides = .{0} ** max_rank;
+    var strides: Strides = @splat(0);
     var s: i64 = 1;
     var k: usize = rank;
     while (k > 0) {
@@ -47,7 +47,7 @@ pub fn computeStrides(dims: [max_rank]i64, rank: u8) Strides {
 
 /// Unravel a flat row-major index into per-axis coordinates.
 pub fn unravelIdx(flat: usize, dims: [max_rank]i64, rank: u8) Coords {
-    var coords: Coords = .{0} ** max_rank;
+    var coords: Coords = @splat(0);
     var rem: i64 = @intCast(flat);
     var k: usize = rank;
     while (k > 0) {
@@ -94,7 +94,7 @@ pub fn evalBroadcast(
     const in_rank = in_shape.rank();
     const in_strides = computeStrides(in_shape.dims, in_rank);
 
-    var eff_strides: Strides = .{0} ** max_rank;
+    var eff_strides: Strides = @splat(0);
     if (in_rank == 0) {
         // Scalar input: every output position reads input[0].
     } else if (attrs.num_axes == 0) {
@@ -272,7 +272,7 @@ pub fn evalReduce(
     const in_elements = staticElements(in_shape) orelse return null;
     if (input.len != in_elements) return null;
 
-    var is_reduced: [max_rank]bool = .{false} ** max_rank;
+    var is_reduced: [max_rank]bool = @splat(false);
     var reduce_count: i64 = 1;
     for (0..attrs.num_axes) |i| {
         const ax = attrs.axes[i];

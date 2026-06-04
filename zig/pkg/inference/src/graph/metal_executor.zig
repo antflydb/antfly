@@ -32,7 +32,7 @@ const runtime = @import("../runtime/root.zig");
 const contracts = @import("backend_contracts.zig");
 const model_runtime = @import("model_runtime.zig");
 
-const c_std = @cImport(@cInclude("stdlib.h"));
+const c_std = @import("../util/c_env.zig");
 
 pub const TimingStats = model_runtime.RuntimeDebugTimingStats;
 

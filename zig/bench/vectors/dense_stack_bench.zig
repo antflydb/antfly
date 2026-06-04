@@ -1042,7 +1042,7 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
     };
 
     const capi_packed_ns = blk: {
-        const zpath = try alloc.dupeZ(u8, path);
+        const zpath = try alloc.dupeSentinel(u8, path, 0);
         defer alloc.free(zpath);
 
         var handle_ptr: ?*anyopaque = null;
@@ -1090,7 +1090,7 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
     };
 
     const capi_wire_ns = blk: {
-        const zpath = try alloc.dupeZ(u8, path);
+        const zpath = try alloc.dupeSentinel(u8, path, 0);
         defer alloc.free(zpath);
 
         var handle_ptr: ?*anyopaque = null;

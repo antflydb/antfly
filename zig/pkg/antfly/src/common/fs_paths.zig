@@ -129,7 +129,7 @@ fn createDirAbsolutePortable(path: []const u8) !void {
     }
 
     const allocator = std.heap.page_allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     while (true) {
@@ -156,7 +156,7 @@ fn createDirAbsolutePortable(path: []const u8) !void {
 
 fn mkdirPathIgnoreExistingPosix(dir_fd: std.posix.fd_t, path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     while (true) {
@@ -181,7 +181,7 @@ fn mkdirPathIgnoreExistingPosix(dir_fd: std.posix.fd_t, path: []const u8) !void 
 
 fn openDirAtPathPosix(dir_fd: std.posix.fd_t, path: []const u8) !std.posix.fd_t {
     const allocator = std.heap.page_allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     return try std.posix.openatZ(dir_fd, path_z.ptr, .{
         .ACCMODE = .RDONLY,
@@ -204,7 +204,7 @@ fn dirAlreadyExistsPosix(path: []const u8) bool {
 
 fn mkdirAbsoluteIgnoreExistingPosix(path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     while (true) {

@@ -1302,7 +1302,7 @@ fn findPrimaryGgufPath(allocator: std.mem.Allocator, model_dir: []const u8) ![]u
         return error.MissingFunctionGemmaTokens;
     }
 
-    const model_dir_z = try allocator.dupeZ(u8, model_dir);
+    const model_dir_z = try allocator.dupeSentinel(u8, model_dir, 0);
     defer allocator.free(model_dir_z);
 
     const dir = c_file.c.opendir(model_dir_z.ptr);

@@ -35,7 +35,7 @@ pub fn effectivePerm(attrs: TransposeAttrs, rank: usize, buf: *[max_rank]u8) []c
 
 pub fn isValidPermutation(perm: []const u8, rank: usize) bool {
     if (rank > max_rank or perm.len != rank) return false;
-    var seen: [max_rank]bool = [_]bool{false} ** max_rank;
+    var seen: [max_rank]bool = @as([max_rank]bool, @splat(false));
     for (perm) |axis| {
         if (axis >= rank or seen[axis]) return false;
         seen[axis] = true;

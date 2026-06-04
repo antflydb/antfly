@@ -47,7 +47,7 @@ pub const Manifest = struct {
 pub fn loadManifest(alloc: Allocator, io: anytype) !Manifest {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_rel_path, alloc, .limited(max_manifest_bytes));
     defer alloc.free(raw);
-    const source = try alloc.dupeZ(u8, raw);
+    const source = try alloc.dupeSentinel(u8, raw, 0);
     defer alloc.free(source);
     return try std.zon.parse.fromSliceAlloc(Manifest, alloc, source, null, .{});
 }

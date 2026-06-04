@@ -558,7 +558,7 @@ pub const OpenedSessionStore = struct {
     lease: SessionLeaseStore,
 
     pub fn open(alloc: std.mem.Allocator, path: []const u8) !OpenedSessionStore {
-        const path_z = try alloc.dupeZ(u8, path);
+        const path_z = try alloc.dupeSentinel(u8, path, 0);
         errdefer alloc.free(path_z);
         const docstore = try alloc.create(docstore_mod.DocStore);
         errdefer alloc.destroy(docstore);
@@ -2722,7 +2722,7 @@ test "transaction session registry adopts durable session ownership" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-adopt-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -2746,7 +2746,7 @@ test "transaction session registry only adopts durable sessions after lease expi
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-adopt-timeout-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -2778,7 +2778,7 @@ test "transaction session registry renews and releases separate lease records" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-lease-renew-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -2809,7 +2809,7 @@ test "transaction session registry reloads durable sessions from kv store" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -2844,7 +2844,7 @@ test "transaction session registry reports status and cleans expired durable ses
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-cleanup-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -2991,7 +2991,7 @@ test "transaction session registry can renew owned leases opportunistically" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-opportunistic-renew-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});

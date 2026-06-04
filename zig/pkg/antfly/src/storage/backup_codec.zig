@@ -709,7 +709,7 @@ test "header CRC validation" {
         .format_version = format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = .{0} ** 16,
+        .backup_id = @splat(0),
         .table_count = 1,
         .shard_count = 1,
     });
@@ -730,7 +730,7 @@ test "block round-trip uncompressed" {
         .format_version = format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = .{0} ** 16,
+        .backup_id = @splat(0),
         .table_count = 1,
         .shard_count = 1,
     });
@@ -757,7 +757,7 @@ test "block CRC validation" {
         .format_version = format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = .{0} ** 16,
+        .backup_id = @splat(0),
         .table_count = 1,
         .shard_count = 1,
     });

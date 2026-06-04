@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ascii_compat = @import("../common/ascii_compat.zig");
 const generating_openapi = @import("antfly_generating_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const indexes_openapi = @import("antfly_indexes_openapi");
@@ -4210,19 +4211,19 @@ fn queryBuilderGraphModeFromIntent(intent: []const u8) QueryBuilderGraphMode {
 }
 
 fn queryBuilderPatternHopCount(intent: []const u8) ?i64 {
-    if (std.ascii.indexOfIgnoreCase(intent, "two-hop") != null or
-        std.ascii.indexOfIgnoreCase(intent, "two hop") != null or
-        std.ascii.indexOfIgnoreCase(intent, "2-hop") != null or
-        std.ascii.indexOfIgnoreCase(intent, "2 hop") != null or
-        std.ascii.indexOfIgnoreCase(intent, "2hop") != null)
+    if (ascii_compat.indexOfIgnoreCase(intent, "two-hop") != null or
+        ascii_compat.indexOfIgnoreCase(intent, "two hop") != null or
+        ascii_compat.indexOfIgnoreCase(intent, "2-hop") != null or
+        ascii_compat.indexOfIgnoreCase(intent, "2 hop") != null or
+        ascii_compat.indexOfIgnoreCase(intent, "2hop") != null)
     {
         return 2;
     }
-    if (std.ascii.indexOfIgnoreCase(intent, "three-hop") != null or
-        std.ascii.indexOfIgnoreCase(intent, "three hop") != null or
-        std.ascii.indexOfIgnoreCase(intent, "3-hop") != null or
-        std.ascii.indexOfIgnoreCase(intent, "3 hop") != null or
-        std.ascii.indexOfIgnoreCase(intent, "3hop") != null)
+    if (ascii_compat.indexOfIgnoreCase(intent, "three-hop") != null or
+        ascii_compat.indexOfIgnoreCase(intent, "three hop") != null or
+        ascii_compat.indexOfIgnoreCase(intent, "3-hop") != null or
+        ascii_compat.indexOfIgnoreCase(intent, "3 hop") != null or
+        ascii_compat.indexOfIgnoreCase(intent, "3hop") != null)
     {
         return 3;
     }
@@ -4400,7 +4401,7 @@ fn queryBuilderInferredIntentNodeText(
 
 fn findIntentBetweenTargetNode(intent: []const u8) ?[]const u8 {
     var start: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(intent, start, "between")) |idx| {
+    while (ascii_compat.indexOfIgnoreCasePos(intent, start, "between")) |idx| {
         const between_end = idx + "between".len;
         const left_ok = idx == 0 or !isWordByte(intent[idx - 1]);
         const right_ok = between_end >= intent.len or !isWordByte(intent[between_end]);
@@ -4418,7 +4419,7 @@ fn findIntentNodeAfterKeyword(
     delimiters: []const []const u8,
 ) ?[]const u8 {
     var start: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(intent, start, keyword)) |idx| {
+    while (ascii_compat.indexOfIgnoreCasePos(intent, start, keyword)) |idx| {
         const end = idx + keyword.len;
         const left_ok = idx == 0 or !isWordByte(intent[idx - 1]);
         const right_ok = end >= intent.len or !isWordByte(intent[end]);
@@ -4449,7 +4450,7 @@ fn findIntentNodeDelimiter(text: []const u8, delimiters: []const []const u8) usi
 
 fn findWholeWordIgnoreCase(text: []const u8, needle: []const u8) ?usize {
     var start: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(text, start, needle)) |idx| {
+    while (ascii_compat.indexOfIgnoreCasePos(text, start, needle)) |idx| {
         const end = idx + needle.len;
         const left_ok = idx == 0 or !isWordByte(text[idx - 1]);
         const right_ok = end >= text.len or !isWordByte(text[end]);
@@ -5566,7 +5567,7 @@ fn appendQueryBuilderTermFilter(
 
 fn findQueryBuilderFieldConstraintValue(intent: []const u8, field: []const u8) ?[]const u8 {
     var start: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(intent, start, field)) |idx| {
+    while (ascii_compat.indexOfIgnoreCasePos(intent, start, field)) |idx| {
         const end = idx + field.len;
         const left_ok = idx == 0 or !isFieldNameByte(intent[idx - 1]);
         const right_ok = end >= intent.len or !isFieldNameByte(intent[end]);
@@ -5628,7 +5629,7 @@ const QueryBuilderStatusOccurrence = struct {
 
 fn findStatusValueOccurrence(intent: []const u8, value: []const u8, start: usize) ?QueryBuilderStatusOccurrence {
     var cursor = start;
-    while (std.ascii.indexOfIgnoreCasePos(intent, cursor, value)) |idx| {
+    while (ascii_compat.indexOfIgnoreCasePos(intent, cursor, value)) |idx| {
         var end = idx + value.len;
         const left_ok = idx == 0 or !isWordByte(intent[idx - 1]);
         var right_ok = end >= intent.len or !isWordByte(intent[end]);
@@ -5709,7 +5710,7 @@ fn detectQueryBuilderDateFilter(intent: []const u8) ?QueryBuilderDateFilter {
 
 fn findIsoDateAfterKeyword(text: []const u8, keyword: []const u8) ?[]const u8 {
     var start: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(text, start, keyword)) |idx| {
+    while (ascii_compat.indexOfIgnoreCasePos(text, start, keyword)) |idx| {
         const end = idx + keyword.len;
         const left_ok = idx == 0 or !isWordByte(text[idx - 1]);
         const right_ok = end >= text.len or !isWordByte(text[end]);
@@ -5737,9 +5738,9 @@ fn detectTemporalHint(intent: []const u8) bool {
     return containsWholeWordIgnoreCase(intent, "recent") or
         containsWholeWordIgnoreCase(intent, "latest") or
         containsWholeWordIgnoreCase(intent, "today") or
-        std.ascii.indexOfIgnoreCase(intent, "last year") != null or
-        std.ascii.indexOfIgnoreCase(intent, "last month") != null or
-        std.ascii.indexOfIgnoreCase(intent, "last week") != null;
+        ascii_compat.indexOfIgnoreCase(intent, "last year") != null or
+        ascii_compat.indexOfIgnoreCase(intent, "last month") != null or
+        ascii_compat.indexOfIgnoreCase(intent, "last week") != null;
 }
 
 fn trimQueryBuilderIntent(intent: []const u8) []const u8 {
@@ -5748,7 +5749,7 @@ fn trimQueryBuilderIntent(intent: []const u8) []const u8 {
 
 fn containsWholeWordIgnoreCase(text: []const u8, needle: []const u8) bool {
     var start: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(text, start, needle)) |idx| {
+    while (ascii_compat.indexOfIgnoreCasePos(text, start, needle)) |idx| {
         const end = idx + needle.len;
         const left_ok = idx == 0 or !isWordByte(text[idx - 1]);
         const right_ok = end >= text.len or !isWordByte(text[end]);

@@ -78,7 +78,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (selected_count >= runtime_limit) break;
         selected_count += 1;
 
-        std.testing.allocator_instance = .{};
+        std.testing.allocator_instance = .init(std.heap.page_allocator, .{});
         std.testing.io_instance = .init(std.testing.allocator, .{
             .argv0 = .init(init.args),
             .environ = init.environ,
@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
 
         std.testing.io_instance.deinit();
-        if (std.testing.allocator_instance.deinit() == .leak) leak_count += 1;
+        if (std.testing.allocator_instance.deinit() != 0) leak_count += 1;
         if (log_err_count != 0) fail_count += 1;
     }
 

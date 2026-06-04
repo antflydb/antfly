@@ -79,7 +79,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     for (test_fns) |test_fn| {
         if (!matchesFilter(test_fn.name)) continue;
         current_count += 1;
-        testing.allocator_instance = .{};
+        testing.allocator_instance = .init(std.heap.page_allocator, .{});
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
             .environ = init.environ,
@@ -107,7 +107,9 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
 
         testing.io_instance.deinit();
-        if (testing.allocator_instance.deinit() == .leak) {
+        // SafeAllocator (the new testing allocator) returns a leak count from
+        // deinit, replacing the old `Check.leak` enum.
+        if (testing.allocator_instance.deinit() != 0) {
             leak_count += 1;
         }
     }

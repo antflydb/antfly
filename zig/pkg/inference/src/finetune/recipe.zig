@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const build_options = @import("build_options");
 
 const grpo = @import("grpo.zig");
@@ -5660,7 +5661,7 @@ fn isQwen35Family(family: []const u8) bool {
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    return std_compat.indexOfIgnoreCase(haystack, needle) != null;
 }
 
 fn containsQwen35Signal(path: []const u8) bool {

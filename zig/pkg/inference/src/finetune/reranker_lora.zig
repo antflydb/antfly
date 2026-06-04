@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const compat = @import("../io/compat.zig");
 const c_file = @import("../util/c_file.zig");
 const manifest_mod = @import("../models/manifest.zig");
@@ -3252,7 +3253,7 @@ fn backwardLinearRowsInputWithLoRA(
             grad_in_row[i] += sum;
         }
         if (pair) |lora_pair| {
-            var tmp_rank = std.heap.stackFallback(4096, std.heap.page_allocator);
+            var tmp_rank = std_compat.stackFallback(4096, std.heap.page_allocator);
             const alloc = tmp_rank.get();
             const tmp = alloc.alloc(f32, lora_pair.rank) catch continue;
             defer alloc.free(tmp);
@@ -3379,7 +3380,7 @@ fn scoreAdaptedExample(
     pooled: []const f32,
     head: *const reranker_head.RerankerHead,
 ) f64 {
-    var transformed = std.heap.stackFallback(8192, std.heap.page_allocator);
+    var transformed = std_compat.stackFallback(8192, std.heap.page_allocator);
     const alloc = transformed.get();
     const output = alloc.alloc(f32, layer.output_dim) catch return reranker_head.scoreHead(head, pooled);
     defer alloc.free(output);
@@ -3408,7 +3409,7 @@ fn applyAdapterDelta(
     alpha: f32,
 ) void {
     const scale = alpha / @as(f32, @floatFromInt(rank));
-    var low_rank = std.heap.stackFallback(4096, std.heap.page_allocator);
+    var low_rank = std_compat.stackFallback(4096, std.heap.page_allocator);
     const alloc = low_rank.get();
     const tmp = alloc.alloc(f32, rank) catch return;
     defer alloc.free(tmp);
@@ -3487,7 +3488,7 @@ fn resolveLayerSelection(
 
 fn countDistinctAdapterLayersInRange(layers: []const LoadedLoRALayer, start_layer_idx: usize, end_layer_exclusive: usize) usize {
     var count: usize = 0;
-    var seen: [256]bool = [_]bool{false} ** 256;
+    var seen: [256]bool = @as([256]bool, @splat(false));
     for (layers) |layer| {
         const layer_idx = parseEncoderLayerIndex(layer.base_tensor_name) orelse continue;
         if (layer_idx < start_layer_idx or layer_idx >= end_layer_exclusive) continue;
@@ -3931,14 +3932,14 @@ test "reranker lora bootstrap inspect load save materialize" {
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "roberta.encoder.layer.0.attention.self.query.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.0.attention.self.key.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.0.attention.self.value.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.1.attention.self.query.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.1.attention.self.key.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.1.attention.self.value.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.1.attention.output.dense.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
+        .{ .name = "roberta.encoder.layer.0.attention.self.query.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.0.attention.self.key.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.0.attention.self.value.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.1.attention.self.query.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.1.attention.self.key.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.1.attention.self.value.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.1.attention.output.dense.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
     });
 
     const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });

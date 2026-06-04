@@ -1122,7 +1122,7 @@ pub const TracingCompute = struct {
     fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) anyerror!CT {
         const tc = fromCtx(ctx);
         const loc = try tc.graph.internConstant(data);
-        var dims: [8]i64 = .{0} ** 8;
+        var dims: [8]i64 = @splat(0);
         for (shape, 0..) |d, i| {
             dims[i] = @intCast(d);
         }

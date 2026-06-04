@@ -47,7 +47,7 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
         nonce,
     });
     defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 // ============================================================================

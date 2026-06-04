@@ -135,7 +135,7 @@ pub const Font = struct {
         var y: f64 = 0;
         var width_seen = false;
         var hint_count: usize = 0;
-        var transient: [32]f64 = [_]f64{0} ** 32;
+        var transient: [32]f64 = @as([32]f64, @splat(0));
         try self.executeCharStringAlloc(alloc, program, self.localSubrsForGlyph(glyph_index), &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, 0);
 
         if (contours.items.len == 0) return null;
@@ -1228,7 +1228,7 @@ test "cff executes local and global subroutines with arithmetic operators" {
     var y: f64 = 0;
     var width_seen = false;
     var hint_count: usize = 0;
-    var transient: [32]f64 = [_]f64{0} ** 32;
+    var transient: [32]f64 = @as([32]f64, @splat(0));
     try font.executeCharStringAlloc(alloc, &program, font.local_subrs, &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, 0);
 
     try std.testing.expectEqual(@as(usize, 1), contours.items.len);
@@ -1274,7 +1274,7 @@ test "cff hintmask skips mask bytes and continues outline parsing" {
     var y: f64 = 0;
     var width_seen = false;
     var hint_count: usize = 0;
-    var transient: [32]f64 = [_]f64{0} ** 32;
+    var transient: [32]f64 = @as([32]f64, @splat(0));
     try font.executeCharStringAlloc(alloc, &program, font.local_subrs, &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, 0);
 
     try std.testing.expectEqual(@as(usize, 1), hint_count);
@@ -1323,7 +1323,7 @@ test "cff supports transient and logical Type2 operators" {
     var y: f64 = 0;
     var width_seen = false;
     var hint_count: usize = 0;
-    var transient: [32]f64 = [_]f64{0} ** 32;
+    var transient: [32]f64 = @as([32]f64, @splat(0));
     try font.executeCharStringAlloc(alloc, &program, font.local_subrs, &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, 0);
 
     try std.testing.expectEqual(@as(usize, 1), contours.items.len);

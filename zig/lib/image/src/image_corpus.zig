@@ -18,9 +18,9 @@ const gif = @import("gif.zig");
 const jpeg = @import("jpeg.zig");
 const png = @import("png.zig");
 const test_support = @import("test_support.zig");
-const c = if (build_options.enable_spng) @cImport({
-    @cInclude("spng.h");
-}) else struct {};
+// Zig 0.17 removed @cImport; the build provides `spng_c` as a translate-c
+// module of spng.h when libspng is available, else an empty struct.
+const c = @import("spng_c");
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;

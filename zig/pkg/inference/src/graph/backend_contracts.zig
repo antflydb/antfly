@@ -75,7 +75,7 @@ pub const TensorStorageClass = enum {
 };
 
 pub const TensorStrides = struct {
-    values: [ml.graph.shape.max_rank]i64 = .{0} ** ml.graph.shape.max_rank,
+    values: [ml.graph.shape.max_rank]i64 = @splat(0),
     rank: u8 = 0,
 
     pub fn init(strides: []const i64) TensorStrides {

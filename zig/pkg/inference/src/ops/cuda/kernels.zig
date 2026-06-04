@@ -1978,8 +1978,8 @@ fn launchRows(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, ro
 }
 
 fn loadModuleWithJitLog(ctx: *context_mod.CudaContext, module: *driver_mod.CUmodule) driver_mod.Error!void {
-    var info_log: [4096]u8 = .{0} ** 4096;
-    var error_log: [4096]u8 = .{0} ** 4096;
+    var info_log: [4096]u8 = @splat(0);
+    var error_log: [4096]u8 = @splat(0);
     var options = [_]driver_mod.CUjit_option{
         driver_mod.CU_JIT_INFO_LOG_BUFFER,
         driver_mod.CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
@@ -2325,7 +2325,7 @@ pub fn smokeQ8_0(allocator: std.mem.Allocator) !void {
         -17, -18, -19, -20, -21, -22, -23, -24,
         -25, -26, -27, -28, -29, -30, -31, -32,
     };
-    var weight_raw = [_]u8{0} ** (out_dim * q8_0_block_bytes);
+    var weight_raw = @as([(out_dim * q8_0_block_bytes)]u8, @splat(0));
     writeQ8_0SmokeRow(weight_raw[0..34], 1.0, 1);
     writeQ8_0SmokeRow(weight_raw[34..68], 0.5, 2);
     writeQ8_0SmokeRow(weight_raw[68..102], 2.0, -1);
@@ -2371,7 +2371,7 @@ pub fn smokeQ4_0(allocator: std.mem.Allocator) !void {
         -17, -18, -19, -20, -21, -22, -23, -24,
         -25, -26, -27, -28, -29, -30, -31, -32,
     };
-    var weight_raw = [_]u8{0} ** (out_dim * q4_0_block_bytes);
+    var weight_raw = @as([(out_dim * q4_0_block_bytes)]u8, @splat(0));
     writeQ4_0SmokeRow(weight_raw[0..18], 1.0, 1);
     writeQ4_0SmokeRow(weight_raw[18..36], 0.5, 2);
     writeQ4_0SmokeRow(weight_raw[36..54], 2.0, -1);
@@ -2412,7 +2412,7 @@ pub fn smokeQ4_K(allocator: std.mem.Allocator) !void {
         input_data[i] = @floatFromInt(i + 1);
         input_data[in_dim + i] = -@as(f32, @floatFromInt(i + 1));
     }
-    var weight_raw = [_]u8{0} ** (out_dim * q4_k_block_bytes);
+    var weight_raw = @as([(out_dim * q4_k_block_bytes)]u8, @splat(0));
     writeQ4_KSmokeRow(weight_raw[0..144], 1.0, 1);
     writeQ4_KSmokeRow(weight_raw[144..288], 0.5, 2);
     const bias_data = [_]f32{ 0.25, -1.0 };
@@ -2563,7 +2563,7 @@ test "cuda kernel launch helper bounds" {
 }
 
 test "cuda q8_0 smoke row writer uses gguf block layout" {
-    var raw = [_]u8{0} ** q8_0_block_bytes;
+    var raw = @as([q8_0_block_bytes]u8, @splat(0));
     writeQ8_0SmokeRow(&raw, 1.0, -3);
     try std.testing.expectEqual(@as(u8, 0x00), raw[0]);
     try std.testing.expectEqual(@as(u8, 0x3c), raw[1]);
@@ -2571,7 +2571,7 @@ test "cuda q8_0 smoke row writer uses gguf block layout" {
 }
 
 test "cuda q4_0 smoke row writer uses gguf block layout" {
-    var raw = [_]u8{0} ** q4_0_block_bytes;
+    var raw = @as([q4_0_block_bytes]u8, @splat(0));
     writeQ4_0SmokeRow(&raw, 1.0, -3);
     try std.testing.expectEqual(@as(u8, 0x00), raw[0]);
     try std.testing.expectEqual(@as(u8, 0x3c), raw[1]);

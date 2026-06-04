@@ -428,7 +428,7 @@ fn HashContext(comptime K: type) type {
             const V = @TypeOf(value);
             switch (@typeInfo(V)) {
                 .int => |int| switch (int.signedness) {
-                    .signed => hashValue(hasher, @as(std.meta.Int(.unsigned, int.bits), @bitCast(value))),
+                    .signed => hashValue(hasher, @as(@Int(.unsigned, int.bits), @bitCast(value))),
                     .unsigned => {
                         if (std.meta.hasUniqueRepresentation(V)) {
                             hasher.update(std.mem.asBytes(&value));

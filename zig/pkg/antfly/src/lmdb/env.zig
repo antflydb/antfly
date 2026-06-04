@@ -19,40 +19,11 @@ const format = @import("format.zig");
 const meta = @import("meta.zig");
 const page = @import("page.zig");
 const readers = @import("readers.zig");
-const c = if (builtin.link_libc) @cImport({
-    @cInclude("pthread.h");
-}) else struct {
-    pub const pthread_mutex_t = usize;
-    pub const pthread_cond_t = usize;
-
-    pub fn pthread_mutex_init(_: *pthread_mutex_t, _: ?*anyopaque) c_int {
-        unreachable;
-    }
-    pub fn pthread_mutex_destroy(_: *pthread_mutex_t) c_int {
-        unreachable;
-    }
-    pub fn pthread_mutex_lock(_: *pthread_mutex_t) c_int {
-        unreachable;
-    }
-    pub fn pthread_mutex_unlock(_: *pthread_mutex_t) c_int {
-        unreachable;
-    }
-    pub fn pthread_cond_init(_: *pthread_cond_t, _: ?*anyopaque) c_int {
-        unreachable;
-    }
-    pub fn pthread_cond_destroy(_: *pthread_cond_t) c_int {
-        unreachable;
-    }
-    pub fn pthread_cond_wait(_: *pthread_cond_t, _: *pthread_mutex_t) c_int {
-        unreachable;
-    }
-    pub fn pthread_cond_signal(_: *pthread_cond_t) c_int {
-        unreachable;
-    }
-    pub fn pthread_cond_broadcast(_: *pthread_cond_t) c_int {
-        unreachable;
-    }
-};
+// Zig 0.17 removed the `@cImport` builtin; the pthread surface is now provided
+// by the build system as the `lmdb_pthread` module — an `addTranslateC` of
+// <pthread.h> when linking libc, or `pthread_stub.zig` for freestanding/no-libc
+// builds.
+const c = @import("lmdb_pthread");
 
 fn heapAllocator() std.mem.Allocator {
     if (builtin.link_libc) return std.heap.c_allocator;
@@ -322,7 +293,7 @@ pub const Environment = struct {
         }
 
         const alloc = heapAllocator();
-        const data_path_owned = alloc.dupeZ(u8, data_path) catch return error.OutOfMemory;
+        const data_path_owned = alloc.dupeSentinel(u8, data_path, 0) catch return error.OutOfMemory;
         errdefer alloc.free(data_path_owned);
 
         var metas = try selectMetas(mapped);
@@ -844,7 +815,7 @@ test "environment rejects files without valid meta pages" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const bytes = [_]u8{0} ** 4096;
+    const bytes = @as([4096]u8, @splat(0));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "broken.mdb", .data = &bytes });
 
     var path_buf: [256]u8 = undefined;

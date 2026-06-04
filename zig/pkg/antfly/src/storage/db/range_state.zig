@@ -180,7 +180,7 @@ test "range state saves and loads namespaced ranges" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/range-state", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z.ptr, .{});
@@ -204,7 +204,7 @@ test "range state returns empty range for missing namespaced key" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/range-state-empty", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z.ptr, .{});

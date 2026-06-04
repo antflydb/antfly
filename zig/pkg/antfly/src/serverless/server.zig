@@ -968,7 +968,7 @@ fn envEnabled(comptime env_name: []const u8) bool {
 }
 
 fn envRequiredOwned(alloc: std.mem.Allocator, env_name: []const u8) ![]u8 {
-    const env_name_z = try alloc.dupeZ(u8, env_name);
+    const env_name_z = try alloc.dupeSentinel(u8, env_name, 0);
     defer alloc.free(env_name_z);
     const value_z = std.c.getenv(env_name_z.ptr) orelse return error.MissingEnvironmentVariable;
     return try alloc.dupe(u8, std.mem.span(value_z));

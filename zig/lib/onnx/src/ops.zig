@@ -479,7 +479,7 @@ fn computeBroadcastShape(shapes: []const Shape, dtype: DType) Shape {
     var out_rank: u8 = 0;
     for (shapes) |shape| out_rank = @max(out_rank, shape.rank());
 
-    var out_dims: [8]i64 = .{1} ** 8;
+    var out_dims: [8]i64 = @splat(1);
     for (shapes) |shape| {
         const offset = out_rank - shape.rank();
         for (0..shape.rank()) |i| {
@@ -525,7 +525,7 @@ fn broadcastBinaryOp(builder: *Builder, op: BinaryOp, a_orig: NodeId, b_orig: No
     const b_new = builder.graph.node(b).output_shape;
     var needs_bcast_a = false;
     var needs_bcast_b = false;
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     for (0..out_rank) |i| {
         const ad = a_new.dim(@intCast(i));
         const bd = b_new.dim(@intCast(i));
@@ -558,7 +558,7 @@ fn broadcastBinaryOp(builder: *Builder, op: BinaryOp, a_orig: NodeId, b_orig: No
 
 fn prependOnes(builder: *Builder, node: NodeId, shape: Shape, target_rank: u8) ConvertError!NodeId {
     const pad = target_rank - shape.rank();
-    var new_dims: [8]i64 = .{0} ** 8;
+    var new_dims: [8]i64 = @splat(0);
     for (0..pad) |i| new_dims[i] = 1;
     for (0..shape.rank()) |i| new_dims[pad + i] = shape.dim(@intCast(i));
     const new_shape = Shape{ .dtype = shape.dtype, .dims = new_dims, .rank_ = target_rank };
@@ -577,7 +577,7 @@ fn broadcastTo(builder: *Builder, node: NodeId, target: Shape) ConvertError!Node
     }
     if (same) return node;
 
-    var broadcast_axes: [8]u8 = .{0} ** 8;
+    var broadcast_axes: [8]u8 = @splat(0);
     for (0..target.rank()) |i| broadcast_axes[i] = @intCast(i);
 
     return builder.graph.addNode(.{
@@ -689,7 +689,7 @@ fn broadcastLinearIndex(src_shape: Shape, dst_shape: Shape, linear_index: usize)
     if (src_shape.rank() != dst_shape.rank()) return null;
     if (dst_shape.rank() == 0) return 0;
 
-    var dst_strides: [8]usize = .{0} ** 8;
+    var dst_strides: [8]usize = @splat(0);
     var running_stride: usize = 1;
     var axis: usize = dst_shape.rank();
     while (axis > 0) {
@@ -984,10 +984,10 @@ fn convertReshape(allocator: std.mem.Allocator, builder: *Builder, node: *const 
     const allow_zero = getInt(node.attributes, "allowzero", 0) != 0;
 
     const input_shape = builder.graph.node(inputs[0]).output_shape;
-    var dims: [8]i64 = .{0} ** 8;
+    var dims: [8]i64 = @splat(0);
     const rank: u8 = @intCast(@min(data.len, 8));
     var materialized_negative_count: usize = 0;
-    var copied_zero_axes: [8]bool = .{false} ** 8;
+    var copied_zero_axes: [8]bool = @splat(false);
     for (0..rank) |i| {
         const d: i64 = @intFromFloat(data[i]);
         if (d == 0 and !allow_zero) {
@@ -1311,7 +1311,7 @@ fn convertSqueeze(builder: *Builder, node: *const NodeProto, inputs: []const Nod
     }
 
     // Build new shape without squeezed dims
-    var new_dims: [8]i64 = .{0} ** 8;
+    var new_dims: [8]i64 = @splat(0);
     var new_rank: u8 = 0;
     for (0..in_shape.rank()) |i| {
         var squeeze = false;
@@ -1363,7 +1363,7 @@ fn convertUnsqueeze(builder: *Builder, node: *const NodeProto, inputs: []const N
     std.mem.sort(i64, axes_buf[0..num_axes], {}, std.sort.asc(i64));
 
     // Build new shape: insert 1s at the specified axes
-    var new_dims: [8]i64 = .{0} ** 8;
+    var new_dims: [8]i64 = @splat(0);
     var src_idx: u8 = 0;
     for (0..new_rank) |i| {
         var is_new_axis = false;
@@ -1447,7 +1447,7 @@ fn convertGather(builder: *Builder, node: *const NodeProto, inputs: []const Node
     const axis: u8 = if (axis_raw < 0) @intCast(@as(i64, table_shape.rank()) + axis_raw) else @intCast(axis_raw);
 
     // Output shape: data.shape[:axis] + indices.shape + data.shape[axis+1:]
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     var out_rank: u8 = 0;
     // Copy dims before axis
     for (0..axis) |i| {
@@ -1510,7 +1510,7 @@ fn convertConcat(builder: *Builder, node: *const NodeProto, inputs: []const Node
         else
             return error.UnsupportedOp;
 
-        var out_dims: [8]i64 = .{0} ** 8;
+        var out_dims: [8]i64 = @splat(0);
         @memcpy(out_dims[0..concat_rank], lhs_shape.dims[0..concat_rank]);
         const ld = lhs_shape.dim(axis);
         const rd = rhs_shape.dim(axis);
@@ -1596,7 +1596,7 @@ fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const No
     }
 
     // Compute output shape
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     for (0..in_shape.rank()) |i| {
         const s = slice_attrs.starts[i];
         const e = slice_attrs.limits[i];
@@ -1934,7 +1934,7 @@ fn convertMatMul(builder: *Builder, _: *const NodeProto, a: NodeId, b: NodeId) C
         const flat_lhs = try builder.reshape(a, Shape.init(a_shape.dtype, &.{ -1, a_shape.dim(@intCast(a_shape.rank() - 1)) }));
         const mm = try builder.matmul(flat_lhs, b);
 
-        var out_dims: [8]i64 = .{0} ** 8;
+        var out_dims: [8]i64 = @splat(0);
         for (0..a_shape.rank() - 1) |i| {
             out_dims[i] = a_shape.dim(@intCast(i));
         }
@@ -1968,7 +1968,7 @@ fn convertMatMul(builder: *Builder, _: *const NodeProto, a: NodeId, b: NodeId) C
     }
 
     // Output shape: batch_dims + [M, N]
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     for (0..num_batch) |i| {
         out_dims[i] = a_shape.dim(@intCast(i));
     }
@@ -2007,7 +2007,7 @@ fn convertExpand(builder: *Builder, inputs: []const NodeId) ConvertError!NodeId 
     const in_rank = in_shape.rank();
     const out_rank = @max(target_rank, in_rank);
 
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     for (0..out_rank) |i| {
         const ri: u8 = @intCast(i);
         const in_dim: i64 = if (ri >= out_rank - in_rank) in_shape.dim(ri - (out_rank - in_rank)) else 1;
@@ -2030,7 +2030,7 @@ fn convertExpand(builder: *Builder, inputs: []const NodeId) ConvertError!NodeId 
     }
 
     // Use broadcast_in_dim
-    var broadcast_axes: [8]u8 = .{0} ** 8;
+    var broadcast_axes: [8]u8 = @splat(0);
     const start = out_rank - in_rank;
     for (0..in_rank) |i| {
         broadcast_axes[i] = @intCast(start + i);
@@ -2039,7 +2039,7 @@ fn convertExpand(builder: *Builder, inputs: []const NodeId) ConvertError!NodeId 
     // If input needs prepended 1-dims first, reshape
     var src = inputs[0];
     if (in_rank < out_rank) {
-        var padded_dims: [8]i64 = .{0} ** 8;
+        var padded_dims: [8]i64 = @splat(0);
         for (0..start) |i| padded_dims[i] = 1;
         for (0..in_rank) |i| padded_dims[start + i] = in_shape.dim(@intCast(i));
         const padded_shape = Shape{ .dtype = in_shape.dtype, .dims = padded_dims, .rank_ = out_rank };
@@ -2082,7 +2082,7 @@ fn convertPad(allocator: std.mem.Allocator, builder: *Builder, node: *const Node
     if (pads_data.len == 0) return inputs[0];
     if (pads_data.len % 2 != 0 or pads_data.len > @as(usize, rank) * 2) return error.ShapeMismatch;
 
-    var normalized_pads_storage: [16]f32 = .{0} ** 16;
+    var normalized_pads_storage: [16]f32 = @splat(0);
     if (pads_data.len < @as(usize, rank) * 2) {
         const pair_count = pads_data.len / 2;
         const start_axis = @as(usize, rank) - pair_count;
@@ -2159,7 +2159,7 @@ fn convertSplit(allocator: std.mem.Allocator, builder: *Builder, node: *const No
     const axis: u8 = if (axis_raw < 0) @intCast(@as(i64, in_shape.rank()) + axis_raw) else @intCast(axis_raw);
 
     // Determine split sizes
-    var split_sizes: [8]i64 = .{0} ** 8;
+    var split_sizes: [8]i64 = @splat(0);
     var num_outputs: u8 = @intCast(node.outputs.len);
 
     if (inputs.len >= 2 and inputs[1] != null_node) {
@@ -2237,7 +2237,7 @@ fn convertShape(builder: *Builder, node: *const NodeProto, input: NodeId) Conver
     const end: usize = @intCast(end_i);
     const rank: usize = end - start;
     var has_dynamic = false;
-    var dims_f32: [8]f32 = .{0} ** 8;
+    var dims_f32: [8]f32 = @splat(0);
     for (0..rank) |i| {
         const dim = in_shape.dim(@intCast(start + i));
         if (dim < 0) has_dynamic = true;
@@ -2275,7 +2275,7 @@ fn convertConstantOfShape(allocator: std.mem.Allocator, builder: *Builder, node:
 
     // Build target shape
     const rank: u8 = @intCast(@min(shape_data.len, 8));
-    var dims: [8]i64 = .{0} ** 8;
+    var dims: [8]i64 = @splat(0);
     var total_elems: usize = 1;
     for (0..rank) |i| {
         dims[i] = @intFromFloat(shape_data[i]);
@@ -2302,14 +2302,14 @@ fn convertTile(builder: *Builder, inputs: []const NodeId) ConvertError!NodeId {
     const repeats_data = materializeConstantValues(builder, inputs[1], &repeats_buf) orelse return error.ConstantMaterializationFailed;
 
     const rank = in_shape.rank();
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     for (0..rank) |i| {
         const rep: i64 = if (i < repeats_data.len) @intFromFloat(repeats_data[i]) else 1;
         out_dims[i] = in_shape.dim(@intCast(i)) * rep;
     }
     const out_shape = Shape{ .dtype = in_shape.dtype, .dims = out_dims, .rank_ = rank };
 
-    var broadcast_axes: [8]u8 = .{0} ** 8;
+    var broadcast_axes: [8]u8 = @splat(0);
     for (0..rank) |i| broadcast_axes[i] = @intCast(i);
 
     return builder.graph.addNode(.{
@@ -2533,7 +2533,7 @@ fn convertBatchNorm(builder: *Builder, node: *const NodeProto, inputs: []const N
 /// Reshape [C] to [1, C, 1, 1, ...] for channel-axis broadcasting.
 fn channelReshape(builder: *Builder, input: NodeId, c_dim: i64, rank: u8) ConvertError!NodeId {
     const src_shape = builder.graph.node(input).output_shape;
-    var dims: [8]i64 = .{1} ** 8;
+    var dims: [8]i64 = @splat(1);
     dims[1] = c_dim;
     const new_shape = Shape{ .dtype = src_shape.dtype, .dims = dims, .rank_ = rank };
     return builder.reshape(input, new_shape);
@@ -2592,7 +2592,7 @@ fn convertGroupNorm(builder: *Builder, node: *const NodeProto, inputs: []const N
     const c_per_g = @divExact(c_dim, num_groups);
 
     // Build reshaped dims: [N, G, C/G, d2, d3, ...]
-    var reshape_dims: [8]i64 = .{0} ** 8;
+    var reshape_dims: [8]i64 = @splat(0);
     reshape_dims[0] = n_dim;
     reshape_dims[1] = num_groups;
     reshape_dims[2] = c_per_g;
@@ -2721,7 +2721,7 @@ fn convertOneHot(allocator: std.mem.Allocator, builder: *Builder, node: *const N
     _ = off_val;
 
     // Build output shape: insert depth at axis position
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     const out_rank: u8 = idx_shape.rank() + 1;
     var src: u8 = 0;
     for (0..out_rank) |i| {
@@ -2790,7 +2790,7 @@ fn convertConv(builder: *Builder, node: *const NodeProto, inputs: []const NodeId
 
     // Compute output spatial dims
     // out_dim = (in_dim + pad_begin + pad_end - dilation*(kernel-1) - 1) / stride + 1
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     out_dims[0] = x_shape.dim(0); // batch
     out_dims[1] = w_shape.dim(0); // output channels
 
@@ -2832,7 +2832,7 @@ fn convertConv(builder: *Builder, node: *const NodeProto, inputs: []const NodeId
 fn addConvBias(builder: *Builder, conv_result: NodeId, bias: NodeId, out_shape: Shape) ConvertError!NodeId {
     const bias_shape = builder.graph.node(bias).output_shape;
     if (bias_shape.rank() == 1 and out_shape.rank() >= 3) {
-        var bias_dims: [8]i64 = .{0} ** 8;
+        var bias_dims: [8]i64 = @splat(0);
         bias_dims[0] = 1;
         bias_dims[1] = bias_shape.dim(0);
         for (2..out_shape.rank()) |i| bias_dims[i] = 1;
@@ -3151,7 +3151,7 @@ fn convertGroupQueryAttention(builder: *Builder, node: *const NodeProto, inputs:
         const k_5d = try builder.reshape(k_t, expanded);
         const v_5d = try builder.reshape(v_t, expanded);
 
-        var target_dims: [8]i64 = .{0} ** 8;
+        var target_dims: [8]i64 = @splat(0);
         target_dims[0] = @intCast(batch);
         target_dims[1] = @intCast(kv_num_heads);
         target_dims[2] = @intCast(repeat_factor);
@@ -3159,7 +3159,7 @@ fn convertGroupQueryAttention(builder: *Builder, node: *const NodeProto, inputs:
         target_dims[4] = @intCast(head_dim);
         const target_shape = Shape{ .dtype = k_shape.dtype, .dims = target_dims, .rank_ = 5 };
 
-        var bcast_axes: [8]u8 = .{0} ** 8;
+        var bcast_axes: [8]u8 = @splat(0);
         for (0..5) |i| bcast_axes[i] = @intCast(i);
 
         k_expanded = try builder.graph.addNode(.{
@@ -3304,7 +3304,7 @@ fn dequantizeBlock(builder: *Builder, x: NodeId, scale: NodeId, zp: ?NodeId, axi
     const actual_block = @divExact(dim, num_blocks); // must divide evenly for reshape
 
     // Reshape x: insert block dimension → [..., num_blocks, block_size, ...]
-    var block_dims: [8]i64 = .{0} ** 8;
+    var block_dims: [8]i64 = @splat(0);
     var bi: u8 = 0;
     for (0..axis) |i| {
         block_dims[bi] = x_shape.dim(@intCast(i));
@@ -3421,7 +3421,7 @@ fn broadcastPerAxis(builder: *Builder, input: NodeId, target_shape: Shape, axis_
     const axis: u8 = if (axis_raw < 0) @intCast(@as(i64, target_shape.rank()) + axis_raw) else @intCast(axis_raw);
 
     // Build shape: all 1s except at `axis`
-    var new_dims: [8]i64 = .{1} ** 8;
+    var new_dims: [8]i64 = @splat(1);
     new_dims[axis] = in_shape.dim(0);
     const new_shape = Shape{
         .dtype = in_shape.dtype,
@@ -3459,7 +3459,7 @@ fn convertAveragePool(builder: *Builder, node: *const NodeProto, inputs: []const
 
     // Non-global: compute output shape and use reduce_mean windowed
     // This is an approximation — proper sliding window needs conv_general
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     out_dims[0] = in_shape.dim(0); // batch
     out_dims[1] = in_shape.dim(1); // channels
     for (0..num_spatial) |i| {
@@ -3495,7 +3495,7 @@ fn convertMaxPool(builder: *Builder, node: *const NodeProto, inputs: []const Nod
     const num_spatial = in_shape.rank() - 2;
 
     // Compute output shape
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     out_dims[0] = in_shape.dim(0);
     out_dims[1] = in_shape.dim(1);
     for (0..num_spatial) |i| {
@@ -3850,7 +3850,7 @@ fn convertEinsum(builder: *Builder, node: *const NodeProto, inputs: []const Node
 
     const a_shape = builder.graph.node(inputs[0]).output_shape;
     const b_shape = builder.graph.node(inputs[1]).output_shape;
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     var out_rank: u8 = 0;
 
     for (out_idx) |oc| {
@@ -3921,7 +3921,7 @@ fn convertConvTranspose(builder: *Builder, node: *const NodeProto, inputs: []con
 
     // Compute output spatial dims and effective padding.
     // out = (in - 1) * stride - 2*pad + dilation*(kernel-1) + output_padding + 1
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     out_dims[0] = x_shape.dim(0); // batch
     // For ConvTranspose, weight layout is [C_in, C_out/groups, kH, kW]
     out_dims[1] = w_shape.dim(1) * @as(i64, group); // output channels
@@ -3956,7 +3956,7 @@ fn convertConvTranspose(builder: *Builder, node: *const NodeProto, inputs: []con
         const bias = inputs[2];
         const bias_shape = builder.graph.node(bias).output_shape;
         if (bias_shape.rank() == 1 and out_shape.rank() >= 3) {
-            var bias_dims: [8]i64 = .{0} ** 8;
+            var bias_dims: [8]i64 = @splat(0);
             bias_dims[0] = 1;
             bias_dims[1] = bias_shape.dim(0);
             for (2..out_shape.rank()) |i| bias_dims[i] = 1;
@@ -3996,7 +3996,7 @@ fn convertResize(builder: *Builder, node: *const NodeProto, inputs: []const Node
     var out_dims: [8]i64 = undefined;
     var has_out_dims = false;
     var all_integer_scales = true;
-    var scale_factors: [8]i64 = .{1} ** 8;
+    var scale_factors: [8]i64 = @splat(1);
 
     // Try scales input (index 2)
     var scales_buf: [8]f32 = undefined;
@@ -4100,7 +4100,7 @@ fn broadcastRank1ToAxis(builder: *Builder, input: NodeId, axis: usize, target_sh
 /// Resize via reshape + broadcast for integer scale factors (fast path).
 fn resizeIntegerBroadcast(builder: *Builder, input: NodeId, in_shape: Shape, rank: u8, scale_factors: *const [8]i64) ConvertError!NodeId {
     // [d0, d1, ..., dn] → [d0, 1, d1, 1, ...] → [d0, s0, d1, s1, ...] → [d0*s0, ...]
-    var interleaved_dims: [8]i64 = .{0} ** 8;
+    var interleaved_dims: [8]i64 = @splat(0);
     const interleaved_rank: u8 = rank * 2;
     for (0..rank) |i| {
         interleaved_dims[i * 2] = in_shape.dim(@intCast(i));
@@ -4113,12 +4113,12 @@ fn resizeIntegerBroadcast(builder: *Builder, input: NodeId, in_shape: Shape, ran
     };
     const reshaped = try builder.reshape(input, interleaved_shape);
 
-    var broadcast_dims: [8]i64 = .{0} ** 8;
+    var broadcast_dims: [8]i64 = @splat(0);
     for (0..rank) |i| {
         broadcast_dims[i * 2] = in_shape.dim(@intCast(i));
         broadcast_dims[i * 2 + 1] = scale_factors[i];
     }
-    var broadcast_axes: [8]u8 = .{0} ** 8;
+    var broadcast_axes: [8]u8 = @splat(0);
     for (0..interleaved_rank) |i| broadcast_axes[i] = @intCast(i);
     const broadcast_shape = Shape{
         .dtype = in_shape.dtype,
@@ -4136,7 +4136,7 @@ fn resizeIntegerBroadcast(builder: *Builder, input: NodeId, in_shape: Shape, ran
         .num_inputs = 1,
     });
 
-    var out_dims: [8]i64 = .{0} ** 8;
+    var out_dims: [8]i64 = @splat(0);
     for (0..rank) |i| {
         out_dims[i] = in_shape.dim(@intCast(i)) * scale_factors[i];
     }
@@ -4390,7 +4390,7 @@ fn convertLoop(
         // Process body nodes in order (they should be topologically sorted)
         for (body_graph.nodes) |*bn| {
             // Resolve inputs — skip node if any required input is unmapped
-            var body_inp: [16]NodeId = .{null_node} ** 16;
+            var body_inp: [16]NodeId = @splat(null_node);
             const ninp = @min(bn.inputs.len, 16);
             var all_resolved = true;
             for (0..ninp) |bi| {
@@ -4508,7 +4508,7 @@ fn convertScan(
 
     // scan_input_axes: which axis to iterate for each scan input (default all 0)
     const scan_input_axes_attr = getInts(node.attributes, "scan_input_axes");
-    var scan_input_axes: [8]u8 = .{0} ** 8;
+    var scan_input_axes: [8]u8 = @splat(0);
     for (0..M) |i| {
         if (i < scan_input_axes_attr.len) {
             scan_input_axes[i] = @intCast(scan_input_axes_attr[i]);
@@ -4520,7 +4520,7 @@ fn convertScan(
 
     // scan_output_axes: which axis to accumulate scan outputs along (default all 0)
     const scan_output_axes_attr = getInts(node.attributes, "scan_output_axes");
-    var scan_output_axes: [8]u8 = .{0} ** 8;
+    var scan_output_axes: [8]u8 = @splat(0);
     for (0..K) |i| {
         if (i < scan_output_axes_attr.len) {
             scan_output_axes[i] = @intCast(scan_output_axes_attr[i]);
@@ -4579,8 +4579,8 @@ fn convertScan(
             const t: usize = if (backward) seq_len_u - 1 - t_raw else t_raw;
 
             // Slice along scan axis: [t:t+1] then squeeze that axis
-            var starts: [8]i64 = .{0} ** 8;
-            var limits: [8]i64 = .{0} ** 8;
+            var starts: [8]i64 = @splat(0);
+            var limits: [8]i64 = @splat(0);
             for (0..rank) |d| {
                 limits[d] = scan_shape.dim(@intCast(d));
             }
@@ -4609,7 +4609,7 @@ fn convertScan(
 
             // Squeeze: remove the scan axis dimension
             // New shape has rank-1 dims (remove axis position)
-            var squeezed_dims: [8]i64 = .{0} ** 8;
+            var squeezed_dims: [8]i64 = @splat(0);
             var di: u8 = 0;
             for (0..rank) |d| {
                 if (d != axis) {
@@ -4637,7 +4637,7 @@ fn convertScan(
 
         // Process body nodes in topological order
         for (body_graph.nodes) |*bn| {
-            var body_inp: [16]NodeId = .{null_node} ** 16;
+            var body_inp: [16]NodeId = @splat(null_node);
             const ninp = @min(bn.inputs.len, 16);
             var all_resolved = true;
             for (0..ninp) |bi| {
@@ -4689,7 +4689,7 @@ fn convertScan(
                     const out_axis: u8 = scan_output_axes[ki];
                     const elem_shape = builder.graph.node(nid).output_shape;
                     const elem_rank = elem_shape.rank();
-                    var unsq_dims: [8]i64 = .{0} ** 8;
+                    var unsq_dims: [8]i64 = @splat(0);
                     var di: u8 = 0;
                     for (0..elem_rank + 1) |d| {
                         if (d == out_axis) {
@@ -4799,7 +4799,7 @@ fn convertIf(
 
         // Process branch body nodes in topological order
         for (branch_graph.nodes) |*bn| {
-            var body_inp: [16]NodeId = .{null_node} ** 16;
+            var body_inp: [16]NodeId = @splat(null_node);
             const ninp = @min(bn.inputs.len, 16);
             var all_resolved = true;
             for (0..ninp) |bi| {
@@ -6834,7 +6834,7 @@ test "convertNode Split equal 3-way" {
     var outputs = [_][]const u8{ "a", "b", "c" };
     const node = NodeProto{ .op_type = "Split", .attributes = &attrs, .outputs = &outputs };
     _ = &attrs;
-    var extra: [2]NodeId = .{null_node} ** 2;
+    var extra: [2]NodeId = @splat(null_node);
     const result = try convertNode(allocator, &b, &node, &.{x}, &extra);
     // All three outputs should be [4, 4]
     try std.testing.expectEqual(@as(i64, 4), g.node(result).output_shape.dim(0));

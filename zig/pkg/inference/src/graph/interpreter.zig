@@ -2996,7 +2996,7 @@ const TestCompute = struct {
 
     /// Attention layer indices received via gqaPagedAttention dispatch.
     /// Used to verify the interpreter auto-increments layer_index.
-    received_layer_indices: [8]usize = .{0} ** 8,
+    received_layer_indices: [8]usize = @splat(0),
     num_attn_calls: usize = 0,
 
     /// Embedding IDs received via embeddingLookup dispatch.
@@ -3795,10 +3795,10 @@ test "stateful: paged attention dispatch with layer_index auto-increment" {
     const hidden = heads * head_dim; // 8
 
     // Weights for 2-layer decoder: each layer has Q, K, V projections + attention
-    var embed_w_data = [_]f32{0.1} ** (4 * hidden); // vocab=4, dim=8
-    var qw_data = [_]f32{0.5} ** (hidden * hidden);
-    var kw_data = [_]f32{0.3} ** (hidden * hidden);
-    var vw_data = [_]f32{0.2} ** (hidden * hidden);
+    var embed_w_data = @as([(4 * hidden)]f32, @splat(0.1)); // vocab=4, dim=8
+    var qw_data = @as([(hidden * hidden)]f32, @splat(0.5));
+    var kw_data = @as([(hidden * hidden)]f32, @splat(0.3));
+    var vw_data = @as([(hidden * hidden)]f32, @splat(0.2));
 
     var tc_backend = TestCompute.init(allocator);
     try tc_backend.addWeight("embed", &embed_w_data);
@@ -3891,7 +3891,7 @@ test "stateful: causal attention without paged context" {
     const head_dim = 4;
 
     // Single-layer: Q projection + attention (no paged context)
-    var qw_data = [_]f32{0.5} ** (hidden * hidden);
+    var qw_data = @as([(hidden * hidden)]f32, @splat(0.5));
     var q_input = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
     var k_input = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
     var v_input = [_]f32{ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };

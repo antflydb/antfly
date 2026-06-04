@@ -2656,7 +2656,7 @@ test "public api multi-node e2e reloads durable cross-table transaction sessions
     var durable_session_stores: [4]transactions_api.DurableSessionStore = undefined;
     var session_store_ptrs: [4]?*transactions_api.DurableSessionStore = undefined;
     for (session_paths, 0..) |path, i| {
-        session_store_paths[i] = try std.testing.allocator.dupeZ(u8, path);
+        session_store_paths[i] = try std.testing.allocator.dupeSentinel(u8, path, 0);
         session_docstores[i] = try docstore_mod.DocStore.open(std.testing.allocator, session_store_paths[i], .{});
         durable_session_stores[i] = transactions_api.DurableSessionStore.init(std.testing.allocator, &session_docstores[i]);
         session_store_ptrs[i] = &durable_session_stores[i];
@@ -3170,7 +3170,7 @@ test "public api multi-node e2e reloads durable transaction sessions after coord
     var durable_session_stores: [4]transactions_api.DurableSessionStore = undefined;
     var session_store_ptrs: [4]?*transactions_api.DurableSessionStore = undefined;
     for (session_paths, 0..) |path, i| {
-        session_store_paths[i] = try std.testing.allocator.dupeZ(u8, path);
+        session_store_paths[i] = try std.testing.allocator.dupeSentinel(u8, path, 0);
         session_docstores[i] = try docstore_mod.DocStore.open(std.testing.allocator, session_store_paths[i], .{});
         durable_session_stores[i] = transactions_api.DurableSessionStore.init(std.testing.allocator, &session_docstores[i]);
         session_store_ptrs[i] = &durable_session_stores[i];

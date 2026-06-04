@@ -496,7 +496,7 @@ test "encode and decode roundtrip - single value" {
 
 test "encode and decode roundtrip - all zeros" {
     const alloc = std.testing.allocator;
-    const values = [_]u32{0} ** 12;
+    const values = @as([12]u32, @splat(0));
 
     const encoded = try encode(alloc, &values);
     defer alloc.free(encoded.control);
@@ -569,7 +569,7 @@ test "SIMD group decoder handles every control byte" {
         try std.testing.expectEqual(ctrl, encoded.control[0]);
         try std.testing.expectEqual(@as(usize, data_len_table[ctrl]), encoded.data.len);
 
-        var padded: [16]u8 = .{0} ** 16;
+        var padded: [16]u8 = @splat(0);
         @memcpy(padded[0..encoded.data.len], encoded.data);
 
         var decoded: [4]u32 = undefined;

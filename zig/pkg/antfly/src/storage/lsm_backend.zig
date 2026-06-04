@@ -309,7 +309,7 @@ pub const Backend = struct {
         mutable_snapshot_clone_calls: u64 = 0,
         mutable_snapshot_clone_bytes_total: u64 = 0,
         mutable_snapshot_clone_peak_bytes: u64 = 0,
-        mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+        mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = @splat(.{}),
         read_snapshot_mutable_rotations: u64 = 0,
         read_snapshot_mutable_rotation_bytes_total: u64 = 0,
         read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
@@ -802,7 +802,7 @@ pub const Backend = struct {
     mutable_snapshot_clone_calls: u64 = 0,
     mutable_snapshot_clone_bytes_total: u64 = 0,
     mutable_snapshot_clone_peak_bytes: u64 = 0,
-    mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+    mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = @splat(.{}),
     read_snapshot_mutable_rotations: u64 = 0,
     read_snapshot_mutable_rotation_bytes_total: u64 = 0,
     read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
@@ -6059,7 +6059,7 @@ test "lsm backend byte flush threshold controls mutable flushes" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 300;
+    const value = @as([300]u8, @splat('x'));
     var txn = try backend.beginWrite();
     try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
     try txn.commit();
@@ -6080,7 +6080,7 @@ test "lsm backend probe borrows immutable point values until reader release" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 300;
+    const value = @as([300]u8, @splat('x'));
     {
         var txn = try backend.beginWrite();
         try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
@@ -6235,7 +6235,7 @@ test "lsm backend read snapshot keeps immutable data visible after flush" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 300;
+    const value = @as([300]u8, @splat('x'));
     {
         var txn = try backend.beginWrite();
         try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
@@ -6268,7 +6268,7 @@ test "lsm backend bulk ingest byte threshold uses byte multiplier" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 300;
+    const value = @as([300]u8, @splat('x'));
     {
         var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
         try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
@@ -6677,7 +6677,7 @@ test "lsm backend compaction scheduler denies and later grants capacity" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 64;
+    const value = @as([64]u8, @splat('x'));
     var i: usize = 0;
     while (i < 3) : (i += 1) {
         var key_buf: [16]u8 = undefined;
@@ -6755,7 +6755,7 @@ test "lsm backend background io budget defers scheduled compaction" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 64;
+    const value = @as([64]u8, @splat('x'));
     var i: usize = 0;
     while (i < 3) : (i += 1) {
         var key_buf: [16]u8 = undefined;
@@ -6794,7 +6794,7 @@ test "lsm backend max compaction input bytes skips oversized scheduled plan" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 64;
+    const value = @as([64]u8, @splat('x'));
     var i: usize = 0;
     while (i < 3) : (i += 1) {
         var key_buf: [16]u8 = undefined;
@@ -6830,7 +6830,7 @@ test "lsm backend max compaction input bytes allows oversized minimum L0 job" {
     });
     defer backend.close();
 
-    const value = [_]u8{'x'} ** 64;
+    const value = @as([64]u8, @splat('x'));
     var i: usize = 0;
     while (i < 3) : (i += 1) {
         var key_buf: [16]u8 = undefined;

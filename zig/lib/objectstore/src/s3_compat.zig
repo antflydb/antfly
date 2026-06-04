@@ -219,7 +219,7 @@ fn optionalValueOwned(alloc: std.mem.Allocator, override: ?[]const u8, env_name:
 }
 
 fn optionalEnvOwned(alloc: std.mem.Allocator, env_name: []const u8) !?[]u8 {
-    const env_name_z = try alloc.dupeZ(u8, env_name);
+    const env_name_z = try alloc.dupeSentinel(u8, env_name, 0);
     defer alloc.free(env_name_z);
     const value = platform.env.getenvSlice(env_name_z) orelse return null;
     return try alloc.dupe(u8, value);

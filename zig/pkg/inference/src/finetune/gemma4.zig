@@ -2880,7 +2880,7 @@ fn applyScheduleFreeInPlace(params: []f32, grads: []const f32, z: []f32, v: []f3
 }
 
 test "hash supervised token transitions ignores masked labels" {
-    var row: [32]f32 = [_]f32{0} ** 32;
+    var row: [32]f32 = @as([32]f32, @splat(0));
     const input_ids = [_]i32{ 10, 11, 12, 13, 14 };
     const labels = [_]i32{ -100, -100, 12, -100, 14 };
     hashSupervisedTokenTransitionsIntoRow(&row, &input_ids, &labels, 1.0);
