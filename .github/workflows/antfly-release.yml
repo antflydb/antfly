@@ -29,6 +29,8 @@ jobs:
             archive_arch: x86_64
             metal: "false"
             system_blas: "false"
+            zig_optimize: ReleaseFast
+            zig_jobs: ""
           - artifact_name: antfly-zig-linux-arm64
             runner: arc-antfly-publish-arm64
             os: linux
@@ -38,6 +40,8 @@ jobs:
             archive_arch: arm64
             metal: "false"
             system_blas: "false"
+            zig_optimize: ReleaseSmall
+            zig_jobs: "1"
           - artifact_name: antfly-zig-darwin-arm64
             runner: macos-15
             os: darwin
@@ -46,6 +50,8 @@ jobs:
             archive_arch: arm64
             metal: "true"
             system_blas: "true"
+            zig_optimize: ReleaseFast
+            zig_jobs: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -76,9 +82,15 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           archive="antfly_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}.tar.gz"
+          jobs_arg=()
+          if [ -n "${{ matrix.zig_jobs }}" ]; then
+            jobs_arg=(--jobs "${{ matrix.zig_jobs }}")
+          fi
           scripts/packaging/build_zig_release_archive.sh \
             --version "$version" \
             --target "${{ matrix.zig_target }}" \
+            --optimize "${{ matrix.zig_optimize }}" \
+            "${jobs_arg[@]}" \
             --archive-name "$archive" \
             --out-dir dist/release-archives \
             --metal "${{ matrix.metal }}" \

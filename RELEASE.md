@@ -22,10 +22,13 @@ README.md
 LICENSE
 ```
 
-Linux archives are built with musl on native Linux runners. macOS arm64 is built
-on a macOS runner with Metal enabled. We do not cross-compile the Zig runtime in
-GoReleaser because ReleaseFast cross-compiles have repeatedly failed under CI
-memory pressure, especially Linux arm64 from amd64.
+Linux archives are built with musl on native Linux runners. Linux amd64 uses
+`ReleaseFast`; Linux arm64 currently uses `ReleaseSmall` because the full
+ReleaseFast build hits a single-process LLVM allocation failure in CI even with
+`-j1`. macOS arm64 is built on a macOS runner with Metal enabled. We do not
+cross-compile the Zig runtime in GoReleaser because ReleaseFast cross-compiles
+have repeatedly failed under CI memory pressure, especially Linux arm64 from
+amd64.
 
 ## Pipeline Ownership
 
@@ -85,9 +88,3 @@ container `latest` tag.
 
 Package registries are immutable. If an RC publish reaches npm or PyPI, the same
 version cannot be republished after recreating the tag; cut the next RC instead.
-
-## Preflight
-
-`.github/workflows/antfly-release-preflight.yml` builds the same native Zig
-archive matrix used by the tag release. It exists to catch runner, Zig, Metal,
-musl, and archive-layout failures before recreating a release tag.

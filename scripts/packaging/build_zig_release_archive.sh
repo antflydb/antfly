@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--metal true|false] [--system-blas true|false]
+usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--metal true|false] [--system-blas true|false] [--optimize MODE] [--jobs N]
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
@@ -20,6 +20,8 @@ archive_name=
 out_dir=
 metal=false
 system_blas=false
+optimize=ReleaseFast
+jobs=
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -47,6 +49,14 @@ while [ "$#" -gt 0 ]; do
       system_blas="${2:?missing --system-blas value}"
       shift 2
       ;;
+    --optimize)
+      optimize="${2:?missing --optimize value}"
+      shift 2
+      ;;
+    --jobs)
+      jobs="${2:?missing --jobs value}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -64,6 +74,21 @@ if [ -z "$version" ] || [ -z "$target" ] || [ -z "$archive_name" ] || [ -z "$out
   exit 2
 fi
 
+if [ -n "$jobs" ] && ! [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+  usage
+  echo "--jobs must be a positive integer, got: $jobs" >&2
+  exit 2
+fi
+
+case "$optimize" in
+  Debug|ReleaseSafe|ReleaseFast|ReleaseSmall) ;;
+  *)
+    usage
+    echo "--optimize must be one of Debug, ReleaseSafe, ReleaseFast, ReleaseSmall; got: $optimize" >&2
+    exit 2
+    ;;
+esac
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${target}"
 prefix="${work_root}/zig-out"
@@ -77,22 +102,29 @@ fi
 rm -rf "$work_root"
 mkdir -p "$prefix" "$stage" "$cache_root/global" "$out_dir"
 
+zig_build_args=(
+  -Dtarget="$target"
+  -Doptimize="$optimize"
+  -Dcpu=baseline
+  -Dedition=full
+  -Dantfly-bin-name=antfly
+  -Dantfly-version="$version"
+  -Donnx=false
+  -Dmlx=false
+  -Dmetal="$metal"
+  -Dsystem-blas="$system_blas"
+  install
+  --prefix "$prefix"
+  --global-cache-dir "$cache_root/global"
+)
+
 (
   cd "$repo_root/zig"
-  zig build \
-    -Dtarget="$target" \
-    -Doptimize=ReleaseFast \
-    -Dcpu=baseline \
-    -Dedition=full \
-    -Dantfly-bin-name=antfly \
-    -Dantfly-version="$version" \
-    -Donnx=false \
-    -Dmlx=false \
-    -Dmetal="$metal" \
-    -Dsystem-blas="$system_blas" \
-    install \
-    --prefix "$prefix" \
-    --global-cache-dir "$cache_root/global"
+  if [ -n "$jobs" ]; then
+    zig build "-j$jobs" "${zig_build_args[@]}"
+  else
+    zig build "${zig_build_args[@]}"
+  fi
 )
 
 test -x "$prefix/bin/antfly"
