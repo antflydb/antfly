@@ -218,34 +218,11 @@ from .inference_chunk_object_object import InferenceChunkObjectObject
 from .inference_chunk_request import InferenceChunkRequest
 from .inference_chunk_response import InferenceChunkResponse
 from .inference_chunk_response_object import InferenceChunkResponseObject
-from .inference_classify_object import InferenceClassifyObject
-from .inference_classify_object_object import InferenceClassifyObjectObject
-from .inference_classify_request import InferenceClassifyRequest
-from .inference_classify_response import InferenceClassifyResponse
-from .inference_classify_response_object import InferenceClassifyResponseObject
-from .inference_classify_result import InferenceClassifyResult
 from .inference_config import InferenceConfig
 from .inference_config_model_strategies import InferenceConfigModelStrategies
 from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
-from .inference_document_classification_features import InferenceDocumentClassificationFeatures
-from .inference_document_classification_object import InferenceDocumentClassificationObject
-from .inference_document_classification_object_input import InferenceDocumentClassificationObjectInput
-from .inference_document_classification_object_object import InferenceDocumentClassificationObjectObject
-from .inference_document_classification_request import InferenceDocumentClassificationRequest
-from .inference_document_classification_response import InferenceDocumentClassificationResponse
-from .inference_document_classification_response_object import InferenceDocumentClassificationResponseObject
-from .inference_document_classification_result import InferenceDocumentClassificationResult
-from .inference_document_token_box import InferenceDocumentTokenBox
-from .inference_document_token_classification_features import InferenceDocumentTokenClassificationFeatures
-from .inference_document_token_classification_object import InferenceDocumentTokenClassificationObject
-from .inference_document_token_classification_object_object import InferenceDocumentTokenClassificationObjectObject
-from .inference_document_token_classification_prediction import InferenceDocumentTokenClassificationPrediction
-from .inference_document_token_classification_request import InferenceDocumentTokenClassificationRequest
-from .inference_document_token_classification_response import InferenceDocumentTokenClassificationResponse
-from .inference_document_token_classification_response_object import InferenceDocumentTokenClassificationResponseObject
-from .inference_document_token_classification_result import InferenceDocumentTokenClassificationResult
 from .inference_embed_request import InferenceEmbedRequest
 from .inference_embed_request_encoding_format import InferenceEmbedRequestEncodingFormat
 from .inference_embed_request_input_type import InferenceEmbedRequestInputType
@@ -256,17 +233,6 @@ from .inference_embedding_object import InferenceEmbeddingObject
 from .inference_embedding_object_object import InferenceEmbeddingObjectObject
 from .inference_embedding_usage import InferenceEmbeddingUsage
 from .inference_error import InferenceError
-from .inference_extract_field_value import InferenceExtractFieldValue
-from .inference_extract_object import InferenceExtractObject
-from .inference_extract_object_object import InferenceExtractObjectObject
-from .inference_extract_object_results import InferenceExtractObjectResults
-from .inference_extract_object_results_additional_property_item import (
-    InferenceExtractObjectResultsAdditionalPropertyItem,
-)
-from .inference_extract_request import InferenceExtractRequest
-from .inference_extract_request_schema import InferenceExtractRequestSchema
-from .inference_extract_response import InferenceExtractResponse
-from .inference_extract_response_object import InferenceExtractResponseObject
 from .inference_finish_reason import InferenceFinishReason
 from .inference_function_definition import InferenceFunctionDefinition
 from .inference_function_definition_parameters import InferenceFunctionDefinitionParameters
@@ -316,13 +282,6 @@ from .inference_read_response import InferenceReadResponse
 from .inference_read_response_object import InferenceReadResponseObject
 from .inference_read_result import InferenceReadResult
 from .inference_read_result_fields import InferenceReadResultFields
-from .inference_recognize_entity import InferenceRecognizeEntity
-from .inference_recognize_object import InferenceRecognizeObject
-from .inference_recognize_object_object import InferenceRecognizeObjectObject
-from .inference_recognize_request import InferenceRecognizeRequest
-from .inference_recognize_response import InferenceRecognizeResponse
-from .inference_recognize_response_object import InferenceRecognizeResponseObject
-from .inference_relation import InferenceRelation
 from .inference_rerank_multimodal_document import InferenceRerankMultimodalDocument
 from .inference_rerank_multimodal_request import InferenceRerankMultimodalRequest
 from .inference_rerank_object import InferenceRerankObject
@@ -330,7 +289,6 @@ from .inference_rerank_object_object import InferenceRerankObjectObject
 from .inference_rerank_request import InferenceRerankRequest
 from .inference_rerank_response import InferenceRerankResponse
 from .inference_rerank_response_object import InferenceRerankResponseObject
-from .inference_resolver_config import InferenceResolverConfig
 from .inference_rewrite_object import InferenceRewriteObject
 from .inference_rewrite_object_object import InferenceRewriteObjectObject
 from .inference_rewrite_request import InferenceRewriteRequest
@@ -762,34 +720,11 @@ __all__ = (
     "InferenceChunkRequest",
     "InferenceChunkResponse",
     "InferenceChunkResponseObject",
-    "InferenceClassifyObject",
-    "InferenceClassifyObjectObject",
-    "InferenceClassifyRequest",
-    "InferenceClassifyResponse",
-    "InferenceClassifyResponseObject",
-    "InferenceClassifyResult",
     "InferenceConfig",
     "InferenceConfigModelStrategies",
     "InferenceConfigModelStrategiesAdditionalProperty",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
-    "InferenceDocumentClassificationFeatures",
-    "InferenceDocumentClassificationObject",
-    "InferenceDocumentClassificationObjectInput",
-    "InferenceDocumentClassificationObjectObject",
-    "InferenceDocumentClassificationRequest",
-    "InferenceDocumentClassificationResponse",
-    "InferenceDocumentClassificationResponseObject",
-    "InferenceDocumentClassificationResult",
-    "InferenceDocumentTokenBox",
-    "InferenceDocumentTokenClassificationFeatures",
-    "InferenceDocumentTokenClassificationObject",
-    "InferenceDocumentTokenClassificationObjectObject",
-    "InferenceDocumentTokenClassificationPrediction",
-    "InferenceDocumentTokenClassificationRequest",
-    "InferenceDocumentTokenClassificationResponse",
-    "InferenceDocumentTokenClassificationResponseObject",
-    "InferenceDocumentTokenClassificationResult",
     "InferenceEmbeddingObject",
     "InferenceEmbeddingObjectObject",
     "InferenceEmbeddingUsage",
@@ -800,15 +735,6 @@ __all__ = (
     "InferenceEmbedResponse",
     "InferenceEmbedResponseObject",
     "InferenceError",
-    "InferenceExtractFieldValue",
-    "InferenceExtractObject",
-    "InferenceExtractObjectObject",
-    "InferenceExtractObjectResults",
-    "InferenceExtractObjectResultsAdditionalPropertyItem",
-    "InferenceExtractRequest",
-    "InferenceExtractRequestSchema",
-    "InferenceExtractResponse",
-    "InferenceExtractResponseObject",
     "InferenceFinishReason",
     "InferenceFunctionDefinition",
     "InferenceFunctionDefinitionParameters",
@@ -858,13 +784,6 @@ __all__ = (
     "InferenceReadResponseObject",
     "InferenceReadResult",
     "InferenceReadResultFields",
-    "InferenceRecognizeEntity",
-    "InferenceRecognizeObject",
-    "InferenceRecognizeObjectObject",
-    "InferenceRecognizeRequest",
-    "InferenceRecognizeResponse",
-    "InferenceRecognizeResponseObject",
-    "InferenceRelation",
     "InferenceRerankMultimodalDocument",
     "InferenceRerankMultimodalRequest",
     "InferenceRerankObject",
@@ -872,7 +791,6 @@ __all__ = (
     "InferenceRerankRequest",
     "InferenceRerankResponse",
     "InferenceRerankResponseObject",
-    "InferenceResolverConfig",
     "InferenceRewriteObject",
     "InferenceRewriteObjectObject",
     "InferenceRewriteRequest",

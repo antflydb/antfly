@@ -23,9 +23,9 @@
     "test": "node --check ./bin/antfly.js"
   },
   "optionalDependencies": {
-    "@antfly/cli-darwin-arm64": "0.0.0",
-    "@antfly/cli-linux-arm64": "0.0.0",
-    "@antfly/cli-linux-x64": "0.0.0"
+    "@antfly/cli-darwin-arm64": "workspace:*",
+    "@antfly/cli-linux-arm64": "workspace:*",
+    "@antfly/cli-linux-x64": "workspace:*"
   },
   "engines": {
     "node": ">=18"
