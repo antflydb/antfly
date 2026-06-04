@@ -606,8 +606,9 @@ Open/index/enrichment validation should reject:
          config so resolvers are declarable, not just API-driven.
    - [x] Live candidate blocking adapter: `DistributedCandidateSource` fetches
          candidates from the entity table (`ann`/`exact`/`prefix`) over the
-         routing-aware read source. Pending only the serving-layer injection
-         (above) to be live end-to-end.
+         routing-aware read source. The serving-layer injection above makes this
+         live for managed raft shards; the multi-node e2e exercises the public
+         document -> candidate read path end to end.
    - [x] Promoter: a managed stage (`promotion_runtime.zig`, `promotion` change-
          journal hint) consumes resolution artifacts and upserts canonical entity
          documents through an injected `EntitySink`. `DistributedEntitySink`
@@ -792,7 +793,7 @@ Resolver / promoter integration:
   resolver's fusion config (db-test). Multi-source combine across extractors over
   one edge is the remaining naive->full step.
 
-## Cross-shard candidate blocking (built; serving-layer injection remaining)
+## Cross-shard candidate blocking
 
 Exact/prefix/embedding blocking are all implemented and tested, but on their own
 they only see entities the resolution worker's own shard store can read.
@@ -828,20 +829,29 @@ and both are now served by the same seam.
    Injection is unconditional -- the worker only queries the source when a
    resolver declares `candidate_search`, so there is no open-time config
    discovery and no behavior change until a resolver + entity table exist.
-   Passes `public-api-parity-test`; the live cross-shard link still needs the
-   multi-node harness to exercise end to end.
+   Passes `public-api-parity-test`; the live multi-node e2e exercises the
+   cross-shard read path end to end.
+4. **Promoter dependency.** Cross-document linking pays off once the promoter
+   writes canonical entity docs. The promoter's cross-shard entity upsert uses
+   the same topology + transport through `DistributedEntitySink` and the
+   transactional `TableCommitRequest` path, so promoted entities are visible to
+   later resolver candidate reads. Verified by db-tests and the live multi-node
+   e2e.
+5. **Mention hydration.** Mention edges carry the resolved entity table and
+   graph hydration buckets result nodes by effective table, so a document graph
+   query can hydrate promoted entity docs across shards. Verified by db-tests and
+   the live multi-node e2e.
 
-**Remaining:**
+**Open follow-ups:**
 
-4. **Promoter dependency.** Cross-document linking only pays off once the
-   promoter writes canonical entity docs (phase 3); until then blocking finds
-   nothing to link to. The promoter's cross-shard entity upsert uses the same
-   topology + transport (and the existing 2PC `BatchRequest` participants).
-5. **Embedding generation.** ANN also needs the mention `name_embedding` to be
+6. **Embedding generation.** ANN also needs the mention `name_embedding` to be
    produced -- a name-embedding enrichment over the extraction entities (an
    `embedding` artifact the resolver reads), reusing the dense-embedding
    producer already in the enrichment runtime.
+7. **Entity + edge atomicity.** Entity promotion is transactional across entity
+   shards, but atomically coupling the entity upsert with graph-edge artifacts
+   still needs a graph-edge participant in `TableCommitRequest`.
 
-Recommended order: (a) serving-layer injection (unlocks a real separate entity
-table), (b) the name-embedding enrichment to feed the cross-shard `ann` source,
-(c) the promoter's cross-shard entity upsert.
+Recommended order: (a) the name-embedding enrichment to feed the cross-shard
+`ann` source, (b) graph-edge participation in `TableCommitRequest` for optional
+entity+edge atomicity.

@@ -45,6 +45,10 @@ from conftest import (
 )
 from test_scaling import MultiNodeScalingCluster
 
+JOURNEY_TIMEOUT_S = 90.0
+POLL_INTERVAL_S = 0.5
+POLL_REQUEST_TIMEOUT_S = 5.0
+
 DOCUMENTS_INDEXES = {
     # Materializes each document's `relations` field into the `relations_v1`
     # extraction asset the resolver consumes (no LLM needed). The resolver is
@@ -135,27 +139,58 @@ class _Api:
             ) from exc
         return self._check(response)
 
-    def lookup(self, table: str, key: str) -> dict | None:
+    def lookup(self, table: str, key: str, *, timeout: float = 10.0) -> dict | None:
         response = self.s.get(
-            f"{self.url}/tables/{table}/lookup/{quote(key, safe='')}", timeout=10
+            f"{self.url}/tables/{table}/lookup/{quote(key, safe='')}", timeout=timeout
         )
         if response.status_code == 404:
             return None
         return self._check(response)
 
-    def query_table(self, table: str, payload: dict) -> dict:
-        return self._check(self.s.post(f"{self.url}/tables/{table}/query", json=payload, timeout=30))
+    def query_table(self, table: str, payload: dict, *, timeout: float = 30.0) -> dict:
+        return self._check(self.s.post(f"{self.url}/tables/{table}/query", json=payload, timeout=timeout))
 
 
-def _wait_for_entity(api: _Api, key: str, *, timeout_s: float = 60.0) -> dict:
-    deadline = time.monotonic() + timeout_s
-    last = None
-    while time.monotonic() < deadline:
-        last = api.lookup("entities", key)
-        if last is not None:
-            return last
-        time.sleep(0.5)
-    raise AssertionError(f"entity {key!r} was not promoted within {timeout_s}s (last={last})")
+class _Deadline:
+    def __init__(self, timeout_s: float):
+        self.timeout_s = timeout_s
+        self.expires_at = time.monotonic() + timeout_s
+
+    def remaining(self) -> float:
+        return max(0.0, self.expires_at - time.monotonic())
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0.0
+
+    def request_timeout(self) -> float:
+        return max(0.1, min(POLL_REQUEST_TIMEOUT_S, self.remaining()))
+
+    def sleep(self) -> None:
+        remaining = self.remaining()
+        if remaining > 0.0:
+            time.sleep(min(POLL_INTERVAL_S, remaining))
+
+
+def _wait_for_entities(api: _Api, expected_names: dict[str, str], *, deadline: _Deadline) -> dict[str, dict]:
+    pending = set(expected_names.keys())
+    found: dict[str, dict] = {}
+    last: dict[str, dict | None] = {}
+
+    while not deadline.expired():
+        for key in list(pending):
+            doc = api.lookup("entities", key, timeout=deadline.request_timeout())
+            last[key] = doc
+            if doc is not None and expected_names[key] in _doc_text(doc):
+                found[key] = doc
+                pending.remove(key)
+        if not pending:
+            return found
+        deadline.sleep()
+
+    raise AssertionError(
+        f"entities were not promoted within {deadline.timeout_s}s "
+        f"(pending={sorted(pending)!r}, last={last!r})"
+    )
 
 
 def _doc_text(doc: dict) -> str:
@@ -171,14 +206,20 @@ def _graph_result(result: dict, name: str) -> dict | None:
     return responses[0].get("graph_results", {}).get(name)
 
 
-def _wait_for_mention_hydration(api: _Api, *, timeout_s: float = 60.0) -> dict:
+def _wait_for_mention_hydration(
+    api: _Api,
+    *,
+    start_node: str,
+    expected_names: dict[str, str],
+    deadline: _Deadline,
+) -> dict:
     payload = {
         "query": {"match_all": {}},
         "graph_searches": {
             "mentions": {
                 "type": "neighbors",
                 "index_name": "relations_graph",
-                "start_nodes": {"keys": ["doc:a"]},
+                "start_nodes": {"keys": [start_node]},
                 "params": {
                     "edge_types": ["mentions"],
                     "direction": "out",
@@ -191,33 +232,36 @@ def _wait_for_mention_hydration(api: _Api, *, timeout_s: float = 60.0) -> dict:
         "limit": 10,
     }
 
-    deadline = time.monotonic() + timeout_s
     last: dict[str, Any] | None = None
-    while time.monotonic() < deadline:
-        last = api.query_table("documents", payload)
+    while not deadline.expired():
+        last = api.query_table("documents", payload, timeout=deadline.request_timeout())
         graph = _graph_result(last, "mentions")
         if graph is None:
-            time.sleep(0.5)
+            deadline.sleep()
             continue
         nodes = graph.get("nodes", [])
         by_key = {node.get("key"): node for node in nodes if isinstance(node, dict)}
-        ada = by_key.get("person/ada_lovelace")
-        antfly = by_key.get("org/antfly")
-        if (
-            isinstance(ada, dict)
-            and isinstance(ada.get("document"), dict)
-            and ada["document"].get("canonical_name") == "Ada Lovelace"
-            and isinstance(antfly, dict)
-            and isinstance(antfly.get("document"), dict)
-            and antfly["document"].get("canonical_name") == "Antfly"
-        ):
+        hydrated = True
+        for key, canonical_name in expected_names.items():
+            node = by_key.get(key)
+            hydrated = (
+                hydrated
+                and isinstance(node, dict)
+                and isinstance(node.get("document"), dict)
+                and node["document"].get("canonical_name") == canonical_name
+            )
+        if hydrated:
             return graph
-        time.sleep(0.5)
-    raise AssertionError(f"mention graph did not hydrate promoted entities within {timeout_s}s (last={last})")
+        deadline.sleep()
+    raise AssertionError(
+        f"mention graph did not hydrate promoted entities within {deadline.timeout_s}s "
+        f"(start_node={start_node!r}, expected={expected_names!r}, last={last!r})"
+    )
 
 
 def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_cluster):
     api = _Api(resolution_cluster.data_api_urls[0], resolution_cluster)
+    deadline = _Deadline(JOURNEY_TIMEOUT_S)
 
     # Entities live in their own table (own shard group); documents are spread
     # across multiple shards in an explicit multi-node metadata/data raft setup.
@@ -241,10 +285,14 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
 
     # The promoter upserts a canonical entity document per resolved mention into
     # the entity table on its own shard.
-    ada = _wait_for_entity(api, "person/ada_lovelace")
-    assert "Ada Lovelace" in _doc_text(ada)
-    antfly = _wait_for_entity(api, "org/antfly")
-    assert "Antfly" in _doc_text(antfly)
+    _wait_for_entities(
+        api,
+        {
+            "person/ada_lovelace": "Ada Lovelace",
+            "org/antfly": "Antfly",
+        },
+        deadline=deadline,
+    )
 
     # A second document mentioning the same person resolves (prefix blocking) to
     # the existing entity rather than minting a new one; the entity persists with
@@ -254,13 +302,25 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
         "doc:b",
         {"relations": {"entities": [{"id": "e0", "label": "person", "text": "Ada Lovelace"}]}},
     )
-    # Give the resolve -> promote loop a moment, then confirm the canonical entity
-    # is still the single Ada Lovelace document.
-    time.sleep(2.0)
-    ada_again = _wait_for_entity(api, "person/ada_lovelace")
-    assert "Ada Lovelace" in _doc_text(ada_again)
 
-    mentions = _wait_for_mention_hydration(api)
+    mentions = _wait_for_mention_hydration(
+        api,
+        start_node="doc:a",
+        expected_names={
+            "person/ada_lovelace": "Ada Lovelace",
+            "org/antfly": "Antfly",
+        },
+        deadline=deadline,
+    )
     assert mentions["type"] == "neighbors"
     node_keys = {node["key"] for node in mentions["nodes"]}
     assert {"person/ada_lovelace", "org/antfly"} <= node_keys
+
+    second_mentions = _wait_for_mention_hydration(
+        api,
+        start_node="doc:b",
+        expected_names={"person/ada_lovelace": "Ada Lovelace"},
+        deadline=deadline,
+    )
+    second_node_keys = {node["key"] for node in second_mentions["nodes"]}
+    assert "person/ada_lovelace" in second_node_keys

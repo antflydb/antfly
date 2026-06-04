@@ -2753,7 +2753,7 @@ pub const DataServer = struct {
         self.store_status_heartbeat_cache.clear(self.alloc);
     }
 
-    pub fn bumpVisibleProvisionedGroupLsmGenerations(self: *DataServer) !void {
+    pub fn bumpVisibleProvisionedGroupRootGenerations(self: *DataServer) !void {
         var io_impl = std.Io.Threaded.init(self.alloc, .{});
         defer io_impl.deinit();
 
@@ -2777,7 +2777,7 @@ pub const DataServer = struct {
     }
 
     pub fn refreshVisibleProvisionedReplicaState(self: *DataServer) !void {
-        try self.bumpVisibleProvisionedGroupLsmGenerations();
+        try self.bumpVisibleProvisionedGroupRootGenerations();
         self.provisioned_storage.read_cache.clear();
         self.provisioned_storage.lsm_cache.invalidatePrefix(self.write_source.replica_root_dir);
         self.provisioned_storage.hbc_cache.clear();
