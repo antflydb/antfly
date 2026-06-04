@@ -87,7 +87,7 @@ jobs:
             ':(glob)scripts/ci/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
-            .github/workflows/zig-container.yml
+            .github/workflows/antfly-container.yml
           then
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
           else
@@ -99,7 +99,7 @@ jobs:
             ':(glob)scripts/ci/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
-            .github/workflows/zig-container.yml
+            .github/workflows/antfly-container.yml
           then
             echo "e2e=false" >> "$GITHUB_OUTPUT"
           else
