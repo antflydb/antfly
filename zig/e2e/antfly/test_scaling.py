@@ -787,15 +787,21 @@ class MultiNodeScalingCluster:
             handle.flush()
         return "\n".join(f"[{path.name}]\n{_read_log_tail(path)}" for path in self.log_paths)
 
-    def stop(self) -> None:
-        for proc in [*self.data_procs, *self.metadata_procs]:
+    def stop(self, *, timeout_s: float = 10.0) -> None:
+        procs = [proc for proc in [*self.data_procs, *self.metadata_procs] if proc.poll() is None]
+        for proc in procs:
+            proc.send_signal(signal.SIGTERM)
+        deadline = time.monotonic() + timeout_s
+        for proc in procs:
             if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
                 try:
-                    proc.wait(timeout=10)
+                    proc.wait(timeout=max(0.0, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    proc.wait()
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
         for handle in self.log_files:
             if not handle.closed:
                 handle.close()

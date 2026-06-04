@@ -5402,6 +5402,7 @@ fn openProvisionedQueryDbForTableWithCache(
     const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
         .drain_resolver_backfill = false,
     });
+    var indexes_added = summary.indexes_added;
     if (summary.indexManagerCatalogChanged()) {
         // Query/status paths can be the first readers to observe a newly-added
         // index or resolver from metadata. Reopen after reconcile so searches
@@ -5438,8 +5439,12 @@ fn openProvisionedQueryDbForTableWithCache(
             .prefer_existing_identity_namespace = identity_namespace != null,
         });
         try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
+        const reopened_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+            .drain_resolver_backfill = false,
+        });
+        indexes_added += reopened_summary.indexes_added;
     }
-    if (summary.indexes_added > 0) {
+    if (indexes_added > 0) {
         if (db.enrichment_runtime != null) {
             _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
             try db.runUntilIdle();

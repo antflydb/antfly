@@ -46,6 +46,7 @@ from conftest import (
 from test_scaling import MultiNodeScalingCluster
 
 AUTOGRAPH_E2E_TIMEOUT_S = 115.0
+AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S = 5.0
 POLL_INTERVAL_S = 0.5
 POLL_REQUEST_TIMEOUT_S = 5.0
 
@@ -107,7 +108,7 @@ def resolution_cluster():
     try:
         yield cluster, deadline
     finally:
-        cluster.stop()
+        cluster.stop(timeout_s=AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S)
 
 
 class _Api:

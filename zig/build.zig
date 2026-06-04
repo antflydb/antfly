@@ -2608,6 +2608,7 @@ pub fn build(b: *std.Build) void {
         "linear merge request parser accepts raw payload value under public request cap",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
+        "provisioned table write cache retires stale db when index metadata changes",
     };
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,

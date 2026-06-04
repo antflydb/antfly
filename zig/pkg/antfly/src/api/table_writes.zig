@@ -1093,13 +1093,13 @@ pub const ProvisionedTableWriteCache = struct {
         }
     }
 
-    fn removeDbEntriesForTable(self: *ProvisionedTableWriteCache, table_name: []const u8) void {
+    fn retireDbEntriesForTableLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) !void {
         var leased_retirements: usize = 0;
         for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.active_leases > 0) leased_retirements += 1;
         }
-        self.retired_entries.ensureUnusedCapacity(self.alloc, leased_retirements) catch return;
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, leased_retirements);
 
         var i: usize = 0;
         while (i < self.entries.items.len) {
@@ -1110,6 +1110,10 @@ pub const ProvisionedTableWriteCache = struct {
             const removed = self.entries.orderedRemove(i);
             self.retireEntryLocked(removed);
         }
+    }
+
+    fn removeDbEntriesForTable(self: *ProvisionedTableWriteCache, table_name: []const u8) void {
+        self.retireDbEntriesForTableLocked(table_name) catch return;
     }
 
     fn hasLiveEntryForGroupTableLocked(
@@ -1540,25 +1544,49 @@ pub const ProvisionedTableWriteCache = struct {
         catalog: table_catalog.CatalogSource,
         table_name: []const u8,
     ) !*const TableMetadata {
-        for (self.table_metadata.items) |*metadata| {
-            if (std.mem.eql(u8, metadata.table_name, table_name)) return metadata;
+        var snapshot = try catalog.adminSnapshot();
+        defer catalog.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name);
+
+        var cached_index: ?usize = null;
+        for (self.table_metadata.items, 0..) |*metadata, i| {
+            if (std.mem.eql(u8, metadata.table_name, table_name)) {
+                cached_index = i;
+                if (table) |current| {
+                    const indexes_match = if (metadata.indexes_json) |cached|
+                        std.mem.eql(u8, cached, current.indexes_json)
+                    else
+                        current.indexes_json.len == 0;
+                    const schema_match = if (metadata.schema_json) |cached|
+                        std.mem.eql(u8, cached, current.schema_json)
+                    else
+                        current.schema_json.len == 0;
+                    if (indexes_match and schema_match) return metadata;
+                } else if (metadata.indexes_json == null and metadata.schema_json == null) {
+                    return metadata;
+                }
+                break;
+            }
+        }
+
+        if (cached_index) |i| {
+            try self.retireDbEntriesForTableLocked(table_name);
+            var removed = self.table_metadata.orderedRemove(i);
+            removed.deinit(self.alloc);
         }
 
         if (self.table_metadata.items.len >= max_cached_write_tables) self.evictOldestTable();
         const owned_table_name = try self.alloc.dupe(u8, table_name);
         errdefer self.alloc.free(owned_table_name);
 
-        var snapshot = try catalog.adminSnapshot();
-        defer catalog.freeAdminSnapshot(&snapshot);
-
         var indexes_json: ?[]u8 = null;
         errdefer if (indexes_json) |value| self.alloc.free(value);
         var schema_json: ?[]u8 = null;
         errdefer if (schema_json) |value| self.alloc.free(value);
 
-        if (tables_api.findTableByName(&snapshot, table_name)) |table| {
-            indexes_json = try self.alloc.dupe(u8, table.indexes_json);
-            schema_json = try self.alloc.dupe(u8, table.schema_json);
+        if (table) |current| {
+            indexes_json = try self.alloc.dupe(u8, current.indexes_json);
+            schema_json = try self.alloc.dupe(u8, current.schema_json);
         }
 
         try self.table_metadata.append(self.alloc, .{
@@ -14009,6 +14037,79 @@ test "provisioned table write source runtime status stays cache-only without sha
     defer cached.deinit(alloc);
 
     try std.testing.expect((try source.source().localRuntimeStatuses(alloc, "docs")) == null);
+}
+
+test "provisioned table write cache retires stale db when index metadata changes" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-write-cache-metadata-refresh";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const Catalog = struct {
+        var indexes_json_buf: []const u8 = "";
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = indexes_json_buf,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    Catalog.indexes_json_buf = "{\"first_idx\":{\"type\":\"full_text\",\"field\":\"body\"}}";
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var first = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    var first_released = false;
+    defer if (!first_released) first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
+    try std.testing.expect(first.db.core.index_manager.textIndex("first_idx") != null);
+
+    Catalog.indexes_json_buf = "{\"second_idx\":{\"type\":\"full_text\",\"field\":\"body\"}}";
+
+    var second = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
+    try std.testing.expect(first.entry.?.retired);
+    try std.testing.expect(second.entry.? != first.entry.?);
+    try std.testing.expect(second.db.core.index_manager.textIndex("second_idx") != null);
+    try std.testing.expect(second.db.core.index_manager.textIndex("first_idx") == null);
+
+    first.deinit(alloc);
+    first_released = true;
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 
 test "provisioned table write source runtime status prefers shared snapshot cache" {
