@@ -543,7 +543,7 @@ test "std http listener and executor round-trip raft batch route" {
     var executor: std_http_executor.StdHttpExecutor = undefined;
     executor.initInPlace(std.testing.allocator, .{});
     defer executor.deinit();
-    var driver = http_driver.HttpFrameDriver.init(std.testing.allocator, .{}, executor.executor());
+    var driver = http_driver.HttpFrameDriver.init(std.testing.allocator, .{}, executor.executor(), executor.io_impl.io());
 
     const msg = raft_engine.core.Message{
         .msg_type = .heartbeat,
