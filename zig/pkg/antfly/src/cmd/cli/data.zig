@@ -146,6 +146,7 @@ const LoadCheckpoint = struct {
     bad_id: u64 = 0,
     too_long: u64 = 0,
     empty_line: u64 = 0,
+    duplicate_in_batch: u64 = 0,
     batch_count: u64 = 0,
 };
 
@@ -394,6 +395,7 @@ const LoadProcessor = struct {
             processor.stats.bad_id = cp.bad_id;
             processor.stats.too_long = cp.too_long;
             processor.stats.empty_line = cp.empty_line;
+            processor.stats.duplicate_in_batch = cp.duplicate_in_batch;
             processor.stats.batch_count = cp.batch_count;
         }
         return processor;
@@ -444,6 +446,10 @@ const LoadProcessor = struct {
             },
             else => return err,
         };
+        const is_duplicate = self.batch.inserts.map.contains(doc_id);
+        if (is_duplicate) {
+            self.stats.duplicate_in_batch += 1;
+        }
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, batch_alloc, line.bytes, .{
             .allocate = .alloc_always,
         }) catch |err| switch (err) {
@@ -456,11 +462,12 @@ const LoadProcessor = struct {
                 return;
             },
         };
-        if (self.batch.inserts.map.contains(doc_id)) self.stats.duplicate_in_batch += 1;
         try self.batch.inserts.map.put(batch_alloc, doc_id, parsed);
-        self.batch.docs += 1;
+        if (!is_duplicate) {
+            self.batch.docs += 1;
+            self.stats.loaded += 1;
+        }
         self.batch.bytes += line.bytes.len + doc_id.len;
-        self.stats.loaded += 1;
         self.last_committed_offset = line.end_offset;
         self.last_committed_line = line.line_number;
 
@@ -575,6 +582,7 @@ const LoadProcessor = struct {
             .bad_id = self.stats.bad_id,
             .too_long = self.stats.too_long,
             .empty_line = self.stats.empty_line,
+            .duplicate_in_batch = self.stats.duplicate_in_batch,
             .batch_count = self.stats.batch_count + 1,
         };
         try writeCheckpointAtomically(self.alloc, self.io, path, checkpoint);
@@ -1005,6 +1013,33 @@ test "load processor advances resume cursor for tolerated rejected and empty lin
     try std.testing.expectEqual(@as(u64, 1), processor.stats.invalid_json);
     try std.testing.expectEqual(@as(u64, 1), processor.stats.bad_id);
     try std.testing.expectEqual(@as(u64, 1), processor.stats.empty_line);
+}
+
+test "load processor handles duplicate ids as last write wins without inflating loaded count" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var processor = try LoadProcessor.init(alloc, io, null, .{
+        .table_name = "t",
+        .file_path = "in.ndjson",
+        .id_field = "id",
+        .dry_run = true,
+        .checkpoint_enabled = false,
+    }, .{ .size = 100, .mtime_ns = 1 }, null, null);
+    defer processor.deinit();
+
+    try processor.handleLine(.{ .bytes = "{\"id\":\"dup\",\"v\":1}", .line_number = 1, .start_offset = 0, .end_offset = 18 });
+    try processor.handleLine(.{ .bytes = "{\"id\":\"dup\",\"v\":2}", .line_number = 2, .start_offset = 19, .end_offset = 37 });
+
+    try std.testing.expectEqual(@as(u64, 1), processor.stats.loaded);
+    try std.testing.expectEqual(@as(usize, 1), processor.batch.docs);
+    try std.testing.expectEqual(@as(u64, 1), processor.stats.duplicate_in_batch);
+    try std.testing.expectEqual(@as(u64, 0), processor.stats.rejected());
+    try std.testing.expectEqual(@as(u64, 37), processor.last_committed_offset);
+    const doc = processor.batch.inserts.map.get("dup").?;
+    try std.testing.expectEqual(@as(i64, 2), doc.object.get("v").?.integer);
 }
 
 test "load processor renders ids from handlebars template" {
