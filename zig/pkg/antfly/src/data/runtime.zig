@@ -2785,14 +2785,43 @@ pub const DataServer = struct {
 
     pub fn reconcileVisibleProvisionedReplicaState(self: *DataServer) !void {
         try self.refreshVisibleProvisionedReplicaState();
-        lockAtomic(self.write_source.localDbMutex());
-        self.write_source.pruneStaleWriteCacheLocked();
-        self.write_source.localDbMutex().unlock();
-        if (self.data_raft_apply) |apply_sm| {
-            lockAtomic(apply_sm.write_source.localDbMutex());
-            defer apply_sm.write_source.localDbMutex().unlock();
-            apply_sm.write_source.pruneStaleWriteCacheLocked();
+        self.pruneStaleVisibleWriteCaches();
+    }
+
+    fn pruneStaleVisibleWriteCaches(self: *DataServer) void {
+        const apply_sm = self.data_raft_apply orelse {
+            lockAtomic(self.write_source.localDbMutex());
+            defer self.write_source.localDbMutex().unlock();
+            self.write_source.pruneStaleWriteCacheLocked();
+            return;
+        };
+
+        pruneStaleWriteCachesInLockOrder(&self.write_source, &apply_sm.write_source);
+    }
+
+    fn pruneStaleWriteCachesInLockOrder(
+        primary: *antfly.public_api.ProvisionedTableWriteSource,
+        secondary: *antfly.public_api.ProvisionedTableWriteSource,
+    ) void {
+        if (primary == secondary) {
+            lockAtomic(primary.localDbMutex());
+            defer primary.localDbMutex().unlock();
+            primary.pruneStaleWriteCacheLocked();
+            return;
         }
+
+        const primary_mutex = primary.localDbMutex();
+        const secondary_mutex = secondary.localDbMutex();
+        const first_mutex = if (@intFromPtr(primary_mutex) < @intFromPtr(secondary_mutex)) primary_mutex else secondary_mutex;
+        const second_mutex = if (first_mutex == primary_mutex) secondary_mutex else primary_mutex;
+
+        lockAtomic(first_mutex);
+        defer first_mutex.unlock();
+        lockAtomic(second_mutex);
+        defer second_mutex.unlock();
+
+        primary.pruneStaleWriteCacheLocked();
+        secondary.pruneStaleWriteCacheLocked();
     }
 
     fn collectLocalGroupStatusesForMetadataService(
@@ -5332,37 +5361,36 @@ pub const DataServer = struct {
             return;
         }
 
-        lockAtomic(self.write_source.localDbMutex());
-        defer self.write_source.localDbMutex().unlock();
+        const fingerprint = blk: {
+            lockAtomic(self.write_source.localDbMutex());
+            defer self.write_source.localDbMutex().unlock();
 
-        try self.reportLocalSchemaProgress(head.metadata_group_id, registration.node_id, local_group_ids, snapshot.tables, snapshot.ranges);
+            try self.reportLocalSchemaProgress(head.metadata_group_id, registration.node_id, local_group_ids, snapshot.tables, snapshot.ranges);
 
-        const fingerprint = antfly.metadata.table_provisioner.provisioningFingerprint(
-            head.metadata_group_id,
-            local_group_ids,
-            snapshot.tables,
-            snapshot.ranges,
-        );
-        if (self.last_provision_fingerprint == fingerprint) {
-            self.last_provision_metadata_epoch = head.metadata_epoch;
-            return;
-        }
-        _ = try self.write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
-            self.alloc,
-            head.metadata_group_id,
-            local_group_ids,
-            snapshot.tables,
-            snapshot.ranges,
-            try self.ensureBackendRuntime(),
-        );
-        try self.provisioned_storage.bumpGroupVisibleRootGenerations(local_group_ids);
-        self.provisioned_storage.read_cache.clear();
-        self.write_source.pruneStaleWriteCacheLocked();
-        if (self.data_raft_apply) |apply_sm| {
-            lockAtomic(apply_sm.write_source.localDbMutex());
-            defer apply_sm.write_source.localDbMutex().unlock();
-            apply_sm.write_source.pruneStaleWriteCacheLocked();
-        }
+            const next_fingerprint = antfly.metadata.table_provisioner.provisioningFingerprint(
+                head.metadata_group_id,
+                local_group_ids,
+                snapshot.tables,
+                snapshot.ranges,
+            );
+            if (self.last_provision_fingerprint == next_fingerprint) {
+                self.last_provision_metadata_epoch = head.metadata_epoch;
+                return;
+            }
+            _ = try self.write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                self.alloc,
+                head.metadata_group_id,
+                local_group_ids,
+                snapshot.tables,
+                snapshot.ranges,
+                try self.ensureBackendRuntime(),
+            );
+            try self.provisioned_storage.bumpGroupVisibleRootGenerations(local_group_ids);
+            self.provisioned_storage.read_cache.clear();
+            break :blk next_fingerprint;
+        };
+
+        self.pruneStaleVisibleWriteCaches();
         self.last_provision_fingerprint = fingerprint;
         self.last_provision_metadata_epoch = head.metadata_epoch;
         self.invalidateLocalGroupStatusCache();

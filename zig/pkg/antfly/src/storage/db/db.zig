@@ -31,6 +31,7 @@ const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
 const shard_mod = @import("../shard.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
+const resolver_catalog_mod = @import("catalog/resolver_catalog.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resolver_lib = @import("antfly_resolver");
@@ -5762,6 +5763,7 @@ pub const DB = struct {
     }
 
     fn backfillResolverCorpus(self: *DB) !void {
+        if (!self.hasConfiguredResolvers()) return;
         if (self.resolution_runtime) |runtime| {
             try runtime.requestReresolveBacklog();
             while (true) {
@@ -24443,6 +24445,9 @@ test "db starts resolver replay workers only while resolver catalog is configure
     try std.testing.expect(!no_resolver_pending.promotion.catch_up_required);
     try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
     try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+    try db.drainResolverBackfill();
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolver_catalog_mod.reresolve_resume_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolver_catalog_mod.reresolve_repair_resume_key));
 
     try db.addResolver(.{
         .name = "kg_lifecycle",
