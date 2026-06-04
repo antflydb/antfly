@@ -184,7 +184,8 @@ pub const AntflyClient = struct {
         const json_body = try httpx.json.Json.stringify(self.allocator, BatchRequestWire{ .inner = body });
         defer self.allocator.free(json_body);
         const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |header| &.{header} else null;
-        var raw_resp = try self.inner.http.post(url, .{ .json = json_body, .headers = headers });
+        var raw_resp = try self.inner.http.post(url, .{ .json = json_body, .headers = headers, .timeout_ms = 1_800_000 });
+        defer raw_resp.deinit();
         var resp = openapi.ApiResponse(openapi.types.BatchResponse).fromResponse(self.allocator, &raw_resp);
         if (resp.status_code >= 300) {
             defer resp.deinit();

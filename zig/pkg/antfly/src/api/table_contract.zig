@@ -49,13 +49,19 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         .object => |object| object,
         else => return error.InvalidCreateTableRequest,
     };
+    const include_default_full_text = if (raw_root.get("default_full_text_index")) |value| switch (value) {
+        .bool => |enabled| enabled,
+        else => true,
+    } else true;
     if (raw_root.get("indexes")) |indexes_value| {
         if (indexes_value != .null)
-            req.indexes_json = try normalizeCreateTableIndexesFromValue(alloc, indexes_value)
+            req.indexes_json = try normalizeCreateTableIndexesFromValue(alloc, indexes_value, include_default_full_text)
+        else if (include_default_full_text)
+            req.indexes_json = try alloc.dupe(u8, tables_api.default_indexes_json)
         else
-            req.indexes_json = try alloc.dupe(u8, tables_api.default_indexes_json);
+            req.indexes_json = try alloc.dupe(u8, "{}");
     } else {
-        req.indexes_json = try alloc.dupe(u8, tables_api.default_indexes_json);
+        req.indexes_json = try alloc.dupe(u8, if (include_default_full_text) tables_api.default_indexes_json else "{}");
     }
 
     if (parsed.value.schema) |schema| {
@@ -77,7 +83,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
 }
 
 pub fn normalizeCreateTableIndexesValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    return try normalizeCreateTableIndexesFromValue(alloc, value);
+    return try normalizeCreateTableIndexesFromValue(alloc, value, true);
 }
 
 pub fn normalizeTableDefinitionIndexesValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -293,7 +299,7 @@ fn isAllowedPublicFullTextField(field_name: []const u8) bool {
         std.mem.eql(u8, field_name, "mem_only");
 }
 
-fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.json.Value, include_default_full_text: bool) ![]u8 {
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidCreateTableRequest,
@@ -303,7 +309,7 @@ fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.jso
     defer out.deinit(alloc);
     try out.append(alloc, '{');
     var first = true;
-    try appendDefaultFullTextIndexEntry(alloc, &out, &first);
+    if (include_default_full_text) try appendDefaultFullTextIndexEntry(alloc, &out, &first);
     var it = object.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
@@ -542,6 +548,16 @@ test "table contract rejects public full text create index" {
             "{}",
         ),
     );
+}
+
+
+test "table contract can disable default full text index for stress ingest" {
+    var req = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"default_full_text_index\":false,\"indexes\":{}}",
+    );
+    defer req.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{}", req.indexes_json.?);
 }
 
 test "table contract rejects reserved full text index names on create table" {

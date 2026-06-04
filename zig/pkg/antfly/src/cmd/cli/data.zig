@@ -84,8 +84,14 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
     var table_name: ?[]const u8 = null;
     var file_path: ?[]const u8 = null;
     var batch_size: usize = 1000;
-    var max_batches: usize = 100;
+    var max_batches: usize = std.math.maxInt(usize);
+    var skip_lines: usize = 0;
+    var sync_level: ?antfly_client.types.SyncLevel = .full_index;
     var id_field: ?[]const u8 = null;
+    var skipped_invalid: usize = 0;
+    var raw_lines_seen: usize = 0;
+    var dry_run = false;
+    var print_invalid = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
@@ -94,26 +100,41 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
             file_path = args.next();
         } else if (std.mem.eql(u8, arg, "--size")) {
             if (args.next()) |s| batch_size = std.fmt.parseInt(usize, s, 10) catch 1000;
-        } else if (std.mem.eql(u8, arg, "--batches")) {
-            if (args.next()) |s| max_batches = std.fmt.parseInt(usize, s, 10) catch 100;
+        } else if (std.mem.eql(u8, arg, "--batches") or std.mem.eql(u8, arg, "--max-batches")) {
+            if (args.next()) |s| max_batches = std.fmt.parseInt(usize, s, 10) catch std.math.maxInt(usize);
+        } else if (std.mem.eql(u8, arg, "--skip")) {
+            if (args.next()) |s| skip_lines = std.fmt.parseInt(usize, s, 10) catch 0;
+        } else if (std.mem.eql(u8, arg, "--sync-level")) {
+            if (args.next()) |s| sync_level = parseSyncLevel(s) orelse cli.fatal(
+                "invalid --sync-level '{s}' (expected propose, write, full_text, enrichments, aknn, full_index)",
+                .{s},
+            );
         } else if (std.mem.eql(u8, arg, "--id-field")) {
             id_field = args.next();
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--print-invalid")) {
+            print_invalid = true;
         }
     }
 
     const tbl = table_name orelse cli.fatal("--table is required", .{});
     const path = file_path orelse cli.fatal("--file is required", .{});
 
-    const file_data = cli.readFileAlloc(io, allocator, path, 512 * 1024 * 1024) catch |err| {
-        cli.fatal("reading file {s}: {}", .{ path, err });
+    const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only, .allow_directory = false }) catch |err| {
+        cli.fatal("opening file {s}: {}", .{ path, err });
     };
-    defer allocator.free(file_data);
+    defer file.close(io);
 
     var total_loaded: usize = 0;
     var batch_count: usize = 0;
-    var line_start: usize = 0;
+    var line_buf = std.ArrayListUnmanaged(u8).empty;
+    defer line_buf.deinit(allocator);
+    var line_offset: usize = 0;
+    var read_buf: [8 * 1024 * 1024]u8 = undefined;
+    var eof = false;
 
-    while (batch_count < max_batches and line_start < file_data.len) {
+    while (batch_count < max_batches and !eof) {
         var inserts: std.json.ArrayHashMap(std.json.Value) = .{};
         defer inserts.deinit(allocator);
         var parsed_docs = std.ArrayListUnmanaged(std.json.Parsed(std.json.Value)).empty;
@@ -128,28 +149,67 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
         }
         var items_in_batch: usize = 0;
 
-        while (items_in_batch < batch_size and line_start < file_data.len) {
-            const remaining = file_data[line_start..];
-            const line_end = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
-            const line = remaining[0..line_end];
-            line_start += line_end + 1;
+        while (items_in_batch < batch_size and !eof) {
+            while (true) {
+                if (std.mem.indexOfScalar(u8, line_buf.items[line_offset..], '\n') != null) break;
+
+                const n_read = file.readStreaming(io, &.{&read_buf}) catch |err| switch (err) {
+                    error.EndOfStream => 0,
+                    else => cli.fatal("reading file {s}: {}", .{ path, err }),
+                };
+                if (n_read == 0) {
+                    eof = true;
+                    break;
+                }
+                try line_buf.appendSlice(allocator, read_buf[0..n_read]);
+            }
+
+            const relative_line_end = std.mem.indexOfScalar(u8, line_buf.items[line_offset..], '\n') orelse blk: {
+                if (eof and line_offset < line_buf.items.len) break :blk line_buf.items.len - line_offset;
+                break;
+            };
+            const line_start = line_offset;
+            const line_end = line_offset + relative_line_end;
+            const raw_line = line_buf.items[line_start..line_end];
+            const line = std.mem.trimEnd(u8, raw_line, "\r");
+            line_offset = @min(line_end + 1, line_buf.items.len);
+            raw_lines_seen += 1;
 
             if (line.len == 0) continue;
+            if (skip_lines > 0) {
+                skip_lines -= 1;
+                if (line_offset > 4 * 1024 * 1024 or line_offset == line_buf.items.len) {
+                    line_buf.replaceRange(allocator, 0, line_offset, &.{}) catch @panic("OOM");
+                    line_offset = 0;
+                }
+                continue;
+            }
 
-            var parsed_line = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+            var parsed_line = std.json.parseFromSlice(std.json.Value, allocator, line, .{ .allocate = .alloc_always }) catch |err| {
+                skipped_invalid += 1;
+                if (print_invalid) {
+                    std.debug.print("Invalid JSON at raw line {d}: {}\n", .{ raw_lines_seen, err });
+                }
+                if (line_offset > 4 * 1024 * 1024 or line_offset == line_buf.items.len) {
+                    line_buf.replaceRange(allocator, 0, line_offset, &.{}) catch @panic("OOM");
+                    line_offset = 0;
+                }
+                continue;
+            };
             errdefer parsed_line.deinit();
 
-            // Generate a document ID
             const doc_id = if (id_field) |field| blk: {
                 if (parsed_line.value.object.get(field)) |val| {
                     switch (val) {
                         .string => |s| break :blk s,
-                        else => break :blk "unknown",
+                        else => {},
                     }
                 }
-                break :blk "unknown";
+                const hash = std.hash.Wyhash.hash(0, line);
+                const owned = std.fmt.allocPrint(allocator, "{x}", .{hash}) catch break :blk "unknown";
+                try owned_ids.append(allocator, owned);
+                break :blk owned;
             } else blk: {
-                // Use hash of line as hex ID
                 const hash = std.hash.Wyhash.hash(0, line);
                 const owned = std.fmt.allocPrint(allocator, "{x}", .{hash}) catch break :blk "unknown";
                 try owned_ids.append(allocator, owned);
@@ -159,19 +219,40 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
             try inserts.map.put(allocator, doc_id, parsed_line.value);
             try parsed_docs.append(allocator, parsed_line);
             items_in_batch += 1;
+            if (line_offset > 4 * 1024 * 1024 or line_offset == line_buf.items.len) {
+                line_buf.replaceRange(allocator, 0, line_offset, &.{}) catch @panic("OOM");
+                line_offset = 0;
+            }
         }
 
         if (items_in_batch == 0) break;
 
-        var resp = try client.batch(tbl, .{
-            .inserts = inserts,
-        });
-        defer resp.deinit();
+        if (!dry_run) {
+            var resp = try client.batch(tbl, .{
+                .inserts = inserts,
+                .sync_level = sync_level,
+            });
+            defer resp.deinit();
+        }
 
         total_loaded += items_in_batch;
         batch_count += 1;
-        std.debug.print("Batch {d}: loaded {d} items (total: {d})\n", .{ batch_count, items_in_batch, total_loaded });
+        std.debug.print("Batch {d}: loaded {d} items (total: {d}, raw lines seen: {d})\n", .{ batch_count, items_in_batch, total_loaded, raw_lines_seen });
     }
 
-    std.debug.print("Bulk load command successful. Total loaded: {d}\n", .{total_loaded});
+    std.debug.print("Bulk load command successful. Total loaded: {d}, raw lines seen: {d}", .{ total_loaded, raw_lines_seen });
+    if (skipped_invalid > 0) std.debug.print(" (skipped invalid JSON lines: {d})", .{skipped_invalid});
+    std.debug.print("\n", .{});
+}
+
+fn parseSyncLevel(value: []const u8) ?antfly_client.types.SyncLevel {
+    if (std.mem.eql(u8, value, "propose")) return .propose;
+    if (std.mem.eql(u8, value, "write")) return .write;
+    if (std.mem.eql(u8, value, "full_text")) return .full_text;
+    if (std.mem.eql(u8, value, "full-text")) return .full_text;
+    if (std.mem.eql(u8, value, "enrichments")) return .enrichments;
+    if (std.mem.eql(u8, value, "aknn")) return .aknn;
+    if (std.mem.eql(u8, value, "full_index")) return .full_index;
+    if (std.mem.eql(u8, value, "full-index")) return .full_index;
+    return null;
 }

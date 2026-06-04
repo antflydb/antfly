@@ -1062,7 +1062,16 @@ fn addOpenApiRegenStep(
 }
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const host = b.graph.host.result;
+    const default_target: std.Target.Query = if (host.os.tag == .linux)
+        .{
+            .cpu_arch = host.cpu.arch,
+            .os_tag = .linux,
+            .abi = .gnu,
+        }
+    else
+        .{};
+    const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,

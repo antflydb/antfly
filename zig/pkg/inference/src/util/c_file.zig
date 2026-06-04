@@ -25,6 +25,11 @@ const build_options = @import("build_options");
 pub const link_libc = build_options.link_libc;
 
 pub const c = if (build_options.link_libc) @cImport({
+    // ReleaseSafe enables optimization, which lets recent glibc expose
+    // _FORTIFY_SOURCE wrappers that Zig's translate-c cannot evaluate cleanly
+    // for open/openat. These declarations are only used for the raw libc
+    // symbols below, so disable fortify for this translation unit.
+    @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("fcntl.h");
     @cInclude("unistd.h");
     @cInclude("sys/stat.h");
