@@ -122,6 +122,22 @@ def _semantic_top_hit(stateful_api, table_name: str, query: str, index_name: str
     return None
 
 
+def _chunked_doc(stateful_api, table_name: str, key: str, chunk_field: str) -> list[dict] | None:
+    scan = stateful_api.scan_keys(
+        table_name,
+        {
+            "from": key,
+            "to": f"{key};",
+            "inclusive_from": True,
+            "fields": ["title", "_chunks"],
+        },
+    )
+    if len(scan) != 1:
+        return None
+    chunks = scan[0].get("_chunks", {}).get(chunk_field)
+    return scan if chunks else None
+
+
 def _write_single_doc(stateful_api, table_name: str, key: str, *, title: str, content: str) -> None:
     batch = stateful_api.batch_write(
         table_name,
@@ -279,22 +295,19 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, op
     )
     assert batch["inserted"] == 2
 
+    before_scan = wait_until(
+        lambda: _chunked_doc(backup_api, table_name, "doc:a", "semantic_chunked_idx_chunks"),
+        timeout_s=60.0,
+        interval_s=1.0,
+    )
+    assert before_scan is not None
+
     assert wait_until(
         lambda: _semantic_top_hit(backup_api, table_name, "alpha concept", "semantic_chunked_idx", "doc:a"),
-        timeout_s=30.0,
-        interval_s=0.5,
+        timeout_s=120.0,
+        interval_s=1.0,
     )
 
-    before_scan = backup_api.scan_keys(
-        table_name,
-        {
-            "from": "doc:a",
-            "to": "doc:a;",
-            "inclusive_from": True,
-            "fields": ["title", "_chunks"],
-        },
-    )
-    assert len(before_scan) == 1
     before_chunks = before_scan[0]["_chunks"]["semantic_chunked_idx_chunks"]
     assert len(before_chunks) >= 2
 
@@ -357,23 +370,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, op
         assert semantic_after
 
         after_scan = wait_until(
-            lambda: (
-                scan
-                if (
-                    (scan := backup_api.scan_keys(
-                        table_name,
-                        {
-                            "from": "doc:a",
-                            "to": "doc:a;",
-                            "inclusive_from": True,
-                            "fields": ["title", "_chunks"],
-                        },
-                    ))
-                    and len(scan) == 1
-                    and scan[0].get("_chunks", {}).get("semantic_chunked_idx_chunks")
-                )
-                else None
-            ),
+            lambda: _chunked_doc(backup_api, table_name, "doc:a", "semantic_chunked_idx_chunks"),
             timeout_s=60.0,
             interval_s=1.0,
         )

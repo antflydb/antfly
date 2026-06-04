@@ -27,6 +27,7 @@ const data_raft_batch = @import("raft_batch.zig");
 const platform_clock = @import("../platform/clock.zig");
 const process_memory_mod = @import("../platform/process_memory.zig");
 const platform_time = @import("../platform/time.zig");
+const platform = @import("antfly_platform");
 const raft_engine = @import("raft_engine");
 
 const health_metrics = antfly.common.health_server;
@@ -48,6 +49,8 @@ const data_raft_batch_leader_retry_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const data_raft_metadata_resync_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_campaign_retry_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_metadata_sync_interval_ms: u64 = 250;
+const trusted_principal_secret_key = "antfly.trusted_principal.secret";
+const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
@@ -263,7 +266,7 @@ const RaftTableApplyStateMachine = struct {
         self.write_source.read_cache = &storage.read_cache;
         self.write_source.write_cache = &self.write_cache;
         self.write_source.runtime_status_cache = &storage.runtime_status_cache;
-        self.write_source.group_lsm_generation = storage.groupLsmGenerationSource();
+        _ = self.write_source.withGroupVisibleRootGeneration(storage.groupVisibleRootGenerationSource());
         if (storage.backend_runtime) |runtime| self.write_source.backend_runtime = runtime;
     }
 
@@ -300,7 +303,7 @@ const RaftTableApplyStateMachine = struct {
         for (committed_entries) |entry| {
             if (entry.index > last_index) last_index = entry.index;
             if (entry.entry_type != .normal) continue;
-            if (!std.mem.startsWith(u8, entry.data, "{\"table\"")) continue;
+            if (!data_raft_batch.looksLikeEnvelope(entry.data)) continue;
             var decoded = try data_raft_batch.decode(self.alloc, entry.data);
             defer decoded.deinit(self.alloc);
             _ = try self.write_source.applyReplicatedBatchGroupLocal(
@@ -1625,6 +1628,16 @@ pub const DataServer = struct {
     provisioned_storage: antfly.public_api.ProvisionedGroupStorage,
     read_source: antfly.public_api.ProvisionedTableReadSource,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
+    /// Long-lived backing for the cross-shard entity-resolution candidate
+    /// source; its `CandidateSource` vtable points into this field, so it must
+    /// not move. Wraps `read_source.source()` and is handed to the write
+    /// source(s) so every managed DB blocks entity resolution across shards.
+    distributed_candidate_source: ?antfly.public_api.DistributedCandidateSource = null,
+    /// Long-lived backing for the promoter's cross-shard entity sink; its
+    /// `EntitySink` vtable points into this field, so it must not move. Wraps
+    /// `write_source.source()` and is handed to the write source(s) so the
+    /// promoter upserts canonical entities into whichever shard owns them.
+    distributed_entity_sink: ?antfly.public_api.DistributedEntitySink = null,
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
@@ -1839,6 +1852,36 @@ pub const DataServer = struct {
         self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
         self.write_source.setLocalChangeHook(self.localChangeHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+        const promotion_leadership = self.promotionLeadershipSource();
+        _ = self.write_source.withPromotionLeadershipSource(promotion_leadership);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withPromotionLeadershipSource(promotion_leadership);
+        }
+
+        // Cross-shard entity-resolution blocking: wrap the routing-aware read
+        // source so resolution workers fetch candidate entities from whichever
+        // shard owns the entity table, then hand it to the write source(s) that
+        // open managed DBs. Captures `read_source.source()` (ptr+vtable), so
+        // later read-source mutations remain visible.
+        self.distributed_candidate_source = .{ .reads = self.read_source.source() };
+        const candidate_source = self.distributed_candidate_source.?.candidateSource();
+        _ = self.write_source.withResolutionCandidateSource(candidate_source);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withResolutionCandidateSource(candidate_source);
+        }
+
+        // The promoter's cross-shard entity sink: wrap the routing-aware write
+        // source so the promoter upserts canonical entity documents into the
+        // shard that owns each entity key, then hand it to the write source(s)
+        // that open managed DBs.
+        // Promote each document's entities atomically through the 2PC commit
+        // path (multi-participant across the entity table's shards).
+        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .transactional = true };
+        const entity_sink = self.distributed_entity_sink.?.entitySink();
+        _ = self.write_source.withEntitySink(entity_sink);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withEntitySink(entity_sink);
+        }
         self.http_server = antfly.public_api.ApiHttpServer.init(
             self.alloc,
             api_server_cfg,
@@ -2251,6 +2294,22 @@ pub const DataServer = struct {
             .vtable = &.{
                 .batch_group = localRaftBatchGroup,
                 .batch_group_local = localRaftBatchGroupLocal,
+            },
+        };
+    }
+
+    fn promotionLeadershipSource(self: *DataServer) ?antfly.public_api.table_writes.ProvisionedTableWriteCache.PromotionLeadershipSource {
+        if (self.group_leadership_source == null) return null;
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .is_local_leader = struct {
+                    fn isLocalLeader(ptr: *anyopaque, group_id: u64) bool {
+                        const server: *DataServer = @ptrCast(@alignCast(ptr));
+                        const source = server.group_leadership_source orelse return true;
+                        return source.isLocalLeader(group_id);
+                    }
+                }.isLocalLeader,
             },
         };
     }
@@ -2694,7 +2753,7 @@ pub const DataServer = struct {
         self.store_status_heartbeat_cache.clear(self.alloc);
     }
 
-    pub fn bumpVisibleProvisionedGroupLsmGenerations(self: *DataServer) !void {
+    pub fn bumpVisibleProvisionedGroupRootGenerations(self: *DataServer) !void {
         var io_impl = std.Io.Threaded.init(self.alloc, .{});
         defer io_impl.deinit();
 
@@ -2712,13 +2771,13 @@ pub const DataServer = struct {
             try group_ids.append(self.alloc, group_id);
         }
 
-        self.provisioned_storage.pruneGroupGenerations(group_ids.items);
+        self.provisioned_storage.pruneGroupVisibleRootGenerations(group_ids.items);
         if (group_ids.items.len == 0) return;
-        try self.provisioned_storage.bumpGroupGenerations(group_ids.items);
+        try self.provisioned_storage.bumpGroupVisibleRootGenerations(group_ids.items);
     }
 
     pub fn refreshVisibleProvisionedReplicaState(self: *DataServer) !void {
-        try self.bumpVisibleProvisionedGroupLsmGenerations();
+        try self.bumpVisibleProvisionedGroupRootGenerations();
         self.provisioned_storage.read_cache.clear();
         self.provisioned_storage.lsm_cache.invalidatePrefix(self.write_source.replica_root_dir);
         self.provisioned_storage.hbc_cache.clear();
@@ -2726,9 +2785,43 @@ pub const DataServer = struct {
 
     pub fn reconcileVisibleProvisionedReplicaState(self: *DataServer) !void {
         try self.refreshVisibleProvisionedReplicaState();
-        lockAtomic(self.write_source.localDbMutex());
-        defer self.write_source.localDbMutex().unlock();
-        self.write_source.pruneStaleWriteCacheLocked();
+        self.pruneStaleVisibleWriteCaches();
+    }
+
+    fn pruneStaleVisibleWriteCaches(self: *DataServer) void {
+        const apply_sm = self.data_raft_apply orelse {
+            lockAtomic(self.write_source.localDbMutex());
+            defer self.write_source.localDbMutex().unlock();
+            self.write_source.pruneStaleWriteCacheLocked();
+            return;
+        };
+
+        pruneStaleWriteCachesInLockOrder(&self.write_source, &apply_sm.write_source);
+    }
+
+    fn pruneStaleWriteCachesInLockOrder(
+        primary: *antfly.public_api.ProvisionedTableWriteSource,
+        secondary: *antfly.public_api.ProvisionedTableWriteSource,
+    ) void {
+        if (primary == secondary) {
+            lockAtomic(primary.localDbMutex());
+            defer primary.localDbMutex().unlock();
+            primary.pruneStaleWriteCacheLocked();
+            return;
+        }
+
+        const primary_mutex = primary.localDbMutex();
+        const secondary_mutex = secondary.localDbMutex();
+        const first_mutex = if (@intFromPtr(primary_mutex) < @intFromPtr(secondary_mutex)) primary_mutex else secondary_mutex;
+        const second_mutex = if (first_mutex == primary_mutex) secondary_mutex else primary_mutex;
+
+        lockAtomic(first_mutex);
+        defer first_mutex.unlock();
+        lockAtomic(second_mutex);
+        defer second_mutex.unlock();
+
+        primary.pruneStaleWriteCacheLocked();
+        secondary.pruneStaleWriteCacheLocked();
     }
 
     fn collectLocalGroupStatusesForMetadataService(
@@ -2767,7 +2860,7 @@ pub const DataServer = struct {
 
     fn localFetchMedianKey(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !?[]u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const lsm_root_generation = self.provisioned_storage.generationForGroup(group_id);
+        const lsm_root_generation = self.provisioned_storage.visibleRootGenerationForGroup(group_id);
         const change_generation = self.local_split_key_generation.load(.monotonic);
         if (try self.snapshotCachedLocalSplitKey(alloc, group_id, lsm_root_generation, change_generation)) |cached| {
             return switch (cached) {
@@ -3470,7 +3563,7 @@ pub const DataServer = struct {
                         table.indexes_json,
                         &self.provisioned_storage.lsm_cache,
                         &self.provisioned_storage.hbc_cache,
-                        self.provisioned_storage.generationForGroup(group_id),
+                        self.provisioned_storage.visibleRootGenerationForGroup(group_id),
                         &self.provisioned_storage.resource_manager,
                         try self.ensureBackendRuntime(),
                     );
@@ -3501,7 +3594,7 @@ pub const DataServer = struct {
                 group_id,
                 .{
                     .lsm_cache = &self.provisioned_storage.lsm_cache,
-                    .lsm_root_generation = self.provisioned_storage.generationForGroup(group_id),
+                    .lsm_root_generation = self.provisioned_storage.visibleRootGenerationForGroup(group_id),
                     .resource_manager = &self.provisioned_storage.resource_manager,
                     .backend_runtime = try self.ensureBackendRuntime(),
                 },
@@ -5246,7 +5339,7 @@ pub const DataServer = struct {
             local_group_ids = fallback_group_ids;
         }
         defer self.alloc.free(local_group_ids);
-        self.provisioned_storage.pruneGroupGenerations(local_group_ids);
+        self.provisioned_storage.pruneGroupVisibleRootGenerations(local_group_ids);
         if (local_group_ids.len == 0) {
             self.provisioned_storage.read_cache.clear();
             self.write_source.clearWriteCache();
@@ -5268,32 +5361,36 @@ pub const DataServer = struct {
             return;
         }
 
-        lockAtomic(self.write_source.localDbMutex());
-        defer self.write_source.localDbMutex().unlock();
+        const fingerprint = blk: {
+            lockAtomic(self.write_source.localDbMutex());
+            defer self.write_source.localDbMutex().unlock();
 
-        try self.reportLocalSchemaProgress(head.metadata_group_id, registration.node_id, local_group_ids, snapshot.tables, snapshot.ranges);
+            try self.reportLocalSchemaProgress(head.metadata_group_id, registration.node_id, local_group_ids, snapshot.tables, snapshot.ranges);
 
-        const fingerprint = antfly.metadata.table_provisioner.provisioningFingerprint(
-            head.metadata_group_id,
-            local_group_ids,
-            snapshot.tables,
-            snapshot.ranges,
-        );
-        if (self.last_provision_fingerprint == fingerprint) {
-            self.last_provision_metadata_epoch = head.metadata_epoch;
-            return;
-        }
-        _ = try self.write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
-            self.alloc,
-            head.metadata_group_id,
-            local_group_ids,
-            snapshot.tables,
-            snapshot.ranges,
-            try self.ensureBackendRuntime(),
-        );
-        try self.provisioned_storage.bumpGroupGenerations(local_group_ids);
-        self.provisioned_storage.read_cache.clear();
-        self.write_source.pruneStaleWriteCacheLocked();
+            const next_fingerprint = antfly.metadata.table_provisioner.provisioningFingerprint(
+                head.metadata_group_id,
+                local_group_ids,
+                snapshot.tables,
+                snapshot.ranges,
+            );
+            if (self.last_provision_fingerprint == next_fingerprint) {
+                self.last_provision_metadata_epoch = head.metadata_epoch;
+                return;
+            }
+            _ = try self.write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                self.alloc,
+                head.metadata_group_id,
+                local_group_ids,
+                snapshot.tables,
+                snapshot.ranges,
+                try self.ensureBackendRuntime(),
+            );
+            try self.provisioned_storage.bumpGroupVisibleRootGenerations(local_group_ids);
+            self.provisioned_storage.read_cache.clear();
+            break :blk next_fingerprint;
+        };
+
+        self.pruneStaleVisibleWriteCaches();
         self.last_provision_fingerprint = fingerprint;
         self.last_provision_metadata_epoch = head.metadata_epoch;
         self.invalidateLocalGroupStatusCache();
@@ -7211,6 +7308,12 @@ pub fn runFromIterator(
     defer metadata_api_urls.deinit(alloc);
     if ((cli.node_id == null) != (cli.store_id == null)) return error.InvalidArguments;
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
+    const trusted_principal_secret = try resolveTrustedPrincipalSecret(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+    );
+    defer if (trusted_principal_secret) |value| alloc.free(value);
+    const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
     defer setup_io.deinit();
@@ -7252,6 +7355,12 @@ pub fn runFromIterator(
     defer if (auth_runtime) |*runtime| runtime.deinit();
     defer if (auth_backend) |*backend| backend.close();
 
+    const trusted_principal_issuer = try resolveTrustedPrincipalIssuer(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+    );
+    defer if (trusted_principal_issuer) |value| alloc.free(value);
+
     var data_server = try DataServer.initFromMetadataApiUrls(alloc, .{
         .bind_host = cli.bind_host orelse "127.0.0.1",
         .bind_port = cli.bind_port orelse 0,
@@ -7267,7 +7376,9 @@ pub fn runFromIterator(
             .failure_domain = cli.failure_domain orelse "",
         } else null,
         .api_server_cfg = .{
-            .auth_enabled = auth_enabled,
+            .auth_enabled = effective_auth_enabled,
+            .trusted_principal_secret = trusted_principal_secret,
+            .trusted_principal_issuer = trusted_principal_issuer,
             .user_manager = if (user_manager) |*manager| manager else null,
             .secret_store = if (secret_store_initialized) &secret_store else null,
         },
@@ -7569,6 +7680,46 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
     return false;
 }
 
+fn resolveTrustedPrincipalSecret(
+    alloc: std.mem.Allocator,
+    secret_store: ?*antfly.common.secrets.FileStore,
+) !?[]u8 {
+    return try resolveTrustedPrincipalConfigValue(alloc, secret_store, trusted_principal_secret_key);
+}
+
+fn resolveTrustedPrincipalIssuer(
+    alloc: std.mem.Allocator,
+    secret_store: ?*antfly.common.secrets.FileStore,
+) !?[]u8 {
+    return try resolveTrustedPrincipalConfigValue(alloc, secret_store, trusted_principal_issuer_key);
+}
+
+fn resolveTrustedPrincipalConfigValue(
+    alloc: std.mem.Allocator,
+    secret_store: ?*antfly.common.secrets.FileStore,
+    key: []const u8,
+) !?[]u8 {
+    if (secret_store) |store| {
+        if (try store.getOwned(alloc, key)) |value| {
+            if (std.mem.trim(u8, value, " \t\r\n").len > 0) return value;
+            alloc.free(value);
+            return null;
+        }
+        return null;
+    }
+
+    const env_var = try antfly.common.secrets.envVarForKey(alloc, key);
+    defer alloc.free(env_var);
+    const env_var_z = try alloc.dupeZ(u8, env_var);
+    defer alloc.free(env_var_z);
+    if (platform.env.getenvSlice(env_var_z)) |value| {
+        const raw = try alloc.dupe(u8, value);
+        if (std.mem.trim(u8, raw, " \t\r\n").len > 0) return raw;
+        alloc.free(raw);
+    }
+    return null;
+}
+
 fn parseBoolFlag(value: []const u8) ?bool {
     if (std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "false")) return false;
@@ -7783,6 +7934,42 @@ test "data runtime leaves auth disabled unless config or cli enables it" {
 
     cli.auth_enabled = false;
     try std.testing.expect(!resolveAuthEnabled(cli, null));
+}
+
+test "data runtime resolves trusted principal secret from secret store" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/trusted-principal-secrets.json", .{tmp.sub_path});
+    defer alloc.free(store_path);
+
+    var store = try antfly.common.secrets.FileStore.init(alloc, store_path);
+    defer store.deinit();
+    var entry = try store.put(alloc, trusted_principal_secret_key, "cloudaf-shared-secret");
+    defer entry.deinit(alloc);
+
+    const resolved = try resolveTrustedPrincipalSecret(alloc, &store);
+    defer if (resolved) |value| alloc.free(value);
+    try std.testing.expectEqualStrings("cloudaf-shared-secret", resolved.?);
+}
+
+test "data runtime resolves trusted principal issuer from secret store" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/trusted-principal-issuer.json", .{tmp.sub_path});
+    defer alloc.free(store_path);
+
+    var store = try antfly.common.secrets.FileStore.init(alloc, store_path);
+    defer store.deinit();
+    var entry = try store.put(alloc, trusted_principal_issuer_key, "cloudaf");
+    defer entry.deinit(alloc);
+
+    const resolved = try resolveTrustedPrincipalIssuer(alloc, &store);
+    defer if (resolved) |value| alloc.free(value);
+    try std.testing.expectEqualStrings("cloudaf", resolved.?);
 }
 
 test "data runtime local group status uses injected leadership source" {

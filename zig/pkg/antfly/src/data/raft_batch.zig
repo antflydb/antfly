@@ -40,6 +40,13 @@ pub fn encode(alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.type
     return try out.toOwnedSlice();
 }
 
+pub fn looksLikeEnvelope(payload: []const u8) bool {
+    const trimmed = std.mem.trim(u8, payload, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "{")) return false;
+    return std.mem.indexOf(u8, trimmed, "\"table\"") != null and
+        std.mem.indexOf(u8, trimmed, "\"batch\"") != null;
+}
+
 pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBatch {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always });
     defer parsed.deinit();
@@ -60,6 +67,13 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
         .table_name = table_name,
         .batch = batch,
     };
+}
+
+test "raft batch envelope detector tolerates whitespace and object field order" {
+    try std.testing.expect(looksLikeEnvelope(" \n {\"batch\":{},\"table\":\"docs\"}"));
+    try std.testing.expect(looksLikeEnvelope("{\"table\":\"docs\",\"batch\":{}}"));
+    try std.testing.expect(!looksLikeEnvelope(""));
+    try std.testing.expect(!looksLikeEnvelope("{\"kind\":\"metadata\",\"value\":1}"));
 }
 
 test "raft batch round trips table batch payload" {

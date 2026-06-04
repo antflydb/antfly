@@ -268,6 +268,16 @@ pub const ProvisionedTableWriteCache = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    /// Cross-shard entity-resolution candidate source applied to every managed
+    /// DB this cache opens (set after open; see `setResolutionCandidateSource`).
+    resolution_candidate_source: ?db_mod.CandidateSource = null,
+    /// Cross-shard entity sink for the promoter, applied to every managed DB
+    /// this cache opens (set after open; see `setEntitySink`).
+    entity_sink: ?db_mod.EntitySink = null,
+    /// Source-group leadership predicate for promotion ownership. When set, each
+    /// managed DB gets a group-specific `PromotionOwner` so only the local leader
+    /// promotes resolution replay into cross-shard entity writes.
+    promotion_leadership_source: ?PromotionLeadershipSource = null,
     open_mutex: std.atomic.Mutex = .unlocked,
     entry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     hit_count: std.atomic.Value(u64) = .init(0),
@@ -344,6 +354,7 @@ pub const ProvisionedTableWriteCache = struct {
         group_id: u64,
         lsm_root_generation: u64,
         table_name: []u8,
+        promotion_owner_state: PromotionOwnerState = .{},
         db: db_mod.DB,
         schema_json: ?[]u8 = null,
         active_leases: usize = 0,
@@ -394,6 +405,139 @@ pub const ProvisionedTableWriteCache = struct {
         }
     };
 
+    pub const PromotionLeadershipSource = struct {
+        ptr: *anyopaque,
+        vtable: *const VTable,
+
+        pub const VTable = struct {
+            is_local_leader: *const fn (ptr: *anyopaque, group_id: u64) bool,
+        };
+
+        pub fn isLocalLeader(self: PromotionLeadershipSource, group_id: u64) bool {
+            return self.vtable.is_local_leader(self.ptr, group_id);
+        }
+    };
+
+    const PromotionOwnerState = struct {
+        group_id: u64 = 0,
+        leadership_source: ?PromotionLeadershipSource = null,
+
+        fn owner(self: *PromotionOwnerState) ?db_mod.PromotionOwner {
+            if (self.leadership_source == null) return null;
+            return .{ .ptr = self, .vtable = &owner_vtable };
+        }
+
+        const owner_vtable = db_mod.PromotionOwner.VTable{ .is_local_owner = isLocalOwner };
+
+        fn isLocalOwner(ptr: *anyopaque) bool {
+            const self: *PromotionOwnerState = @ptrCast(@alignCast(ptr));
+            const source = self.leadership_source orelse return true;
+            return source.isLocalLeader(self.group_id);
+        }
+    };
+
+    fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, group_id: u64, owner_state: ?*PromotionOwnerState) void {
+        db.setResolutionCandidateSource(self.resolution_candidate_source);
+        db.setEntitySink(self.entity_sink);
+        if (owner_state) |state| {
+            state.* = .{
+                .group_id = group_id,
+                .leadership_source = self.promotion_leadership_source,
+            };
+            db.setPromotionOwner(state.owner());
+        } else {
+            db.setPromotionOwner(null);
+        }
+    }
+
+    fn retireFailedOpenLocked(self: *ProvisionedTableWriteCache, cached: *CachedDb) void {
+        const entry = cached.entry orelse {
+            cached.deinit(self.alloc);
+            return;
+        };
+
+        var i: usize = 0;
+        while (i < self.entries.items.len) : (i += 1) {
+            if (self.entries.items[i] != entry) continue;
+            _ = self.entries.orderedRemove(i);
+            break;
+        }
+
+        if (!entry.retired) self.retireEntryLocked(entry);
+        cached.deinit(self.alloc);
+    }
+
+    fn refreshRuntimeHooksLocked(self: *ProvisionedTableWriteCache) void {
+        for (self.entries.items) |entry| {
+            self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
+        }
+    }
+
+    fn candidateSourcesEqual(a: ?db_mod.CandidateSource, b: ?db_mod.CandidateSource) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return a.?.ptr == b.?.ptr and a.?.vtable == b.?.vtable;
+    }
+
+    fn entitySinksEqual(a: ?db_mod.EntitySink, b: ?db_mod.EntitySink) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return a.?.ptr == b.?.ptr and a.?.vtable == b.?.vtable;
+    }
+
+    fn promotionLeadershipSourcesEqual(a: ?PromotionLeadershipSource, b: ?PromotionLeadershipSource) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return a.?.ptr == b.?.ptr and a.?.vtable == b.?.vtable;
+    }
+
+    fn runtimeHooksEqual(
+        self: *const ProvisionedTableWriteCache,
+        candidate_source: ?db_mod.CandidateSource,
+        entity_sink_value: ?db_mod.EntitySink,
+        leadership_source: ?PromotionLeadershipSource,
+    ) bool {
+        return candidateSourcesEqual(self.resolution_candidate_source, candidate_source) and
+            entitySinksEqual(self.entity_sink, entity_sink_value) and
+            promotionLeadershipSourcesEqual(self.promotion_leadership_source, leadership_source);
+    }
+
+    fn setRuntimeHooks(
+        self: *ProvisionedTableWriteCache,
+        candidate_source: ?db_mod.CandidateSource,
+        entity_sink_value: ?db_mod.EntitySink,
+        leadership_source: ?PromotionLeadershipSource,
+    ) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        if (self.runtimeHooksEqual(candidate_source, entity_sink_value, leadership_source)) return;
+        self.resolution_candidate_source = candidate_source;
+        self.entity_sink = entity_sink_value;
+        self.promotion_leadership_source = leadership_source;
+        self.refreshRuntimeHooksLocked();
+    }
+
+    pub fn setResolutionCandidateSource(self: *ProvisionedTableWriteCache, source: ?db_mod.CandidateSource) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        if (candidateSourcesEqual(self.resolution_candidate_source, source)) return;
+        self.resolution_candidate_source = source;
+        self.refreshRuntimeHooksLocked();
+    }
+
+    pub fn setEntitySink(self: *ProvisionedTableWriteCache, sink: ?db_mod.EntitySink) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        if (entitySinksEqual(self.entity_sink, sink)) return;
+        self.entity_sink = sink;
+        self.refreshRuntimeHooksLocked();
+    }
+
+    pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSource) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        if (promotionLeadershipSourcesEqual(self.promotion_leadership_source, source)) return;
+        self.promotion_leadership_source = source;
+        self.refreshRuntimeHooksLocked();
+    }
+
     const ActiveBulkIngestSession = struct {
         table_name: []u8,
         depth: usize = 1,
@@ -416,6 +560,25 @@ pub const ProvisionedTableWriteCache = struct {
             self.* = undefined;
         }
     };
+
+    fn cloneTableMetadataAlloc(
+        self: *ProvisionedTableWriteCache,
+        table_name: []const u8,
+        indexes_json: ?[]const u8,
+        schema_json: ?[]const u8,
+    ) !TableMetadata {
+        const owned_table_name = try self.alloc.dupe(u8, table_name);
+        errdefer self.alloc.free(owned_table_name);
+        const owned_indexes_json = if (indexes_json) |value| try self.alloc.dupe(u8, value) else null;
+        errdefer if (owned_indexes_json) |value| self.alloc.free(value);
+        const owned_schema_json = if (schema_json) |value| try self.alloc.dupe(u8, value) else null;
+        errdefer if (owned_schema_json) |value| self.alloc.free(value);
+        return .{
+            .table_name = owned_table_name,
+            .indexes_json = owned_indexes_json,
+            .schema_json = owned_schema_json,
+        };
+    }
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedTableWriteCache {
         return .{ .alloc = alloc };
@@ -526,7 +689,7 @@ pub const ProvisionedTableWriteCache = struct {
                 identity_namespace: ?doc_identity.Namespace,
             ) !OpenedDb {
                 var db = if (indexes_json) |managed_indexes_json|
-                    try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+                    try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                         allocator,
                         db_path,
                         managed_indexes_json,
@@ -540,6 +703,7 @@ pub const ProvisionedTableWriteCache = struct {
                         secret_store,
                         null,
                         identity_namespace,
+                        .{ .drain_resolver_backfill = false },
                     )
                 else
                     try db_mod.DB.open(allocator, db_path, .{
@@ -556,6 +720,7 @@ pub const ProvisionedTableWriteCache = struct {
                             .startup_catch_up, .restore_repair => .writer_no_replay,
                             .status_only => .status_only,
                         },
+                        .start_optional_runtimes = open_mode != .startup_catch_up,
                         .index_open_parallelism = if (open_mode == .default_async or open_mode == .writer_no_replay) 1 else null,
                     });
                 errdefer db.close();
@@ -648,13 +813,17 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
+        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         try self.entries.append(self.alloc, owned_entry);
-        return .{
+        var cached = CachedDb{
             .cache = self,
             .entry = owned_entry,
             .db = &owned_entry.db,
             .schema_json = metadata.schema_json,
         };
+        errdefer self.retireFailedOpenLocked(&cached);
+        try owned_entry.db.drainResolverBackfill();
+        return cached;
     }
 
     fn adoptSeededEntryGenerationLocked(self: *ProvisionedTableWriteCache, entry: *Entry, lsm_root_generation: u64) bool {
@@ -801,6 +970,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
+        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc);
         try self.entries.append(self.alloc, owned_entry);
@@ -853,6 +1023,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 0,
             .allow_generation_adoption = true,
         };
+        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         errdefer owned_entry.deinit(self.alloc);
 
         try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
@@ -948,13 +1119,13 @@ pub const ProvisionedTableWriteCache = struct {
         }
     }
 
-    fn removeDbEntriesForTable(self: *ProvisionedTableWriteCache, table_name: []const u8) void {
+    fn retireDbEntriesForTableLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) !void {
         var leased_retirements: usize = 0;
         for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.active_leases > 0) leased_retirements += 1;
         }
-        self.retired_entries.ensureUnusedCapacity(self.alloc, leased_retirements) catch return;
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, leased_retirements);
 
         var i: usize = 0;
         while (i < self.entries.items.len) {
@@ -965,6 +1136,10 @@ pub const ProvisionedTableWriteCache = struct {
             const removed = self.entries.orderedRemove(i);
             self.retireEntryLocked(removed);
         }
+    }
+
+    fn removeDbEntriesForTable(self: *ProvisionedTableWriteCache, table_name: []const u8) void {
+        self.retireDbEntriesForTableLocked(table_name) catch return;
     }
 
     fn hasLiveEntryForGroupTableLocked(
@@ -1273,34 +1448,56 @@ pub const ProvisionedTableWriteCache = struct {
         removed.deinit(self.alloc);
     }
 
+    fn reserveDbEntryRetirementsForTableLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) !void {
+        var leased_retirements: usize = 0;
+        for (self.entries.items) |entry| {
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.active_leases > 0) leased_retirements += 1;
+        }
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, leased_retirements);
+    }
+
     fn replaceTableMetadataLocked(
         self: *ProvisionedTableWriteCache,
         table_name: []const u8,
         indexes_json: []const u8,
         schema_json: []const u8,
     ) !void {
-        var i: usize = 0;
-        while (i < self.table_metadata.items.len) {
-            if (!std.mem.eql(u8, self.table_metadata.items[i].table_name, table_name)) {
-                i += 1;
-                continue;
+        const replace_index = blk: {
+            for (self.table_metadata.items, 0..) |metadata, i| {
+                if (std.mem.eql(u8, metadata.table_name, table_name)) break :blk i;
             }
-            var removed = self.table_metadata.orderedRemove(i);
-            removed.deinit(self.alloc);
+            break :blk null;
+        };
+        if (replace_index == null) try self.table_metadata.ensureUnusedCapacity(self.alloc, 1);
+        var replacement = try self.cloneTableMetadataAlloc(table_name, indexes_json, schema_json);
+        errdefer replacement.deinit(self.alloc);
+
+        if (replace_index) |i| {
+            self.table_metadata.items[i].deinit(self.alloc);
+            self.table_metadata.items[i] = replacement;
+            return;
         }
 
         if (self.table_metadata.items.len >= max_cached_write_tables) self.evictOldestTable();
-        const owned_table_name = try self.alloc.dupe(u8, table_name);
-        errdefer self.alloc.free(owned_table_name);
-        const owned_indexes_json = try self.alloc.dupe(u8, indexes_json);
-        errdefer self.alloc.free(owned_indexes_json);
-        const owned_schema_json = try self.alloc.dupe(u8, schema_json);
-        errdefer self.alloc.free(owned_schema_json);
-        try self.table_metadata.append(self.alloc, .{
-            .table_name = owned_table_name,
-            .indexes_json = owned_indexes_json,
-            .schema_json = owned_schema_json,
-        });
+        self.table_metadata.appendAssumeCapacity(replacement);
+    }
+
+    fn installLoadedTableMetadataLocked(
+        self: *ProvisionedTableWriteCache,
+        cached_index: ?usize,
+        replacement: TableMetadata,
+    ) !*const TableMetadata {
+        if (cached_index) |i| {
+            try self.retireDbEntriesForTableLocked(replacement.table_name);
+            self.table_metadata.items[i].deinit(self.alloc);
+            self.table_metadata.items[i] = replacement;
+            return &self.table_metadata.items[i];
+        }
+
+        if (self.table_metadata.items.len >= max_cached_write_tables) self.evictOldestTable();
+        self.table_metadata.appendAssumeCapacity(replacement);
+        return &self.table_metadata.items[self.table_metadata.items.len - 1];
     }
 
     fn tableMetadataLocked(self: *const ProvisionedTableWriteCache, table_name: []const u8) ?TableMetadata {
@@ -1314,7 +1511,7 @@ pub const ProvisionedTableWriteCache = struct {
         self: *ProvisionedTableWriteCache,
         dest: *ProvisionedTableWriteCache,
         table_name: []const u8,
-        generation_source: ?table_reads.GroupLsmGenerationSource,
+        generation_source: ?table_reads.GroupVisibleRootGenerationSource,
     ) !usize {
         if (self.alloc.ptr != dest.alloc.ptr or self.alloc.vtable != dest.alloc.vtable) {
             return self.retireAdoptableEntriesForTableLocked(table_name);
@@ -1340,7 +1537,7 @@ pub const ProvisionedTableWriteCache = struct {
                 continue;
             }
 
-            const dest_generation = if (generation_source) |source| source.generationForGroup(entry.group_id) else 0;
+            const dest_generation = if (generation_source) |source| source.visibleRootGenerationForGroup(entry.group_id) else table_reads.backend_current_root_generation;
             try dest.pruneStaleEntriesForGroupTableLocked(entry.group_id, dest_generation, table_name);
             var existing_index: ?usize = null;
             for (dest.entries.items, 0..) |dest_entry, dest_i| {
@@ -1395,33 +1592,45 @@ pub const ProvisionedTableWriteCache = struct {
         catalog: table_catalog.CatalogSource,
         table_name: []const u8,
     ) !*const TableMetadata {
-        for (self.table_metadata.items) |*metadata| {
-            if (std.mem.eql(u8, metadata.table_name, table_name)) return metadata;
-        }
-
-        if (self.table_metadata.items.len >= max_cached_write_tables) self.evictOldestTable();
-        const owned_table_name = try self.alloc.dupe(u8, table_name);
-        errdefer self.alloc.free(owned_table_name);
-
         var snapshot = try catalog.adminSnapshot();
         defer catalog.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name);
 
-        var indexes_json: ?[]u8 = null;
-        errdefer if (indexes_json) |value| self.alloc.free(value);
-        var schema_json: ?[]u8 = null;
-        errdefer if (schema_json) |value| self.alloc.free(value);
-
-        if (tables_api.findTableByName(&snapshot, table_name)) |table| {
-            indexes_json = try self.alloc.dupe(u8, table.indexes_json);
-            schema_json = try self.alloc.dupe(u8, table.schema_json);
+        var cached_index: ?usize = null;
+        for (self.table_metadata.items, 0..) |*metadata, i| {
+            if (std.mem.eql(u8, metadata.table_name, table_name)) {
+                cached_index = i;
+                if (table) |current| {
+                    const indexes_match = if (metadata.indexes_json) |cached|
+                        std.mem.eql(u8, cached, current.indexes_json)
+                    else
+                        current.indexes_json.len == 0;
+                    const schema_match = if (metadata.schema_json) |cached|
+                        std.mem.eql(u8, cached, current.schema_json)
+                    else
+                        current.schema_json.len == 0;
+                    if (indexes_match and schema_match) return metadata;
+                } else if (metadata.indexes_json == null and metadata.schema_json == null) {
+                    return metadata;
+                }
+                break;
+            }
         }
 
-        try self.table_metadata.append(self.alloc, .{
-            .table_name = owned_table_name,
-            .indexes_json = indexes_json,
-            .schema_json = schema_json,
-        });
-        return &self.table_metadata.items[self.table_metadata.items.len - 1];
+        if (cached_index != null) {
+            try self.reserveDbEntryRetirementsForTableLocked(table_name);
+        } else {
+            try self.table_metadata.ensureUnusedCapacity(self.alloc, 1);
+        }
+
+        const indexes_json = if (table) |current| current.indexes_json else null;
+        const schema_json = if (table) |current| current.schema_json else null;
+        var replacement = try self.cloneTableMetadataAlloc(table_name, indexes_json, schema_json);
+        errdefer replacement.deinit(self.alloc);
+
+        const installed = try self.installLoadedTableMetadataLocked(cached_index, replacement);
+        replacement = undefined;
+        return installed;
     }
 
     fn releaseEntry(self: *ProvisionedTableWriteCache, entry: *Entry) void {
@@ -2727,7 +2936,7 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        try validateTableBatchAgainstLocalSchema(alloc, self.db, req.writes, req.transforms);
+        try validateTableBatchAgainstLocalSchema(alloc, self.db, req.writes, req.deletes, req.transforms);
         self.db.batch(req) catch |err| return normalizeRelationalConstraintError(err);
     }
 
@@ -2850,7 +3059,7 @@ pub const BoundTableWriteSource = struct {
         if (tables.len != 1) return error.UnsupportedOperation;
         const table = tables[0];
         if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
-        try validateTransactionAgainstLocalSchema(alloc, self.db, table.writes, table.transforms);
+        try validateTransactionAgainstLocalSchema(alloc, self.db, table.writes, table.deletes, table.transforms);
 
         const commit_version = begin_timestamp + 1;
 
@@ -2941,7 +3150,7 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        try validateTransactionAgainstLocalSchema(alloc, self.db, req.writes, req.transforms);
+        try validateTransactionAgainstLocalSchema(alloc, self.db, req.writes, req.deletes, req.transforms);
         self.db.writeTransaction(txn_id, req) catch |err| return normalizeRelationalConstraintError(err);
     }
 
@@ -3016,10 +3225,13 @@ pub const ProvisionedTableWriteSource = struct {
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     local_change_hook: ?LocalChangeHook = null,
     raft_batcher: ?RaftBatcher = null,
-    group_lsm_generation: ?table_reads.GroupLsmGenerationSource = null,
+    group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    resolution_candidate_source: ?db_mod.CandidateSource = null,
+    entity_sink: ?db_mod.EntitySink = null,
+    promotion_leadership_source: ?ProvisionedTableWriteCache.PromotionLeadershipSource = null,
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
     dirty_write_table_count: std.atomic.Value(u32) = .init(0),
     startup_catch_up_active: std.atomic.Value(bool) = .init(false),
@@ -3087,6 +3299,63 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| cache.remote_content = remote_content;
         if (self.startup_write_cache) |cache| cache.remote_content = remote_content;
         return self;
+    }
+
+    pub fn withGroupVisibleRootGeneration(
+        self: *ProvisionedTableWriteSource,
+        generation_source: ?table_reads.GroupVisibleRootGenerationSource,
+    ) *ProvisionedTableWriteSource {
+        self.group_visible_root_generation = generation_source;
+        return self;
+    }
+
+    fn groupVisibleRootGenerationSource(self: *const ProvisionedTableWriteSource) ?table_reads.GroupVisibleRootGenerationSource {
+        return self.group_visible_root_generation;
+    }
+
+    pub fn withResolutionCandidateSource(
+        self: *ProvisionedTableWriteSource,
+        resolution_candidate_source: ?db_mod.CandidateSource,
+    ) *ProvisionedTableWriteSource {
+        self.resolution_candidate_source = resolution_candidate_source;
+        if (self.write_cache) |cache| cache.setResolutionCandidateSource(resolution_candidate_source);
+        if (self.startup_write_cache) |cache| cache.setResolutionCandidateSource(resolution_candidate_source);
+        return self;
+    }
+
+    pub fn withEntitySink(
+        self: *ProvisionedTableWriteSource,
+        entity_sink: ?db_mod.EntitySink,
+    ) *ProvisionedTableWriteSource {
+        self.entity_sink = entity_sink;
+        if (self.write_cache) |cache| cache.setEntitySink(entity_sink);
+        if (self.startup_write_cache) |cache| cache.setEntitySink(entity_sink);
+        return self;
+    }
+
+    pub fn withPromotionLeadershipSource(
+        self: *ProvisionedTableWriteSource,
+        leadership_source: ?ProvisionedTableWriteCache.PromotionLeadershipSource,
+    ) *ProvisionedTableWriteSource {
+        self.promotion_leadership_source = leadership_source;
+        if (self.write_cache) |cache| cache.setPromotionLeadershipSource(leadership_source);
+        if (self.startup_write_cache) |cache| cache.setPromotionLeadershipSource(leadership_source);
+        return self;
+    }
+
+    fn applyRuntimeHooksToUncachedDb(
+        self: *ProvisionedTableWriteSource,
+        db: *db_mod.DB,
+        group_id: u64,
+        owner_state: *ProvisionedTableWriteCache.PromotionOwnerState,
+    ) void {
+        db.setResolutionCandidateSource(self.resolution_candidate_source);
+        db.setEntitySink(self.entity_sink);
+        owner_state.* = .{
+            .group_id = group_id,
+            .leadership_source = self.promotion_leadership_source,
+        };
+        db.setPromotionOwner(owner_state.owner());
     }
 
     pub fn withRaftBatcher(self: *ProvisionedTableWriteSource, batcher: ?RaftBatcher) *ProvisionedTableWriteSource {
@@ -3165,8 +3434,8 @@ pub const ProvisionedTableWriteSource = struct {
         return &self.write_coalesce_queues.items[self.write_coalesce_queues.items.len - 1];
     }
 
-    fn lsmRootGeneration(self: *const ProvisionedTableWriteSource, group_id: u64) u64 {
-        return if (self.group_lsm_generation) |generation_source| generation_source.generationForGroup(group_id) else 0;
+    fn visibleRootGeneration(self: *const ProvisionedTableWriteSource, group_id: u64) u64 {
+        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else table_reads.backend_current_root_generation;
     }
 
     fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) u64 {
@@ -3522,7 +3791,7 @@ pub const ProvisionedTableWriteSource = struct {
             cache,
             path,
             group_id,
-            self.lsmRootGeneration(group_id),
+            self.visibleRootGeneration(group_id),
             table_name,
             mode,
             finish_expired_auto_bulk_now_ns,
@@ -3546,6 +3815,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
         cache.antfly_provider = self.antfly_provider;
         cache.remote_content = self.remote_content;
+        cache.setRuntimeHooks(self.resolution_candidate_source, self.entity_sink, self.promotion_leadership_source);
         const identity_namespace = try loadTableIdentityNamespaceForGroup(cache.alloc, self.catalog, table_name, group_id);
         const expected_identity_namespace = if (mode == .startup_catch_up or mode == .restore_repair)
             null
@@ -3621,7 +3891,22 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
-            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(cache.alloc, path, value, cache.lsm_cache, cache.hbc_cache, lsm_root_generation, cache.resource_manager, mode, cache.backend_runtime, self.antfly_provider, self.secret_store, cache.remote_content, identity_namespace)
+            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+                cache.alloc,
+                path,
+                value,
+                cache.lsm_cache,
+                cache.hbc_cache,
+                lsm_root_generation,
+                cache.resource_manager,
+                mode,
+                cache.backend_runtime,
+                self.antfly_provider,
+                self.secret_store,
+                cache.remote_content,
+                identity_namespace,
+                .{ .drain_resolver_backfill = false },
+            )
         else
             try db_mod.DB.open(cache.alloc, path, .{
                 .lsm_cache = cache.lsm_cache,
@@ -3639,6 +3924,7 @@ pub const ProvisionedTableWriteSource = struct {
                 },
                 .index_open_parallelism = if (mode == .default_async or mode == .writer_no_replay) 1 else null,
                 .start_index_workers = if (mode == .startup_catch_up) false else true,
+                .start_optional_runtimes = mode != .startup_catch_up,
                 .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair) .{ .enabled = false } else .{},
                 .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair) .{ .enabled = false } else .{},
                 .text_merge = if (mode == .startup_catch_up or mode == .restore_repair) .{ .enabled = false } else .{},
@@ -3646,13 +3932,23 @@ pub const ProvisionedTableWriteSource = struct {
         defer if (opened) |*db| db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &opened.?);
 
-        lockAtomic(&self.local_db_mutex);
-        defer self.local_db_mutex.unlock();
-        const cached = try cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
-        if (mode == .default or mode == .default_async) {
-            cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+        var cached = blk: {
+            lockAtomic(&self.local_db_mutex);
+            defer self.local_db_mutex.unlock();
+            try cache.retired_entries.ensureUnusedCapacity(cache.alloc, 1);
+            const adopted = try cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
+            if (mode == .default or mode == .default_async) {
+                adopted.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(adopted.entry.?.table_name, group_id, adopted.db));
+            }
+            if (ensure_auto_bulk_now_ns) |now_ns| try cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns);
+            break :blk adopted;
+        };
+        errdefer {
+            lockAtomic(&self.local_db_mutex);
+            defer self.local_db_mutex.unlock();
+            cache.retireFailedOpenLocked(&cached);
         }
-        if (ensure_auto_bulk_now_ns) |now_ns| try cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns);
+        try cached.db.drainResolverBackfill();
         return cached;
     }
 
@@ -3817,7 +4113,7 @@ pub const ProvisionedTableWriteSource = struct {
         const cache = maybe_cache orelse return;
         for (cache.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.lsm_root_generation != self.lsmRootGeneration(entry.group_id)) continue;
+            if (entry.lsm_root_generation != self.visibleRootGeneration(entry.group_id)) continue;
             entry.db.setQueryVisibilityHook(null);
         }
     }
@@ -3831,7 +4127,7 @@ pub const ProvisionedTableWriteSource = struct {
         var published = true;
         for (cache.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.lsm_root_generation != self.lsmRootGeneration(entry.group_id)) continue;
+            if (entry.lsm_root_generation != self.visibleRootGeneration(entry.group_id)) continue;
             self.finishEntryAutoBulkIngestForForegroundVisibility(cache, entry) catch |err| {
                 if (!isTransientReplayVisibilityError(err)) {
                     std.log.warn("managed writer auto bulk finish before status publish failed table={s} group_id={} err={s}", .{
@@ -3870,7 +4166,7 @@ pub const ProvisionedTableWriteSource = struct {
             fn run(write_source: *ProvisionedTableWriteSource, cache: *ProvisionedTableWriteCache) void {
                 var leased_retirements: usize = 0;
                 for (cache.entries.items) |entry| {
-                    const current_generation = write_source.lsmRootGeneration(entry.group_id);
+                    const current_generation = write_source.visibleRootGeneration(entry.group_id);
                     if (entry.lsm_root_generation == current_generation) continue;
                     if (entry.active_leases > 0) leased_retirements += 1;
                 }
@@ -3879,7 +4175,7 @@ pub const ProvisionedTableWriteSource = struct {
                 var i: usize = 0;
                 while (i < cache.entries.items.len) {
                     const entry = cache.entries.items[i];
-                    const current_generation = write_source.lsmRootGeneration(entry.group_id);
+                    const current_generation = write_source.visibleRootGeneration(entry.group_id);
                     if (entry.lsm_root_generation == current_generation) {
                         i += 1;
                         continue;
@@ -3950,7 +4246,7 @@ pub const ProvisionedTableWriteSource = struct {
             try fs_paths.createDirPathPortable(io_impl.io(), path);
             try metadata_table_provisioner.applyRestoreIntentIfNeeded(alloc, path, group_id, table, range);
 
-            const lsm_root_generation = self.lsmRootGeneration(group_id);
+            const lsm_root_generation = self.visibleRootGeneration(group_id);
             const identity_namespace = doc_identity.Namespace{
                 .table_id = table.table_id,
                 .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
@@ -3963,6 +4259,9 @@ pub const ProvisionedTableWriteSource = struct {
                 summary.indexes_removed += index_summary.indexes_removed;
                 summary.indexes_added += index_summary.indexes_added;
                 summary.enrichments_added += index_summary.enrichments_added;
+                summary.resolvers_added += index_summary.resolvers_added;
+                summary.resolvers_updated += index_summary.resolvers_updated;
+                summary.resolvers_removed += index_summary.resolvers_removed;
                 try cache.replaceTableMetadataLocked(table.name, table.indexes_json, table.schema_json);
                 continue;
             }
@@ -4013,7 +4312,7 @@ pub const ProvisionedTableWriteSource = struct {
             lockAtomic(self_mutex);
             defer self_mutex.unlock();
         }
-        return try source_cache.transferAdoptableEntriesForTableLocked(dest_cache, table_name, dest.group_lsm_generation);
+        return try source_cache.transferAdoptableEntriesForTableLocked(dest_cache, table_name, dest.groupVisibleRootGenerationSource());
     }
 
     pub fn clearStartupWriteCacheLocked(self: *ProvisionedTableWriteSource) void {
@@ -4123,7 +4422,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !StartupCatchUpResult {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        const lsm_root_generation = self.lsmRootGeneration(group_id);
+        const lsm_root_generation = self.visibleRootGeneration(group_id);
 
         if (!self.tryBeginGroupOperation(table_name, group_id)) return .{ .busy = true };
         if (!self.local_db_mutex.tryLock()) {
@@ -4178,6 +4477,7 @@ pub const ProvisionedTableWriteSource = struct {
         var cached_db: ?ProvisionedTableWriteCache.CachedDb = null;
         defer if (cached_db) |*cached| cached.deinit(alloc);
         var uncached_db: ?db_mod.DB = null;
+        var uncached_promotion_owner_state: ProvisionedTableWriteCache.PromotionOwnerState = .{};
         const db = db_blk: {
             if (startup_cache) |cache| {
                 cached_db = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, startup_open_mode, null, null);
@@ -4189,13 +4489,29 @@ pub const ProvisionedTableWriteSource = struct {
             else
                 null;
             uncached_db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(alloc, path, value, null, null, lsm_root_generation, null, startup_open_mode, self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, identity_namespace)
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+                    alloc,
+                    path,
+                    value,
+                    null,
+                    null,
+                    lsm_root_generation,
+                    null,
+                    startup_open_mode,
+                    self.backend_runtime,
+                    self.antfly_provider,
+                    self.secret_store,
+                    self.remote_content,
+                    identity_namespace,
+                    .{ .drain_resolver_backfill = false },
+                )
             else
                 try db_mod.DB.open(alloc, path, .{
                     .open_mode = .writer_no_replay,
                     .lsm_root_generation = lsm_root_generation,
                     .backend_runtime = self.backend_runtime,
                     .start_index_workers = false,
+                    .start_optional_runtimes = false,
                     .ttl_cleanup = .{ .enabled = false },
                     .transaction_recovery = .{ .enabled = false },
                     .text_merge = .{ .enabled = false },
@@ -4204,6 +4520,8 @@ pub const ProvisionedTableWriteSource = struct {
                 });
             errdefer if (uncached_db) |*owned| owned.close();
             try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &uncached_db.?);
+            self.applyRuntimeHooksToUncachedDb(&uncached_db.?, group_id, &uncached_promotion_owner_state);
+            try uncached_db.?.drainResolverBackfill();
             break :db_blk &uncached_db.?;
         };
         defer if (uncached_db) |*owned| owned.close();
@@ -4400,7 +4718,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         const cache = maybe_cache orelse return;
         for (cache.entries.items) |entry| {
-            if (entry.lsm_root_generation != self.lsmRootGeneration(entry.group_id)) continue;
+            if (entry.lsm_root_generation != self.visibleRootGeneration(entry.group_id)) continue;
             if (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open) continue;
             try cache.appendRuntimeStatusLeaseForEntryLocked(alloc, entry, out);
         }
@@ -4450,7 +4768,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
     ) ManagedWriterGroupProbe {
         if (!self.local_db_mutex.tryLock()) return .unknown;
-        const lsm_root_generation = self.lsmRootGeneration(group_id);
+        const lsm_root_generation = self.visibleRootGeneration(group_id);
         var leased: ?ProvisionedTableWriteCache.CachedDb = null;
         if (self.write_cache) |cache| {
             leased = cache.snapshotLeaseLocked(group_id, lsm_root_generation, table_name);
@@ -4822,7 +5140,7 @@ pub const ProvisionedTableWriteSource = struct {
         const cache = maybe_cache orelse return;
         for (cache.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.lsm_root_generation != self.lsmRootGeneration(entry.group_id)) continue;
+            if (entry.lsm_root_generation != self.visibleRootGeneration(entry.group_id)) continue;
             for (statuses.items) |*status| {
                 if (status.group_id != entry.group_id) continue;
                 overlayRuntimeStatusReplayTargetFromDb(status, &entry.db);
@@ -5219,7 +5537,7 @@ pub const ProvisionedTableWriteSource = struct {
             indexes_json,
             null,
             null,
-            self.lsmRootGeneration(group_id),
+            self.visibleRootGeneration(group_id),
             null,
             .restore_repair,
             self.backend_runtime,
@@ -5445,7 +5763,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer alloc.free(path);
 
             const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
-            const lsm_root_generation = self.lsmRootGeneration(group_id);
+            const lsm_root_generation = self.visibleRootGeneration(group_id);
             if (self.write_cache) |cache| {
                 if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
                 cache.antfly_provider = self.antfly_provider;
@@ -5469,6 +5787,11 @@ pub const ProvisionedTableWriteSource = struct {
             );
             defer if (opened) |*db| db.close();
             try applyLocalTableSchemaJson(alloc, &opened.?, schema_json);
+            // Register entity resolvers declared in the index config. Indexes
+            // and enrichments are provisioned through the managed-open path, but
+            // resolvers are not, so do it here (idempotent: addResolver skips
+            // names that already exist on reopen).
+            _ = try metadata_table_provisioner.ensureResolvers(alloc, &opened.?, indexes_json);
             if (self.write_cache) |cache| {
                 try cache.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table_name, indexes_json, schema_json);
             }
@@ -6151,8 +6474,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        var apply_req = req;
-        apply_req.sync_level = .write;
+        const apply_req = req;
         const auto_bulk_ops = autoBulkIngestBatchOps(apply_req);
         const auto_bulk_now_ns = platform_time.monotonicNs();
         self.beginGroupOperation(table_name, group_id);
@@ -6181,9 +6503,9 @@ pub const ProvisionedTableWriteSource = struct {
                 if (auto_bulk_ops > 0) auto_bulk_now_ns else null,
             );
             defer cached.deinit(alloc);
-            try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.transforms);
+            try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
-            cached.db.batchWithoutRangeValidation(apply_req) catch |err| return normalizeRelationalConstraintError(err);
+            cached.db.batchReplicatedApply(apply_req) catch |err| return normalizeRelationalConstraintError(err);
             {
                 lockAtomic(&self.local_db_mutex);
                 defer self.local_db_mutex.unlock();
@@ -6211,9 +6533,9 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.transforms);
+            try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
-            db.batchWithoutRangeValidation(apply_req) catch |err| return normalizeRelationalConstraintError(err);
+            db.batchReplicatedApply(apply_req) catch |err| return normalizeRelationalConstraintError(err);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             lockAtomic(&self.local_db_mutex);
             self.markWriteCacheDirty(table_name);
@@ -6268,17 +6590,18 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         db: *db_mod.DB,
     ) void {
-        if (self.runtime_status_cache == null) return;
-        drainManagedDbBeforeClose(db) catch |err| {
-            if (!isTransientReplayVisibilityError(err)) {
-                std.log.warn("transient managed writer drain before status publish failed table={s} group_id={} err={s}", .{
-                    table_name,
-                    group_id,
-                    @errorName(err),
-                });
-            }
-        };
-        _ = self.publishManagedRuntimeStatusBestEffort(table_name, group_id, db);
+        if (self.runtime_status_cache != null) {
+            drainManagedDbBeforeClose(db) catch |err| {
+                if (!isTransientReplayVisibilityError(err)) {
+                    std.log.warn("transient managed writer drain before status publish failed table={s} group_id={} err={s}", .{
+                        table_name,
+                        group_id,
+                        @errorName(err),
+                    });
+                }
+            };
+            _ = self.publishManagedRuntimeStatusBestEffort(table_name, group_id, db);
+        }
     }
 
     fn txnBeginGroupLocal(
@@ -6323,7 +6646,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer db.close();
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
         try recoverProvisionedTransactionsOnce(self, alloc, &db);
-        try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, table_name, req.writes, req.transforms);
+        try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, table_name, req.writes, req.deletes, req.transforms);
         db.writeTransaction(txn_id, req) catch |err| return normalizeRelationalConstraintError(err);
     }
 
@@ -6649,7 +6972,7 @@ pub const ProvisionedTableWriteSource = struct {
         var leased_retirements: usize = 0;
         for (cache.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.lsm_root_generation == self.lsmRootGeneration(entry.group_id)) continue;
+            if (entry.lsm_root_generation == self.visibleRootGeneration(entry.group_id)) continue;
             if (entry.active_leases > 0) leased_retirements += 1;
         }
         try cache.retired_entries.ensureUnusedCapacity(cache.alloc, leased_retirements);
@@ -6661,7 +6984,7 @@ pub const ProvisionedTableWriteSource = struct {
                 i += 1;
                 continue;
             }
-            if (entry.lsm_root_generation == self.lsmRootGeneration(entry.group_id)) {
+            if (entry.lsm_root_generation == self.visibleRootGeneration(entry.group_id)) {
                 i += 1;
                 continue;
             }
@@ -6672,7 +6995,7 @@ pub const ProvisionedTableWriteSource = struct {
         var matching_entries: usize = 0;
         for (cache.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.lsm_root_generation != self.lsmRootGeneration(entry.group_id)) continue;
+            if (entry.lsm_root_generation != self.visibleRootGeneration(entry.group_id)) continue;
             if (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open) continue;
             matching_entries += 1;
         }
@@ -6680,7 +7003,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         for (cache.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.lsm_root_generation != self.lsmRootGeneration(entry.group_id)) continue;
+            if (entry.lsm_root_generation != self.visibleRootGeneration(entry.group_id)) continue;
             if (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open) continue;
             lockAtomic(&cache.entry_lifecycle_mutex);
             entry.active_leases += 1;
@@ -6746,7 +7069,7 @@ pub const ProvisionedTableWriteSource = struct {
             path,
             self.catalog,
             group_id,
-            self.lsmRootGeneration(group_id),
+            self.visibleRootGeneration(group_id),
             table_name,
         ) catch return;
         defer read_lease.release();
@@ -6775,7 +7098,7 @@ pub const ProvisionedTableWriteSource = struct {
             path,
             self.catalog,
             group_id,
-            self.lsmRootGeneration(group_id),
+            self.visibleRootGeneration(group_id),
             table_name,
         ) catch return;
         defer read_lease.release();
@@ -6870,6 +7193,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     router: table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     foreground_derived_progress: bool = false,
@@ -6890,6 +7214,14 @@ pub const HostedProvisionedTableWriteSource = struct {
 
     pub fn withBackendRuntime(self: *HostedProvisionedTableWriteSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableWriteSource {
         self.backend_runtime = backend_runtime;
+        return self;
+    }
+
+    pub fn withGroupVisibleRootGeneration(
+        self: *HostedProvisionedTableWriteSource,
+        generation_source: ?table_reads.GroupVisibleRootGenerationSource,
+    ) *HostedProvisionedTableWriteSource {
+        self.group_visible_root_generation = generation_source;
         return self;
     }
 
@@ -6924,6 +7256,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         return self.foreground_derived_progress or shouldDrainCachedManagedDbAfterBatch(sync_level);
     }
 
+    fn visibleRootGeneration(self: *const HostedProvisionedTableWriteSource, group_id: u64) u64 {
+        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else table_reads.backend_current_root_generation;
+    }
+
     fn invalidateManagedCache(self: *HostedProvisionedTableWriteSource, table_name: []const u8) void {
         const hosted_cache = hostedManagedDbCacheForRootIfPresent(self.replica_root_dir) orelse return;
         lockAtomic(&hosted_cache.mutex);
@@ -6939,7 +7275,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
         mode: ManagedDbOpenMode,
     ) !ProvisionedTableWriteCache.CachedDb {
-        const lsm_root_generation: u64 = 0;
+        const lsm_root_generation = self.visibleRootGeneration(group_id);
         if (cache.write_cache.backend_runtime == null) cache.write_cache.backend_runtime = self.backend_runtime;
         cache.write_cache.secret_store = self.secret_store;
         cache.write_cache.remote_content = self.remote_content;
@@ -6995,7 +7331,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
 
         var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
-            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 cache.write_cache.alloc,
                 path,
                 value,
@@ -7009,6 +7345,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 cache.write_cache.secret_store,
                 cache.write_cache.remote_content,
                 identity_namespace,
+                .{ .drain_resolver_backfill = false },
             )
         else
             try db_mod.DB.open(cache.write_cache.alloc, path, .{
@@ -7026,6 +7363,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .status_only => .status_only,
                 },
                 .start_index_workers = if (mode == .startup_catch_up) false else true,
+                .start_optional_runtimes = mode != .startup_catch_up,
                 .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair) .{ .enabled = false } else .{},
                 .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair) .{ .enabled = false } else .{},
                 .text_merge = if (mode == .startup_catch_up or mode == .restore_repair) .{ .enabled = false } else .{},
@@ -7033,9 +7371,19 @@ pub const HostedProvisionedTableWriteSource = struct {
         defer if (opened) |*db| db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &opened.?);
 
-        lockAtomic(&cache.mutex);
-        defer cache.mutex.unlock();
-        return try cache.write_cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
+        var cached = blk: {
+            lockAtomic(&cache.mutex);
+            defer cache.mutex.unlock();
+            try cache.write_cache.retired_entries.ensureUnusedCapacity(cache.write_cache.alloc, 1);
+            break :blk try cache.write_cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
+        };
+        errdefer {
+            lockAtomic(&cache.mutex);
+            defer cache.mutex.unlock();
+            cache.write_cache.retireFailedOpenLocked(&cached);
+        }
+        try cached.db.drainResolverBackfill();
+        return cached;
     }
 
     fn reconcileCachedIndexCreate(
@@ -7182,7 +7530,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
                         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group.group_id, table_name, .default_async);
                         defer cached.deinit(hosted_cache.write_cache.alloc);
-                        try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, group.writes.items, group.transforms.items);
+                        try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, group.writes.items, group.deletes.items, group.transforms.items);
                         try cached.db.batch(.{
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
@@ -7224,7 +7572,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
                 var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group.group_id, table_name, .default_async);
                 defer cached.deinit(hosted_cache.write_cache.alloc);
-                try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, group.writes.items, group.transforms.items);
+                try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, group.writes.items, group.deletes.items, group.transforms.items);
                 try cached.db.batch(.{
                     .writes = group.writes.items,
                     .deletes = group.deletes.items,
@@ -7313,8 +7661,8 @@ pub const HostedProvisionedTableWriteSource = struct {
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
         defer cached.deinit(hosted_cache.write_cache.alloc);
-        try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.transforms);
-        cached.db.batchWithoutRangeValidation(req) catch |err| return normalizeRelationalConstraintError(err);
+        try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
+        cached.db.batchReplicatedApply(req) catch |err| return normalizeRelationalConstraintError(err);
         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
     }
 
@@ -7356,7 +7704,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
         defer cached.deinit(hosted_cache.write_cache.alloc);
         try recoverHostedTransactionsOnce(self, alloc, cached.db);
-        try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, table_name, req.writes, req.transforms);
+        try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, table_name, req.writes, req.deletes, req.transforms);
         cached.db.writeTransaction(txn_id, req) catch |err| return normalizeRelationalConstraintError(err);
     }
 
@@ -7749,7 +8097,7 @@ fn applyGroupBatch(
     group: GroupBatch,
     req: db_mod.types.BatchRequest,
 ) !void {
-    try validateTableBatchAgainstCatalogSchema(alloc, catalog, db, table_name, group.writes.items, group.transforms.items);
+    try validateTableBatchAgainstCatalogSchema(alloc, catalog, db, table_name, group.writes.items, group.deletes.items, group.transforms.items);
     try applyGroupBatchUnchecked(db, group, req);
 }
 
@@ -7760,7 +8108,7 @@ fn applyGroupBatchWithSchemaJson(
     group: GroupBatch,
     req: db_mod.types.BatchRequest,
 ) !void {
-    try validateTableBatchAgainstSchemaJson(alloc, db, schema_json, group.writes.items, group.transforms.items);
+    try validateTableBatchAgainstSchemaJson(alloc, db, schema_json, group.writes.items, group.deletes.items, group.transforms.items);
     try applyGroupBatchUnchecked(db, group, req);
 }
 
@@ -8038,7 +8386,7 @@ fn openManagedDbForTableWithRuntime(
     table_name: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !db_mod.DB {
-    return try openManagedDbForTableWithCacheAndRuntime(alloc, path, catalog, table_name, null, null, 0, null, backend_runtime);
+    return try openManagedDbForTableWithCacheAndRuntime(alloc, path, catalog, table_name, null, null, table_reads.backend_current_root_generation, null, backend_runtime);
 }
 
 fn openManagedDbForTableGroupWithRuntime(
@@ -8049,7 +8397,7 @@ fn openManagedDbForTableGroupWithRuntime(
     group_id: u64,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !db_mod.DB {
-    return try openManagedDbForTableGroupWithCacheAndRuntime(alloc, path, catalog, table_name, group_id, null, null, 0, null, backend_runtime);
+    return try openManagedDbForTableGroupWithCacheAndRuntime(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime);
 }
 
 fn openManagedDbForTableWithCache(
@@ -8125,7 +8473,7 @@ fn openManagedDbForTableWithIndexesJson(
     path: []const u8,
     indexes_json: ?[]const u8,
 ) !db_mod.DB {
-    return try openManagedDbForTableWithIndexesJsonAndCacheAndRuntime(alloc, path, indexes_json, null, null, 0, null, null);
+    return try openManagedDbForTableWithIndexesJsonAndCacheAndRuntime(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null, null);
 }
 
 fn openManagedDbForTableWithIndexesJsonAndCache(
@@ -8209,7 +8557,7 @@ fn reconcileCachedLocalTableIndexCreate(
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var cached = try cache.getOrOpenLockedMode(path, self.catalog, group_id, self.lsmRootGeneration(group_id), table_name, .default_async);
+        var cached = try cache.getOrOpenLockedMode(path, self.catalog, group_id, self.visibleRootGeneration(group_id), table_name, .default_async);
         defer cached.deinit(alloc);
         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
 
@@ -8480,7 +8828,7 @@ fn snapshotLocalTableRuntimeStatusesUncached(
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var db = try openManagedDbForStatusWithCache(alloc, path, catalog, table_name, group_id, null, null, 0, null, backend_runtime);
+        var db = try openManagedDbForStatusWithCache(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime);
         errdefer db.close();
         items[initialized] = .{
             .group_id = group_id,
@@ -8498,7 +8846,7 @@ fn openManagedDbWithIndexesJson(
     path: []const u8,
     indexes_json: []const u8,
 ) !db_mod.DB {
-    return try openManagedDbWithIndexesJsonAndCache(alloc, path, indexes_json, null, null, 0, null);
+    return try openManagedDbWithIndexesJsonAndCache(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null);
 }
 
 fn openManagedDbForStatusWithCache(
@@ -8725,6 +9073,44 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
     remote_content: ?*const scraping.RemoteContentConfig,
     identity_namespace: ?doc_identity.Namespace,
 ) !db_mod.DB {
+    return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+        alloc,
+        path,
+        indexes_json,
+        lsm_cache,
+        hbc_cache,
+        lsm_root_generation,
+        resource_manager,
+        mode,
+        backend_runtime,
+        antfly_provider,
+        secret_store,
+        remote_content,
+        identity_namespace,
+        .{},
+    );
+}
+
+const ManagedDbOpenOptions = struct {
+    drain_resolver_backfill: bool = true,
+};
+
+fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    indexes_json: []const u8,
+    lsm_cache: ?*lsm_backend.Cache,
+    hbc_cache: ?*hbc_mod.Cache,
+    lsm_root_generation: u64,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+    mode: ManagedDbOpenMode,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    antfly_provider: ?managed_embedder.AntflyProvider,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+    identity_namespace: ?doc_identity.Namespace,
+    options: ManagedDbOpenOptions,
+) !db_mod.DB {
     const EnrichmentSet = struct {
         dense: ?db_embedder.DenseEmbedder = null,
         sparse: ?db_embedder.SparseEmbedder = null,
@@ -8876,6 +9262,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
                     .prefer_existing_identity_namespace = namespace != null,
                     .open_mode = .writer_no_replay,
                     .start_index_workers = false,
+                    .start_optional_runtimes = false,
                     .ttl_cleanup = .{ .enabled = false },
                     .transaction_recovery = .{ .enabled = false },
                     .text_merge = .{ .enabled = false },
@@ -8968,13 +9355,18 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
     try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
     if (mode == .status_only) return db;
 
-    const summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, &db, indexes_json);
-    if (summary.indexes_added > 0 or summary.indexes_removed > 0) {
+    const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+        .drain_resolver_backfill = options.drain_resolver_backfill,
+    });
+    if (summary.indexManagerCatalogChanged()) {
         // First-open provisioning can mutate the live index manager. Reopen so
         // request work runs against the stabilized post-reconcile state.
         db.close();
         db_open = false;
-        enrichments = try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
+        enrichments = if (mode == .startup_catch_up)
+            EnrichmentSet{}
+        else
+            try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
         db = blk: {
             const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
             const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace);
@@ -10042,22 +10434,139 @@ fn freeOwnedBatchWrites(alloc: std.mem.Allocator, writes: []const db_mod.types.B
     if (writes.len > 0) alloc.free(@constCast(writes));
 }
 
-fn removeOwnedBatchWriteByKey(
-    alloc: std.mem.Allocator,
-    list: *std.ArrayListUnmanaged(db_mod.types.BatchWrite),
-    key: []const u8,
-) void {
-    var i: usize = 0;
-    while (i < list.items.len) {
-        if (!std.mem.eql(u8, list.items[i].key, key)) {
-            i += 1;
-            continue;
+const SchemaValidationWriteState = struct {
+    const Kind = enum { write, delete };
+
+    const Entry = struct {
+        key: []u8,
+        kind: Kind,
+        value: ?[]u8 = null,
+
+        fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
+            alloc.free(self.key);
+            if (self.value) |value| alloc.free(value);
+            self.* = undefined;
         }
-        alloc.free(@constCast(list.items[i].key));
-        alloc.free(@constCast(list.items[i].value));
-        _ = list.swapRemove(i);
+    };
+
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+
+    fn deinit(self: *SchemaValidationWriteState, alloc: std.mem.Allocator) void {
+        for (self.entries.items) |*entry| entry.deinit(alloc);
+        self.entries.deinit(alloc);
+        self.* = undefined;
     }
-}
+
+    fn findIndex(self: *const SchemaValidationWriteState, key: []const u8) ?usize {
+        for (self.entries.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.key, key)) return i;
+        }
+        return null;
+    }
+
+    fn applyBorrowedWrite(self: *SchemaValidationWriteState, alloc: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+        const owned_value = try alloc.dupe(u8, value);
+        errdefer alloc.free(owned_value);
+        if (self.findIndex(key)) |idx| {
+            const entry = &self.entries.items[idx];
+            if (entry.value) |old_value| alloc.free(old_value);
+            entry.kind = .write;
+            entry.value = owned_value;
+            return;
+        }
+
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        try self.entries.append(alloc, .{
+            .key = owned_key,
+            .kind = .write,
+            .value = owned_value,
+        });
+    }
+
+    fn applyDelete(self: *SchemaValidationWriteState, alloc: std.mem.Allocator, key: []const u8) !void {
+        if (self.findIndex(key)) |idx| {
+            const entry = &self.entries.items[idx];
+            if (entry.value) |old_value| alloc.free(old_value);
+            entry.kind = .delete;
+            entry.value = null;
+            return;
+        }
+
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        try self.entries.append(alloc, .{
+            .key = owned_key,
+            .kind = .delete,
+        });
+    }
+
+    fn applyOwnedWrite(self: *SchemaValidationWriteState, alloc: std.mem.Allocator, key: []const u8, value: []u8) !void {
+        if (self.findIndex(key)) |idx| {
+            const entry = &self.entries.items[idx];
+            if (entry.value) |old_value| alloc.free(old_value);
+            entry.kind = .write;
+            entry.value = value;
+            return;
+        }
+
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        try self.entries.append(alloc, .{
+            .key = owned_key,
+            .kind = .write,
+            .value = value,
+        });
+    }
+
+    fn baseValue(self: *const SchemaValidationWriteState, key: []const u8) ?[]const u8 {
+        const idx = self.findIndex(key) orelse return null;
+        const entry = self.entries.items[idx];
+        return switch (entry.kind) {
+            .write => entry.value.?,
+            .delete => null,
+        };
+    }
+
+    fn hasRequestState(self: *const SchemaValidationWriteState, key: []const u8) bool {
+        return self.findIndex(key) != null;
+    }
+
+    fn toOwnedWrites(self: *const SchemaValidationWriteState, alloc: std.mem.Allocator) ![]db_mod.types.BatchWrite {
+        var count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.kind == .write) count += 1;
+        }
+
+        var out = try alloc.alloc(db_mod.types.BatchWrite, count);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            alloc.free(out);
+        }
+
+        var i: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.kind != .write) continue;
+            {
+                const owned_key = try alloc.dupe(u8, entry.key);
+                errdefer alloc.free(owned_key);
+                const owned_value = try alloc.dupe(u8, entry.value.?);
+                errdefer alloc.free(owned_value);
+                out[i] = .{
+                    .key = owned_key,
+                    .value = owned_value,
+                };
+            }
+            filled += 1;
+            i += 1;
+        }
+        return out;
+    }
+};
 
 fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {
     for (shards) |shard| shard.deinit(alloc);
@@ -10068,35 +10577,38 @@ fn resolveWritesForSchemaValidation(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     base_writes: []const db_mod.types.BatchWrite,
+    deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) ![]db_mod.types.BatchWrite {
-    var writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
-    defer writes.deinit(alloc);
+    var state = SchemaValidationWriteState{};
+    defer state.deinit(alloc);
 
     for (base_writes) |write| {
-        try writes.append(alloc, .{
-            .key = try alloc.dupe(u8, write.key),
-            .value = try alloc.dupe(u8, write.value),
-        });
+        try state.applyBorrowedWrite(alloc, write.key, write.value);
+    }
+
+    for (deletes) |key| {
+        try state.applyDelete(alloc, key);
     }
 
     for (transforms) |transform| {
-        const existing = try db.get(alloc, transform.key);
-        defer if (existing) |body| alloc.free(body);
+        const has_request_state = state.hasRequestState(transform.key);
+        const existing_from_request = state.baseValue(transform.key);
+        const existing_from_db = if (!has_request_state) try db.get(alloc, transform.key) else null;
+        defer if (existing_from_db) |body| alloc.free(body);
+        const existing = existing_from_request orelse existing_from_db;
         const resolved = db_mod.transform.resolveDocumentTransform(alloc, existing, transform) catch |err| switch (err) {
             error.InvalidArgument => return error.InvalidBatchRequest,
             else => return err,
         } orelse continue;
-        errdefer alloc.free(resolved);
 
-        removeOwnedBatchWriteByKey(alloc, &writes, transform.key);
-        try writes.append(alloc, .{
-            .key = try alloc.dupe(u8, transform.key),
-            .value = resolved,
-        });
+        state.applyOwnedWrite(alloc, transform.key, resolved) catch |err| {
+            alloc.free(resolved);
+            return err;
+        };
     }
 
-    return try writes.toOwnedSlice(alloc);
+    return try state.toOwnedWrites(alloc);
 }
 
 fn transactionWritesToBatchWrites(
@@ -10117,14 +10629,15 @@ fn validateTableBatchAgainstLocalSchema(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     writes: []const db_mod.types.BatchWrite,
+    deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
-    if (writes.len == 0 and transforms.len == 0) return;
+    if (writes.len == 0 and deletes.len == 0 and transforms.len == 0) return;
     const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
     defer alloc.free(schema_json);
     if (schema_json.len == 0) return;
 
-    const effective_writes = try resolveWritesForSchemaValidation(alloc, db, writes, transforms);
+    const effective_writes = try resolveWritesForSchemaValidation(alloc, db, writes, deletes, transforms);
     defer freeOwnedBatchWrites(alloc, effective_writes);
     if (effective_writes.len == 0) return;
 
@@ -10137,11 +10650,12 @@ fn validateTransactionAgainstLocalSchema(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     writes: []const db_mod.types.TransactionWrite,
+    deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
     const batch_writes = try transactionWritesToBatchWrites(alloc, writes);
     defer alloc.free(batch_writes);
-    try validateTableBatchAgainstLocalSchema(alloc, db, batch_writes, transforms);
+    try validateTableBatchAgainstLocalSchema(alloc, db, batch_writes, deletes, transforms);
 }
 
 fn applyLocalTableSchemaJson(
@@ -10305,12 +10819,13 @@ fn validateTableBatchAgainstCatalogSchema(
     db: *db_mod.DB,
     table_name: []const u8,
     writes: []const db_mod.types.BatchWrite,
+    deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
-    if (writes.len == 0 and transforms.len == 0) return;
+    if (writes.len == 0 and deletes.len == 0 and transforms.len == 0) return;
     const schema_json = (try loadTableSchemaJson(alloc, catalog, table_name)) orelse return;
     defer alloc.free(schema_json);
-    try validateTableBatchAgainstSchemaJson(alloc, db, schema_json, writes, transforms);
+    try validateTableBatchAgainstSchemaJson(alloc, db, schema_json, writes, deletes, transforms);
 }
 
 fn validateTableBatchAgainstSchemaJson(
@@ -10318,13 +10833,14 @@ fn validateTableBatchAgainstSchemaJson(
     db: *db_mod.DB,
     schema_json: ?[]const u8,
     writes: []const db_mod.types.BatchWrite,
+    deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
-    if (writes.len == 0 and transforms.len == 0) return;
+    if (writes.len == 0 and deletes.len == 0 and transforms.len == 0) return;
     const raw_schema_json = schema_json orelse return;
     if (raw_schema_json.len == 0) return;
 
-    const effective_writes = try resolveWritesForSchemaValidation(alloc, db, writes, transforms);
+    const effective_writes = try resolveWritesForSchemaValidation(alloc, db, writes, deletes, transforms);
     defer freeOwnedBatchWrites(alloc, effective_writes);
     if (effective_writes.len == 0) return;
 
@@ -10339,11 +10855,12 @@ fn validateTransactionAgainstCatalogSchema(
     db: *db_mod.DB,
     table_name: []const u8,
     writes: []const db_mod.types.TransactionWrite,
+    deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
     const batch_writes = try transactionWritesToBatchWrites(alloc, writes);
     defer alloc.free(batch_writes);
-    try validateTableBatchAgainstCatalogSchema(alloc, catalog, db, table_name, batch_writes, transforms);
+    try validateTableBatchAgainstCatalogSchema(alloc, catalog, db, table_name, batch_writes, deletes, transforms);
 }
 
 fn encodeRemoteBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
@@ -13409,6 +13926,121 @@ test "bound table write source rejects invalid batch transforms against persiste
     }));
 }
 
+test "bound table write source validates transforms against same-batch writes" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-table-batch-transform-same-request-schema";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+
+    var source = BoundTableWriteSource.init("docs", &db);
+    var req = tables_api.CreateTableRequest{
+        .schema_json = try alloc.dupe(u8, "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"aliases\":{\"type\":\"keyword\"}}}}}}"),
+    };
+    defer req.deinit(alloc);
+    _ = try source.source().createTable(alloc, "docs", req);
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"curated\"}" }},
+        .transforms = &.{.{
+            .key = "doc:a",
+            .upsert = true,
+            .operations = &.{
+                .{ .op = .set_on_insert, .path = "body", .value_json = "\"would-be-invalid-on-insert\"" },
+                .{ .op = .add_to_set, .path = "aliases", .value_json = "\"alpha\"" },
+            },
+        }},
+    });
+
+    const stored = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"title\":\"curated\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "would-be-invalid-on-insert") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"aliases\":[\"alpha\"]") != null);
+}
+
+test "bound table write source validates non-upsert transforms against same-batch deletes" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-table-batch-transform-delete-no-upsert-schema";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+
+    var source = BoundTableWriteSource.init("docs", &db);
+    var req = tables_api.CreateTableRequest{
+        .schema_json = try alloc.dupe(u8, "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}}}}"),
+    };
+    defer req.deinit(alloc);
+    _ = try source.source().createTable(alloc, "docs", req);
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+    });
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .deletes = &.{"doc:a"},
+        .transforms = &.{.{
+            .key = "doc:a",
+            .operations = &.{
+                .{ .op = .set, .path = "body", .value_json = "\"would-be-invalid\"" },
+            },
+        }},
+    });
+
+    const stored = try db.get(alloc, "doc:a");
+    defer if (stored) |body| alloc.free(body);
+    try std.testing.expect(stored == null);
+}
+
+test "bound table write source rejects upsert transforms against same-batch deletes" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-table-batch-transform-delete-upsert-schema";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+
+    var source = BoundTableWriteSource.init("docs", &db);
+    var req = tables_api.CreateTableRequest{
+        .schema_json = try alloc.dupe(u8, "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}}}}"),
+    };
+    defer req.deinit(alloc);
+    _ = try source.source().createTable(alloc, "docs", req);
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+    });
+
+    try std.testing.expectError(error.InvalidBatchRequest, source.source().batch(alloc, "docs", .{
+        .deletes = &.{"doc:a"},
+        .transforms = &.{.{
+            .key = "doc:a",
+            .upsert = true,
+            .operations = &.{
+                .{ .op = .set_on_insert, .path = "body", .value_json = "\"invalid-insert\"" },
+            },
+        }},
+    }));
+}
+
 test "bound table write source derives ttl timestamps from ttl_field values" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-table-ttl-field-schema";
@@ -14592,6 +15224,80 @@ test "provisioned table write source runtime status stays cache-only without sha
     defer cached.deinit(alloc);
 
     try std.testing.expect((try source.source().localRuntimeStatuses(alloc, "docs")) == null);
+}
+
+test "provisioned table write cache retires stale db when index metadata changes" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-metadata-refresh", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        var indexes_json_buf: []const u8 = "";
+        var table_records = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .placement_role = "data",
+        }};
+        var range_records = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            table_records[0].indexes_json = indexes_json_buf;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = table_records[0..],
+                .ranges = range_records[0..],
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    Catalog.indexes_json_buf = "{\"first_idx\":{\"type\":\"full_text\",\"field\":\"body\"}}";
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var first = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    var first_released = false;
+    defer if (!first_released) first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
+    try std.testing.expect(first.db.core.index_manager.textIndex("first_idx") != null);
+
+    Catalog.indexes_json_buf = "{\"second_idx\":{\"type\":\"full_text\",\"field\":\"body\"}}";
+
+    var second = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
+    try std.testing.expect(first.entry.?.retired);
+    try std.testing.expect(second.entry.? != first.entry.?);
+    try std.testing.expect(second.db.core.index_manager.textIndex("second_idx") != null);
+    try std.testing.expect(second.db.core.index_manager.textIndex("first_idx") == null);
+
+    first.deinit(alloc);
+    first_released = true;
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 
 test "provisioned table write source runtime status prefers shared snapshot cache" {
@@ -18101,6 +18807,8 @@ test "managed startup catch-up open disables optional runtimes and workers" {
 
     try std.testing.expect(!db.start_index_workers);
     try std.testing.expect(db.enrichment_runtime == null);
+    try std.testing.expect(db.resolution_runtime == null);
+    try std.testing.expect(db.promotion_runtime == null);
     try std.testing.expect(db.ttl_runtime == null);
     try std.testing.expect(db.transaction_runtime == null);
     try std.testing.expect(db.text_merge_runtime == null);
@@ -18119,7 +18827,7 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     const indexes_json = "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}";
 
     {
-        var db = try openManagedDbWithIndexesJsonAndCacheMode(alloc, path, indexes_json, null, null, 0, null, .default);
+        var db = try openManagedDbWithIndexesJsonAndCacheMode(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null, .default);
         defer db.close();
     }
 
@@ -19657,7 +20365,18 @@ test "managed source status-only open bypasses shared writer cache entry" {
     try std.testing.expect(write_cache.entries.items[0].db.start_index_workers);
 }
 
-test "write cache prunes stale generations instead of clearing current entries" {
+fn testingVisibleRootGenerationSource(value: *u64) table_reads.GroupVisibleRootGenerationSource {
+    return .{
+        .ptr = value,
+        .visible_root_generation_for_group = testingVisibleRootGenerationForGroup,
+    };
+}
+
+fn testingVisibleRootGenerationForGroup(ptr: *anyopaque, _: u64) u64 {
+    return (@as(*u64, @ptrCast(@alignCast(ptr)))).*;
+}
+
+test "write cache prunes stale visible root generations instead of clearing current entries" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -19704,25 +20423,12 @@ test "write cache prunes stale generations instead of clearing current entries" 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    const GenerationSource = struct {
-        fn iface(value: *u64) table_reads.GroupLsmGenerationSource {
-            return .{
-                .ptr = value,
-                .generation_for_group = generationForGroup,
-            };
-        }
-
-        fn generationForGroup(ptr: *anyopaque, _: u64) u64 {
-            return (@as(*u64, @ptrCast(@alignCast(ptr)))).*;
-        }
-    };
-
     var generation: u64 = 1;
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
     source.write_cache = &write_cache;
-    source.group_lsm_generation = GenerationSource.iface(&generation);
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 
     var cached_first = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, generation, "docs");
     cached_first.deinit(alloc);
@@ -19739,6 +20445,120 @@ test "write cache prunes stale generations instead of clearing current entries" 
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);
+}
+
+test "hosted write cache opens current visible root generation" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-write-cache-generation", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Router = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (group_id == 7001) .active else .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001) 1 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            _ = node_id;
+            return if (group_id == 7001) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const Executor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var generation: u64 = 1;
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), Router.iface(), Executor.iface());
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
+    defer source.invalidateManagedCache("docs");
+
+    const hosted_cache = try hostedManagedDbCacheForRoot(replica_root_dir);
+    var cached_first = try source.getOrOpenCachedDbMode(hosted_cache, path, 7001, "docs", .default_async);
+    cached_first.deinit(hosted_cache.write_cache.alloc);
+    try std.testing.expectEqual(@as(usize, 1), hosted_cache.write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), hosted_cache.write_cache.entries.items[0].lsm_root_generation);
+
+    generation = 2;
+    var cached_second = try source.getOrOpenCachedDbMode(hosted_cache, path, 7001, "docs", .default_async);
+    cached_second.deinit(hosted_cache.write_cache.alloc);
+    try std.testing.expectEqual(@as(usize, 1), hosted_cache.write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 2), hosted_cache.write_cache.entries.items[0].lsm_root_generation);
 }
 
 test "write cache adopts just-created db across reconcile generation bump" {
@@ -19788,25 +20608,12 @@ test "write cache adopts just-created db across reconcile generation bump" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    const GenerationSource = struct {
-        fn iface(value: *u64) table_reads.GroupLsmGenerationSource {
-            return .{
-                .ptr = value,
-                .generation_for_group = generationForGroup,
-            };
-        }
-
-        fn generationForGroup(ptr: *anyopaque, _: u64) u64 {
-            return (@as(*u64, @ptrCast(@alignCast(ptr)))).*;
-        }
-    };
-
     var generation: u64 = 1;
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
     source.write_cache = &write_cache;
-    source.group_lsm_generation = GenerationSource.iface(&generation);
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 
     var cached_seed = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, generation, "docs");
     cached_seed.deinit(alloc);
@@ -19874,19 +20681,6 @@ test "replica root reconcile seeds write cache across generation bump" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    const GenerationSource = struct {
-        fn iface(value: *u64) table_reads.GroupLsmGenerationSource {
-            return .{
-                .ptr = value,
-                .generation_for_group = generationForGroup,
-            };
-        }
-
-        fn generationForGroup(ptr: *anyopaque, _: u64) u64 {
-            return (@as(*u64, @ptrCast(@alignCast(ptr)))).*;
-        }
-    };
-
     const tables = [_]metadata_table_manager.TableRecord{.{
         .table_id = 7,
         .name = "docs",
@@ -19906,7 +20700,7 @@ test "replica root reconcile seeds write cache across generation bump" {
     defer write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
     source.write_cache = &write_cache;
-    source.group_lsm_generation = GenerationSource.iface(&generation);
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 
     const summary = try source.reconcileReplicaRootTablesWithWriteCacheLocked(
         alloc,
@@ -19979,19 +20773,6 @@ test "write cache transfers adoptable provisioned db to raft apply source" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    const GenerationSource = struct {
-        fn iface(value: *u64) table_reads.GroupLsmGenerationSource {
-            return .{
-                .ptr = value,
-                .generation_for_group = generationForGroup,
-            };
-        }
-
-        fn generationForGroup(ptr: *anyopaque, _: u64) u64 {
-            return (@as(*u64, @ptrCast(@alignCast(ptr)))).*;
-        }
-    };
-
     var generation: u64 = 1;
     var source_cache = ProvisionedTableWriteCache.init(alloc);
     defer source_cache.deinit();
@@ -20001,8 +20782,8 @@ test "write cache transfers adoptable provisioned db to raft apply source" {
     var apply_source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
     source.write_cache = &source_cache;
     apply_source.write_cache = &apply_cache;
-    source.group_lsm_generation = GenerationSource.iface(&generation);
-    apply_source.group_lsm_generation = GenerationSource.iface(&generation);
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
+    _ = apply_source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 
     var seeded = try source_cache.getOrOpenLocked(path, Catalog.iface(), 7001, generation, "docs");
     seeded.deinit(alloc);
@@ -20069,19 +20850,6 @@ test "write cache retires adoptable seed when transfer allocators differ" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    const GenerationSource = struct {
-        fn iface(value: *u64) table_reads.GroupLsmGenerationSource {
-            return .{
-                .ptr = value,
-                .generation_for_group = generationForGroup,
-            };
-        }
-
-        fn generationForGroup(ptr: *anyopaque, _: u64) u64 {
-            return (@as(*u64, @ptrCast(@alignCast(ptr)))).*;
-        }
-    };
-
     var generation: u64 = 1;
     var source_cache = ProvisionedTableWriteCache.init(alloc);
     defer source_cache.deinit();
@@ -20093,8 +20861,8 @@ test "write cache retires adoptable seed when transfer allocators differ" {
     var apply_source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
     source.write_cache = &source_cache;
     apply_source.write_cache = &apply_cache;
-    source.group_lsm_generation = GenerationSource.iface(&generation);
-    apply_source.group_lsm_generation = GenerationSource.iface(&generation);
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
+    _ = apply_source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 
     var seeded = try source_cache.getOrOpenLocked(path, Catalog.iface(), 7001, generation, "docs");
     seeded.deinit(alloc);

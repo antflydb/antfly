@@ -1,7 +1,7 @@
 # Cloud Build config for packaging a prebuilt Antfly Zig runtime artifact.
 #
 # Substitutions:
-#   _ARTIFACT_URI: gs:// URI of a tar.gz containing bin/ and share/
+#   _ARTIFACT_URI: gs:// URI of a release tar.gz containing antfly and share/
 #   _IMAGE_NAME: image name in the containers repo
 #   _DOCKERFILE: runtime Dockerfile path relative to repo root
 #   _CONTEXT: extracted runtime image build context path
@@ -22,7 +22,7 @@ steps:
         mkdir -p "${_CONTEXT}"
         gsutil cp "${_ARTIFACT_URI}" /tmp/antfly-zig-runtime.tar.gz
         tar -xzf /tmp/antfly-zig-runtime.tar.gz -C "${_CONTEXT}"
-        test -x "${_CONTEXT}/bin/antfly"
+        test -x "${_CONTEXT}/antfly"
         test -d "${_CONTEXT}/share/antfly"
 
   - name: gcr.io/cloud-builders/docker

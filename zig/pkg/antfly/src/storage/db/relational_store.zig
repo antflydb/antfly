@@ -1617,6 +1617,76 @@ pub fn dryRunRepairForeignKeyRefsInRange(
     return try reconcileForeignKeyRefsInRange(alloc, store, table_name, foreign_keys, unique_constraints, lower_doc_key, upper_doc_key, .dry_run);
 }
 
+pub fn reconcileForeignKeyRefOwnerForParent(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    table_name: []const u8,
+    foreign_keys: []const schema_mod.ForeignKey,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    mode: ForeignKeyIntegrityMode,
+) !ForeignKeyIntegrityReport {
+    var report: ForeignKeyIntegrityReport = .{};
+    const foreign_key = findForeignKeyByName(foreign_keys, constraint_name) orelse return error.ForeignKeyViolation;
+    if (!std.mem.eql(u8, foreign_key.parent_table, parent_table)) return error.ForeignKeyViolation;
+
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+
+    const prefix = try internal_keys.relationalForeignKeyRefParentPrefixAlloc(alloc, constraint_name, parent_table, parent_key);
+    defer alloc.free(prefix);
+    const upper = try internal_keys.relationalForeignKeyRefParentPrefixUpperAlloc(alloc, constraint_name, parent_table, parent_key);
+    defer if (upper) |buf| alloc.free(buf);
+    const scanned = try store.scanRange(alloc, prefix, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    for (scanned) |entry| {
+        var decoded = (try internal_keys.decodeRelationalForeignKeyRefKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!std.mem.eql(u8, decoded.child_table, table_name)) continue;
+        report.scanned_ref_rows += 1;
+
+        var stale = false;
+        const child_row = try getRawAlloc(alloc, store, decoded.child_key);
+        if (child_row) |raw| {
+            defer alloc.free(raw);
+            if (try foreignKeyReferenceValueAlloc(alloc, raw, foreign_key)) |current_parent| {
+                defer alloc.free(current_parent);
+                stale = !std.mem.eql(u8, current_parent, decoded.parent_key);
+            } else {
+                stale = true;
+            }
+        } else {
+            stale = true;
+        }
+        if (!stale) continue;
+
+        report.stale_ref_rows += 1;
+        if (mode == .repair or mode == .dry_run) {
+            report.deleted_stale_ref_rows += 1;
+        }
+        if (mode == .repair) {
+            const key = try alloc.dupe(u8, entry.key);
+            var key_owned = true;
+            errdefer if (key_owned) alloc.free(key);
+            try owned_keys.append(alloc, key);
+            key_owned = false;
+            try deletes.append(alloc, key);
+        }
+    }
+
+    if (mode == .repair and deletes.items.len > 0) {
+        try store.putBatch(&.{}, deletes.items);
+    }
+    return report;
+}
+
 pub fn explainForeignKeyDelete(
     alloc: Allocator,
     store: *docstore_mod.DocStore,

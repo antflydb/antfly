@@ -1,7 +1,7 @@
 """Main client interface for Antfly SDK."""
 
 import base64
-from typing import Any, Optional, cast
+from typing import Any, cast
 from urllib.parse import quote
 
 from httpx import Timeout
@@ -42,10 +42,10 @@ class AntflyClient:
     def __init__(
         self,
         base_url: str,
-        username: Optional[str] = None,
-        password: Optional[str] = None,
-        api_key: Optional[tuple[str, str]] = None,
-        token: Optional[str] = None,
+        username: str | None = None,
+        password: str | None = None,
+        api_key: tuple[str, str] | None = None,
+        token: str | None = None,
         timeout: float = 30.0,
     ):
         """
@@ -127,9 +127,9 @@ class AntflyClient:
     def create_table(
         self,
         name: str,
-        num_shards: Optional[int] = None,
-        indexes: Optional[dict[str, Any]] = None,
-        schema: Optional[dict[str, Any]] = None,
+        num_shards: int | None = None,
+        indexes: dict[str, Any] | None = None,
+        schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Create a new table.
@@ -229,8 +229,8 @@ class AntflyClient:
     def batch(
         self,
         table: str,
-        inserts: Optional[dict[str, dict[str, Any]]] = None,
-        deletes: Optional[list[str]] = None,
+        inserts: dict[str, dict[str, Any]] | None = None,
+        deletes: list[str] | None = None,
     ) -> None:
         """
         Perform batch operations on a table.

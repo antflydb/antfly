@@ -461,17 +461,17 @@ For cross-shard or cross-table writes:
   parent-existence checks through configured unique-owner ranges. The check
   carries the parent unique constraint name and encoded tuple identity, and the
   unique-owner participant validates that the tuple exists in its final staged
-  unique-index state plus committed store. Versioned same-table or cross-table
+  unique-index state plus committed store. Same-table or cross-table
   `restrict`, `set_null`, and bounded `cascade` parent deletes over a declared
-  unique parent tuple read the deleted parent row before prepare, encode the old
-  unique tuple with the same unique-index encoder, and route enforcement through
-  the FK-ref owner range for that encoded tuple. `restrict` sends an
+  unique parent tuple read the deleted parent row before prepare, inject the
+  observed row version when the caller did not supply one, encode the old unique
+  tuple with the same unique-index encoder, and route enforcement through the
+  FK-ref owner range for that encoded tuple. `restrict` sends an
   encoded-tuple parent-delete check to the owner. `set_null` and `cascade` scan
   the owner prefix through the bounded child listing contract, send FK-ref
   deletes to the owner, and send exact child-key actions to each child-row
-  participant. Missing unique-owner or FK-ref owner topology and unversioned
-  unique parent deletes fail before prepare until they can provide a durable
-  old-tuple proof.
+  participant. Missing unique-owner or FK-ref owner topology still fails before
+  prepare.
   Primary-key `set_null` and bounded primary-key `cascade` use exact routed
   owner discovery when FK-ref owner topology exists: the coordinator scans the
   bounded owner prefix, registers only the discovered child-row participants,
@@ -785,8 +785,13 @@ Work:
   child-table range fanout. Hosted/provisioned explain now reads the parent row,
   resolves configured FK-ref owner ranges, scans bounded owner prefixes, reports
   routed `restrict` blockers and first-hop `set_null` / `cascade` child counts,
-  and fails closed on incomplete scans. Validation and repair still need the
-  same owner-range job model instead of child-table fanout;
+  and fails closed on incomplete scans. The storage layer also has an
+  owner-prefix validation/dry-run/repair primitive for one routed
+  `(constraint, parent_table, parent_key)` prefix: it verifies each owner ref row
+  against the current child row and can prune stale owner rows without scanning
+  every child range. Hosted validation and repair still need resumable job
+  orchestration over that owner-prefix primitive plus the child-range pass that
+  creates missing owner rows;
 - retain fail-closed behavior for operations whose final FK value or affected
   FK-ref owner set cannot be known before prepare.
 
@@ -822,12 +827,18 @@ Implemented:
   keyed by `(mode, constraint, lower_doc_key, upper_doc_key)` so distinct range
   checkpoints do not overwrite each other;
 - public/hosted integrity responses that return the latest per-group progress
-  rows alongside aggregate report counters and violations.
+  rows alongside aggregate report counters and violations;
+- DB owner-prefix validation/dry-run/repair for a single routed FK-ref owner
+  range. The primitive scans exactly one parent-key prefix, detects owner rows
+  whose child row is missing or now references a different parent, and repairs
+  by deleting those stale owner rows without mutating child rows.
 
 Remaining work:
 
-- hosted resumable validation/repair jobs that advance the durable per-range
-  checkpoints incrementally instead of running one interactive scan per group.
+- hosted resumable validation/repair jobs that advance durable checkpoints
+  incrementally instead of running one interactive scan per group. Those jobs
+  should compose the child-range pass that recreates missing owner rows with the
+  owner-prefix pass that prunes stale owner rows.
 
 Repair may rebuild missing/corrupt secondary metadata, but it must not silently
 mutate user rows. Orphaned child rows should be reported for explicit operator
@@ -1193,8 +1204,8 @@ Minimum coverage:
 - parent deletes conflict with concurrent child reference creation at the FK-ref
   owner participant;
 - FK-ref range split/merge preserves ownership and rejects stale topology epochs;
-- routed repair recreates missing FK-ref rows in the owner range and prunes
-  stale rows without mutating child rows.
+- routed repair recreates missing FK-ref rows in the owner range and the
+  owner-prefix primitive prunes stale rows without mutating child rows.
 
 ## Documentation Status
 

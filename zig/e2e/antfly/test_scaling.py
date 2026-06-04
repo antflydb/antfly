@@ -41,6 +41,26 @@ from conftest import (
 from helpers import wait_until
 
 
+class _ClusterStartupDeadline:
+    def __init__(self, expires_at: float):
+        self.expires_at = expires_at
+
+    def remaining(self) -> float:
+        return max(0.0, self.expires_at - time.monotonic())
+
+    def timeout(self, max_timeout_s: float) -> float:
+        remaining = self.remaining()
+        if remaining <= 0.0:
+            raise RuntimeError("multi-node cluster startup deadline expired")
+        return max(0.1, min(max_timeout_s, remaining))
+
+    def sleep(self, duration_s: float) -> None:
+        remaining = self.remaining()
+        if remaining <= 0.0:
+            raise RuntimeError("multi-node cluster startup deadline expired")
+        time.sleep(min(duration_s, remaining))
+
+
 def _metadata_admin_url(stateful_api) -> str:
     server = getattr(stateful_api, "_server", None)
     admin_url = getattr(server, "metadata_admin_url", None)
@@ -352,12 +372,16 @@ class MultiNodeScalingCluster:
         *,
         initial_data_node_count: int = 5,
         max_shard_size_bytes: int = 0,
+        startup_deadline_at: float | None = None,
     ):
         self.binary = binary
         self.host = "127.0.0.1"
         self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-scaling-e2e-")
         self.root = Path(self.tempdir.name)
         self.max_shard_size_bytes = max_shard_size_bytes
+        self.startup_deadline = (
+            _ClusterStartupDeadline(startup_deadline_at) if startup_deadline_at is not None else None
+        )
 
         self.metadata_nodes = [
             {
@@ -464,22 +488,33 @@ class MultiNodeScalingCluster:
             )
 
         for url in self.metadata_urls:
-            if not wait_for_server(url, path="/metadata/v1/status"):
+            if not wait_for_server(url, timeout=self.startup_timeout(30.0), path="/metadata/v1/status"):
                 raise RuntimeError(f"Metadata node failed to start at {url}\n{self.debug_logs()}")
-        time.sleep(1.0)
+        self.startup_sleep(1.0)
 
         for node in self.data_nodes:
             self._start_data_node(node)
 
         for url in self.data_api_urls:
-            if not wait_for_server(url):
+            if not wait_for_server(url, timeout=self.startup_timeout(30.0)):
                 raise RuntimeError(f"Data node failed to start at {url}\n{self.debug_logs()}")
-        if not self.wait_for_all_data_nodes_registered(timeout_s=60.0):
+        if not self.wait_for_all_data_nodes_registered(timeout_s=self.startup_timeout(60.0)):
             raise RuntimeError(
                 "Data nodes did not register on all metadata nodes\n"
                 f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
                 f"{self.debug_logs()}"
             )
+
+    def startup_timeout(self, max_timeout_s: float) -> float:
+        if self.startup_deadline is None:
+            return max_timeout_s
+        return self.startup_deadline.timeout(max_timeout_s)
+
+    def startup_sleep(self, duration_s: float) -> None:
+        if self.startup_deadline is None:
+            time.sleep(duration_s)
+            return
+        self.startup_deadline.sleep(duration_s)
 
     def _start_data_node(self, node: dict[str, int]) -> None:
         log = self._open_log(f"data-{node['id']}.log")
@@ -752,15 +787,21 @@ class MultiNodeScalingCluster:
             handle.flush()
         return "\n".join(f"[{path.name}]\n{_read_log_tail(path)}" for path in self.log_paths)
 
-    def stop(self) -> None:
-        for proc in [*self.data_procs, *self.metadata_procs]:
+    def stop(self, *, timeout_s: float = 10.0) -> None:
+        procs = [proc for proc in [*self.data_procs, *self.metadata_procs] if proc.poll() is None]
+        for proc in procs:
+            proc.send_signal(signal.SIGTERM)
+        deadline = time.monotonic() + timeout_s
+        for proc in procs:
             if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
                 try:
-                    proc.wait(timeout=10)
+                    proc.wait(timeout=max(0.0, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    proc.wait()
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
         for handle in self.log_files:
             if not handle.closed:
                 handle.close()

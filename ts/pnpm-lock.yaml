@@ -29,6 +29,9 @@ importers:
       '@antfly/design-system':
         specifier: workspace:*
         version: link:../../packages/design-system
+      '@antfly/graph':
+        specifier: workspace:*
+        version: link:../../packages/graph
       '@antfly/sdk':
         specifier: workspace:*
         version: link:../../packages/sdk
@@ -101,6 +104,9 @@ importers:
       '@streamdown/mermaid':
         specifier: ^1.0.2
         version: 1.0.2(react@19.2.4)
+      '@xyflow/react':
+        specifier: ^12.10.2
+        version: 12.10.2(@types/react@19.2.14)(immer@11.1.4)(react-dom@19.2.4(react@19.2.4))(react@19.2.4)
       class-variance-authority:
         specifier: ^0.7.1
         version: 0.7.1
@@ -295,6 +301,24 @@ importers:
       typescript:
         specifier: 5.9.3
         version: 5.9.3
+
+  packages/cli:
+    optionalDependencies:
+      '@antfly/cli-darwin-arm64':
+        specifier: workspace:*
+        version: link:../cli-darwin-arm64
+      '@antfly/cli-linux-arm64':
+        specifier: workspace:*
+        version: link:../cli-linux-arm64
+      '@antfly/cli-linux-x64':
+        specifier: workspace:*
+        version: link:../cli-linux-x64
+
+  packages/cli-darwin-arm64: {}
+
+  packages/cli-linux-arm64: {}
+
+  packages/cli-linux-x64: {}
 
   packages/components:
     dependencies:

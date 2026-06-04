@@ -9,7 +9,7 @@ export function GraphLegend({ typeLabels, typeColors, className }: GraphLegendPr
   return (
     <div
       className={cn(
-        "flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-md border border-border/50 bg-background/70 px-3 py-2 text-xs backdrop-blur-sm",
+        "flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-none border-[1.5px] border-border-strong bg-background/85 px-3 py-2 text-xs backdrop-blur-sm",
         className
       )}
     >

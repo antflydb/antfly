@@ -5365,7 +5365,34 @@ pub const HBCIndex = struct {
             }
         }
 
-        if (best_child == 0) return node_id;
+        if (best_child == 0) {
+            self.invalidateNodeCache(node_id);
+            var fresh_node = self.loadNodeFromStorage(txn, node_id) catch |err| {
+                if (isNotFound(err)) return error.Corrupted;
+                return err;
+            };
+            defer fresh_node.deinit(self.alloc);
+            if (fresh_node.is_leaf) return node_id;
+            if (fresh_node.children.len == 0) return error.Corrupted;
+
+            try scratch.ensureCapacity(self.alloc, fresh_node.children.len);
+            @memcpy(scratch.child_ids[0..fresh_node.children.len], fresh_node.children);
+            const fresh_child_ids = scratch.child_ids[0..fresh_node.children.len];
+
+            for (fresh_child_ids) |child_id| {
+                var child = self.loadNodeFromStorage(txn, child_id) catch |err| {
+                    if (isNotFound(err)) continue;
+                    return err;
+                };
+                defer child.deinit(self.alloc);
+                const dist = vec.distanceToQuery(query, query_measure, child.centroid, self.config.metric);
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_child = child_id;
+                }
+            }
+            if (best_child == 0) return error.Corrupted;
+        }
         return self.findLeafWithOptionsScratch(txn, best_child, query, false, scratch);
     }
 
@@ -10627,6 +10654,55 @@ test "findLeafWithOptions does not use-after-free when cache evicts mid-traversa
     var results = try idx.search(&[_]f32{ 5.0, 5.0, 5.0, 5.0 }, 5);
     defer results.deinit();
     try std.testing.expect(results.getHits().len > 0);
+}
+
+test "findLeafWithOptions fails closed when cached internal children are stale" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .search_width = 8,
+        .max_cached_nodes = 2,
+    });
+    defer idx.close();
+
+    var centroid = [_]f32{ 0.0, 0.0 };
+    var children = [_]u64{999};
+    const root = Node{
+        .id = 1,
+        .is_leaf = false,
+        .level = 1,
+        .parent = 0,
+        .centroid = centroid[0..],
+        .children = children[0..],
+        .members = &.{},
+    };
+
+    var write_txn = try idx.beginWriteTxn();
+    errdefer write_txn.abort();
+    const centroid_bytes = std.mem.sliceAsBytes(root.centroid);
+    const ids_bytes = std.mem.sliceAsBytes(root.children);
+    const packed_len = vectorindex_hbc.packedNodeValueSize(centroid_bytes.len, ids_bytes.len);
+    const packed_buf = try alloc.alloc(u8, packed_len);
+    defer alloc.free(packed_buf);
+    const header = NodeHeader{ .is_leaf = false, .level = 1, .parent = 0 };
+    const encoded = try vectorindex_hbc.encodePackedNodeValue(packed_buf, header, centroid_bytes, ids_bytes);
+    var key_buf: [12]u8 = undefined;
+    try idx.putNamespaced(&write_txn, .nodes, encodeNodeKey(&key_buf, root.id, .packed_node), encoded);
+    try idx.cacheNode(&root);
+    try idx.finishWriteTxn(&write_txn);
+
+    var read_txn = try idx.beginRuntimeReadTxn();
+    defer read_txn.abort();
+    try std.testing.expectError(
+        error.Corrupted,
+        idx.findLeafWithOptions(&read_txn, idx.metadata.root_node, &.{ 1.0, 0.0 }, true),
+    );
 }
 
 test "insert routes while search cache admission is disabled" {

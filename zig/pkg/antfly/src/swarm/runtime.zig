@@ -359,7 +359,18 @@ const LocalSwarmMetadata = struct {
 
     fn waitTableLifecycle(_: *anyopaque, _: []const u8, _: antfly.public_api.http_server.TableVisibility) !void {}
 
-    fn waitTableProjection(_: *anyopaque, _: []const u8, _: ?[]const u8, _: ?[]const u8) !void {}
+    fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const table = self.findTableByNameLocked(table_name) orelse return error.TableVisibilityTimeout;
+        if (schema_json) |expected| {
+            if (!std.mem.eql(u8, table.schema_json, expected)) return error.TableVisibilityTimeout;
+        }
+        if (indexes_json) |expected| {
+            if (!std.mem.eql(u8, table.indexes_json, expected)) return error.TableVisibilityTimeout;
+        }
+    }
 
     fn runRound(ptr: *anyopaque) !void {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
