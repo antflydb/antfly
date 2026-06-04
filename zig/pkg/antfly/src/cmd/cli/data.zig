@@ -410,6 +410,7 @@ const LoadProcessor = struct {
         self.stats.lines_seen = line.line_number;
         if (line.bytes.len == 0) {
             self.stats.empty_line += 1;
+            self.last_committed_offset = line.end_offset;
             self.last_committed_line = line.line_number;
             return;
         }
@@ -427,6 +428,8 @@ const LoadProcessor = struct {
             error.OutOfMemory => return err,
             else => {
                 self.stats.invalid_json += 1;
+                self.last_committed_offset = line.end_offset;
+                self.last_committed_line = line.line_number;
                 try self.checkErrorLimit();
                 return;
             },
@@ -434,7 +437,11 @@ const LoadProcessor = struct {
 
         const batch_alloc = self.batch.allocator();
         const doc_id = self.documentId(batch_alloc, parsed_for_id, line.bytes) catch |err| switch (err) {
-            error.BadDocumentId => return,
+            error.BadDocumentId => {
+                self.last_committed_offset = line.end_offset;
+                self.last_committed_line = line.line_number;
+                return;
+            },
             else => return err,
         };
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, batch_alloc, line.bytes, .{
@@ -443,6 +450,8 @@ const LoadProcessor = struct {
             error.OutOfMemory => return err,
             else => {
                 self.stats.invalid_json += 1;
+                self.last_committed_offset = line.end_offset;
+                self.last_committed_line = line.line_number;
                 try self.checkErrorLimit();
                 return;
             },
@@ -607,9 +616,9 @@ fn parseLoadOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterat
         } else if (std.mem.eql(u8, arg, "--file") or std.mem.eql(u8, arg, "-f")) {
             file_path = args.next();
         } else if (std.mem.eql(u8, arg, "--size")) {
-            batch_size = parsePositive(usize, args.next(), default_batch_size, "--size");
+            batch_size = parsePositive(usize, args.next(), "--size");
         } else if (std.mem.eql(u8, arg, "--batches")) {
-            max_batches = parsePositive(usize, args.next(), default_max_batches, "--batches");
+            max_batches = parsePositive(usize, args.next(), "--batches");
         } else if (std.mem.eql(u8, arg, "--id-field")) {
             id_field = args.next();
         } else if (std.mem.eql(u8, arg, "--id-template")) {
@@ -618,11 +627,11 @@ fn parseLoadOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterat
             sync_level = parseSyncLevel(args.next() orelse cli.fatal("--sync-level requires a value", .{})) orelse
                 cli.fatal("invalid --sync-level", .{});
         } else if (std.mem.eql(u8, arg, "--read-buffer-bytes")) {
-            read_buffer_bytes = parsePositive(usize, args.next(), default_read_buffer_bytes, "--read-buffer-bytes");
+            read_buffer_bytes = parsePositive(usize, args.next(), "--read-buffer-bytes");
         } else if (std.mem.eql(u8, arg, "--max-line-bytes")) {
-            max_line_bytes = parsePositive(usize, args.next(), default_max_line_bytes, "--max-line-bytes");
+            max_line_bytes = parsePositive(usize, args.next(), "--max-line-bytes");
         } else if (std.mem.eql(u8, arg, "--batch-bytes")) {
-            batch_bytes = parsePositive(usize, args.next(), default_batch_bytes, "--batch-bytes");
+            batch_bytes = parsePositive(usize, args.next(), "--batch-bytes");
         } else if (std.mem.eql(u8, arg, "--checkpoint")) {
             checkpoint_path = args.next();
         } else if (std.mem.eql(u8, arg, "--resume")) {
@@ -668,9 +677,9 @@ fn parseLoadOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterat
     };
 }
 
-fn parsePositive(comptime T: type, raw: ?[]const u8, default: T, flag: []const u8) T {
+fn parsePositive(comptime T: type, raw: ?[]const u8, flag: []const u8) T {
     const text = raw orelse cli.fatal("{s} requires a value", .{flag});
-    return std.fmt.parseInt(T, text, 10) catch default;
+    return std.fmt.parseInt(T, text, 10) catch cli.fatal("invalid {s}", .{flag});
 }
 
 fn parseSyncLevel(text: []const u8) ?antfly_client.types.SyncLevel {
@@ -702,12 +711,14 @@ fn runLoad(
     checkpoint_path: ?[]const u8,
 ) !LoadStats {
     const file_meta = try statFile(io, opts.file_path);
+    var checkpoint_parsed: ?std.json.Parsed(LoadCheckpoint) = null;
+    defer if (checkpoint_parsed) |parsed| parsed.deinit();
+
     const checkpoint = if (opts.resume_load) blk: {
         const path = checkpoint_path orelse return error.CheckpointDisabled;
-        var parsed = try loadCheckpoint(allocator, io, path);
-        defer parsed.deinit();
-        try validateCheckpoint(parsed.value, opts, file_meta);
-        break :blk parsed.value;
+        checkpoint_parsed = try loadCheckpoint(allocator, io, path);
+        try validateCheckpoint(checkpoint_parsed.?.value, opts, file_meta);
+        break :blk checkpoint_parsed.?.value;
     } else null;
 
     const start_offset = if (checkpoint) |cp| cp.offset else 0;
@@ -782,7 +793,10 @@ fn defaultCheckpointPath(alloc: std.mem.Allocator, file_path: []const u8) ![]u8 
 fn loadCheckpoint(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(LoadCheckpoint) {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(checkpoint_max_bytes));
     defer alloc.free(raw);
-    return try std.json.parseFromSlice(LoadCheckpoint, alloc, raw, .{ .ignore_unknown_fields = true });
+    return try std.json.parseFromSlice(LoadCheckpoint, alloc, raw, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
 }
 
 fn validateCheckpoint(cp: LoadCheckpoint, opts: LoadOptions, meta: FileMetadata) !void {
@@ -958,6 +972,41 @@ test "load processor rejects malformed json and bad ids" {
     try std.testing.expectEqual(@as(u64, 1), processor.stats.bad_id);
 }
 
+test "load processor advances resume cursor for tolerated rejected and empty lines" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var processor = try LoadProcessor.init(alloc, io, null, .{
+        .table_name = "t",
+        .file_path = "in.ndjson",
+        .id_field = "id",
+        .dry_run = true,
+        .checkpoint_enabled = false,
+    }, .{ .size = 100, .mtime_ns = 1 }, null, null);
+    defer processor.deinit();
+
+    try processor.handleLine(.{ .bytes = "{\"id\":\"ok\",\"v\":1}", .line_number = 1, .start_offset = 0, .end_offset = 17 });
+    try std.testing.expectEqual(@as(u64, 17), processor.last_committed_offset);
+    try std.testing.expectEqual(@as(u64, 1), processor.last_committed_line);
+
+    try processor.handleLine(.{ .bytes = "{", .line_number = 2, .start_offset = 18, .end_offset = 20 });
+    try std.testing.expectEqual(@as(u64, 20), processor.last_committed_offset);
+    try std.testing.expectEqual(@as(u64, 2), processor.last_committed_line);
+
+    try processor.handleLine(.{ .bytes = "{\"id\":7}", .line_number = 3, .start_offset = 21, .end_offset = 29 });
+    try std.testing.expectEqual(@as(u64, 29), processor.last_committed_offset);
+    try std.testing.expectEqual(@as(u64, 3), processor.last_committed_line);
+
+    try processor.handleLine(.{ .bytes = "", .line_number = 4, .start_offset = 30, .end_offset = 31 });
+    try std.testing.expectEqual(@as(u64, 31), processor.last_committed_offset);
+    try std.testing.expectEqual(@as(u64, 4), processor.last_committed_line);
+    try std.testing.expectEqual(@as(u64, 1), processor.stats.invalid_json);
+    try std.testing.expectEqual(@as(u64, 1), processor.stats.bad_id);
+    try std.testing.expectEqual(@as(u64, 1), processor.stats.empty_line);
+}
+
 test "load processor renders ids from handlebars template" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -1063,6 +1112,46 @@ test "checkpoint validation rejects changed source and load config" {
         .file_path = "a.ndjson",
         .id_template = "{{id}}",
     }, .{ .size = 10, .mtime_ns = 99 }));
+}
+
+test "load checkpoint owns strings independently of read buffer" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/loader.checkpoint", .{tmp.sub_path});
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [4096]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        try writer.interface.writeAll(
+            "{\"version\":1,\"source_path\":\"a.ndjson\",\"source_size\":10,\"source_mtime_ns\":99,\"table_name\":\"docs\",\"id_template\":\"{{tenant}}:{{id}}\",\"sync_level\":\"write\",\"offset\":4,\"line_number\":1}",
+        );
+        try writer.end();
+    }
+
+    var parsed = try loadCheckpoint(alloc, io, path);
+    defer parsed.deinit();
+
+    const scratch = try alloc.alloc(u8, 4096);
+    defer alloc.free(scratch);
+    @memset(scratch, 'x');
+
+    try validateCheckpoint(parsed.value, .{
+        .table_name = "docs",
+        .file_path = "a.ndjson",
+        .id_template = "{{tenant}}:{{id}}",
+        .sync_level = .write,
+    }, .{ .size = 10, .mtime_ns = 99 });
+    try std.testing.expectEqual(@as(u64, 4), parsed.value.offset);
+    try std.testing.expectEqualStrings("docs", parsed.value.table_name);
 }
 
 test "dry-run load streams boundary-straddling ndjson without bogus invalid json" {
