@@ -14078,6 +14078,14 @@ test "provisioned table write cache retires stale db when index metadata changes
 
     const Catalog = struct {
         var indexes_json_buf: []const u8 = "";
+        var table_records = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .placement_role = "data",
+        }};
+        var range_records = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+        };
 
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -14090,17 +14098,11 @@ test "provisioned table write cache retires stale db when index metadata changes
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            table_records[0].indexes_json = indexes_json_buf;
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .placement_role = "data",
-                    .indexes_json = indexes_json_buf,
-                }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
-                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
-                })[0..]),
+                .tables = table_records[0..],
+                .ranges = range_records[0..],
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),

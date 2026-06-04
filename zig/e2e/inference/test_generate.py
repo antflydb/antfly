@@ -24,7 +24,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 from .helpers import TINY_PNG_URI
-from .models import default_generator_model_name, find_multimodal_generator_model_name, find_tool_model_name, run_large_model_tests
+from .models import (
+    default_generator_model_name,
+    find_multimodal_generator_model_name,
+    find_tool_model_name,
+    response_indicates_missing_model,
+    run_large_model_tests,
+)
 
 pytestmark = pytest.mark.model_integration
 
@@ -50,6 +56,8 @@ def _first_tool_generator_model(api):
 
 
 def _skip_unloadable_tool_model_response(response):
+    if response_indicates_missing_model(response):
+        pytest.skip("Generator model is listed but not loadable in this build/backend configuration")
     if response.status_code == 400:
         try:
             payload = response.json()
@@ -68,8 +76,14 @@ def _skip_unloadable_tool_model_response(response):
         pytest.skip("Tool-capable model is present but not loadable in this build/backend configuration")
 
 
+def _skip_missing_generator_response(response):
+    if response_indicates_missing_model(response):
+        pytest.skip("Generator model is listed but not loadable in this build/backend configuration")
+
+
 def _generate_or_skip_unsupported(api, body: dict) -> dict:
     response = api.post("/generate", json=body)
+    _skip_missing_generator_response(response)
     if response.status_code == 500 and response.headers.get("content-type", "").startswith("application/json"):
         payload = response.json()
         if payload.get("error") == "GENERATION_FAILED" and payload.get("message") in {
@@ -188,6 +202,7 @@ def test_generate_invalid_grammar_rejected(api):
         "max_tokens": 8,
         "grammar": "this is not valid GBNF syntax %%%",
     })
+    _skip_missing_generator_response(r)
     assert r.status_code == 400, f"Expected 400, got {r.status_code}: {r.text}"
 
 
@@ -354,6 +369,7 @@ def test_multimodal_generation(api):
         "messages": messages,
         "max_tokens": 20,
     })
+    _skip_missing_generator_response(r)
     if r.status_code == 400:
         payload = r.json()
         assert payload.get("error") == "INVALID_REQUEST", payload
@@ -373,6 +389,7 @@ def test_generate_rejects_tool_choice_without_tools(api):
         "messages": [{"role": "user", "content": "What is the weather?"}],
         "tool_choice": "required",
     })
+    _skip_missing_generator_response(r)
     assert r.status_code == 400
     assert "tools are required when tool_choice is set" in r.text
 
@@ -398,6 +415,7 @@ def test_generate_rejects_invalid_tool_choice(api):
         }],
         "tool_choice": {"type": "function"},
     })
+    _skip_missing_generator_response(r)
     assert r.status_code == 400
     assert "invalid tool_choice" in r.text
 
