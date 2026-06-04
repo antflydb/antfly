@@ -9,11 +9,20 @@ on:
         description: "The release tag name (e.g., v1.0.0)"
         required: true
         type: string
+      artifact_source:
+        description: "Where Linux runtime archives come from: build or github"
+        required: false
+        default: build
+        type: string
   workflow_dispatch:
     inputs:
       tag_name:
         description: "The release tag name (e.g., v1.0.0)"
         required: true
+      artifact_source:
+        description: "Where Linux runtime archives come from: build or github"
+        required: false
+        default: build
 
 env:
   GCP_REGION: us-central1
@@ -27,6 +36,7 @@ env:
 jobs:
   build-artifact:
     name: Build ${{ matrix.arch }} artifact
+    if: ${{ inputs.artifact_source != 'github' }}
     runs-on: ${{ matrix.runner }}
     environment: container-publish
     permissions:
@@ -86,21 +96,15 @@ jobs:
 
       - name: Build runtime artifact
         run: |
-          CACHE_ROOT="$RUNNER_TEMP/zig-cache"
-          if [ -d /mnt/cache ] && [ -w /mnt/cache ]; then
-            CACHE_ROOT=/mnt/cache/zig
-          fi
-          mkdir -p "$CACHE_ROOT/global" "$RUNNER_TEMP/zig-out"
-          cd zig
-          zig build \
-            -Dtarget="${{ matrix.zig_target }}" \
-            -Doptimize=ReleaseFast \
-            -Dedition=full \
-            install \
-            --prefix "$RUNNER_TEMP/zig-out" \
-            --global-cache-dir "$CACHE_ROOT/global"
-          test -x "$RUNNER_TEMP/zig-out/bin/antfly"
-          tar -C "$RUNNER_TEMP/zig-out" -czf "$RUNNER_TEMP/antfly-zig-${{ matrix.arch }}.tar.gz" bin share
+          VERSION="${{ inputs.tag_name || github.event.release.tag_name || github.event.inputs.tag_name }}"
+          VERSION="${VERSION#v}"
+          scripts/packaging/build_zig_release_archive.sh \
+            --version "$VERSION" \
+            --target "${{ matrix.zig_target }}" \
+            --archive-name "antfly-zig-${{ matrix.arch }}.tar.gz" \
+            --out-dir "$RUNNER_TEMP" \
+            --metal false \
+            --system-blas false
 
       - name: Upload runtime artifact to GCS
         run: |
@@ -111,6 +115,7 @@ jobs:
   publish:
     runs-on: arc-antfly-publish
     needs: build-artifact
+    if: ${{ always() && (inputs.artifact_source == 'github' || needs.build-artifact.result == 'success') }}
     environment: container-publish
     permissions:
       contents: read
@@ -131,6 +136,27 @@ jobs:
 
       - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@v3
+
+      - name: Download release runtime archives
+        if: ${{ inputs.artifact_source == 'github' }}
+        uses: actions/download-artifact@v6
+        with:
+          pattern: antfly-zig-linux-*
+          merge-multiple: true
+          path: dist/release-archives
+
+      - name: Upload release runtime archives to GCS
+        if: ${{ inputs.artifact_source == 'github' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/container-artifacts"
+          cp dist/release-archives/antfly_*_Linux_x86_64.tar.gz "$RUNNER_TEMP/container-artifacts/antfly-zig-amd64.tar.gz"
+          cp dist/release-archives/antfly_*_Linux_arm64.tar.gz "$RUNNER_TEMP/container-artifacts/antfly-zig-arm64.tar.gz"
+          for arch in amd64 arm64; do
+            gsutil cp \
+              "$RUNNER_TEMP/container-artifacts/antfly-zig-${arch}.tar.gz" \
+              "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}.tar.gz"
+          done
 
       - name: Extract version
         id: version
