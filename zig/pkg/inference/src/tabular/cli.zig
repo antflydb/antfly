@@ -42,7 +42,7 @@ pub fn pullMain(
     alloc: std.mem.Allocator,
     io: std.Io,
     args: []const []const u8,
-    default_models_dir: []const u8,
+    default_ml_dir: []const u8,
 ) !void {
     if (args.len == 0 or std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "-h")) {
         printPullUsage();
@@ -57,7 +57,7 @@ pub fn pullMain(
 
     var name: ?[]const u8 = null;
     var token: ?[]const u8 = null;
-    var models_dir: []const u8 = default_models_dir;
+    var ml_dir: []const u8 = default_ml_dir;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -67,8 +67,8 @@ pub fn pullMain(
         } else if (std.mem.eql(u8, args[i], "--token") and i + 1 < args.len) {
             token = args[i + 1];
             i += 1;
-        } else if (std.mem.eql(u8, args[i], "--models-dir") and i + 1 < args.len) {
-            models_dir = args[i + 1];
+        } else if ((std.mem.eql(u8, args[i], "--ml-dir") or std.mem.eql(u8, args[i], "--models-dir")) and i + 1 < args.len) {
+            ml_dir = args[i + 1];
             i += 1;
         } else {
             print("pull: unexpected arg '{s}'\n", .{args[i]});
@@ -119,7 +119,7 @@ pub fn pullMain(
         return;
     };
 
-    installPulledModel(alloc, io, models_dir, model_name, body) catch |err| {
+    installPulledModel(alloc, io, ml_dir, model_name, body) catch |err| {
         print("pull: {s}\n", .{@errorName(err)});
         return;
     };
@@ -230,7 +230,7 @@ pub fn convertMain(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
 fn installPulledModel(
     alloc: std.mem.Allocator,
     io: std.Io,
-    models_dir: []const u8,
+    ml_dir: []const u8,
     name: []const u8,
     body: []const u8,
 ) PullInstallError!void {
@@ -241,9 +241,7 @@ fn installPulledModel(
     defer loaded.deinit();
     loaded.model.metadata.name = name;
 
-    const predictors_dir = try std.fs.path.join(alloc, &.{ models_dir, "predictors" });
-    defer alloc.free(predictors_dir);
-    const target_dir = try std.fs.path.join(alloc, &.{ predictors_dir, name });
+    const target_dir = try std.fs.path.join(alloc, &.{ ml_dir, name });
     defer alloc.free(target_dir);
     std.Io.Dir.cwd().createDirPath(io, target_dir) catch return PullInstallError.IoError;
 
@@ -286,8 +284,8 @@ fn printConvertUsage() void {
         \\Supported in this binary:
         \\  XGBoost JSON, LightGBM text, ONNX-ML.
         \\Models already exported as tabular_model.json can be served from
-        \\<models-dir>/predictors/<name>/, or pulled with:
-        \\  antfly inference pull <url> --name <name> [--models-dir <dir>]
+        \\<ml-dir>/<name>/, or pulled with:
+        \\  antfly inference pull <url> --name <name> [--ml-dir <dir>]
         \\
     , .{});
 }
@@ -300,7 +298,7 @@ fn printPullUsage() void {
         \\
         \\Options:
         \\  --name <name>        Local predictor name. Must match [A-Za-z0-9_-]+.
-        \\  --models-dir <dir>  Models directory (default: ~/.antfly/inference/models)
+        \\  --ml-dir <dir>     Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --token <token>     Bearer token for the model URL
         \\
     , .{});

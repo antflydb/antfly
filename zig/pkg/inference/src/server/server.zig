@@ -122,6 +122,7 @@ pub const BudgetOverrides = struct {
 
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
+    ml_dir: []const u8 = "./ml",
     content_security: ?scraping.ContentSecurityConfig = null,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
     allow_downloads: bool = true,
@@ -546,19 +547,15 @@ pub const Node = struct {
     }
 
     /// Convenience for callers that want to seed the builtin iris classifier
-    /// and scan the predictors directory at startup.
+    /// and scan the Traditional ML directory at startup.
     pub fn seedAndDiscoverPredictors(self: *Node, io: std.Io) void {
-        const sub = std.fs.path.join(self.allocator, &.{ self.config.models_dir, "predictors" }) catch return;
-        defer self.allocator.free(sub);
-        std.Io.Dir.cwd().createDirPath(io, sub) catch {};
-        tabular_discovery_mod.seedBuiltins(io, sub) catch {};
-        self.discoverPredictorsIn(sub, io);
+        std.Io.Dir.cwd().createDirPath(io, self.config.ml_dir) catch {};
+        tabular_discovery_mod.seedBuiltins(io, self.config.ml_dir) catch {};
+        self.discoverPredictorsIn(self.config.ml_dir, io);
     }
 
     fn discoverPredictors(self: *Node, io: std.Io) void {
-        const sub = std.fs.path.join(self.allocator, &.{ self.config.models_dir, "predictors" }) catch return;
-        defer self.allocator.free(sub);
-        self.discoverPredictorsIn(sub, io);
+        self.discoverPredictorsIn(self.config.ml_dir, io);
     }
 
     fn discoverPredictorsIn(self: *Node, predictors_dir: []const u8, io: std.Io) void {

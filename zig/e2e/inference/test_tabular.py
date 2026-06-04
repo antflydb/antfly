@@ -38,7 +38,7 @@ import pytest
 import requests
 
 from .conftest import api_path
-from .models import REPO_ROOT, inference_command, models_dir
+from .models import REPO_ROOT, inference_command, ml_dir
 
 
 IRIS_SAMPLE_SETOSA = [5.1, 3.5, 1.4, 0.2]
@@ -213,7 +213,7 @@ def _local_cli_models():
         command = inference_command()
     except RuntimeError as exc:
         pytest.skip(str(exc))
-    return command, models_dir()
+    return command, ml_dir()
 
 
 def _write_hosted_ir(tmp_path, name, payload):
@@ -238,7 +238,7 @@ def test_pull_url_then_predict(api, tmp_path):
                 f"{origin}/tabular_model.json",
                 "--name",
                 model_name,
-                "--models-dir",
+                "--ml-dir",
                 str(model_root),
             ],
             cwd=REPO_ROOT,
@@ -281,7 +281,7 @@ def test_pull_rejects_unsafe_name(tmp_path):
                     f"{origin}/tabular_model.json",
                     "--name",
                     unsafe,
-                    "--models-dir",
+                    "--ml-dir",
                     str(model_root),
                 ],
                 cwd=REPO_ROOT,
@@ -290,7 +290,7 @@ def test_pull_rejects_unsafe_name(tmp_path):
                 text=True,
             )
         assert "InvalidName" in result.stderr or "InvalidName" in result.stdout
-        assert not (model_root / "predictors" / unsafe / "tabular_model.json").exists()
+        assert not (model_root / unsafe / "tabular_model.json").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +315,7 @@ def test_convert_tree_model_predicts(api, framework, tmp_path):
             "convert",
             str(model_path),
             "-o",
-            str(model_root / "predictors" / model_name),
+            str(model_root / model_name),
             "--framework",
             framework,
         ],
@@ -364,7 +364,7 @@ def test_convert_onnx_linear_regressor_predicts(api, tmp_path):
             "convert",
             str(model_path),
             "-o",
-            str(model_root / "predictors" / model_name),
+            str(model_root / model_name),
             "--framework",
             "onnx",
         ],
@@ -389,7 +389,7 @@ def test_convert_rejects_unknown_framework(tmp_path):
             "convert",
             str(model_path),
             "-o",
-            str(model_root / "predictors" / "sk"),
+            str(model_root / "sk"),
             "--framework",
             "sklearn",
         ],
@@ -422,7 +422,7 @@ def test_convert_malformed_xgboost_does_not_crash_server(base_url, tmp_path):
             "convert",
             str(model_path),
             "-o",
-            str(model_root / "predictors" / "bad-xgb"),
+            str(model_root / "bad-xgb"),
             "--framework",
             "xgboost",
         ],
@@ -518,7 +518,7 @@ def test_hostile_int_does_not_crash_loader(base_url, tmp_path):
                 f"{origin}/tabular_model.json",
                 "--name",
                 "hostile",
-                "--models-dir",
+                "--ml-dir",
                 str(model_root),
             ],
             cwd=REPO_ROOT,

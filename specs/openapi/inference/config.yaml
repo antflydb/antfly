@@ -1391,6 +1391,14 @@ components:
 
             Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
           example: "~/.antfly/inference/models"
+        ml_dir:
+          type: string
+          description: |
+            Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*`
+            API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`.
+
+            Defaults to ~/.antfly/inference/ml.
+          example: "~/.antfly/inference/ml"
         content_security:
           $ref: "../shared/scraping.yaml#/components/schemas/ContentSecurityConfig"
           description: "Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts."

@@ -5593,9 +5593,9 @@ paths:
       description: >
         Returns the Traditional ML predictor catalog for `/ml/v1/predict`.
 
-        Predictors are loaded from `<models_dir>/predictors/<name>/` and exposed
+        Predictors are loaded from `<ml_dir>/<name>/` and exposed separately
 
-        separately from the AI model catalog.
+        from the AI model catalog.
       operationId: listPredictors
       responses:
         '200':
@@ -5616,9 +5616,9 @@ paths:
       description: >
         Run a tabular predictor (tree ensemble, linear, or SVM) on a batch of
 
-        feature vectors. Models are loaded from `<models_dir>/predictors/<name>/`
+        feature vectors. Models are loaded from `<ml_dir>/<name>/` and
 
-        and identified by name. Use `/ml/v1/models` for the list of available
+        identified by name. Use `/ml/v1/models` for the list of available
 
         predictors and their feature schemas.
       operationId: predict

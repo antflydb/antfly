@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Walks `~/.antfly/inference/predictors/<name>/tabular_model.json` and
+//! Walks `~/.antfly/inference/ml/<name>/tabular_model.json` and
 //! registers each discovered model with the registry. Seeds the builtin
 //! iris classifier from `builtin/models/iris-classifier/` on first run.
 

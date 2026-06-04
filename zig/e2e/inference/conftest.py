@@ -21,8 +21,9 @@ Usage:
     # Start server automatically:
     ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/inference pytest e2e/inference
 
-    # Custom models directory:
+    # Custom AI and ML directories:
     ANTFLY_INFERENCE_MODELS_DIR=/path/to/models uv run --project e2e/inference pytest e2e/inference
+    ANTFLY_INFERENCE_ML_DIR=/path/to/ml uv run --project e2e/inference pytest e2e/inference
 
     # Lazily pull missing models with a local antfly binary (opt-in):
     ANTFLY_INFERENCE_DOWNLOAD=1 uv run --project e2e/inference pytest e2e/inference
@@ -40,7 +41,7 @@ import time
 import pytest
 import requests
 
-from .models import bootstrap_models_for_listing, inference_command, maybe_pull_missing_model, models_dir
+from .models import bootstrap_models_for_listing, inference_command, maybe_pull_missing_model, ml_dir, models_dir
 
 API_PREFIX = "/ai/v1"
 ML_API_PREFIX = "/ml/v1"
@@ -90,10 +91,21 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
 class InferenceServer:
     """Manages a local inference server process."""
 
-    def __init__(self, command_prefix: list[str], models_path: str, host: str, port: int):
+    def __init__(self, command_prefix: list[str], models_path: str, ml_path: str, host: str, port: int):
         self.url = f"http://{host}:{port}"
         self.proc = subprocess.Popen(
-            [*command_prefix, "run", "--host", host, "--port", str(port), "--models-dir", models_path],
+            [
+                *command_prefix,
+                "run",
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--models-dir",
+                models_path,
+                "--ml-dir",
+                ml_path,
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
@@ -136,9 +148,10 @@ def base_url():
         pytest.skip("Set ANTFLY_INFERENCE_URL or ANTFLY_BIN to run E2E tests")
 
     models_path = str(models_dir())
+    ml_path = str(ml_dir())
 
     port = find_free_port()
-    server = InferenceServer(command_prefix, models_path, "127.0.0.1", port)
+    server = InferenceServer(command_prefix, models_path, ml_path, "127.0.0.1", port)
     yield server.url
     server.stop()
 

@@ -70,7 +70,7 @@ writing the IR.
 
 ## Serving
 
-Models are auto-discovered from `~/.antfly/inference/predictors/<name>/`.
+Models are auto-discovered from `~/.antfly/inference/ml/<name>/`.
 On first run a built-in iris classifier is seeded (`@embedFile`-backed) so
 the catalog is non-empty even on a fresh install.
 
@@ -94,6 +94,10 @@ Install hosted IRs with the CLI:
 antfly inference pull https://example.com/models/iris/tabular_model.json \
   --name iris-classifier
 ```
+
+Use `--ml-dir <dir>` or `ANTFLY_INFERENCE_ML_DIR` to override the ML predictor
+root. `--models-dir` / `ANTFLY_INFERENCE_MODELS_DIR` remains reserved for the
+AI model bundle catalog used by `/ai/v1/*`.
 
 Limits: max batch 10 000 rows, max pull 50 MB. Names are restricted to
 `[A-Za-z0-9_-]+`. The HTTP API does not accept model uploads; conversion and
@@ -147,7 +151,7 @@ Engine layer (`lib/ml/tabular/`) — **complete and tested.**
 Service layer (`pkg/inference/src/tabular/`) — **fully wired, tested end-to-end.**
 - `registry.zig` — TTL-based eviction + atomic ref-count + orphan-on-evict;
   predictor lifetime owned by the IR arena (no leak under load/evict)
-- `discovery.zig` — scans `<models-dir>/predictors/<name>/tabular_model.json`,
+- `discovery.zig` — scans `<ml-dir>/<name>/tabular_model.json`,
   seeds the builtin iris classifier via `@embedFile`
 - `manifest.zig` — optional `model_manifest.json` reader
 - `http.zig` — predict handler logic
@@ -164,5 +168,5 @@ End-to-end coverage:
 - `zig build fuzz-tabular-loader` — loader fuzz target
 - `e2e/inference/test_tabular.py` — Python pytest suite that spins up a
   real `antfly inference run`, runs the iris classifier end-to-end, and
-  trains + converts + predicts XGBoost / LightGBM models against the
-  source framework, plus an ONNX-ML linear-regressor conversion path.
+  converts + predicts tiny XGBoost / LightGBM fixtures, plus an ONNX-ML
+  linear-regressor conversion path.
