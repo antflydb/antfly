@@ -1,69 +1,65 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.transform_op_type import TransformOpType
-from ..types import UNSET, Unset
-
-T = TypeVar("T", bound="TransformOp")
+T = TypeVar("T", bound="InferencePredictRequest")
 
 
 @_attrs_define
-class TransformOp:
+class InferencePredictRequest:
     """
     Attributes:
-        op (TransformOpType): MongoDB-style update operator
-        path (str): JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name") Example: $.views.
-        value (Any | Unset): Value for operation (not required for $unset, $currentDate). Type depends on operator
-            (number for $inc/$mul, any for $set/$setOnInsert, etc.)
+        model (str): Predictor name from the model catalog.
+        input_ (list[list[float]]): Batch of feature vectors. Max 10000 rows.
     """
 
-    op: TransformOpType
-    path: str
-    value: Any | Unset = UNSET
+    model: str
+    input_: list[list[float]]
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        op = self.op.value
+        model = self.model
 
-        path = self.path
+        input_ = []
+        for input_item_data in self.input_:
+            input_item = input_item_data
 
-        value = self.value
+            input_.append(input_item)
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "op": op,
-                "path": path,
+                "model": model,
+                "input": input_,
             }
         )
-        if value is not UNSET:
-            field_dict["value"] = value
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        op = TransformOpType(d.pop("op"))
+        model = d.pop("model")
 
-        path = d.pop("path")
+        input_ = []
+        _input_ = d.pop("input")
+        for input_item_data in _input_:
+            input_item = cast(list[float], input_item_data)
 
-        value = d.pop("value", UNSET)
+            input_.append(input_item)
 
-        transform_op = cls(
-            op=op,
-            path=path,
-            value=value,
+        inference_predict_request = cls(
+            model=model,
+            input_=input_,
         )
 
-        transform_op.additional_properties = d
-        return transform_op
+        inference_predict_request.additional_properties = d
+        return inference_predict_request
 
     @property
     def additional_keys(self) -> list[str]:

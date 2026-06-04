@@ -14811,9 +14811,13 @@ components:
       properties:
         model:
           type: string
+          minLength: 1
+          maxLength: 128
+          pattern: ^[A-Za-z0-9_-]+$
           description: Predictor name from the model catalog.
         input:
           type: array
+          maxItems: 10000
           description: Batch of feature vectors. Max 10000 rows.
           items:
             type: array
