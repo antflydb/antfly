@@ -193,6 +193,7 @@ export type {
   MergeProfile,
   MultiBatchRequest,
   MultiBatchResult,
+  PathWeightMode,
   Permission,
   PermissionType,
   // Query Builder Agent types

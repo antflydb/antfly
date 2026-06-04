@@ -57,6 +57,7 @@ import AggregationResults from "../components/AggregationResults";
 import AIQueryAssistant from "../components/AIQueryAssistant";
 import CreateIndexDialog from "../components/CreateIndexDialog";
 import DocumentBuilder from "../components/DocumentBuilder";
+import { GraphIndexExplorer } from "../components/GraphIndexExplorer";
 
 import BulkInsert from "../components/Insert";
 import JsonViewer from "../components/JsonViewer";
@@ -586,6 +587,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
     indexes: "Indexes",
     schema: "Schema",
     semantic: "Search",
+    graph: "Graph Explorer",
     faceted: "Component Builder",
     bulk: "Upload",
     "document-builder": "Document Builder",
@@ -908,6 +910,15 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
               </Card>
             )}
           </div>
+        )}
+
+        {/* Graph Explorer Section */}
+        {currentSection === "graph" && tableName && (
+          <GraphIndexExplorer
+            tableName={tableName}
+            indexes={indexes}
+            onRefreshIndexes={fetchIndexes}
+          />
         )}
 
         {/* SearchBox Builder Section */}
