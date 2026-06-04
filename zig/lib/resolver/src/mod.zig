@@ -19,7 +19,8 @@
 //!
 //!   * deterministic: render a canonical key from the mention via `key_template`
 //!     ("mint a new entity"); this is pure and needs no global state, so the
-//!     graph works even before the entity document exists.
+//!     resolution artifact can be replayed consistently before the entity
+//!     document exists.
 //!   * scored: when candidates are supplied (the blocking/candidate-fetch step
 //!     lives in the DB integration layer), score the mention against each with
 //!     the `matcher` scorer and link to the best MATCH; otherwise fall back to

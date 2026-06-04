@@ -39,7 +39,6 @@ else
 const chunk_artifact_mod = @import("../../../chunking/chunk.zig");
 const chunking_types_mod = @import("../../../chunking/types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
-const resolver_lib = @import("antfly_resolver");
 const ownership_mod = @import("../ownership.zig");
 const types = @import("../types.zig");
 const platform_clock = @import("../../../platform/clock.zig");
@@ -1512,28 +1511,7 @@ fn materializeGraphAssetForRuntime(
             }
             writes.deinit(runtime.alloc);
         }
-        // Provenance: doc->entity mention edges (resolved canonical keys),
-        // keyed and tracked alongside the relation edges so they share
-        // replace-on-rerender and delete-on-source-delete semantics.
-        const mention_writes: []types.GraphEdgeWrite = if (source.mention_edge_type.len > 0)
-            try runtimeMentionEdgeWritesAlloc(runtime, graph_entry.config.name, request.doc_key, value, source.mention_edge_type, artifact_name)
-        else
-            &.{};
-        defer runtimeFreeGraphWrites(runtime.alloc, mention_writes);
-
         for (graph_writes) |write| {
-            const key = try internal_keys.graphEdgeArtifactKeyAlloc(runtime.alloc, write.source, write.index_name, write.edge_type, write.target);
-            var key_owned = true;
-            errdefer if (key_owned) runtime.alloc.free(key);
-            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(runtime.alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
-            var payload_owned = true;
-            errdefer if (payload_owned) runtime.alloc.free(payload);
-            try writes.append(runtime.alloc, .{ .key = key, .value = payload });
-            key_owned = false;
-            payload_owned = false;
-            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
-        }
-        for (mention_writes) |write| {
             const key = try internal_keys.graphEdgeArtifactKeyAlloc(runtime.alloc, write.source, write.index_name, write.edge_type, write.target);
             var key_owned = true;
             errdefer if (key_owned) runtime.alloc.free(key);
@@ -1562,12 +1540,15 @@ fn materializeGraphAssetForRuntime(
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
             }
         } else {
+            const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
+            defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
             const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
             defer runtime.alloc.free(prefix);
             const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
             defer backend_scan.freeResults(runtime.alloc, existing);
             for (existing) |entry| {
                 if (runtimeContainsKVKey(writes.items, entry.key)) continue;
+                if (runtimeContainsConstKey(protected_keys, entry.key)) continue;
                 try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, entry.key);
             }
@@ -1615,11 +1596,14 @@ fn materializeGraphAssetDeleteForRuntime(
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
             }
         } else {
+            const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
+            defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
             const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
             defer runtime.alloc.free(prefix);
             const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
             defer backend_scan.freeResults(runtime.alloc, existing);
             for (existing) |entry| {
+                if (runtimeContainsConstKey(protected_keys, entry.key)) continue;
                 try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, entry.key);
             }
@@ -1637,6 +1621,13 @@ fn materializeGraphAssetDeleteForRuntime(
 fn runtimeContainsKVKey(items: []const KVPair, key: []const u8) bool {
     for (items) |item| {
         if (std.mem.eql(u8, item.key, key)) return true;
+    }
+    return false;
+}
+
+fn runtimeContainsConstKey(items: []const []const u8, key: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, key)) return true;
     }
     return false;
 }
@@ -1672,71 +1663,6 @@ fn runtimeGraphWritesFromArtifactValueAlloc(
     }
 
     return try writes.toOwnedSlice(alloc);
-}
-
-/// Build `doc -> entity` mention edges (provenance) for the extracted mentions
-/// in `extraction_raw`. The target is the canonical entity key the resolver that
-/// consumes `artifact_name` would render via its `key_template` -- deterministic
-/// from the mention text, so it works even before the entity is promoted (the
-/// entity node hydrates only once the entity document exists; missing entities
-/// fail closed at query time). Returns an empty slice if no resolver consumes
-/// the artifact.
-fn runtimeMentionEdgeWritesAlloc(
-    runtime: *EnrichmentRuntime,
-    index_name: []const u8,
-    doc_key: []const u8,
-    extraction_raw: []const u8,
-    mention_edge_type: []const u8,
-    artifact_name: []const u8,
-) ![]types.GraphEdgeWrite {
-    var resolver_cfg: ?*const index_manager_mod.ResolverConfig = null;
-    for (runtime.index_manager.resolvers.items) |*cfg| {
-        if (std.mem.eql(u8, cfg.source_artifact, artifact_name)) {
-            resolver_cfg = cfg;
-            break;
-        }
-    }
-    const cfg = resolver_cfg orelse return &.{};
-
-    var resolver = try resolver_lib.Resolver.initFromParts(
-        runtime.alloc,
-        cfg.table,
-        cfg.key_template,
-        cfg.type_must_match,
-        cfg.scorer_json,
-    );
-    defer resolver.deinit();
-
-    var parsed = resolver_lib.parseExtractionEntities(runtime.alloc, extraction_raw) catch return &.{};
-    defer parsed.deinit();
-
-    var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
-    errdefer runtimeFreeGraphWrites(runtime.alloc, writes.items);
-    for (parsed.entities) |entity| {
-        const key = resolver.renderKeyAlloc(runtime.alloc, entity) catch continue;
-        defer runtime.alloc.free(@constCast(key));
-        if (key.len == 0) continue;
-        // One mention edge per distinct entity even if mentioned repeatedly.
-        var duplicate = false;
-        for (writes.items) |existing| {
-            if (std.mem.eql(u8, existing.target, key)) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (duplicate) continue;
-        const metadata = try std.fmt.allocPrint(runtime.alloc, "{{\"target_table\":{f}}}", .{std.json.fmt(cfg.table, .{})});
-        errdefer runtime.alloc.free(metadata);
-        try writes.append(runtime.alloc, .{
-            .index_name = try runtime.alloc.dupe(u8, index_name),
-            .source = try runtime.alloc.dupe(u8, doc_key),
-            .target = try runtime.alloc.dupe(u8, key),
-            .edge_type = try runtime.alloc.dupe(u8, mention_edge_type),
-            .weight = cfg.fusedMentionWeight(entity.confidence),
-            .metadata_json = metadata,
-        });
-    }
-    return try writes.toOwnedSlice(runtime.alloc);
 }
 
 fn runtimeFreeGraphWrites(alloc: Allocator, writes: []types.GraphEdgeWrite) void {
@@ -3337,6 +3263,42 @@ fn graphAssetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []
     try internal_keys.appendEncodedComponent(&list, alloc, index_name);
     try internal_keys.appendEncodedComponent(&list, alloc, artifact_name);
     return try list.toOwnedSlice(alloc);
+}
+
+fn runtimeMentionGraphStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mentions\x1f{s}", .{ source_artifact, resolution_artifact });
+}
+
+fn runtimeResolutionMentionStateKeysForGraphSourceAlloc(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    index_name: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+) ![][]const u8 {
+    if (source.mention_edge_type.len == 0) return try runtime.alloc.alloc([]const u8, 0);
+
+    var protected = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (protected.items) |key| runtime.alloc.free(@constCast(key));
+        protected.deinit(runtime.alloc);
+    }
+
+    for (runtime.index_manager.resolvers.items) |cfg| {
+        if (!std.mem.eql(u8, cfg.source_artifact, source.artifact_name)) continue;
+
+        const state_name = try runtimeMentionGraphStateNameAlloc(runtime.alloc, source.artifact_name, cfg.resolution_artifact);
+        defer runtime.alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(runtime.alloc, doc_key, index_name, state_name);
+        defer runtime.alloc.free(state_key);
+
+        const state_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key) orelse continue;
+        defer freeOwnedConstKeySlice(runtime.alloc, state_keys);
+        for (state_keys) |key| {
+            try protected.append(runtime.alloc, try runtime.alloc.dupe(u8, key));
+        }
+    }
+
+    return try protected.toOwnedSlice(runtime.alloc);
 }
 
 fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, writes: []const KVPair) ![]u8 {

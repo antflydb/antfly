@@ -11304,10 +11304,10 @@ pub const GraphArtifactSource = struct {
     path: []u8 = "",
     format: GraphArtifactFormat = .extraction_relation,
     mapping: GraphArtifactMapping = .{},
-    /// When set, the materializer also emits `doc --<mention_edge_type>--> entity`
-    /// provenance edges: one per extracted mention, targeting the canonical
-    /// entity key rendered by the resolver that consumes the same source
-    /// artifact. Empty disables mention-edge provenance.
+    /// When set, resolution-artifact replay emits
+    /// `doc --<mention_edge_type>--> entity` provenance edges for canonical
+    /// resolver decisions, targeting the resolved DocRef key. Empty disables
+    /// mention-edge provenance.
     mention_edge_type: []u8 = "",
 
     pub fn clone(alloc: Allocator, source: GraphArtifactSource) !GraphArtifactSource {

@@ -355,14 +355,14 @@ promoter:
   resolution artifact -> entity document upserts
 
 graph materializer:
-  extraction artifact + optional resolution artifact -> graph edge artifacts
+  extraction artifacts + resolution artifacts -> graph edge artifacts
 ```
 
 The resolver decides identity, such as mapping local `e0` to
 `entities/person/ada_lovelace`. The promoter performs the durable entity
-document writes and provenance updates. The graph materializer remains
-responsible only for rendering resolved or unresolved endpoints into graph edge
-artifact rows.
+document writes. The graph materializer remains responsible for rendering
+extracted relation endpoints and resolution-backed provenance endpoints into
+graph edge artifact rows.
 
 Extraction artifacts remain source-document local:
 

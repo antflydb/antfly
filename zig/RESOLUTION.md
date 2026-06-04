@@ -341,17 +341,19 @@ The promoter turns resolution decisions into durable entity state.
 
 ### Deterministic resolver makes the promoter optional in phase 1
 
-A deterministic `key_template` computes the canonical key **purely from
-extracted text** -- no global state. Consequence: the materializer can write
-edges pointing at `entities/person/ada_lovelace` even before that entity
-document exists, as long as the resolution decision is canonical (`new` or
-`match`). `review` decisions are deliberately not canonical: they remain durable
-in the resolution artifact and review queue, but they do not create entity
-documents or ordinary doc->entity provenance edges until a curator override
-re-resolves them. So in phase 1 the **graph works end-to-end without the
-promoter** for canonical decisions; the promoter's job is to make those
-canonical docs exist for hydration, search, and display. This de-risks the first
-ship without leaking unresolved review state into the canonical graph.
+A deterministic `key_template` computes a fallback canonical key **purely from
+extracted text** -- no global state. The resolver still records that decision in
+a durable resolution artifact, and the graph materializer emits provenance only
+by replaying that artifact. Consequence: canonical `new` or `match` decisions can
+produce `doc -> entity` edges before the entity document exists, but their target
+is always the resolved DocRef, not a speculative extraction-time render. `review`
+decisions are deliberately not canonical: they remain durable in the resolution
+artifact and review queue, but they do not create entity documents or ordinary
+doc->entity provenance edges until a curator override re-resolves them. So in
+phase 1 the **graph works end-to-end without the promoter** for canonical
+decisions; the promoter's job is to make those canonical docs exist for
+hydration, search, and display. This de-risks the first ship without leaking
+unresolved review state into the canonical graph.
 
 ### Cross-shard placement
 
@@ -628,12 +630,13 @@ Open/index/enrichment validation should reject:
          index config (top-level or nested in an index) is registered by the
          provisioner on both the reconcile and create-local paths.
    - [x] Provenance as inbound mention edges: a graph index whose artifact
-         source sets `mention_edge_type` emits `doc -> entity` edges to the
-         canonical key the resolver renders (deterministic, so the edge exists
-         pre-promotion). "Which documents mention this entity" == the entity's
-         inbound edges. Implemented in both materializer paths (sync db.zig +
-         async enrichment_runtime); inherits replace-on-rerender and
-         delete-on-source-delete from the graph-edge-artifact machinery.
+         source sets `mention_edge_type` emits `doc -> entity` edges from
+         resolution artifact replay, targeting the resolved DocRef for canonical
+         `new`/`match` decisions. "Which documents mention this entity" == the
+         entity's inbound edges. Implemented in the durable graph materializer;
+         extraction-time graph materialization stays relation-only so prefix/ANN
+         matches, curator overrides, and merge rewrites do not leave speculative
+         mention edges behind.
    - [x] Fail-closed hydration: a graph node whose document is not present
          (entity not yet promoted, or a cross-table entity key) hydrates to
          nothing rather than being fabricated or erroring -- the storage path
@@ -641,7 +644,7 @@ Open/index/enrichment validation should reject:
          path skips the missing key. Verified by a db-test.
    - [x] `DocRef` endpoints threaded through graph edge artifacts: mention edges
          record the resolved target table (`{"target_table":...}` in edge
-         metadata, both materializer paths). Graph traversal now surfaces that
+         metadata). Graph traversal now surfaces that
          endpoint per result node (`traversal.TraversalResult.target_table` ->
          `query.GraphResultNode.table`, preserved across the api wire/clone
          paths), and the distributed hydrate coordinator buckets result nodes by
@@ -736,9 +739,8 @@ Open/index/enrichment validation should reject:
          backfill; legacy asset markers are repaired and replayed).
    - [x] Eager edge rewrite on merge: `DB.rewriteEntityEdges` repoints every
          inbound edge of the merged-away entity at the survivor (preserving type,
-         weight, metadata), so provenance mention edges -- which target the
-         deterministic template key and don't follow `merged_into` on their own
-         -- come into line with a merge. Verified by a db-test.
+         weight, metadata), so already-materialized provenance mention edges come
+         into line with a merge. Verified by a db-test.
 
 ## Test Plan
 

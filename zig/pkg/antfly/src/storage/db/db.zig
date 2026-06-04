@@ -5953,9 +5953,9 @@ pub const DB = struct {
 
     /// Eager edge rewrite for an entity merge: repoint every inbound edge of
     /// `old_key` (the merged-away entity) at `new_key` (the survivor) in the
-    /// given graph index, preserving edge type, weight, and metadata. Provenance
-    /// mention edges target the deterministic template key, so they do not follow
-    /// `merged_into` on their own; this brings the graph in line with a merge.
+    /// given graph index, preserving edge type, weight, and metadata. Already
+    /// materialized provenance mention edges do not follow `merged_into` on their
+    /// own; this brings the graph in line with a merge.
     /// Returns the number of edges rewritten.
     pub fn rewriteEntityEdges(
         self: *DB,
@@ -13453,11 +13453,14 @@ fn appendPrecomputedGraphSourceArtifactKey(
                 try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, previous_key);
             }
         } else {
+            const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(self.alloc, self.core.store, self.core.index_manager, artifact_ref.document_id, graph_entry.config.name, source);
+            defer freeOwnedConstKeySlice(self.alloc, protected_keys);
             const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, artifact_ref.document_id, graph_entry.config.name);
             defer docstore_mod.DocStore.freeResults(self.alloc, existing);
             for (existing) |entry| {
                 if (containsStoreWriteKey(graph_store_writes.items, entry.key)) continue;
                 if (containsOwnedKey(owned_delete_keys.items, entry.key)) continue;
+                if (containsDeleteKey(protected_keys, entry.key)) continue;
                 const owned_key = try self.alloc.dupe(u8, entry.key);
                 try owned_delete_keys.append(self.alloc, owned_key);
                 try delete_keys.append(self.alloc, owned_key);
@@ -16864,10 +16867,13 @@ fn materializeGraphSourceArtifactsForIndex(
                 try appendUniqueOwnedKey(alloc, &changed, previous_key);
             }
         } else {
+            const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source);
+            defer freeOwnedConstKeySlice(alloc, protected_keys);
             const existing = try collectGraphArtifactsForDocIndex(alloc, store, artifact_ref.document_id, index_name);
             defer docstore_mod.DocStore.freeResults(alloc, existing);
             for (existing) |entry| {
                 if (containsStoreWriteKey(writes.items, entry.key)) continue;
+                if (containsDeleteKey(protected_keys, entry.key)) continue;
                 try deletes.append(alloc, try alloc.dupe(u8, entry.key));
                 try appendUniqueOwnedKey(alloc, &changed, entry.key);
             }
@@ -17008,6 +17014,40 @@ fn resolverConfigForResolution(
 
 fn mentionGraphStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mentions\x1f{s}", .{ source_artifact, resolution_artifact });
+}
+
+fn resolutionMentionStateKeysForGraphSourceAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    doc_key: []const u8,
+    index_name: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+) ![][]const u8 {
+    if (source.mention_edge_type.len == 0) return try alloc.alloc([]const u8, 0);
+
+    var protected = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (protected.items) |key| alloc.free(@constCast(key));
+        protected.deinit(alloc);
+    }
+
+    for (index_manager.resolvers.items) |cfg| {
+        if (!std.mem.eql(u8, cfg.source_artifact, source.artifact_name)) continue;
+
+        const state_name = try mentionGraphStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
+        defer alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(alloc, doc_key, index_name, state_name);
+        defer alloc.free(state_key);
+
+        const state_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key) orelse continue;
+        defer freeOwnedConstKeySlice(alloc, state_keys);
+        for (state_keys) |key| {
+            try protected.append(alloc, try alloc.dupe(u8, key));
+        }
+    }
+
+    return try protected.toOwnedSlice(alloc);
 }
 
 fn loadSourceExtractionForResolution(
@@ -24846,8 +24886,8 @@ test "db materializes doc->entity mention edges as provenance and clears them on
     defer db.close();
 
     // The graph index materializes the relations_v1 extraction asset and, with
-    // mention_edge_type set, emits doc->entity provenance edges to the canonical
-    // entity keys the resolver renders.
+    // mention_edge_type set, emits doc->entity provenance edges from the durable
+    // resolution artifact.
     try db.addIndex(.{
         .name = "prov_graph",
         .kind = .graph,
@@ -25194,7 +25234,7 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
     });
     try db.runUntilIdle();
 
-    // The mention edge points at the deterministic template key.
+    // The mention edge points at the resolved DocRef from the resolution artifact.
     {
         const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
@@ -25860,6 +25900,108 @@ test "db async asset producer graph source materializes through replay" {
     try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"content_type\":\"application/json\"") != null);
 }
 
+test "db async asset producer mention edges come from resolution artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{
+        .extractor_output =
+        \\{"entities":[{"id":"e0","label":"person","text":"A. Lovelace"}],"relations":[]}
+        ,
+    };
+    var embedder = FixedVectorEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+        .resolution_embedder = embedder.interface(),
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]",
+        \\    "format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .name_embedding = "name",
+        .name_embedding_dims = 4,
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "emb", "left": "name_embedding", "right": "name_embedding",
+        \\  "levels": [ { "when": "cosine > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    });
+
+    const entity_doc_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(entity_doc_key);
+    try db.core.store.put(entity_doc_key,
+        \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [1.0, 0.0, 0.0, 0.0] }
+    );
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"Ada mention\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try std.testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+
+    const edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"target_table\":\"entities\"") != null);
+
+    const deterministic_edges = try db.getEdges(alloc, "prov_graph", "person/a_lovelace", "mentions", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, deterministic_edges);
+    try std.testing.expectEqual(@as(usize, 0), deterministic_edges.len);
+
+    const relation_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "prov_graph", "relations_v1");
+    defer alloc.free(relation_state_key);
+    try db.core.store.delete(relation_state_key);
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    const changed = try materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph");
+    defer freeOwnedKeySlice(alloc, changed);
+
+    const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
+    defer alloc.free(graph_edge_key);
+    const edge_raw = try db.core.store.get(alloc, graph_edge_key);
+    defer alloc.free(edge_raw);
+}
+
 test "db graph artifact source replay catches up after reopen" {
     const alloc = std.testing.allocator;
 
@@ -26288,6 +26430,7 @@ const TestAssetProducer = struct {
     reader_calls: usize = 0,
     transcriber_calls: usize = 0,
     extractor_calls: usize = 0,
+    extractor_output: ?[]const u8 = null,
 
     fn producer(self: *@This()) asset_producer_mod.Producer {
         return .{
@@ -26307,6 +26450,7 @@ const TestAssetProducer = struct {
             .extractor => self.extractor_calls += 1,
         }
         if (request.producer_type == .extractor) {
+            if (self.extractor_output) |output| return try alloc.dupe(u8, output);
             return try std.fmt.allocPrint(alloc, "{{\"relations\":[{{\"type\":\"mentions\",\"target\":{{\"document_id\":{f}}}}}]}}", .{std.json.fmt(request.source_text, .{})});
         }
         return try std.fmt.allocPrint(alloc, "{s}:{s}", .{ @tagName(request.producer_type), request.source_text });
