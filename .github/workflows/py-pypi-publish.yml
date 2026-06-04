@@ -1,12 +1,12 @@
 name: Publish Python 🐍 distribution 📦 to PyPI and TestPyPI
 
-# Trigger on py-prefixed version tags only:
-# - py-v1.2.3       → publishes to PyPI
-# - py-v1.2.3-test1 → publishes to TestPyPI
+# Trigger on Python SDK version tags only:
+# - py/antfly/sdk/v1.2.3       → publishes to PyPI
+# - py/antfly/sdk/v1.2.3-test1 → publishes to TestPyPI
 on:
   push:
     tags:
-      - 'py-v*'
+      - 'py/antfly/sdk/v*'
 
 jobs:
   build:
@@ -36,7 +36,7 @@ jobs:
     name: >-
       Publish Python 🐍 distribution 📦 to PyPI
     # Only publish release tags (no -test suffix)
-    if: startsWith(github.ref, 'refs/tags/py-v') && !contains(github.ref, '-test')
+    if: startsWith(github.ref, 'refs/tags/py/antfly/sdk/v') && !contains(github.ref, '-test')
     needs:
       - build
     runs-on: ubuntu-latest
