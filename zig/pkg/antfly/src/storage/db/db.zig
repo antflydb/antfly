@@ -6838,33 +6838,40 @@ pub const DB = struct {
         try replayPendingDerivedBatches(self, progress_ctx, progress_hook);
     }
 
-    pub fn runUntilIdle(self: *DB) !void {
+    const run_until_idle_max_replay_rounds: usize = 16;
+
+    fn currentMaintenanceTargetSequence(self: *DB) u64 {
         var target_sequence = self.core.nextDerivedSequence();
         if (self.enrichment_runtime) |runtime| {
             target_sequence = @max(target_sequence, runtime.stats().target_sequence);
         }
-        try self.runMaintenanceUntil(target_sequence, .{});
-        if (self.resolution_runtime) |runtime| {
-            // Drive to the latest produced sequence (extraction artifacts may
-            // have been appended above), then drain.
-            const latest = self.core.nextDerivedSequence();
-            if (latest > 0) runtime.notifySequence(latest - 1);
-            try runtime.catchUp();
-            // Resolution catch-up can journal resolution artifacts that drive
-            // graph provenance materialization. Drain those graph records before
-            // declaring the DB idle.
-            const post_resolution_latest = self.core.nextDerivedSequence();
-            if (post_resolution_latest > latest) {
-                try self.runMaintenanceUntil(post_resolution_latest, .{});
+        return target_sequence;
+    }
+
+    fn drainReplayStagesUntilStable(self: *DB) !void {
+        var rounds: usize = 0;
+        while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
+            try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
+            const drained_sequence = self.core.nextDerivedSequence();
+
+            if (self.resolution_runtime) |runtime| {
+                if (drained_sequence > 0) runtime.notifySequence(drained_sequence - 1);
+                try runtime.catchUp();
             }
+
+            if (self.promotion_runtime) |runtime| {
+                const latest = self.core.nextDerivedSequence();
+                if (latest > 0) runtime.notifySequence(latest - 1);
+                try runtime.catchUp();
+            }
+
+            if (self.core.nextDerivedSequence() <= drained_sequence) return;
         }
-        if (self.promotion_runtime) |runtime| {
-            // Resolution catch-up above journals resolution artifacts; drive the
-            // promoter to the new latest sequence so it upserts their entities.
-            const latest = self.core.nextDerivedSequence();
-            if (latest > 0) runtime.notifySequence(latest - 1);
-            try runtime.catchUp();
-        }
+        return error.RunUntilIdleDidNotConverge;
+    }
+
+    pub fn runUntilIdle(self: *DB) !void {
+        try self.drainReplayStagesUntilStable();
         _ = try self.evaluateAlgebraicAdaptiveCandidates();
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
@@ -17819,7 +17826,6 @@ fn truncateReplayLogs(ctx: *const BatchExecutionContext, up_to_sequence: u64) !v
 }
 
 fn resolverReplayRetentionRequired(index_manager: *const index_manager_mod.IndexManager, stats: types.ReplayStageStats) bool {
-    if (!stats.catch_up_required and !stats.blocked) return false;
     if (stats.blocked) return true;
     return index_manager.resolvers.items.len > 0;
 }
@@ -17837,10 +17843,11 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     var effective = sequence;
     // The resolution/promotion stages consume the replay journal but are not
-    // executor workers. Clamp truncation while a configured resolver pipeline is
-    // behind, or whenever a stage has reached a real blocked state. Resolver
-    // removal drains or refuses pending stage work before deleting catalog state,
-    // so a never-configured resolver pipeline does not pin generic replay hints.
+    // executor workers. Clamp truncation to their applied watermarks whenever a
+    // resolver is configured, even before the synchronous driver has raised the
+    // stage target for the newest write. Resolver removal drains or refuses
+    // pending stage work before deleting catalog state, so a never-configured
+    // resolver pipeline does not pin generic replay hints.
     if (ctx.resolution_runtime) |runtime| {
         effective = clampReplayTruncationForReplayStage(effective, ctx.index_manager, runtime.stats());
     }
@@ -24918,6 +24925,24 @@ test "db materializes doc->entity mention edges as provenance and clears them on
         .sync_level = .enrichments,
     });
     try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    {
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"decision\":\"new\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "org/antfly") != null);
+    }
+
+    const ada_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
+    defer alloc.free(ada_edge_key);
+    {
+        const raw = try db.core.store.get(alloc, ada_edge_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"target_table\":\"entities\"") != null);
+    }
 
     // Outbound: doc:a mentions both canonical entities.
     {
