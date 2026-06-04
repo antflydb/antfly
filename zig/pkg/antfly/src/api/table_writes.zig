@@ -554,6 +554,25 @@ pub const ProvisionedTableWriteCache = struct {
         }
     };
 
+    fn cloneTableMetadataAlloc(
+        self: *ProvisionedTableWriteCache,
+        table_name: []const u8,
+        indexes_json: ?[]const u8,
+        schema_json: ?[]const u8,
+    ) !TableMetadata {
+        const owned_table_name = try self.alloc.dupe(u8, table_name);
+        errdefer self.alloc.free(owned_table_name);
+        const owned_indexes_json = if (indexes_json) |value| try self.alloc.dupe(u8, value) else null;
+        errdefer if (owned_indexes_json) |value| self.alloc.free(value);
+        const owned_schema_json = if (schema_json) |value| try self.alloc.dupe(u8, value) else null;
+        errdefer if (owned_schema_json) |value| self.alloc.free(value);
+        return .{
+            .table_name = owned_table_name,
+            .indexes_json = owned_indexes_json,
+            .schema_json = owned_schema_json,
+        };
+    }
+
     pub fn init(alloc: std.mem.Allocator) ProvisionedTableWriteCache {
         return .{ .alloc = alloc };
     }
@@ -1422,34 +1441,56 @@ pub const ProvisionedTableWriteCache = struct {
         removed.deinit(self.alloc);
     }
 
+    fn reserveDbEntryRetirementsForTableLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) !void {
+        var leased_retirements: usize = 0;
+        for (self.entries.items) |entry| {
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.active_leases > 0) leased_retirements += 1;
+        }
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, leased_retirements);
+    }
+
     fn replaceTableMetadataLocked(
         self: *ProvisionedTableWriteCache,
         table_name: []const u8,
         indexes_json: []const u8,
         schema_json: []const u8,
     ) !void {
-        var i: usize = 0;
-        while (i < self.table_metadata.items.len) {
-            if (!std.mem.eql(u8, self.table_metadata.items[i].table_name, table_name)) {
-                i += 1;
-                continue;
+        const replace_index = blk: {
+            for (self.table_metadata.items, 0..) |metadata, i| {
+                if (std.mem.eql(u8, metadata.table_name, table_name)) break :blk i;
             }
-            var removed = self.table_metadata.orderedRemove(i);
-            removed.deinit(self.alloc);
+            break :blk null;
+        };
+        if (replace_index == null) try self.table_metadata.ensureUnusedCapacity(self.alloc, 1);
+        var replacement = try self.cloneTableMetadataAlloc(table_name, indexes_json, schema_json);
+        errdefer replacement.deinit(self.alloc);
+
+        if (replace_index) |i| {
+            self.table_metadata.items[i].deinit(self.alloc);
+            self.table_metadata.items[i] = replacement;
+            return;
         }
 
         if (self.table_metadata.items.len >= max_cached_write_tables) self.evictOldestTable();
-        const owned_table_name = try self.alloc.dupe(u8, table_name);
-        errdefer self.alloc.free(owned_table_name);
-        const owned_indexes_json = try self.alloc.dupe(u8, indexes_json);
-        errdefer self.alloc.free(owned_indexes_json);
-        const owned_schema_json = try self.alloc.dupe(u8, schema_json);
-        errdefer self.alloc.free(owned_schema_json);
-        try self.table_metadata.append(self.alloc, .{
-            .table_name = owned_table_name,
-            .indexes_json = owned_indexes_json,
-            .schema_json = owned_schema_json,
-        });
+        self.table_metadata.appendAssumeCapacity(replacement);
+    }
+
+    fn installLoadedTableMetadataLocked(
+        self: *ProvisionedTableWriteCache,
+        cached_index: ?usize,
+        replacement: TableMetadata,
+    ) !*const TableMetadata {
+        if (cached_index) |i| {
+            try self.retireDbEntriesForTableLocked(replacement.table_name);
+            self.table_metadata.items[i].deinit(self.alloc);
+            self.table_metadata.items[i] = replacement;
+            return &self.table_metadata.items[i];
+        }
+
+        if (self.table_metadata.items.len >= max_cached_write_tables) self.evictOldestTable();
+        self.table_metadata.appendAssumeCapacity(replacement);
+        return &self.table_metadata.items[self.table_metadata.items.len - 1];
     }
 
     fn tableMetadataLocked(self: *const ProvisionedTableWriteCache, table_name: []const u8) ?TableMetadata {
@@ -1569,32 +1610,20 @@ pub const ProvisionedTableWriteCache = struct {
             }
         }
 
-        if (cached_index) |i| {
-            try self.retireDbEntriesForTableLocked(table_name);
-            var removed = self.table_metadata.orderedRemove(i);
-            removed.deinit(self.alloc);
+        if (cached_index != null) {
+            try self.reserveDbEntryRetirementsForTableLocked(table_name);
+        } else {
+            try self.table_metadata.ensureUnusedCapacity(self.alloc, 1);
         }
 
-        if (self.table_metadata.items.len >= max_cached_write_tables) self.evictOldestTable();
-        const owned_table_name = try self.alloc.dupe(u8, table_name);
-        errdefer self.alloc.free(owned_table_name);
+        const indexes_json = if (table) |current| current.indexes_json else null;
+        const schema_json = if (table) |current| current.schema_json else null;
+        var replacement = try self.cloneTableMetadataAlloc(table_name, indexes_json, schema_json);
+        errdefer replacement.deinit(self.alloc);
 
-        var indexes_json: ?[]u8 = null;
-        errdefer if (indexes_json) |value| self.alloc.free(value);
-        var schema_json: ?[]u8 = null;
-        errdefer if (schema_json) |value| self.alloc.free(value);
-
-        if (table) |current| {
-            indexes_json = try self.alloc.dupe(u8, current.indexes_json);
-            schema_json = try self.alloc.dupe(u8, current.schema_json);
-        }
-
-        try self.table_metadata.append(self.alloc, .{
-            .table_name = owned_table_name,
-            .indexes_json = indexes_json,
-            .schema_json = schema_json,
-        });
-        return &self.table_metadata.items[self.table_metadata.items.len - 1];
+        const installed = try self.installLoadedTableMetadataLocked(cached_index, replacement);
+        replacement = undefined;
+        return installed;
     }
 
     fn releaseEntry(self: *ProvisionedTableWriteCache, entry: *Entry) void {
@@ -14041,12 +14070,11 @@ test "provisioned table write source runtime status stays cache-only without sha
 
 test "provisioned table write cache retires stale db when index metadata changes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-write-cache-metadata-refresh";
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-metadata-refresh", .{tmp.sub_path});
+    defer alloc.free(path);
 
     const Catalog = struct {
         var indexes_json_buf: []const u8 = "";

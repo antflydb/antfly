@@ -201,10 +201,17 @@ def _wait_for_entities(api: _Api, expected_names: dict[str, str], *, deadline: _
     pending = set(expected_names.keys())
     found: dict[str, dict] = {}
     last: dict[str, dict | None] = {}
+    last_error: str | None = None
 
     while not deadline.expired():
         for key in list(pending):
-            doc = api.lookup("entities", key, timeout=deadline.request_timeout())
+            try:
+                doc = api.lookup("entities", key, timeout=deadline.request_timeout())
+            except requests.RequestException as exc:
+                if not _transient_poll_error(exc):
+                    raise
+                last_error = repr(exc)
+                continue
             last[key] = doc
             if doc is not None and expected_names[key] in _doc_text(doc):
                 found[key] = doc
@@ -215,7 +222,7 @@ def _wait_for_entities(api: _Api, expected_names: dict[str, str], *, deadline: _
 
     raise AssertionError(
         f"entities were not promoted within {deadline.timeout_s}s "
-        f"(pending={sorted(pending)!r}, last={last!r})"
+        f"(pending={sorted(pending)!r}, last={last!r}, last_error={last_error!r})"
     )
 
 
@@ -223,6 +230,20 @@ def _doc_text(doc: dict) -> str:
     """The lookup response carries the stored document; flatten it to text so the
     assertions tolerate whichever envelope the public API uses."""
     return json.dumps(doc)
+
+
+def _transient_poll_error(exc: requests.RequestException) -> bool:
+    response = getattr(exc, "response", None)
+    if response is not None:
+        return response.status_code >= 500
+    return isinstance(
+        exc,
+        (
+            requests.ConnectionError,
+            requests.ReadTimeout,
+            requests.Timeout,
+        ),
+    )
 
 
 def _graph_result(result: dict, name: str) -> dict | None:
@@ -259,8 +280,16 @@ def _wait_for_mention_hydration(
     }
 
     last: dict[str, Any] | None = None
+    last_error: str | None = None
     while not deadline.expired():
-        last = api.query_table("documents", payload, timeout=deadline.request_timeout())
+        try:
+            last = api.query_table("documents", payload, timeout=deadline.request_timeout())
+        except requests.RequestException as exc:
+            if not _transient_poll_error(exc):
+                raise
+            last_error = repr(exc)
+            deadline.sleep()
+            continue
         graph = _graph_result(last, "mentions")
         if graph is None:
             deadline.sleep()
@@ -281,7 +310,7 @@ def _wait_for_mention_hydration(
         deadline.sleep()
     raise AssertionError(
         f"mention graph did not hydrate promoted entities within {deadline.timeout_s}s "
-        f"(start_node={start_node!r}, expected={expected_names!r}, last={last!r})"
+        f"(start_node={start_node!r}, expected={expected_names!r}, last={last!r}, last_error={last_error!r})"
     )
 
 
