@@ -252,6 +252,35 @@ def test_pull_url_then_predict(api, tmp_path):
     assert abs(preds[1][0] - 1.0) < 1e-4
 
 
+def test_pull_url_does_not_accept_models_dir_alias(tmp_path):
+    command, model_root = _local_cli_models()
+    ai_root = tmp_path / "ai-models"
+    model_name = f"stump-wrong-root-{os.getpid()}"
+    hosted_dir = _write_hosted_ir(tmp_path, model_name, STUMP_IR)
+
+    with _serve_directory(hosted_dir) as origin:
+        result = subprocess.run(
+            [
+                *command,
+                "pull",
+                f"{origin}/tabular_model.json",
+                "--name",
+                model_name,
+                "--models-dir",
+                str(ai_root),
+            ],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    combined = result.stdout + result.stderr
+    assert "unexpected arg '--models-dir'" in combined
+    assert not (ai_root / model_name / "tabular_model.json").exists()
+    assert not (model_root / model_name / "tabular_model.json").exists()
+
+
 def test_upload_and_convert_routes_removed(base_url):
     body = json.dumps(STUMP_IR).encode()
     for path in ("/predict/upload", "/predict/convert"):
@@ -291,6 +320,22 @@ def test_pull_rejects_unsafe_name(tmp_path):
             )
         assert "InvalidName" in result.stderr or "InvalidName" in result.stdout
         assert not (model_root / unsafe / "tabular_model.json").exists()
+
+
+def test_discovery_skips_unsafe_metadata_name(api):
+    _, model_root = _local_cli_models()
+    model_name = f"unsafe-metadata-name-{os.getpid()}"
+    model_dir = model_root / model_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model = json.loads(json.dumps(STUMP_IR))
+    model["metadata"]["name"] = f"../{model_name}"
+    (model_dir / "tabular_model.json").write_text(json.dumps(model), encoding="utf-8")
+
+    r = api.get("/ml/v1/models")
+    assert r.status_code == 200, r.text
+    predictors = r.json()["predictors"]
+    assert f"../{model_name}" not in predictors
+    assert model_name not in predictors
 
 
 # ---------------------------------------------------------------------------

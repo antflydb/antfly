@@ -67,7 +67,7 @@ pub fn pullMain(
         } else if (std.mem.eql(u8, args[i], "--token") and i + 1 < args.len) {
             token = args[i + 1];
             i += 1;
-        } else if ((std.mem.eql(u8, args[i], "--ml-dir") or std.mem.eql(u8, args[i], "--models-dir")) and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--ml-dir") and i + 1 < args.len) {
             ml_dir = args[i + 1];
             i += 1;
         } else {

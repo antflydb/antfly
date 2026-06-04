@@ -26,8 +26,8 @@ const builtin_iris_bytes = @embedFile("builtin/models/iris-classifier/tabular_mo
 pub const Error = error{ OutOfMemory, IoError } || registry_mod.Error;
 
 /// Scan a base directory for predictor models. The directory layout is
-/// `<base>/<model-name>/tabular_model.json`. Models with the same `name`
-/// metadata override the directory name.
+/// `<base>/<model-name>/tabular_model.json`. Models with safe `name`
+/// metadata override the directory name; unsafe effective names are skipped.
 pub fn discover(io: std.Io, alloc: std.mem.Allocator, reg: *registry_mod.Registry, base_dir: []const u8) Error!u32 {
     var found: u32 = 0;
     var dir = std.Io.Dir.cwd().openDir(io, base_dir, .{ .iterate = true }) catch return found;
@@ -47,6 +47,7 @@ pub fn discover(io: std.Io, alloc: std.mem.Allocator, reg: *registry_mod.Registr
 
         const md = loaded.model.metadata;
         const name = if (md.name.len > 0) md.name else entry.name;
+        if (!registry_mod.isSafeName(name)) continue;
         const model_dir = try std.fs.path.join(alloc, &.{ base_dir, entry.name });
         defer alloc.free(model_dir);
 
