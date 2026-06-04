@@ -1,0 +1,22 @@
+{
+  "name": "@antfly/cli-linux-arm64",
+  "version": "0.0.0",
+  "description": "Native Antfly CLI binary for Linux arm64",
+  "license": "Elastic-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antflydb/antfly.git",
+    "directory": "ts/packages/cli-linux-arm64"
+  },
+  "files": [
+    "bin",
+    "share",
+    "README.md"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ]
+}

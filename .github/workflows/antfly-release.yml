@@ -139,9 +139,136 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
 
+  package-cli-artifacts:
+    name: Build CLI package artifacts
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release archives
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          tag="${{ steps.version.outputs.tag }}"
+          base="https://releases.antfly.io/antfly/${tag}"
+          mkdir -p dist/release-archives
+          for archive in \
+            "antfly_${version}_Darwin_arm64.tar.gz" \
+            "antfly_${version}_Linux_arm64.tar.gz" \
+            "antfly_${version}_Linux_x86_64.tar.gz"
+          do
+            curl -fsSL "${base}/${archive}" -o "dist/release-archives/${archive}"
+          done
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+          registry-url: https://registry.npmjs.org/
+
+      - name: Build wheels and populate npm packages
+        run: |
+          python scripts/packaging/package_cli_release.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --archive-dir dist/release-archives \
+            --out-dir dist/cli-packages
+
+      - name: Smoke check package wrappers
+        run: |
+          python -m compileall -q py/packages/cli/src/antfly_cli
+          node --check ts/packages/cli/bin/antfly.js
+
+      - name: Pack npm packages
+        run: |
+          set -euo pipefail
+          mkdir -p dist/cli-packages/npm
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-darwin-arm64
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-arm64
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli-linux-x64
+          npm pack --pack-destination dist/cli-packages/npm ./ts/packages/cli
+
+      - name: Upload Python wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: antfly-cli-wheels
+          path: dist/cli-packages/python/*.whl
+
+      - name: Upload npm tarballs
+        uses: actions/upload-artifact@v6
+        with:
+          name: antfly-cli-npm
+          path: dist/cli-packages/npm/*.tgz
+
+  publish-cli-pypi:
+    name: Publish antfly-cli to PyPI
+    needs: package-cli-artifacts
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/antfly-cli
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: antfly-cli-wheels
+          path: dist/
+
+      - name: Publish wheels
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-cli-npm:
+    name: Publish @antfly/cli to npm
+    needs: package-cli-artifacts
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: antfly-cli-npm
+          path: dist/
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+          registry-url: https://registry.npmjs.org/
+
+      - name: Upgrade npm for OIDC support
+        run: npm install -g npm@latest
+
+      - name: Publish npm packages
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          npm_tag="latest"
+          case "$version" in
+            *-*) npm_tag="next" ;;
+          esac
+          echo "Publishing CLI npm packages with dist-tag: ${npm_tag}"
+          npm publish dist/antfly-cli-darwin-arm64-*.tgz --access public --provenance --tag "$npm_tag"
+          npm publish dist/antfly-cli-linux-arm64-*.tgz --access public --provenance --tag "$npm_tag"
+          npm publish dist/antfly-cli-linux-x64-*.tgz --access public --provenance --tag "$npm_tag"
+          npm publish dist/antfly-cli-[0-9]*.tgz --access public --provenance --tag "$npm_tag"
+
   # Build and publish container images after release
   publish-container:
-    needs: goreleaser
+    needs:
+      - goreleaser
+      - publish-cli-pypi
+      - publish-cli-npm
     uses: ./.github/workflows/antfly-container.yml
     with:
       tag_name: ${{ github.ref_name }}
