@@ -2753,18 +2753,6 @@ fn buildGraphQueryResults(
 
     for (result.graph_results) |graph_result| {
         const query_type = findGraphQueryType(req.graph_queries, graph_result.name) orelse continue;
-        std.log.info(
-            "encode graph result name={s} type={s} total={d} nodes={d} paths={d} matches={d} hits={d}",
-            .{
-                graph_result.name,
-                @tagName(query_type),
-                graph_result.total_hits,
-                graph_result.nodes.len,
-                graph_result.paths.len,
-                graph_result.matches.len,
-                graph_result.hits.len,
-            },
-        );
         try out.map.put(alloc, graph_result.name, try toOpenApiGraphQueryResult(alloc, query_type, meta, graph_result));
     }
     return out;

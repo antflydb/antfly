@@ -306,6 +306,8 @@ fn parseTransformOps(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
 
 fn transformOpTypeFromString(op: []const u8) !db_mod.types.TransformOpType {
     if (std.mem.eql(u8, op, "$set")) return .set;
+    if (std.mem.eql(u8, op, "$setOnInsert")) return .set_on_insert;
+    if (std.mem.eql(u8, op, "$set_on_insert")) return .set_on_insert;
     if (std.mem.eql(u8, op, "$unset")) return .unset;
     if (std.mem.eql(u8, op, "$inc")) return .inc;
     if (std.mem.eql(u8, op, "$push")) return .push;

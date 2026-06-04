@@ -154,8 +154,8 @@ fn smartResourceBudgets() SmartResourceBudgets {
 
 pub const ProvisionedGroupStorage = struct {
     alloc: std.mem.Allocator,
-    group_lsm_generation_mutex: std.atomic.Mutex = .unlocked,
-    group_lsm_generations: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    group_visible_root_generation_mutex: std.atomic.Mutex = .unlocked,
+    group_visible_root_generations: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     resource_manager: resource_manager_mod.ResourceManager,
     lsm_cache: lsm_backend.Cache,
     hbc_cache: hbc_mod.Cache,
@@ -178,7 +178,7 @@ pub const ProvisionedGroupStorage = struct {
     }
 
     pub fn deinit(self: *ProvisionedGroupStorage) void {
-        self.group_lsm_generations.deinit(self.alloc);
+        self.group_visible_root_generations.deinit(self.alloc);
         self.write_cache.deinit();
         self.read_cache.deinit();
         self.runtime_status_cache.deinit();
@@ -216,12 +216,12 @@ pub const ProvisionedGroupStorage = struct {
         read_source.cache = &self.read_cache;
         read_source.runtime_status_cache = &self.runtime_status_cache;
         read_source.prepare_for_read = write_source.readPreparation();
-        read_source.group_lsm_generation = self.groupLsmGenerationSource();
+        _ = read_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
         read_source.primary_lookup_db = write_source.primaryLookupDbSource();
         write_source.read_cache = &self.read_cache;
         write_source.write_cache = &self.write_cache;
         write_source.runtime_status_cache = &self.runtime_status_cache;
-        write_source.group_lsm_generation = self.groupLsmGenerationSource();
+        _ = write_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
     }
 
     pub fn attachBackendRuntime(
@@ -237,17 +237,17 @@ pub const ProvisionedGroupStorage = struct {
         write_source.backend_runtime = runtime;
     }
 
-    pub fn generationForGroup(self: *ProvisionedGroupStorage, group_id: u64) u64 {
-        lockAtomic(&self.group_lsm_generation_mutex);
-        defer self.group_lsm_generation_mutex.unlock();
-        return self.group_lsm_generations.get(group_id) orelse 0;
+    pub fn visibleRootGenerationForGroup(self: *ProvisionedGroupStorage, group_id: u64) u64 {
+        lockAtomic(&self.group_visible_root_generation_mutex);
+        defer self.group_visible_root_generation_mutex.unlock();
+        return self.group_visible_root_generations.get(group_id) orelse table_reads.backend_current_root_generation;
     }
 
-    pub fn bumpGroupGenerations(self: *ProvisionedGroupStorage, group_ids: []const u64) !void {
-        lockAtomic(&self.group_lsm_generation_mutex);
-        defer self.group_lsm_generation_mutex.unlock();
+    pub fn bumpGroupVisibleRootGenerations(self: *ProvisionedGroupStorage, group_ids: []const u64) !void {
+        lockAtomic(&self.group_visible_root_generation_mutex);
+        defer self.group_visible_root_generation_mutex.unlock();
         for (group_ids) |group_id| {
-            const entry = try self.group_lsm_generations.getOrPut(self.alloc, group_id);
+            const entry = try self.group_visible_root_generations.getOrPut(self.alloc, group_id);
             if (entry.found_existing) {
                 entry.value_ptr.* +%= 1;
             } else {
@@ -256,13 +256,13 @@ pub const ProvisionedGroupStorage = struct {
         }
     }
 
-    pub fn pruneGroupGenerations(self: *ProvisionedGroupStorage, retain_group_ids: []const u64) void {
-        lockAtomic(&self.group_lsm_generation_mutex);
-        defer self.group_lsm_generation_mutex.unlock();
+    pub fn pruneGroupVisibleRootGenerations(self: *ProvisionedGroupStorage, retain_group_ids: []const u64) void {
+        lockAtomic(&self.group_visible_root_generation_mutex);
+        defer self.group_visible_root_generation_mutex.unlock();
 
         var stale = std.ArrayListUnmanaged(u64).empty;
         defer stale.deinit(self.alloc);
-        var i = self.group_lsm_generations.iterator();
+        var i = self.group_visible_root_generations.iterator();
         while (i.next()) |entry| {
             for (retain_group_ids) |group_id| {
                 if (entry.key_ptr.* == group_id) break;
@@ -270,35 +270,35 @@ pub const ProvisionedGroupStorage = struct {
                 stale.append(self.alloc, entry.key_ptr.*) catch return;
             }
         }
-        for (stale.items) |group_id| _ = self.group_lsm_generations.remove(group_id);
+        for (stale.items) |group_id| _ = self.group_visible_root_generations.remove(group_id);
     }
 
-    pub fn groupLsmGenerationSource(self: *ProvisionedGroupStorage) table_reads.GroupLsmGenerationSource {
+    pub fn groupVisibleRootGenerationSource(self: *ProvisionedGroupStorage) table_reads.GroupVisibleRootGenerationSource {
         return .{
             .ptr = self,
-            .generation_for_group = groupLsmGenerationForGroup,
+            .visible_root_generation_for_group = groupVisibleRootGenerationForGroup,
         };
     }
 
-    fn groupLsmGenerationForGroup(ptr: *anyopaque, group_id: u64) u64 {
+    fn groupVisibleRootGenerationForGroup(ptr: *anyopaque, group_id: u64) u64 {
         const self: *ProvisionedGroupStorage = @ptrCast(@alignCast(ptr));
-        return self.generationForGroup(group_id);
+        return self.visibleRootGenerationForGroup(group_id);
     }
 };
 
-test "provisioned group storage prunes stale generations" {
+test "provisioned group storage prunes stale visible root generations" {
     var storage = ProvisionedGroupStorage.init(std.testing.allocator);
     defer storage.deinit();
 
-    try storage.bumpGroupGenerations(&.{ 11, 22, 33 });
-    try std.testing.expectEqual(@as(u64, 1), storage.generationForGroup(11));
-    try std.testing.expectEqual(@as(u64, 1), storage.generationForGroup(22));
-    try std.testing.expectEqual(@as(u64, 1), storage.generationForGroup(33));
+    try storage.bumpGroupVisibleRootGenerations(&.{ 11, 22, 33 });
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(22));
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(33));
 
-    storage.pruneGroupGenerations(&.{ 11, 33 });
-    try std.testing.expectEqual(@as(u64, 1), storage.generationForGroup(11));
-    try std.testing.expectEqual(@as(u64, 0), storage.generationForGroup(22));
-    try std.testing.expectEqual(@as(u64, 1), storage.generationForGroup(33));
+    storage.pruneGroupVisibleRootGenerations(&.{ 11, 33 });
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
+    try std.testing.expectEqual(@as(u64, table_reads.backend_current_root_generation), storage.visibleRootGenerationForGroup(22));
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(33));
 }
 
 test "provisioned group storage aligns lsm cache with resource budget" {

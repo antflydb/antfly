@@ -6606,6 +6606,7 @@ components:
       type: string
       enum:
         - $set
+        - $setOnInsert
         - $unset
         - $inc
         - $push
@@ -6632,7 +6633,7 @@ components:
           example: $.views
         value:
           description: Value for operation (not required for $unset, $currentDate). Type depends on operator
-            (number for $inc/$mul, any for $set, etc.)
+            (number for $inc/$mul, any for $set/$setOnInsert, etc.)
     Transform:
       type: object
       required:

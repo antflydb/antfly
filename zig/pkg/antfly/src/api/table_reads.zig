@@ -646,12 +646,19 @@ pub const ReadPreparation = struct {
     }
 };
 
-pub const GroupLsmGenerationSource = struct {
-    ptr: *anyopaque,
-    generation_for_group: *const fn (ptr: *anyopaque, group_id: u64) u64,
+/// Shared LSM/HBC cache namespace used when callers want the storage backend's
+/// current root instead of a reconciled group-visible root snapshot.
+pub const backend_current_root_generation: u64 = 0;
 
-    pub fn generationForGroup(self: GroupLsmGenerationSource, group_id: u64) u64 {
-        return self.generation_for_group(self.ptr, group_id);
+pub const GroupVisibleRootGenerationSource = struct {
+    ptr: *anyopaque,
+    visible_root_generation_for_group: *const fn (ptr: *anyopaque, group_id: u64) u64,
+
+    /// Shared LSM/HBC cache namespace for the currently visible replica root.
+    /// This is advanced when local root/catalog visibility is reconciled; it is
+    /// not the storage engine's physical per-write generation.
+    pub fn visibleRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) u64 {
+        return self.visible_root_generation_for_group(self.ptr, group_id);
     }
 };
 
@@ -2060,13 +2067,13 @@ pub const BoundTableReadSource = struct {
         for (req.frontier, 0..) |item, i| {
             const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
             defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
-            var result = try self.reads.searchWithConsistency(alloc, self.db, search_req, consistency);
-            defer result.deinit();
 
             expansions[i] = .{
                 .frontier_id = item.id,
                 .frontier_key = try alloc.dupe(u8, item.key),
                 .graph_result = graph_result_blk: {
+                    var result = try self.reads.searchWithConsistency(alloc, self.db, search_req, consistency);
+                    defer result.deinit();
                     var graph_result = if (result.graph_results.len > 0)
                         try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
                     else
@@ -2139,7 +2146,7 @@ pub const ProvisionedTableReadSource = struct {
     cache: ?*ProvisionedTableReadCache = null,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     prepare_for_read: ?ReadPreparation = null,
-    group_lsm_generation: ?GroupLsmGenerationSource = null,
+    group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
     primary_lookup_db: ?PrimaryLookupDbSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
@@ -2189,6 +2196,14 @@ pub const ProvisionedTableReadSource = struct {
         return self;
     }
 
+    pub fn withGroupVisibleRootGeneration(
+        self: *ProvisionedTableReadSource,
+        generation_source: ?GroupVisibleRootGenerationSource,
+    ) *ProvisionedTableReadSource {
+        self.group_visible_root_generation = generation_source;
+        return self;
+    }
+
     pub fn source(self: *ProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
@@ -2230,15 +2245,15 @@ pub const ProvisionedTableReadSource = struct {
         var db = try openProvisionedWarmStatusDbForTable(
             alloc,
             path,
-            self.lsmRootGeneration(group_id),
+            self.visibleRootGeneration(group_id),
             self.backend_runtime,
             try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
         );
         db.close();
     }
 
-    fn lsmRootGeneration(self: *const ProvisionedTableReadSource, group_id: u64) u64 {
-        return if (self.group_lsm_generation) |generation_source| generation_source.generationForGroup(group_id) else 0;
+    fn visibleRootGeneration(self: *const ProvisionedTableReadSource, group_id: u64) u64 {
+        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else backend_current_root_generation;
     }
 
     fn lookup(
@@ -2252,7 +2267,7 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse return null;
-        return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
+        return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
     }
 
     fn scan(
@@ -2281,7 +2296,7 @@ pub const ProvisionedTableReadSource = struct {
                 group_opts.limit = opts.limit - emitted;
             }
 
-            var result = (try scanProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, group_opts, consistency)) orelse continue;
+            var result = (try scanProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, group_opts, consistency)) orelse continue;
             defer result.deinit(alloc);
             try out.appendSlice(alloc, result.ndjson);
             emitted += @intCast(std.mem.count(u8, result.ndjson, "\n"));
@@ -2305,7 +2320,7 @@ pub const ProvisionedTableReadSource = struct {
         if (group_ids.len > 1) try distributed_graph.rejectUnstampedResultRefs(req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
-            const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.lsmRootGeneration(group_ids[0]), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, req, consistency);
+            const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, req, consistency);
             var result = execution.result;
             defer result.deinit();
             const response_req = execution.request;
@@ -2391,7 +2406,7 @@ pub const ProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
-        return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
+        return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
     }
 
     fn preflightQueryGroupLocal(
@@ -2411,7 +2426,7 @@ pub const ProvisionedTableReadSource = struct {
             self.requester,
             alloc,
             group_id,
-            self.lsmRootGeneration(group_id),
+            self.visibleRootGeneration(group_id),
             self.backend_runtime,
             table_name,
             req,
@@ -2432,7 +2447,7 @@ pub const ProvisionedTableReadSource = struct {
     ) !?ScanResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
-        return try scanProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, consistency);
+        return try scanProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, consistency);
     }
 
     fn queryGroupLocal(
@@ -2446,7 +2461,7 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
         const start_ns = platform_time.monotonicNs();
-        const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, req, consistency);
+        const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, req, consistency);
         var result = execution.result;
         defer result.deinit();
         const response_req = execution.request;
@@ -2471,7 +2486,7 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.types.SearchResult {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
-        return try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, req, consistency);
+        return try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, req, consistency);
     }
 
     fn textStatsGroupLocal(
@@ -2482,7 +2497,7 @@ pub const ProvisionedTableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try collectProvisionedHostedLocalTextStats(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, table_name, body);
+        return try collectProvisionedHostedLocalTextStats(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body);
     }
 
     fn algebraicPartialsGroupLocal(
@@ -2493,7 +2508,7 @@ pub const ProvisionedTableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try collectProvisionedHostedLocalAlgebraicPartials(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, table_name, body);
+        return try collectProvisionedHostedLocalAlgebraicPartials(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body);
     }
 
     fn graphExpandGroupLocal(
@@ -2514,13 +2529,13 @@ pub const ProvisionedTableReadSource = struct {
         for (req.frontier, 0..) |item, i| {
             const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
             defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
-            var result = try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, search_req, consistency);
-            defer result.deinit();
 
             expansions[i] = .{
                 .frontier_id = item.id,
                 .frontier_key = try alloc.dupe(u8, item.key),
                 .graph_result = graph_result_blk: {
+                    var result = try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, search_req, consistency);
+                    defer result.deinit();
                     var graph_result = if (result.graph_results.len > 0)
                         try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
                     else
@@ -2559,7 +2574,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphEdgesResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.backend_runtime, table_name, req, consistency);
+        return try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency);
     }
 
     fn localRuntimeStatuses(
@@ -2583,6 +2598,7 @@ pub const HostedProvisionedTableReadSource = struct {
     executor: http_common.RequestExecutor,
     io_impl: ?*std.Io.Threaded = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
 
     pub fn init(
         replica_root_dir: []const u8,
@@ -2608,6 +2624,15 @@ pub const HostedProvisionedTableReadSource = struct {
     pub fn withBackendRuntime(self: *HostedProvisionedTableReadSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableReadSource {
         self.backend_runtime = backend_runtime;
         return self;
+    }
+
+    pub fn withGroupVisibleRootGeneration(self: *HostedProvisionedTableReadSource, generation_source: ?GroupVisibleRootGenerationSource) *HostedProvisionedTableReadSource {
+        self.group_visible_root_generation = generation_source;
+        return self;
+    }
+
+    fn visibleRootGeneration(self: *const HostedProvisionedTableReadSource, group_id: u64) u64 {
+        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else backend_current_root_generation;
     }
 
     pub fn source(self: *HostedProvisionedTableReadSource) TableReadSource {
@@ -2670,7 +2695,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         return switch (route) {
-            .local => try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, table_name, key, opts, consistency),
+            .local => try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency),
             .remote => |remote| lookupRemote(self.executor, alloc, remote.base_uri, group_id, table_name, key, opts) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
@@ -2704,7 +2729,7 @@ pub const HostedProvisionedTableReadSource = struct {
             const node_id = intent.record.local_node_id;
             if (node_id == local_node_id) {
                 if (tried_local or self.router.localStatus(group_id) != .active) continue;
-                if (try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, table_name, key, opts, consistency)) |result| return result;
+                if (try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency)) |result| return result;
                 continue;
             }
             if (node_id == tried_remote_node_id) continue;
@@ -2753,7 +2778,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
 
             var result = switch (route) {
-                .local => try scanProvisionedHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, table_name, from_key, to_key, group_opts, consistency),
+                .local => try scanProvisionedHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, group_opts, consistency),
                 .remote => |remote| try scanRemote(self.executor, alloc, remote.base_uri, group_id, table_name, from_key, to_key, group_opts),
             } orelse return null;
             defer result.deinit(alloc);
@@ -2783,7 +2808,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
 
             if (route == .local) {
-                const execution = try queryHostedLocalDetailed(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], 0, self.backend_runtime, null, null, null, table_name, req, consistency);
+                const execution = try queryHostedLocalDetailed(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime, null, null, null, table_name, req, consistency);
                 var result = execution.result;
                 defer result.deinit();
                 const response_req = execution.request;
@@ -2868,7 +2893,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
             switch (route) {
                 .local => {
-                    const summary = try preflightHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, table_name, req, consistency, max_work);
+                    const summary = try preflightHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency, max_work);
                     if (first_summary == null) {
                         first_summary = summary;
                     } else {
@@ -2899,7 +2924,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, table_name, key, opts, consistency);
+        return try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
     }
 
     fn preflightQueryGroupLocal(
@@ -2912,7 +2937,7 @@ pub const HostedProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try preflightHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, table_name, req, consistency, max_work);
+        return try preflightHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency, max_work);
     }
 
     fn scanGroupLocal(
@@ -2926,7 +2951,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try scanProvisionedHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, table_name, from_key, to_key, opts, consistency);
+        return try scanProvisionedHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, consistency);
     }
 
     fn queryGroupLocal(
@@ -2939,7 +2964,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const start_ns = platform_time.monotonicNs();
-        const execution = try queryHostedLocalDetailed(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, null, null, table_name, req, consistency);
+        const execution = try queryHostedLocalDetailed(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, null, null, null, table_name, req, consistency);
         var result = execution.result;
         defer result.deinit();
         const response_req = execution.request;
@@ -2967,7 +2992,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, null, null, table_name, req, consistency),
+            .local => try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, null, null, null, table_name, req, consistency),
             .remote => null,
         };
     }
@@ -2980,7 +3005,7 @@ pub const HostedProvisionedTableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, 0, self.backend_runtime, table_name, body);
+        return try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body);
     }
 
     fn algebraicPartialsGroupLocal(
@@ -2991,7 +3016,7 @@ pub const HostedProvisionedTableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try collectProvisionedHostedLocalAlgebraicPartials(null, self.replica_root_dir, self.catalog, alloc, group_id, 0, self.backend_runtime, table_name, body);
+        return try collectProvisionedHostedLocalAlgebraicPartials(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body);
     }
 
     fn joinPartitionGroupLocal(
@@ -3126,13 +3151,13 @@ pub const HostedProvisionedTableReadSource = struct {
                 for (req.frontier, 0..) |item, i| {
                     const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
                     defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
-                    var result = try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, null, null, table_name, search_req, consistency);
-                    defer result.deinit();
 
                     expansions[i] = .{
                         .frontier_id = item.id,
                         .frontier_key = try alloc.dupe(u8, item.key),
                         .graph_result = graph_blk: {
+                            var result = try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, null, null, null, table_name, search_req, consistency);
+                            defer result.deinit();
                             var graph_result = if (result.graph_results.len > 0)
                                 try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
                             else
@@ -3191,7 +3216,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.backend_runtime, table_name, req, consistency),
+            .local => try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency),
             .remote => |remote| try graphEdgesRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req),
         };
     }
@@ -3319,7 +3344,7 @@ fn collectProvisionedSearchRequestTextStatsParallel(
                 source.catalog,
                 arena,
                 group_id,
-                source.lsmRootGeneration(group_id),
+                source.visibleRootGeneration(group_id),
                 source.backend_runtime,
                 table_name_inner,
                 body_inner,
@@ -3493,7 +3518,7 @@ fn queryProvisionedAcrossGroupsParallel(
                 source.requester,
                 arena,
                 group_id,
-                source.lsmRootGeneration(group_id),
+                source.visibleRootGeneration(group_id),
                 source.backend_runtime,
                 source.antfly_provider,
                 source.secret_store,
@@ -3649,7 +3674,7 @@ fn preflightProvisionedGroupsParallel(
                 source.requester,
                 arena,
                 group_id,
-                source.lsmRootGeneration(group_id),
+                source.visibleRootGeneration(group_id),
                 source.backend_runtime,
                 table_name_inner,
                 req_inner.*,
@@ -3991,7 +4016,7 @@ fn queryProvisionedAcrossGroups(
     }
 
     for (group_ids, 0..) |group_id, i| {
-        shard_results[i] = try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, shard_req, consistency);
+        shard_results[i] = try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, shard_req, consistency);
         initialized += 1;
     }
     return try query_api.mergeSearchResults(alloc, req, shard_results[0..initialized], req.offset, req.limit);
@@ -4037,7 +4062,7 @@ fn queryHostedAcrossGroups(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         shard_results[i] = switch (route) {
-            .local => try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, null, null, table_name, shard_req, consistency),
+            .local => try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, null, null, null, table_name, shard_req, consistency),
             .remote => |remote| try queryRemote(self.executor, alloc, remote.base_uri, group_id, table_name, shard_req),
         };
         initialized += 1;
@@ -4115,13 +4140,13 @@ fn executeProvisionedGraphExpand(
     for (req.frontier, 0..) |item, i| {
         const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
         defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
-        var result = try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, 0, self.backend_runtime, null, null, null, table_name, search_req, consistency);
-        defer result.deinit();
 
         expansions[i] = .{
             .frontier_id = item.id,
             .frontier_key = try alloc.dupe(u8, item.key),
             .graph_result = graph_result_blk: {
+                var result = try queryHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, null, null, null, table_name, search_req, consistency);
+                defer result.deinit();
                 var graph_result = if (result.graph_results.len > 0)
                     try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
                 else
@@ -4149,7 +4174,7 @@ fn executeProvisionedGraphHydrate(
     try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
     defer alloc.free(path);
-    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_id, self.lsmRootGeneration(group_id), self.backend_runtime);
+    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_id, self.visibleRootGeneration(group_id), self.backend_runtime);
     defer db.close();
     try validateGraphHydrateResolvedDocFilterForDb(req, &db);
 
@@ -4261,7 +4286,7 @@ fn executeProvisionedGraphGetEdges(
     consistency: raft_mod.ReadConsistency,
 ) anyerror!distributed_graph.GraphEdgesResponse {
     const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-    return graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.backend_runtime, table_name, req, consistency);
+    return graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency);
 }
 
 fn executeHostedGraphGetEdges(
@@ -4277,7 +4302,7 @@ fn executeHostedGraphGetEdges(
     defer route.deinit(alloc);
 
     return switch (route) {
-        .local => graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.backend_runtime, table_name, req, consistency),
+        .local => graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency),
         .remote => |remote| try graphEdgesRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req),
     };
 }
@@ -4288,6 +4313,7 @@ fn graphGetEdgesLocal(
     catalog: table_catalog.CatalogSource,
     requester: raft_mod.ReadableLeaseRequester,
     group_id: u64,
+    lsm_root_generation: u64,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     table_name: []const u8,
     req: distributed_graph.GraphEdgesRequest,
@@ -4298,14 +4324,8 @@ fn graphGetEdgesLocal(
 
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);
-    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
-    var db = try db_mod.DB.open(alloc, path, .{
-        .backend_runtime = backend_runtime,
-        .identity_namespace = identity_namespace,
-        .prefer_existing_identity_namespace = identity_namespace != null,
-    });
+    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog, table_name, group_id, lsm_root_generation, backend_runtime);
     defer db.close();
-    try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
     _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, &db);
 
     const reads = raft_mod.FeatureDBReads.init(group_id, requester);
@@ -5109,7 +5129,7 @@ fn preflightProvisionedGroups(
             self.requester,
             alloc,
             group_id,
-            self.lsmRootGeneration(group_id),
+            self.visibleRootGeneration(group_id),
             self.backend_runtime,
             table_name,
             req,
@@ -5376,15 +5396,20 @@ fn openProvisionedQueryDbForTableWithCache(
         .identity_namespace = identity_namespace,
         .prefer_existing_identity_namespace = identity_namespace != null,
     });
-    errdefer db.close();
+    var db_open = true;
+    errdefer if (db_open) db.close();
     try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
 
-    const summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, &db, indexes_json);
-    if (summary.indexes_added > 0 or summary.indexes_removed > 0) {
+    const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+        .drain_resolver_backfill = false,
+    });
+    var indexes_added = summary.indexes_added;
+    if (summary.indexManagerCatalogChanged()) {
         // Query/status paths can be the first readers to observe a newly-added
-        // index from metadata. Reopen after reconcile so searches run against
-        // the stabilized post-reconcile index-manager state.
+        // index or resolver from metadata. Reopen after reconcile so searches
+        // run against the stabilized post-reconcile index-manager state.
         db.close();
+        db_open = false;
         enrichments = try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
         db = if (enrichments.enabled()) blk: {
             const enrichment_cfg = enrichments.config();
@@ -5415,9 +5440,14 @@ fn openProvisionedQueryDbForTableWithCache(
             .identity_namespace = identity_namespace,
             .prefer_existing_identity_namespace = identity_namespace != null,
         });
+        db_open = true;
         try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
+        const reopened_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
+            .drain_resolver_backfill = false,
+        });
+        indexes_added += reopened_summary.indexes_added;
     }
-    if (summary.indexes_added > 0) {
+    if (indexes_added > 0) {
         if (db.enrichment_runtime != null) {
             _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
             try db.runUntilIdle();
@@ -8564,7 +8594,7 @@ fn applyProvisionedQueryAggregations(
     if (group_ids.len == 1) {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_ids[0]);
         defer alloc.free(path);
-        var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], 0, self.backend_runtime);
+        var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
         defer db.close();
 
         if (!req.count_only and result.hits.len == result.total_hits) {
@@ -8643,7 +8673,7 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
 
     const first_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_ids[0]);
     defer alloc.free(first_path);
-    var first_db = try openProvisionedQueryDbForTableWithRuntime(alloc, first_path, self.catalog, table_name, group_ids[0], self.lsmRootGeneration(group_ids[0]), self.backend_runtime);
+    var first_db = try openProvisionedQueryDbForTableWithRuntime(alloc, first_path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
     defer first_db.close();
     if (!(try algebraicIndexFreshEnoughForRequest(alloc, req, &first_db))) return false;
     const first_entry = if (req.index_name) |index_name|
@@ -8738,7 +8768,7 @@ fn collectProvisionedAlgebraicDistributedPartials(
     for (group_ids) |group_id| {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_id, self.lsmRootGeneration(group_id), self.backend_runtime);
+        var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_id, self.visibleRootGeneration(group_id), self.backend_runtime);
         defer db.close();
         if (!(try algebraicIndexFreshEnoughForRequest(alloc, req, &db))) return null;
         var parsed = try parseAlgebraicPartialsRequest(alloc, body);
@@ -8773,7 +8803,7 @@ fn applyHostedProvisionedQueryAggregations(
             .local => {
                 const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_ids[0]);
                 defer alloc.free(path);
-                var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], 0, self.backend_runtime);
+                var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
                 defer db.close();
 
                 if (!req.count_only and result.hits.len == result.total_hits) {
@@ -8869,7 +8899,7 @@ fn tryApplyHostedAlgebraicDistributedAggregations(
     if (representative_group_id) |group_id| {
         const first_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(first_path);
-        var first_db = try openProvisionedQueryDbForTableWithRuntime(alloc, first_path, self.catalog, table_name, group_id, 0, self.backend_runtime);
+        var first_db = try openProvisionedQueryDbForTableWithRuntime(alloc, first_path, self.catalog, table_name, group_id, self.visibleRootGeneration(group_id), self.backend_runtime);
         defer first_db.close();
         if (!(try algebraicIndexFreshEnoughForRequest(alloc, req, &first_db))) return false;
         const first_entry = if (req.index_name) |index_name|
@@ -9819,7 +9849,7 @@ fn collectHostedAlgebraicDistributedPartials(
             .local => blk: {
                 const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
                 defer alloc.free(path);
-                var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_id, 0, self.backend_runtime);
+                var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_id, self.visibleRootGeneration(group_id), self.backend_runtime);
                 defer db.close();
                 if (!(try algebraicIndexFreshEnoughForRequest(alloc, req, &db))) return null;
                 var parsed = try parseAlgebraicPartialsRequest(alloc, body);
@@ -11224,7 +11254,7 @@ fn collectProvisionedSearchRequestTextStats(
     }
 
     for (group_ids, 0..) |group_id, i| {
-        var response = (try collectProvisionedHostedLocalTextStats(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound;
+        var response = (try collectProvisionedHostedLocalTextStats(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -11264,7 +11294,7 @@ fn collectHostedSearchRequestTextStats(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         var response = switch (route) {
-            .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, 0, self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
+            .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -11303,7 +11333,7 @@ fn collectProvisionedAggregationTextStats(
         alloc.free(shard_stats);
     }
     for (group_ids, 0..) |group_id, i| {
-        var response = (try collectProvisionedHostedLocalTextStats(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound;
+        var response = (try collectProvisionedHostedLocalTextStats(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -11339,7 +11369,7 @@ fn collectProvisionedAggregationBackgroundTextStats(
         alloc.free(shard_stats);
     }
     for (group_ids, 0..) |group_id, i| {
-        var response = (try collectProvisionedHostedLocalTextStats(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.lsmRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound;
+        var response = (try collectProvisionedHostedLocalTextStats(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseBackgroundTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -11379,7 +11409,7 @@ fn collectHostedAggregationTextStats(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         var response = switch (route) {
-            .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, 0, self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
+            .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -11421,7 +11451,7 @@ fn collectHostedAggregationBackgroundTextStats(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         var response = switch (route) {
-            .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, 0, self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
+            .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -17732,6 +17762,183 @@ test "hosted table read source preflights mixed local and remote groups" {
     try std.testing.expectEqual(@as(usize, 1), executor_state.call_count);
 }
 
+test "hosted cross-range graph query expands explicit local start keys" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-hosted-cross-range-graph-explicit";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const left_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(left_path);
+    const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7002);
+    defer alloc.free(right_path);
+
+    const graph_indexes_json =
+        \\{"relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
+    ;
+
+    var left_db = try db_mod.DB.open(alloc, left_path, .{});
+    defer left_db.close();
+    try left_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
+    try left_db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"left\"}" }},
+        .sync_level = .write,
+    });
+
+    var right_db = try db_mod.DB.open(alloc, right_path, .{});
+    defer right_db.close();
+    try right_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
+    try right_db.batch(.{
+        .writes = &.{.{ .key = "zdoc:a", .value = "{\"title\":\"right\"}" }},
+        .sync_level = .write,
+    });
+    const graph_entry = right_db.core.graphIndex("relations_graph") orelse return error.IndexNotFound;
+    try graph_entry.index.addEdge("zdoc:a", "entity:ada", "mentions", 1.0, 0, 0, "{\"target_table\":\"entities\"}");
+
+    const FakeCatalog = struct {
+        const statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{
+                .group_id = 7001,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7001,
+                    .namespace_range_id = 7001,
+                    .next_ordinal = 2,
+                    .allocated_ordinals = 1,
+                    .state_rows = 1,
+                    .live_ordinals = 1,
+                    .complete = true,
+                },
+            },
+            .{
+                .group_id = 7002,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7002,
+                    .namespace_range_id = 7002,
+                    .next_ordinal = 2,
+                    .allocated_ordinals = 1,
+                    .state_rows = 1,
+                    .live_ordinals = 1,
+                    .complete = true,
+                },
+            },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = graph_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .range_id = 7001, .start_key = "", .end_key = "m" },
+                    .{ .group_id = 7002, .table_id = 7, .range_id = 7002, .start_key = "m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(statuses[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const ExecutorState = struct {
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var executor_state = ExecutorState{};
+    var hosted = HostedProvisionedTableReadSource.init(
+        path,
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+        FakeRouter.iface(),
+        executor_state.iface(),
+    );
+    _ = hosted.withIo(&io_impl);
+
+    var response = (try hosted.source().query(alloc, "docs", .{
+        .query = .{ .match_all = {} },
+        .limit = 10,
+        .graph_queries = &.{.{
+            .name = "mentions",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "relations_graph",
+                .start_nodes = .{ .keys = &.{"zdoc:a"} },
+                .params = .{ .edge_types = &.{"mentions"}, .direction = .out, .max_results = 10 },
+            },
+        }},
+    }, .read_index)).?;
+    defer response.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"graph_results\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"entity:ada\"") != null);
+}
+
 test "provisioned read cache keys entries by lsm root generation" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-read-cache-generation";
@@ -18039,6 +18246,7 @@ test "graph edge local read rejects stale identity generation" {
         catalog_state.iface(),
         raft_mod.read_gate.noopReadableLeaseRequester(),
         7001,
+        0,
         null,
         "docs",
         req,
@@ -18137,6 +18345,7 @@ test "graph edge local read rejects stale identity namespace" {
         catalog_state.iface(),
         raft_mod.read_gate.noopReadableLeaseRequester(),
         7001,
+        0,
         null,
         "docs",
         req,
@@ -18158,7 +18367,7 @@ test "provisioned lookup db opens with identity namespace" {
         .shard_id = 7001,
         .range_id = 7103,
     };
-    var db = try openProvisionedLookupDbForTable(alloc, path, null, 0, null, null, namespace);
+    var db = try openProvisionedLookupDbForTable(alloc, path, null, backend_current_root_generation, null, null, namespace);
     defer db.close();
 
     try std.testing.expect(db.core.identity_namespace.eql(namespace));
@@ -18178,7 +18387,7 @@ test "provisioned warm status db opens with identity namespace" {
         .shard_id = 7001,
         .range_id = 7104,
     };
-    var db = try openProvisionedWarmStatusDbForTable(alloc, path, 0, null, namespace);
+    var db = try openProvisionedWarmStatusDbForTable(alloc, path, backend_current_root_generation, null, namespace);
     defer db.close();
 
     try std.testing.expect(db.core.identity_namespace.eql(namespace));
@@ -18217,7 +18426,7 @@ test "provisioned direct read db opens reject stale identity namespace" {
         });
         db.close();
     }
-    if (openProvisionedLookupDbForTable(alloc, lookup_path, null, 0, null, null, expected_namespace)) |opened| {
+    if (openProvisionedLookupDbForTable(alloc, lookup_path, null, backend_current_root_generation, null, null, expected_namespace)) |opened| {
         var db = opened;
         db.close();
         return error.TestExpectedError;
@@ -18233,7 +18442,7 @@ test "provisioned direct read db opens reject stale identity namespace" {
         });
         db.close();
     }
-    if (openProvisionedWarmStatusDbForTable(alloc, status_path, 0, null, expected_namespace)) |opened| {
+    if (openProvisionedWarmStatusDbForTable(alloc, status_path, backend_current_root_generation, null, expected_namespace)) |opened| {
         var db = opened;
         db.close();
         return error.TestExpectedError;
@@ -18291,7 +18500,7 @@ test "provisioned query runtime db opens with catalog identity namespace" {
     };
 
     var catalog_state = CatalogState{};
-    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog_state.iface(), "docs", 7001, 0, null);
+    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog_state.iface(), "docs", 7001, backend_current_root_generation, null);
     defer db.close();
 
     try std.testing.expect(db.core.identity_namespace.eql(.{
@@ -18368,7 +18577,7 @@ test "provisioned query runtime db rejects stale identity namespace" {
     };
 
     var catalog_state = CatalogState{};
-    if (openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog_state.iface(), "docs", 7001, 0, null)) |opened| {
+    if (openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog_state.iface(), "docs", 7001, backend_current_root_generation, null)) |opened| {
         var db = opened;
         db.close();
         return error.TestExpectedError;
