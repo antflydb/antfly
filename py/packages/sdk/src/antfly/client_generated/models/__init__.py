@@ -218,6 +218,11 @@ from .inference_chunk_object_object import InferenceChunkObjectObject
 from .inference_chunk_request import InferenceChunkRequest
 from .inference_chunk_response import InferenceChunkResponse
 from .inference_chunk_response_object import InferenceChunkResponseObject
+from .inference_config import InferenceConfig
+from .inference_config_model_strategies import InferenceConfigModelStrategies
+from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
+from .inference_content_security_config import InferenceContentSecurityConfig
+from .inference_credentials import InferenceCredentials
 from .inference_embed_request import InferenceEmbedRequest
 from .inference_embed_request_encoding_format import InferenceEmbedRequestEncodingFormat
 from .inference_embed_request_input_type import InferenceEmbedRequestInputType
@@ -251,6 +256,11 @@ from .inference_generate_response_format_type import InferenceGenerateResponseFo
 from .inference_generate_response_object import InferenceGenerateResponseObject
 from .inference_generate_usage import InferenceGenerateUsage
 from .inference_image_url import InferenceImageURL
+from .inference_image_url_content_part import InferenceImageURLContentPart
+from .inference_image_url_content_part_type import InferenceImageURLContentPartType
+from .inference_level import InferenceLevel
+from .inference_media_content_part import InferenceMediaContentPart
+from .inference_media_content_part_type import InferenceMediaContentPartType
 from .inference_model_info import InferenceModelInfo
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
@@ -286,8 +296,11 @@ from .inference_rewrite_response import InferenceRewriteResponse
 from .inference_rewrite_response_object import InferenceRewriteResponseObject
 from .inference_role import InferenceRole
 from .inference_sparse_vector import InferenceSparseVector
+from .inference_style import InferenceStyle
 from .inference_text_chunk_options import InferenceTextChunkOptions
 from .inference_text_content import InferenceTextContent
+from .inference_text_content_part import InferenceTextContentPart
+from .inference_text_content_part_type import InferenceTextContentPartType
 from .inference_text_region import InferenceTextRegion
 from .inference_tool import InferenceTool
 from .inference_tool_call_delta import InferenceToolCallDelta
@@ -303,6 +316,7 @@ from .inference_transcribe_request import InferenceTranscribeRequest
 from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
 from .inference_vad_options import InferenceVADOptions
+from .inferenceschemas_config import InferenceschemasConfig
 from .ip_range_query import IPRangeQuery
 from .join_condition import JoinCondition
 from .join_operator import JoinOperator
@@ -706,6 +720,11 @@ __all__ = (
     "InferenceChunkRequest",
     "InferenceChunkResponse",
     "InferenceChunkResponseObject",
+    "InferenceConfig",
+    "InferenceConfigModelStrategies",
+    "InferenceConfigModelStrategiesAdditionalProperty",
+    "InferenceContentSecurityConfig",
+    "InferenceCredentials",
     "InferenceEmbeddingObject",
     "InferenceEmbeddingObjectObject",
     "InferenceEmbeddingUsage",
@@ -739,6 +758,11 @@ __all__ = (
     "InferenceGenerateResponseObject",
     "InferenceGenerateUsage",
     "InferenceImageURL",
+    "InferenceImageURLContentPart",
+    "InferenceImageURLContentPartType",
+    "InferenceLevel",
+    "InferenceMediaContentPart",
+    "InferenceMediaContentPartType",
     "InferenceModelInfo",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
@@ -773,9 +797,13 @@ __all__ = (
     "InferenceRewriteResponse",
     "InferenceRewriteResponseObject",
     "InferenceRole",
+    "InferenceschemasConfig",
     "InferenceSparseVector",
+    "InferenceStyle",
     "InferenceTextChunkOptions",
     "InferenceTextContent",
+    "InferenceTextContentPart",
+    "InferenceTextContentPartType",
     "InferenceTextRegion",
     "InferenceTool",
     "InferenceToolCallDelta",

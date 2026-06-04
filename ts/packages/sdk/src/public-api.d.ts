@@ -7879,7 +7879,11 @@ export interface components {
             /** @description Error message */
             error: string;
         };
+        InferenceTextContentPart: components["schemas"]["TextContentPart"];
         InferenceImageURL: components["schemas"]["ImageURL"];
+        InferenceImageURLContentPart: components["schemas"]["ImageURLContentPart"];
+        InferenceMediaContentPart: components["schemas"]["MediaContentPart"];
+        InferenceContentPart: components["schemas"]["ContentPart"];
         /** @description OpenAI-compatible embedding request with inference multimodal content-part extension */
         InferenceEmbedRequest: {
             /** @description Model name to use for embedding generation */
@@ -8651,6 +8655,168 @@ export interface components {
             /** @description Incremental arguments JSON string */
             arguments?: string;
         };
+        InferenceConfig: {
+            /**
+             * Format: uri
+             * @description URL of the inference embedding/chunking service
+             * @example http://localhost:8080
+             */
+            api_url: string;
+            /** @description API key used when calling an authenticated shared Antfly inference API. */
+            api_key?: string;
+            /**
+             * @description Base directory containing model subdirectories. Antfly inference auto-discovers models from:
+             *     - `{models_dir}/embedders/` - Embedding models (ONNX)
+             *     - `{models_dir}/chunkers/` - Chunking models (ONNX)
+             *     - `{models_dir}/rerankers/` - Reranking models (ONNX)
+             *     - `{models_dir}/recognizers/` - Recognition models (ONNX)
+             *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
+             *
+             *     Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+             * @example ~/.antfly/inference/models
+             */
+            models_dir?: string;
+            /** @description Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts. */
+            content_security?: components["schemas"]["InferenceContentSecurityConfig"];
+            /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
+            s3_credentials?: components["schemas"]["InferenceCredentials"];
+            /**
+             * @description How long to keep models loaded in memory after last use (Ollama-compatible).
+             *     Models are automatically unloaded after this duration of inactivity.
+             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
+             *     Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
+             *     where all models are loaded at startup and never unloaded.
+             * @default 5m
+             * @example 5m
+             */
+            keep_alive?: string;
+            /**
+             * @description Maximum total models loaded across all registry types (embedders, rerankers,
+             *     generators, chunkers, etc.). When the limit is reached, the least-recently-used
+             *     idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
+             * @default 0
+             * @example 3
+             */
+            max_loaded_models?: number;
+            /**
+             * @description Number of concurrent inference pipelines per model. Each pipeline loads
+             *     a copy of the model, so higher values use more memory but allow more
+             *     concurrent requests. Note: pool_size multiplies per-model memory
+             *     independently of max_loaded_models.
+             * @default 1
+             * @example 1
+             */
+            pool_size?: number;
+            /**
+             * @description Backend priority order for model loading with optional device specifiers.
+             *     Format: `backend` or `backend:device` where device defaults to `auto`.
+             *
+             *     Antfly inference tries entries in order and uses the first available backend+device
+             *     combination that supports the model.
+             *
+             *     **Backends** (depend on build flags):
+             *     - `native` - Native CPU backend
+             *     - `onnx` - ONNX Runtime backend
+             *     - `metal` - Apple Metal backend
+             *     - `mlx` - MLX backend
+             *     - `cuda` - NVIDIA CUDA backend
+             *     - `xla` - PJRT/XLA compiled backend
+             *
+             *     **Devices**:
+             *     - `auto` - Auto-detect best available (default)
+             *     - `cuda` - NVIDIA CUDA GPU
+             *     - `tpu` - Google TPU (used by XLA)
+             *     - `cpu` - Force CPU only
+             *
+             *     **Examples**:
+             *     - `["native", "onnx", "xla"]` - Try backends with auto device detection
+             *     - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+             * @default [
+             *       "native",
+             *       "onnx",
+             *       "xla"
+             *     ]
+             * @example [
+             *       "cuda",
+             *       "onnx:cuda",
+             *       "xla:tpu",
+             *       "native"
+             *     ]
+             */
+            backend_priority?: string[];
+            /**
+             * @description Maximum number of concurrent inference requests allowed.
+             *     Additional requests will be queued up to max_queue_size.
+             *     Set to 0 for unlimited (default).
+             * @default 0
+             * @example 4
+             */
+            max_concurrent_requests?: number;
+            /**
+             * @description Maximum number of requests to queue when max_concurrent_requests is reached.
+             *     When the queue is full, new requests receive 503 Service Unavailable with Retry-After header.
+             *     Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+             * @default 0
+             * @example 100
+             */
+            max_queue_size?: number;
+            /**
+             * @description Maximum time to wait for a request to complete, including queue wait time.
+             *     Use Go duration format: "30s", "1m", "0" (no timeout, default).
+             *     Requests exceeding this timeout receive 504 Gateway Timeout.
+             * @default 0
+             * @example 30s
+             */
+            request_timeout?: string;
+            /**
+             * @description List of model names to preload at startup (Ollama-compatible).
+             *     These models are loaded immediately when inference starts, avoiding first-request latency.
+             *     Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5").
+             *     Only effective when keep_alive is non-zero (lazy loading mode).
+             * @example [
+             *       "BAAI/bge-small-en-v1.5",
+             *       "openai/clip-vit-base-patch32"
+             *     ]
+             */
+            preload?: string[];
+            /**
+             * @description Maximum memory (in MB) to use for loaded models.
+             *     When this limit is approached, least recently used models are unloaded.
+             *     Set to 0 for unlimited (default). This is an advisory limit - actual memory
+             *     usage depends on model sizes and may temporarily exceed this value.
+             *     Works alongside max_loaded_models for fine-grained control.
+             * @default 0
+             * @example 4096
+             */
+            max_memory_mb?: number;
+            /**
+             * @description Per-model loading strategy overrides. Maps model names to their loading strategy.
+             *     Models not in this map use the default strategy based on keep_alive:
+             *     - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
+             *     - If keep_alive="0": eager loading (load at startup, never unload)
+             *
+             *     When a model has strategy "eager" in this map:
+             *     - It is loaded at startup (as part of preload)
+             *     - It is never unloaded, even when keep_alive>0 (pinned in memory)
+             *
+             *     This allows mixing eager and lazy models in the same pool.
+             * @example {
+             *       "BAAI/bge-small-en-v1.5": "eager",
+             *       "mirth/chonky-mmbert-small-multilingual-1": "lazy"
+             *     }
+             */
+            model_strategies?: {
+                [key: string]: "eager" | "lazy" | "bounded";
+            };
+            /**
+             * @description Whether the dashboard should show model download commands.
+             *     Defaults to true for standalone/swarm mode. Set to false in managed
+             *     deployments (e.g., Kubernetes operator) where models are managed externally.
+             * @default true
+             */
+            allow_downloads?: boolean;
+            log?: components["schemas"]["Inferenceschemas-Config"];
+        };
         /** @description Runtime backends compiled into this inference server. */
         InferenceBackendRuntimes: {
             /**
@@ -8728,6 +8894,99 @@ export interface components {
             frame_index?: number;
             /** @description Animation: display delay in milliseconds */
             frame_delay_ms?: number;
+        };
+        InferenceContentSecurityConfig: {
+            /**
+             * @description Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts are allowed (except private IPs if block_private_ips is true).
+             * @example [
+             *       "example.com",
+             *       "cdn.example.com",
+             *       "192.0.2.1"
+             *     ]
+             */
+            allowed_hosts?: string[];
+            /**
+             * @description Block requests to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
+             * @default true
+             */
+            block_private_ips?: boolean;
+            /**
+             * @description Maximum size of downloaded content in bytes
+             * @default 104857600
+             * @example 104857600
+             */
+            max_download_size_bytes?: number;
+            /**
+             * @description Timeout for individual download operations in seconds
+             * @default 30
+             * @example 30
+             */
+            download_timeout_seconds?: number;
+            /**
+             * @description Maximum image width/height in pixels (images will be resized)
+             * @default 2048
+             * @example 2048
+             */
+            max_image_dimension?: number;
+            /**
+             * @description Whitelist of allowed path prefixes for file:// and s3:// URLs. If empty, all paths are allowed. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+             * @example [
+             *       "/Users/data/",
+             *       "my-bucket/uploads/"
+             *     ]
+             */
+            allowed_paths?: string[];
+            /**
+             * @description User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
+             * @example AntflyDB/1.0
+             */
+            user_agent?: string;
+        };
+        InferenceCredentials: {
+            /**
+             * @description S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
+             * @example s3.amazonaws.com
+             */
+            endpoint?: string;
+            /**
+             * @description Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
+             * @default true
+             */
+            use_ssl?: boolean;
+            /**
+             * @description AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
+             * @example your-access-key-id
+             */
+            access_key_id?: string;
+            /**
+             * @description AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
+             * @example your-secret-access-key
+             */
+            secret_access_key?: string;
+            /**
+             * @description Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
+             * @example your-session-token
+             */
+            session_token?: string;
+        };
+        /**
+         * @description Logging verbosity level
+         * @default info
+         * @example info
+         * @enum {string}
+         */
+        InferenceLevel: "debug" | "info" | "warn" | "error";
+        /**
+         * @description Logging output format style. 'terminal' for colorized console, 'json' for structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
+         * @default terminal
+         * @example terminal
+         * @enum {string}
+         */
+        InferenceStyle: "terminal" | "json" | "logfmt" | "noop";
+        /** @description Logging configuration for inference services */
+        "Inferenceschemas-Config": {
+            level?: components["schemas"]["InferenceLevel"];
+            style?: components["schemas"]["InferenceStyle"];
         };
         /** @description A single embedding result */
         InferenceEmbeddingObject: {

@@ -126,6 +126,16 @@ def inference_schema_name(name: str) -> str:
     return f"Inference{name}"
 
 
+PUBLIC_INFERENCE_SCHEMA_ROOTS = {
+    "Config",
+    "ContentPart",
+    "ImageURL",
+    "ImageURLContentPart",
+    "MediaContentPart",
+    "TextContentPart",
+}
+
+
 def collect_local_schema_refs(value: object) -> set[str]:
     refs: set[str] = set()
     prefix = "#/components/schemas/"
@@ -149,7 +159,7 @@ def referenced_inference_schema_names(inference: dict) -> set[str]:
         return set()
 
     seen: set[str] = set()
-    pending = list(collect_local_schema_refs(inference.get("paths", {})))
+    pending = list(collect_local_schema_refs(inference.get("paths", {})) | PUBLIC_INFERENCE_SCHEMA_ROOTS)
     while pending:
         name = pending.pop()
         if name in seen:
