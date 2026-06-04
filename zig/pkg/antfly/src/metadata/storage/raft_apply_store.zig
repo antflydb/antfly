@@ -80,6 +80,31 @@ pub const TransitionCommand = union(enum) {
     remove_range: struct {
         group_id: u64,
     },
+    upsert_foreign_key_ref_range: metadata.ForeignKeyReferenceRangeRecord,
+    remove_foreign_key_ref_range: struct {
+        child_table_id: u64,
+        constraint_name: []const u8,
+        parent_table_id: u64,
+        start_parent_key: []const u8,
+    },
+    begin_foreign_key_ref_range_split: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest,
+    finish_foreign_key_ref_range_split: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest,
+    begin_foreign_key_ref_range_merge: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest,
+    finish_foreign_key_ref_range_merge: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest,
+    begin_foreign_key_ref_range_rebuild: metadata_table_manager.ForeignKeyReferenceRangeSelector,
+    finish_foreign_key_ref_range_rebuild: metadata_table_manager.ForeignKeyReferenceRangeSelector,
+    upsert_unique_constraint_range: metadata.UniqueConstraintRangeRecord,
+    remove_unique_constraint_range: struct {
+        table_id: u64,
+        constraint_name: []const u8,
+        start_encoded_value: []const u8,
+    },
+    begin_unique_constraint_range_split: metadata_table_manager.UniqueConstraintRangeSplitRequest,
+    finish_unique_constraint_range_split: metadata_table_manager.UniqueConstraintRangeSplitRequest,
+    begin_unique_constraint_range_merge: metadata_table_manager.UniqueConstraintRangeMergeRequest,
+    finish_unique_constraint_range_merge: metadata_table_manager.UniqueConstraintRangeMergeRequest,
+    begin_unique_constraint_range_rebuild: metadata_table_manager.UniqueConstraintRangeSelector,
+    finish_unique_constraint_range_rebuild: metadata_table_manager.UniqueConstraintRangeSelector,
     upsert_split_transition: metadata.SplitTransitionRecord,
     remove_split_transition: struct {
         transition_id: u64,
@@ -122,6 +147,38 @@ pub const TransitionCommand = union(enum) {
             .upsert_range => |*record| {
                 metadata_table_manager.freeRange(alloc, record.*);
             },
+            .upsert_foreign_key_ref_range => |*record| {
+                metadata_table_manager.freeForeignKeyReferenceRange(alloc, record.*);
+            },
+            .remove_foreign_key_ref_range => |*record| {
+                alloc.free(record.constraint_name);
+                alloc.free(record.start_parent_key);
+            },
+            .begin_foreign_key_ref_range_split, .finish_foreign_key_ref_range_split => |*request| {
+                freeForeignKeyReferenceRangeSplitRequest(alloc, request.*);
+            },
+            .begin_foreign_key_ref_range_merge, .finish_foreign_key_ref_range_merge => |*request| {
+                freeForeignKeyReferenceRangeMergeRequest(alloc, request.*);
+            },
+            .begin_foreign_key_ref_range_rebuild, .finish_foreign_key_ref_range_rebuild => |*selector| {
+                freeForeignKeyReferenceRangeSelector(alloc, selector.*);
+            },
+            .upsert_unique_constraint_range => |*record| {
+                metadata_table_manager.freeUniqueConstraintRange(alloc, record.*);
+            },
+            .remove_unique_constraint_range => |*record| {
+                alloc.free(record.constraint_name);
+                alloc.free(record.start_encoded_value);
+            },
+            .begin_unique_constraint_range_split, .finish_unique_constraint_range_split => |*request| {
+                freeUniqueConstraintRangeSplitRequest(alloc, request.*);
+            },
+            .begin_unique_constraint_range_merge, .finish_unique_constraint_range_merge => |*request| {
+                freeUniqueConstraintRangeMergeRequest(alloc, request.*);
+            },
+            .begin_unique_constraint_range_rebuild, .finish_unique_constraint_range_rebuild => |*selector| {
+                freeUniqueConstraintRangeSelector(alloc, selector.*);
+            },
             .upsert_split_transition => |*record| {
                 if (record.split_key) |split_key| alloc.free(split_key);
                 if (record.source_range_end) |end| alloc.free(end);
@@ -144,6 +201,22 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         .remove_restore_progress => |record| try group_ids.requireDataGroupId(record.group_id),
         .upsert_range => |record| try group_ids.requireDataGroupId(record.group_id),
         .remove_range => |record| try group_ids.requireDataGroupId(record.group_id),
+        .upsert_foreign_key_ref_range => |record| try group_ids.requireDataGroupId(record.group_id),
+        .begin_foreign_key_ref_range_split, .finish_foreign_key_ref_range_split => |request| {
+            try group_ids.requireDataGroupId(request.left_group_id);
+            try group_ids.requireDataGroupId(request.right_group_id);
+        },
+        .begin_foreign_key_ref_range_merge, .finish_foreign_key_ref_range_merge => |request| {
+            try group_ids.requireDataGroupId(request.merged_group_id);
+        },
+        .upsert_unique_constraint_range => |record| try group_ids.requireDataGroupId(record.group_id),
+        .begin_unique_constraint_range_split, .finish_unique_constraint_range_split => |request| {
+            try group_ids.requireDataGroupId(request.left_group_id);
+            try group_ids.requireDataGroupId(request.right_group_id);
+        },
+        .begin_unique_constraint_range_merge, .finish_unique_constraint_range_merge => |request| {
+            try group_ids.requireDataGroupId(request.merged_group_id);
+        },
         .upsert_split_transition => |record| {
             try group_ids.requireDataGroupId(record.source_group_id);
             try group_ids.requireDataGroupId(record.destination_group_id);
@@ -166,6 +239,8 @@ test "transition command validation rejects metadata group ids in data group fie
         .{ .remove_restore_progress = .{ .table_id = 1, .node_id = 1, .group_id = metadata_group_id } },
         .{ .upsert_range = .{ .group_id = metadata_group_id, .table_id = 1, .start_key = "" } },
         .{ .remove_range = .{ .group_id = metadata_group_id } },
+        .{ .upsert_foreign_key_ref_range = .{ .child_table_id = 1, .constraint_name = "orders_customer_id_fkey", .parent_table_id = 2, .start_parent_key = "", .group_id = metadata_group_id } },
+        .{ .upsert_unique_constraint_range = .{ .table_id = 1, .constraint_name = "users_email_key", .start_encoded_value = "", .group_id = metadata_group_id } },
         .{ .upsert_split_transition = .{ .transition_id = 1, .source_group_id = metadata_group_id, .destination_group_id = 2 } },
         .{ .upsert_split_transition = .{ .transition_id = 1, .source_group_id = 2, .destination_group_id = metadata_group_id } },
         .{ .upsert_merge_transition = .{ .transition_id = 1, .donor_group_id = metadata_group_id, .receiver_group_id = 2 } },
@@ -199,6 +274,8 @@ pub const ProjectionSignalKind = enum {
     schema_progress,
     restore_progress,
     replication_source_status,
+    foreign_key_ref_range,
+    unique_constraint_range,
 };
 
 pub const ProjectionSignal = struct {
@@ -727,6 +804,56 @@ pub const RaftApplyStore = struct {
         alloc.free(records);
     }
 
+    pub fn listForeignKeyReferenceRanges(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.ForeignKeyReferenceRangeRecord {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try foreignKeyReferenceRangePrefixForGroup(&prefix_buf, group_id);
+        const kvs = try self.store.scanPrefix(alloc, prefix);
+        defer {
+            for (kvs) |kv| {
+                alloc.free(kv.key);
+                alloc.free(kv.value);
+            }
+            alloc.free(kvs);
+        }
+        const out = try alloc.alloc(metadata.ForeignKeyReferenceRangeRecord, kvs.len);
+        errdefer {
+            for (out[0..kvs.len]) |record| metadata_table_manager.freeForeignKeyReferenceRange(alloc, record);
+            alloc.free(out);
+        }
+        for (kvs, 0..) |kv, i| out[i] = try decodeForeignKeyReferenceRangeRecord(alloc, kv.value);
+        return out;
+    }
+
+    pub fn freeForeignKeyReferenceRanges(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []metadata.ForeignKeyReferenceRangeRecord) void {
+        for (records) |record| metadata_table_manager.freeForeignKeyReferenceRange(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listUniqueConstraintRanges(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.UniqueConstraintRangeRecord {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try uniqueConstraintRangePrefixForGroup(&prefix_buf, group_id);
+        const kvs = try self.store.scanPrefix(alloc, prefix);
+        defer {
+            for (kvs) |kv| {
+                alloc.free(kv.key);
+                alloc.free(kv.value);
+            }
+            alloc.free(kvs);
+        }
+        const out = try alloc.alloc(metadata.UniqueConstraintRangeRecord, kvs.len);
+        errdefer {
+            for (out[0..kvs.len]) |record| metadata_table_manager.freeUniqueConstraintRange(alloc, record);
+            alloc.free(out);
+        }
+        for (kvs, 0..) |kv, i| out[i] = try decodeUniqueConstraintRangeRecord(alloc, kv.value);
+        return out;
+    }
+
+    pub fn freeUniqueConstraintRanges(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []metadata.UniqueConstraintRangeRecord) void {
+        for (records) |record| metadata_table_manager.freeUniqueConstraintRange(alloc, record);
+        alloc.free(records);
+    }
+
     pub fn freeSplitTransitions(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []metadata.SplitTransitionRecord) void {
         for (records) |record| {
             if (record.split_key) |split_key| alloc.free(split_key);
@@ -1158,6 +1285,136 @@ pub const RaftApplyStore = struct {
                     .group_id = record.group_id,
                 });
             },
+            .upsert_foreign_key_ref_range => |record| {
+                const table_name = try self.lookupTableNameTxn(txn, group_id, record.child_table_id);
+                defer if (table_name) |name| self.alloc.free(name);
+                var key_buf: [512]u8 = undefined;
+                const key = try foreignKeyReferenceRangeKeyForGroup(&key_buf, group_id, record.child_table_id, record.constraint_name, record.parent_table_id, record.start_parent_key);
+                const value = try encodeForeignKeyReferenceRangeRecord(self.alloc, record);
+                defer self.alloc.free(value);
+                try txn.put(key, value);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{
+                    .kind = .foreign_key_ref_range,
+                    .metadata_group_id = group_id,
+                    .table_name = table_name,
+                    .table_id = record.child_table_id,
+                    .group_id = record.group_id,
+                });
+            },
+            .remove_foreign_key_ref_range => |record| {
+                const existing = blk: {
+                    var key_buf: [512]u8 = undefined;
+                    const existing_key = try foreignKeyReferenceRangeKeyForGroup(&key_buf, group_id, record.child_table_id, record.constraint_name, record.parent_table_id, record.start_parent_key);
+                    const encoded = txn.get(existing_key) catch |err| switch (err) {
+                        error.NotFound => break :blk null,
+                        else => return err,
+                    };
+                    const decoded = try decodeForeignKeyReferenceRangeRecord(self.alloc, encoded);
+                    break :blk decoded;
+                };
+                defer if (existing) |record_existing| metadata_table_manager.freeForeignKeyReferenceRange(self.alloc, record_existing);
+                const owner_group_id = if (existing) |record_existing| record_existing.group_id else 0;
+                const table_name = try self.lookupTableNameTxn(txn, group_id, record.child_table_id);
+                defer if (table_name) |name| self.alloc.free(name);
+                var key_buf: [512]u8 = undefined;
+                const key = try foreignKeyReferenceRangeKeyForGroup(&key_buf, group_id, record.child_table_id, record.constraint_name, record.parent_table_id, record.start_parent_key);
+                txn.delete(key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{
+                    .kind = .foreign_key_ref_range,
+                    .metadata_group_id = group_id,
+                    .table_name = table_name,
+                    .table_id = record.child_table_id,
+                    .group_id = owner_group_id,
+                });
+            },
+            .begin_foreign_key_ref_range_split => |request| {
+                try self.applyForeignKeyReferenceRangeBeginSplitTxn(txn, group_id, request);
+            },
+            .finish_foreign_key_ref_range_split => |request| {
+                try self.applyForeignKeyReferenceRangeFinishSplitTxn(txn, group_id, request);
+            },
+            .begin_foreign_key_ref_range_merge => |request| {
+                try self.applyForeignKeyReferenceRangeBeginMergeTxn(txn, group_id, request);
+            },
+            .finish_foreign_key_ref_range_merge => |request| {
+                try self.applyForeignKeyReferenceRangeFinishMergeTxn(txn, group_id, request);
+            },
+            .begin_foreign_key_ref_range_rebuild => |selector| {
+                try self.applyForeignKeyReferenceRangeSetStateTxn(txn, group_id, selector, metadata_table_manager.foreign_key_ref_range_active, metadata_table_manager.foreign_key_ref_range_rebuilding);
+            },
+            .finish_foreign_key_ref_range_rebuild => |selector| {
+                try self.applyForeignKeyReferenceRangeSetStateTxn(txn, group_id, selector, metadata_table_manager.foreign_key_ref_range_rebuilding, metadata_table_manager.foreign_key_ref_range_active);
+            },
+            .upsert_unique_constraint_range => |record| {
+                const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
+                defer if (table_name) |name| self.alloc.free(name);
+                var key_buf: [512]u8 = undefined;
+                const key = try uniqueConstraintRangeKeyForGroup(&key_buf, group_id, record.table_id, record.constraint_name, record.start_encoded_value);
+                const value = try encodeUniqueConstraintRangeRecord(self.alloc, record);
+                defer self.alloc.free(value);
+                try txn.put(key, value);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{
+                    .kind = .unique_constraint_range,
+                    .metadata_group_id = group_id,
+                    .table_name = table_name,
+                    .table_id = record.table_id,
+                    .group_id = record.group_id,
+                });
+            },
+            .remove_unique_constraint_range => |record| {
+                const existing = blk: {
+                    var key_buf: [512]u8 = undefined;
+                    const existing_key = try uniqueConstraintRangeKeyForGroup(&key_buf, group_id, record.table_id, record.constraint_name, record.start_encoded_value);
+                    const encoded = txn.get(existing_key) catch |err| switch (err) {
+                        error.NotFound => break :blk null,
+                        else => return err,
+                    };
+                    const decoded = try decodeUniqueConstraintRangeRecord(self.alloc, encoded);
+                    break :blk decoded;
+                };
+                defer if (existing) |record_existing| metadata_table_manager.freeUniqueConstraintRange(self.alloc, record_existing);
+                const owner_group_id = if (existing) |record_existing| record_existing.group_id else 0;
+                const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
+                defer if (table_name) |name| self.alloc.free(name);
+                var key_buf: [512]u8 = undefined;
+                const key = try uniqueConstraintRangeKeyForGroup(&key_buf, group_id, record.table_id, record.constraint_name, record.start_encoded_value);
+                txn.delete(key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{
+                    .kind = .unique_constraint_range,
+                    .metadata_group_id = group_id,
+                    .table_name = table_name,
+                    .table_id = record.table_id,
+                    .group_id = owner_group_id,
+                });
+            },
+            .begin_unique_constraint_range_split => |request| {
+                try self.applyUniqueConstraintRangeBeginSplitTxn(txn, group_id, request);
+            },
+            .finish_unique_constraint_range_split => |request| {
+                try self.applyUniqueConstraintRangeFinishSplitTxn(txn, group_id, request);
+            },
+            .begin_unique_constraint_range_merge => |request| {
+                try self.applyUniqueConstraintRangeBeginMergeTxn(txn, group_id, request);
+            },
+            .finish_unique_constraint_range_merge => |request| {
+                try self.applyUniqueConstraintRangeFinishMergeTxn(txn, group_id, request);
+            },
+            .begin_unique_constraint_range_rebuild => |selector| {
+                try self.applyUniqueConstraintRangeSetStateTxn(txn, group_id, selector, metadata_table_manager.unique_constraint_range_active, metadata_table_manager.unique_constraint_range_rebuilding);
+            },
+            .finish_unique_constraint_range_rebuild => |selector| {
+                try self.applyUniqueConstraintRangeSetStateTxn(txn, group_id, selector, metadata_table_manager.unique_constraint_range_rebuilding, metadata_table_manager.unique_constraint_range_active);
+            },
             .upsert_split_transition => |record| {
                 var key_buf: [160]u8 = undefined;
                 const key = try splitTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
@@ -1499,6 +1756,451 @@ pub const RaftApplyStore = struct {
         return try decodeStoreRecord(self.alloc, encoded);
     }
 
+    fn applyForeignKeyReferenceRangeBeginSplitTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest,
+    ) !void {
+        if (request.left_group_id == request.right_group_id) return error.InvalidForeignKeyReferenceRangeSplit;
+        var source = (try self.loadForeignKeyReferenceRangeTxn(txn, group_id, request.selector)) orelse return error.UnknownForeignKeyReferenceRange;
+        defer metadata_table_manager.freeForeignKeyReferenceRange(self.alloc, source);
+        if (!std.mem.eql(u8, source.state, metadata_table_manager.foreign_key_ref_range_active)) return error.ForeignKeyReferenceRangeNotActive;
+        if (!foreignKeyReferenceSplitKeyInsideRange(request.split_parent_key, source.start_parent_key, source.end_parent_key)) return error.InvalidForeignKeyReferenceRangeSplit;
+        if (request.left_group_id != source.group_id and try self.foreignKeyReferenceRangeGroupExistsTxn(txn, group_id, request.left_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (try self.foreignKeyReferenceRangeGroupExistsTxn(txn, group_id, request.right_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+
+        try replaceOwnedString(self.alloc, &source.state, metadata_table_manager.foreign_key_ref_range_splitting);
+        source.topology_epoch +%= 1;
+        try self.putForeignKeyReferenceRangeTxn(txn, group_id, source);
+    }
+
+    fn applyForeignKeyReferenceRangeFinishSplitTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest,
+    ) !void {
+        if (request.left_group_id == request.right_group_id) return error.InvalidForeignKeyReferenceRangeSplit;
+        const source = (try self.loadForeignKeyReferenceRangeTxn(txn, group_id, request.selector)) orelse return error.UnknownForeignKeyReferenceRange;
+        defer metadata_table_manager.freeForeignKeyReferenceRange(self.alloc, source);
+        if (!std.mem.eql(u8, source.state, metadata_table_manager.foreign_key_ref_range_splitting)) return error.ForeignKeyReferenceRangeNotSplitting;
+        if (!foreignKeyReferenceSplitKeyInsideRange(request.split_parent_key, source.start_parent_key, source.end_parent_key)) return error.InvalidForeignKeyReferenceRangeSplit;
+        if (request.left_group_id != source.group_id and try self.foreignKeyReferenceRangeGroupExistsTxn(txn, group_id, request.left_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (try self.foreignKeyReferenceRangeGroupExistsTxn(txn, group_id, request.right_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+
+        try self.deleteForeignKeyReferenceRangeTxn(txn, group_id, source);
+        try self.putForeignKeyReferenceRangeTxn(txn, group_id, .{
+            .child_table_id = source.child_table_id,
+            .constraint_name = source.constraint_name,
+            .parent_table_id = source.parent_table_id,
+            .start_parent_key = source.start_parent_key,
+            .end_parent_key = request.split_parent_key,
+            .group_id = request.left_group_id,
+            .topology_epoch = source.topology_epoch +% 1,
+            .state = metadata_table_manager.foreign_key_ref_range_active,
+        });
+        try self.putForeignKeyReferenceRangeTxn(txn, group_id, .{
+            .child_table_id = source.child_table_id,
+            .constraint_name = source.constraint_name,
+            .parent_table_id = source.parent_table_id,
+            .start_parent_key = request.split_parent_key,
+            .end_parent_key = source.end_parent_key,
+            .group_id = request.right_group_id,
+            .topology_epoch = source.topology_epoch +% 1,
+            .state = metadata_table_manager.foreign_key_ref_range_active,
+        });
+    }
+
+    fn applyForeignKeyReferenceRangeBeginMergeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest,
+    ) !void {
+        var left = (try self.loadForeignKeyReferenceRangeTxn(txn, group_id, request.left_selector)) orelse return error.UnknownForeignKeyReferenceRange;
+        defer metadata_table_manager.freeForeignKeyReferenceRange(self.alloc, left);
+        var right = (try self.loadForeignKeyReferenceRangeTxn(txn, group_id, .{
+            .child_table_id = request.left_selector.child_table_id,
+            .constraint_name = request.left_selector.constraint_name,
+            .parent_table_id = request.left_selector.parent_table_id,
+            .start_parent_key = request.right_start_parent_key,
+        })) orelse return error.UnknownForeignKeyReferenceRange;
+        defer metadata_table_manager.freeForeignKeyReferenceRange(self.alloc, right);
+        if (!foreignKeyReferenceRangesAdjacent(left, right)) return error.ForeignKeyReferenceRangesNotAdjacent;
+        if (!std.mem.eql(u8, left.state, metadata_table_manager.foreign_key_ref_range_active) or !std.mem.eql(u8, right.state, metadata_table_manager.foreign_key_ref_range_active)) return error.ForeignKeyReferenceRangeNotActive;
+        if (request.merged_group_id != left.group_id and request.merged_group_id != right.group_id and try self.foreignKeyReferenceRangeGroupExistsTxn(txn, group_id, request.merged_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+
+        try replaceOwnedString(self.alloc, &left.state, metadata_table_manager.foreign_key_ref_range_merging);
+        left.topology_epoch +%= 1;
+        try self.putForeignKeyReferenceRangeTxn(txn, group_id, left);
+        try replaceOwnedString(self.alloc, &right.state, metadata_table_manager.foreign_key_ref_range_merging);
+        right.topology_epoch +%= 1;
+        try self.putForeignKeyReferenceRangeTxn(txn, group_id, right);
+    }
+
+    fn applyForeignKeyReferenceRangeFinishMergeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest,
+    ) !void {
+        const left = (try self.loadForeignKeyReferenceRangeTxn(txn, group_id, request.left_selector)) orelse return error.UnknownForeignKeyReferenceRange;
+        defer metadata_table_manager.freeForeignKeyReferenceRange(self.alloc, left);
+        const right = (try self.loadForeignKeyReferenceRangeTxn(txn, group_id, .{
+            .child_table_id = request.left_selector.child_table_id,
+            .constraint_name = request.left_selector.constraint_name,
+            .parent_table_id = request.left_selector.parent_table_id,
+            .start_parent_key = request.right_start_parent_key,
+        })) orelse return error.UnknownForeignKeyReferenceRange;
+        defer metadata_table_manager.freeForeignKeyReferenceRange(self.alloc, right);
+        if (!foreignKeyReferenceRangesAdjacent(left, right)) return error.ForeignKeyReferenceRangesNotAdjacent;
+        if (!std.mem.eql(u8, left.state, metadata_table_manager.foreign_key_ref_range_merging) or !std.mem.eql(u8, right.state, metadata_table_manager.foreign_key_ref_range_merging)) return error.ForeignKeyReferenceRangeNotMerging;
+        if (request.merged_group_id != left.group_id and request.merged_group_id != right.group_id and try self.foreignKeyReferenceRangeGroupExistsTxn(txn, group_id, request.merged_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+
+        try self.deleteForeignKeyReferenceRangeTxn(txn, group_id, left);
+        try self.deleteForeignKeyReferenceRangeTxn(txn, group_id, right);
+        try self.putForeignKeyReferenceRangeTxn(txn, group_id, .{
+            .child_table_id = left.child_table_id,
+            .constraint_name = left.constraint_name,
+            .parent_table_id = left.parent_table_id,
+            .start_parent_key = left.start_parent_key,
+            .end_parent_key = right.end_parent_key,
+            .group_id = request.merged_group_id,
+            .topology_epoch = @max(left.topology_epoch, right.topology_epoch) +% 1,
+            .state = metadata_table_manager.foreign_key_ref_range_active,
+        });
+    }
+
+    fn applyForeignKeyReferenceRangeSetStateTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        selector: metadata_table_manager.ForeignKeyReferenceRangeSelector,
+        expected_state: []const u8,
+        next_state: []const u8,
+    ) !void {
+        var record = (try self.loadForeignKeyReferenceRangeTxn(txn, group_id, selector)) orelse return error.UnknownForeignKeyReferenceRange;
+        defer metadata_table_manager.freeForeignKeyReferenceRange(self.alloc, record);
+        if (!std.mem.eql(u8, record.state, expected_state)) {
+            if (std.mem.eql(u8, expected_state, metadata_table_manager.foreign_key_ref_range_active)) return error.ForeignKeyReferenceRangeNotActive;
+            if (std.mem.eql(u8, expected_state, metadata_table_manager.foreign_key_ref_range_rebuilding)) return error.ForeignKeyReferenceRangeNotRebuilding;
+            return error.InvalidForeignKeyReferenceRangeState;
+        }
+        try replaceOwnedString(self.alloc, &record.state, next_state);
+        record.topology_epoch +%= 1;
+        try self.putForeignKeyReferenceRangeTxn(txn, group_id, record);
+    }
+
+    fn loadForeignKeyReferenceRangeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        selector: metadata_table_manager.ForeignKeyReferenceRangeSelector,
+    ) !?metadata.ForeignKeyReferenceRangeRecord {
+        var key_buf: [512]u8 = undefined;
+        const key = try foreignKeyReferenceRangeKeyForGroup(&key_buf, group_id, selector.child_table_id, selector.constraint_name, selector.parent_table_id, selector.start_parent_key);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return try decodeForeignKeyReferenceRangeRecord(self.alloc, encoded);
+    }
+
+    fn putForeignKeyReferenceRangeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.ForeignKeyReferenceRangeRecord,
+    ) !void {
+        var key_buf: [512]u8 = undefined;
+        const key = try foreignKeyReferenceRangeKeyForGroup(&key_buf, group_id, record.child_table_id, record.constraint_name, record.parent_table_id, record.start_parent_key);
+        const value = try encodeForeignKeyReferenceRangeRecord(self.alloc, record);
+        defer self.alloc.free(value);
+        try txn.put(key, value);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        const table_name = try self.lookupTableNameTxn(txn, group_id, record.child_table_id);
+        defer if (table_name) |name| self.alloc.free(name);
+        self.notifyProjectionListeners(.{
+            .kind = .foreign_key_ref_range,
+            .metadata_group_id = group_id,
+            .table_name = table_name,
+            .table_id = record.child_table_id,
+            .group_id = record.group_id,
+        });
+    }
+
+    fn deleteForeignKeyReferenceRangeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.ForeignKeyReferenceRangeRecord,
+    ) !void {
+        var key_buf: [512]u8 = undefined;
+        const key = try foreignKeyReferenceRangeKeyForGroup(&key_buf, group_id, record.child_table_id, record.constraint_name, record.parent_table_id, record.start_parent_key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        const table_name = try self.lookupTableNameTxn(txn, group_id, record.child_table_id);
+        defer if (table_name) |name| self.alloc.free(name);
+        self.notifyProjectionListeners(.{
+            .kind = .foreign_key_ref_range,
+            .metadata_group_id = group_id,
+            .table_name = table_name,
+            .table_id = record.child_table_id,
+            .group_id = record.group_id,
+        });
+    }
+
+    fn foreignKeyReferenceRangeGroupExistsTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        owner_group_id: u64,
+    ) !bool {
+        var range_key_buf: [160]u8 = undefined;
+        const range_key = try rangeKeyForGroup(&range_key_buf, group_id, owner_group_id);
+        if (txn.get(range_key)) |_| return true else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try foreignKeyReferenceRangePrefixForGroup(&prefix_buf, group_id);
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var entry = try cur.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cur.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const record = try decodeForeignKeyReferenceRangeRecord(self.alloc, kv.value);
+            defer metadata_table_manager.freeForeignKeyReferenceRange(self.alloc, record);
+            if (record.group_id == owner_group_id) return true;
+        }
+        return false;
+    }
+
+    fn applyUniqueConstraintRangeBeginSplitTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.UniqueConstraintRangeSplitRequest,
+    ) !void {
+        if (request.left_group_id == request.right_group_id) return error.InvalidUniqueConstraintRangeSplit;
+        var source = (try self.loadUniqueConstraintRangeTxn(txn, group_id, request.selector)) orelse return error.UnknownUniqueConstraintRange;
+        defer metadata_table_manager.freeUniqueConstraintRange(self.alloc, source);
+        if (!std.mem.eql(u8, source.state, metadata_table_manager.unique_constraint_range_active)) return error.UniqueConstraintRangeNotActive;
+        if (!uniqueConstraintSplitKeyInsideRange(request.split_encoded_value, source.start_encoded_value, source.end_encoded_value)) return error.InvalidUniqueConstraintRangeSplit;
+        if (request.left_group_id != source.group_id and try self.uniqueConstraintRangeGroupExistsTxn(txn, group_id, request.left_group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (try self.uniqueConstraintRangeGroupExistsTxn(txn, group_id, request.right_group_id)) return error.UniqueConstraintRangeGroupCollision;
+
+        try replaceOwnedString(self.alloc, &source.state, metadata_table_manager.unique_constraint_range_splitting);
+        source.topology_epoch +%= 1;
+        try self.putUniqueConstraintRangeTxn(txn, group_id, source);
+    }
+
+    fn applyUniqueConstraintRangeFinishSplitTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.UniqueConstraintRangeSplitRequest,
+    ) !void {
+        if (request.left_group_id == request.right_group_id) return error.InvalidUniqueConstraintRangeSplit;
+        const source = (try self.loadUniqueConstraintRangeTxn(txn, group_id, request.selector)) orelse return error.UnknownUniqueConstraintRange;
+        defer metadata_table_manager.freeUniqueConstraintRange(self.alloc, source);
+        if (!std.mem.eql(u8, source.state, metadata_table_manager.unique_constraint_range_splitting)) return error.UniqueConstraintRangeNotSplitting;
+        if (!uniqueConstraintSplitKeyInsideRange(request.split_encoded_value, source.start_encoded_value, source.end_encoded_value)) return error.InvalidUniqueConstraintRangeSplit;
+        if (request.left_group_id != source.group_id and try self.uniqueConstraintRangeGroupExistsTxn(txn, group_id, request.left_group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (try self.uniqueConstraintRangeGroupExistsTxn(txn, group_id, request.right_group_id)) return error.UniqueConstraintRangeGroupCollision;
+
+        try self.deleteUniqueConstraintRangeTxn(txn, group_id, source);
+        try self.putUniqueConstraintRangeTxn(txn, group_id, .{
+            .table_id = source.table_id,
+            .constraint_name = source.constraint_name,
+            .start_encoded_value = source.start_encoded_value,
+            .end_encoded_value = request.split_encoded_value,
+            .group_id = request.left_group_id,
+            .topology_epoch = source.topology_epoch +% 1,
+            .state = metadata_table_manager.unique_constraint_range_active,
+        });
+        try self.putUniqueConstraintRangeTxn(txn, group_id, .{
+            .table_id = source.table_id,
+            .constraint_name = source.constraint_name,
+            .start_encoded_value = request.split_encoded_value,
+            .end_encoded_value = source.end_encoded_value,
+            .group_id = request.right_group_id,
+            .topology_epoch = source.topology_epoch +% 1,
+            .state = metadata_table_manager.unique_constraint_range_active,
+        });
+    }
+
+    fn applyUniqueConstraintRangeBeginMergeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.UniqueConstraintRangeMergeRequest,
+    ) !void {
+        var left = (try self.loadUniqueConstraintRangeTxn(txn, group_id, request.left_selector)) orelse return error.UnknownUniqueConstraintRange;
+        defer metadata_table_manager.freeUniqueConstraintRange(self.alloc, left);
+        var right = (try self.loadUniqueConstraintRangeTxn(txn, group_id, .{
+            .table_id = request.left_selector.table_id,
+            .constraint_name = request.left_selector.constraint_name,
+            .start_encoded_value = request.right_start_encoded_value,
+        })) orelse return error.UnknownUniqueConstraintRange;
+        defer metadata_table_manager.freeUniqueConstraintRange(self.alloc, right);
+        if (!uniqueConstraintRangesAdjacent(left, right)) return error.UniqueConstraintRangesNotAdjacent;
+        if (!std.mem.eql(u8, left.state, metadata_table_manager.unique_constraint_range_active) or !std.mem.eql(u8, right.state, metadata_table_manager.unique_constraint_range_active)) return error.UniqueConstraintRangeNotActive;
+        if (request.merged_group_id != left.group_id and request.merged_group_id != right.group_id and try self.uniqueConstraintRangeGroupExistsTxn(txn, group_id, request.merged_group_id)) return error.UniqueConstraintRangeGroupCollision;
+
+        try replaceOwnedString(self.alloc, &left.state, metadata_table_manager.unique_constraint_range_merging);
+        left.topology_epoch +%= 1;
+        try self.putUniqueConstraintRangeTxn(txn, group_id, left);
+        try replaceOwnedString(self.alloc, &right.state, metadata_table_manager.unique_constraint_range_merging);
+        right.topology_epoch +%= 1;
+        try self.putUniqueConstraintRangeTxn(txn, group_id, right);
+    }
+
+    fn applyUniqueConstraintRangeFinishMergeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        request: metadata_table_manager.UniqueConstraintRangeMergeRequest,
+    ) !void {
+        const left = (try self.loadUniqueConstraintRangeTxn(txn, group_id, request.left_selector)) orelse return error.UnknownUniqueConstraintRange;
+        defer metadata_table_manager.freeUniqueConstraintRange(self.alloc, left);
+        const right = (try self.loadUniqueConstraintRangeTxn(txn, group_id, .{
+            .table_id = request.left_selector.table_id,
+            .constraint_name = request.left_selector.constraint_name,
+            .start_encoded_value = request.right_start_encoded_value,
+        })) orelse return error.UnknownUniqueConstraintRange;
+        defer metadata_table_manager.freeUniqueConstraintRange(self.alloc, right);
+        if (!uniqueConstraintRangesAdjacent(left, right)) return error.UniqueConstraintRangesNotAdjacent;
+        if (!std.mem.eql(u8, left.state, metadata_table_manager.unique_constraint_range_merging) or !std.mem.eql(u8, right.state, metadata_table_manager.unique_constraint_range_merging)) return error.UniqueConstraintRangeNotMerging;
+        if (request.merged_group_id != left.group_id and request.merged_group_id != right.group_id and try self.uniqueConstraintRangeGroupExistsTxn(txn, group_id, request.merged_group_id)) return error.UniqueConstraintRangeGroupCollision;
+
+        try self.deleteUniqueConstraintRangeTxn(txn, group_id, left);
+        try self.deleteUniqueConstraintRangeTxn(txn, group_id, right);
+        try self.putUniqueConstraintRangeTxn(txn, group_id, .{
+            .table_id = left.table_id,
+            .constraint_name = left.constraint_name,
+            .start_encoded_value = left.start_encoded_value,
+            .end_encoded_value = right.end_encoded_value,
+            .group_id = request.merged_group_id,
+            .topology_epoch = @max(left.topology_epoch, right.topology_epoch) +% 1,
+            .state = metadata_table_manager.unique_constraint_range_active,
+        });
+    }
+
+    fn applyUniqueConstraintRangeSetStateTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        selector: metadata_table_manager.UniqueConstraintRangeSelector,
+        expected_state: []const u8,
+        next_state: []const u8,
+    ) !void {
+        var record = (try self.loadUniqueConstraintRangeTxn(txn, group_id, selector)) orelse return error.UnknownUniqueConstraintRange;
+        defer metadata_table_manager.freeUniqueConstraintRange(self.alloc, record);
+        if (!std.mem.eql(u8, record.state, expected_state)) {
+            if (std.mem.eql(u8, expected_state, metadata_table_manager.unique_constraint_range_active)) return error.UniqueConstraintRangeNotActive;
+            if (std.mem.eql(u8, expected_state, metadata_table_manager.unique_constraint_range_rebuilding)) return error.UniqueConstraintRangeNotRebuilding;
+            return error.InvalidUniqueConstraintRangeState;
+        }
+        try replaceOwnedString(self.alloc, &record.state, next_state);
+        record.topology_epoch +%= 1;
+        try self.putUniqueConstraintRangeTxn(txn, group_id, record);
+    }
+
+    fn loadUniqueConstraintRangeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        selector: metadata_table_manager.UniqueConstraintRangeSelector,
+    ) !?metadata.UniqueConstraintRangeRecord {
+        var key_buf: [512]u8 = undefined;
+        const key = try uniqueConstraintRangeKeyForGroup(&key_buf, group_id, selector.table_id, selector.constraint_name, selector.start_encoded_value);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return try decodeUniqueConstraintRangeRecord(self.alloc, encoded);
+    }
+
+    fn putUniqueConstraintRangeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.UniqueConstraintRangeRecord,
+    ) !void {
+        var key_buf: [512]u8 = undefined;
+        const key = try uniqueConstraintRangeKeyForGroup(&key_buf, group_id, record.table_id, record.constraint_name, record.start_encoded_value);
+        const value = try encodeUniqueConstraintRangeRecord(self.alloc, record);
+        defer self.alloc.free(value);
+        try txn.put(key, value);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
+        defer if (table_name) |name| self.alloc.free(name);
+        self.notifyProjectionListeners(.{
+            .kind = .unique_constraint_range,
+            .metadata_group_id = group_id,
+            .table_name = table_name,
+            .table_id = record.table_id,
+            .group_id = record.group_id,
+        });
+    }
+
+    fn deleteUniqueConstraintRangeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.UniqueConstraintRangeRecord,
+    ) !void {
+        var key_buf: [512]u8 = undefined;
+        const key = try uniqueConstraintRangeKeyForGroup(&key_buf, group_id, record.table_id, record.constraint_name, record.start_encoded_value);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
+        defer if (table_name) |name| self.alloc.free(name);
+        self.notifyProjectionListeners(.{
+            .kind = .unique_constraint_range,
+            .metadata_group_id = group_id,
+            .table_name = table_name,
+            .table_id = record.table_id,
+            .group_id = record.group_id,
+        });
+    }
+
+    fn uniqueConstraintRangeGroupExistsTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        owner_group_id: u64,
+    ) !bool {
+        var range_key_buf: [160]u8 = undefined;
+        const range_key = try rangeKeyForGroup(&range_key_buf, group_id, owner_group_id);
+        if (txn.get(range_key)) |_| return true else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try uniqueConstraintRangePrefixForGroup(&prefix_buf, group_id);
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var entry = try cur.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cur.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const record = try decodeUniqueConstraintRangeRecord(self.alloc, kv.value);
+            defer metadata_table_manager.freeUniqueConstraintRange(self.alloc, record);
+            if (record.group_id == owner_group_id) return true;
+        }
+        return false;
+    }
+
     fn notifyProjectionListeners(self: *RaftApplyStore, signal: ProjectionSignal) void {
         for (self.projection_listeners.items) |listener| listener.onProjectionSignal(signal);
     }
@@ -1536,6 +2238,69 @@ pub const RaftApplyStore = struct {
 const transition_magic = "afmd1";
 const runtime_status_record_version: u16 = 4;
 
+fn freeForeignKeyReferenceRangeSelector(alloc: std.mem.Allocator, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) void {
+    alloc.free(selector.constraint_name);
+    alloc.free(selector.start_parent_key);
+}
+
+fn freeForeignKeyReferenceRangeSplitRequest(alloc: std.mem.Allocator, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) void {
+    freeForeignKeyReferenceRangeSelector(alloc, request.selector);
+    alloc.free(request.split_parent_key);
+}
+
+fn freeForeignKeyReferenceRangeMergeRequest(alloc: std.mem.Allocator, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) void {
+    freeForeignKeyReferenceRangeSelector(alloc, request.left_selector);
+    alloc.free(request.right_start_parent_key);
+}
+
+fn freeUniqueConstraintRangeSelector(alloc: std.mem.Allocator, selector: metadata_table_manager.UniqueConstraintRangeSelector) void {
+    alloc.free(selector.constraint_name);
+    alloc.free(selector.start_encoded_value);
+}
+
+fn freeUniqueConstraintRangeSplitRequest(alloc: std.mem.Allocator, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) void {
+    freeUniqueConstraintRangeSelector(alloc, request.selector);
+    alloc.free(request.split_encoded_value);
+}
+
+fn freeUniqueConstraintRangeMergeRequest(alloc: std.mem.Allocator, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) void {
+    freeUniqueConstraintRangeSelector(alloc, request.left_selector);
+    alloc.free(request.right_start_encoded_value);
+}
+
+fn replaceOwnedString(alloc: std.mem.Allocator, target: *[]const u8, replacement: []const u8) !void {
+    const owned = try alloc.dupe(u8, replacement);
+    alloc.free(target.*);
+    target.* = owned;
+}
+
+fn foreignKeyReferenceSplitKeyInsideRange(split_key: []const u8, start_parent_key: []const u8, end_parent_key: ?[]const u8) bool {
+    if (std.mem.order(u8, start_parent_key, split_key) != .lt) return false;
+    if (end_parent_key) |end| return std.mem.order(u8, split_key, end) == .lt;
+    return true;
+}
+
+fn foreignKeyReferenceRangesAdjacent(left: metadata.ForeignKeyReferenceRangeRecord, right: metadata.ForeignKeyReferenceRangeRecord) bool {
+    if (left.child_table_id != right.child_table_id) return false;
+    if (left.parent_table_id != right.parent_table_id) return false;
+    if (!std.mem.eql(u8, left.constraint_name, right.constraint_name)) return false;
+    const left_end = left.end_parent_key orelse return false;
+    return std.mem.eql(u8, left_end, right.start_parent_key);
+}
+
+fn uniqueConstraintSplitKeyInsideRange(split_key: []const u8, start_encoded_value: []const u8, end_encoded_value: ?[]const u8) bool {
+    if (std.mem.order(u8, start_encoded_value, split_key) != .lt) return false;
+    if (end_encoded_value) |end| return std.mem.order(u8, split_key, end) == .lt;
+    return true;
+}
+
+fn uniqueConstraintRangesAdjacent(left: metadata.UniqueConstraintRangeRecord, right: metadata.UniqueConstraintRangeRecord) bool {
+    if (left.table_id != right.table_id) return false;
+    if (!std.mem.eql(u8, left.constraint_name, right.constraint_name)) return false;
+    const left_end = left.end_encoded_value orelse return false;
+    return std.mem.eql(u8, left_end, right.start_encoded_value);
+}
+
 const TransitionTag = enum(u8) {
     upsert_node = 1,
     remove_node = 2,
@@ -1568,6 +2333,22 @@ const TransitionTag = enum(u8) {
     register_node = 29,
     register_store = 30,
     finalize_node_shutdown = 31,
+    upsert_foreign_key_ref_range = 32,
+    remove_foreign_key_ref_range = 33,
+    begin_foreign_key_ref_range_split = 34,
+    finish_foreign_key_ref_range_split = 35,
+    begin_foreign_key_ref_range_merge = 36,
+    finish_foreign_key_ref_range_merge = 37,
+    begin_foreign_key_ref_range_rebuild = 38,
+    finish_foreign_key_ref_range_rebuild = 39,
+    upsert_unique_constraint_range = 40,
+    remove_unique_constraint_range = 41,
+    begin_unique_constraint_range_split = 42,
+    finish_unique_constraint_range_split = 43,
+    begin_unique_constraint_range_merge = 44,
+    finish_unique_constraint_range_merge = 45,
+    begin_unique_constraint_range_rebuild = 46,
+    finish_unique_constraint_range_rebuild = 47,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -1664,6 +2445,79 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .remove_range => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_range));
             try appendInt(alloc, &out, u64, record.group_id);
+        },
+        .upsert_foreign_key_ref_range => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.upsert_foreign_key_ref_range));
+            try appendForeignKeyReferenceRangeRecord(alloc, &out, record);
+        },
+        .remove_foreign_key_ref_range => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_foreign_key_ref_range));
+            try appendInt(alloc, &out, u64, record.child_table_id);
+            try appendInt(alloc, &out, u32, @intCast(record.constraint_name.len));
+            try out.appendSlice(alloc, record.constraint_name);
+            try appendInt(alloc, &out, u64, record.parent_table_id);
+            try appendInt(alloc, &out, u32, @intCast(record.start_parent_key.len));
+            try out.appendSlice(alloc, record.start_parent_key);
+        },
+        .begin_foreign_key_ref_range_split => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.begin_foreign_key_ref_range_split));
+            try appendForeignKeyReferenceRangeSplitRequest(alloc, &out, request);
+        },
+        .finish_foreign_key_ref_range_split => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.finish_foreign_key_ref_range_split));
+            try appendForeignKeyReferenceRangeSplitRequest(alloc, &out, request);
+        },
+        .begin_foreign_key_ref_range_merge => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.begin_foreign_key_ref_range_merge));
+            try appendForeignKeyReferenceRangeMergeRequest(alloc, &out, request);
+        },
+        .finish_foreign_key_ref_range_merge => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.finish_foreign_key_ref_range_merge));
+            try appendForeignKeyReferenceRangeMergeRequest(alloc, &out, request);
+        },
+        .begin_foreign_key_ref_range_rebuild => |selector| {
+            try out.append(alloc, @intFromEnum(TransitionTag.begin_foreign_key_ref_range_rebuild));
+            try appendForeignKeyReferenceRangeSelector(alloc, &out, selector);
+        },
+        .finish_foreign_key_ref_range_rebuild => |selector| {
+            try out.append(alloc, @intFromEnum(TransitionTag.finish_foreign_key_ref_range_rebuild));
+            try appendForeignKeyReferenceRangeSelector(alloc, &out, selector);
+        },
+        .upsert_unique_constraint_range => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.upsert_unique_constraint_range));
+            try appendUniqueConstraintRangeRecord(alloc, &out, record);
+        },
+        .remove_unique_constraint_range => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_unique_constraint_range));
+            try appendInt(alloc, &out, u64, record.table_id);
+            try appendInt(alloc, &out, u32, @intCast(record.constraint_name.len));
+            try out.appendSlice(alloc, record.constraint_name);
+            try appendInt(alloc, &out, u32, @intCast(record.start_encoded_value.len));
+            try out.appendSlice(alloc, record.start_encoded_value);
+        },
+        .begin_unique_constraint_range_split => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.begin_unique_constraint_range_split));
+            try appendUniqueConstraintRangeSplitRequest(alloc, &out, request);
+        },
+        .finish_unique_constraint_range_split => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.finish_unique_constraint_range_split));
+            try appendUniqueConstraintRangeSplitRequest(alloc, &out, request);
+        },
+        .begin_unique_constraint_range_merge => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.begin_unique_constraint_range_merge));
+            try appendUniqueConstraintRangeMergeRequest(alloc, &out, request);
+        },
+        .finish_unique_constraint_range_merge => |request| {
+            try out.append(alloc, @intFromEnum(TransitionTag.finish_unique_constraint_range_merge));
+            try appendUniqueConstraintRangeMergeRequest(alloc, &out, request);
+        },
+        .begin_unique_constraint_range_rebuild => |selector| {
+            try out.append(alloc, @intFromEnum(TransitionTag.begin_unique_constraint_range_rebuild));
+            try appendUniqueConstraintRangeSelector(alloc, &out, selector);
+        },
+        .finish_unique_constraint_range_rebuild => |selector| {
+            try out.append(alloc, @intFromEnum(TransitionTag.finish_unique_constraint_range_rebuild));
+            try appendUniqueConstraintRangeSelector(alloc, &out, selector);
         },
         .upsert_split_transition => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_split_transition));
@@ -1792,6 +2646,63 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .remove_range => .{
             .remove_range = .{ .group_id = try readInt(encoded, &pos, u64) },
         },
+        .upsert_foreign_key_ref_range => .{
+            .upsert_foreign_key_ref_range = try readForeignKeyReferenceRangeRecord(alloc, encoded, &pos),
+        },
+        .remove_foreign_key_ref_range => .{
+            .remove_foreign_key_ref_range = .{
+                .child_table_id = try readInt(encoded, &pos, u64),
+                .constraint_name = try readRequiredString(alloc, encoded, &pos),
+                .parent_table_id = try readInt(encoded, &pos, u64),
+                .start_parent_key = try readRequiredString(alloc, encoded, &pos),
+            },
+        },
+        .begin_foreign_key_ref_range_split => .{
+            .begin_foreign_key_ref_range_split = try readForeignKeyReferenceRangeSplitRequest(alloc, encoded, &pos),
+        },
+        .finish_foreign_key_ref_range_split => .{
+            .finish_foreign_key_ref_range_split = try readForeignKeyReferenceRangeSplitRequest(alloc, encoded, &pos),
+        },
+        .begin_foreign_key_ref_range_merge => .{
+            .begin_foreign_key_ref_range_merge = try readForeignKeyReferenceRangeMergeRequest(alloc, encoded, &pos),
+        },
+        .finish_foreign_key_ref_range_merge => .{
+            .finish_foreign_key_ref_range_merge = try readForeignKeyReferenceRangeMergeRequest(alloc, encoded, &pos),
+        },
+        .begin_foreign_key_ref_range_rebuild => .{
+            .begin_foreign_key_ref_range_rebuild = try readForeignKeyReferenceRangeSelector(alloc, encoded, &pos),
+        },
+        .finish_foreign_key_ref_range_rebuild => .{
+            .finish_foreign_key_ref_range_rebuild = try readForeignKeyReferenceRangeSelector(alloc, encoded, &pos),
+        },
+        .upsert_unique_constraint_range => .{
+            .upsert_unique_constraint_range = try readUniqueConstraintRangeRecord(alloc, encoded, &pos),
+        },
+        .remove_unique_constraint_range => .{
+            .remove_unique_constraint_range = .{
+                .table_id = try readInt(encoded, &pos, u64),
+                .constraint_name = try readRequiredString(alloc, encoded, &pos),
+                .start_encoded_value = try readRequiredString(alloc, encoded, &pos),
+            },
+        },
+        .begin_unique_constraint_range_split => .{
+            .begin_unique_constraint_range_split = try readUniqueConstraintRangeSplitRequest(alloc, encoded, &pos),
+        },
+        .finish_unique_constraint_range_split => .{
+            .finish_unique_constraint_range_split = try readUniqueConstraintRangeSplitRequest(alloc, encoded, &pos),
+        },
+        .begin_unique_constraint_range_merge => .{
+            .begin_unique_constraint_range_merge = try readUniqueConstraintRangeMergeRequest(alloc, encoded, &pos),
+        },
+        .finish_unique_constraint_range_merge => .{
+            .finish_unique_constraint_range_merge = try readUniqueConstraintRangeMergeRequest(alloc, encoded, &pos),
+        },
+        .begin_unique_constraint_range_rebuild => .{
+            .begin_unique_constraint_range_rebuild = try readUniqueConstraintRangeSelector(alloc, encoded, &pos),
+        },
+        .finish_unique_constraint_range_rebuild => .{
+            .finish_unique_constraint_range_rebuild = try readUniqueConstraintRangeSelector(alloc, encoded, &pos),
+        },
         .upsert_split_transition => .{
             .upsert_split_transition = try readSplitTransitionRecord(alloc, encoded, &pos),
         },
@@ -1859,6 +2770,20 @@ fn encodeRangeRecord(alloc: std.mem.Allocator, record: metadata.RangeRecord) ![]
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try appendRangeRecord(alloc, &out, record);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn encodeForeignKeyReferenceRangeRecord(alloc: std.mem.Allocator, record: metadata.ForeignKeyReferenceRangeRecord) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendForeignKeyReferenceRangeRecord(alloc, &out, record);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn encodeUniqueConstraintRangeRecord(alloc: std.mem.Allocator, record: metadata.UniqueConstraintRangeRecord) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendUniqueConstraintRangeRecord(alloc, &out, record);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -1936,6 +2861,16 @@ fn decodeTableRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.Ta
 fn decodeRangeRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.RangeRecord {
     var pos: usize = 0;
     return try readRangeRecord(alloc, encoded, &pos);
+}
+
+fn decodeForeignKeyReferenceRangeRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.ForeignKeyReferenceRangeRecord {
+    var pos: usize = 0;
+    return try readForeignKeyReferenceRangeRecord(alloc, encoded, &pos);
+}
+
+fn decodeUniqueConstraintRangeRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.UniqueConstraintRangeRecord {
+    var pos: usize = 0;
+    return try readUniqueConstraintRangeRecord(alloc, encoded, &pos);
 }
 
 fn decodeSchemaProgressRecord(encoded: []const u8) !metadata.SchemaProgressRecord {
@@ -2707,6 +3642,124 @@ fn appendRangeRecord(
     try appendInt(alloc, out, u64, record.doc_identity_range_id);
 }
 
+fn appendForeignKeyReferenceRangeRecord(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: metadata.ForeignKeyReferenceRangeRecord,
+) !void {
+    try appendInt(alloc, out, u64, record.child_table_id);
+    try appendInt(alloc, out, u32, @intCast(record.constraint_name.len));
+    try out.appendSlice(alloc, record.constraint_name);
+    try appendInt(alloc, out, u64, record.parent_table_id);
+    try appendInt(alloc, out, u32, @intCast(record.start_parent_key.len));
+    try out.appendSlice(alloc, record.start_parent_key);
+    if (record.end_parent_key) |end| {
+        try out.append(alloc, 1);
+        try appendInt(alloc, out, u32, @intCast(end.len));
+        try out.appendSlice(alloc, end);
+    } else {
+        try out.append(alloc, 0);
+    }
+    try appendInt(alloc, out, u64, record.group_id);
+    try appendInt(alloc, out, u64, record.topology_epoch);
+    try appendInt(alloc, out, u32, @intCast(record.state.len));
+    try out.appendSlice(alloc, record.state);
+}
+
+fn appendForeignKeyReferenceRangeSelector(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    selector: metadata_table_manager.ForeignKeyReferenceRangeSelector,
+) !void {
+    try appendInt(alloc, out, u64, selector.child_table_id);
+    try appendInt(alloc, out, u32, @intCast(selector.constraint_name.len));
+    try out.appendSlice(alloc, selector.constraint_name);
+    try appendInt(alloc, out, u64, selector.parent_table_id);
+    try appendInt(alloc, out, u32, @intCast(selector.start_parent_key.len));
+    try out.appendSlice(alloc, selector.start_parent_key);
+}
+
+fn appendForeignKeyReferenceRangeSplitRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest,
+) !void {
+    try appendForeignKeyReferenceRangeSelector(alloc, out, request.selector);
+    try appendInt(alloc, out, u32, @intCast(request.split_parent_key.len));
+    try out.appendSlice(alloc, request.split_parent_key);
+    try appendInt(alloc, out, u64, request.left_group_id);
+    try appendInt(alloc, out, u64, request.right_group_id);
+}
+
+fn appendForeignKeyReferenceRangeMergeRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest,
+) !void {
+    try appendForeignKeyReferenceRangeSelector(alloc, out, request.left_selector);
+    try appendInt(alloc, out, u32, @intCast(request.right_start_parent_key.len));
+    try out.appendSlice(alloc, request.right_start_parent_key);
+    try appendInt(alloc, out, u64, request.merged_group_id);
+}
+
+fn appendUniqueConstraintRangeRecord(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: metadata.UniqueConstraintRangeRecord,
+) !void {
+    try appendInt(alloc, out, u64, record.table_id);
+    try appendInt(alloc, out, u32, @intCast(record.constraint_name.len));
+    try out.appendSlice(alloc, record.constraint_name);
+    try appendInt(alloc, out, u32, @intCast(record.start_encoded_value.len));
+    try out.appendSlice(alloc, record.start_encoded_value);
+    if (record.end_encoded_value) |end| {
+        try out.append(alloc, 1);
+        try appendInt(alloc, out, u32, @intCast(end.len));
+        try out.appendSlice(alloc, end);
+    } else {
+        try out.append(alloc, 0);
+    }
+    try appendInt(alloc, out, u64, record.group_id);
+    try appendInt(alloc, out, u64, record.topology_epoch);
+    try appendInt(alloc, out, u32, @intCast(record.state.len));
+    try out.appendSlice(alloc, record.state);
+}
+
+fn appendUniqueConstraintRangeSelector(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    selector: metadata_table_manager.UniqueConstraintRangeSelector,
+) !void {
+    try appendInt(alloc, out, u64, selector.table_id);
+    try appendInt(alloc, out, u32, @intCast(selector.constraint_name.len));
+    try out.appendSlice(alloc, selector.constraint_name);
+    try appendInt(alloc, out, u32, @intCast(selector.start_encoded_value.len));
+    try out.appendSlice(alloc, selector.start_encoded_value);
+}
+
+fn appendUniqueConstraintRangeSplitRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    request: metadata_table_manager.UniqueConstraintRangeSplitRequest,
+) !void {
+    try appendUniqueConstraintRangeSelector(alloc, out, request.selector);
+    try appendInt(alloc, out, u32, @intCast(request.split_encoded_value.len));
+    try out.appendSlice(alloc, request.split_encoded_value);
+    try appendInt(alloc, out, u64, request.left_group_id);
+    try appendInt(alloc, out, u64, request.right_group_id);
+}
+
+fn appendUniqueConstraintRangeMergeRequest(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    request: metadata_table_manager.UniqueConstraintRangeMergeRequest,
+) !void {
+    try appendUniqueConstraintRangeSelector(alloc, out, request.left_selector);
+    try appendInt(alloc, out, u32, @intCast(request.right_start_encoded_value.len));
+    try out.appendSlice(alloc, request.right_start_encoded_value);
+    try appendInt(alloc, out, u64, request.merged_group_id);
+}
+
 fn appendSplitTransitionRecord(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -3002,6 +4055,164 @@ fn readRangeRecord(
         .restore_backup_id = restore_backup_id,
         .restore_location = restore_location,
         .restore_snapshot_path = restore_snapshot_path,
+    };
+}
+
+fn readForeignKeyReferenceRangeRecord(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata.ForeignKeyReferenceRangeRecord {
+    const child_table_id = try readInt(encoded, pos, u64);
+    const constraint_name = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(constraint_name);
+    const parent_table_id = try readInt(encoded, pos, u64);
+    const start_parent_key = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(start_parent_key);
+    const end_parent_key = try readOptionalString(alloc, encoded, pos);
+    errdefer if (end_parent_key) |end| alloc.free(end);
+    const group_id = try readInt(encoded, pos, u64);
+    const topology_epoch = try readInt(encoded, pos, u64);
+    const state = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(state);
+    return .{
+        .child_table_id = child_table_id,
+        .constraint_name = constraint_name,
+        .parent_table_id = parent_table_id,
+        .start_parent_key = start_parent_key,
+        .end_parent_key = end_parent_key,
+        .group_id = group_id,
+        .topology_epoch = topology_epoch,
+        .state = state,
+    };
+}
+
+fn readForeignKeyReferenceRangeSelector(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.ForeignKeyReferenceRangeSelector {
+    const child_table_id = try readInt(encoded, pos, u64);
+    const constraint_name = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(constraint_name);
+    const parent_table_id = try readInt(encoded, pos, u64);
+    const start_parent_key = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(start_parent_key);
+    return .{
+        .child_table_id = child_table_id,
+        .constraint_name = constraint_name,
+        .parent_table_id = parent_table_id,
+        .start_parent_key = start_parent_key,
+    };
+}
+
+fn readForeignKeyReferenceRangeSplitRequest(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.ForeignKeyReferenceRangeSplitRequest {
+    const selector = try readForeignKeyReferenceRangeSelector(alloc, encoded, pos);
+    errdefer freeForeignKeyReferenceRangeSelector(alloc, selector);
+    const split_parent_key = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(split_parent_key);
+    return .{
+        .selector = selector,
+        .split_parent_key = split_parent_key,
+        .left_group_id = try readInt(encoded, pos, u64),
+        .right_group_id = try readInt(encoded, pos, u64),
+    };
+}
+
+fn readForeignKeyReferenceRangeMergeRequest(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.ForeignKeyReferenceRangeMergeRequest {
+    const left_selector = try readForeignKeyReferenceRangeSelector(alloc, encoded, pos);
+    errdefer freeForeignKeyReferenceRangeSelector(alloc, left_selector);
+    const right_start_parent_key = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(right_start_parent_key);
+    return .{
+        .left_selector = left_selector,
+        .right_start_parent_key = right_start_parent_key,
+        .merged_group_id = try readInt(encoded, pos, u64),
+    };
+}
+
+fn readUniqueConstraintRangeRecord(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata.UniqueConstraintRangeRecord {
+    const table_id = try readInt(encoded, pos, u64);
+    const constraint_name = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(constraint_name);
+    const start_encoded_value = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(start_encoded_value);
+    const end_encoded_value = try readOptionalString(alloc, encoded, pos);
+    errdefer if (end_encoded_value) |end| alloc.free(end);
+    const group_id = try readInt(encoded, pos, u64);
+    const topology_epoch = try readInt(encoded, pos, u64);
+    const state = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(state);
+    return .{
+        .table_id = table_id,
+        .constraint_name = constraint_name,
+        .start_encoded_value = start_encoded_value,
+        .end_encoded_value = end_encoded_value,
+        .group_id = group_id,
+        .topology_epoch = topology_epoch,
+        .state = state,
+    };
+}
+
+fn readUniqueConstraintRangeSelector(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.UniqueConstraintRangeSelector {
+    const table_id = try readInt(encoded, pos, u64);
+    const constraint_name = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(constraint_name);
+    const start_encoded_value = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(start_encoded_value);
+    return .{
+        .table_id = table_id,
+        .constraint_name = constraint_name,
+        .start_encoded_value = start_encoded_value,
+    };
+}
+
+fn readUniqueConstraintRangeSplitRequest(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.UniqueConstraintRangeSplitRequest {
+    const selector = try readUniqueConstraintRangeSelector(alloc, encoded, pos);
+    errdefer freeUniqueConstraintRangeSelector(alloc, selector);
+    const split_encoded_value = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(split_encoded_value);
+    return .{
+        .selector = selector,
+        .split_encoded_value = split_encoded_value,
+        .left_group_id = try readInt(encoded, pos, u64),
+        .right_group_id = try readInt(encoded, pos, u64),
+    };
+}
+
+fn readUniqueConstraintRangeMergeRequest(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata_table_manager.UniqueConstraintRangeMergeRequest {
+    const left_selector = try readUniqueConstraintRangeSelector(alloc, encoded, pos);
+    errdefer freeUniqueConstraintRangeSelector(alloc, left_selector);
+    const right_start_encoded_value = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(right_start_encoded_value);
+    return .{
+        .left_selector = left_selector,
+        .right_start_encoded_value = right_start_encoded_value,
+        .merged_group_id = try readInt(encoded, pos, u64),
     };
 }
 
@@ -3343,6 +4554,14 @@ pub fn rangePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_range:{d}:", .{group_id});
 }
 
+pub fn foreignKeyReferenceRangePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_foreign_key_ref_range:{d}:", .{group_id});
+}
+
+pub fn uniqueConstraintRangePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_unique_constraint_range:{d}:", .{group_id});
+}
+
 pub fn mergeTransitionPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_transition:merge:{d}:", .{group_id});
 }
@@ -3385,6 +4604,50 @@ fn replicationSourceStatusKeyForGroup(buf: []u8, group_id: u64, table_id: u64, s
 
 fn rangeKeyForGroup(buf: []u8, group_id: u64, range_group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_range:{d}:{d}", .{ group_id, range_group_id });
+}
+
+fn foreignKeyReferenceRangeKeyForGroup(
+    buf: []u8,
+    group_id: u64,
+    child_table_id: u64,
+    constraint_name: []const u8,
+    parent_table_id: u64,
+    start_parent_key: []const u8,
+) ![]const u8 {
+    return try std.fmt.bufPrint(
+        buf,
+        "\x00\x00__metadata__:metadata_foreign_key_ref_range:{d}:{d}:{d}:{s}:{d}:{d}:{s}",
+        .{
+            group_id,
+            child_table_id,
+            constraint_name.len,
+            constraint_name,
+            parent_table_id,
+            start_parent_key.len,
+            start_parent_key,
+        },
+    );
+}
+
+fn uniqueConstraintRangeKeyForGroup(
+    buf: []u8,
+    group_id: u64,
+    table_id: u64,
+    constraint_name: []const u8,
+    start_encoded_value: []const u8,
+) ![]const u8 {
+    return try std.fmt.bufPrint(
+        buf,
+        "\x00\x00__metadata__:metadata_unique_constraint_range:{d}:{d}:{d}:{s}:{d}:{s}",
+        .{
+            group_id,
+            table_id,
+            constraint_name.len,
+            constraint_name,
+            start_encoded_value.len,
+            start_encoded_value,
+        },
+    );
 }
 
 fn placementKeyForGroup(buf: []u8, group_id: u64, range_group_id: u64, local_node_id: u64) ![]const u8 {
@@ -4102,10 +5365,283 @@ test "metadata raft apply store preserves projected tables and ranges across reo
         },
     });
     defer std.testing.allocator.free(range_cmd);
+    const fk_ref_low_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_foreign_key_ref_range = .{
+            .child_table_id = 61,
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table_id = 62,
+            .start_parent_key = "",
+            .end_parent_key = "customer:m",
+            .group_id = 6201,
+            .topology_epoch = 11,
+        },
+    });
+    defer std.testing.allocator.free(fk_ref_low_cmd);
+    const fk_ref_high_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_foreign_key_ref_range = .{
+            .child_table_id = 61,
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table_id = 62,
+            .start_parent_key = "customer:m",
+            .end_parent_key = null,
+            .group_id = 6202,
+            .topology_epoch = 12,
+            .state = metadata_table_manager.foreign_key_ref_range_rebuilding,
+        },
+    });
+    defer std.testing.allocator.free(fk_ref_high_cmd);
+    const fk_ref_high_replace_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_foreign_key_ref_range = .{
+            .child_table_id = 61,
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table_id = 62,
+            .start_parent_key = "customer:m",
+            .end_parent_key = null,
+            .group_id = 6212,
+            .topology_epoch = 22,
+            .state = metadata_table_manager.foreign_key_ref_range_active,
+        },
+    });
+    defer std.testing.allocator.free(fk_ref_high_replace_cmd);
+    const fk_ref_low_remove_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_foreign_key_ref_range = .{
+            .child_table_id = 61,
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table_id = 62,
+            .start_parent_key = "",
+        },
+    });
+    defer std.testing.allocator.free(fk_ref_low_remove_cmd);
+    const fk_ref_lifecycle_upsert_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_foreign_key_ref_range = .{
+            .child_table_id = 61,
+            .constraint_name = "orders_account_id_fkey",
+            .parent_table_id = 63,
+            .start_parent_key = "",
+            .end_parent_key = null,
+            .group_id = 6301,
+            .topology_epoch = 31,
+        },
+    });
+    defer std.testing.allocator.free(fk_ref_lifecycle_upsert_cmd);
+    const fk_ref_begin_rebuild_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_foreign_key_ref_range_rebuild = .{
+            .child_table_id = 61,
+            .constraint_name = "orders_account_id_fkey",
+            .parent_table_id = 63,
+            .start_parent_key = "",
+        },
+    });
+    defer std.testing.allocator.free(fk_ref_begin_rebuild_cmd);
+    const fk_ref_finish_rebuild_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .finish_foreign_key_ref_range_rebuild = .{
+            .child_table_id = 61,
+            .constraint_name = "orders_account_id_fkey",
+            .parent_table_id = 63,
+            .start_parent_key = "",
+        },
+    });
+    defer std.testing.allocator.free(fk_ref_finish_rebuild_cmd);
+    const fk_ref_begin_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_foreign_key_ref_range_split = .{
+            .selector = .{
+                .child_table_id = 61,
+                .constraint_name = "orders_account_id_fkey",
+                .parent_table_id = 63,
+                .start_parent_key = "",
+            },
+            .split_parent_key = "account:m",
+            .left_group_id = 6301,
+            .right_group_id = 6302,
+        },
+    });
+    defer std.testing.allocator.free(fk_ref_begin_split_cmd);
+    const fk_ref_finish_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .finish_foreign_key_ref_range_split = .{
+            .selector = .{
+                .child_table_id = 61,
+                .constraint_name = "orders_account_id_fkey",
+                .parent_table_id = 63,
+                .start_parent_key = "",
+            },
+            .split_parent_key = "account:m",
+            .left_group_id = 6301,
+            .right_group_id = 6302,
+        },
+    });
+    defer std.testing.allocator.free(fk_ref_finish_split_cmd);
+    const fk_ref_begin_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_foreign_key_ref_range_merge = .{
+            .left_selector = .{
+                .child_table_id = 61,
+                .constraint_name = "orders_account_id_fkey",
+                .parent_table_id = 63,
+                .start_parent_key = "",
+            },
+            .right_start_parent_key = "account:m",
+            .merged_group_id = 6301,
+        },
+    });
+    defer std.testing.allocator.free(fk_ref_begin_merge_cmd);
+    const fk_ref_finish_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .finish_foreign_key_ref_range_merge = .{
+            .left_selector = .{
+                .child_table_id = 61,
+                .constraint_name = "orders_account_id_fkey",
+                .parent_table_id = 63,
+                .start_parent_key = "",
+            },
+            .right_start_parent_key = "account:m",
+            .merged_group_id = 6301,
+        },
+    });
+    defer std.testing.allocator.free(fk_ref_finish_merge_cmd);
+    const unique_low_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_unique_constraint_range = .{
+            .table_id = 61,
+            .constraint_name = "users_email_key",
+            .start_encoded_value = "",
+            .end_encoded_value = "email:m",
+            .group_id = 6401,
+            .topology_epoch = 41,
+        },
+    });
+    defer std.testing.allocator.free(unique_low_cmd);
+    const unique_high_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_unique_constraint_range = .{
+            .table_id = 61,
+            .constraint_name = "users_email_key",
+            .start_encoded_value = "email:m",
+            .end_encoded_value = null,
+            .group_id = 6402,
+            .topology_epoch = 42,
+            .state = metadata_table_manager.unique_constraint_range_rebuilding,
+        },
+    });
+    defer std.testing.allocator.free(unique_high_cmd);
+    const unique_high_replace_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_unique_constraint_range = .{
+            .table_id = 61,
+            .constraint_name = "users_email_key",
+            .start_encoded_value = "email:m",
+            .end_encoded_value = null,
+            .group_id = 6412,
+            .topology_epoch = 52,
+            .state = metadata_table_manager.unique_constraint_range_active,
+        },
+    });
+    defer std.testing.allocator.free(unique_high_replace_cmd);
+    const unique_low_remove_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_unique_constraint_range = .{
+            .table_id = 61,
+            .constraint_name = "users_email_key",
+            .start_encoded_value = "",
+        },
+    });
+    defer std.testing.allocator.free(unique_low_remove_cmd);
+    const unique_lifecycle_upsert_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_unique_constraint_range = .{
+            .table_id = 61,
+            .constraint_name = "users_username_key",
+            .start_encoded_value = "",
+            .end_encoded_value = null,
+            .group_id = 6501,
+            .topology_epoch = 61,
+        },
+    });
+    defer std.testing.allocator.free(unique_lifecycle_upsert_cmd);
+    const unique_begin_rebuild_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_unique_constraint_range_rebuild = .{
+            .table_id = 61,
+            .constraint_name = "users_username_key",
+            .start_encoded_value = "",
+        },
+    });
+    defer std.testing.allocator.free(unique_begin_rebuild_cmd);
+    const unique_finish_rebuild_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .finish_unique_constraint_range_rebuild = .{
+            .table_id = 61,
+            .constraint_name = "users_username_key",
+            .start_encoded_value = "",
+        },
+    });
+    defer std.testing.allocator.free(unique_finish_rebuild_cmd);
+    const unique_begin_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_unique_constraint_range_split = .{
+            .selector = .{
+                .table_id = 61,
+                .constraint_name = "users_username_key",
+                .start_encoded_value = "",
+            },
+            .split_encoded_value = "username:m",
+            .left_group_id = 6501,
+            .right_group_id = 6502,
+        },
+    });
+    defer std.testing.allocator.free(unique_begin_split_cmd);
+    const unique_finish_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .finish_unique_constraint_range_split = .{
+            .selector = .{
+                .table_id = 61,
+                .constraint_name = "users_username_key",
+                .start_encoded_value = "",
+            },
+            .split_encoded_value = "username:m",
+            .left_group_id = 6501,
+            .right_group_id = 6502,
+        },
+    });
+    defer std.testing.allocator.free(unique_finish_split_cmd);
+    const unique_begin_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .begin_unique_constraint_range_merge = .{
+            .left_selector = .{
+                .table_id = 61,
+                .constraint_name = "users_username_key",
+                .start_encoded_value = "",
+            },
+            .right_start_encoded_value = "username:m",
+            .merged_group_id = 6501,
+        },
+    });
+    defer std.testing.allocator.free(unique_begin_merge_cmd);
+    const unique_finish_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .finish_unique_constraint_range_merge = .{
+            .left_selector = .{
+                .table_id = 61,
+                .constraint_name = "users_username_key",
+                .start_encoded_value = "",
+            },
+            .right_start_encoded_value = "username:m",
+            .merged_group_id = 6501,
+        },
+    });
+    defer std.testing.allocator.free(unique_finish_merge_cmd);
 
     const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = range_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = fk_ref_low_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = fk_ref_high_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = fk_ref_high_replace_cmd },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = fk_ref_low_remove_cmd },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = fk_ref_lifecycle_upsert_cmd },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = fk_ref_begin_rebuild_cmd },
+        .{ .term = 1, .index = 9, .entry_type = .normal, .data = fk_ref_finish_rebuild_cmd },
+        .{ .term = 1, .index = 10, .entry_type = .normal, .data = fk_ref_begin_split_cmd },
+        .{ .term = 1, .index = 11, .entry_type = .normal, .data = fk_ref_finish_split_cmd },
+        .{ .term = 1, .index = 12, .entry_type = .normal, .data = fk_ref_begin_merge_cmd },
+        .{ .term = 1, .index = 13, .entry_type = .normal, .data = fk_ref_finish_merge_cmd },
+        .{ .term = 1, .index = 14, .entry_type = .normal, .data = unique_low_cmd },
+        .{ .term = 1, .index = 15, .entry_type = .normal, .data = unique_high_cmd },
+        .{ .term = 1, .index = 16, .entry_type = .normal, .data = unique_high_replace_cmd },
+        .{ .term = 1, .index = 17, .entry_type = .normal, .data = unique_low_remove_cmd },
+        .{ .term = 1, .index = 18, .entry_type = .normal, .data = unique_lifecycle_upsert_cmd },
+        .{ .term = 1, .index = 19, .entry_type = .normal, .data = unique_begin_rebuild_cmd },
+        .{ .term = 1, .index = 20, .entry_type = .normal, .data = unique_finish_rebuild_cmd },
+        .{ .term = 1, .index = 21, .entry_type = .normal, .data = unique_begin_split_cmd },
+        .{ .term = 1, .index = 22, .entry_type = .normal, .data = unique_finish_split_cmd },
+        .{ .term = 1, .index = 23, .entry_type = .normal, .data = unique_begin_merge_cmd },
+        .{ .term = 1, .index = 24, .entry_type = .normal, .data = unique_finish_merge_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
 
@@ -4114,7 +5650,7 @@ test "metadata raft apply store preserves projected tables and ranges across reo
         defer store.deinit();
         try store.snapshotBuilder().applyBatch(.{
             .group_id = 61,
-            .commit_index = 2,
+            .commit_index = 6,
             .entries_bytes = encoded_entries,
         });
     }
@@ -4127,11 +5663,60 @@ test "metadata raft apply store preserves projected tables and ranges across reo
         defer store.freeTables(std.testing.allocator, tables);
         const ranges = try store.listRanges(std.testing.allocator, 61);
         defer store.freeRanges(std.testing.allocator, ranges);
+        const fk_ref_ranges = try store.listForeignKeyReferenceRanges(std.testing.allocator, 61);
+        defer store.freeForeignKeyReferenceRanges(std.testing.allocator, fk_ref_ranges);
+        const unique_ranges = try store.listUniqueConstraintRanges(std.testing.allocator, 61);
+        defer store.freeUniqueConstraintRanges(std.testing.allocator, unique_ranges);
 
         try std.testing.expectEqual(@as(usize, 1), tables.len);
         try std.testing.expectEqualStrings("docs", tables[0].name);
         try std.testing.expectEqual(@as(usize, 1), ranges.len);
         try std.testing.expectEqual(@as(u64, 6101), ranges[0].group_id);
+        try std.testing.expectEqual(@as(usize, 2), fk_ref_ranges.len);
+        var saw_customer = false;
+        var saw_account = false;
+        for (fk_ref_ranges) |record| {
+            try std.testing.expectEqual(@as(u64, 61), record.child_table_id);
+            try std.testing.expectEqualStrings(metadata_table_manager.foreign_key_ref_range_active, record.state);
+            if (std.mem.eql(u8, record.constraint_name, "orders_customer_id_fkey")) {
+                try std.testing.expectEqual(@as(u64, 62), record.parent_table_id);
+                try std.testing.expectEqualStrings("customer:m", record.start_parent_key);
+                try std.testing.expect(record.end_parent_key == null);
+                try std.testing.expectEqual(@as(u64, 6212), record.group_id);
+                try std.testing.expectEqual(@as(u64, 22), record.topology_epoch);
+                saw_customer = true;
+            } else if (std.mem.eql(u8, record.constraint_name, "orders_account_id_fkey")) {
+                try std.testing.expectEqual(@as(u64, 63), record.parent_table_id);
+                try std.testing.expectEqualStrings("", record.start_parent_key);
+                try std.testing.expect(record.end_parent_key == null);
+                try std.testing.expectEqual(@as(u64, 6301), record.group_id);
+                try std.testing.expect(record.topology_epoch > 31);
+                saw_account = true;
+            }
+        }
+        try std.testing.expect(saw_customer and saw_account);
+
+        try std.testing.expectEqual(@as(usize, 2), unique_ranges.len);
+        var saw_email = false;
+        var saw_username = false;
+        for (unique_ranges) |record| {
+            try std.testing.expectEqual(@as(u64, 61), record.table_id);
+            try std.testing.expectEqualStrings(metadata_table_manager.unique_constraint_range_active, record.state);
+            if (std.mem.eql(u8, record.constraint_name, "users_email_key")) {
+                try std.testing.expectEqualStrings("email:m", record.start_encoded_value);
+                try std.testing.expect(record.end_encoded_value == null);
+                try std.testing.expectEqual(@as(u64, 6412), record.group_id);
+                try std.testing.expectEqual(@as(u64, 52), record.topology_epoch);
+                saw_email = true;
+            } else if (std.mem.eql(u8, record.constraint_name, "users_username_key")) {
+                try std.testing.expectEqualStrings("", record.start_encoded_value);
+                try std.testing.expect(record.end_encoded_value == null);
+                try std.testing.expectEqual(@as(u64, 6501), record.group_id);
+                try std.testing.expect(record.topology_epoch > 61);
+                saw_username = true;
+            }
+        }
+        try std.testing.expect(saw_email and saw_username);
     }
 }
 

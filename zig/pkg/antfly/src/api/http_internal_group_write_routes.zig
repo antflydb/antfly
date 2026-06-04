@@ -57,6 +57,26 @@ const CorruptEmbeddingArtifactRequest = struct {
     index_name: []const u8,
 };
 
+const ForeignKeyIntegrityRequestWire = struct {
+    action: ?[]const u8 = null,
+    constraint_name: ?[]const u8 = null,
+    doc_key: ?[]const u8 = null,
+    lower_doc_key: ?[]const u8 = null,
+    upper_doc_key: ?[]const u8 = null,
+    violation_limit: ?usize = null,
+};
+
+fn parseForeignKeyIntegrityAction(value: ?[]const u8) !table_writes.ForeignKeyIntegrityAction {
+    const text = value orelse "validate";
+    if (std.mem.eql(u8, text, "validate")) return .validate;
+    if (std.mem.eql(u8, text, "dry_run")) return .dry_run;
+    if (std.mem.eql(u8, text, "repair")) return .repair;
+    if (std.mem.eql(u8, text, "list")) return .list;
+    if (std.mem.eql(u8, text, "explain_delete")) return .explain_delete;
+    if (std.mem.eql(u8, text, "progress")) return .progress;
+    return error.InvalidForeignKeyIntegrityRequest;
+}
+
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
     if (req.method == .GET) {
         if (routes.Routes.matchGroupDbMedianKey(path)) |route| {
@@ -159,7 +179,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         };
 
         _ = (writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req) catch |err| switch (err) {
-            error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
+            error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             else => return err,
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
@@ -170,6 +190,78 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             .transformed = result.transformed,
         };
         return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 201, response);
+    }
+    if (routes.Routes.matchGroupForeignKeyIntegrity(path)) |fk_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(ForeignKeyIntegrityRequestWire, ctx.alloc, if (req.body.len == 0) "{}" else req.body, .{
+            .ignore_unknown_fields = true,
+        }) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key integrity request");
+        defer parsed.deinit();
+        const action = parseForeignKeyIntegrityAction(parsed.value.action) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key integrity request");
+        };
+        const violation_limit = @min(parsed.value.violation_limit orelse 100, 10_000);
+        if (action == .explain_delete and (parsed.value.doc_key == null or parsed.value.doc_key.?.len == 0)) {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "foreign key delete explain requires doc_key");
+        }
+        const lower_doc_key = if (action == .explain_delete) parsed.value.doc_key.? else parsed.value.lower_doc_key orelse "";
+        const upper_doc_key = if (action == .explain_delete) "" else parsed.value.upper_doc_key orelse "";
+        var result = (writes.foreignKeyIntegrityGroupLocal(
+            ctx.alloc,
+            fk_route.group_id,
+            fk_route.table_name,
+            action,
+            parsed.value.constraint_name,
+            lower_doc_key,
+            upper_doc_key,
+            violation_limit,
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.ForeignKeyNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "foreign key not found"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer result.deinit(ctx.alloc);
+        return try http_route_helpers.jsonResponse(ctx.alloc, result);
+    }
+    if (routes.Routes.matchGroupForeignKeyRefChildren(path)) |fk_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var scan_req = distributed_txn.parseForeignKeyRefChildrenRequest(ctx.alloc, if (req.body.len == 0) "{}" else req.body) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key ref children request");
+        };
+        defer distributed_txn.freeForeignKeyRefChildrenRequest(ctx.alloc, &scan_req);
+        const limit = @min(scan_req.limit, 10_000);
+        var page = (writes.foreignKeyRefChildrenPageGroupLocal(
+            ctx.alloc,
+            fk_route.group_id,
+            fk_route.table_name,
+            scan_req.constraint_name,
+            scan_req.parent_table,
+            scan_req.parent_key,
+            scan_req.start_after_child_table,
+            scan_req.start_after_child_key,
+            limit,
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.ForeignKeyNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "foreign key not found"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            error.ForeignKeyActionLimitExceeded => return try http_route_helpers.textResponse(ctx.alloc, 409, "foreign key action limit exceeded"),
+            error.ForeignKeyViolation => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key ref children request"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer table_writes.freeForeignKeyRefChildrenPage(ctx.alloc, &page);
+        const body = try distributed_txn.encodeForeignKeyRefChildrenResponse(ctx.alloc, .{
+            .children = page.children,
+            .complete = page.complete,
+            .next_child_table = page.next_child_table,
+            .next_child_key = page.next_child_key,
+        });
+        errdefer ctx.alloc.free(body);
+        return .{
+            .status = 200,
+            .content_type = try ctx.alloc.dupe(u8, "application/json"),
+            .body = body,
+        };
     }
     if (routes.Routes.matchGroupTxnBegin(path)) |txn_route| {
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
@@ -213,6 +305,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             txn_req.topology_epoch,
             txn_req.req,
         ) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request"),
             error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
             error.VersionConflict, error.IntentConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "transaction conflict"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
@@ -235,6 +328,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             txn_req.status,
             txn_req.commit_version,
         ) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request"),
             error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
@@ -449,6 +543,54 @@ test "internal group write routes validate transaction status requests" {
     try std.testing.expectEqualStrings("invalid transaction request", resp.body);
 }
 
+test "internal group write routes expose foreign key integrity" {
+    const alloc = std.testing.allocator;
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/foreign-key-integrity",
+        .body = "{\"action\":\"list\",\"violation_limit\":3}",
+    }, "/internal/v1/groups/7/tables/docs/foreign-key-integrity")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    var parsed = try std.json.parseFromSlice(table_writes.ForeignKeyIntegrityResult, alloc, resp.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(table_writes.ForeignKeyIntegrityAction.list, parsed.value.action);
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.groups[0].group_id);
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.violation_limit);
+
+    var dry_run_resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/foreign-key-integrity",
+        .body = "{\"action\":\"dry_run\"}",
+    }, "/internal/v1/groups/7/tables/docs/foreign-key-integrity")).?;
+    defer dry_run_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), dry_run_resp.status);
+    var dry_run_parsed = try std.json.parseFromSlice(table_writes.ForeignKeyIntegrityResult, alloc, dry_run_resp.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer dry_run_parsed.deinit();
+    try std.testing.expectEqual(table_writes.ForeignKeyIntegrityAction.dry_run, dry_run_parsed.value.action);
+}
+
 test "internal group write routes reject mismatched shard execute requests" {
     const alloc = std.testing.allocator;
 
@@ -610,6 +752,7 @@ const TestWriteSource = struct {
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
             },
         };
     }
@@ -654,6 +797,31 @@ const TestWriteSource = struct {
 
     fn txnStatusGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !?db_mod.types.TxnStatus {
         return .pending;
+    }
+
+    fn foreignKeyIntegrityGroupLocal(
+        _: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        _: []const u8,
+        action: table_writes.ForeignKeyIntegrityAction,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        violation_limit: usize,
+    ) !?table_writes.ForeignKeyIntegrityResult {
+        const groups = try alloc.alloc(table_writes.ForeignKeyIntegrityGroupReport, 1);
+        groups[0] = .{ .group_id = group_id, .report = .{} };
+        return .{
+            .action = action,
+            .valid = true,
+            .complete = true,
+            .violation_limit = violation_limit,
+            .violations_truncated = false,
+            .report = .{},
+            .groups = groups,
+            .violations = &.{},
+        };
     }
 };
 

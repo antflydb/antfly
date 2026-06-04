@@ -74,7 +74,15 @@ pub const DocumentSchema = struct {
 pub const ForeignKeyReference = struct {
     /// Referenced relational table name.
     table: ?[]const u8 = null,
-    /// Referenced parent columns. Currently must be exactly ["_id"].
+    /// Referenced parent columns. Use ["_id"] for the document-key primary key, or an ordered column tuple backed by a declared unique constraint.
+    columns: ?[]const []const u8 = null,
+};
+
+/// Relational unique constraint.
+pub const UniqueConstraint = struct {
+    /// Constraint name, unique within the table schema.
+    name: ?[]const u8 = null,
+    /// Unique columns. One or more ordered non-json relational columns are supported.
     columns: ?[]const []const u8 = null,
 };
 
@@ -97,11 +105,15 @@ pub const TemplateFieldMapping = struct {
 pub const ForeignKey = struct {
     /// Constraint name, unique within the table schema.
     name: ?[]const u8 = null,
-    /// Child columns. Currently exactly one scalar relational column is supported.
+    /// Child columns. A single scalar column is supported for ["_id"] references; ordered scalar tuples are supported when references.columns names a unique constraint column tuple.
     columns: ?[]const []const u8 = null,
     references: ?ForeignKeyReference = null,
-    /// Delete action. Currently only "restrict" is supported.
+    /// Delete action. "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
     on_delete: ?[]const u8 = null,
+    /// Constraint timing. Only immediate enforcement is currently accepted; deferred constraints are reserved for the distributed constraint planner.
+    timing: ?[]const u8 = null,
+    /// Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
+    validation_state: ?[]const u8 = null,
 };
 
 /// A rule for mapping dynamically detected fields. Templates are checked in order and the first matching template's mapping is used.
@@ -139,6 +151,8 @@ pub const TableSchema = struct {
     ttl_duration: ?[]const u8 = null,
     /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
     dynamic_templates: ?[]const DynamicTemplate = null,
-    /// Relational-mode referential constraints. The first supported shape is a single declared child column referencing a parent table's `_id` document key with `on_delete: "restrict"`. Unsupported shapes are rejected during schema validation.
+    /// Relational-mode referential constraints. Supported targets are a parent table's `_id` document key or a same-table declared unique parent column tuple with `on_delete: "restrict"` or bounded local nullable-column `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`. Cross-table unique targets are rejected until routed parent-table unique participants exist. Unsupported shapes are rejected during schema validation.
     foreign_keys: ?[]const ForeignKey = null,
+    /// Relational-mode unique constraints over one or more ordered declared non-json relational columns. Present scalar tuples are enforced by committed integrity rows; rows with any absent nullable component do not create unique rows.
+    unique_constraints: ?[]const UniqueConstraint = null,
 };

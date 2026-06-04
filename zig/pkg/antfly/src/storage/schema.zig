@@ -136,6 +136,20 @@ pub const RelationalColumn = struct {
 
 pub const ForeignKeyAction = enum(u8) {
     restrict = 0,
+    set_null = 1,
+    cascade = 2,
+};
+
+pub const ForeignKeyTiming = enum(u8) {
+    immediate = 0,
+    deferred = 1,
+};
+
+pub const ForeignKeyValidationState = enum(u8) {
+    enforced = 0,
+    unvalidated = 1,
+    validating = 2,
+    invalid = 3,
 };
 
 pub const ForeignKey = struct {
@@ -144,6 +158,13 @@ pub const ForeignKey = struct {
     parent_table: []const u8,
     parent_columns: []const []const u8 = &.{},
     on_delete: ForeignKeyAction = .restrict,
+    timing: ForeignKeyTiming = .immediate,
+    validation_state: ForeignKeyValidationState = .enforced,
+};
+
+pub const UniqueConstraint = struct {
+    name: []const u8,
+    columns: []const []const u8 = &.{},
 };
 
 pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []const RelationalColumn) bool {
@@ -166,6 +187,17 @@ pub fn foreignKeyCatalogsEqual(current: []const ForeignKey, next: []const Foreig
         if (!std.mem.eql(u8, a.parent_table, b.parent_table)) return false;
         if (!stringSlicesEqual(a.parent_columns, b.parent_columns)) return false;
         if (a.on_delete != b.on_delete) return false;
+        if (a.timing != b.timing) return false;
+        if (a.validation_state != b.validation_state) return false;
+    }
+    return true;
+}
+
+pub fn uniqueConstraintCatalogsEqual(current: []const UniqueConstraint, next: []const UniqueConstraint) bool {
+    if (current.len != next.len) return false;
+    for (current, next) |a, b| {
+        if (!std.mem.eql(u8, a.name, b.name)) return false;
+        if (!stringSlicesEqual(a.columns, b.columns)) return false;
     }
     return true;
 }
@@ -189,6 +221,7 @@ pub const TableSchema = struct {
     full_text_documents: []const FullTextDocument = &.{},
     relational_columns: []const RelationalColumn = &.{},
     foreign_keys: []const ForeignKey = &.{},
+    unique_constraints: []const UniqueConstraint = &.{},
 };
 
 // ============================================================================
@@ -209,7 +242,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 11); // format version
+    try appendU32(&buf, alloc, 13); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -282,6 +315,16 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try appendU32(&buf, alloc, @intCast(foreign_key.parent_columns.len));
         for (foreign_key.parent_columns) |column| try appendStr(&buf, alloc, column);
         try buf.append(alloc, @intFromEnum(foreign_key.on_delete));
+        try buf.append(alloc, @intFromEnum(foreign_key.timing));
+        try buf.append(alloc, @intFromEnum(foreign_key.validation_state));
+    }
+
+    // Unique-constraint catalog (format version 12+).
+    try appendU32(&buf, alloc, @intCast(schema.unique_constraints.len));
+    for (schema.unique_constraints) |constraint| {
+        try appendStr(&buf, alloc, constraint.name);
+        try appendU32(&buf, alloc, @intCast(constraint.columns.len));
+        for (constraint.columns) |column| try appendStr(&buf, alloc, column);
     }
 
     const result = try alloc.dupe(u8, buf.items);
@@ -297,7 +340,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version != 1 and fmt_version != 2 and fmt_version != 3 and fmt_version != 4 and fmt_version != 5 and fmt_version != 6 and fmt_version != 7 and fmt_version != 8 and fmt_version != 9 and fmt_version != 10 and fmt_version != 11) return error.UnsupportedVersion;
+    if (fmt_version != 1 and fmt_version != 2 and fmt_version != 3 and fmt_version != 4 and fmt_version != 5 and fmt_version != 6 and fmt_version != 7 and fmt_version != 8 and fmt_version != 9 and fmt_version != 10 and fmt_version != 11 and fmt_version != 12 and fmt_version != 13) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -601,16 +644,51 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer freeStringSlice(alloc, parent_columns);
             const on_delete: ForeignKeyAction = @enumFromInt(data[pos]);
             pos += 1;
+            const timing: ForeignKeyTiming = if (fmt_version >= 13) timing_blk: {
+                const value: ForeignKeyTiming = @enumFromInt(data[pos]);
+                pos += 1;
+                break :timing_blk value;
+            } else .immediate;
+            const validation_state: ForeignKeyValidationState = if (fmt_version >= 13) state_blk: {
+                const value: ForeignKeyValidationState = @enumFromInt(data[pos]);
+                pos += 1;
+                break :state_blk value;
+            } else .enforced;
             foreign_key.* = .{
                 .name = name,
                 .child_columns = child_columns,
                 .parent_table = parent_table,
                 .parent_columns = parent_columns,
                 .on_delete = on_delete,
+                .timing = timing,
+                .validation_state = validation_state,
             };
             foreign_keys_initialized += 1;
         }
         break :blk foreign_keys;
+    } else &.{};
+    errdefer freeForeignKeysSlice(alloc, foreign_keys);
+
+    const unique_constraints: []UniqueConstraint = if (fmt_version >= 12) blk: {
+        const constraint_count = readU32(data, &pos);
+        const constraints = try alloc.alloc(UniqueConstraint, constraint_count);
+        var constraints_initialized: usize = 0;
+        errdefer {
+            for (constraints[0..constraints_initialized]) |constraint| freeUniqueConstraint(alloc, constraint);
+            alloc.free(constraints);
+        }
+        for (constraints) |*constraint| {
+            const name = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(name);
+            const columns = try readStringSliceAlloc(alloc, data, &pos);
+            errdefer freeStringSlice(alloc, columns);
+            constraint.* = .{
+                .name = name,
+                .columns = columns,
+            };
+            constraints_initialized += 1;
+        }
+        break :blk constraints;
     } else &.{};
 
     return .{
@@ -624,6 +702,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .full_text_documents = full_text_documents,
         .relational_columns = relational_columns,
         .foreign_keys = foreign_keys,
+        .unique_constraints = unique_constraints,
     };
 }
 
@@ -644,6 +723,7 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
     freeFullTextDocumentsSlice(alloc, s.full_text_documents);
     freeRelationalColumnsSlice(alloc, s.relational_columns);
     freeForeignKeysSlice(alloc, s.foreign_keys);
+    freeUniqueConstraintsSlice(alloc, s.unique_constraints);
 }
 
 fn freeRelationalColumnsSlice(alloc: Allocator, columns: []const RelationalColumn) void {
@@ -664,6 +744,16 @@ fn freeForeignKey(alloc: Allocator, foreign_key: ForeignKey) void {
     freeStringSlice(alloc, foreign_key.child_columns);
     alloc.free(foreign_key.parent_table);
     freeStringSlice(alloc, foreign_key.parent_columns);
+}
+
+fn freeUniqueConstraintsSlice(alloc: Allocator, constraints: []const UniqueConstraint) void {
+    for (constraints) |constraint| freeUniqueConstraint(alloc, constraint);
+    if (constraints.len > 0) alloc.free(constraints);
+}
+
+fn freeUniqueConstraint(alloc: Allocator, constraint: UniqueConstraint) void {
+    alloc.free(constraint.name);
+    freeStringSlice(alloc, constraint.columns);
 }
 
 fn freeStringSlice(alloc: Allocator, values: []const []const u8) void {
@@ -1201,6 +1291,7 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expectEqual(StorageMode.document, loaded.storage_mode);
     try std.testing.expectEqual(@as(usize, 0), loaded.relational_columns.len);
     try std.testing.expectEqual(@as(usize, 0), loaded.foreign_keys.len);
+    try std.testing.expectEqual(@as(usize, 0), loaded.unique_constraints.len);
 }
 
 test "schema serialize/deserialize round-trips relational storage mode and columns" {
@@ -1224,6 +1315,28 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                 .parent_table = "customers",
                 .parent_columns = &.{"_id"},
             },
+            .{
+                .name = "orders_referrer_id_fkey",
+                .child_columns = &.{"referrer_id"},
+                .parent_table = "customers",
+                .parent_columns = &.{"_id"},
+                .on_delete = .set_null,
+            },
+            .{
+                .name = "orders_account_id_fkey",
+                .child_columns = &.{"account_id"},
+                .parent_table = "accounts",
+                .parent_columns = &.{"_id"},
+                .on_delete = .cascade,
+                .timing = .immediate,
+                .validation_state = .enforced,
+            },
+        },
+        .unique_constraints = &.{
+            .{
+                .name = "users_tenant_email_key",
+                .columns = &.{ "tenant_id", "email" },
+            },
         },
     };
 
@@ -1244,12 +1357,23 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expect(loaded.relational_columns[2].nullable);
     try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[3].field_type);
     try std.testing.expect(!loaded.relational_columns[3].indexed);
-    try std.testing.expectEqual(@as(usize, 1), loaded.foreign_keys.len);
+    try std.testing.expectEqual(@as(usize, 3), loaded.foreign_keys.len);
     try std.testing.expectEqualStrings("orders_customer_id_fkey", loaded.foreign_keys[0].name);
     try std.testing.expectEqualStrings("customer_id", loaded.foreign_keys[0].child_columns[0]);
     try std.testing.expectEqualStrings("customers", loaded.foreign_keys[0].parent_table);
     try std.testing.expectEqualStrings("_id", loaded.foreign_keys[0].parent_columns[0]);
     try std.testing.expectEqual(ForeignKeyAction.restrict, loaded.foreign_keys[0].on_delete);
+    try std.testing.expectEqualStrings("orders_referrer_id_fkey", loaded.foreign_keys[1].name);
+    try std.testing.expectEqual(ForeignKeyAction.set_null, loaded.foreign_keys[1].on_delete);
+    try std.testing.expectEqualStrings("orders_account_id_fkey", loaded.foreign_keys[2].name);
+    try std.testing.expectEqual(ForeignKeyAction.cascade, loaded.foreign_keys[2].on_delete);
+    try std.testing.expectEqual(ForeignKeyTiming.immediate, loaded.foreign_keys[2].timing);
+    try std.testing.expectEqual(ForeignKeyValidationState.enforced, loaded.foreign_keys[2].validation_state);
+    try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_tenant_email_key", loaded.unique_constraints[0].name);
+    try std.testing.expectEqual(@as(usize, 2), loaded.unique_constraints[0].columns.len);
+    try std.testing.expectEqualStrings("tenant_id", loaded.unique_constraints[0].columns[0]);
+    try std.testing.expectEqualStrings("email", loaded.unique_constraints[0].columns[1]);
 }
 
 test "schema save/load via DocStore" {

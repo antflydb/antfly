@@ -266,6 +266,46 @@ pub const MetadataHttpClient = struct {
         try self.requestWithBody(base_uri, .POST, path, body, null, null, error.DocIdentityNamespaceMismatch);
     }
 
+    pub fn beginForeignKeyReferenceRangeRebuild(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, body: []const u8) !void {
+        try self.postForeignKeyReferenceRangeLifecycle(base_uri, table_name, routes.Routes.internal_fk_ref_rebuild_begin_suffix, body);
+    }
+
+    pub fn finishForeignKeyReferenceRangeRebuild(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, body: []const u8) !void {
+        try self.postForeignKeyReferenceRangeLifecycle(base_uri, table_name, routes.Routes.internal_fk_ref_rebuild_finish_suffix, body);
+    }
+
+    pub fn beginForeignKeyReferenceRangeSplit(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, body: []const u8) !void {
+        try self.postForeignKeyReferenceRangeLifecycle(base_uri, table_name, routes.Routes.internal_fk_ref_split_begin_suffix, body);
+    }
+
+    pub fn finishForeignKeyReferenceRangeSplit(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, body: []const u8) !void {
+        try self.postForeignKeyReferenceRangeLifecycle(base_uri, table_name, routes.Routes.internal_fk_ref_split_finish_suffix, body);
+    }
+
+    pub fn beginForeignKeyReferenceRangeMerge(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, body: []const u8) !void {
+        try self.postForeignKeyReferenceRangeLifecycle(base_uri, table_name, routes.Routes.internal_fk_ref_merge_begin_suffix, body);
+    }
+
+    pub fn finishForeignKeyReferenceRangeMerge(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, body: []const u8) !void {
+        try self.postForeignKeyReferenceRangeLifecycle(base_uri, table_name, routes.Routes.internal_fk_ref_merge_finish_suffix, body);
+    }
+
+    fn postForeignKeyReferenceRangeLifecycle(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        suffix: []const u8,
+        body: []const u8,
+    ) !void {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            table_name,
+            suffix,
+        });
+        defer self.alloc.free(path);
+        try self.requestWithBody(base_uri, .POST, path, body, null, error.TableNotFound, null);
+    }
+
     fn getJson(self: *MetadataHttpClient, comptime T: type, base_uri: []const u8, path: []const u8) !std.json.Parsed(T) {
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
@@ -484,6 +524,12 @@ test "metadata http client round-trips server endpoints" {
         upsert_node_count: usize = 0,
         upsert_store_count: usize = 0,
         report_store_status_count: usize = 0,
+        fk_rebuild_begin_count: usize = 0,
+        fk_rebuild_finish_count: usize = 0,
+        fk_split_begin_count: usize = 0,
+        fk_split_finish_count: usize = 0,
+        fk_merge_begin_count: usize = 0,
+        fk_merge_finish_count: usize = 0,
 
         const tables = [_]metadata_table_manager.TableRecord{
             .{ .table_id = 1, .name = "docs", .placement_role = "data" },
@@ -566,6 +612,12 @@ test "metadata http client round-trips server endpoints" {
                     .trigger_reallocate = triggerReallocate,
                     .request_split = requestSplit,
                     .request_merge = requestMerge,
+                    .begin_foreign_key_ref_range_rebuild = beginForeignKeyReferenceRangeRebuild,
+                    .finish_foreign_key_ref_range_rebuild = finishForeignKeyReferenceRangeRebuild,
+                    .begin_foreign_key_ref_range_split = beginForeignKeyReferenceRangeSplit,
+                    .finish_foreign_key_ref_range_split = finishForeignKeyReferenceRangeSplit,
+                    .begin_foreign_key_ref_range_merge = beginForeignKeyReferenceRangeMerge,
+                    .finish_foreign_key_ref_range_merge = finishForeignKeyReferenceRangeMerge,
                 },
             };
         }
@@ -685,6 +737,59 @@ test "metadata http client round-trips server endpoints" {
             try std.testing.expectEqual(@as(u64, 10), req.receiver_group_id);
             self.merge_count += 1;
         }
+
+        fn expectForeignKeySelector(table_name: []const u8, req: metadata_http_server.ForeignKeyReferenceRangeSelectorRequest) !void {
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("fk_customer", req.constraint_name);
+            try std.testing.expectEqualStrings("customers", req.parent_table);
+            try std.testing.expectEqualStrings("", req.start_parent_key);
+        }
+
+        fn beginForeignKeyReferenceRangeRebuild(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.ForeignKeyReferenceRangeSelectorRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try expectForeignKeySelector(table_name, req);
+            self.fk_rebuild_begin_count += 1;
+        }
+
+        fn finishForeignKeyReferenceRangeRebuild(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.ForeignKeyReferenceRangeSelectorRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try expectForeignKeySelector(table_name, req);
+            self.fk_rebuild_finish_count += 1;
+        }
+
+        fn beginForeignKeyReferenceRangeSplit(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.ForeignKeyReferenceRangeSplitRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try expectForeignKeySelector(table_name, req.selector);
+            try std.testing.expectEqualStrings("cust:m", req.split_parent_key);
+            try std.testing.expectEqual(@as(?u64, 101), req.left_group_id);
+            try std.testing.expectEqual(@as(?u64, 102), req.right_group_id);
+            self.fk_split_begin_count += 1;
+        }
+
+        fn finishForeignKeyReferenceRangeSplit(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.ForeignKeyReferenceRangeSplitRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try expectForeignKeySelector(table_name, req.selector);
+            try std.testing.expectEqualStrings("cust:m", req.split_parent_key);
+            try std.testing.expectEqual(@as(?u64, 101), req.left_group_id);
+            try std.testing.expectEqual(@as(?u64, 102), req.right_group_id);
+            self.fk_split_finish_count += 1;
+        }
+
+        fn beginForeignKeyReferenceRangeMerge(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.ForeignKeyReferenceRangeMergeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try expectForeignKeySelector(table_name, req.left_selector);
+            try std.testing.expectEqualStrings("cust:m", req.right_start_parent_key);
+            try std.testing.expectEqual(@as(?u64, 101), req.merged_group_id);
+            self.fk_merge_begin_count += 1;
+        }
+
+        fn finishForeignKeyReferenceRangeMerge(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.ForeignKeyReferenceRangeMergeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try expectForeignKeySelector(table_name, req.left_selector);
+            try std.testing.expectEqualStrings("cust:m", req.right_start_parent_key);
+            try std.testing.expectEqual(@as(?u64, 101), req.merged_group_id);
+            self.fk_merge_finish_count += 1;
+        }
     };
 
     var source = FakeSource{};
@@ -734,6 +839,12 @@ test "metadata http client round-trips server endpoints" {
     try client.reportNodeStatus(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}");
     try client.requestTableSplit(base_uri, "docs", "{\"split_key\":\"doc:m\"}");
     try client.requestTableMerge(base_uri, "docs", "{\"donor_group_id\":11,\"receiver_group_id\":10}");
+    try client.beginForeignKeyReferenceRangeRebuild(base_uri, "docs", "{\"constraint_name\":\"fk_customer\",\"parent_table\":\"customers\",\"start_parent_key\":\"\"}");
+    try client.finishForeignKeyReferenceRangeRebuild(base_uri, "docs", "{\"constraint_name\":\"fk_customer\",\"parent_table\":\"customers\",\"start_parent_key\":\"\"}");
+    try client.beginForeignKeyReferenceRangeSplit(base_uri, "docs", "{\"constraint_name\":\"fk_customer\",\"parent_table\":\"customers\",\"start_parent_key\":\"\",\"split_parent_key\":\"cust:m\",\"left_group_id\":101,\"right_group_id\":102}");
+    try client.finishForeignKeyReferenceRangeSplit(base_uri, "docs", "{\"constraint_name\":\"fk_customer\",\"parent_table\":\"customers\",\"start_parent_key\":\"\",\"split_parent_key\":\"cust:m\",\"left_group_id\":101,\"right_group_id\":102}");
+    try client.beginForeignKeyReferenceRangeMerge(base_uri, "docs", "{\"constraint_name\":\"fk_customer\",\"parent_table\":\"customers\",\"start_parent_key\":\"\",\"right_start_parent_key\":\"cust:m\",\"merged_group_id\":101}");
+    try client.finishForeignKeyReferenceRangeMerge(base_uri, "docs", "{\"constraint_name\":\"fk_customer\",\"parent_table\":\"customers\",\"start_parent_key\":\"\",\"right_start_parent_key\":\"cust:m\",\"merged_group_id\":101}");
     try std.testing.expectEqual(@as(usize, 1), source.create_count);
     try std.testing.expectEqual(@as(usize, 1), source.drop_count);
     try std.testing.expectEqual(@as(usize, 1), source.update_schema_count);
@@ -745,6 +856,12 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
     try std.testing.expectEqual(@as(usize, 1), source.split_count);
     try std.testing.expectEqual(@as(usize, 1), source.merge_count);
+    try std.testing.expectEqual(@as(usize, 1), source.fk_rebuild_begin_count);
+    try std.testing.expectEqual(@as(usize, 1), source.fk_rebuild_finish_count);
+    try std.testing.expectEqual(@as(usize, 1), source.fk_split_begin_count);
+    try std.testing.expectEqual(@as(usize, 1), source.fk_split_finish_count);
+    try std.testing.expectEqual(@as(usize, 1), source.fk_merge_begin_count);
+    try std.testing.expectEqual(@as(usize, 1), source.fk_merge_finish_count);
 }
 
 test "metadata http client round-trips range doc identity fields" {

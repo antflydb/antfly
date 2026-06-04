@@ -841,11 +841,82 @@ pub const TransactionVersionPredicate = struct {
     expected_version: u64,
 };
 
+pub const ForeignKeyParentCheck = struct {
+    constraint_name: []const u8,
+    child_table: []const u8,
+    child_key: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    parent_constraint_name: ?[]const u8 = null,
+};
+
+pub const ForeignKeyParentDeleteCheck = struct {
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+};
+
+pub const ForeignKeyConflictCheck = struct {
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+};
+
+pub const ForeignKeyRefMutation = struct {
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    child_table: []const u8,
+    child_key: []const u8,
+};
+
+pub const ForeignKeyRefChild = struct {
+    child_table: []const u8,
+    child_key: []const u8,
+};
+
+pub const ForeignKeyRefChildrenPage = struct {
+    children: []ForeignKeyRefChild,
+    complete: bool = true,
+    next_child_table: ?[]const u8 = null,
+    next_child_key: ?[]const u8 = null,
+};
+
+pub const ForeignKeySetNullChildAction = struct {
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    child_key: []const u8,
+};
+
+pub const ForeignKeyCascadeChildAction = struct {
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    child_key: []const u8,
+};
+
+pub const UniqueConstraintMutation = struct {
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    owner_key: []const u8,
+};
+
 pub const TransactionIntentRequest = struct {
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
+    foreign_key_parent_checks: []const ForeignKeyParentCheck = &.{},
+    foreign_key_parent_delete_checks: []const ForeignKeyParentDeleteCheck = &.{},
+    foreign_key_conflict_checks: []const ForeignKeyConflictCheck = &.{},
+    foreign_key_set_null_children: []const ForeignKeySetNullChildAction = &.{},
+    foreign_key_cascade_children: []const ForeignKeyCascadeChildAction = &.{},
+    foreign_key_ref_writes: []const ForeignKeyRefMutation = &.{},
+    foreign_key_ref_deletes: []const ForeignKeyRefMutation = &.{},
+    unique_constraint_writes: []const UniqueConstraintMutation = &.{},
+    unique_constraint_deletes: []const UniqueConstraintMutation = &.{},
+    foreign_key_parent_checks_externalized: bool = false,
 };
 
 pub const SplitState = struct {
@@ -1323,12 +1394,45 @@ pub const DocSetPlanningStats = struct {
     stale_identity_generation_rejection_count: u64 = 0,
 };
 
+pub const ForeignKeyStats = struct {
+    child_write_rejects: u64 = 0,
+    parent_delete_rejects: u64 = 0,
+    validation_runs: u64 = 0,
+    dry_run_runs: u64 = 0,
+    repair_runs: u64 = 0,
+    scanned_child_rows: u64 = 0,
+    referenced_child_rows: u64 = 0,
+    scanned_ref_rows: u64 = 0,
+    missing_parent_rows: u64 = 0,
+    missing_ref_rows: u64 = 0,
+    stale_ref_rows: u64 = 0,
+    repaired_ref_rows: u64 = 0,
+    deleted_stale_ref_rows: u64 = 0,
+
+    pub fn hasRuntimeFacts(self: @This()) bool {
+        return self.child_write_rejects != 0 or
+            self.parent_delete_rejects != 0 or
+            self.validation_runs != 0 or
+            self.dry_run_runs != 0 or
+            self.repair_runs != 0 or
+            self.scanned_child_rows != 0 or
+            self.referenced_child_rows != 0 or
+            self.scanned_ref_rows != 0 or
+            self.missing_parent_rows != 0 or
+            self.missing_ref_rows != 0 or
+            self.stale_ref_rows != 0 or
+            self.repaired_ref_rows != 0 or
+            self.deleted_stale_ref_rows != 0;
+    }
+};
+
 pub const DBStats = struct {
     doc_count: u64 = 0,
     index_count: u32 = 0,
     indexes: []DBIndexStats = &.{},
     doc_identity: DocIdentityStats = .{},
     doc_set_planning: DocSetPlanningStats = .{},
+    foreign_keys: ForeignKeyStats = .{},
     enrichment: EnrichmentStats = .{},
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},

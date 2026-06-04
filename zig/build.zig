@@ -2961,7 +2961,10 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db ttl cleanup",
             "storage.db.db.test.db exposes local transaction lifecycle",
             "storage.db.db.test.db relational foreign keys",
+            "storage.db.db.test.db foreign key integrity progress is durable per range",
+            "storage.db.db.test.db transaction unique constraint mutations enforce owner handoff",
             "storage.db.db.test.db transaction ",
+            "storage.db.db.test.db foreign key ref children page by child cursor",
             "storage.db.db.test.db explicit resolveTransactionIntents",
             "storage.db.db.test.db recoverTransactions",
             "storage.db.db.test.db participant recovery",
@@ -2984,9 +2987,42 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_test_step = b.step("lib-metadata-test", "Run root-module metadata tests only");
     lib_metadata_test_step.dependOn(&run_lib_metadata_tests.step);
 
+    const metadata_fk_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata_fk_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, metadata_fk_test_mod, true, true);
+    const lib_metadata_fk_tests = b.addTest(.{
+        .root_module = metadata_fk_test_mod,
+        .filters = &.{
+            "metadata raft apply store preserves projected tables and ranges across reopen",
+            "metadata reconciler converges foreign key reference owner ranges",
+            "metadata reconciler derives foreign key reference owner ranges from table schemas",
+            "metadata reconciler preserves split foreign key reference owner ranges for active schema foreign keys",
+            "metadata reconciler converges unique constraint owner ranges",
+            "placement planner places foreign key reference owner ranges",
+            "placement planner places unique constraint owner ranges",
+            "table manager applies foreign key reference range lifecycle operations",
+            "table manager applies unique constraint range lifecycle operations",
+            "table manager owns foreign key reference owner ranges",
+            "table manager owns unique constraint owner ranges",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_metadata_fk_tests = b.addRunArtifact(lib_metadata_fk_tests);
+    const lib_metadata_fk_test_step = b.step("metadata-fk-test", "Run focused metadata tests for foreign-key ownership metadata");
+    lib_metadata_fk_test_step.dependOn(&run_lib_metadata_fk_tests.step);
+
     const lib_metadata_table_workflow_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
+            "table workflow can reconcile foreign key reference owner ranges",
+            "table workflow drives foreign key reference range lifecycle commands",
+            "metadata http server accepts internal foreign key reference range lifecycle routes",
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
         },
@@ -3187,6 +3223,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves table query response envelope",
         "api http server serves retrieval agent response envelope",
         "api http server serves table batch writes",
+        "api http server exposes relational foreign key integrity repair",
         "auto bulk max-window session rolls without a following write",
         "auto bulk group writes release leases so idle finish can publish",
         "auto bulk max-window rolls publish all threshold aligned docs",
@@ -3216,6 +3253,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves table create and drop",
         "api http server serves table metadata routes against real metadata service",
         "api http server create table with replication sources returns encoded table detail",
+        "api http server exposes relational foreign key integrity repair",
         "api http server lists cluster backups through public route",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
@@ -3483,6 +3521,39 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "transaction read snapshot map keys preserve embedded delimiters",
             "transaction session commit response includes retry hints for doc identity availability conflicts",
+            "catalog source resolves foreign key ref owner groups",
+            "catalog source resolves unique constraint owner groups",
+            "txn prepare parser round-trips constraint participant intents",
+            "foreign key ref children request and response round-trip cursors",
+            "distributed txn coordinator registers foreign key parent participants",
+            "single-table distributed txn coordinator registers foreign key parent groups",
+            "distributed txn coordinator routes foreign key child writes through ref owners when configured",
+            "distributed txn coordinator fails closed for transitional foreign key ref owner ranges",
+            "distributed txn coordinator routes old and new foreign key refs with versioned child rows",
+            "distributed txn coordinator rejects unversioned multi-range unique writes without owner proof",
+            "distributed txn coordinator routes unique constraint writes through owner ranges",
+            "distributed txn coordinator routes versioned unique owner handoff",
+            "distributed txn coordinator allows non-unique transforms on multi-range unique tables",
+            "distributed txn coordinator allows single-range unique writes to use local enforcement",
+            "distributed txn coordinator rejects non-primary foreign key parent writes without unique owner topology",
+            "distributed txn coordinator routes foreign key checks through unique owner ranges",
+            "distributed txn coordinator routes cross-table foreign key checks through parent unique owner ranges",
+            "distributed txn coordinator routes cross-table composite foreign key checks through parent unique owner ranges",
+            "distributed txn coordinator routes unique foreign key parent deletes through ref owners",
+            "distributed txn coordinator routes cross-table unique foreign key parent deletes through ref owners",
+            "distributed txn coordinator routes unique foreign key set-null parent deletes through ref owners",
+            "distributed txn coordinator routes unique foreign key cascade parent deletes through ref owners",
+            "distributed txn explain routes restrict parent deletes through ref owners",
+            "distributed txn explain fails closed on incomplete routed ref owner scans",
+            "distributed txn coordinator routes foreign key reference transforms with final-value planning",
+            "distributed txn coordinator allows non-reference transforms on foreign key tables",
+            "distributed txn coordinator registers foreign key parent delete participants",
+            "distributed txn coordinator routes foreign key parent deletes through ref owners when configured",
+            "distributed txn coordinator fails closed for transitional foreign key ref owner parent deletes",
+            "distributed txn coordinator ignores unrelated foreign key child tables for parent delete planning",
+            "distributed txn coordinator routes distributed foreign key set-null actions across child ranges",
+            "distributed txn coordinator routes distributed foreign key cascade actions across child ranges",
+            "distributed txn coordinator rejects distributed foreign key cascade actions without ref owner topology",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3557,6 +3628,10 @@ pub fn build(b: *std.Build) void {
     const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
+
+    const api_transactions_test_step = b.step("api-transactions-test", "Run focused API transaction coordinator tests");
+    api_transactions_test_step.dependOn(&run_api_transactions_docid_tests.step);
+
     const lib_docid_lifecycle_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -4326,6 +4401,25 @@ pub fn build(b: *std.Build) void {
     const run_db_unit_tests = b.addRunArtifact(db_unit_tests);
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
+
+    const db_foreign_key_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{
+            "db transaction externalized foreign key parent checks still maintain refs",
+            "db transaction foreign key parent checks validate final prepared state",
+            "db transaction foreign key parent checks validate unique tuple state",
+            "db transaction foreign key parent delete checks support unique tuple keys",
+            "db transaction foreign key parent delete checks support cross-table unique tuple keys",
+            "db transaction foreign key parent delete checks validate child references",
+            "db transaction foreign key set-null child actions support unique tuple parent keys",
+            "db transaction foreign key cascade child actions support unique tuple parent keys",
+            "db transaction foreign key ref mutations support routed owner participants",
+            "db foreign key integrity progress is durable per range",
+        },
+    });
+    const run_db_foreign_key_tests = b.addRunArtifact(db_foreign_key_tests);
+    const db_foreign_key_test_step = b.step("db-foreign-key-test", "Run focused storage/db foreign-key unit tests");
+    db_foreign_key_test_step.dependOn(&run_db_foreign_key_tests.step);
 
     const db_enrichment_tests = b.addTest(.{
         .root_module = db_test_mod,

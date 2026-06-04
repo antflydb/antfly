@@ -69,6 +69,8 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     errdefer freeRuntimeRelationalColumns(alloc, relational_columns);
     const foreign_keys = try deriveRuntimeForeignKeys(alloc, schema);
     errdefer freeRuntimeForeignKeys(alloc, foreign_keys);
+    const unique_constraints = try deriveRuntimeUniqueConstraints(alloc, schema);
+    errdefer freeRuntimeUniqueConstraints(alloc, unique_constraints);
     const storage_mode: storage_schema.StorageMode = switch (schema.storage_mode) {
         .document => .document,
         .relational => .relational,
@@ -95,6 +97,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .full_text_documents = full_text_documents,
         .relational_columns = relational_columns,
         .foreign_keys = foreign_keys,
+        .unique_constraints = unique_constraints,
     };
 }
 
@@ -237,6 +240,18 @@ fn deriveRuntimeForeignKeys(alloc: std.mem.Allocator, schema: ParsedTableSchema)
             .parent_columns = try cloneStringSlice(alloc, foreign_key.references.columns),
             .on_delete = switch (foreign_key.on_delete) {
                 .restrict => .restrict,
+                .set_null => .set_null,
+                .cascade => .cascade,
+            },
+            .timing = switch (foreign_key.timing) {
+                .immediate => .immediate,
+                .deferred => .deferred,
+            },
+            .validation_state = switch (foreign_key.validation_state) {
+                .enforced => .enforced,
+                .unvalidated => .unvalidated,
+                .validating => .validating,
+                .invalid => .invalid,
             },
         };
         initialized += 1;
@@ -254,6 +269,36 @@ fn freeRuntimeForeignKeys(alloc: std.mem.Allocator, foreign_keys: []storage_sche
         if (foreign_key.parent_columns.len > 0) alloc.free(foreign_key.parent_columns);
     }
     if (foreign_keys.len > 0) alloc.free(foreign_keys);
+}
+
+fn deriveRuntimeUniqueConstraints(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.UniqueConstraint {
+    if (schema.unique_constraints.len == 0) return &.{};
+    const constraints = try alloc.alloc(storage_schema.UniqueConstraint, schema.unique_constraints.len);
+    var initialized: usize = 0;
+    errdefer {
+        if (initialized > 0) {
+            freeRuntimeUniqueConstraints(alloc, constraints[0..initialized]);
+        } else {
+            alloc.free(constraints);
+        }
+    }
+    for (schema.unique_constraints) |constraint| {
+        constraints[initialized] = .{
+            .name = try alloc.dupe(u8, constraint.name),
+            .columns = try cloneStringSlice(alloc, constraint.columns),
+        };
+        initialized += 1;
+    }
+    return constraints;
+}
+
+fn freeRuntimeUniqueConstraints(alloc: std.mem.Allocator, constraints: []storage_schema.UniqueConstraint) void {
+    for (constraints) |constraint| {
+        alloc.free(constraint.name);
+        for (constraint.columns) |column| alloc.free(column);
+        if (constraint.columns.len > 0) alloc.free(constraint.columns);
+    }
+    if (constraints.len > 0) alloc.free(constraints);
 }
 
 fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {

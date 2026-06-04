@@ -47,6 +47,44 @@ pub const MergeRequest = struct {
     allow_doc_identity_reassignment: bool = false,
 };
 
+pub const ForeignKeyReferenceRangeSelectorRequest = struct {
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    start_parent_key: []const u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.constraint_name);
+        alloc.free(self.parent_table);
+        alloc.free(self.start_parent_key);
+        self.* = undefined;
+    }
+};
+
+pub const ForeignKeyReferenceRangeSplitRequest = struct {
+    selector: ForeignKeyReferenceRangeSelectorRequest,
+    split_parent_key: []const u8,
+    left_group_id: ?u64 = null,
+    right_group_id: ?u64 = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.selector.deinit(alloc);
+        alloc.free(self.split_parent_key);
+        self.* = undefined;
+    }
+};
+
+pub const ForeignKeyReferenceRangeMergeRequest = struct {
+    left_selector: ForeignKeyReferenceRangeSelectorRequest,
+    right_start_parent_key: []const u8,
+    merged_group_id: ?u64 = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.left_selector.deinit(alloc);
+        alloc.free(self.right_start_parent_key);
+        self.* = undefined;
+    }
+};
+
 pub const NodeShutdownRequest = struct {
     type: []const u8 = "remove",
     reason: []const u8 = "",
@@ -109,6 +147,12 @@ pub const AdminSource = struct {
         trigger_reallocate: ?*const fn (ptr: *anyopaque) anyerror!void = null,
         request_split: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: SplitRequest) anyerror!void = null,
         request_merge: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: MergeRequest) anyerror!void = null,
+        begin_foreign_key_ref_range_rebuild: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSelectorRequest) anyerror!void = null,
+        finish_foreign_key_ref_range_rebuild: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSelectorRequest) anyerror!void = null,
+        begin_foreign_key_ref_range_split: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSplitRequest) anyerror!void = null,
+        finish_foreign_key_ref_range_split: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSplitRequest) anyerror!void = null,
+        begin_foreign_key_ref_range_merge: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) anyerror!void = null,
+        finish_foreign_key_ref_range_merge: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) anyerror!void = null,
         reseed_replication_source_exact_cutover: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) anyerror!ReseedExactCutoverResult = null,
         forward_metadata_request: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!?http_common.HttpResponse = null,
     };
@@ -214,6 +258,36 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, req);
     }
 
+    pub fn beginForeignKeyReferenceRangeRebuild(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSelectorRequest) !void {
+        const fn_ptr = self.vtable.begin_foreign_key_ref_range_rebuild orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn finishForeignKeyReferenceRangeRebuild(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSelectorRequest) !void {
+        const fn_ptr = self.vtable.finish_foreign_key_ref_range_rebuild orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn beginForeignKeyReferenceRangeSplit(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSplitRequest) !void {
+        const fn_ptr = self.vtable.begin_foreign_key_ref_range_split orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn finishForeignKeyReferenceRangeSplit(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSplitRequest) !void {
+        const fn_ptr = self.vtable.finish_foreign_key_ref_range_split orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn beginForeignKeyReferenceRangeMerge(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) !void {
+        const fn_ptr = self.vtable.begin_foreign_key_ref_range_merge orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn finishForeignKeyReferenceRangeMerge(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) !void {
+        const fn_ptr = self.vtable.finish_foreign_key_ref_range_merge orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, req);
+    }
+
     pub fn reseedReplicationSourceExactCutover(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) !ReseedExactCutoverResult {
         const fn_ptr = self.vtable.reseed_replication_source_exact_cutover orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, source_ordinal);
@@ -248,6 +322,12 @@ pub const AdminSource = struct {
                 .trigger_reallocate = metadataServiceTriggerReallocate,
                 .request_split = metadataServiceRequestSplit,
                 .request_merge = metadataServiceRequestMerge,
+                .begin_foreign_key_ref_range_rebuild = metadataServiceBeginForeignKeyReferenceRangeRebuild,
+                .finish_foreign_key_ref_range_rebuild = metadataServiceFinishForeignKeyReferenceRangeRebuild,
+                .begin_foreign_key_ref_range_split = metadataServiceBeginForeignKeyReferenceRangeSplit,
+                .finish_foreign_key_ref_range_split = metadataServiceFinishForeignKeyReferenceRangeSplit,
+                .begin_foreign_key_ref_range_merge = metadataServiceBeginForeignKeyReferenceRangeMerge,
+                .finish_foreign_key_ref_range_merge = metadataServiceFinishForeignKeyReferenceRangeMerge,
                 .reseed_replication_source_exact_cutover = metadataServiceReseedReplicationSourceExactCutover,
             },
         };
@@ -277,6 +357,12 @@ pub const AdminSource = struct {
                 .trigger_reallocate = metadataHttpServiceTriggerReallocate,
                 .request_split = metadataHttpServiceRequestSplit,
                 .request_merge = metadataHttpServiceRequestMerge,
+                .begin_foreign_key_ref_range_rebuild = metadataHttpServiceBeginForeignKeyReferenceRangeRebuild,
+                .finish_foreign_key_ref_range_rebuild = metadataHttpServiceFinishForeignKeyReferenceRangeRebuild,
+                .begin_foreign_key_ref_range_split = metadataHttpServiceBeginForeignKeyReferenceRangeSplit,
+                .finish_foreign_key_ref_range_split = metadataHttpServiceFinishForeignKeyReferenceRangeSplit,
+                .begin_foreign_key_ref_range_merge = metadataHttpServiceBeginForeignKeyReferenceRangeMerge,
+                .finish_foreign_key_ref_range_merge = metadataHttpServiceFinishForeignKeyReferenceRangeMerge,
                 .reseed_replication_source_exact_cutover = metadataHttpServiceReseedReplicationSourceExactCutover,
                 .forward_metadata_request = metadataHttpServiceForwardMetadataRequest,
             },
@@ -482,6 +568,36 @@ pub const AdminSource = struct {
             .allow_doc_identity_reassignment = req.allow_doc_identity_reassignment,
         });
         try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceBeginForeignKeyReferenceRangeRebuild(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSelectorRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try beginForeignKeyReferenceRangeRebuildForService(service.MetadataService, svc, alloc, table_name, req, flushMetadataServiceMutation);
+    }
+
+    fn metadataServiceFinishForeignKeyReferenceRangeRebuild(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSelectorRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try finishForeignKeyReferenceRangeRebuildForService(service.MetadataService, svc, alloc, table_name, req, flushMetadataServiceMutation);
+    }
+
+    fn metadataServiceBeginForeignKeyReferenceRangeSplit(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSplitRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try beginForeignKeyReferenceRangeSplitForService(service.MetadataService, svc, alloc, table_name, req, flushMetadataServiceMutation);
+    }
+
+    fn metadataServiceFinishForeignKeyReferenceRangeSplit(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSplitRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try finishForeignKeyReferenceRangeSplitForService(service.MetadataService, svc, alloc, table_name, req, flushMetadataServiceMutation);
+    }
+
+    fn metadataServiceBeginForeignKeyReferenceRangeMerge(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try beginForeignKeyReferenceRangeMergeForService(service.MetadataService, svc, alloc, table_name, req, flushMetadataServiceMutation);
+    }
+
+    fn metadataServiceFinishForeignKeyReferenceRangeMerge(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try finishForeignKeyReferenceRangeMergeForService(service.MetadataService, svc, alloc, table_name, req, flushMetadataServiceMutation);
     }
 
     fn metadataServiceReseedReplicationSourceExactCutover(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) !ReseedExactCutoverResult {
@@ -696,6 +812,36 @@ pub const AdminSource = struct {
         try flushMetadataHttpServiceMutation(svc);
     }
 
+    fn metadataHttpServiceBeginForeignKeyReferenceRangeRebuild(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSelectorRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try beginForeignKeyReferenceRangeRebuildForService(service.MetadataHttpService, svc, alloc, table_name, req, flushMetadataHttpServiceMutation);
+    }
+
+    fn metadataHttpServiceFinishForeignKeyReferenceRangeRebuild(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSelectorRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try finishForeignKeyReferenceRangeRebuildForService(service.MetadataHttpService, svc, alloc, table_name, req, flushMetadataHttpServiceMutation);
+    }
+
+    fn metadataHttpServiceBeginForeignKeyReferenceRangeSplit(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSplitRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try beginForeignKeyReferenceRangeSplitForService(service.MetadataHttpService, svc, alloc, table_name, req, flushMetadataHttpServiceMutation);
+    }
+
+    fn metadataHttpServiceFinishForeignKeyReferenceRangeSplit(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSplitRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try finishForeignKeyReferenceRangeSplitForService(service.MetadataHttpService, svc, alloc, table_name, req, flushMetadataHttpServiceMutation);
+    }
+
+    fn metadataHttpServiceBeginForeignKeyReferenceRangeMerge(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try beginForeignKeyReferenceRangeMergeForService(service.MetadataHttpService, svc, alloc, table_name, req, flushMetadataHttpServiceMutation);
+    }
+
+    fn metadataHttpServiceFinishForeignKeyReferenceRangeMerge(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try finishForeignKeyReferenceRangeMergeForService(service.MetadataHttpService, svc, alloc, table_name, req, flushMetadataHttpServiceMutation);
+    }
+
     fn metadataHttpServiceReseedReplicationSourceExactCutover(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) !ReseedExactCutoverResult {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         while (!svc.cdc_runtime_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -906,6 +1052,66 @@ pub const MetadataHttpServer = struct {
                         error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 409, "doc identity namespace mismatch"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
                         else => return try textResponse(self.alloc, 400, "invalid merge request"),
+                    };
+                    return try textResponse(self.alloc, 202, "accepted");
+                }
+                if (routes.Routes.matchInternalForeignKeyReferenceRangeRebuildBegin(req.uri)) |table| {
+                    var fk_req = parseForeignKeyReferenceRangeSelectorRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid foreign key reference range request");
+                    defer fk_req.deinit(self.alloc);
+                    self.source.beginForeignKeyReferenceRangeRebuild(self.alloc, table.table_name, fk_req) catch |err| switch (err) {
+                        error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        else => return try textResponse(self.alloc, 400, "invalid foreign key reference range request"),
+                    };
+                    return try textResponse(self.alloc, 202, "accepted");
+                }
+                if (routes.Routes.matchInternalForeignKeyReferenceRangeRebuildFinish(req.uri)) |table| {
+                    var fk_req = parseForeignKeyReferenceRangeSelectorRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid foreign key reference range request");
+                    defer fk_req.deinit(self.alloc);
+                    self.source.finishForeignKeyReferenceRangeRebuild(self.alloc, table.table_name, fk_req) catch |err| switch (err) {
+                        error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        else => return try textResponse(self.alloc, 400, "invalid foreign key reference range request"),
+                    };
+                    return try textResponse(self.alloc, 202, "accepted");
+                }
+                if (routes.Routes.matchInternalForeignKeyReferenceRangeSplitBegin(req.uri)) |table| {
+                    var fk_req = parseForeignKeyReferenceRangeSplitRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid foreign key reference range request");
+                    defer fk_req.deinit(self.alloc);
+                    self.source.beginForeignKeyReferenceRangeSplit(self.alloc, table.table_name, fk_req) catch |err| switch (err) {
+                        error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        else => return try textResponse(self.alloc, 400, "invalid foreign key reference range request"),
+                    };
+                    return try textResponse(self.alloc, 202, "accepted");
+                }
+                if (routes.Routes.matchInternalForeignKeyReferenceRangeSplitFinish(req.uri)) |table| {
+                    var fk_req = parseForeignKeyReferenceRangeSplitRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid foreign key reference range request");
+                    defer fk_req.deinit(self.alloc);
+                    self.source.finishForeignKeyReferenceRangeSplit(self.alloc, table.table_name, fk_req) catch |err| switch (err) {
+                        error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        else => return try textResponse(self.alloc, 400, "invalid foreign key reference range request"),
+                    };
+                    return try textResponse(self.alloc, 202, "accepted");
+                }
+                if (routes.Routes.matchInternalForeignKeyReferenceRangeMergeBegin(req.uri)) |table| {
+                    var fk_req = parseForeignKeyReferenceRangeMergeRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid foreign key reference range request");
+                    defer fk_req.deinit(self.alloc);
+                    self.source.beginForeignKeyReferenceRangeMerge(self.alloc, table.table_name, fk_req) catch |err| switch (err) {
+                        error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        else => return try textResponse(self.alloc, 400, "invalid foreign key reference range request"),
+                    };
+                    return try textResponse(self.alloc, 202, "accepted");
+                }
+                if (routes.Routes.matchInternalForeignKeyReferenceRangeMergeFinish(req.uri)) |table| {
+                    var fk_req = parseForeignKeyReferenceRangeMergeRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid foreign key reference range request");
+                    defer fk_req.deinit(self.alloc);
+                    self.source.finishForeignKeyReferenceRangeMerge(self.alloc, table.table_name, fk_req) catch |err| switch (err) {
+                        error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        else => return try textResponse(self.alloc, 400, "invalid foreign key reference range request"),
                     };
                     return try textResponse(self.alloc, 202, "accepted");
                 }
@@ -1380,6 +1586,87 @@ fn parseMergeRequest(alloc: std.mem.Allocator, body: []const u8) !MergeRequest {
     };
 }
 
+fn parseForeignKeyReferenceRangeSelectorRequest(alloc: std.mem.Allocator, body: []const u8) !ForeignKeyReferenceRangeSelectorRequest {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidForeignKeyReferenceRangeRequest,
+    };
+    const constraint_name = try parseRequiredStringField(alloc, root.get("constraint_name") orelse return error.InvalidForeignKeyReferenceRangeRequest);
+    errdefer alloc.free(constraint_name);
+    const parent_table = try parseRequiredStringField(alloc, root.get("parent_table") orelse return error.InvalidForeignKeyReferenceRangeRequest);
+    errdefer alloc.free(parent_table);
+    const start_parent_key = try parseStringField(alloc, root.get("start_parent_key") orelse return error.InvalidForeignKeyReferenceRangeRequest);
+    errdefer alloc.free(start_parent_key);
+    return .{
+        .constraint_name = constraint_name,
+        .parent_table = parent_table,
+        .start_parent_key = start_parent_key,
+    };
+}
+
+fn parseForeignKeyReferenceRangeSplitRequest(alloc: std.mem.Allocator, body: []const u8) !ForeignKeyReferenceRangeSplitRequest {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidForeignKeyReferenceRangeRequest,
+    };
+    var selector: ForeignKeyReferenceRangeSelectorRequest = blk: {
+        const constraint_name = try parseRequiredStringField(alloc, root.get("constraint_name") orelse return error.InvalidForeignKeyReferenceRangeRequest);
+        errdefer alloc.free(constraint_name);
+        const parent_table = try parseRequiredStringField(alloc, root.get("parent_table") orelse return error.InvalidForeignKeyReferenceRangeRequest);
+        errdefer alloc.free(parent_table);
+        const start_parent_key = try parseStringField(alloc, root.get("start_parent_key") orelse return error.InvalidForeignKeyReferenceRangeRequest);
+        errdefer alloc.free(start_parent_key);
+        break :blk .{
+            .constraint_name = constraint_name,
+            .parent_table = parent_table,
+            .start_parent_key = start_parent_key,
+        };
+    };
+    errdefer selector.deinit(alloc);
+    const split_parent_key = try parseRequiredStringField(alloc, root.get("split_parent_key") orelse return error.InvalidForeignKeyReferenceRangeRequest);
+    errdefer alloc.free(split_parent_key);
+    return .{
+        .selector = selector,
+        .split_parent_key = split_parent_key,
+        .left_group_id = if (root.get("left_group_id")) |value| try parseU64Field(value) else null,
+        .right_group_id = if (root.get("right_group_id")) |value| try parseU64Field(value) else null,
+    };
+}
+
+fn parseForeignKeyReferenceRangeMergeRequest(alloc: std.mem.Allocator, body: []const u8) !ForeignKeyReferenceRangeMergeRequest {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidForeignKeyReferenceRangeRequest,
+    };
+    var left_selector: ForeignKeyReferenceRangeSelectorRequest = blk: {
+        const constraint_name = try parseRequiredStringField(alloc, root.get("constraint_name") orelse return error.InvalidForeignKeyReferenceRangeRequest);
+        errdefer alloc.free(constraint_name);
+        const parent_table = try parseRequiredStringField(alloc, root.get("parent_table") orelse return error.InvalidForeignKeyReferenceRangeRequest);
+        errdefer alloc.free(parent_table);
+        const start_parent_key = try parseStringField(alloc, root.get("left_start_parent_key") orelse root.get("start_parent_key") orelse return error.InvalidForeignKeyReferenceRangeRequest);
+        errdefer alloc.free(start_parent_key);
+        break :blk .{
+            .constraint_name = constraint_name,
+            .parent_table = parent_table,
+            .start_parent_key = start_parent_key,
+        };
+    };
+    errdefer left_selector.deinit(alloc);
+    const right_start_parent_key = try parseRequiredStringField(alloc, root.get("right_start_parent_key") orelse return error.InvalidForeignKeyReferenceRangeRequest);
+    errdefer alloc.free(right_start_parent_key);
+    return .{
+        .left_selector = left_selector,
+        .right_start_parent_key = right_start_parent_key,
+        .merged_group_id = if (root.get("merged_group_id")) |value| try parseU64Field(value) else null,
+    };
+}
+
 fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tables_api.CreateTableRequest {
     return try tables_api.parseCreateTableRequest(alloc, body);
 }
@@ -1811,6 +2098,221 @@ fn parseU64Field(value: std.json.Value) !u64 {
         .integer => |int_value| std.math.cast(u64, int_value) orelse error.InvalidIntegerField,
         else => error.InvalidIntegerField,
     };
+}
+
+fn parseRequiredStringField(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return switch (value) {
+        .string => |text| if (text.len == 0) error.InvalidStringField else try alloc.dupe(u8, text),
+        else => error.InvalidStringField,
+    };
+}
+
+fn parseStringField(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return switch (value) {
+        .string => |text| try alloc.dupe(u8, text),
+        else => error.InvalidStringField,
+    };
+}
+
+fn beginForeignKeyReferenceRangeRebuildForService(
+    comptime ServiceType: type,
+    svc: *ServiceType,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: ForeignKeyReferenceRangeSelectorRequest,
+    comptime flushFn: anytype,
+) !void {
+    const selector = try resolveForeignKeyReferenceRangeSelector(ServiceType, svc, table_name, req);
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    try workflow.beginForeignKeyReferenceRangeRebuild(svc, selector);
+    try flushFn(svc);
+}
+
+fn finishForeignKeyReferenceRangeRebuildForService(
+    comptime ServiceType: type,
+    svc: *ServiceType,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: ForeignKeyReferenceRangeSelectorRequest,
+    comptime flushFn: anytype,
+) !void {
+    const selector = try resolveForeignKeyReferenceRangeSelector(ServiceType, svc, table_name, req);
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    try workflow.finishForeignKeyReferenceRangeRebuild(svc, selector);
+    try flushFn(svc);
+}
+
+fn beginForeignKeyReferenceRangeSplitForService(
+    comptime ServiceType: type,
+    svc: *ServiceType,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: ForeignKeyReferenceRangeSplitRequest,
+    comptime flushFn: anytype,
+) !void {
+    const request = try resolveForeignKeyReferenceRangeSplitRequest(ServiceType, svc, table_name, req);
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    try workflow.beginForeignKeyReferenceRangeSplit(svc, request);
+    try flushFn(svc);
+}
+
+fn finishForeignKeyReferenceRangeSplitForService(
+    comptime ServiceType: type,
+    svc: *ServiceType,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: ForeignKeyReferenceRangeSplitRequest,
+    comptime flushFn: anytype,
+) !void {
+    const request = try resolveForeignKeyReferenceRangeSplitRequest(ServiceType, svc, table_name, req);
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    try workflow.finishForeignKeyReferenceRangeSplit(svc, request);
+    try flushFn(svc);
+}
+
+fn beginForeignKeyReferenceRangeMergeForService(
+    comptime ServiceType: type,
+    svc: *ServiceType,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: ForeignKeyReferenceRangeMergeRequest,
+    comptime flushFn: anytype,
+) !void {
+    const request = try resolveForeignKeyReferenceRangeMergeRequest(ServiceType, svc, table_name, req);
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    try workflow.beginForeignKeyReferenceRangeMerge(svc, request);
+    try flushFn(svc);
+}
+
+fn finishForeignKeyReferenceRangeMergeForService(
+    comptime ServiceType: type,
+    svc: *ServiceType,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: ForeignKeyReferenceRangeMergeRequest,
+    comptime flushFn: anytype,
+) !void {
+    const request = try resolveForeignKeyReferenceRangeMergeRequest(ServiceType, svc, table_name, req);
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    try workflow.finishForeignKeyReferenceRangeMerge(svc, request);
+    try flushFn(svc);
+}
+
+fn resolveForeignKeyReferenceRangeSelector(
+    comptime ServiceType: type,
+    svc: *ServiceType,
+    table_name: []const u8,
+    req: ForeignKeyReferenceRangeSelectorRequest,
+) !metadata_table_manager.ForeignKeyReferenceRangeSelector {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    const child_table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const parent_table = findTableByName(&snapshot, req.parent_table) orelse return error.TableNotFound;
+    const selector: metadata_table_manager.ForeignKeyReferenceRangeSelector = .{
+        .child_table_id = child_table.table_id,
+        .constraint_name = req.constraint_name,
+        .parent_table_id = parent_table.table_id,
+        .start_parent_key = req.start_parent_key,
+    };
+    _ = findForeignKeyReferenceRange(&snapshot, selector) orelse return error.RangeNotFound;
+    return selector;
+}
+
+fn resolveForeignKeyReferenceRangeSplitRequest(
+    comptime ServiceType: type,
+    svc: *ServiceType,
+    table_name: []const u8,
+    req: ForeignKeyReferenceRangeSplitRequest,
+) !metadata_table_manager.ForeignKeyReferenceRangeSplitRequest {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    const child_table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const parent_table = findTableByName(&snapshot, req.selector.parent_table) orelse return error.TableNotFound;
+    const selector: metadata_table_manager.ForeignKeyReferenceRangeSelector = .{
+        .child_table_id = child_table.table_id,
+        .constraint_name = req.selector.constraint_name,
+        .parent_table_id = parent_table.table_id,
+        .start_parent_key = req.selector.start_parent_key,
+    };
+    const existing = findForeignKeyReferenceRange(&snapshot, selector) orelse return error.RangeNotFound;
+    const left_group_id = req.left_group_id orelse existing.group_id;
+    const right_group_id = req.right_group_id orelse deriveForeignKeyReferenceRangeGroupId(table_name, req.selector.constraint_name, req.selector.parent_table, req.split_parent_key, left_group_id);
+    try group_ids.requireDataGroupId(left_group_id);
+    try group_ids.requireDataGroupId(right_group_id);
+    return .{
+        .selector = selector,
+        .split_parent_key = req.split_parent_key,
+        .left_group_id = left_group_id,
+        .right_group_id = right_group_id,
+    };
+}
+
+fn resolveForeignKeyReferenceRangeMergeRequest(
+    comptime ServiceType: type,
+    svc: *ServiceType,
+    table_name: []const u8,
+    req: ForeignKeyReferenceRangeMergeRequest,
+) !metadata_table_manager.ForeignKeyReferenceRangeMergeRequest {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    const child_table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const parent_table = findTableByName(&snapshot, req.left_selector.parent_table) orelse return error.TableNotFound;
+    const left_selector: metadata_table_manager.ForeignKeyReferenceRangeSelector = .{
+        .child_table_id = child_table.table_id,
+        .constraint_name = req.left_selector.constraint_name,
+        .parent_table_id = parent_table.table_id,
+        .start_parent_key = req.left_selector.start_parent_key,
+    };
+    const left = findForeignKeyReferenceRange(&snapshot, left_selector) orelse return error.RangeNotFound;
+    const right = findForeignKeyReferenceRange(&snapshot, .{
+        .child_table_id = child_table.table_id,
+        .constraint_name = req.left_selector.constraint_name,
+        .parent_table_id = parent_table.table_id,
+        .start_parent_key = req.right_start_parent_key,
+    }) orelse return error.RangeNotFound;
+    const merged_group_id = req.merged_group_id orelse left.group_id;
+    _ = right;
+    try group_ids.requireDataGroupId(merged_group_id);
+    return .{
+        .left_selector = left_selector,
+        .right_start_parent_key = req.right_start_parent_key,
+        .merged_group_id = merged_group_id,
+    };
+}
+
+fn findForeignKeyReferenceRange(
+    snapshot: *const metadata_api.AdminSnapshot,
+    selector: metadata_table_manager.ForeignKeyReferenceRangeSelector,
+) ?*const metadata_table_manager.ForeignKeyReferenceRangeRecord {
+    for (snapshot.foreign_key_ref_ranges) |*record| {
+        if (record.child_table_id != selector.child_table_id) continue;
+        if (record.parent_table_id != selector.parent_table_id) continue;
+        if (!std.mem.eql(u8, record.constraint_name, selector.constraint_name)) continue;
+        if (!std.mem.eql(u8, record.start_parent_key, selector.start_parent_key)) continue;
+        return record;
+    }
+    return null;
+}
+
+fn deriveForeignKeyReferenceRangeGroupId(child_table: []const u8, constraint_name: []const u8, parent_table: []const u8, split_parent_key: []const u8, reserved: u64) u64 {
+    var hasher = std.hash.Wyhash.init(0x464b5246);
+    hasher.update(child_table);
+    hasher.update(&[_]u8{0});
+    hasher.update(constraint_name);
+    hasher.update(&[_]u8{0});
+    hasher.update(parent_table);
+    hasher.update(&[_]u8{0});
+    hasher.update(split_parent_key);
+    var id = group_ids.dataGroupIdFromHash(hasher.final());
+    if (id == 0 or id == reserved) id +%= 1;
+    if (id == 0 or group_ids.isSystemGroupId(id)) return group_ids.dataGroupIdFromHash(reserved +% 1);
+    return id;
 }
 
 fn reseedReplicationSourceExactCutoverForService(
@@ -3254,6 +3756,142 @@ test "metadata http server accepts internal reallocate and split merge routes" {
     try std.testing.expectEqual(@as(usize, 1), source.restore_count);
     try std.testing.expectEqual(@as(usize, 1), source.split_count);
     try std.testing.expectEqual(@as(usize, 1), source.merge_count);
+}
+
+test "metadata http server accepts internal foreign key reference range lifecycle routes" {
+    const FakeSource = struct {
+        begin_rebuilds: usize = 0,
+        finish_rebuilds: usize = 0,
+        begin_splits: usize = 0,
+        finish_splits: usize = 0,
+        begin_merges: usize = 0,
+        finish_merges: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_foreign_key_ref_range_rebuild = beginRebuild,
+                    .finish_foreign_key_ref_range_rebuild = finishRebuild,
+                    .begin_foreign_key_ref_range_split = beginSplit,
+                    .finish_foreign_key_ref_range_split = finishSplit,
+                    .begin_foreign_key_ref_range_merge = beginMerge,
+                    .finish_foreign_key_ref_range_merge = finishMerge,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn expectSelector(table_name: []const u8, req: ForeignKeyReferenceRangeSelectorRequest) !void {
+            try std.testing.expectEqualStrings("orders", table_name);
+            try std.testing.expectEqualStrings("orders_customer_id_fkey", req.constraint_name);
+            try std.testing.expectEqualStrings("customers", req.parent_table);
+            try std.testing.expectEqualStrings("", req.start_parent_key);
+        }
+
+        fn beginRebuild(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSelectorRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try expectSelector(table_name, req);
+            self.begin_rebuilds += 1;
+        }
+
+        fn finishRebuild(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSelectorRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try expectSelector(table_name, req);
+            self.finish_rebuilds += 1;
+        }
+
+        fn beginSplit(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSplitRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try expectSelector(table_name, req.selector);
+            try std.testing.expectEqualStrings("customer:m", req.split_parent_key);
+            try std.testing.expectEqual(@as(?u64, 3001), req.left_group_id);
+            try std.testing.expectEqual(@as(?u64, 3002), req.right_group_id);
+            self.begin_splits += 1;
+        }
+
+        fn finishSplit(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeSplitRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try expectSelector(table_name, req.selector);
+            try std.testing.expectEqualStrings("customer:m", req.split_parent_key);
+            self.finish_splits += 1;
+        }
+
+        fn beginMerge(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try expectSelector(table_name, req.left_selector);
+            try std.testing.expectEqualStrings("customer:m", req.right_start_parent_key);
+            try std.testing.expectEqual(@as(?u64, 3001), req.merged_group_id);
+            self.begin_merges += 1;
+        }
+
+        fn finishMerge(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: ForeignKeyReferenceRangeMergeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try expectSelector(table_name, req.left_selector);
+            try std.testing.expectEqualStrings("customer:m", req.right_start_parent_key);
+            self.finish_merges += 1;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+
+    const selector_body = "{\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"start_parent_key\":\"\"}";
+    const split_body = "{\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"start_parent_key\":\"\",\"split_parent_key\":\"customer:m\",\"left_group_id\":3001,\"right_group_id\":3002}";
+    const merge_body = "{\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"start_parent_key\":\"\",\"right_start_parent_key\":\"customer:m\",\"merged_group_id\":3001}";
+
+    var begin_rebuild = try server.handle(.{ .method = .POST, .uri = "/internal/v1/tables/orders/foreign-key-ref-ranges/rebuild/begin", .body = selector_body });
+    defer begin_rebuild.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), begin_rebuild.status);
+
+    var finish_rebuild = try server.handle(.{ .method = .POST, .uri = "/internal/v1/tables/orders/foreign-key-ref-ranges/rebuild/finish", .body = selector_body });
+    defer finish_rebuild.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), finish_rebuild.status);
+
+    var begin_split = try server.handle(.{ .method = .POST, .uri = "/internal/v1/tables/orders/foreign-key-ref-ranges/split/begin", .body = split_body });
+    defer begin_split.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), begin_split.status);
+
+    var finish_split = try server.handle(.{ .method = .POST, .uri = "/internal/v1/tables/orders/foreign-key-ref-ranges/split/finish", .body = split_body });
+    defer finish_split.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), finish_split.status);
+
+    var begin_merge = try server.handle(.{ .method = .POST, .uri = "/internal/v1/tables/orders/foreign-key-ref-ranges/merge/begin", .body = merge_body });
+    defer begin_merge.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), begin_merge.status);
+
+    var finish_merge = try server.handle(.{ .method = .POST, .uri = "/internal/v1/tables/orders/foreign-key-ref-ranges/merge/finish", .body = merge_body });
+    defer finish_merge.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), finish_merge.status);
+
+    try std.testing.expectEqual(@as(usize, 1), source.begin_rebuilds);
+    try std.testing.expectEqual(@as(usize, 1), source.finish_rebuilds);
+    try std.testing.expectEqual(@as(usize, 1), source.begin_splits);
+    try std.testing.expectEqual(@as(usize, 1), source.finish_splits);
+    try std.testing.expectEqual(@as(usize, 1), source.begin_merges);
+    try std.testing.expectEqual(@as(usize, 1), source.finish_merges);
 }
 
 test "metadata http server rejects split and merge during active doc identity reassignment before source mutation" {

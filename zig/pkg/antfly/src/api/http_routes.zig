@@ -59,6 +59,8 @@ pub const Routes = struct {
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const restore_suffix = "/restore";
+    pub const foreign_key_integrity_suffix = "/foreign-key-integrity";
+    pub const foreign_key_ref_children_suffix = "/foreign-key-ref-children";
     pub const query_suffix = "/query";
     pub const query_preflight_suffix = "/query-preflight";
     pub const text_stats_suffix = "/text-stats";
@@ -121,6 +123,10 @@ pub const Routes = struct {
     };
 
     pub const TableRestore = struct {
+        table_name: []const u8,
+    };
+
+    pub const TableForeignKeyIntegrity = struct {
         table_name: []const u8,
     };
 
@@ -241,6 +247,11 @@ pub const Routes = struct {
         table_name: []const u8,
     };
 
+    pub const GroupForeignKeyIntegrity = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
     pub const GroupGraphExpand = struct {
         group_id: u64,
         table_name: []const u8,
@@ -277,6 +288,11 @@ pub const Routes = struct {
     };
 
     pub const GroupTxnStatus = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupForeignKeyRefChildren = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -371,6 +387,14 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, restore_suffix)) return null;
         const table_name = path[tables_prefix.len .. path.len - restore_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableForeignKeyIntegrity(path: []const u8) ?TableForeignKeyIntegrity {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, foreign_key_integrity_suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - foreign_key_integrity_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
     }
@@ -624,6 +648,26 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupForeignKeyIntegrity(path: []const u8) ?GroupForeignKeyIntegrity {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, foreign_key_integrity_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - foreign_key_integrity_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupForeignKeyRefChildren(path: []const u8) ?GroupForeignKeyRefChildren {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, foreign_key_ref_children_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - foreign_key_ref_children_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchInternalTableCorruptEmbeddingArtifact(path: []const u8) ?InternalTableCorruptEmbeddingArtifact {
         if (!std.mem.startsWith(u8, path, internal_tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, corrupt_embedding_artifact_suffix)) return null;
@@ -835,6 +879,9 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", backup.table_name);
     const restore = Routes.matchTableRestore("/tables/docs/restore").?;
     try std.testing.expectEqualStrings("docs", restore.table_name);
+    const fk_integrity = Routes.matchTableForeignKeyIntegrity("/tables/docs/foreign-key-integrity").?;
+    try std.testing.expectEqualStrings("docs", fk_integrity.table_name);
+    try std.testing.expect(Routes.matchTablePath("/tables/docs/foreign-key-integrity") == null);
     const indexes = Routes.matchTableIndexes("/tables/docs/indexes").?;
     try std.testing.expectEqualStrings("docs", indexes.table_name);
     const index = Routes.matchTableIndex("/tables/docs/indexes/search_idx").?;
@@ -878,6 +925,12 @@ test "public api routes compile" {
     try std.testing.expectEqual(@as(u64, 7), group_query_preflight.group_id);
     const group_batch = Routes.matchGroupBatch("/internal/v1/groups/7/tables/docs/batch").?;
     try std.testing.expectEqual(@as(u64, 7), group_batch.group_id);
+    const group_fk_integrity = Routes.matchGroupForeignKeyIntegrity("/internal/v1/groups/7/tables/docs/foreign-key-integrity").?;
+    try std.testing.expectEqual(@as(u64, 7), group_fk_integrity.group_id);
+    try std.testing.expectEqualStrings("docs", group_fk_integrity.table_name);
+    const group_fk_ref_children = Routes.matchGroupForeignKeyRefChildren("/internal/v1/groups/7/tables/docs/foreign-key-ref-children").?;
+    try std.testing.expectEqual(@as(u64, 7), group_fk_ref_children.group_id);
+    try std.testing.expectEqualStrings("docs", group_fk_ref_children.table_name);
     const group_graph_expand = Routes.matchGroupGraphExpand("/internal/v1/groups/7/tables/docs/graph-expand").?;
     try std.testing.expectEqual(@as(u64, 7), group_graph_expand.group_id);
     const group_graph_hydrate = Routes.matchGroupGraphHydrate("/internal/v1/groups/7/tables/docs/graph-hydrate").?;

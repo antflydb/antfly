@@ -106,6 +106,28 @@ pub const TableRangeRef = struct {
     end_key: ?[]const u8,
 };
 
+pub const ForeignKeyRefOwnerResolution = struct {
+    configured: bool,
+    topology_epoch: u64 = 0,
+    groups: []u64 = &.{},
+
+    pub fn deinit(self: *ForeignKeyRefOwnerResolution, alloc: std.mem.Allocator) void {
+        if (self.groups.len > 0) alloc.free(self.groups);
+        self.* = undefined;
+    }
+};
+
+pub const UniqueConstraintOwnerResolution = struct {
+    configured: bool,
+    topology_epoch: u64 = 0,
+    groups: []u64 = &.{},
+
+    pub fn deinit(self: *UniqueConstraintOwnerResolution, alloc: std.mem.Allocator) void {
+        if (self.groups.len > 0) alloc.free(self.groups);
+        self.* = undefined;
+    }
+};
+
 pub fn resolveSingleRangeGroup(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,
@@ -119,6 +141,81 @@ pub fn resolveSingleRangeGroup(
     if (ranges.len == 0) return null;
     if (ranges.len != 1) return error.UnsupportedMultiRangeTable;
     return ranges[0].group_id;
+}
+
+pub fn resolveForeignKeyRefOwnerGroups(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    child_table_name: []const u8,
+    constraint_name: []const u8,
+    parent_table_name: []const u8,
+    parent_key: []const u8,
+) !ForeignKeyRefOwnerResolution {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const child_table = tables_api.findTableByName(&snapshot, child_table_name) orelse return .{ .configured = false };
+    const parent_table = tables_api.findTableByName(&snapshot, parent_table_name) orelse return .{ .configured = false };
+
+    var configured = false;
+    var groups = std.ArrayListUnmanaged(u64).empty;
+    defer groups.deinit(alloc);
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(child_table.name);
+    hasher.update(parent_table.name);
+    hasher.update(constraint_name);
+
+    for (snapshot.foreign_key_ref_ranges) |range| {
+        if (range.child_table_id != child_table.table_id) continue;
+        if (range.parent_table_id != parent_table.table_id) continue;
+        if (!std.mem.eql(u8, range.constraint_name, constraint_name)) continue;
+        configured = true;
+        hashForeignKeyRefRange(&hasher, range);
+        if (!metadata_table_manager.foreignKeyReferenceRangeRoutable(range)) continue;
+        if (!foreignKeyRefRangeContainsParentKey(range, parent_key)) continue;
+        if (!containsGroup(groups.items, range.group_id)) try groups.append(alloc, range.group_id);
+    }
+    if (!configured) return .{ .configured = false };
+    return .{
+        .configured = true,
+        .topology_epoch = hasher.final(),
+        .groups = try groups.toOwnedSlice(alloc),
+    };
+}
+
+pub fn resolveUniqueConstraintOwnerGroups(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) !UniqueConstraintOwnerResolution {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{ .configured = false };
+
+    var configured = false;
+    var groups = std.ArrayListUnmanaged(u64).empty;
+    defer groups.deinit(alloc);
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(table.name);
+    hasher.update(std.mem.asBytes(&table.table_id));
+    hasher.update(constraint_name);
+
+    for (snapshot.unique_constraint_ranges) |range| {
+        if (range.table_id != table.table_id) continue;
+        if (!std.mem.eql(u8, range.constraint_name, constraint_name)) continue;
+        configured = true;
+        hashUniqueConstraintRange(&hasher, range);
+        if (!metadata_table_manager.uniqueConstraintRangeRoutable(range)) continue;
+        if (!uniqueConstraintRangeContainsEncodedValue(range, encoded_value)) continue;
+        if (!containsGroup(groups.items, range.group_id)) try groups.append(alloc, range.group_id);
+    }
+    if (!configured) return .{ .configured = false };
+    return .{
+        .configured = true,
+        .topology_epoch = hasher.final(),
+        .groups = try groups.toOwnedSlice(alloc),
+    };
 }
 
 pub fn resolveGroupForKey(
@@ -157,6 +254,13 @@ pub fn topologyEpoch(
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
 
+    return tableTopologyEpochFromRanges(table.*, ranges);
+}
+
+fn tableTopologyEpochFromRanges(
+    table: metadata_table_manager.TableRecord,
+    ranges: []const *const metadata_table_manager.RangeRecord,
+) u64 {
     sortRangeRefs(ranges);
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(table.name);
@@ -175,6 +279,18 @@ pub fn topologyEpoch(
     return hasher.final();
 }
 
+pub fn tableSchemaJsonAlloc(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+) !?[]u8 {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    if (table.schema_json.len == 0) return null;
+    return try alloc.dupe(u8, table.schema_json);
+}
+
 pub fn validateTopologyEpoch(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,
@@ -184,6 +300,25 @@ pub fn validateTopologyEpoch(
     if (expected_epoch == 0) return;
     const actual_epoch = try topologyEpoch(alloc, catalog, table_name);
     if (actual_epoch != expected_epoch) return error.TopologyChanged;
+}
+
+pub fn validateGroupTopologyEpoch(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    expected_epoch: u64,
+) !void {
+    if (expected_epoch == 0) return;
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TopologyChanged;
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+    if (rangeRefsContainGroup(ranges, group_id) and tableTopologyEpochFromRanges(table.*, ranges) == expected_epoch) return;
+    if (foreignKeyRefTopologyEpochMatchesGroup(&snapshot, table.*, group_id, expected_epoch)) return;
+    if (uniqueConstraintTopologyEpochMatchesGroup(&snapshot, table.*, group_id, expected_epoch)) return;
+    return error.TopologyChanged;
 }
 
 pub fn validateDocIdentityReadyForTable(
@@ -358,6 +493,122 @@ fn rangeOverlapsSpan(range: metadata_table_manager.RangeRecord, from_key: []cons
     return true;
 }
 
+fn rangeRefsContainGroup(ranges: []const *const metadata_table_manager.RangeRecord, group_id: u64) bool {
+    for (ranges) |range| {
+        if (range.group_id == group_id) return true;
+    }
+    return false;
+}
+
+fn foreignKeyRefRangeContainsParentKey(range: metadata_table_manager.ForeignKeyReferenceRangeRecord, parent_key: []const u8) bool {
+    if (range.start_parent_key.len > 0 and std.mem.order(u8, parent_key, range.start_parent_key) == .lt) return false;
+    if (range.end_parent_key) |end_key| {
+        if (end_key.len > 0 and std.mem.order(u8, parent_key, end_key) != .lt) return false;
+    }
+    return true;
+}
+
+fn uniqueConstraintRangeContainsEncodedValue(range: metadata_table_manager.UniqueConstraintRangeRecord, encoded_value: []const u8) bool {
+    if (range.start_encoded_value.len > 0 and std.mem.order(u8, encoded_value, range.start_encoded_value) == .lt) return false;
+    if (range.end_encoded_value) |end_value| {
+        if (end_value.len > 0 and std.mem.order(u8, encoded_value, end_value) != .lt) return false;
+    }
+    return true;
+}
+
+fn foreignKeyRefTopologyEpochMatchesGroup(
+    snapshot: *const metadata_api.AdminSnapshot,
+    child_table: metadata_table_manager.TableRecord,
+    group_id: u64,
+    expected_epoch: u64,
+) bool {
+    for (snapshot.foreign_key_ref_ranges) |candidate| {
+        if (candidate.child_table_id != child_table.table_id) continue;
+        if (candidate.group_id != group_id) continue;
+        const parent_table = findTableById(snapshot.tables, candidate.parent_table_id) orelse continue;
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(child_table.name);
+        hasher.update(parent_table.name);
+        hasher.update(candidate.constraint_name);
+        for (snapshot.foreign_key_ref_ranges) |range| {
+            if (range.child_table_id != child_table.table_id) continue;
+            if (range.parent_table_id != candidate.parent_table_id) continue;
+            if (!std.mem.eql(u8, range.constraint_name, candidate.constraint_name)) continue;
+            hashForeignKeyRefRange(&hasher, range);
+        }
+        if (hasher.final() == expected_epoch) return true;
+    }
+    return false;
+}
+
+fn uniqueConstraintTopologyEpochMatchesGroup(
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: metadata_table_manager.TableRecord,
+    group_id: u64,
+    expected_epoch: u64,
+) bool {
+    for (snapshot.unique_constraint_ranges) |candidate| {
+        if (candidate.table_id != table.table_id) continue;
+        if (candidate.group_id != group_id) continue;
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(table.name);
+        hasher.update(std.mem.asBytes(&table.table_id));
+        hasher.update(candidate.constraint_name);
+        for (snapshot.unique_constraint_ranges) |range| {
+            if (range.table_id != table.table_id) continue;
+            if (!std.mem.eql(u8, range.constraint_name, candidate.constraint_name)) continue;
+            hashUniqueConstraintRange(&hasher, range);
+        }
+        if (hasher.final() == expected_epoch) return true;
+    }
+    return false;
+}
+
+fn findTableById(tables: []const metadata_table_manager.TableRecord, table_id: u64) ?metadata_table_manager.TableRecord {
+    for (tables) |table| {
+        if (table.table_id == table_id) return table;
+    }
+    return null;
+}
+
+fn hashForeignKeyRefRange(hasher: *std.hash.Wyhash, range: metadata_table_manager.ForeignKeyReferenceRangeRecord) void {
+    hasher.update(std.mem.asBytes(&range.child_table_id));
+    hasher.update(range.constraint_name);
+    hasher.update(std.mem.asBytes(&range.parent_table_id));
+    hasher.update(std.mem.asBytes(&range.group_id));
+    hasher.update(std.mem.asBytes(&range.topology_epoch));
+    hasher.update(range.start_parent_key);
+    if (range.end_parent_key) |end_key| {
+        hasher.update(&[_]u8{1});
+        hasher.update(end_key);
+    } else {
+        hasher.update(&[_]u8{0});
+    }
+    hasher.update(range.state);
+}
+
+fn hashUniqueConstraintRange(hasher: *std.hash.Wyhash, range: metadata_table_manager.UniqueConstraintRangeRecord) void {
+    hasher.update(std.mem.asBytes(&range.table_id));
+    hasher.update(range.constraint_name);
+    hasher.update(std.mem.asBytes(&range.group_id));
+    hasher.update(std.mem.asBytes(&range.topology_epoch));
+    hasher.update(range.start_encoded_value);
+    if (range.end_encoded_value) |end_value| {
+        hasher.update(&[_]u8{1});
+        hasher.update(end_value);
+    } else {
+        hasher.update(&[_]u8{0});
+    }
+    hasher.update(range.state);
+}
+
+fn containsGroup(groups: []const u64, group_id: u64) bool {
+    for (groups) |group| {
+        if (group == group_id) return true;
+    }
+    return false;
+}
+
 fn findMergedGroupStatus(statuses: []const metadata_reconciler.MergedGroupStatus, group_id: u64) ?metadata_reconciler.MergedGroupStatus {
     for (statuses) |status| {
         if (status.group_id == group_id) return status;
@@ -477,12 +728,236 @@ test "catalog source resolves groups by key and span" {
 
     try std.testing.expectEqual(@as(u64, 7001), (try resolveGroupForKey(std.testing.allocator, FakeCatalog.iface(), "docs", "doc:a")).?);
     try std.testing.expectEqual(@as(u64, 7002), (try resolveGroupForKey(std.testing.allocator, FakeCatalog.iface(), "docs", "doc:z")).?);
+    const epoch = try topologyEpoch(std.testing.allocator, FakeCatalog.iface(), "docs");
+    try validateGroupTopologyEpoch(std.testing.allocator, FakeCatalog.iface(), "docs", 7001, epoch);
+    try std.testing.expectError(error.TopologyChanged, validateGroupTopologyEpoch(std.testing.allocator, FakeCatalog.iface(), "docs", 8001, epoch));
+    try std.testing.expectError(error.TopologyChanged, validateGroupTopologyEpoch(std.testing.allocator, FakeCatalog.iface(), "docs", 7001, epoch +% 1));
 
     const groups = try resolveGroupsForSpan(std.testing.allocator, FakeCatalog.iface(), "docs", "doc:b", "doc:z");
     defer std.testing.allocator.free(groups);
     try std.testing.expectEqual(@as(usize, 2), groups.len);
     try std.testing.expectEqual(@as(u64, 7001), groups[0]);
     try std.testing.expectEqual(@as(u64, 7002), groups[1]);
+}
+
+test "catalog source resolves foreign key ref owner groups" {
+    const FakeCatalog = struct {
+        fn iface() CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 7, .name = "orders", .placement_role = "data" },
+                    .{ .table_id = 8, .name = "customers", .placement_role = "data" },
+                    .{ .table_id = 9, .name = "accounts", .placement_role = "data" },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .foreign_key_ref_ranges = @constCast((&[_]metadata_table_manager.ForeignKeyReferenceRangeRecord{
+                    .{
+                        .child_table_id = 7,
+                        .constraint_name = "orders_customer_id_fkey",
+                        .parent_table_id = 8,
+                        .start_parent_key = "",
+                        .end_parent_key = "customer:m",
+                        .group_id = 9101,
+                        .topology_epoch = 11,
+                    },
+                    .{
+                        .child_table_id = 7,
+                        .constraint_name = "orders_customer_id_fkey",
+                        .parent_table_id = 8,
+                        .start_parent_key = "customer:m",
+                        .end_parent_key = null,
+                        .group_id = 9102,
+                        .topology_epoch = 12,
+                    },
+                    .{
+                        .child_table_id = 7,
+                        .constraint_name = "orders_account_id_fkey",
+                        .parent_table_id = 9,
+                        .start_parent_key = "",
+                        .end_parent_key = null,
+                        .group_id = 9201,
+                        .topology_epoch = 13,
+                    },
+                    .{
+                        .child_table_id = 7,
+                        .constraint_name = "orders_region_id_fkey",
+                        .parent_table_id = 9,
+                        .start_parent_key = "",
+                        .end_parent_key = null,
+                        .group_id = 9301,
+                        .topology_epoch = 14,
+                        .state = metadata_table_manager.foreign_key_ref_range_rebuilding,
+                    },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var low = try resolveForeignKeyRefOwnerGroups(std.testing.allocator, FakeCatalog.iface(), "orders", "orders_customer_id_fkey", "customers", "customer:a");
+    defer low.deinit(std.testing.allocator);
+    try std.testing.expect(low.configured);
+    try std.testing.expectEqual(@as(usize, 1), low.groups.len);
+    try std.testing.expectEqual(@as(u64, 9101), low.groups[0]);
+    try std.testing.expect(low.topology_epoch != 0);
+    try validateGroupTopologyEpoch(std.testing.allocator, FakeCatalog.iface(), "orders", 9101, low.topology_epoch);
+    try validateGroupTopologyEpoch(std.testing.allocator, FakeCatalog.iface(), "orders", 9102, low.topology_epoch);
+    try std.testing.expectError(error.TopologyChanged, validateGroupTopologyEpoch(std.testing.allocator, FakeCatalog.iface(), "orders", 9201, low.topology_epoch));
+    try std.testing.expectError(error.TopologyChanged, validateGroupTopologyEpoch(std.testing.allocator, FakeCatalog.iface(), "orders", 9101, low.topology_epoch +% 1));
+
+    var high = try resolveForeignKeyRefOwnerGroups(std.testing.allocator, FakeCatalog.iface(), "orders", "orders_customer_id_fkey", "customers", "customer:z");
+    defer high.deinit(std.testing.allocator);
+    try std.testing.expect(high.configured);
+    try std.testing.expectEqual(@as(usize, 1), high.groups.len);
+    try std.testing.expectEqual(@as(u64, 9102), high.groups[0]);
+    try std.testing.expectEqual(low.topology_epoch, high.topology_epoch);
+
+    var other_constraint = try resolveForeignKeyRefOwnerGroups(std.testing.allocator, FakeCatalog.iface(), "orders", "orders_account_id_fkey", "accounts", "acct:1");
+    defer other_constraint.deinit(std.testing.allocator);
+    try std.testing.expect(other_constraint.configured);
+    try std.testing.expectEqual(@as(usize, 1), other_constraint.groups.len);
+    try std.testing.expectEqual(@as(u64, 9201), other_constraint.groups[0]);
+    try std.testing.expect(other_constraint.topology_epoch != low.topology_epoch);
+
+    var rebuilding = try resolveForeignKeyRefOwnerGroups(std.testing.allocator, FakeCatalog.iface(), "orders", "orders_region_id_fkey", "accounts", "region:1");
+    defer rebuilding.deinit(std.testing.allocator);
+    try std.testing.expect(rebuilding.configured);
+    try std.testing.expectEqual(@as(usize, 0), rebuilding.groups.len);
+    try std.testing.expect(rebuilding.topology_epoch != 0);
+
+    var absent = try resolveForeignKeyRefOwnerGroups(std.testing.allocator, FakeCatalog.iface(), "orders", "missing_fkey", "customers", "customer:a");
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expect(!absent.configured);
+    try std.testing.expectEqual(@as(usize, 0), absent.groups.len);
+
+    var empty_parent_key = try resolveForeignKeyRefOwnerGroups(std.testing.allocator, FakeCatalog.iface(), "orders", "orders_customer_id_fkey", "customers", "");
+    defer empty_parent_key.deinit(std.testing.allocator);
+    try std.testing.expect(empty_parent_key.configured);
+    try std.testing.expectEqual(@as(usize, 1), empty_parent_key.groups.len);
+    try std.testing.expectEqual(@as(u64, 9101), empty_parent_key.groups[0]);
+}
+
+test "catalog source resolves unique constraint owner groups" {
+    const FakeCatalog = struct {
+        fn iface() CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 7, .name = "users", .placement_role = "data" },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_email_key",
+                        .start_encoded_value = "",
+                        .end_encoded_value = "email:m",
+                        .group_id = 7101,
+                        .topology_epoch = 21,
+                    },
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_email_key",
+                        .start_encoded_value = "email:m",
+                        .end_encoded_value = null,
+                        .group_id = 7102,
+                        .topology_epoch = 22,
+                    },
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_username_key",
+                        .start_encoded_value = "",
+                        .end_encoded_value = null,
+                        .group_id = 7201,
+                        .topology_epoch = 23,
+                    },
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_phone_key",
+                        .start_encoded_value = "",
+                        .end_encoded_value = null,
+                        .group_id = 7301,
+                        .topology_epoch = 24,
+                        .state = metadata_table_manager.unique_constraint_range_rebuilding,
+                    },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var low = try resolveUniqueConstraintOwnerGroups(std.testing.allocator, FakeCatalog.iface(), "users", "users_email_key", "email:a");
+    defer low.deinit(std.testing.allocator);
+    try std.testing.expect(low.configured);
+    try std.testing.expectEqual(@as(usize, 1), low.groups.len);
+    try std.testing.expectEqual(@as(u64, 7101), low.groups[0]);
+    try std.testing.expect(low.topology_epoch != 0);
+    try validateGroupTopologyEpoch(std.testing.allocator, FakeCatalog.iface(), "users", 7101, low.topology_epoch);
+    try validateGroupTopologyEpoch(std.testing.allocator, FakeCatalog.iface(), "users", 7102, low.topology_epoch);
+    try std.testing.expectError(error.TopologyChanged, validateGroupTopologyEpoch(std.testing.allocator, FakeCatalog.iface(), "users", 7201, low.topology_epoch));
+    try std.testing.expectError(error.TopologyChanged, validateGroupTopologyEpoch(std.testing.allocator, FakeCatalog.iface(), "users", 7101, low.topology_epoch +% 1));
+
+    var high = try resolveUniqueConstraintOwnerGroups(std.testing.allocator, FakeCatalog.iface(), "users", "users_email_key", "email:z");
+    defer high.deinit(std.testing.allocator);
+    try std.testing.expect(high.configured);
+    try std.testing.expectEqual(@as(usize, 1), high.groups.len);
+    try std.testing.expectEqual(@as(u64, 7102), high.groups[0]);
+    try std.testing.expectEqual(low.topology_epoch, high.topology_epoch);
+
+    var other_constraint = try resolveUniqueConstraintOwnerGroups(std.testing.allocator, FakeCatalog.iface(), "users", "users_username_key", "username:a");
+    defer other_constraint.deinit(std.testing.allocator);
+    try std.testing.expect(other_constraint.configured);
+    try std.testing.expectEqual(@as(usize, 1), other_constraint.groups.len);
+    try std.testing.expectEqual(@as(u64, 7201), other_constraint.groups[0]);
+    try std.testing.expect(other_constraint.topology_epoch != low.topology_epoch);
+
+    var rebuilding = try resolveUniqueConstraintOwnerGroups(std.testing.allocator, FakeCatalog.iface(), "users", "users_phone_key", "phone:1");
+    defer rebuilding.deinit(std.testing.allocator);
+    try std.testing.expect(rebuilding.configured);
+    try std.testing.expectEqual(@as(usize, 0), rebuilding.groups.len);
+    try std.testing.expect(rebuilding.topology_epoch != 0);
+
+    var absent = try resolveUniqueConstraintOwnerGroups(std.testing.allocator, FakeCatalog.iface(), "users", "missing_key", "email:a");
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expect(!absent.configured);
+    try std.testing.expectEqual(@as(usize, 0), absent.groups.len);
+
+    var empty_value = try resolveUniqueConstraintOwnerGroups(std.testing.allocator, FakeCatalog.iface(), "users", "users_email_key", "");
+    defer empty_value.deinit(std.testing.allocator);
+    try std.testing.expect(empty_value.configured);
+    try std.testing.expectEqual(@as(usize, 1), empty_value.groups.len);
+    try std.testing.expectEqual(@as(u64, 7101), empty_value.groups[0]);
 }
 
 test "catalog doc identity readiness checks table range health" {

@@ -2473,6 +2473,26 @@ pub const MetadataHttpNodeSimulation = struct {
         store.freeRanges(alloc, records);
     }
 
+    pub fn listProjectedForeignKeyReferenceRanges(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]metadata_table_manager.ForeignKeyReferenceRangeRecord {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        return try store.listForeignKeyReferenceRanges(alloc, self.cluster.metadata_group_id);
+    }
+
+    pub fn freeProjectedForeignKeyReferenceRanges(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator, records: []metadata_table_manager.ForeignKeyReferenceRangeRecord) void {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse return;
+        store.freeForeignKeyReferenceRanges(alloc, records);
+    }
+
+    pub fn listProjectedUniqueConstraintRanges(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]metadata_table_manager.UniqueConstraintRangeRecord {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        return try store.listUniqueConstraintRanges(alloc, self.cluster.metadata_group_id);
+    }
+
+    pub fn freeProjectedUniqueConstraintRanges(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator, records: []metadata_table_manager.UniqueConstraintRangeRecord) void {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse return;
+        store.freeUniqueConstraintRanges(alloc, records);
+    }
+
     pub fn listProjectedPlacementIntents(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.listPlacementIntents(alloc, self.cluster.metadata_group_id);
@@ -2641,6 +2661,90 @@ pub const MetadataHttpNodeSimulation = struct {
         try self.proposeTransitionCommand(.{ .remove_range = .{ .group_id = group_id } });
     }
 
+    pub fn upsertForeignKeyReferenceRange(self: MetadataHttpNodeSimulation, record: metadata_table_manager.ForeignKeyReferenceRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_foreign_key_ref_range = record });
+    }
+
+    pub fn removeForeignKeyReferenceRange(
+        self: MetadataHttpNodeSimulation,
+        child_table_id: u64,
+        constraint_name: []const u8,
+        parent_table_id: u64,
+        start_parent_key: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_foreign_key_ref_range = .{
+            .child_table_id = child_table_id,
+            .constraint_name = constraint_name,
+            .parent_table_id = parent_table_id,
+            .start_parent_key = start_parent_key,
+        } });
+    }
+
+    pub fn upsertUniqueConstraintRange(self: MetadataHttpNodeSimulation, record: metadata_table_manager.UniqueConstraintRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_unique_constraint_range = record });
+    }
+
+    pub fn removeUniqueConstraintRange(
+        self: MetadataHttpNodeSimulation,
+        table_id: u64,
+        constraint_name: []const u8,
+        start_encoded_value: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_unique_constraint_range = .{
+            .table_id = table_id,
+            .constraint_name = constraint_name,
+            .start_encoded_value = start_encoded_value,
+        } });
+    }
+
+    pub fn beginUniqueConstraintRangeSplit(self: MetadataHttpNodeSimulation, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_split = request });
+    }
+
+    pub fn finishUniqueConstraintRangeSplit(self: MetadataHttpNodeSimulation, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_split = request });
+    }
+
+    pub fn beginUniqueConstraintRangeMerge(self: MetadataHttpNodeSimulation, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_merge = request });
+    }
+
+    pub fn finishUniqueConstraintRangeMerge(self: MetadataHttpNodeSimulation, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_merge = request });
+    }
+
+    pub fn beginUniqueConstraintRangeRebuild(self: MetadataHttpNodeSimulation, selector: metadata_table_manager.UniqueConstraintRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_rebuild = selector });
+    }
+
+    pub fn finishUniqueConstraintRangeRebuild(self: MetadataHttpNodeSimulation, selector: metadata_table_manager.UniqueConstraintRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_rebuild = selector });
+    }
+
+    pub fn beginForeignKeyReferenceRangeSplit(self: MetadataHttpNodeSimulation, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_split = request });
+    }
+
+    pub fn finishForeignKeyReferenceRangeSplit(self: MetadataHttpNodeSimulation, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_split = request });
+    }
+
+    pub fn beginForeignKeyReferenceRangeMerge(self: MetadataHttpNodeSimulation, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_merge = request });
+    }
+
+    pub fn finishForeignKeyReferenceRangeMerge(self: MetadataHttpNodeSimulation, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_merge = request });
+    }
+
+    pub fn beginForeignKeyReferenceRangeRebuild(self: MetadataHttpNodeSimulation, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_rebuild = selector });
+    }
+
+    pub fn finishForeignKeyReferenceRangeRebuild(self: MetadataHttpNodeSimulation, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_rebuild = selector });
+    }
+
     pub fn upsertSplitTransition(self: MetadataHttpNodeSimulation, record: transition_state.SplitTransitionRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_split_transition = record });
     }
@@ -2688,6 +2792,8 @@ pub const MetadataHttpNodeSimulation = struct {
         }
         for (plan.table_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_table = record });
         for (plan.range_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_range = record });
+        for (plan.foreign_key_ref_range_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_foreign_key_ref_range = record });
+        for (plan.unique_constraint_range_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_unique_constraint_range = record });
         for (plan.split_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_split_transition = record });
         for (plan.merge_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_merge_transition = record });
         for (plan.placement_removals) |record| {
@@ -2698,6 +2804,17 @@ pub const MetadataHttpNodeSimulation = struct {
                 .local_node_id = record.local_node_id,
             } });
         }
+        for (plan.foreign_key_ref_range_removals) |record| try commands.append(self.cluster.alloc, .{ .remove_foreign_key_ref_range = .{
+            .child_table_id = record.child_table_id,
+            .constraint_name = record.constraint_name,
+            .parent_table_id = record.parent_table_id,
+            .start_parent_key = record.start_parent_key,
+        } });
+        for (plan.unique_constraint_range_removals) |record| try commands.append(self.cluster.alloc, .{ .remove_unique_constraint_range = .{
+            .table_id = record.table_id,
+            .constraint_name = record.constraint_name,
+            .start_encoded_value = record.start_encoded_value,
+        } });
         for (plan.table_removals) |table_id| try commands.append(self.cluster.alloc, .{ .remove_table = .{ .table_id = table_id } });
         for (plan.range_removals) |group_id| try commands.append(self.cluster.alloc, .{ .remove_range = .{ .group_id = group_id } });
         for (plan.split_removals) |transition_id| try commands.append(self.cluster.alloc, .{ .remove_split_transition = .{ .transition_id = transition_id } });

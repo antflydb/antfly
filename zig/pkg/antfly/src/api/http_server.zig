@@ -2204,7 +2204,7 @@ pub const ApiHttpServer = struct {
                 }
 
                 const outcome = (source.commitTransaction(self.alloc, distributed_tables, commit_req.sync_level) catch |err| switch (err) {
-                    error.InvalidBatchRequest => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
+                    error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
                     error.TopologyChanged => {
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
@@ -2483,7 +2483,7 @@ pub const ApiHttpServer = struct {
                 }
 
                 const outcome = (source.commitTransactionWithId(self.alloc, txn_id, session.begin_timestamp, distributed_tables, session.sync_level) catch |err| switch (err) {
-                    error.InvalidBatchRequest => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
+                    error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
                     error.TopologyChanged => {
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
@@ -3009,6 +3009,11 @@ pub const ApiHttpServer = struct {
         if (req.method == .POST) {
             if (routes.Routes.matchTableRestore(uri_parts.path)) |table_restore| {
                 return try self.handlePublicTableRestore(table_restore.table_name, req.body);
+            }
+        }
+        if (req.method == .POST) {
+            if (routes.Routes.matchTableForeignKeyIntegrity(uri_parts.path)) |fk_integrity| {
+                return try self.handlePublicTableForeignKeyIntegrity(fk_integrity.table_name, req.body);
             }
         }
         if (req.method == .POST) {
@@ -4390,7 +4395,7 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_writes orelse return error.NotFound;
         _ = (source.batch(alloc, table_name, req) catch |err| switch (err) {
-            error.InvalidBatchRequest => return error.InvalidBatchRequest,
+            error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return error.InvalidBatchRequest,
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.EnrichmentRetryInProgress => return error.Backpressured,
@@ -5479,6 +5484,65 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    const ForeignKeyIntegrityRequest = struct {
+        action: ?[]const u8 = null,
+        constraint_name: ?[]const u8 = null,
+        doc_key: ?[]const u8 = null,
+        lower_doc_key: ?[]const u8 = null,
+        upper_doc_key: ?[]const u8 = null,
+        violation_limit: ?usize = null,
+    };
+
+    fn parseForeignKeyIntegrityAction(value: ?[]const u8) !table_writes.ForeignKeyIntegrityAction {
+        const text = value orelse "validate";
+        if (std.mem.eql(u8, text, "validate")) return .validate;
+        if (std.mem.eql(u8, text, "dry_run")) return .dry_run;
+        if (std.mem.eql(u8, text, "repair")) return .repair;
+        if (std.mem.eql(u8, text, "list")) return .list;
+        if (std.mem.eql(u8, text, "explain_delete")) return .explain_delete;
+        if (std.mem.eql(u8, text, "progress")) return .progress;
+        return error.InvalidForeignKeyIntegrityRequest;
+    }
+
+    pub fn handlePublicTableForeignKeyIntegrity(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(
+            ForeignKeyIntegrityRequest,
+            self.alloc,
+            if (body.len == 0) "{}" else body,
+            .{ .ignore_unknown_fields = true },
+        ) catch return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+        defer parsed.deinit();
+
+        const action = parseForeignKeyIntegrityAction(parsed.value.action) catch {
+            return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+        };
+        const violation_limit = @min(parsed.value.violation_limit orelse 100, 10_000);
+        if (action == .explain_delete and (parsed.value.doc_key == null or parsed.value.doc_key.?.len == 0)) {
+            return try textResponse(self.alloc, 400, "foreign key delete explain requires doc_key");
+        }
+        const lower_doc_key = if (action == .explain_delete) parsed.value.doc_key.? else parsed.value.lower_doc_key orelse "";
+        const upper_doc_key = if (action == .explain_delete) "" else parsed.value.upper_doc_key orelse "";
+        var result = (source.foreignKeyIntegrity(
+            self.alloc,
+            table_name,
+            action,
+            parsed.value.constraint_name,
+            lower_doc_key,
+            upper_doc_key,
+            violation_limit,
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.ForeignKeyNotFound => return try textResponse(self.alloc, 404, "foreign key not found"),
+            error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+            error.ReadOnly => return try textResponse(self.alloc, 405, "method not allowed"),
+            else => return err,
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        return try jsonResponse(self.alloc, result);
+    }
+
     pub fn handlePublicClusterBackupList(self: *ApiHttpServer, location_uri: []const u8) !http_common.HttpResponse {
         var resp = try cluster_api_http.handleClusterBackupList(self.alloc, location_uri, self.clusterApi());
         defer resp.deinit(self.alloc);
@@ -5855,6 +5919,11 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
     if (routes.Routes.matchTableRestore(path)) |table_restore| return .{
         .resource_type = .table,
         .resource = table_restore.table_name,
+        .permission_type = .admin,
+    };
+    if (routes.Routes.matchTableForeignKeyIntegrity(path)) |fk_integrity| return .{
+        .resource_type = .table,
+        .resource = fk_integrity.table_name,
         .permission_type = .admin,
     };
     if (tableNameForGraphPath(path)) |table_name| return .{
@@ -9769,6 +9838,250 @@ test "api http server serves table batch writes" {
     defer compact_lookup.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, compact_lookup.json, "\"vec_data\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, compact_lookup.json, "_embeddings") == null);
+}
+
+test "api http server exposes relational foreign key integrity repair" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-http-fk-integrity";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+    try db.applyTableSchemaJson(
+        alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"},"account_id":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"},{"name":"orders_account_id_fkey","columns":["account_id"],"references":{"table":"accounts","columns":["_id"]},"on_delete":"restrict"}]}
+    ,
+        .{},
+    );
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:a", .value = "{\"_type\":\"customers\"}" },
+            .{ .key = "account:a", .value = "{\"_type\":\"accounts\"}" },
+            .{ .key = "order:1", .value = "{\"customer_id\":\"customer:a\",\"account_id\":\"account:a\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const ref_key = try db_mod.internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:a", "row", "order:1");
+    defer alloc.free(ref_key);
+    try db.core.store.delete(ref_key);
+
+    var table_source = table_writes.BoundTableWriteSource.init("docs", &db);
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const IntegrityResponse = struct {
+        valid: bool,
+        report: struct {
+            missing_ref_rows: u64,
+            repaired_ref_rows: u64,
+        },
+        progress: []const struct {
+            group_id: u64,
+            mode: []const u8,
+            constraint_name: ?[]const u8 = null,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+            completed: bool,
+            valid: bool,
+            report: struct {
+                missing_ref_rows: u64,
+                repaired_ref_rows: u64,
+            },
+        },
+        violations: []const struct {
+            kind: []const u8,
+            constraint_name: []const u8,
+            child_key: []const u8,
+            parent_key: []const u8,
+        },
+    };
+    const DeleteExplainResponse = struct {
+        valid: bool,
+        delete_plan: struct {
+            exists: bool,
+            allowed: bool,
+            block_reason: []const u8,
+            planned_set_null_updates: u64,
+            planned_cascade_deletes: u64,
+        },
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, table_source.source());
+    var validate_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"validate\",\"constraint_name\":\"orders_customer_id_fkey\"}",
+    });
+    defer validate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), validate_resp.status);
+    var validate_body = try std.json.parseFromSlice(IntegrityResponse, alloc, validate_resp.body, .{ .ignore_unknown_fields = true });
+    defer validate_body.deinit();
+    try std.testing.expect(!validate_body.value.valid);
+    try std.testing.expectEqual(@as(u64, 1), validate_body.value.report.missing_ref_rows);
+    try std.testing.expectEqual(@as(usize, 1), validate_body.value.progress.len);
+    try std.testing.expectEqual(@as(u64, 0), validate_body.value.progress[0].group_id);
+    try std.testing.expectEqualStrings("validate", validate_body.value.progress[0].mode);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", validate_body.value.progress[0].constraint_name.?);
+    try std.testing.expectEqualStrings("", validate_body.value.progress[0].lower_doc_key);
+    try std.testing.expectEqualStrings("", validate_body.value.progress[0].upper_doc_key);
+    try std.testing.expect(validate_body.value.progress[0].completed);
+    try std.testing.expect(!validate_body.value.progress[0].valid);
+    try std.testing.expectEqual(@as(u64, 1), validate_body.value.progress[0].report.missing_ref_rows);
+    try std.testing.expectEqual(@as(usize, 1), validate_body.value.violations.len);
+    try std.testing.expectEqualStrings("missing_ref", validate_body.value.violations[0].kind);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", validate_body.value.violations[0].constraint_name);
+    try std.testing.expectEqualStrings("order:1", validate_body.value.violations[0].child_key);
+    try std.testing.expectEqualStrings("customer:a", validate_body.value.violations[0].parent_key);
+
+    var unrelated_validate_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"validate\",\"constraint_name\":\"orders_account_id_fkey\"}",
+    });
+    defer unrelated_validate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unrelated_validate_resp.status);
+    var unrelated_validate_body = try std.json.parseFromSlice(IntegrityResponse, alloc, unrelated_validate_resp.body, .{ .ignore_unknown_fields = true });
+    defer unrelated_validate_body.deinit();
+    try std.testing.expect(unrelated_validate_body.value.valid);
+    try std.testing.expectEqual(@as(u64, 0), unrelated_validate_body.value.report.missing_ref_rows);
+    try std.testing.expectEqual(@as(usize, 0), unrelated_validate_body.value.violations.len);
+
+    var missing_doc_key_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"explain_delete\",\"constraint_name\":\"orders_account_id_fkey\"}",
+    });
+    defer missing_doc_key_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), missing_doc_key_resp.status);
+    try std.testing.expectEqualStrings("foreign key delete explain requires doc_key", missing_doc_key_resp.body);
+
+    var explain_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"explain_delete\",\"constraint_name\":\"orders_account_id_fkey\",\"doc_key\":\"account:a\"}",
+    });
+    defer explain_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), explain_resp.status);
+    var explain_body = try std.json.parseFromSlice(DeleteExplainResponse, alloc, explain_resp.body, .{ .ignore_unknown_fields = true });
+    defer explain_body.deinit();
+    try std.testing.expect(!explain_body.value.valid);
+    try std.testing.expect(explain_body.value.delete_plan.exists);
+    try std.testing.expect(!explain_body.value.delete_plan.allowed);
+    try std.testing.expectEqualStrings("restrict", explain_body.value.delete_plan.block_reason);
+    try std.testing.expectEqual(@as(u64, 0), explain_body.value.delete_plan.planned_set_null_updates);
+    try std.testing.expectEqual(@as(u64, 0), explain_body.value.delete_plan.planned_cascade_deletes);
+
+    var unknown_constraint_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"validate\",\"constraint_name\":\"orders_missing_fkey\"}",
+    });
+    defer unknown_constraint_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), unknown_constraint_resp.status);
+    try std.testing.expectEqualStrings("foreign key not found", unknown_constraint_resp.body);
+
+    var dry_run_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"dry_run\",\"constraint_name\":\"orders_customer_id_fkey\"}",
+    });
+    defer dry_run_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), dry_run_resp.status);
+    var dry_run_body = try std.json.parseFromSlice(IntegrityResponse, alloc, dry_run_resp.body, .{ .ignore_unknown_fields = true });
+    defer dry_run_body.deinit();
+    try std.testing.expect(!dry_run_body.value.valid);
+    try std.testing.expectEqual(@as(u64, 1), dry_run_body.value.report.missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 1), dry_run_body.value.report.repaired_ref_rows);
+    try std.testing.expectEqual(@as(usize, 1), dry_run_body.value.progress.len);
+    try std.testing.expectEqualStrings("dry_run", dry_run_body.value.progress[0].mode);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", dry_run_body.value.progress[0].constraint_name.?);
+    try std.testing.expectEqual(@as(u64, 1), dry_run_body.value.progress[0].report.repaired_ref_rows);
+    try std.testing.expectEqual(@as(usize, 1), dry_run_body.value.violations.len);
+
+    var after_dry_run_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"validate\",\"constraint_name\":\"orders_customer_id_fkey\"}",
+    });
+    defer after_dry_run_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), after_dry_run_resp.status);
+    var after_dry_run_body = try std.json.parseFromSlice(IntegrityResponse, alloc, after_dry_run_resp.body, .{ .ignore_unknown_fields = true });
+    defer after_dry_run_body.deinit();
+    try std.testing.expect(!after_dry_run_body.value.valid);
+    try std.testing.expectEqual(@as(u64, 1), after_dry_run_body.value.report.missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 0), after_dry_run_body.value.report.repaired_ref_rows);
+
+    var repair_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"repair\",\"constraint_name\":\"orders_customer_id_fkey\"}",
+    });
+    defer repair_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), repair_resp.status);
+    var repair_body = try std.json.parseFromSlice(IntegrityResponse, alloc, repair_resp.body, .{ .ignore_unknown_fields = true });
+    defer repair_body.deinit();
+    try std.testing.expect(repair_body.value.valid);
+    try std.testing.expectEqual(@as(u64, 1), repair_body.value.report.repaired_ref_rows);
+    try std.testing.expectEqual(@as(usize, 1), repair_body.value.progress.len);
+    try std.testing.expectEqualStrings("repair", repair_body.value.progress[0].mode);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", repair_body.value.progress[0].constraint_name.?);
+    try std.testing.expect(repair_body.value.progress[0].valid);
+    try std.testing.expectEqual(@as(u64, 1), repair_body.value.progress[0].report.repaired_ref_rows);
+    try std.testing.expectEqual(@as(usize, 0), repair_body.value.violations.len);
+
+    var progress_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"progress\"}",
+    });
+    defer progress_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), progress_resp.status);
+    var progress_body = try std.json.parseFromSlice(IntegrityResponse, alloc, progress_resp.body, .{ .ignore_unknown_fields = true });
+    defer progress_body.deinit();
+    try std.testing.expectEqual(@as(usize, 4), progress_body.value.progress.len);
+    var saw_validate_customer = false;
+    var saw_validate_account = false;
+    var saw_dry_run_customer = false;
+    var saw_repair_customer = false;
+    for (progress_body.value.progress) |entry| {
+        if (std.mem.eql(u8, entry.mode, "validate") and entry.constraint_name != null and std.mem.eql(u8, entry.constraint_name.?, "orders_customer_id_fkey")) saw_validate_customer = true;
+        if (std.mem.eql(u8, entry.mode, "validate") and entry.constraint_name != null and std.mem.eql(u8, entry.constraint_name.?, "orders_account_id_fkey")) saw_validate_account = true;
+        if (std.mem.eql(u8, entry.mode, "dry_run") and entry.constraint_name != null and std.mem.eql(u8, entry.constraint_name.?, "orders_customer_id_fkey")) saw_dry_run_customer = true;
+        if (std.mem.eql(u8, entry.mode, "repair") and entry.constraint_name != null and std.mem.eql(u8, entry.constraint_name.?, "orders_customer_id_fkey")) saw_repair_customer = true;
+    }
+    try std.testing.expect(saw_validate_customer);
+    try std.testing.expect(saw_validate_account);
+    try std.testing.expect(saw_dry_run_customer);
+    try std.testing.expect(saw_repair_customer);
 }
 
 test "api http server serves table batch transforms" {

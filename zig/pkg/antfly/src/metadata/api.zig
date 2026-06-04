@@ -91,6 +91,8 @@ pub const MetadataStatus = struct {
     projected_replication_source_last_source_commit_at_ms_max: u64 = 0,
     projected_replication_source_last_change_applied_at_ms_max: u64 = 0,
     projected_ranges: usize = 0,
+    projected_foreign_key_ref_ranges: usize = 0,
+    projected_unique_constraint_ranges: usize = 0,
     projected_stores: usize = 0,
     projected_placement_intents: usize = 0,
     projected_snapshot_bootstrap_intents: usize = 0,
@@ -134,6 +136,8 @@ pub const AdminSnapshot = struct {
     status: MetadataStatus,
     tables: []table_manager.TableRecord,
     ranges: []table_manager.RangeRecord,
+    foreign_key_ref_ranges: []table_manager.ForeignKeyReferenceRangeRecord = &.{},
+    unique_constraint_ranges: []table_manager.UniqueConstraintRangeRecord = &.{},
     nodes: []table_manager.NodeRecord = &.{},
     stores: []table_manager.StoreRecord,
     placement_intents: []raft_reconciler.PlacementIntent,
@@ -167,6 +171,12 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
     errdefer freeSnapshot(alloc, source, &snapshot);
     snapshot.tables = try source.listProjectedTables(alloc);
     snapshot.ranges = try source.listProjectedRanges(alloc);
+    if (@hasDecl(SourceDeclType, "listProjectedForeignKeyReferenceRanges")) {
+        snapshot.foreign_key_ref_ranges = try source.listProjectedForeignKeyReferenceRanges(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedUniqueConstraintRanges")) {
+        snapshot.unique_constraint_ranges = try source.listProjectedUniqueConstraintRanges(alloc);
+    }
     if (@hasDecl(SourceDeclType, "listProjectedNodes")) {
         snapshot.nodes = try source.listProjectedNodes(alloc);
     }
@@ -220,6 +230,12 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
     };
     source.freeProjectedTables(alloc, snapshot.tables);
     source.freeProjectedRanges(alloc, snapshot.ranges);
+    if (@hasDecl(SourceDeclType, "freeProjectedForeignKeyReferenceRanges") and snapshot.foreign_key_ref_ranges.len > 0) {
+        source.freeProjectedForeignKeyReferenceRanges(alloc, snapshot.foreign_key_ref_ranges);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedUniqueConstraintRanges") and snapshot.unique_constraint_ranges.len > 0) {
+        source.freeProjectedUniqueConstraintRanges(alloc, snapshot.unique_constraint_ranges);
+    }
     if (@hasDecl(SourceDeclType, "freeProjectedNodes") and snapshot.nodes.len > 0) {
         source.freeProjectedNodes(alloc, snapshot.nodes);
     }

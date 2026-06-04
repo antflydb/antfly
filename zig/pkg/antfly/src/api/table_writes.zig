@@ -79,6 +79,13 @@ fn isTransientReplayVisibilityError(err: anyerror) bool {
     return err == error.WriterLocked or err == error.ReplayDocumentNotVisible;
 }
 
+fn normalizeRelationalConstraintError(err: anyerror) anyerror {
+    return switch (err) {
+        error.ForeignKeyViolation, error.UniqueConstraintViolation => error.InvalidBatchRequest,
+        else => err,
+    };
+}
+
 const TestExecutionHook = struct {
     ptr: *anyopaque,
     run: *const fn (ptr: *anyopaque) void,
@@ -1551,6 +1558,113 @@ const TestEmbeddingRequest = struct {
     input: std.json.Value,
 };
 
+pub const ForeignKeyIntegrityAction = enum {
+    validate,
+    dry_run,
+    repair,
+    list,
+    explain_delete,
+    progress,
+};
+
+pub const ForeignKeyIntegrityRequest = struct {
+    action: ForeignKeyIntegrityAction = .validate,
+    constraint_name: ?[]const u8 = null,
+    doc_key: ?[]const u8 = null,
+    lower_doc_key: []const u8 = "",
+    upper_doc_key: []const u8 = "",
+    violation_limit: usize = 100,
+};
+
+pub const ForeignKeyIntegrityGroupReport = struct {
+    group_id: u64,
+    report: db_mod.relational_store.ForeignKeyIntegrityReport,
+};
+
+pub const ForeignKeyIntegrityTupleValue = struct {
+    column: []u8,
+    value: []u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.column);
+        alloc.free(self.value);
+        self.* = undefined;
+    }
+};
+
+pub const ForeignKeyIntegrityViolation = struct {
+    group_id: u64,
+    kind: db_mod.relational_store.ForeignKeyIntegrityViolationKind,
+    constraint_name: []u8,
+    child_table: []u8,
+    child_key: []u8,
+    parent_table: []u8,
+    parent_key: []u8,
+    parent_values: []ForeignKeyIntegrityTupleValue = &.{},
+    observed_parent_key: ?[]u8 = null,
+    observed_parent_values: []ForeignKeyIntegrityTupleValue = &.{},
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.constraint_name);
+        alloc.free(self.child_table);
+        alloc.free(self.child_key);
+        alloc.free(self.parent_table);
+        alloc.free(self.parent_key);
+        freeForeignKeyIntegrityTupleValues(alloc, self.parent_values);
+        if (self.observed_parent_key) |value| alloc.free(value);
+        freeForeignKeyIntegrityTupleValues(alloc, self.observed_parent_values);
+        self.* = undefined;
+    }
+};
+
+fn freeForeignKeyIntegrityTupleValues(alloc: std.mem.Allocator, values: []ForeignKeyIntegrityTupleValue) void {
+    for (values) |*value| value.deinit(alloc);
+    if (values.len > 0) alloc.free(values);
+}
+
+pub const ForeignKeyIntegrityResult = struct {
+    action: ForeignKeyIntegrityAction,
+    valid: bool,
+    complete: bool,
+    violation_limit: usize,
+    violations_truncated: bool,
+    report: db_mod.relational_store.ForeignKeyIntegrityReport,
+    delete_plan: ?db_mod.relational_store.ForeignKeyDeletePlan = null,
+    groups: []ForeignKeyIntegrityGroupReport,
+    progress: []ForeignKeyIntegrityProgress = &.{},
+    violations: []ForeignKeyIntegrityViolation,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.groups);
+        for (self.progress) |*progress| progress.deinit(alloc);
+        if (self.progress.len > 0) alloc.free(self.progress);
+        for (self.violations) |*violation| violation.deinit(alloc);
+        alloc.free(self.violations);
+        self.* = undefined;
+    }
+};
+
+pub const ForeignKeyIntegrityProgress = struct {
+    group_id: u64,
+    version: u32 = 1,
+    mode: []u8,
+    constraint_name: ?[]u8 = null,
+    lower_doc_key: []u8,
+    upper_doc_key: []u8,
+    completed: bool = true,
+    valid: bool,
+    updated_at_ns: u64,
+    report: db_mod.relational_store.ForeignKeyIntegrityReport,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.mode.len > 0) alloc.free(self.mode);
+        if (self.constraint_name) |value| alloc.free(value);
+        if (self.lower_doc_key.len > 0) alloc.free(self.lower_doc_key);
+        if (self.upper_doc_key.len > 0) alloc.free(self.upper_doc_key);
+        self.* = undefined;
+    }
+};
+
 pub const TableWriteSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -1688,6 +1802,49 @@ pub const TableWriteSource = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
         ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
+        foreign_key_integrity: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            action: ForeignKeyIntegrityAction,
+            constraint_name: ?[]const u8,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+            violation_limit: usize,
+        ) anyerror!?ForeignKeyIntegrityResult = null,
+        foreign_key_integrity_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            action: ForeignKeyIntegrityAction,
+            constraint_name: ?[]const u8,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+            violation_limit: usize,
+        ) anyerror!?ForeignKeyIntegrityResult = null,
+        foreign_key_ref_children_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            parent_table: []const u8,
+            parent_key: []const u8,
+            limit: usize,
+        ) anyerror!?[]db_mod.types.ForeignKeyRefChild = null,
+        foreign_key_ref_children_page_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            parent_table: []const u8,
+            parent_key: []const u8,
+            start_after_child_table: ?[]const u8,
+            start_after_child_key: ?[]const u8,
+            limit: usize,
+        ) anyerror!?db_mod.types.ForeignKeyRefChildrenPage = null,
     };
 
     pub fn batch(
@@ -1893,7 +2050,453 @@ pub const TableWriteSource = struct {
         const fn_ptr = self.vtable.local_runtime_statuses orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name);
     }
+
+    pub fn foreignKeyIntegrity(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        action: ForeignKeyIntegrityAction,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        violation_limit: usize,
+    ) !?ForeignKeyIntegrityResult {
+        const fn_ptr = self.vtable.foreign_key_integrity orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, action, constraint_name, lower_doc_key, upper_doc_key, violation_limit);
+    }
+
+    pub fn foreignKeyIntegrityGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        action: ForeignKeyIntegrityAction,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        violation_limit: usize,
+    ) !?ForeignKeyIntegrityResult {
+        const fn_ptr = self.vtable.foreign_key_integrity_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, action, constraint_name, lower_doc_key, upper_doc_key, violation_limit);
+    }
+
+    pub fn foreignKeyRefChildrenGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        limit: usize,
+    ) !?[]db_mod.types.ForeignKeyRefChild {
+        if (self.vtable.foreign_key_ref_children_group_local) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, constraint_name, parent_table, parent_key, limit);
+        }
+        var page = (try self.foreignKeyRefChildrenPageGroupLocal(alloc, group_id, table_name, constraint_name, parent_table, parent_key, null, null, limit)) orelse return null;
+        errdefer freeForeignKeyRefChildrenPage(alloc, &page);
+        if (!page.complete) return error.ForeignKeyActionLimitExceeded;
+        const children = page.children;
+        page.children = &.{};
+        freeForeignKeyRefChildrenPage(alloc, &page);
+        return children;
+    }
+
+    pub fn foreignKeyRefChildrenPageGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        start_after_child_table: ?[]const u8,
+        start_after_child_key: ?[]const u8,
+        limit: usize,
+    ) !?db_mod.types.ForeignKeyRefChildrenPage {
+        const fn_ptr = self.vtable.foreign_key_ref_children_page_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, constraint_name, parent_table, parent_key, start_after_child_table, start_after_child_key, limit);
+    }
 };
+
+pub fn freeForeignKeyRefChildrenPage(alloc: std.mem.Allocator, page: *db_mod.types.ForeignKeyRefChildrenPage) void {
+    for (page.children) |child| {
+        alloc.free(@constCast(child.child_table));
+        alloc.free(@constCast(child.child_key));
+    }
+    if (page.children.len > 0) alloc.free(page.children);
+    if (page.next_child_table) |value| alloc.free(@constCast(value));
+    if (page.next_child_key) |value| alloc.free(@constCast(value));
+    page.* = undefined;
+}
+
+fn mergeForeignKeyIntegrityReport(
+    dst: *db_mod.relational_store.ForeignKeyIntegrityReport,
+    src: db_mod.relational_store.ForeignKeyIntegrityReport,
+) void {
+    dst.scanned_child_rows +|= src.scanned_child_rows;
+    dst.referenced_child_rows +|= src.referenced_child_rows;
+    dst.scanned_ref_rows +|= src.scanned_ref_rows;
+    dst.missing_parent_rows +|= src.missing_parent_rows;
+    dst.missing_ref_rows +|= src.missing_ref_rows;
+    dst.stale_ref_rows +|= src.stale_ref_rows;
+    dst.repaired_ref_rows +|= src.repaired_ref_rows;
+    dst.deleted_stale_ref_rows +|= src.deleted_stale_ref_rows;
+}
+
+fn cloneForeignKeyIntegrityViolation(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    violation: db_mod.relational_store.ForeignKeyIntegrityViolation,
+) !ForeignKeyIntegrityViolation {
+    var cloned = ForeignKeyIntegrityViolation{
+        .group_id = group_id,
+        .kind = violation.kind,
+        .constraint_name = try alloc.dupe(u8, violation.constraint_name),
+        .child_table = &.{},
+        .child_key = &.{},
+        .parent_table = &.{},
+        .parent_key = &.{},
+        .parent_values = &.{},
+        .observed_parent_key = null,
+        .observed_parent_values = &.{},
+    };
+    errdefer cloned.deinit(alloc);
+    cloned.child_table = try alloc.dupe(u8, violation.child_table);
+    cloned.child_key = try alloc.dupe(u8, violation.child_key);
+    cloned.parent_table = try alloc.dupe(u8, violation.parent_table);
+    cloned.parent_key = try alloc.dupe(u8, violation.parent_key);
+    cloned.parent_values = try cloneStorageForeignKeyIntegrityTupleValues(alloc, violation.parent_values);
+    if (violation.observed_parent_key) |value| cloned.observed_parent_key = try alloc.dupe(u8, value);
+    cloned.observed_parent_values = try cloneStorageForeignKeyIntegrityTupleValues(alloc, violation.observed_parent_values);
+    return cloned;
+}
+
+fn cloneForeignKeyIntegrityResultViolation(
+    alloc: std.mem.Allocator,
+    violation: ForeignKeyIntegrityViolation,
+) !ForeignKeyIntegrityViolation {
+    var cloned = ForeignKeyIntegrityViolation{
+        .group_id = violation.group_id,
+        .kind = violation.kind,
+        .constraint_name = try alloc.dupe(u8, violation.constraint_name),
+        .child_table = &.{},
+        .child_key = &.{},
+        .parent_table = &.{},
+        .parent_key = &.{},
+        .parent_values = &.{},
+        .observed_parent_key = null,
+        .observed_parent_values = &.{},
+    };
+    errdefer cloned.deinit(alloc);
+    cloned.child_table = try alloc.dupe(u8, violation.child_table);
+    cloned.child_key = try alloc.dupe(u8, violation.child_key);
+    cloned.parent_table = try alloc.dupe(u8, violation.parent_table);
+    cloned.parent_key = try alloc.dupe(u8, violation.parent_key);
+    cloned.parent_values = try cloneForeignKeyIntegrityTupleValues(alloc, violation.parent_values);
+    if (violation.observed_parent_key) |value| cloned.observed_parent_key = try alloc.dupe(u8, value);
+    cloned.observed_parent_values = try cloneForeignKeyIntegrityTupleValues(alloc, violation.observed_parent_values);
+    return cloned;
+}
+
+fn cloneForeignKeyIntegrityProgress(
+    alloc: std.mem.Allocator,
+    progress: ForeignKeyIntegrityProgress,
+) !ForeignKeyIntegrityProgress {
+    var cloned = ForeignKeyIntegrityProgress{
+        .group_id = progress.group_id,
+        .version = progress.version,
+        .mode = try alloc.dupe(u8, progress.mode),
+        .constraint_name = null,
+        .lower_doc_key = &.{},
+        .upper_doc_key = &.{},
+        .completed = progress.completed,
+        .valid = progress.valid,
+        .updated_at_ns = progress.updated_at_ns,
+        .report = progress.report,
+    };
+    errdefer cloned.deinit(alloc);
+    if (progress.constraint_name) |value| cloned.constraint_name = try alloc.dupe(u8, value);
+    cloned.lower_doc_key = try alloc.dupe(u8, progress.lower_doc_key);
+    cloned.upper_doc_key = try alloc.dupe(u8, progress.upper_doc_key);
+    return cloned;
+}
+
+fn cloneForeignKeyIntegrityProgressRecord(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    progress: db_mod.DB.ForeignKeyIntegrityProgressRecord,
+) !ForeignKeyIntegrityProgress {
+    var cloned = ForeignKeyIntegrityProgress{
+        .group_id = group_id,
+        .version = progress.version,
+        .mode = try alloc.dupe(u8, progress.mode),
+        .constraint_name = null,
+        .lower_doc_key = &.{},
+        .upper_doc_key = &.{},
+        .completed = progress.completed,
+        .valid = progress.valid,
+        .updated_at_ns = progress.updated_at_ns,
+        .report = progress.report,
+    };
+    errdefer cloned.deinit(alloc);
+    if (progress.constraint_name) |value| cloned.constraint_name = try alloc.dupe(u8, value);
+    cloned.lower_doc_key = try alloc.dupe(u8, progress.lower_doc_key);
+    cloned.upper_doc_key = try alloc.dupe(u8, progress.upper_doc_key);
+    return cloned;
+}
+
+fn cloneStorageForeignKeyIntegrityTupleValues(
+    alloc: std.mem.Allocator,
+    values: []const db_mod.relational_store.ForeignKeyIntegrityTupleValue,
+) ![]ForeignKeyIntegrityTupleValue {
+    var out = try alloc.alloc(ForeignKeyIntegrityTupleValue, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*value| value.deinit(alloc);
+        if (out.len > 0) alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        const column = try alloc.dupe(u8, value.column);
+        var column_transferred = false;
+        errdefer if (!column_transferred) alloc.free(column);
+        const scalar = try alloc.dupe(u8, value.value);
+        var scalar_transferred = false;
+        errdefer if (!scalar_transferred) alloc.free(scalar);
+        out[i] = .{
+            .column = column,
+            .value = scalar,
+        };
+        column_transferred = true;
+        scalar_transferred = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneForeignKeyIntegrityTupleValues(
+    alloc: std.mem.Allocator,
+    values: []const ForeignKeyIntegrityTupleValue,
+) ![]ForeignKeyIntegrityTupleValue {
+    var out = try alloc.alloc(ForeignKeyIntegrityTupleValue, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*value| value.deinit(alloc);
+        if (out.len > 0) alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        const column = try alloc.dupe(u8, value.column);
+        var column_transferred = false;
+        errdefer if (!column_transferred) alloc.free(column);
+        const scalar = try alloc.dupe(u8, value.value);
+        var scalar_transferred = false;
+        errdefer if (!scalar_transferred) alloc.free(scalar);
+        out[i] = .{
+            .column = column,
+            .value = scalar,
+        };
+        column_transferred = true;
+        scalar_transferred = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn appendForeignKeyIntegrityResult(
+    alloc: std.mem.Allocator,
+    result: ForeignKeyIntegrityResult,
+    violation_limit: usize,
+    aggregate: *db_mod.relational_store.ForeignKeyIntegrityReport,
+    group_reports: *std.ArrayListUnmanaged(ForeignKeyIntegrityGroupReport),
+    progress_entries: *std.ArrayListUnmanaged(ForeignKeyIntegrityProgress),
+    violations: *std.ArrayListUnmanaged(ForeignKeyIntegrityViolation),
+    delete_plan: *?db_mod.relational_store.ForeignKeyDeletePlan,
+    truncated: *bool,
+    valid: *bool,
+    complete: *bool,
+) !void {
+    mergeForeignKeyIntegrityReport(aggregate, result.report);
+    try group_reports.ensureUnusedCapacity(alloc, result.groups.len);
+    for (result.groups) |group| group_reports.appendAssumeCapacity(group);
+
+    try progress_entries.ensureUnusedCapacity(alloc, result.progress.len);
+    for (result.progress) |progress| {
+        progress_entries.appendAssumeCapacity(try cloneForeignKeyIntegrityProgress(alloc, progress));
+    }
+
+    const remaining = violation_limit -| violations.items.len;
+    const copy_count = @min(remaining, result.violations.len);
+    try violations.ensureUnusedCapacity(alloc, copy_count);
+    for (result.violations[0..copy_count]) |violation| {
+        violations.appendAssumeCapacity(try cloneForeignKeyIntegrityResultViolation(alloc, violation));
+    }
+
+    truncated.* = truncated.* or result.violations_truncated or result.violations.len > remaining;
+    valid.* = valid.* and result.valid;
+    complete.* = complete.* and result.complete;
+    if (result.delete_plan) |plan| {
+        delete_plan.* = mergeForeignKeyDeletePlans(delete_plan.*, plan);
+    }
+}
+
+fn mergeForeignKeyDeletePlans(
+    existing: ?db_mod.relational_store.ForeignKeyDeletePlan,
+    next: db_mod.relational_store.ForeignKeyDeletePlan,
+) db_mod.relational_store.ForeignKeyDeletePlan {
+    var merged = existing orelse return next;
+    merged.exists = merged.exists or next.exists;
+    merged.allowed = merged.allowed and next.allowed;
+    if (merged.block_reason == .none and next.block_reason != .none) merged.block_reason = next.block_reason;
+    merged.planned_set_null_updates +|= next.planned_set_null_updates;
+    merged.planned_cascade_deletes +|= next.planned_cascade_deletes;
+    merged.planned_row_deletes +|= next.planned_row_deletes;
+    merged.planned_index_deletes +|= next.planned_index_deletes;
+    merged.planned_writes +|= next.planned_writes;
+    return merged;
+}
+
+fn resolveForeignKeyIntegrityGroupsEventually(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    action: ForeignKeyIntegrityAction,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) ![]u64 {
+    if (action == .explain_delete) {
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, catalog, table_name, lower_doc_key)) orelse return try alloc.alloc(u64, 0);
+        const groups = try alloc.alloc(u64, 1);
+        groups[0] = group_id;
+        return groups;
+    }
+    return try table_catalog.resolveGroupsForSpanEventually(
+        alloc,
+        catalog,
+        table_name,
+        lower_doc_key,
+        upper_doc_key,
+        5 * std.time.ns_per_s,
+        10,
+    );
+}
+
+fn foreignKeyIntegrityProgressModeForAction(
+    action: ForeignKeyIntegrityAction,
+) ?db_mod.relational_store.ForeignKeyIntegrityMode {
+    return switch (action) {
+        .validate, .list => .validate,
+        .dry_run => .dry_run,
+        .repair => .repair,
+        .explain_delete, .progress => null,
+    };
+}
+
+fn foreignKeyIntegrityResultFromRoutedExplain(
+    alloc: std.mem.Allocator,
+    action: ForeignKeyIntegrityAction,
+    violation_limit: usize,
+    explain: distributed_txn.ForeignKeyDeleteExplain,
+) !ForeignKeyIntegrityResult {
+    const groups = try alloc.alloc(ForeignKeyIntegrityGroupReport, 1);
+    errdefer alloc.free(groups);
+    groups[0] = .{
+        .group_id = explain.parent_group_id,
+        .report = .{},
+    };
+    return .{
+        .action = action,
+        .valid = explain.plan.allowed,
+        .complete = true,
+        .violation_limit = violation_limit,
+        .violations_truncated = false,
+        .report = .{},
+        .delete_plan = explain.plan,
+        .groups = groups,
+        .progress = &.{},
+        .violations = &.{},
+    };
+}
+
+fn runForeignKeyIntegrityOnDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    group_id: u64,
+    action: ForeignKeyIntegrityAction,
+    constraint_name: ?[]const u8,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+    violation_limit: usize,
+) !ForeignKeyIntegrityResult {
+    const report = switch (action) {
+        .validate, .list => try db.validateForeignKeyRefsInRangeForConstraint(constraint_name, lower_doc_key, upper_doc_key),
+        .dry_run => try db.dryRunRepairForeignKeyRefsInRangeForConstraint(constraint_name, lower_doc_key, upper_doc_key),
+        .repair => try db.repairForeignKeyRefsInRangeForConstraint(constraint_name, lower_doc_key, upper_doc_key),
+        .explain_delete, .progress => db_mod.relational_store.ForeignKeyIntegrityReport{},
+    };
+
+    const delete_plan = if (action == .explain_delete)
+        try db.explainForeignKeyDeleteForConstraint(constraint_name, lower_doc_key)
+    else
+        null;
+
+    var raw_violations = if (action == .explain_delete or action == .progress)
+        try alloc.alloc(db_mod.relational_store.ForeignKeyIntegrityViolation, 0)
+    else
+        try db.listForeignKeyViolationsInRangeForConstraint(constraint_name, lower_doc_key, upper_doc_key);
+    defer db.freeForeignKeyIntegrityViolations(raw_violations);
+
+    var violations = std.ArrayListUnmanaged(ForeignKeyIntegrityViolation).empty;
+    errdefer {
+        for (violations.items) |*violation| violation.deinit(alloc);
+        violations.deinit(alloc);
+    }
+    const copy_count = @min(violation_limit, raw_violations.len);
+    try violations.ensureTotalCapacity(alloc, copy_count);
+    for (raw_violations[0..copy_count]) |violation| {
+        violations.appendAssumeCapacity(try cloneForeignKeyIntegrityViolation(alloc, group_id, violation));
+    }
+
+    const groups = try alloc.alloc(ForeignKeyIntegrityGroupReport, 1);
+    errdefer alloc.free(groups);
+    groups[0] = .{ .group_id = group_id, .report = report };
+
+    var progress = std.ArrayListUnmanaged(ForeignKeyIntegrityProgress).empty;
+    errdefer {
+        for (progress.items) |*entry| entry.deinit(alloc);
+        progress.deinit(alloc);
+    }
+    if (foreignKeyIntegrityProgressModeForAction(action)) |mode| {
+        if (try db.loadForeignKeyIntegrityProgressRecord(mode, constraint_name, lower_doc_key, upper_doc_key)) |record| {
+            defer db.freeForeignKeyIntegrityProgressRecord(record);
+            try progress.append(alloc, try cloneForeignKeyIntegrityProgressRecord(alloc, group_id, record));
+        }
+    } else if (action == .progress) {
+        const records = try db.listForeignKeyIntegrityProgressRecords();
+        defer db.freeForeignKeyIntegrityProgressRecords(records);
+        try progress.ensureUnusedCapacity(alloc, records.len);
+        for (records) |record| {
+            progress.appendAssumeCapacity(try cloneForeignKeyIntegrityProgressRecord(alloc, group_id, record));
+        }
+    }
+
+    var progress_valid = true;
+    if (action == .progress) {
+        for (progress.items) |entry| progress_valid = progress_valid and entry.valid;
+    }
+
+    return .{
+        .action = action,
+        .valid = if (action == .progress) progress_valid else if (delete_plan) |plan| plan.allowed else raw_violations.len == 0,
+        .complete = true,
+        .violation_limit = violation_limit,
+        .violations_truncated = raw_violations.len > violation_limit,
+        .report = report,
+        .delete_plan = delete_plan,
+        .groups = groups,
+        .progress = try progress.toOwnedSlice(alloc),
+        .violations = try violations.toOwnedSlice(alloc),
+    };
+}
 
 pub const RaftBatcher = struct {
     ptr: *anyopaque,
@@ -1971,6 +2574,10 @@ pub const BoundTableWriteSource = struct {
                 .txn_status_group_local = txnStatusGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .foreign_key_integrity = foreignKeyIntegrity,
+                .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
+                .foreign_key_ref_children_group_local = foreignKeyRefChildrenGroupLocal,
+                .foreign_key_ref_children_page_group_local = foreignKeyRefChildrenPageGroupLocal,
             },
         };
     }
@@ -1988,6 +2595,69 @@ pub const BoundTableWriteSource = struct {
             .stats = try self.db.runtimeStatusStatsConsistent(alloc),
         };
         return .{ .items = items };
+    }
+
+    fn foreignKeyIntegrity(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        action: ForeignKeyIntegrityAction,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        violation_limit: usize,
+    ) !?ForeignKeyIntegrityResult {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try runForeignKeyIntegrityOnDb(alloc, self.db, 0, action, constraint_name, lower_doc_key, upper_doc_key, violation_limit);
+    }
+
+    fn foreignKeyIntegrityGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        action: ForeignKeyIntegrityAction,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        violation_limit: usize,
+    ) !?ForeignKeyIntegrityResult {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try runForeignKeyIntegrityOnDb(alloc, self.db, group_id, action, constraint_name, lower_doc_key, upper_doc_key, violation_limit);
+    }
+
+    fn foreignKeyRefChildrenGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        _: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        limit: usize,
+    ) !?[]db_mod.types.ForeignKeyRefChild {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try self.db.listForeignKeyRefChildrenForParent(alloc, constraint_name, parent_table, parent_key, limit);
+    }
+
+    fn foreignKeyRefChildrenPageGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        _: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        start_after_child_table: ?[]const u8,
+        start_after_child_key: ?[]const u8,
+        limit: usize,
+    ) !?db_mod.types.ForeignKeyRefChildrenPage {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try self.db.listForeignKeyRefChildrenPageForParent(alloc, constraint_name, parent_table, parent_key, start_after_child_table, start_after_child_key, limit);
     }
 
     fn corruptEmbeddingArtifact(
@@ -2058,7 +2728,7 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try validateTableBatchAgainstLocalSchema(alloc, self.db, req.writes, req.transforms);
-        try self.db.batch(req);
+        self.db.batch(req) catch |err| return normalizeRelationalConstraintError(err);
     }
 
     fn beginBulkIngest(
@@ -2195,9 +2865,11 @@ pub const BoundTableWriteSource = struct {
                 self.db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch {};
                 return .{ .conflict = boundConflict(table, err) };
             },
-            else => return err,
+            else => return normalizeRelationalConstraintError(err),
         };
-        try self.db.resolveTransactionIntents(txn_id, .committed, commit_version);
+        self.db.resolveTransactionIntents(txn_id, .committed, commit_version) catch |err| {
+            return normalizeRelationalConstraintError(err);
+        };
         return .{ .committed = .{ .participant_count = 1 } };
     }
 
@@ -2270,7 +2942,7 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try validateTransactionAgainstLocalSchema(alloc, self.db, req.writes, req.transforms);
-        try self.db.writeTransaction(txn_id, req);
+        self.db.writeTransaction(txn_id, req) catch |err| return normalizeRelationalConstraintError(err);
     }
 
     fn txnResolveGroupLocal(
@@ -2284,7 +2956,9 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        try self.db.resolveTransactionIntents(txn_id, status, commit_version);
+        self.db.resolveTransactionIntents(txn_id, status, commit_version) catch |err| {
+            return normalizeRelationalConstraintError(err);
+        };
         const participant = try std.fmt.allocPrint(self.db.alloc, "group:{d}", .{group_id});
         defer self.db.alloc.free(participant);
         try self.db.markTransactionParticipantResolved(txn_id, participant);
@@ -4729,6 +5403,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_status_group_local = txnStatusGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .foreign_key_integrity = foreignKeyIntegrity,
+                .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
+                .foreign_key_ref_children_group_local = foreignKeyRefChildrenGroupLocal,
+                .foreign_key_ref_children_page_group_local = foreignKeyRefChildrenPageGroupLocal,
             },
         };
     }
@@ -5428,6 +6106,14 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
+        var read_source = table_reads.ProvisionedTableReadSource.init(self.replica_root_dir, self.catalog, raft_mod.read_gate.noopReadableLeaseRequester());
+        read_source.cache = self.read_cache;
+        read_source.backend_runtime = self.backend_runtime;
+        read_source.group_lsm_generation = self.group_lsm_generation;
+        read_source.primary_lookup_db = self.primaryLookupDbSource();
+        read_source.secret_store = self.secret_store;
+        read_source.remote_content = self.remote_content;
+        _ = worker_impl.withReads(read_source.source());
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommit(
             alloc,
@@ -5497,7 +6183,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer cached.deinit(alloc);
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
-            try cached.db.batchWithoutRangeValidation(apply_req);
+            cached.db.batchWithoutRangeValidation(apply_req) catch |err| return normalizeRelationalConstraintError(err);
             {
                 lockAtomic(&self.local_db_mutex);
                 defer self.local_db_mutex.unlock();
@@ -5527,7 +6213,7 @@ pub const ProvisionedTableWriteSource = struct {
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
-            try db.batchWithoutRangeValidation(apply_req);
+            db.batchWithoutRangeValidation(apply_req) catch |err| return normalizeRelationalConstraintError(err);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             lockAtomic(&self.local_db_mutex);
             self.markWriteCacheDirty(table_name);
@@ -5608,7 +6294,7 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
-        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
@@ -5630,7 +6316,7 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
-        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
@@ -5638,7 +6324,7 @@ pub const ProvisionedTableWriteSource = struct {
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
         try recoverProvisionedTransactionsOnce(self, alloc, &db);
         try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, table_name, req.writes, req.transforms);
-        try db.writeTransaction(txn_id, req);
+        db.writeTransaction(txn_id, req) catch |err| return normalizeRelationalConstraintError(err);
     }
 
     fn txnResolveGroupLocal(
@@ -5670,7 +6356,9 @@ pub const ProvisionedTableWriteSource = struct {
         var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
         defer db.close();
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-        try db.resolveTransactionIntents(txn_id, status, commit_version);
+        db.resolveTransactionIntents(txn_id, status, commit_version) catch |err| {
+            return normalizeRelationalConstraintError(err);
+        };
         if (status == .committed) try drainManagedDbBeforeClose(&db);
         const participant = try std.fmt.allocPrint(alloc, "group:{d}", .{group_id});
         defer alloc.free(participant);
@@ -5710,6 +6398,239 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try self.snapshotRuntimeStatusesBestEffort(alloc, table_name);
+    }
+
+    fn foreignKeyIntegrity(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        action: ForeignKeyIntegrityAction,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        violation_limit: usize,
+    ) !?ForeignKeyIntegrityResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (action == .explain_delete) {
+            var read_source = table_reads.ProvisionedTableReadSource.init(
+                self.replica_root_dir,
+                self.catalog,
+                raft_mod.read_gate.noopReadableLeaseRequester(),
+            );
+            var worker_impl = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
+            _ = worker_impl.withReads(read_source.source());
+            if (try distributed_txn.explainRoutedForeignKeyParentDelete(
+                alloc,
+                self.catalog,
+                worker_impl.worker(),
+                table_name,
+                constraint_name,
+                lower_doc_key,
+            )) |explain| {
+                return try foreignKeyIntegrityResultFromRoutedExplain(alloc, action, violation_limit, explain);
+            }
+        }
+        const group_ids = try resolveForeignKeyIntegrityGroupsEventually(
+            alloc,
+            self.catalog,
+            table_name,
+            action,
+            lower_doc_key,
+            upper_doc_key,
+        );
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        var group_reports = std.ArrayListUnmanaged(ForeignKeyIntegrityGroupReport).empty;
+        var progress_entries = std.ArrayListUnmanaged(ForeignKeyIntegrityProgress).empty;
+        var violations = std.ArrayListUnmanaged(ForeignKeyIntegrityViolation).empty;
+        errdefer {
+            group_reports.deinit(alloc);
+            for (progress_entries.items) |*progress| progress.deinit(alloc);
+            progress_entries.deinit(alloc);
+            for (violations.items) |*violation| violation.deinit(alloc);
+            violations.deinit(alloc);
+        }
+
+        var aggregate: db_mod.relational_store.ForeignKeyIntegrityReport = .{};
+        var delete_plan: ?db_mod.relational_store.ForeignKeyDeletePlan = null;
+        var truncated = false;
+        var valid = true;
+        var complete = true;
+        for (group_ids) |group_id| {
+            var one = (try runProvisionedForeignKeyIntegrityGroupLocal(
+                self,
+                alloc,
+                group_id,
+                table_name,
+                action,
+                constraint_name,
+                lower_doc_key,
+                upper_doc_key,
+                violation_limit -| violations.items.len,
+            )) orelse return null;
+            defer one.deinit(alloc);
+            try appendForeignKeyIntegrityResult(
+                alloc,
+                one,
+                violation_limit,
+                &aggregate,
+                &group_reports,
+                &progress_entries,
+                &violations,
+                &delete_plan,
+                &truncated,
+                &valid,
+                &complete,
+            );
+        }
+
+        return .{
+            .action = action,
+            .valid = valid,
+            .complete = complete,
+            .violation_limit = violation_limit,
+            .violations_truncated = truncated,
+            .report = aggregate,
+            .delete_plan = delete_plan,
+            .groups = try group_reports.toOwnedSlice(alloc),
+            .progress = try progress_entries.toOwnedSlice(alloc),
+            .violations = try violations.toOwnedSlice(alloc),
+        };
+    }
+
+    fn foreignKeyIntegrityGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        action: ForeignKeyIntegrityAction,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        violation_limit: usize,
+    ) !?ForeignKeyIntegrityResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runProvisionedForeignKeyIntegrityGroupLocal(
+            self,
+            alloc,
+            group_id,
+            table_name,
+            action,
+            constraint_name,
+            lower_doc_key,
+            upper_doc_key,
+            violation_limit,
+        );
+    }
+
+    fn foreignKeyRefChildrenGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        limit: usize,
+    ) !?[]db_mod.types.ForeignKeyRefChild {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .status_only, null, null);
+            defer cached.deinit(alloc);
+            return try cached.db.listForeignKeyRefChildrenForParent(alloc, constraint_name, parent_table, parent_key, limit);
+        }
+
+        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        defer db.close();
+        return try db.listForeignKeyRefChildrenForParent(alloc, constraint_name, parent_table, parent_key, limit);
+    }
+
+    fn foreignKeyRefChildrenPageGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        start_after_child_table: ?[]const u8,
+        start_after_child_key: ?[]const u8,
+        limit: usize,
+    ) !?db_mod.types.ForeignKeyRefChildrenPage {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .status_only, null, null);
+            defer cached.deinit(alloc);
+            return try cached.db.listForeignKeyRefChildrenPageForParent(alloc, constraint_name, parent_table, parent_key, start_after_child_table, start_after_child_key, limit);
+        }
+
+        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        defer db.close();
+        return try db.listForeignKeyRefChildrenPageForParent(alloc, constraint_name, parent_table, parent_key, start_after_child_table, start_after_child_key, limit);
+    }
+
+    fn runProvisionedForeignKeyIntegrityGroupLocal(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        action: ForeignKeyIntegrityAction,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        violation_limit: usize,
+    ) !?ForeignKeyIntegrityResult {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        const mode: ManagedDbOpenMode = switch (action) {
+            .validate, .dry_run, .list, .explain_delete, .progress => .status_only,
+            .repair => .default,
+        };
+
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, mode, null, null);
+            defer cached.deinit(alloc);
+            var result = try runForeignKeyIntegrityOnDb(alloc, cached.db, group_id, action, constraint_name, lower_doc_key, upper_doc_key, violation_limit);
+            errdefer result.deinit(alloc);
+            if (action == .repair) {
+                try drainManagedDbBeforeClose(cached.db);
+                lockAtomic(&self.local_db_mutex);
+                self.markWriteCacheDirty(table_name);
+                self.invalidateReadCache(table_name);
+                self.local_db_mutex.unlock();
+                self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+                self.notifyLocalChange(table_name, .data);
+            }
+            return result;
+        }
+
+        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        defer db.close();
+        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+        var result = try runForeignKeyIntegrityOnDb(alloc, &db, group_id, action, constraint_name, lower_doc_key, upper_doc_key, violation_limit);
+        errdefer result.deinit(alloc);
+        if (action == .repair) {
+            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            self.notifyLocalChange(table_name, .data);
+        }
+        return result;
     }
 
     fn collectRuntimeStatusLeasesFromWriteCacheLocked(
@@ -6181,6 +7102,10 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .txn_status_group_local = txnStatusGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .foreign_key_integrity = foreignKeyIntegrity,
+                .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
+                .foreign_key_ref_children_group_local = foreignKeyRefChildrenGroupLocal,
+                .foreign_key_ref_children_page_group_local = foreignKeyRefChildrenPageGroupLocal,
             },
         };
     }
@@ -6335,6 +7260,15 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+        var read_source = table_reads.HostedProvisionedTableReadSource.init(
+            self.replica_root_dir,
+            self.catalog,
+            raft_mod.read_gate.noopReadableLeaseRequester(),
+            self.router,
+            self.executor,
+        );
+        if (self.backend_runtime) |runtime| _ = read_source.withBackendRuntime(runtime);
+        _ = worker_impl.withReads(read_source.source());
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommit(
             alloc,
@@ -6380,7 +7314,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
         defer cached.deinit(hosted_cache.write_cache.alloc);
         try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.transforms);
-        try cached.db.batchWithoutRangeValidation(req);
+        cached.db.batchWithoutRangeValidation(req) catch |err| return normalizeRelationalConstraintError(err);
         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
     }
 
@@ -6395,7 +7329,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         participants: []const []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
@@ -6415,7 +7349,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
@@ -6423,7 +7357,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         defer cached.deinit(hosted_cache.write_cache.alloc);
         try recoverHostedTransactionsOnce(self, alloc, cached.db);
         try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, table_name, req.writes, req.transforms);
-        try cached.db.writeTransaction(txn_id, req);
+        cached.db.writeTransaction(txn_id, req) catch |err| return normalizeRelationalConstraintError(err);
     }
 
     fn txnResolveGroupLocal(
@@ -6441,7 +7375,9 @@ pub const HostedProvisionedTableWriteSource = struct {
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
         defer cached.deinit(hosted_cache.write_cache.alloc);
-        try cached.db.resolveTransactionIntents(txn_id, status, commit_version);
+        cached.db.resolveTransactionIntents(txn_id, status, commit_version) catch |err| {
+            return normalizeRelationalConstraintError(err);
+        };
         if (status == .committed) try drainManagedDbBeforeClose(cached.db);
         const participant = try std.fmt.allocPrint(alloc, "group:{d}", .{group_id});
         defer alloc.free(participant);
@@ -6478,6 +7414,237 @@ pub const HostedProvisionedTableWriteSource = struct {
             if (statuses) |owned| return owned;
         }
         return try snapshotLocalTableRuntimeStatusesUncached(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name);
+    }
+
+    fn foreignKeyIntegrity(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        action: ForeignKeyIntegrityAction,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        violation_limit: usize,
+    ) !?ForeignKeyIntegrityResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (action == .explain_delete) {
+            var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+            var read_source = table_reads.HostedProvisionedTableReadSource.init(
+                self.replica_root_dir,
+                self.catalog,
+                raft_mod.read_gate.noopReadableLeaseRequester(),
+                self.router,
+                self.executor,
+            );
+            if (self.backend_runtime) |runtime| _ = read_source.withBackendRuntime(runtime);
+            _ = worker_impl.withReads(read_source.source());
+            if (try distributed_txn.explainRoutedForeignKeyParentDelete(
+                alloc,
+                self.catalog,
+                worker_impl.worker(),
+                table_name,
+                constraint_name,
+                lower_doc_key,
+            )) |explain| {
+                return try foreignKeyIntegrityResultFromRoutedExplain(alloc, action, violation_limit, explain);
+            }
+        }
+        const group_ids = try resolveForeignKeyIntegrityGroupsEventually(
+            alloc,
+            self.catalog,
+            table_name,
+            action,
+            lower_doc_key,
+            upper_doc_key,
+        );
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        var group_reports = std.ArrayListUnmanaged(ForeignKeyIntegrityGroupReport).empty;
+        var progress_entries = std.ArrayListUnmanaged(ForeignKeyIntegrityProgress).empty;
+        var violations = std.ArrayListUnmanaged(ForeignKeyIntegrityViolation).empty;
+        errdefer {
+            group_reports.deinit(alloc);
+            for (progress_entries.items) |*progress| progress.deinit(alloc);
+            progress_entries.deinit(alloc);
+            for (violations.items) |*violation| violation.deinit(alloc);
+            violations.deinit(alloc);
+        }
+
+        var aggregate: db_mod.relational_store.ForeignKeyIntegrityReport = .{};
+        var delete_plan: ?db_mod.relational_store.ForeignKeyDeletePlan = null;
+        var truncated = false;
+        var valid = true;
+        var complete = true;
+        for (group_ids) |group_id| {
+            var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+            if (resolved_route) |*route| {
+                defer route.deinit(alloc);
+                switch (route.*) {
+                    .local => {
+                        var one = (try runHostedForeignKeyIntegrityGroupLocal(
+                            self,
+                            alloc,
+                            group_id,
+                            table_name,
+                            action,
+                            constraint_name,
+                            lower_doc_key,
+                            upper_doc_key,
+                            violation_limit -| violations.items.len,
+                        )) orelse return error.UnknownGroup;
+                        defer one.deinit(alloc);
+                        try appendForeignKeyIntegrityResult(alloc, one, violation_limit, &aggregate, &group_reports, &progress_entries, &violations, &delete_plan, &truncated, &valid, &complete);
+                    },
+                    .remote => |remote| {
+                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        const body = try std.json.Stringify.valueAlloc(alloc, ForeignKeyIntegrityRequest{
+                            .action = action,
+                            .constraint_name = constraint_name,
+                            .doc_key = if (action == .explain_delete) lower_doc_key else null,
+                            .lower_doc_key = lower_doc_key,
+                            .upper_doc_key = upper_doc_key,
+                            .violation_limit = violation_limit -| violations.items.len,
+                        }, .{});
+                        defer alloc.free(body);
+                        var response = try client.fetchGroupForeignKeyIntegrity(remote.base_uri, group_id, table_name, body);
+                        defer response.deinit(alloc);
+                        var parsed = try std.json.parseFromSlice(ForeignKeyIntegrityResult, alloc, response.body, .{
+                            .allocate = .alloc_always,
+                            .ignore_unknown_fields = true,
+                        });
+                        defer parsed.deinit();
+                        try appendForeignKeyIntegrityResult(alloc, parsed.value, violation_limit, &aggregate, &group_reports, &progress_entries, &violations, &delete_plan, &truncated, &valid, &complete);
+                    },
+                }
+            } else {
+                const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+                defer alloc.free(path);
+                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                defer io_impl.deinit();
+                std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
+                    error.FileNotFound => return error.UnknownGroup,
+                    else => return err,
+                };
+                var one = (try runHostedForeignKeyIntegrityGroupLocal(
+                    self,
+                    alloc,
+                    group_id,
+                    table_name,
+                    action,
+                    constraint_name,
+                    lower_doc_key,
+                    upper_doc_key,
+                    violation_limit -| violations.items.len,
+                )) orelse return error.UnknownGroup;
+                defer one.deinit(alloc);
+                try appendForeignKeyIntegrityResult(alloc, one, violation_limit, &aggregate, &group_reports, &progress_entries, &violations, &delete_plan, &truncated, &valid, &complete);
+            }
+        }
+
+        return .{
+            .action = action,
+            .valid = valid,
+            .complete = complete,
+            .violation_limit = violation_limit,
+            .violations_truncated = truncated,
+            .report = aggregate,
+            .delete_plan = delete_plan,
+            .groups = try group_reports.toOwnedSlice(alloc),
+            .progress = try progress_entries.toOwnedSlice(alloc),
+            .violations = try violations.toOwnedSlice(alloc),
+        };
+    }
+
+    fn foreignKeyIntegrityGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        action: ForeignKeyIntegrityAction,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        violation_limit: usize,
+    ) !?ForeignKeyIntegrityResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runHostedForeignKeyIntegrityGroupLocal(
+            self,
+            alloc,
+            group_id,
+            table_name,
+            action,
+            constraint_name,
+            lower_doc_key,
+            upper_doc_key,
+            violation_limit,
+        );
+    }
+
+    fn foreignKeyRefChildrenGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        limit: usize,
+    ) !?[]db_mod.types.ForeignKeyRefChild {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .status_only);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        return try cached.db.listForeignKeyRefChildrenForParent(alloc, constraint_name, parent_table, parent_key, limit);
+    }
+
+    fn foreignKeyRefChildrenPageGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        start_after_child_table: ?[]const u8,
+        start_after_child_key: ?[]const u8,
+        limit: usize,
+    ) !?db_mod.types.ForeignKeyRefChildrenPage {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .status_only);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        return try cached.db.listForeignKeyRefChildrenPageForParent(alloc, constraint_name, parent_table, parent_key, start_after_child_table, start_after_child_key, limit);
+    }
+
+    fn runHostedForeignKeyIntegrityGroupLocal(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        action: ForeignKeyIntegrityAction,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        violation_limit: usize,
+    ) !?ForeignKeyIntegrityResult {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const mode: ManagedDbOpenMode = switch (action) {
+            .validate, .dry_run, .list, .explain_delete, .progress => .status_only,
+            .repair => .default,
+        };
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, mode);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        var result = try runForeignKeyIntegrityOnDb(alloc, cached.db, group_id, action, constraint_name, lower_doc_key, upper_doc_key, violation_limit);
+        errdefer result.deinit(alloc);
+        if (action == .repair) try drainManagedDbBeforeClose(cached.db);
+        return result;
     }
 
     fn corruptEmbeddingArtifact(

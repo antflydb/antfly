@@ -19,6 +19,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const table_manager = @import("table_manager.zig");
 const platform_clock = @import("../platform/clock.zig");
 const platform_time = @import("../platform/time.zig");
+const schema_mod = @import("../schema/mod.zig");
 const transition_controller = @import("transition_controller.zig");
 const transition_state = @import("transition_state.zig");
 
@@ -52,6 +53,8 @@ pub const CurrentMetadataState = struct {
     placement_intents: []const raft_reconciler.PlacementIntent = &.{},
     tables: []const table_manager.TableRecord = &.{},
     ranges: []const table_manager.RangeRecord = &.{},
+    foreign_key_ref_ranges: []const table_manager.ForeignKeyReferenceRangeRecord = &.{},
+    unique_constraint_ranges: []const table_manager.UniqueConstraintRangeRecord = &.{},
     stores: []const table_manager.StoreRecord = &.{},
     merged_group_statuses: []const MergedGroupStatus = &.{},
     restore_progresses: []const table_manager.RestoreProgressRecord = &.{},
@@ -120,11 +123,15 @@ pub const ReconciliationPlan = struct {
     placement_upserts: []raft_reconciler.PlacementIntent,
     table_upserts: []table_manager.TableRecord,
     range_upserts: []table_manager.RangeRecord,
+    foreign_key_ref_range_upserts: []table_manager.ForeignKeyReferenceRangeRecord,
+    unique_constraint_range_upserts: []table_manager.UniqueConstraintRangeRecord,
     split_upserts: []transition_state.SplitTransitionRecord,
     merge_upserts: []transition_state.MergeTransitionRecord,
     placement_removals: []PlacementRemoval,
     table_removals: []u64,
     range_removals: []u64,
+    foreign_key_ref_range_removals: []table_manager.ForeignKeyReferenceRangeRecord,
+    unique_constraint_range_removals: []table_manager.UniqueConstraintRangeRecord,
     split_removals: []u64,
     merge_removals: []u64,
     split_steps: []PlannedSplitStep,
@@ -139,11 +146,15 @@ pub const ReconciliationPlan = struct {
             .placement_upserts = &.{},
             .table_upserts = &.{},
             .range_upserts = &.{},
+            .foreign_key_ref_range_upserts = &.{},
+            .unique_constraint_range_upserts = &.{},
             .split_upserts = &.{},
             .merge_upserts = &.{},
             .placement_removals = &.{},
             .table_removals = &.{},
             .range_removals = &.{},
+            .foreign_key_ref_range_removals = &.{},
+            .unique_constraint_range_removals = &.{},
             .split_removals = &.{},
             .merge_removals = &.{},
             .split_steps = &.{},
@@ -166,6 +177,10 @@ pub const ReconciliationPlan = struct {
         alloc.free(self.table_upserts);
         for (self.range_upserts) |record| table_manager.freeRange(alloc, record);
         alloc.free(self.range_upserts);
+        for (self.foreign_key_ref_range_upserts) |record| table_manager.freeForeignKeyReferenceRange(alloc, record);
+        alloc.free(self.foreign_key_ref_range_upserts);
+        for (self.unique_constraint_range_upserts) |record| table_manager.freeUniqueConstraintRange(alloc, record);
+        alloc.free(self.unique_constraint_range_upserts);
         for (self.split_upserts) |record| table_manager.freeSplitTransitionRecord(alloc, record);
         alloc.free(self.split_upserts);
         for (self.merge_upserts) |record| table_manager.freeMergeTransitionRecord(alloc, record);
@@ -173,6 +188,10 @@ pub const ReconciliationPlan = struct {
         alloc.free(self.placement_removals);
         alloc.free(self.table_removals);
         alloc.free(self.range_removals);
+        for (self.foreign_key_ref_range_removals) |record| table_manager.freeForeignKeyReferenceRange(alloc, record);
+        alloc.free(self.foreign_key_ref_range_removals);
+        for (self.unique_constraint_range_removals) |record| table_manager.freeUniqueConstraintRange(alloc, record);
+        alloc.free(self.unique_constraint_range_removals);
         alloc.free(self.split_removals);
         alloc.free(self.merge_removals);
         for (self.split_steps) |step| table_manager.freeSplitTransitionRecord(alloc, step.record);
@@ -223,6 +242,47 @@ pub const Reconciler = struct {
         self.config.median_key_lookup = lookup;
     }
 
+    pub fn syncAutomaticForeignKeyReferenceOwnerRanges(
+        self: *Reconciler,
+        manager: *table_manager.TableManager,
+    ) !void {
+        const tables = try manager.listTables(self.alloc);
+        defer manager.freeTables(self.alloc, tables);
+        const ranges = try manager.listRanges(self.alloc);
+        defer manager.freeRanges(self.alloc, ranges);
+
+        const existing_fk_ref_ranges = try manager.listForeignKeyReferenceRanges(self.alloc);
+        defer manager.freeForeignKeyReferenceRanges(self.alloc, existing_fk_ref_ranges);
+
+        for (existing_fk_ref_ranges) |record| {
+            if (try foreignKeyReferenceRangeStillDeclared(self.alloc, tables, record)) continue;
+            _ = manager.removeForeignKeyReferenceRange(record.child_table_id, record.constraint_name, record.parent_table_id, record.start_parent_key);
+        }
+
+        for (tables) |child_table| {
+            if (child_table.schema_json.len == 0) continue;
+            var parsed = schema_mod.parseValidatedTableSchema(self.alloc, child_table.schema_json) catch continue;
+            defer parsed.deinit(self.alloc);
+            if (parsed.storage_mode != .relational) continue;
+            for (parsed.foreign_keys) |foreign_key| {
+                if (!foreignKeyEligibleForRoutedOwner(foreign_key)) continue;
+                const parent_table = findTableRecordByName(tables, foreign_key.references.table) orelse continue;
+                if (foreignKeyReferenceRangeIdentityExists(self.alloc, manager, child_table.table_id, foreign_key.name, parent_table.table_id)) continue;
+                const group_id = try deriveForeignKeyReferenceOwnerGroupId(self.alloc, manager, ranges, child_table.table_id, foreign_key.name, parent_table.table_id);
+                try manager.upsertForeignKeyReferenceRange(.{
+                    .child_table_id = child_table.table_id,
+                    .constraint_name = foreign_key.name,
+                    .parent_table_id = parent_table.table_id,
+                    .start_parent_key = "",
+                    .end_parent_key = null,
+                    .group_id = group_id,
+                    .topology_epoch = 1,
+                    .state = table_manager.foreign_key_ref_range_active,
+                });
+            }
+        }
+    }
+
     pub fn computePlan(
         self: *Reconciler,
         manager: *table_manager.TableManager,
@@ -235,10 +295,15 @@ pub const Reconciler = struct {
         self.cleanupExpiredShardCooldowns(now_monotonic_ms);
         try self.recordCompletedTransitionCooldowns(current, now_monotonic_ms);
         var planner = placement_planner.PlacementPlanner.init(self.alloc);
+        try self.syncAutomaticForeignKeyReferenceOwnerRanges(manager);
         const desired_tables = try manager.listTables(self.alloc);
         defer manager.freeTables(self.alloc, desired_tables);
         const desired_ranges = try manager.listRanges(self.alloc);
         defer manager.freeRanges(self.alloc, desired_ranges);
+        const desired_foreign_key_ref_ranges = try manager.listForeignKeyReferenceRanges(self.alloc);
+        defer manager.freeForeignKeyReferenceRanges(self.alloc, desired_foreign_key_ref_ranges);
+        const desired_unique_constraint_ranges = try manager.listUniqueConstraintRanges(self.alloc);
+        defer manager.freeUniqueConstraintRanges(self.alloc, desired_unique_constraint_ranges);
         const candidate_domains = try self.alloc.alloc(placement_planner.CandidateDomain, placement_candidate_info.len);
         defer self.alloc.free(candidate_domains);
         for (placement_candidate_info, 0..) |candidate, i| {
@@ -284,6 +349,16 @@ pub const Reconciler = struct {
             for (range_upserts.items) |record| table_manager.freeRange(self.alloc, record);
             range_upserts.deinit(self.alloc);
         }
+        var foreign_key_ref_range_upserts = std.ArrayListUnmanaged(table_manager.ForeignKeyReferenceRangeRecord).empty;
+        errdefer {
+            for (foreign_key_ref_range_upserts.items) |record| table_manager.freeForeignKeyReferenceRange(self.alloc, record);
+            foreign_key_ref_range_upserts.deinit(self.alloc);
+        }
+        var unique_constraint_range_upserts = std.ArrayListUnmanaged(table_manager.UniqueConstraintRangeRecord).empty;
+        errdefer {
+            for (unique_constraint_range_upserts.items) |record| table_manager.freeUniqueConstraintRange(self.alloc, record);
+            unique_constraint_range_upserts.deinit(self.alloc);
+        }
         var split_upserts = std.ArrayListUnmanaged(transition_state.SplitTransitionRecord).empty;
         errdefer {
             for (split_upserts.items) |record| table_manager.freeSplitTransitionRecord(self.alloc, record);
@@ -300,6 +375,16 @@ pub const Reconciler = struct {
         errdefer table_removals.deinit(self.alloc);
         var range_removals = std.ArrayListUnmanaged(u64).empty;
         errdefer range_removals.deinit(self.alloc);
+        var foreign_key_ref_range_removals = std.ArrayListUnmanaged(table_manager.ForeignKeyReferenceRangeRecord).empty;
+        errdefer {
+            for (foreign_key_ref_range_removals.items) |record| table_manager.freeForeignKeyReferenceRange(self.alloc, record);
+            foreign_key_ref_range_removals.deinit(self.alloc);
+        }
+        var unique_constraint_range_removals = std.ArrayListUnmanaged(table_manager.UniqueConstraintRangeRecord).empty;
+        errdefer {
+            for (unique_constraint_range_removals.items) |record| table_manager.freeUniqueConstraintRange(self.alloc, record);
+            unique_constraint_range_removals.deinit(self.alloc);
+        }
         var split_removals = std.ArrayListUnmanaged(u64).empty;
         errdefer split_removals.deinit(self.alloc);
         var merge_removals = std.ArrayListUnmanaged(u64).empty;
@@ -333,6 +418,18 @@ pub const Reconciler = struct {
             const existing = findRangeRecord(current.ranges, desired.group_id);
             if (existing == null or !rangeRecordsEqual(existing.?, desired)) {
                 try range_upserts.append(self.alloc, try table_manager.cloneRange(self.alloc, desired));
+            }
+        }
+        for (desired_foreign_key_ref_ranges) |desired| {
+            const existing = findForeignKeyReferenceRangeRecord(current.foreign_key_ref_ranges, desired);
+            if (existing == null or !foreignKeyReferenceRangeRecordsEqual(existing.?, desired)) {
+                try foreign_key_ref_range_upserts.append(self.alloc, try table_manager.cloneForeignKeyReferenceRange(self.alloc, desired));
+            }
+        }
+        for (desired_unique_constraint_ranges) |desired| {
+            const existing = findUniqueConstraintRangeRecord(current.unique_constraint_ranges, desired);
+            if (existing == null or !uniqueConstraintRangeRecordsEqual(existing.?, desired)) {
+                try unique_constraint_range_upserts.append(self.alloc, try table_manager.cloneUniqueConstraintRange(self.alloc, desired));
             }
         }
         for (desired_splits) |desired| {
@@ -421,6 +518,16 @@ pub const Reconciler = struct {
         for (current.ranges) |record| {
             if (findRangeRecord(desired_ranges, record.group_id) == null) try range_removals.append(self.alloc, record.group_id);
         }
+        for (current.foreign_key_ref_ranges) |record| {
+            if (findForeignKeyReferenceRangeRecord(desired_foreign_key_ref_ranges, record) == null) {
+                try foreign_key_ref_range_removals.append(self.alloc, try table_manager.cloneForeignKeyReferenceRange(self.alloc, record));
+            }
+        }
+        for (current.unique_constraint_ranges) |record| {
+            if (findUniqueConstraintRangeRecord(desired_unique_constraint_ranges, record) == null) {
+                try unique_constraint_range_removals.append(self.alloc, try table_manager.cloneUniqueConstraintRange(self.alloc, record));
+            }
+        }
         for (current.split_transitions) |record| {
             if (findSplitRecord(desired_splits, record.transition_id) == null) try split_removals.append(self.alloc, record.transition_id);
         }
@@ -437,16 +544,34 @@ pub const Reconciler = struct {
                 .stable => {},
             }
         }
+        for (desired_foreign_key_ref_ranges) |range| {
+            switch (classifyPlacementChange(range.group_id, desired_placements, current.placement_intents, candidate_domains)) {
+                .repair_required => repair_placement_groups += 1,
+                .rebalance => rebalance_placement_groups += 1,
+                .stable => {},
+            }
+        }
+        for (desired_unique_constraint_ranges) |range| {
+            switch (classifyPlacementChange(range.group_id, desired_placements, current.placement_intents, candidate_domains)) {
+                .repair_required => repair_placement_groups += 1,
+                .rebalance => rebalance_placement_groups += 1,
+                .stable => {},
+            }
+        }
 
         return .{
             .placement_upserts = try placement_upserts.toOwnedSlice(self.alloc),
             .table_upserts = try table_upserts.toOwnedSlice(self.alloc),
             .range_upserts = try range_upserts.toOwnedSlice(self.alloc),
+            .foreign_key_ref_range_upserts = try foreign_key_ref_range_upserts.toOwnedSlice(self.alloc),
+            .unique_constraint_range_upserts = try unique_constraint_range_upserts.toOwnedSlice(self.alloc),
             .split_upserts = try split_upserts.toOwnedSlice(self.alloc),
             .merge_upserts = try merge_upserts.toOwnedSlice(self.alloc),
             .placement_removals = try placement_removals.toOwnedSlice(self.alloc),
             .table_removals = try table_removals.toOwnedSlice(self.alloc),
             .range_removals = try range_removals.toOwnedSlice(self.alloc),
+            .foreign_key_ref_range_removals = try foreign_key_ref_range_removals.toOwnedSlice(self.alloc),
+            .unique_constraint_range_removals = try unique_constraint_range_removals.toOwnedSlice(self.alloc),
             .split_removals = try split_removals.toOwnedSlice(self.alloc),
             .merge_removals = try merge_removals.toOwnedSlice(self.alloc),
             .split_steps = try split_steps.toOwnedSlice(self.alloc),
@@ -1434,6 +1559,8 @@ fn deriveAutomaticSplitDestinationId(
 fn groupIdExists(current: CurrentMetadataState, group_id: u64) bool {
     if (!group_ids.isDataGroupId(group_id)) return true;
     if (findRangeRecord(current.ranges, group_id) != null) return true;
+    if (findForeignKeyReferenceRangeByGroupId(current.foreign_key_ref_ranges, group_id) != null) return true;
+    if (findUniqueConstraintRangeByGroupId(current.unique_constraint_ranges, group_id) != null) return true;
     for (current.split_transitions) |record| {
         if (record.source_group_id == group_id or record.destination_group_id == group_id) return true;
     }
@@ -1636,6 +1763,115 @@ fn rangeRecordsEqual(a: table_manager.RangeRecord, b: table_manager.RangeRecord)
         std.mem.eql(u8, a.restore_snapshot_path, b.restore_snapshot_path);
 }
 
+fn foreignKeyEligibleForRoutedOwner(foreign_key: anytype) bool {
+    return foreign_key.timing == .immediate and
+        foreign_key.validation_state == .enforced and
+        foreign_key.references.columns.len == 1 and
+        std.mem.eql(u8, foreign_key.references.columns[0], "_id");
+}
+
+fn foreignKeyReferenceRangeStillDeclared(
+    alloc: std.mem.Allocator,
+    tables: []const table_manager.TableRecord,
+    record: table_manager.ForeignKeyReferenceRangeRecord,
+) !bool {
+    const child_table = findTableRecord(tables, record.child_table_id) orelse return false;
+    if (child_table.schema_json.len == 0) return false;
+    var parsed = schema_mod.parseValidatedTableSchema(alloc, child_table.schema_json) catch return false;
+    defer parsed.deinit(alloc);
+    if (parsed.storage_mode != .relational) return false;
+    for (parsed.foreign_keys) |foreign_key| {
+        if (!std.mem.eql(u8, foreign_key.name, record.constraint_name)) continue;
+        if (!foreignKeyEligibleForRoutedOwner(foreign_key)) return false;
+        const parent_table = findTableRecordByName(tables, foreign_key.references.table) orelse return false;
+        return parent_table.table_id == record.parent_table_id;
+    }
+    return false;
+}
+
+fn foreignKeyReferenceRangeIdentityExists(
+    alloc: std.mem.Allocator,
+    manager: *table_manager.TableManager,
+    child_table_id: u64,
+    constraint_name: []const u8,
+    parent_table_id: u64,
+) bool {
+    const records = manager.listForeignKeyReferenceRanges(alloc) catch return false;
+    defer manager.freeForeignKeyReferenceRanges(alloc, records);
+    for (records) |record| {
+        if (record.child_table_id != child_table_id) continue;
+        if (record.parent_table_id != parent_table_id) continue;
+        if (!std.mem.eql(u8, record.constraint_name, constraint_name)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn deriveForeignKeyReferenceOwnerGroupId(
+    alloc: std.mem.Allocator,
+    manager: *table_manager.TableManager,
+    ranges: []const table_manager.RangeRecord,
+    child_table_id: u64,
+    constraint_name: []const u8,
+    parent_table_id: u64,
+) !u64 {
+    var attempt: u64 = 0;
+    while (attempt < 64) : (attempt += 1) {
+        var hasher = std.hash.Wyhash.init(0xf011_e916_2026_0001 +% attempt);
+        hasher.update("fk-ref-owner");
+        hasher.update(std.mem.asBytes(&child_table_id));
+        hasher.update(constraint_name);
+        hasher.update(std.mem.asBytes(&parent_table_id));
+        const candidate = group_ids.dataGroupIdFromHash(hasher.final());
+        if (candidate == 0) continue;
+        if (rangeGroupIdExists(ranges, candidate)) continue;
+        if (foreignKeyReferenceGroupIdExists(alloc, manager, candidate)) continue;
+        return candidate;
+    }
+    return error.ForeignKeyReferenceRangeGroupCollision;
+}
+
+fn rangeGroupIdExists(ranges: []const table_manager.RangeRecord, group_id: u64) bool {
+    for (ranges) |range| {
+        if (range.group_id == group_id) return true;
+    }
+    return false;
+}
+
+fn foreignKeyReferenceGroupIdExists(
+    alloc: std.mem.Allocator,
+    manager: *table_manager.TableManager,
+    group_id: u64,
+) bool {
+    const records = manager.listForeignKeyReferenceRanges(alloc) catch return true;
+    defer manager.freeForeignKeyReferenceRanges(alloc, records);
+    for (records) |record| {
+        if (record.group_id == group_id) return true;
+    }
+    return false;
+}
+
+fn uniqueConstraintRangeRecordsEqual(a: table_manager.UniqueConstraintRangeRecord, b: table_manager.UniqueConstraintRangeRecord) bool {
+    return a.group_id == b.group_id and
+        a.table_id == b.table_id and
+        std.mem.eql(u8, a.constraint_name, b.constraint_name) and
+        std.mem.eql(u8, a.start_encoded_value, b.start_encoded_value) and
+        optionalBytesEqual(a.end_encoded_value, b.end_encoded_value) and
+        std.mem.eql(u8, a.state, b.state) and
+        a.topology_epoch == b.topology_epoch;
+}
+
+fn foreignKeyReferenceRangeRecordsEqual(a: table_manager.ForeignKeyReferenceRangeRecord, b: table_manager.ForeignKeyReferenceRangeRecord) bool {
+    return a.group_id == b.group_id and
+        a.child_table_id == b.child_table_id and
+        a.parent_table_id == b.parent_table_id and
+        std.mem.eql(u8, a.constraint_name, b.constraint_name) and
+        std.mem.eql(u8, a.start_parent_key, b.start_parent_key) and
+        optionalBytesEqual(a.end_parent_key, b.end_parent_key) and
+        std.mem.eql(u8, a.state, b.state) and
+        a.topology_epoch == b.topology_epoch;
+}
+
 fn findTableRecord(records: []const table_manager.TableRecord, table_id: u64) ?table_manager.TableRecord {
     for (records) |record| {
         if (record.table_id == table_id) return record;
@@ -1643,7 +1879,61 @@ fn findTableRecord(records: []const table_manager.TableRecord, table_id: u64) ?t
     return null;
 }
 
+fn findTableRecordByName(records: []const table_manager.TableRecord, name: []const u8) ?table_manager.TableRecord {
+    for (records) |record| {
+        if (std.mem.eql(u8, record.name, name)) return record;
+    }
+    return null;
+}
+
 fn findRangeRecord(records: []const table_manager.RangeRecord, group_id: u64) ?table_manager.RangeRecord {
+    for (records) |record| {
+        if (record.group_id == group_id) return record;
+    }
+    return null;
+}
+
+fn findForeignKeyReferenceRangeRecord(
+    records: []const table_manager.ForeignKeyReferenceRangeRecord,
+    target: table_manager.ForeignKeyReferenceRangeRecord,
+) ?table_manager.ForeignKeyReferenceRangeRecord {
+    for (records) |record| {
+        if (record.child_table_id != target.child_table_id) continue;
+        if (record.parent_table_id != target.parent_table_id) continue;
+        if (!std.mem.eql(u8, record.constraint_name, target.constraint_name)) continue;
+        if (!std.mem.eql(u8, record.start_parent_key, target.start_parent_key)) continue;
+        return record;
+    }
+    return null;
+}
+
+fn findForeignKeyReferenceRangeByGroupId(
+    records: []const table_manager.ForeignKeyReferenceRangeRecord,
+    group_id: u64,
+) ?table_manager.ForeignKeyReferenceRangeRecord {
+    for (records) |record| {
+        if (record.group_id == group_id) return record;
+    }
+    return null;
+}
+
+fn findUniqueConstraintRangeRecord(
+    records: []const table_manager.UniqueConstraintRangeRecord,
+    target: table_manager.UniqueConstraintRangeRecord,
+) ?table_manager.UniqueConstraintRangeRecord {
+    for (records) |record| {
+        if (record.table_id != target.table_id) continue;
+        if (!std.mem.eql(u8, record.constraint_name, target.constraint_name)) continue;
+        if (!std.mem.eql(u8, record.start_encoded_value, target.start_encoded_value)) continue;
+        return record;
+    }
+    return null;
+}
+
+fn findUniqueConstraintRangeByGroupId(
+    records: []const table_manager.UniqueConstraintRangeRecord,
+    group_id: u64,
+) ?table_manager.UniqueConstraintRangeRecord {
     for (records) |record| {
         if (record.group_id == group_id) return record;
     }
@@ -1802,6 +2092,273 @@ test "metadata reconciler plans transition upserts before runtime steps" {
     try std.testing.expectEqual(@as(usize, 1), plan.merge_upserts.len);
     try std.testing.expectEqual(@as(usize, 0), plan.split_steps.len);
     try std.testing.expectEqual(@as(usize, 0), plan.merge_steps.len);
+}
+
+test "metadata reconciler converges foreign key reference owner ranges" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const parent_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const child_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    const child_schema_without_fk =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const child_table = table_manager.TableRecord{ .table_id = 10, .name = "orders", .schema_json = child_schema };
+    const parent_table = table_manager.TableRecord{ .table_id = 20, .name = "customers", .schema_json = parent_schema };
+    try manager.upsertTable(child_table);
+    try manager.upsertTable(parent_table);
+    try manager.upsertForeignKeyReferenceRange(.{
+        .group_id = 3001,
+        .child_table_id = child_table.table_id,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = parent_table.table_id,
+        .start_parent_key = "",
+        .end_parent_key = null,
+        .state = table_manager.foreign_key_ref_range_active,
+        .topology_epoch = 7,
+    });
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    defer reconciler.deinit();
+
+    const current_tables = [_]table_manager.TableRecord{ child_table, parent_table };
+    {
+        var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+            .tables = &current_tables,
+        });
+        defer plan.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 1), plan.foreign_key_ref_range_upserts.len);
+        try std.testing.expectEqual(@as(usize, 0), plan.foreign_key_ref_range_removals.len);
+        try std.testing.expectEqual(@as(u64, 3001), plan.foreign_key_ref_range_upserts[0].group_id);
+    }
+    {
+        var plan = try reconciler.computePlan(&manager, &.{ 1, 2 }, &.{}, .{
+            .tables = &current_tables,
+        });
+        defer plan.deinit(std.testing.allocator);
+
+        var fk_owner_placements: usize = 0;
+        for (plan.placement_upserts) |intent| {
+            if (intent.record.group_id == 3001) fk_owner_placements += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), fk_owner_placements);
+        try std.testing.expectEqual(@as(usize, 1), plan.repair_placement_groups);
+    }
+
+    const stale_fk_refs = [_]table_manager.ForeignKeyReferenceRangeRecord{.{
+        .group_id = 3001,
+        .child_table_id = child_table.table_id,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = parent_table.table_id,
+        .start_parent_key = "",
+        .end_parent_key = null,
+        .state = table_manager.foreign_key_ref_range_rebuilding,
+        .topology_epoch = 6,
+    }};
+    {
+        var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+            .tables = &current_tables,
+            .foreign_key_ref_ranges = &stale_fk_refs,
+        });
+        defer plan.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 1), plan.foreign_key_ref_range_upserts.len);
+        try std.testing.expectEqual(@as(u64, 7), plan.foreign_key_ref_range_upserts[0].topology_epoch);
+        try std.testing.expectEqualStrings(table_manager.foreign_key_ref_range_active, plan.foreign_key_ref_range_upserts[0].state);
+    }
+
+    _ = manager.removeForeignKeyReferenceRange(child_table.table_id, "orders_customer_id_fkey", parent_table.table_id, "");
+    const child_table_without_fk = table_manager.TableRecord{ .table_id = 10, .name = "orders", .schema_json = child_schema_without_fk };
+    try manager.upsertTable(child_table_without_fk);
+    {
+        var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+            .tables = &[_]table_manager.TableRecord{ child_table_without_fk, parent_table },
+            .foreign_key_ref_ranges = &stale_fk_refs,
+        });
+        defer plan.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), plan.foreign_key_ref_range_upserts.len);
+        try std.testing.expectEqual(@as(usize, 1), plan.foreign_key_ref_range_removals.len);
+        try std.testing.expectEqualStrings("orders_customer_id_fkey", plan.foreign_key_ref_range_removals[0].constraint_name);
+    }
+}
+
+test "metadata reconciler derives foreign key reference owner ranges from table schemas" {
+    const parent_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const child_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","timing":"immediate","validation_state":"enforced"}]}
+    ;
+    const child_schema_without_fk =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const parent_table = table_manager.TableRecord{ .table_id = 20, .name = "customers", .schema_json = parent_schema };
+    const child_table = table_manager.TableRecord{ .table_id = 10, .name = "orders", .schema_json = child_schema };
+    try manager.upsertTable(parent_table);
+    try manager.upsertTable(child_table);
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    defer reconciler.deinit();
+
+    var create_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = &[_]table_manager.TableRecord{ parent_table, child_table },
+    });
+    defer create_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), create_plan.foreign_key_ref_range_upserts.len);
+    try std.testing.expectEqual(@as(u64, 10), create_plan.foreign_key_ref_range_upserts[0].child_table_id);
+    try std.testing.expectEqual(@as(u64, 20), create_plan.foreign_key_ref_range_upserts[0].parent_table_id);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", create_plan.foreign_key_ref_range_upserts[0].constraint_name);
+    try std.testing.expectEqualStrings("", create_plan.foreign_key_ref_range_upserts[0].start_parent_key);
+    try std.testing.expect(create_plan.foreign_key_ref_range_upserts[0].end_parent_key == null);
+
+    const derived = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+    defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, derived);
+    try std.testing.expectEqual(@as(usize, 1), derived.len);
+
+    const child_table_without_fk = table_manager.TableRecord{ .table_id = 10, .name = "orders", .schema_json = child_schema_without_fk };
+    try manager.upsertTable(child_table_without_fk);
+    var remove_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = &[_]table_manager.TableRecord{ parent_table, child_table_without_fk },
+        .foreign_key_ref_ranges = derived,
+    });
+    defer remove_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), remove_plan.foreign_key_ref_range_upserts.len);
+    try std.testing.expectEqual(@as(usize, 1), remove_plan.foreign_key_ref_range_removals.len);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", remove_plan.foreign_key_ref_range_removals[0].constraint_name);
+}
+
+test "metadata reconciler preserves split foreign key reference owner ranges for active schema foreign keys" {
+    const parent_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const child_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const parent_table = table_manager.TableRecord{ .table_id = 20, .name = "customers", .schema_json = parent_schema };
+    const child_table = table_manager.TableRecord{ .table_id = 10, .name = "orders", .schema_json = child_schema };
+    try manager.upsertTable(parent_table);
+    try manager.upsertTable(child_table);
+    try manager.upsertForeignKeyReferenceRange(.{
+        .group_id = 3001,
+        .child_table_id = 10,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 20,
+        .start_parent_key = "",
+        .end_parent_key = "customer:m",
+    });
+    try manager.upsertForeignKeyReferenceRange(.{
+        .group_id = 3002,
+        .child_table_id = 10,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 20,
+        .start_parent_key = "customer:m",
+        .end_parent_key = null,
+    });
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    defer reconciler.deinit();
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = &[_]table_manager.TableRecord{ parent_table, child_table },
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), plan.foreign_key_ref_range_upserts.len);
+    for (plan.foreign_key_ref_range_upserts) |record| {
+        try std.testing.expect(record.group_id == 3001 or record.group_id == 3002);
+    }
+}
+
+test "metadata reconciler converges unique constraint owner ranges" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const table = table_manager.TableRecord{ .table_id = 10, .name = "users" };
+    try manager.upsertTable(table);
+    try manager.upsertUniqueConstraintRange(.{
+        .table_id = table.table_id,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "",
+        .end_encoded_value = null,
+        .group_id = 4001,
+        .topology_epoch = 7,
+        .state = table_manager.unique_constraint_range_active,
+    });
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    defer reconciler.deinit();
+
+    const current_tables = [_]table_manager.TableRecord{table};
+    {
+        var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+            .tables = &current_tables,
+        });
+        defer plan.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 1), plan.unique_constraint_range_upserts.len);
+        try std.testing.expectEqual(@as(usize, 0), plan.unique_constraint_range_removals.len);
+        try std.testing.expectEqual(@as(u64, 4001), plan.unique_constraint_range_upserts[0].group_id);
+    }
+    {
+        var plan = try reconciler.computePlan(&manager, &.{ 1, 2 }, &.{}, .{
+            .tables = &current_tables,
+        });
+        defer plan.deinit(std.testing.allocator);
+
+        var unique_owner_placements: usize = 0;
+        for (plan.placement_upserts) |intent| {
+            if (intent.record.group_id == 4001) unique_owner_placements += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), unique_owner_placements);
+        try std.testing.expectEqual(@as(usize, 1), plan.repair_placement_groups);
+    }
+
+    const stale_unique_ranges = [_]table_manager.UniqueConstraintRangeRecord{.{
+        .table_id = table.table_id,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "",
+        .end_encoded_value = null,
+        .group_id = 4001,
+        .topology_epoch = 6,
+        .state = table_manager.unique_constraint_range_rebuilding,
+    }};
+    {
+        var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+            .tables = &current_tables,
+            .unique_constraint_ranges = &stale_unique_ranges,
+        });
+        defer plan.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 1), plan.unique_constraint_range_upserts.len);
+        try std.testing.expectEqual(@as(u64, 7), plan.unique_constraint_range_upserts[0].topology_epoch);
+        try std.testing.expectEqualStrings(table_manager.unique_constraint_range_active, plan.unique_constraint_range_upserts[0].state);
+    }
+
+    _ = manager.removeUniqueConstraintRange(table.table_id, "users_email_key", "");
+    {
+        var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+            .tables = &current_tables,
+            .unique_constraint_ranges = &stale_unique_ranges,
+        });
+        defer plan.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), plan.unique_constraint_range_upserts.len);
+        try std.testing.expectEqual(@as(usize, 1), plan.unique_constraint_range_removals.len);
+        try std.testing.expectEqualStrings("users_email_key", plan.unique_constraint_range_removals[0].constraint_name);
+    }
 }
 
 test "metadata reconciler emits runtime steps once transitions are committed" {

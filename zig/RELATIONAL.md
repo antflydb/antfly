@@ -134,21 +134,69 @@ schema. Top-level dynamic templates in relational schemas stay invalid; flexible
 fields belong behind an explicit `json` column.
 
 Constraints in scope for v1: primary key is the existing document key;
-`NOT NULL` via `required_fields`; and single-column foreign keys from a declared
-scalar child column to a parent table's `_id` with `on_delete: "restrict"`.
-Existing Antfly transaction/2PC semantics still apply to relational writes. SQL-
-style unique constraints, foreign keys that target non-primary-key columns, and
-constraint-driven cascading actions remain out of scope for v1; use graph
-indexes and the join planner for relationship queries rather than integrity
-enforcement.
+`NOT NULL` via `required_fields`; unique constraints over one or more ordered
+declared non-`json` relational columns; `on_delete: "restrict"` foreign keys;
+bounded local nullable-column `on_delete: "set_null"` foreign keys; and bounded
+local `on_delete: "cascade"` foreign keys from declared scalar child columns to
+either a parent table's `_id` or a same-table declared unique parent column
+tuple. Cross-table unique targets are rejected until the parent table's unique
+catalog and routed participants can be registered.
+Existing Antfly transaction/2PC semantics still apply to relational writes.
+Hosted writes register the referenced parent table/range as a 2PC participant
+for enforced immediate single-column `_id` FKs and send an explicit
+parent-existence validation instruction to that participant. Hosted restrict
+parent deletes register every range of child tables that declare a matching
+primary-key FK and send parent-delete validation checks to those child
+participants. Child reference creation and restrict parent-delete checks stage
+the same internal FK conflict intent, so concurrent prepares on the same parent
+reference conflict. Hosted writes that would create or update a complete unique
+tuple on a multi-range table fail before prepare until routed unique
+participants exist; single-range tables still use local unique enforcement.
+Composite row identity, constraint-driven large-operation
+cascade/set-null routing, and deferrable constraints remain out of scope for v1.
+Use graph indexes and the join planner for relationship queries rather than
+integrity enforcement.
 
-Foreign-key metadata lives in `TableSchema.foreign_keys`, compiles into the
-runtime schema, persists with the runtime schema, and is immutable across
-ordinary same-table schema updates until an explicit constraint-validation
-migration path exists. The relational write participant enforces parent
-existence on child insert/update, maintains reverse-reference rows with child
-rows, rejects parent deletes with live child references, and applies those same
-rules while resolving committed transaction intents. See [FOREIGN_KEYS.md](FOREIGN_KEYS.md).
+Foreign-key metadata lives in `TableSchema.foreign_keys`; unique metadata lives
+in `TableSchema.unique_constraints`. Both compile into the runtime schema,
+persist with the runtime schema, and can be added or dropped by constraint name
+across ordinary same-table schema updates when the base relational column
+catalog is unchanged. Additions synchronously validate existing rows and install
+the required integrity rows before the runtime schema is persisted when the FK
+is `enforced`; `unvalidated` FK additions are catalog-only and can later be
+applied as the same definition with `validation_state: "enforced"` to run the
+validation/build before the catalog flip. Drops remove the old backing rows.
+Same-name semantic changes are rejected. FK catalog rows also persist `timing`
+and `validation_state`; `immediate` timing plus `enforced` or `unvalidated`
+validation states are accepted through public schema validation today, while
+`deferred`, `validating`, and `invalid` remain reserved for the distributed
+constraint planner.
+The relational write participant enforces parent existence on child
+insert/update against the participant's final planned state before durable
+commit, maintains reverse-reference rows with child rows, rejects parent deletes
+with live restrict references, rewrites nullable child references for `set_null`
+parent deletes, recursively prepares child deletes for local cascade parent
+deletes, maintains committed unique rows for present unique values, rejects
+duplicate unique values, and applies those same rules while resolving committed
+transaction intents. The DB can also explain a single FK parent delete through
+that same participant path without applying the planned writes, reporting
+restrict blocks plus planned set-null/cascade effects for local tables. See
+[FOREIGN_KEYS.md](FOREIGN_KEYS.md).
+Hosted transaction planning additionally registers table-resolved primary-key
+FK parent participants and includes FK parent checks in prepare so missing
+parents fail on the referenced table/range participant. It also registers
+child-table range participants for restrict primary-key parent deletes so live
+or staged child references fail prepare on child participants, and the shared
+FK conflict intent prevents concurrent child-reference and parent-delete
+prepares for the same parent key from both committing. Hosted distributed
+planning fails before prepare for enforced non-primary FK child writes and for
+enforced parent deletes that would require distributed `set_null`, `cascade`, or
+non-primary target validation until those routed planners exist.
+The foreign-key integrity endpoint can validate, dry-run, repair, or list either
+the full FK catalog or a single named constraint through `constraint_name`; hosted
+execution forwards the same scope to each resolved group. The same endpoint can
+also run `action: "explain_delete"` with a required `doc_key` to route a
+non-mutating parent-delete plan to the target key's owning group.
 
 ## Runtime model
 

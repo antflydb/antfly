@@ -924,9 +924,65 @@ fn validateRelationalStorageModeUpdateAlloc(
     if (!runtime_schema_mod.relationalColumnCatalogsEqual(current_runtime.relational_columns, next_runtime.relational_columns)) {
         return error.InvalidSchemaUpdateRequest;
     }
-    if (!runtime_schema_mod.foreignKeyCatalogsEqual(current_runtime.foreign_keys, next_runtime.foreign_keys)) {
-        return error.InvalidSchemaUpdateRequest;
+    try validateConstraintCatalogTransition(current_runtime, next_runtime);
+}
+
+fn validateConstraintCatalogTransition(current_runtime: runtime_schema_mod.TableSchema, next_runtime: runtime_schema_mod.TableSchema) !void {
+    for (current_runtime.unique_constraints) |constraint| {
+        if (findUniqueConstraintByName(next_runtime.unique_constraints, constraint.name)) |next_constraint| {
+            if (!uniqueConstraintsEqual(constraint, next_constraint)) return error.InvalidSchemaUpdateRequest;
+        }
     }
+    for (next_runtime.unique_constraints) |constraint| {
+        if (findUniqueConstraintByName(current_runtime.unique_constraints, constraint.name)) |current_constraint| {
+            if (!uniqueConstraintsEqual(current_constraint, constraint)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    for (current_runtime.foreign_keys) |foreign_key| {
+        if (findForeignKeyByName(next_runtime.foreign_keys, foreign_key.name)) |next_foreign_key| {
+            if (!foreignKeysSameDefinition(foreign_key, next_foreign_key)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    for (next_runtime.foreign_keys) |foreign_key| {
+        if (findForeignKeyByName(current_runtime.foreign_keys, foreign_key.name)) |current_foreign_key| {
+            if (!foreignKeysSameDefinition(current_foreign_key, foreign_key)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn findUniqueConstraintByName(unique_constraints: []const runtime_schema_mod.UniqueConstraint, name: []const u8) ?runtime_schema_mod.UniqueConstraint {
+    for (unique_constraints) |constraint| {
+        if (std.mem.eql(u8, constraint.name, name)) return constraint;
+    }
+    return null;
+}
+
+fn findForeignKeyByName(foreign_keys: []const runtime_schema_mod.ForeignKey, name: []const u8) ?runtime_schema_mod.ForeignKey {
+    for (foreign_keys) |foreign_key| {
+        if (std.mem.eql(u8, foreign_key.name, name)) return foreign_key;
+    }
+    return null;
+}
+
+fn uniqueConstraintsEqual(a: runtime_schema_mod.UniqueConstraint, b: runtime_schema_mod.UniqueConstraint) bool {
+    return std.mem.eql(u8, a.name, b.name) and stringSlicesEqual(a.columns, b.columns);
+}
+
+fn foreignKeysSameDefinition(a: runtime_schema_mod.ForeignKey, b: runtime_schema_mod.ForeignKey) bool {
+    return std.mem.eql(u8, a.name, b.name) and
+        stringSlicesEqual(a.child_columns, b.child_columns) and
+        std.mem.eql(u8, a.parent_table, b.parent_table) and
+        stringSlicesEqual(a.parent_columns, b.parent_columns) and
+        a.on_delete == b.on_delete and
+        a.timing == b.timing;
+}
+
+fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
 }
 
 pub fn routeQueryRequestToActiveReadIndex(
@@ -2679,12 +2735,20 @@ test "metadata.schema update rejects relational storage mode and base column cha
         .placement_role = "data",
     };
 
+    const dropped_fk = try applySchemaUpdateRecord(
+        std.testing.allocator,
+        &relational_fk_table,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}}}",
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, dropped_fk);
+    try std.testing.expect(std.mem.indexOf(u8, dropped_fk.schema_json, "\"foreign_keys\"") == null);
+
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
         applySchemaUpdateRecord(
             std.testing.allocator,
             &relational_fk_table,
-            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}}}",
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\",\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"cascade\"}]}",
         ),
     );
 }

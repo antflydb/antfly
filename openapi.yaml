@@ -12211,6 +12211,7 @@ components:
           $ref: '#/components/schemas/TemplateFieldMapping'
     ForeignKeyReference:
       type: object
+      additionalProperties: false
       description: Parent side of a relational foreign-key constraint.
       properties:
         table:
@@ -12220,9 +12221,11 @@ components:
           type: array
           items:
             type: string
-          description: Referenced parent columns. Currently must be exactly ["_id"].
+          description: Referenced parent columns. Use ["_id"] for the document-key primary key, or an
+            ordered column tuple backed by a declared unique constraint.
     ForeignKey:
       type: object
+      additionalProperties: false
       description: Relational foreign-key constraint.
       properties:
         name:
@@ -12232,14 +12235,45 @@ components:
           type: array
           items:
             type: string
-          description: Child columns. Currently exactly one scalar relational column is supported.
+          description: Child columns. A single scalar column is supported for ["_id"] references; ordered
+            scalar tuples are supported when references.columns names a unique constraint column tuple.
         references:
           $ref: '#/components/schemas/ForeignKeyReference'
         on_delete:
           type: string
           enum:
             - restrict
-          description: Delete action. Currently only "restrict" is supported.
+            - set_null
+            - cascade
+          description: Delete action. "set_null" requires nullable child columns; "set_null" and "cascade"
+            are bounded in local execution.
+        timing:
+          type: string
+          enum:
+            - immediate
+          description: Constraint timing. Only immediate enforcement is currently accepted; deferred constraints
+            are reserved for the distributed constraint planner.
+        validation_state:
+          type: string
+          enum:
+            - enforced
+            - unvalidated
+          description: Constraint validation state. Public schema validation accepts enforced constraints
+            and local unvalidated adoption entries; online job-owned states are reserved for hosted migration
+            jobs.
+    UniqueConstraint:
+      type: object
+      additionalProperties: false
+      description: Relational unique constraint.
+      properties:
+        name:
+          type: string
+          description: Constraint name, unique within the table schema.
+        columns:
+          type: array
+          items:
+            type: string
+          description: Unique columns. One or more ordered non-json relational columns are supported.
     TableSchema:
       type: object
       description: Schema definition for a table with multiple document types
@@ -12304,13 +12338,31 @@ components:
           items:
             $ref: '#/components/schemas/ForeignKey'
           description: >
-            Relational-mode referential constraints. The first supported shape is
+            Relational-mode referential constraints. Supported targets are a
 
-            a single declared child column referencing a parent table's `_id`
+            parent table's `_id` document key or a same-table declared unique
 
-            document key with `on_delete: "restrict"`. Unsupported shapes are
+            parent column tuple with `on_delete: "restrict"` or bounded local
 
-            rejected during schema validation.
+            nullable-column `on_delete: "set_null"`, plus bounded local
+
+            `on_delete: "cascade"`. Cross-table unique targets are rejected
+
+            until routed parent-table unique participants exist.
+
+            Unsupported shapes are rejected during schema validation.
+        unique_constraints:
+          type: array
+          items:
+            $ref: '#/components/schemas/UniqueConstraint'
+          description: >
+            Relational-mode unique constraints over one or more ordered declared
+
+            non-json relational columns. Present scalar tuples are enforced by
+
+            committed integrity rows; rows with any absent nullable component do
+
+            not create unique rows.
     Boost:
       type: number
       format: double

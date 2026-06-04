@@ -321,6 +321,16 @@ pub const TxnManager = struct {
                 const user_key = entry.key[intents_prefix.len + 17 ..];
                 if (containsKey(extra_batch.skip_intent_keys, user_key)) continue;
 
+                if (internal_keys.isInternalPhysicalTableDataKey(user_key)) {
+                    if (entry.value.len > 0 and entry.value[0] == 1) {
+                        try deletes.append(self.alloc, user_key);
+                    } else {
+                        const val = if (entry.value.len > 1) entry.value[1..] else "";
+                        try writes.append(self.alloc, .{ .key = user_key, .value = val });
+                    }
+                    continue;
+                }
+
                 if (entry.value.len > 0 and entry.value[0] == 1) {
                     // Delete — also remove the timestamp entry
                     const store_key = try internal_keys.documentKeyAlloc(self.alloc, user_key);

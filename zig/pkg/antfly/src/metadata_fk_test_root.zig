@@ -12,12 +12,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const transactions = @import("api/transactions.zig");
-const distributed_txn = @import("api/distributed_txn.zig");
-const table_catalog = @import("api/table_catalog.zig");
+const table_manager = @import("metadata/table_manager.zig");
+const placement_planner = @import("metadata/placement_planner.zig");
+const reconciler = @import("metadata/reconciler.zig");
+const raft_apply_store = @import("metadata/storage/raft_apply_store.zig");
 
 test {
-    _ = transactions;
-    _ = distributed_txn;
-    _ = table_catalog;
+    _ = table_manager;
+    _ = placement_planner;
+    _ = reconciler;
+    _ = raft_apply_store;
 }

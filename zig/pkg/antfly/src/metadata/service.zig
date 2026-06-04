@@ -351,6 +351,8 @@ const LocalProjectionInputs = struct {
 const ProjectedCoreSnapshot = struct {
     tables: []metadata_table_manager.TableRecord = &.{},
     ranges: []metadata_table_manager.RangeRecord = &.{},
+    foreign_key_ref_ranges: []metadata_table_manager.ForeignKeyReferenceRangeRecord = &.{},
+    unique_constraint_ranges: []metadata_table_manager.UniqueConstraintRangeRecord = &.{},
     stores: []metadata_table_manager.StoreRecord = &.{},
     placement_intents: []raft_reconciler.PlacementIntent = &.{},
     shuffle_join_leases: []metadata_table_manager.ShuffleJoinLeaseRecord = &.{},
@@ -365,6 +367,10 @@ const ProjectedCoreSnapshot = struct {
         if (self.tables.len > 0) alloc.free(self.tables);
         for (self.ranges) |record| metadata_table_manager.freeRange(alloc, record);
         if (self.ranges.len > 0) alloc.free(self.ranges);
+        for (self.foreign_key_ref_ranges) |record| metadata_table_manager.freeForeignKeyReferenceRange(alloc, record);
+        if (self.foreign_key_ref_ranges.len > 0) alloc.free(self.foreign_key_ref_ranges);
+        for (self.unique_constraint_ranges) |record| metadata_table_manager.freeUniqueConstraintRange(alloc, record);
+        if (self.unique_constraint_ranges.len > 0) alloc.free(self.unique_constraint_ranges);
         for (self.stores) |record| metadata_table_manager.freeStore(alloc, record);
         if (self.stores.len > 0) alloc.free(self.stores);
         for (self.placement_intents) |intent| alloc.free(intent.peer_node_ids);
@@ -470,6 +476,40 @@ fn cloneProjectedRangesOwned(
     }
     for (records, 0..) |record, i| {
         out[i] = try metadata_table_manager.cloneRange(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
+fn cloneProjectedForeignKeyReferenceRangesOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.ForeignKeyReferenceRangeRecord,
+) ![]metadata_table_manager.ForeignKeyReferenceRangeRecord {
+    const out = try alloc.alloc(metadata_table_manager.ForeignKeyReferenceRangeRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeForeignKeyReferenceRange(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneForeignKeyReferenceRange(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
+fn cloneProjectedUniqueConstraintRangesOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.UniqueConstraintRangeRecord,
+) ![]metadata_table_manager.UniqueConstraintRangeRecord {
+    const out = try alloc.alloc(metadata_table_manager.UniqueConstraintRangeRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeUniqueConstraintRange(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneUniqueConstraintRange(alloc, record);
         cloned = i + 1;
     }
     return out;
@@ -843,7 +883,7 @@ pub const MetadataService = struct {
     fn metadataServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
         switch (signal.kind) {
-            .table, .range, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
+            .table, .range, .foreign_key_ref_range, .unique_constraint_range, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
             .reconcile_lease => _ = self.reconcile_lease_epoch.fetchAdd(1, .monotonic),
             .split_transition, .merge_transition => _ = self.transition_epoch.fetchAdd(1, .monotonic),
@@ -1024,6 +1064,90 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .remove_range = .{ .group_id = group_id } });
     }
 
+    pub fn upsertForeignKeyReferenceRange(self: *MetadataService, record: metadata_table_manager.ForeignKeyReferenceRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_foreign_key_ref_range = record });
+    }
+
+    pub fn removeForeignKeyReferenceRange(
+        self: *MetadataService,
+        child_table_id: u64,
+        constraint_name: []const u8,
+        parent_table_id: u64,
+        start_parent_key: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_foreign_key_ref_range = .{
+            .child_table_id = child_table_id,
+            .constraint_name = constraint_name,
+            .parent_table_id = parent_table_id,
+            .start_parent_key = start_parent_key,
+        } });
+    }
+
+    pub fn beginForeignKeyReferenceRangeSplit(self: *MetadataService, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_split = request });
+    }
+
+    pub fn finishForeignKeyReferenceRangeSplit(self: *MetadataService, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_split = request });
+    }
+
+    pub fn beginForeignKeyReferenceRangeMerge(self: *MetadataService, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_merge = request });
+    }
+
+    pub fn finishForeignKeyReferenceRangeMerge(self: *MetadataService, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_merge = request });
+    }
+
+    pub fn beginForeignKeyReferenceRangeRebuild(self: *MetadataService, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_rebuild = selector });
+    }
+
+    pub fn finishForeignKeyReferenceRangeRebuild(self: *MetadataService, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_rebuild = selector });
+    }
+
+    pub fn upsertUniqueConstraintRange(self: *MetadataService, record: metadata_table_manager.UniqueConstraintRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_unique_constraint_range = record });
+    }
+
+    pub fn removeUniqueConstraintRange(
+        self: *MetadataService,
+        table_id: u64,
+        constraint_name: []const u8,
+        start_encoded_value: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_unique_constraint_range = .{
+            .table_id = table_id,
+            .constraint_name = constraint_name,
+            .start_encoded_value = start_encoded_value,
+        } });
+    }
+
+    pub fn beginUniqueConstraintRangeSplit(self: *MetadataService, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_split = request });
+    }
+
+    pub fn finishUniqueConstraintRangeSplit(self: *MetadataService, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_split = request });
+    }
+
+    pub fn beginUniqueConstraintRangeMerge(self: *MetadataService, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_merge = request });
+    }
+
+    pub fn finishUniqueConstraintRangeMerge(self: *MetadataService, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_merge = request });
+    }
+
+    pub fn beginUniqueConstraintRangeRebuild(self: *MetadataService, selector: metadata_table_manager.UniqueConstraintRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_rebuild = selector });
+    }
+
+    pub fn finishUniqueConstraintRangeRebuild(self: *MetadataService, selector: metadata_table_manager.UniqueConstraintRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_rebuild = selector });
+    }
+
     pub fn removeSplitTransition(self: *MetadataService, transition_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_split_transition = .{ .transition_id = transition_id } });
     }
@@ -1153,9 +1277,13 @@ pub const MetadataService = struct {
         for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
         for (plan.table_upserts) |record| try self.upsertTable(record);
         for (plan.range_upserts) |record| try self.upsertRange(record);
+        for (plan.foreign_key_ref_range_upserts) |record| try self.upsertForeignKeyReferenceRange(record);
+        for (plan.unique_constraint_range_upserts) |record| try self.upsertUniqueConstraintRange(record);
         for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
         for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
         for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id);
+        for (plan.foreign_key_ref_range_removals) |record| try self.removeForeignKeyReferenceRange(record.child_table_id, record.constraint_name, record.parent_table_id, record.start_parent_key);
+        for (plan.unique_constraint_range_removals) |record| try self.removeUniqueConstraintRange(record.table_id, record.constraint_name, record.start_encoded_value);
         for (plan.table_removals) |table_id| try self.removeTable(table_id);
         for (plan.range_removals) |group_id| try self.removeRange(group_id);
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
@@ -1289,6 +1417,26 @@ pub const MetadataService = struct {
     pub fn freeProjectedRanges(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeRanges(alloc, records);
+    }
+
+    pub fn listProjectedForeignKeyReferenceRanges(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.ForeignKeyReferenceRangeRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listForeignKeyReferenceRanges(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedForeignKeyReferenceRanges(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.ForeignKeyReferenceRangeRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeForeignKeyReferenceRanges(alloc, records);
+    }
+
+    pub fn listProjectedUniqueConstraintRanges(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.UniqueConstraintRangeRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listUniqueConstraintRanges(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedUniqueConstraintRanges(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.UniqueConstraintRangeRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeUniqueConstraintRanges(alloc, records);
     }
 
     pub fn listProjectedPlacementIntents(self: *MetadataService, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
@@ -1976,7 +2124,7 @@ pub const MetadataHttpService = struct {
     fn metadataHttpServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         switch (signal.kind) {
-            .table, .range, .store, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
+            .table, .range, .foreign_key_ref_range, .unique_constraint_range, .store, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .schema_progress => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .restore_progress, .replication_source_status => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
@@ -2204,6 +2352,90 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .remove_range = .{ .group_id = group_id } });
     }
 
+    pub fn upsertForeignKeyReferenceRange(self: *MetadataHttpService, record: metadata_table_manager.ForeignKeyReferenceRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_foreign_key_ref_range = record });
+    }
+
+    pub fn removeForeignKeyReferenceRange(
+        self: *MetadataHttpService,
+        child_table_id: u64,
+        constraint_name: []const u8,
+        parent_table_id: u64,
+        start_parent_key: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_foreign_key_ref_range = .{
+            .child_table_id = child_table_id,
+            .constraint_name = constraint_name,
+            .parent_table_id = parent_table_id,
+            .start_parent_key = start_parent_key,
+        } });
+    }
+
+    pub fn beginForeignKeyReferenceRangeSplit(self: *MetadataHttpService, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_split = request });
+    }
+
+    pub fn finishForeignKeyReferenceRangeSplit(self: *MetadataHttpService, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_split = request });
+    }
+
+    pub fn beginForeignKeyReferenceRangeMerge(self: *MetadataHttpService, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_merge = request });
+    }
+
+    pub fn finishForeignKeyReferenceRangeMerge(self: *MetadataHttpService, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_merge = request });
+    }
+
+    pub fn beginForeignKeyReferenceRangeRebuild(self: *MetadataHttpService, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_rebuild = selector });
+    }
+
+    pub fn finishForeignKeyReferenceRangeRebuild(self: *MetadataHttpService, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_rebuild = selector });
+    }
+
+    pub fn upsertUniqueConstraintRange(self: *MetadataHttpService, record: metadata_table_manager.UniqueConstraintRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_unique_constraint_range = record });
+    }
+
+    pub fn removeUniqueConstraintRange(
+        self: *MetadataHttpService,
+        table_id: u64,
+        constraint_name: []const u8,
+        start_encoded_value: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_unique_constraint_range = .{
+            .table_id = table_id,
+            .constraint_name = constraint_name,
+            .start_encoded_value = start_encoded_value,
+        } });
+    }
+
+    pub fn beginUniqueConstraintRangeSplit(self: *MetadataHttpService, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_split = request });
+    }
+
+    pub fn finishUniqueConstraintRangeSplit(self: *MetadataHttpService, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_split = request });
+    }
+
+    pub fn beginUniqueConstraintRangeMerge(self: *MetadataHttpService, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_merge = request });
+    }
+
+    pub fn finishUniqueConstraintRangeMerge(self: *MetadataHttpService, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_merge = request });
+    }
+
+    pub fn beginUniqueConstraintRangeRebuild(self: *MetadataHttpService, selector: metadata_table_manager.UniqueConstraintRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_rebuild = selector });
+    }
+
+    pub fn finishUniqueConstraintRangeRebuild(self: *MetadataHttpService, selector: metadata_table_manager.UniqueConstraintRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_rebuild = selector });
+    }
+
     pub fn removeSplitTransition(self: *MetadataHttpService, transition_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_split_transition = .{ .transition_id = transition_id } });
     }
@@ -2377,9 +2609,13 @@ pub const MetadataHttpService = struct {
         for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
         for (plan.table_upserts) |record| try self.upsertTable(record);
         for (plan.range_upserts) |record| try self.upsertRange(record);
+        for (plan.foreign_key_ref_range_upserts) |record| try self.upsertForeignKeyReferenceRange(record);
+        for (plan.unique_constraint_range_upserts) |record| try self.upsertUniqueConstraintRange(record);
         for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
         for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
         for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id);
+        for (plan.foreign_key_ref_range_removals) |record| try self.removeForeignKeyReferenceRange(record.child_table_id, record.constraint_name, record.parent_table_id, record.start_parent_key);
+        for (plan.unique_constraint_range_removals) |record| try self.removeUniqueConstraintRange(record.table_id, record.constraint_name, record.start_encoded_value);
         for (plan.table_removals) |table_id| try self.removeTable(table_id);
         for (plan.range_removals) |group_id| try self.removeRange(group_id);
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
@@ -2502,6 +2738,8 @@ pub const MetadataHttpService = struct {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         snapshot.tables = try cloneProjectedTablesOwned(self.alloc, core.tables);
         snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, core.ranges);
+        snapshot.foreign_key_ref_ranges = try cloneProjectedForeignKeyReferenceRangesOwned(self.alloc, core.foreign_key_ref_ranges);
+        snapshot.unique_constraint_ranges = try cloneProjectedUniqueConstraintRangesOwned(self.alloc, core.unique_constraint_ranges);
         snapshot.nodes = try store.listNodes(self.alloc, self.metadata_group_id);
         snapshot.stores = try cloneProjectedStoresOwned(self.alloc, core.stores);
         snapshot.placement_intents = try cloneProjectedPlacementIntentsOwned(self.alloc, core.placement_intents);
@@ -2572,6 +2810,8 @@ pub const MetadataHttpService = struct {
         errdefer snapshot.deinit(self.alloc);
         snapshot.tables = try store.listTables(self.alloc, self.metadata_group_id);
         snapshot.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
+        snapshot.foreign_key_ref_ranges = try store.listForeignKeyReferenceRanges(self.alloc, self.metadata_group_id);
+        snapshot.unique_constraint_ranges = try store.listUniqueConstraintRanges(self.alloc, self.metadata_group_id);
         snapshot.stores = try store.listStores(self.alloc, self.metadata_group_id);
         snapshot.placement_intents = try store.listPlacementIntents(self.alloc, self.metadata_group_id);
         snapshot.shuffle_join_leases = try store.listShuffleJoinLeases(self.alloc, self.metadata_group_id);
@@ -2686,6 +2926,30 @@ pub const MetadataHttpService = struct {
     pub fn freeProjectedRanges(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeRanges(alloc, records);
+    }
+
+    pub fn listProjectedForeignKeyReferenceRanges(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.ForeignKeyReferenceRangeRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedForeignKeyReferenceRangesOwned(alloc, snapshot.foreign_key_ref_ranges);
+    }
+
+    pub fn freeProjectedForeignKeyReferenceRanges(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.ForeignKeyReferenceRangeRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeForeignKeyReferenceRanges(alloc, records);
+    }
+
+    pub fn listProjectedUniqueConstraintRanges(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.UniqueConstraintRangeRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedUniqueConstraintRangesOwned(alloc, snapshot.unique_constraint_ranges);
+    }
+
+    pub fn freeProjectedUniqueConstraintRanges(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.UniqueConstraintRangeRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeUniqueConstraintRanges(alloc, records);
     }
 
     pub fn listProjectedPlacementIntents(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
@@ -4996,6 +5260,20 @@ pub fn snapshotStatus(
     defer service.freeProjectedTables(alloc, projected_tables);
     const projected_ranges = try service.listProjectedRanges(alloc);
     defer service.freeProjectedRanges(alloc, projected_ranges);
+    const projected_foreign_key_ref_ranges = if (@hasDecl(SourceDeclType, "listProjectedForeignKeyReferenceRanges"))
+        try service.listProjectedForeignKeyReferenceRanges(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedForeignKeyReferenceRanges") and projected_foreign_key_ref_ranges.len > 0) {
+        service.freeProjectedForeignKeyReferenceRanges(alloc, projected_foreign_key_ref_ranges);
+    };
+    const projected_unique_constraint_ranges = if (@hasDecl(SourceDeclType, "listProjectedUniqueConstraintRanges"))
+        try service.listProjectedUniqueConstraintRanges(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedUniqueConstraintRanges") and projected_unique_constraint_ranges.len > 0) {
+        service.freeProjectedUniqueConstraintRanges(alloc, projected_unique_constraint_ranges);
+    };
     const projected_stores = try service.listProjectedStores(alloc);
     defer service.freeProjectedStores(alloc, projected_stores);
     const projected_placement_intents = try service.listProjectedPlacementIntents(alloc);
@@ -5264,6 +5542,8 @@ pub fn snapshotStatus(
         .projected_replication_source_last_source_commit_at_ms_max = projected_replication_source_last_source_commit_at_ms_max,
         .projected_replication_source_last_change_applied_at_ms_max = projected_replication_source_last_change_applied_at_ms_max,
         .projected_ranges = projected_ranges.len,
+        .projected_foreign_key_ref_ranges = projected_foreign_key_ref_ranges.len,
+        .projected_unique_constraint_ranges = projected_unique_constraint_ranges.len,
         .projected_stores = projected_stores.len,
         .projected_placement_intents = projected_placement_intents.len,
         .projected_snapshot_bootstrap_intents = projected_snapshot_bootstrap_intents,

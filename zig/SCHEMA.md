@@ -261,8 +261,7 @@ secondary-index rebuild path is available. Derived-only changes below an
 existing `json` column remain valid because the base row still stores the same
 JSON cell.
 
-Relational schemas may also declare primary-key-only foreign keys with
-`foreign_keys`:
+Relational schemas may also declare foreign keys with `foreign_keys`:
 
 ```json
 {
@@ -277,14 +276,57 @@ Relational schemas may also declare primary-key-only foreign keys with
 }
 ```
 
-The supported shape is deliberately narrow: one declared scalar child column,
-parent columns exactly `["_id"]`, and `on_delete: "restrict"` only. Nullable
-child values mean "no reference"; required child fields continue to be enforced
-by the row schema. The runtime schema persists the normalized FK catalog and the
-relational participant maintains reverse-reference rows transactionally with the
-child row. FK catalog changes are rejected by ordinary schema updates for the
-same reason relational base-column catalog changes are rejected: adding or
-removing a constraint needs explicit validation or repair over existing rows.
+The supported shape is deliberately narrow: child columns must either reference
+the parent row document key with `references.columns: ["_id"]`, or reference an
+ordered parent column tuple backed by a declared `unique_constraints` entry.
+Unique-parent references use the same typed tuple encoder as the unique
+integrity row. Nullable child values mean "no reference"; for tuple references,
+any absent nullable component means no reference. `on_delete` supports
+`"restrict"`, bounded local `"set_null"`, and bounded local `"cascade"`;
+`"set_null"` requires every child FK column to be nullable and removes those
+columns from affected child rows during parent delete, while `"cascade"`
+recursively deletes affected child rows through the relational participant.
+Required child fields continue to be enforced by the row schema.
+The runtime schema persists the normalized FK catalog, including `timing` and
+`validation_state`. Public schema validation currently accepts `"immediate"`
+timing with `"enforced"` or `"unvalidated"` validation state. `unvalidated`
+foreign keys are catalog-only: they do not enforce writes or maintain
+reverse-reference rows until the same FK definition is applied later as
+`"enforced"`, which validates existing rows and builds the missing
+reverse-reference rows before the catalog flip. Deferred timing plus job-owned
+`"validating"` and `"invalid"` states are reserved for distributed constraint
+jobs. The relational participant maintains reverse-reference rows
+transactionally with the child row once a FK is enforced.
+
+Relational schemas may also declare unique constraints with
+`unique_constraints`:
+
+```json
+{
+  "unique_constraints": [
+    { "name": "users_email_key", "columns": ["email"] },
+    { "name": "users_tenant_handle_key", "columns": ["tenant_id", "handle"] }
+  ]
+}
+```
+
+The supported unique shape is one or more ordered declared non-`json`
+relational columns. Multiple absent/null values are allowed because a row with
+any absent nullable component does not create a unique row. Present scalar
+tuples are encoded from typed relational cells and maintained as committed
+internal integrity rows in the same write participant as the base row. Duplicate
+tuples are rejected on insert, update, and transaction-intent commit.
+
+FK and unique catalog changes are storage-level constraint migrations, but the
+local same-table path supports additive/drop changes by constraint name when the
+relational base-column catalog is unchanged. Added unique constraints scan
+existing rows, reject duplicate present tuples, and install unique integrity
+rows before the schema is persisted. Added foreign keys validate every existing
+non-null child reference and install reverse-reference rows before the schema is
+persisted. Dropped constraint names remove their backing rows. Reusing an
+existing constraint name with different columns, target, or action is rejected;
+perform that as an explicit drop plus a new constraint name. Distributed
+validation-state jobs remain future work.
 
 Backup/restore follows that same boundary. Native backups preserve relational
 physical rows and secondary scan entries as a snapshot. Portable logical backups

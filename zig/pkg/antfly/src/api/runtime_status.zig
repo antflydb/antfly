@@ -455,6 +455,7 @@ fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     if (stats.doc_count > 0) return true;
     if (docIdentityStatsHaveRuntimeFacts(stats.doc_identity)) return true;
     if (docSetPlanningStatsHaveRuntimeFacts(stats.doc_set_planning)) return true;
+    if (stats.foreign_keys.hasRuntimeFacts()) return true;
     if (stats.async_indexing.startup.active or stats.async_indexing.dense_catch_up.active) return true;
     if (stats.enrichment.enabled and (stats.enrichment.processed_requests > 0 or stats.enrichment.applied_sequence > 0 or stats.enrichment.target_sequence > 0 or stats.enrichment.retrying or stats.enrichment.worker_failed)) return true;
     if (stats.text_merge.pending_segments > 0 or stats.text_merge.in_flight_merges > 0 or stats.text_merge.completed_merges > 0 or stats.text_merge.failed_merges > 0) return true;
@@ -970,6 +971,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .indexes = indexes,
         .doc_identity = stats.doc_identity,
         .doc_set_planning = stats.doc_set_planning,
+        .foreign_keys = stats.foreign_keys,
         .enrichment = stats.enrichment,
         .ttl_cleanup = stats.ttl_cleanup,
         .transaction_recovery = stats.transaction_recovery,

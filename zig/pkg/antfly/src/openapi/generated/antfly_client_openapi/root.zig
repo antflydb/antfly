@@ -207,6 +207,7 @@ pub const TemplateFieldMapping = types.TemplateFieldMapping;
 pub const DynamicTemplate = types.DynamicTemplate;
 pub const ForeignKeyReference = types.ForeignKeyReference;
 pub const ForeignKey = types.ForeignKey;
+pub const UniqueConstraint = types.UniqueConstraint;
 pub const TableSchema = types.TableSchema;
 pub const Boost = types.Boost;
 pub const TermQuery = types.TermQuery;

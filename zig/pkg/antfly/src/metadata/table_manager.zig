@@ -83,6 +83,98 @@ pub const RangeRecord = struct {
     restore_snapshot_path: []const u8 = "",
 };
 
+pub const foreign_key_ref_range_active = "active";
+pub const foreign_key_ref_range_splitting = "splitting";
+pub const foreign_key_ref_range_merging = "merging";
+pub const foreign_key_ref_range_rebuilding = "rebuilding";
+
+pub const ForeignKeyReferenceRangeRecord = struct {
+    child_table_id: u64,
+    constraint_name: []const u8,
+    parent_table_id: u64,
+    start_parent_key: []const u8,
+    end_parent_key: ?[]const u8 = null,
+    group_id: u64,
+    topology_epoch: u64 = 0,
+    state: []const u8 = foreign_key_ref_range_active,
+};
+
+pub const unique_constraint_range_active = "active";
+pub const unique_constraint_range_splitting = "splitting";
+pub const unique_constraint_range_merging = "merging";
+pub const unique_constraint_range_rebuilding = "rebuilding";
+
+pub const UniqueConstraintRangeRecord = struct {
+    table_id: u64,
+    constraint_name: []const u8,
+    start_encoded_value: []const u8,
+    end_encoded_value: ?[]const u8 = null,
+    group_id: u64,
+    topology_epoch: u64 = 0,
+    state: []const u8 = unique_constraint_range_active,
+};
+
+pub const ForeignKeyReferenceRangeSelector = struct {
+    child_table_id: u64,
+    constraint_name: []const u8,
+    parent_table_id: u64,
+    start_parent_key: []const u8,
+};
+
+pub const ForeignKeyReferenceRangeSplitRequest = struct {
+    selector: ForeignKeyReferenceRangeSelector,
+    split_parent_key: []const u8,
+    left_group_id: u64,
+    right_group_id: u64,
+};
+
+pub const ForeignKeyReferenceRangeMergeRequest = struct {
+    left_selector: ForeignKeyReferenceRangeSelector,
+    right_start_parent_key: []const u8,
+    merged_group_id: u64,
+};
+
+pub const UniqueConstraintRangeSelector = struct {
+    table_id: u64,
+    constraint_name: []const u8,
+    start_encoded_value: []const u8,
+};
+
+pub const UniqueConstraintRangeSplitRequest = struct {
+    selector: UniqueConstraintRangeSelector,
+    split_encoded_value: []const u8,
+    left_group_id: u64,
+    right_group_id: u64,
+};
+
+pub const UniqueConstraintRangeMergeRequest = struct {
+    left_selector: UniqueConstraintRangeSelector,
+    right_start_encoded_value: []const u8,
+    merged_group_id: u64,
+};
+
+pub fn foreignKeyReferenceRangeStateValid(state: []const u8) bool {
+    return std.mem.eql(u8, state, foreign_key_ref_range_active) or
+        std.mem.eql(u8, state, foreign_key_ref_range_splitting) or
+        std.mem.eql(u8, state, foreign_key_ref_range_merging) or
+        std.mem.eql(u8, state, foreign_key_ref_range_rebuilding);
+}
+
+pub fn foreignKeyReferenceRangeRoutable(record: ForeignKeyReferenceRangeRecord) bool {
+    return std.mem.eql(u8, record.state, foreign_key_ref_range_active);
+}
+
+pub fn uniqueConstraintRangeStateValid(state: []const u8) bool {
+    return std.mem.eql(u8, state, unique_constraint_range_active) or
+        std.mem.eql(u8, state, unique_constraint_range_splitting) or
+        std.mem.eql(u8, state, unique_constraint_range_merging) or
+        std.mem.eql(u8, state, unique_constraint_range_rebuilding);
+}
+
+pub fn uniqueConstraintRangeRoutable(record: UniqueConstraintRangeRecord) bool {
+    return std.mem.eql(u8, record.state, unique_constraint_range_active);
+}
+
 pub const node_lifecycle_active = "active";
 pub const node_lifecycle_draining = "draining";
 
@@ -307,6 +399,8 @@ pub const TableManager = struct {
     alloc: std.mem.Allocator,
     tables: std.AutoHashMapUnmanaged(u64, TableRecord) = .empty,
     ranges: std.AutoHashMapUnmanaged(u64, RangeRecord) = .empty,
+    foreign_key_ref_ranges: std.ArrayListUnmanaged(ForeignKeyReferenceRangeRecord) = .empty,
+    unique_constraint_ranges: std.ArrayListUnmanaged(UniqueConstraintRangeRecord) = .empty,
     split_intents: std.AutoHashMapUnmanaged(u64, SplitIntent) = .empty,
     merge_intents: std.AutoHashMapUnmanaged(u64, MergeIntent) = .empty,
 
@@ -322,6 +416,12 @@ pub const TableManager = struct {
         var range_it = self.ranges.valueIterator();
         while (range_it.next()) |range| freeRange(self.alloc, range.*);
         self.ranges.deinit(self.alloc);
+
+        for (self.foreign_key_ref_ranges.items) |record| freeForeignKeyReferenceRange(self.alloc, record);
+        self.foreign_key_ref_ranges.deinit(self.alloc);
+
+        for (self.unique_constraint_ranges.items) |record| freeUniqueConstraintRange(self.alloc, record);
+        self.unique_constraint_ranges.deinit(self.alloc);
 
         var split_it = self.split_intents.valueIterator();
         while (split_it.next()) |intent| freeSplitIntent(self.alloc, intent.*);
@@ -352,6 +452,8 @@ pub const TableManager = struct {
 
         var normalized = record;
         if (normalized.range_id == 0) normalized.range_id = normalized.group_id;
+        if (self.foreignKeyReferenceRangeGroupExists(record.group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (self.uniqueConstraintRangeGroupExists(record.group_id)) return error.UniqueConstraintRangeGroupCollision;
         const owned = try cloneRange(self.alloc, normalized);
         errdefer freeRange(self.alloc, owned);
         if (self.ranges.getPtr(record.group_id)) |existing| {
@@ -362,6 +464,62 @@ pub const TableManager = struct {
         try self.ranges.put(self.alloc, record.group_id, owned);
     }
 
+    pub fn upsertForeignKeyReferenceRange(self: *TableManager, record: ForeignKeyReferenceRangeRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
+        if (!self.tables.contains(record.child_table_id)) return error.UnknownChildTable;
+        if (!self.tables.contains(record.parent_table_id)) return error.UnknownParentTable;
+        if (record.constraint_name.len == 0) return error.InvalidForeignKeyConstraint;
+        if (!foreignKeyReferenceRangeStateValid(record.state)) return error.InvalidForeignKeyReferenceRangeState;
+        if (self.ranges.contains(record.group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (self.uniqueConstraintRangeGroupExists(record.group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (record.end_parent_key) |end_parent_key| {
+            if (std.mem.order(u8, record.start_parent_key, end_parent_key) != .lt) return error.InvalidForeignKeyReferenceRange;
+        }
+        for (self.foreign_key_ref_ranges.items) |existing| {
+            if (foreignKeyReferenceRangeIdentityMatches(existing, record)) continue;
+            if (!foreignKeyReferenceRangeConstraintMatches(existing, record)) continue;
+            if (foreignKeyReferenceRangesOverlap(existing, record)) return error.ForeignKeyReferenceRangeOverlap;
+        }
+
+        const owned = try cloneForeignKeyReferenceRange(self.alloc, record);
+        errdefer freeForeignKeyReferenceRange(self.alloc, owned);
+        for (self.foreign_key_ref_ranges.items) |*existing| {
+            if (!foreignKeyReferenceRangeIdentityMatches(existing.*, record)) continue;
+            freeForeignKeyReferenceRange(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.foreign_key_ref_ranges.append(self.alloc, owned);
+    }
+
+    pub fn upsertUniqueConstraintRange(self: *TableManager, record: UniqueConstraintRangeRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
+        if (!self.tables.contains(record.table_id)) return error.UnknownTable;
+        if (record.constraint_name.len == 0) return error.InvalidUniqueConstraint;
+        if (!uniqueConstraintRangeStateValid(record.state)) return error.InvalidUniqueConstraintRangeState;
+        if (self.ranges.contains(record.group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (self.foreignKeyReferenceRangeGroupExists(record.group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (record.end_encoded_value) |end_encoded_value| {
+            if (std.mem.order(u8, record.start_encoded_value, end_encoded_value) != .lt) return error.InvalidUniqueConstraintRange;
+        }
+        for (self.unique_constraint_ranges.items) |existing| {
+            if (uniqueConstraintRangeIdentityMatches(existing, record)) continue;
+            if (existing.group_id == record.group_id) return error.UniqueConstraintRangeGroupCollision;
+            if (!uniqueConstraintRangeConstraintMatches(existing, record)) continue;
+            if (uniqueConstraintRangesOverlap(existing, record)) return error.UniqueConstraintRangeOverlap;
+        }
+
+        const owned = try cloneUniqueConstraintRange(self.alloc, record);
+        errdefer freeUniqueConstraintRange(self.alloc, owned);
+        for (self.unique_constraint_ranges.items) |*existing| {
+            if (!uniqueConstraintRangeIdentityMatches(existing.*, record)) continue;
+            freeUniqueConstraintRange(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.unique_constraint_ranges.append(self.alloc, owned);
+    }
+
     pub fn clearTopology(self: *TableManager) void {
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
@@ -370,12 +528,39 @@ pub const TableManager = struct {
         var range_it = self.ranges.valueIterator();
         while (range_it.next()) |range| freeRange(self.alloc, range.*);
         self.ranges.clearRetainingCapacity();
+
+        for (self.foreign_key_ref_ranges.items) |record| freeForeignKeyReferenceRange(self.alloc, record);
+        self.foreign_key_ref_ranges.clearRetainingCapacity();
+
+        for (self.unique_constraint_ranges.items) |record| freeUniqueConstraintRange(self.alloc, record);
+        self.unique_constraint_ranges.clearRetainingCapacity();
     }
 
     pub fn replaceTopology(self: *TableManager, tables: []const TableRecord, ranges: []const RangeRecord) !void {
+        try self.replaceTopologyWithForeignKeyReferenceRanges(tables, ranges, &.{});
+    }
+
+    pub fn replaceTopologyWithForeignKeyReferenceRanges(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+    ) !void {
+        try self.replaceTopologyWithConstraintOwnerRanges(tables, ranges, foreign_key_ref_ranges, &.{});
+    }
+
+    pub fn replaceTopologyWithConstraintOwnerRanges(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+        unique_constraint_ranges: []const UniqueConstraintRangeRecord,
+    ) !void {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
         for (ranges) |record| try self.upsertRange(record);
+        for (foreign_key_ref_ranges) |record| try self.upsertForeignKeyReferenceRange(record);
+        for (unique_constraint_ranges) |record| try self.upsertUniqueConstraintRange(record);
     }
 
     pub const ProjectedTopologyLoadResult = struct {
@@ -383,6 +568,25 @@ pub const TableManager = struct {
     };
 
     pub fn replaceProjectedTopology(self: *TableManager, tables: []const TableRecord, ranges: []const RangeRecord) !ProjectedTopologyLoadResult {
+        return try self.replaceProjectedTopologyWithForeignKeyReferenceRanges(tables, ranges, &.{});
+    }
+
+    pub fn replaceProjectedTopologyWithForeignKeyReferenceRanges(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+    ) !ProjectedTopologyLoadResult {
+        return try self.replaceProjectedTopologyWithConstraintOwnerRanges(tables, ranges, foreign_key_ref_ranges, &.{});
+    }
+
+    pub fn replaceProjectedTopologyWithConstraintOwnerRanges(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+        unique_constraint_ranges: []const UniqueConstraintRangeRecord,
+    ) !ProjectedTopologyLoadResult {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
 
@@ -394,6 +598,20 @@ pub const TableManager = struct {
             }
             try self.upsertRange(record);
         }
+        for (foreign_key_ref_ranges) |record| {
+            if (!self.tables.contains(record.child_table_id) or !self.tables.contains(record.parent_table_id)) {
+                result.skipped_orphan_ranges += 1;
+                continue;
+            }
+            try self.upsertForeignKeyReferenceRange(record);
+        }
+        for (unique_constraint_ranges) |record| {
+            if (!self.tables.contains(record.table_id)) {
+                result.skipped_orphan_ranges += 1;
+                continue;
+            }
+            try self.upsertUniqueConstraintRange(record);
+        }
         return result;
     }
 
@@ -401,6 +619,8 @@ pub const TableManager = struct {
         const removed = self.tables.fetchRemove(table_id);
         if (removed) |entry| {
             freeTable(self.alloc, entry.value);
+            _ = self.removeForeignKeyReferenceRangesForTable(table_id);
+            _ = self.removeUniqueConstraintRangesForTable(table_id);
             return true;
         }
         return false;
@@ -432,6 +652,370 @@ pub const TableManager = struct {
         return false;
     }
 
+    pub fn removeForeignKeyReferenceRangesForTable(self: *TableManager, table_id: u64) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.foreign_key_ref_ranges.items.len) {
+            const record = self.foreign_key_ref_ranges.items[i];
+            if (record.child_table_id != table_id and record.parent_table_id != table_id) {
+                i += 1;
+                continue;
+            }
+            freeForeignKeyReferenceRange(self.alloc, record);
+            _ = self.foreign_key_ref_ranges.orderedRemove(i);
+            removed += 1;
+        }
+        return removed;
+    }
+
+    pub fn removeForeignKeyReferenceRange(
+        self: *TableManager,
+        child_table_id: u64,
+        constraint_name: []const u8,
+        parent_table_id: u64,
+        start_parent_key: []const u8,
+    ) bool {
+        for (self.foreign_key_ref_ranges.items, 0..) |record, i| {
+            if (record.child_table_id != child_table_id) continue;
+            if (record.parent_table_id != parent_table_id) continue;
+            if (!std.mem.eql(u8, record.constraint_name, constraint_name)) continue;
+            if (!std.mem.eql(u8, record.start_parent_key, start_parent_key)) continue;
+            freeForeignKeyReferenceRange(self.alloc, record);
+            _ = self.foreign_key_ref_ranges.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn removeUniqueConstraintRangesForTable(self: *TableManager, table_id: u64) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.unique_constraint_ranges.items.len) {
+            const record = self.unique_constraint_ranges.items[i];
+            if (record.table_id != table_id) {
+                i += 1;
+                continue;
+            }
+            freeUniqueConstraintRange(self.alloc, record);
+            _ = self.unique_constraint_ranges.orderedRemove(i);
+            removed += 1;
+        }
+        return removed;
+    }
+
+    pub fn removeUniqueConstraintRange(
+        self: *TableManager,
+        table_id: u64,
+        constraint_name: []const u8,
+        start_encoded_value: []const u8,
+    ) bool {
+        for (self.unique_constraint_ranges.items, 0..) |record, i| {
+            if (record.table_id != table_id) continue;
+            if (!std.mem.eql(u8, record.constraint_name, constraint_name)) continue;
+            if (!std.mem.eql(u8, record.start_encoded_value, start_encoded_value)) continue;
+            freeUniqueConstraintRange(self.alloc, record);
+            _ = self.unique_constraint_ranges.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn beginForeignKeyReferenceRangeSplit(self: *TableManager, request: ForeignKeyReferenceRangeSplitRequest) !void {
+        try group_ids.requireDataGroupId(request.left_group_id);
+        try group_ids.requireDataGroupId(request.right_group_id);
+        if (request.left_group_id == request.right_group_id) return error.InvalidForeignKeyReferenceRangeSplit;
+        const source = self.findForeignKeyReferenceRange(request.selector) orelse return error.UnknownForeignKeyReferenceRange;
+        if (!std.mem.eql(u8, source.state, foreign_key_ref_range_active)) return error.ForeignKeyReferenceRangeNotActive;
+        if (!keyStrictlyInsideRange(request.split_parent_key, source.start_parent_key, source.end_parent_key)) return error.InvalidForeignKeyReferenceRangeSplit;
+        if (request.left_group_id != source.group_id and self.foreignKeyReferenceRangeGroupExists(request.left_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (self.foreignKeyReferenceRangeGroupExists(request.right_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+
+        var updated = source.*;
+        updated.state = foreign_key_ref_range_splitting;
+        updated.topology_epoch +%= 1;
+        try self.upsertForeignKeyReferenceRange(updated);
+    }
+
+    pub fn finishForeignKeyReferenceRangeSplit(self: *TableManager, request: ForeignKeyReferenceRangeSplitRequest) !void {
+        try group_ids.requireDataGroupId(request.left_group_id);
+        try group_ids.requireDataGroupId(request.right_group_id);
+        if (request.left_group_id == request.right_group_id) return error.InvalidForeignKeyReferenceRangeSplit;
+        const source = self.findForeignKeyReferenceRange(request.selector) orelse return error.UnknownForeignKeyReferenceRange;
+        if (!std.mem.eql(u8, source.state, foreign_key_ref_range_splitting)) return error.ForeignKeyReferenceRangeNotSplitting;
+        if (!keyStrictlyInsideRange(request.split_parent_key, source.start_parent_key, source.end_parent_key)) return error.InvalidForeignKeyReferenceRangeSplit;
+        if (request.left_group_id != source.group_id and self.foreignKeyReferenceRangeGroupExists(request.left_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (self.foreignKeyReferenceRangeGroupExists(request.right_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+
+        const original = try cloneForeignKeyReferenceRange(self.alloc, source.*);
+        defer freeForeignKeyReferenceRange(self.alloc, original);
+        if (!self.removeForeignKeyReferenceRange(original.child_table_id, original.constraint_name, original.parent_table_id, original.start_parent_key)) return error.UnknownForeignKeyReferenceRange;
+        errdefer self.restoreForeignKeyReferenceRangeBestEffort(original);
+
+        try self.upsertForeignKeyReferenceRange(.{
+            .child_table_id = original.child_table_id,
+            .constraint_name = original.constraint_name,
+            .parent_table_id = original.parent_table_id,
+            .start_parent_key = original.start_parent_key,
+            .end_parent_key = request.split_parent_key,
+            .group_id = request.left_group_id,
+            .topology_epoch = original.topology_epoch +% 1,
+            .state = foreign_key_ref_range_active,
+        });
+        errdefer _ = self.removeForeignKeyReferenceRange(original.child_table_id, original.constraint_name, original.parent_table_id, original.start_parent_key);
+        try self.upsertForeignKeyReferenceRange(.{
+            .child_table_id = original.child_table_id,
+            .constraint_name = original.constraint_name,
+            .parent_table_id = original.parent_table_id,
+            .start_parent_key = request.split_parent_key,
+            .end_parent_key = original.end_parent_key,
+            .group_id = request.right_group_id,
+            .topology_epoch = original.topology_epoch +% 1,
+            .state = foreign_key_ref_range_active,
+        });
+    }
+
+    pub fn beginForeignKeyReferenceRangeMerge(self: *TableManager, request: ForeignKeyReferenceRangeMergeRequest) !void {
+        try group_ids.requireDataGroupId(request.merged_group_id);
+        const left = self.findForeignKeyReferenceRange(request.left_selector) orelse return error.UnknownForeignKeyReferenceRange;
+        const right = self.findForeignKeyReferenceRange(.{
+            .child_table_id = request.left_selector.child_table_id,
+            .constraint_name = request.left_selector.constraint_name,
+            .parent_table_id = request.left_selector.parent_table_id,
+            .start_parent_key = request.right_start_parent_key,
+        }) orelse return error.UnknownForeignKeyReferenceRange;
+        if (!foreignKeyReferenceRangesAdjacent(left.*, right.*)) return error.ForeignKeyReferenceRangesNotAdjacent;
+        if (!std.mem.eql(u8, left.state, foreign_key_ref_range_active) or !std.mem.eql(u8, right.state, foreign_key_ref_range_active)) return error.ForeignKeyReferenceRangeNotActive;
+        if (request.merged_group_id != left.group_id and request.merged_group_id != right.group_id and self.foreignKeyReferenceRangeGroupExists(request.merged_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+
+        var updated_left = left.*;
+        updated_left.state = foreign_key_ref_range_merging;
+        updated_left.topology_epoch +%= 1;
+        try self.upsertForeignKeyReferenceRange(updated_left);
+        var updated_right = right.*;
+        updated_right.state = foreign_key_ref_range_merging;
+        updated_right.topology_epoch +%= 1;
+        try self.upsertForeignKeyReferenceRange(updated_right);
+    }
+
+    pub fn finishForeignKeyReferenceRangeMerge(self: *TableManager, request: ForeignKeyReferenceRangeMergeRequest) !void {
+        try group_ids.requireDataGroupId(request.merged_group_id);
+        const left = self.findForeignKeyReferenceRange(request.left_selector) orelse return error.UnknownForeignKeyReferenceRange;
+        const right = self.findForeignKeyReferenceRange(.{
+            .child_table_id = request.left_selector.child_table_id,
+            .constraint_name = request.left_selector.constraint_name,
+            .parent_table_id = request.left_selector.parent_table_id,
+            .start_parent_key = request.right_start_parent_key,
+        }) orelse return error.UnknownForeignKeyReferenceRange;
+        if (!foreignKeyReferenceRangesAdjacent(left.*, right.*)) return error.ForeignKeyReferenceRangesNotAdjacent;
+        if (!std.mem.eql(u8, left.state, foreign_key_ref_range_merging) or !std.mem.eql(u8, right.state, foreign_key_ref_range_merging)) return error.ForeignKeyReferenceRangeNotMerging;
+        if (request.merged_group_id != left.group_id and request.merged_group_id != right.group_id and self.foreignKeyReferenceRangeGroupExists(request.merged_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+
+        const owned_left = try cloneForeignKeyReferenceRange(self.alloc, left.*);
+        defer freeForeignKeyReferenceRange(self.alloc, owned_left);
+        const owned_right = try cloneForeignKeyReferenceRange(self.alloc, right.*);
+        defer freeForeignKeyReferenceRange(self.alloc, owned_right);
+        if (!self.removeForeignKeyReferenceRange(owned_left.child_table_id, owned_left.constraint_name, owned_left.parent_table_id, owned_left.start_parent_key)) return error.UnknownForeignKeyReferenceRange;
+        errdefer self.restoreForeignKeyReferenceRangeBestEffort(owned_left);
+        if (!self.removeForeignKeyReferenceRange(owned_right.child_table_id, owned_right.constraint_name, owned_right.parent_table_id, owned_right.start_parent_key)) return error.UnknownForeignKeyReferenceRange;
+        errdefer self.restoreForeignKeyReferenceRangeBestEffort(owned_right);
+
+        try self.upsertForeignKeyReferenceRange(.{
+            .child_table_id = owned_left.child_table_id,
+            .constraint_name = owned_left.constraint_name,
+            .parent_table_id = owned_left.parent_table_id,
+            .start_parent_key = owned_left.start_parent_key,
+            .end_parent_key = owned_right.end_parent_key,
+            .group_id = request.merged_group_id,
+            .topology_epoch = @max(owned_left.topology_epoch, owned_right.topology_epoch) +% 1,
+            .state = foreign_key_ref_range_active,
+        });
+    }
+
+    pub fn beginForeignKeyReferenceRangeRebuild(self: *TableManager, selector: ForeignKeyReferenceRangeSelector) !void {
+        const record = self.findForeignKeyReferenceRange(selector) orelse return error.UnknownForeignKeyReferenceRange;
+        if (!std.mem.eql(u8, record.state, foreign_key_ref_range_active)) return error.ForeignKeyReferenceRangeNotActive;
+        var updated = record.*;
+        updated.state = foreign_key_ref_range_rebuilding;
+        updated.topology_epoch +%= 1;
+        try self.upsertForeignKeyReferenceRange(updated);
+    }
+
+    pub fn finishForeignKeyReferenceRangeRebuild(self: *TableManager, selector: ForeignKeyReferenceRangeSelector) !void {
+        const record = self.findForeignKeyReferenceRange(selector) orelse return error.UnknownForeignKeyReferenceRange;
+        if (!std.mem.eql(u8, record.state, foreign_key_ref_range_rebuilding)) return error.ForeignKeyReferenceRangeNotRebuilding;
+        var updated = record.*;
+        updated.state = foreign_key_ref_range_active;
+        updated.topology_epoch +%= 1;
+        try self.upsertForeignKeyReferenceRange(updated);
+    }
+
+    fn foreignKeyReferenceRangeGroupExists(self: *const TableManager, group_id: u64) bool {
+        for (self.foreign_key_ref_ranges.items) |record| {
+            if (record.group_id == group_id) return true;
+        }
+        return false;
+    }
+
+    fn findForeignKeyReferenceRange(self: *TableManager, selector: ForeignKeyReferenceRangeSelector) ?*ForeignKeyReferenceRangeRecord {
+        for (self.foreign_key_ref_ranges.items) |*record| {
+            if (record.child_table_id != selector.child_table_id) continue;
+            if (record.parent_table_id != selector.parent_table_id) continue;
+            if (!std.mem.eql(u8, record.constraint_name, selector.constraint_name)) continue;
+            if (!std.mem.eql(u8, record.start_parent_key, selector.start_parent_key)) continue;
+            return record;
+        }
+        return null;
+    }
+
+    fn restoreForeignKeyReferenceRangeBestEffort(self: *TableManager, record: ForeignKeyReferenceRangeRecord) void {
+        self.upsertForeignKeyReferenceRange(record) catch {};
+    }
+
+    pub fn beginUniqueConstraintRangeSplit(self: *TableManager, request: UniqueConstraintRangeSplitRequest) !void {
+        try group_ids.requireDataGroupId(request.left_group_id);
+        try group_ids.requireDataGroupId(request.right_group_id);
+        if (request.left_group_id == request.right_group_id) return error.InvalidUniqueConstraintRangeSplit;
+        const source = self.findUniqueConstraintRange(request.selector) orelse return error.UnknownUniqueConstraintRange;
+        if (!std.mem.eql(u8, source.state, unique_constraint_range_active)) return error.UniqueConstraintRangeNotActive;
+        if (!keyStrictlyInsideRange(request.split_encoded_value, source.start_encoded_value, source.end_encoded_value)) return error.InvalidUniqueConstraintRangeSplit;
+        if (request.left_group_id != source.group_id and self.uniqueConstraintRangeGroupExists(request.left_group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (self.uniqueConstraintRangeGroupExists(request.right_group_id)) return error.UniqueConstraintRangeGroupCollision;
+
+        var updated = source.*;
+        updated.state = unique_constraint_range_splitting;
+        updated.topology_epoch +%= 1;
+        try self.upsertUniqueConstraintRange(updated);
+    }
+
+    pub fn finishUniqueConstraintRangeSplit(self: *TableManager, request: UniqueConstraintRangeSplitRequest) !void {
+        try group_ids.requireDataGroupId(request.left_group_id);
+        try group_ids.requireDataGroupId(request.right_group_id);
+        if (request.left_group_id == request.right_group_id) return error.InvalidUniqueConstraintRangeSplit;
+        const source = self.findUniqueConstraintRange(request.selector) orelse return error.UnknownUniqueConstraintRange;
+        if (!std.mem.eql(u8, source.state, unique_constraint_range_splitting)) return error.UniqueConstraintRangeNotSplitting;
+        if (!keyStrictlyInsideRange(request.split_encoded_value, source.start_encoded_value, source.end_encoded_value)) return error.InvalidUniqueConstraintRangeSplit;
+        if (request.left_group_id != source.group_id and self.uniqueConstraintRangeGroupExists(request.left_group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (self.uniqueConstraintRangeGroupExists(request.right_group_id)) return error.UniqueConstraintRangeGroupCollision;
+
+        const original = try cloneUniqueConstraintRange(self.alloc, source.*);
+        defer freeUniqueConstraintRange(self.alloc, original);
+        if (!self.removeUniqueConstraintRange(original.table_id, original.constraint_name, original.start_encoded_value)) return error.UnknownUniqueConstraintRange;
+        errdefer self.restoreUniqueConstraintRangeBestEffort(original);
+
+        try self.upsertUniqueConstraintRange(.{
+            .table_id = original.table_id,
+            .constraint_name = original.constraint_name,
+            .start_encoded_value = original.start_encoded_value,
+            .end_encoded_value = request.split_encoded_value,
+            .group_id = request.left_group_id,
+            .topology_epoch = original.topology_epoch +% 1,
+            .state = unique_constraint_range_active,
+        });
+        errdefer _ = self.removeUniqueConstraintRange(original.table_id, original.constraint_name, original.start_encoded_value);
+        try self.upsertUniqueConstraintRange(.{
+            .table_id = original.table_id,
+            .constraint_name = original.constraint_name,
+            .start_encoded_value = request.split_encoded_value,
+            .end_encoded_value = original.end_encoded_value,
+            .group_id = request.right_group_id,
+            .topology_epoch = original.topology_epoch +% 1,
+            .state = unique_constraint_range_active,
+        });
+    }
+
+    pub fn beginUniqueConstraintRangeMerge(self: *TableManager, request: UniqueConstraintRangeMergeRequest) !void {
+        try group_ids.requireDataGroupId(request.merged_group_id);
+        const left = self.findUniqueConstraintRange(request.left_selector) orelse return error.UnknownUniqueConstraintRange;
+        const right = self.findUniqueConstraintRange(.{
+            .table_id = request.left_selector.table_id,
+            .constraint_name = request.left_selector.constraint_name,
+            .start_encoded_value = request.right_start_encoded_value,
+        }) orelse return error.UnknownUniqueConstraintRange;
+        if (!uniqueConstraintRangesAdjacent(left.*, right.*)) return error.UniqueConstraintRangesNotAdjacent;
+        if (!std.mem.eql(u8, left.state, unique_constraint_range_active) or !std.mem.eql(u8, right.state, unique_constraint_range_active)) return error.UniqueConstraintRangeNotActive;
+        if (request.merged_group_id != left.group_id and request.merged_group_id != right.group_id and self.uniqueConstraintRangeGroupExists(request.merged_group_id)) return error.UniqueConstraintRangeGroupCollision;
+
+        var updated_left = left.*;
+        updated_left.state = unique_constraint_range_merging;
+        updated_left.topology_epoch +%= 1;
+        try self.upsertUniqueConstraintRange(updated_left);
+        var updated_right = right.*;
+        updated_right.state = unique_constraint_range_merging;
+        updated_right.topology_epoch +%= 1;
+        try self.upsertUniqueConstraintRange(updated_right);
+    }
+
+    pub fn finishUniqueConstraintRangeMerge(self: *TableManager, request: UniqueConstraintRangeMergeRequest) !void {
+        try group_ids.requireDataGroupId(request.merged_group_id);
+        const left = self.findUniqueConstraintRange(request.left_selector) orelse return error.UnknownUniqueConstraintRange;
+        const right = self.findUniqueConstraintRange(.{
+            .table_id = request.left_selector.table_id,
+            .constraint_name = request.left_selector.constraint_name,
+            .start_encoded_value = request.right_start_encoded_value,
+        }) orelse return error.UnknownUniqueConstraintRange;
+        if (!uniqueConstraintRangesAdjacent(left.*, right.*)) return error.UniqueConstraintRangesNotAdjacent;
+        if (!std.mem.eql(u8, left.state, unique_constraint_range_merging) or !std.mem.eql(u8, right.state, unique_constraint_range_merging)) return error.UniqueConstraintRangeNotMerging;
+        if (request.merged_group_id != left.group_id and request.merged_group_id != right.group_id and self.uniqueConstraintRangeGroupExists(request.merged_group_id)) return error.UniqueConstraintRangeGroupCollision;
+
+        const owned_left = try cloneUniqueConstraintRange(self.alloc, left.*);
+        defer freeUniqueConstraintRange(self.alloc, owned_left);
+        const owned_right = try cloneUniqueConstraintRange(self.alloc, right.*);
+        defer freeUniqueConstraintRange(self.alloc, owned_right);
+        if (!self.removeUniqueConstraintRange(owned_left.table_id, owned_left.constraint_name, owned_left.start_encoded_value)) return error.UnknownUniqueConstraintRange;
+        errdefer self.restoreUniqueConstraintRangeBestEffort(owned_left);
+        if (!self.removeUniqueConstraintRange(owned_right.table_id, owned_right.constraint_name, owned_right.start_encoded_value)) return error.UnknownUniqueConstraintRange;
+        errdefer self.restoreUniqueConstraintRangeBestEffort(owned_right);
+
+        try self.upsertUniqueConstraintRange(.{
+            .table_id = owned_left.table_id,
+            .constraint_name = owned_left.constraint_name,
+            .start_encoded_value = owned_left.start_encoded_value,
+            .end_encoded_value = owned_right.end_encoded_value,
+            .group_id = request.merged_group_id,
+            .topology_epoch = @max(owned_left.topology_epoch, owned_right.topology_epoch) +% 1,
+            .state = unique_constraint_range_active,
+        });
+    }
+
+    pub fn beginUniqueConstraintRangeRebuild(self: *TableManager, selector: UniqueConstraintRangeSelector) !void {
+        const record = self.findUniqueConstraintRange(selector) orelse return error.UnknownUniqueConstraintRange;
+        if (!std.mem.eql(u8, record.state, unique_constraint_range_active)) return error.UniqueConstraintRangeNotActive;
+        var updated = record.*;
+        updated.state = unique_constraint_range_rebuilding;
+        updated.topology_epoch +%= 1;
+        try self.upsertUniqueConstraintRange(updated);
+    }
+
+    pub fn finishUniqueConstraintRangeRebuild(self: *TableManager, selector: UniqueConstraintRangeSelector) !void {
+        const record = self.findUniqueConstraintRange(selector) orelse return error.UnknownUniqueConstraintRange;
+        if (!std.mem.eql(u8, record.state, unique_constraint_range_rebuilding)) return error.UniqueConstraintRangeNotRebuilding;
+        var updated = record.*;
+        updated.state = unique_constraint_range_active;
+        updated.topology_epoch +%= 1;
+        try self.upsertUniqueConstraintRange(updated);
+    }
+
+    fn uniqueConstraintRangeGroupExists(self: *const TableManager, group_id: u64) bool {
+        for (self.unique_constraint_ranges.items) |record| {
+            if (record.group_id == group_id) return true;
+        }
+        return false;
+    }
+
+    fn findUniqueConstraintRange(self: *TableManager, selector: UniqueConstraintRangeSelector) ?*UniqueConstraintRangeRecord {
+        for (self.unique_constraint_ranges.items) |*record| {
+            if (record.table_id != selector.table_id) continue;
+            if (!std.mem.eql(u8, record.constraint_name, selector.constraint_name)) continue;
+            if (!std.mem.eql(u8, record.start_encoded_value, selector.start_encoded_value)) continue;
+            return record;
+        }
+        return null;
+    }
+
+    fn restoreUniqueConstraintRangeBestEffort(self: *TableManager, record: UniqueConstraintRangeRecord) void {
+        self.upsertUniqueConstraintRange(record) catch {};
+    }
+
     pub fn listTables(self: *TableManager, alloc: std.mem.Allocator) ![]TableRecord {
         var out = std.ArrayListUnmanaged(TableRecord).empty;
         errdefer {
@@ -461,6 +1045,36 @@ pub const TableManager = struct {
 
     pub fn freeRanges(_: *TableManager, alloc: std.mem.Allocator, records: []RangeRecord) void {
         for (records) |record| freeRange(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listForeignKeyReferenceRanges(self: *TableManager, alloc: std.mem.Allocator) ![]ForeignKeyReferenceRangeRecord {
+        var out = std.ArrayListUnmanaged(ForeignKeyReferenceRangeRecord).empty;
+        errdefer {
+            for (out.items) |record| freeForeignKeyReferenceRange(alloc, record);
+            out.deinit(alloc);
+        }
+        for (self.foreign_key_ref_ranges.items) |record| try out.append(alloc, try cloneForeignKeyReferenceRange(alloc, record));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeForeignKeyReferenceRanges(_: *TableManager, alloc: std.mem.Allocator, records: []ForeignKeyReferenceRangeRecord) void {
+        for (records) |record| freeForeignKeyReferenceRange(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listUniqueConstraintRanges(self: *TableManager, alloc: std.mem.Allocator) ![]UniqueConstraintRangeRecord {
+        var out = std.ArrayListUnmanaged(UniqueConstraintRangeRecord).empty;
+        errdefer {
+            for (out.items) |record| freeUniqueConstraintRange(alloc, record);
+            out.deinit(alloc);
+        }
+        for (self.unique_constraint_ranges.items) |record| try out.append(alloc, try cloneUniqueConstraintRange(alloc, record));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeUniqueConstraintRanges(_: *TableManager, alloc: std.mem.Allocator, records: []UniqueConstraintRangeRecord) void {
+        for (records) |record| freeUniqueConstraintRange(alloc, record);
         alloc.free(records);
     }
 
@@ -766,6 +1380,120 @@ pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
     alloc.free(record.restore_backup_id);
     alloc.free(record.restore_location);
     alloc.free(record.restore_snapshot_path);
+}
+
+fn foreignKeyReferenceRangeIdentityMatches(a: ForeignKeyReferenceRangeRecord, b: ForeignKeyReferenceRangeRecord) bool {
+    return a.child_table_id == b.child_table_id and
+        a.parent_table_id == b.parent_table_id and
+        std.mem.eql(u8, a.constraint_name, b.constraint_name) and
+        std.mem.eql(u8, a.start_parent_key, b.start_parent_key);
+}
+
+fn foreignKeyReferenceRangeConstraintMatches(a: ForeignKeyReferenceRangeRecord, b: ForeignKeyReferenceRangeRecord) bool {
+    return a.child_table_id == b.child_table_id and
+        a.parent_table_id == b.parent_table_id and
+        std.mem.eql(u8, a.constraint_name, b.constraint_name);
+}
+
+fn foreignKeyReferenceRangesOverlap(a: ForeignKeyReferenceRangeRecord, b: ForeignKeyReferenceRangeRecord) bool {
+    if (a.end_parent_key) |a_end| {
+        if (std.mem.order(u8, a_end, b.start_parent_key) != .gt) return false;
+    }
+    if (b.end_parent_key) |b_end| {
+        if (std.mem.order(u8, b_end, a.start_parent_key) != .gt) return false;
+    }
+    return true;
+}
+
+fn foreignKeyReferenceRangesAdjacent(left: ForeignKeyReferenceRangeRecord, right: ForeignKeyReferenceRangeRecord) bool {
+    if (left.child_table_id != right.child_table_id) return false;
+    if (left.parent_table_id != right.parent_table_id) return false;
+    if (!std.mem.eql(u8, left.constraint_name, right.constraint_name)) return false;
+    const left_end = left.end_parent_key orelse return false;
+    return std.mem.eql(u8, left_end, right.start_parent_key);
+}
+
+fn uniqueConstraintRangeIdentityMatches(a: UniqueConstraintRangeRecord, b: UniqueConstraintRangeRecord) bool {
+    return a.table_id == b.table_id and
+        std.mem.eql(u8, a.constraint_name, b.constraint_name) and
+        std.mem.eql(u8, a.start_encoded_value, b.start_encoded_value);
+}
+
+fn uniqueConstraintRangeConstraintMatches(a: UniqueConstraintRangeRecord, b: UniqueConstraintRangeRecord) bool {
+    return a.table_id == b.table_id and
+        std.mem.eql(u8, a.constraint_name, b.constraint_name);
+}
+
+fn uniqueConstraintRangesOverlap(a: UniqueConstraintRangeRecord, b: UniqueConstraintRangeRecord) bool {
+    if (a.end_encoded_value) |a_end| {
+        if (std.mem.order(u8, a_end, b.start_encoded_value) != .gt) return false;
+    }
+    if (b.end_encoded_value) |b_end| {
+        if (std.mem.order(u8, b_end, a.start_encoded_value) != .gt) return false;
+    }
+    return true;
+}
+
+fn uniqueConstraintRangesAdjacent(left: UniqueConstraintRangeRecord, right: UniqueConstraintRangeRecord) bool {
+    if (left.table_id != right.table_id) return false;
+    if (!std.mem.eql(u8, left.constraint_name, right.constraint_name)) return false;
+    const left_end = left.end_encoded_value orelse return false;
+    return std.mem.eql(u8, left_end, right.start_encoded_value);
+}
+
+pub fn cloneForeignKeyReferenceRange(alloc: std.mem.Allocator, record: ForeignKeyReferenceRangeRecord) !ForeignKeyReferenceRangeRecord {
+    const constraint_name = try alloc.dupe(u8, record.constraint_name);
+    errdefer alloc.free(constraint_name);
+    const start_parent_key = try alloc.dupe(u8, record.start_parent_key);
+    errdefer alloc.free(start_parent_key);
+    const end_parent_key = try cloneOwnedOptional(alloc, record.end_parent_key);
+    errdefer freeOwnedOptional(alloc, end_parent_key);
+    const state = try alloc.dupe(u8, record.state);
+    errdefer alloc.free(state);
+    return .{
+        .child_table_id = record.child_table_id,
+        .constraint_name = constraint_name,
+        .parent_table_id = record.parent_table_id,
+        .start_parent_key = start_parent_key,
+        .end_parent_key = end_parent_key,
+        .group_id = record.group_id,
+        .topology_epoch = record.topology_epoch,
+        .state = state,
+    };
+}
+
+pub fn freeForeignKeyReferenceRange(alloc: std.mem.Allocator, record: ForeignKeyReferenceRangeRecord) void {
+    alloc.free(record.constraint_name);
+    alloc.free(record.start_parent_key);
+    freeOwnedOptional(alloc, record.end_parent_key);
+    alloc.free(record.state);
+}
+
+pub fn cloneUniqueConstraintRange(alloc: std.mem.Allocator, record: UniqueConstraintRangeRecord) !UniqueConstraintRangeRecord {
+    const constraint_name = try alloc.dupe(u8, record.constraint_name);
+    errdefer alloc.free(constraint_name);
+    const start_encoded_value = try alloc.dupe(u8, record.start_encoded_value);
+    errdefer alloc.free(start_encoded_value);
+    const end_encoded_value = try cloneOwnedOptional(alloc, record.end_encoded_value);
+    errdefer freeOwnedOptional(alloc, end_encoded_value);
+    const state = try alloc.dupe(u8, record.state);
+    errdefer alloc.free(state);
+    return .{
+        .table_id = record.table_id,
+        .constraint_name = constraint_name,
+        .start_encoded_value = start_encoded_value,
+        .end_encoded_value = end_encoded_value,
+        .group_id = record.group_id,
+        .topology_epoch = record.topology_epoch,
+        .state = state,
+    };
+}
+
+pub fn freeUniqueConstraintRange(alloc: std.mem.Allocator, record: UniqueConstraintRangeRecord) void {
+    alloc.free(record.constraint_name);
+    alloc.free(record.start_encoded_value);
+    freeOwnedOptional(alloc, record.end_encoded_value);
+    alloc.free(record.state);
 }
 
 pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) !RestoreProgressRecord {
@@ -1356,6 +2084,404 @@ test "table manager can replace topology from projected state" {
     try std.testing.expectEqualStrings("new", listed_tables[0].name);
     try std.testing.expectEqual(@as(usize, 1), listed_ranges.len);
     try std.testing.expectEqual(@as(u64, 21), listed_ranges[0].group_id);
+}
+
+test "table manager owns foreign key reference owner ranges" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    try manager.upsertTable(.{ .table_id = 8, .name = "customers" });
+    try manager.upsertTable(.{ .table_id = 9, .name = "accounts" });
+
+    try manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "",
+        .end_parent_key = "customer:m",
+        .group_id = 9001,
+        .topology_epoch = 11,
+    });
+    try manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "customer:m",
+        .end_parent_key = null,
+        .group_id = 9002,
+        .topology_epoch = 12,
+    });
+    try manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_account_id_fkey",
+        .parent_table_id = 9,
+        .start_parent_key = "",
+        .end_parent_key = null,
+        .group_id = 9003,
+        .state = foreign_key_ref_range_rebuilding,
+    });
+    try std.testing.expectError(error.InvalidForeignKeyReferenceRangeState, manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_account_id_fkey",
+        .parent_table_id = 9,
+        .start_parent_key = "account:z",
+        .end_parent_key = null,
+        .group_id = 9004,
+        .state = "unknown",
+    }));
+    try std.testing.expectError(error.ForeignKeyReferenceRangeOverlap, manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "customer:h",
+        .end_parent_key = "customer:t",
+        .group_id = 9005,
+    }));
+    try manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "customer:m",
+        .end_parent_key = null,
+        .group_id = 9012,
+        .topology_epoch = 22,
+    });
+    try std.testing.expectError(error.ForeignKeyReferenceRangeGroupCollision, manager.upsertRange(.{
+        .group_id = 9012,
+        .table_id = 7,
+        .start_key = "order:a",
+        .end_key = "order:z",
+    }));
+    try manager.upsertRange(.{
+        .group_id = 9100,
+        .table_id = 7,
+        .start_key = "order:a",
+        .end_key = "order:z",
+    });
+    try std.testing.expectError(error.ForeignKeyReferenceRangeGroupCollision, manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "customer:z",
+        .end_parent_key = null,
+        .group_id = 9100,
+    }));
+
+    const listed = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+    defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 3), listed.len);
+
+    var saw_replaced = false;
+    for (listed) |record| {
+        if (!std.mem.eql(u8, record.constraint_name, "orders_customer_id_fkey")) continue;
+        if (!std.mem.eql(u8, record.start_parent_key, "customer:m")) continue;
+        try std.testing.expectEqual(@as(u64, 9012), record.group_id);
+        try std.testing.expectEqual(@as(u64, 22), record.topology_epoch);
+        saw_replaced = true;
+    }
+    try std.testing.expect(saw_replaced);
+
+    try std.testing.expectEqual(@as(usize, 2), manager.removeForeignKeyReferenceRangesForTable(8));
+    const remaining = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+    defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    try std.testing.expectEqualStrings("orders_account_id_fkey", remaining[0].constraint_name);
+    try std.testing.expectEqualStrings(foreign_key_ref_range_rebuilding, remaining[0].state);
+}
+
+test "table manager applies foreign key reference range lifecycle operations" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    try manager.upsertTable(.{ .table_id = 8, .name = "customers" });
+    const selector: ForeignKeyReferenceRangeSelector = .{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "",
+    };
+    try manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "",
+        .end_parent_key = null,
+        .group_id = 9001,
+    });
+
+    try manager.beginForeignKeyReferenceRangeRebuild(selector);
+    {
+        const ranges = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+        defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings(foreign_key_ref_range_rebuilding, ranges[0].state);
+        try std.testing.expect(!foreignKeyReferenceRangeRoutable(ranges[0]));
+    }
+
+    try manager.finishForeignKeyReferenceRangeRebuild(selector);
+    {
+        const ranges = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+        defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqualStrings(foreign_key_ref_range_active, ranges[0].state);
+        try std.testing.expect(foreignKeyReferenceRangeRoutable(ranges[0]));
+    }
+
+    const split_request: ForeignKeyReferenceRangeSplitRequest = .{
+        .selector = selector,
+        .split_parent_key = "customer:m",
+        .left_group_id = 9001,
+        .right_group_id = 9002,
+    };
+    try manager.beginForeignKeyReferenceRangeSplit(split_request);
+    {
+        const ranges = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+        defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings(foreign_key_ref_range_splitting, ranges[0].state);
+        try std.testing.expect(!foreignKeyReferenceRangeRoutable(ranges[0]));
+    }
+
+    try manager.finishForeignKeyReferenceRangeSplit(split_request);
+    {
+        const ranges = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+        defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 2), ranges.len);
+        var saw_left = false;
+        var saw_right = false;
+        for (ranges) |record| {
+            try std.testing.expectEqualStrings(foreign_key_ref_range_active, record.state);
+            if (std.mem.eql(u8, record.start_parent_key, "")) {
+                try std.testing.expectEqualStrings("customer:m", record.end_parent_key.?);
+                try std.testing.expectEqual(@as(u64, 9001), record.group_id);
+                saw_left = true;
+            } else if (std.mem.eql(u8, record.start_parent_key, "customer:m")) {
+                try std.testing.expect(record.end_parent_key == null);
+                try std.testing.expectEqual(@as(u64, 9002), record.group_id);
+                saw_right = true;
+            }
+        }
+        try std.testing.expect(saw_left and saw_right);
+    }
+
+    const merge_request: ForeignKeyReferenceRangeMergeRequest = .{
+        .left_selector = selector,
+        .right_start_parent_key = "customer:m",
+        .merged_group_id = 9001,
+    };
+    try manager.beginForeignKeyReferenceRangeMerge(merge_request);
+    {
+        const ranges = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+        defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+        for (ranges) |record| {
+            try std.testing.expectEqualStrings(foreign_key_ref_range_merging, record.state);
+            try std.testing.expect(!foreignKeyReferenceRangeRoutable(record));
+        }
+    }
+
+    try manager.finishForeignKeyReferenceRangeMerge(merge_request);
+    {
+        const ranges = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+        defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings("", ranges[0].start_parent_key);
+        try std.testing.expect(ranges[0].end_parent_key == null);
+        try std.testing.expectEqual(@as(u64, 9001), ranges[0].group_id);
+        try std.testing.expectEqualStrings(foreign_key_ref_range_active, ranges[0].state);
+    }
+}
+
+test "table manager owns unique constraint owner ranges" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "users" });
+
+    try manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "",
+        .end_encoded_value = "email:m",
+        .group_id = 7101,
+        .topology_epoch = 21,
+    });
+    try manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "email:m",
+        .end_encoded_value = null,
+        .group_id = 7102,
+        .topology_epoch = 22,
+    });
+    try manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_username_key",
+        .start_encoded_value = "",
+        .end_encoded_value = null,
+        .group_id = 7201,
+        .state = unique_constraint_range_rebuilding,
+    });
+    try std.testing.expectError(error.InvalidUniqueConstraintRangeState, manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_username_key",
+        .start_encoded_value = "username:z",
+        .end_encoded_value = null,
+        .group_id = 7202,
+        .state = "unknown",
+    }));
+    try std.testing.expectError(error.UniqueConstraintRangeOverlap, manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "email:h",
+        .end_encoded_value = "email:t",
+        .group_id = 7105,
+    }));
+    try manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "email:m",
+        .end_encoded_value = null,
+        .group_id = 7112,
+        .topology_epoch = 32,
+    });
+    try std.testing.expectError(error.UniqueConstraintRangeGroupCollision, manager.upsertRange(.{
+        .group_id = 7112,
+        .table_id = 7,
+        .start_key = "user:a",
+        .end_key = "user:z",
+    }));
+    try manager.upsertRange(.{
+        .group_id = 7300,
+        .table_id = 7,
+        .start_key = "user:a",
+        .end_key = "user:z",
+    });
+    try std.testing.expectError(error.UniqueConstraintRangeGroupCollision, manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "email:z",
+        .end_encoded_value = null,
+        .group_id = 7300,
+    }));
+
+    const listed = try manager.listUniqueConstraintRanges(std.testing.allocator);
+    defer manager.freeUniqueConstraintRanges(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 3), listed.len);
+
+    var saw_replaced = false;
+    for (listed) |record| {
+        if (!std.mem.eql(u8, record.constraint_name, "users_email_key")) continue;
+        if (!std.mem.eql(u8, record.start_encoded_value, "email:m")) continue;
+        try std.testing.expectEqual(@as(u64, 7112), record.group_id);
+        try std.testing.expectEqual(@as(u64, 32), record.topology_epoch);
+        saw_replaced = true;
+    }
+    try std.testing.expect(saw_replaced);
+
+    try std.testing.expectEqual(@as(usize, 3), manager.removeUniqueConstraintRangesForTable(7));
+    const remaining = try manager.listUniqueConstraintRanges(std.testing.allocator);
+    defer manager.freeUniqueConstraintRanges(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "table manager applies unique constraint range lifecycle operations" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "users" });
+    const selector: UniqueConstraintRangeSelector = .{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "",
+    };
+    try manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "",
+        .end_encoded_value = null,
+        .group_id = 7101,
+    });
+
+    try manager.beginUniqueConstraintRangeRebuild(selector);
+    {
+        const ranges = try manager.listUniqueConstraintRanges(std.testing.allocator);
+        defer manager.freeUniqueConstraintRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings(unique_constraint_range_rebuilding, ranges[0].state);
+        try std.testing.expect(!uniqueConstraintRangeRoutable(ranges[0]));
+    }
+
+    try manager.finishUniqueConstraintRangeRebuild(selector);
+    {
+        const ranges = try manager.listUniqueConstraintRanges(std.testing.allocator);
+        defer manager.freeUniqueConstraintRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqualStrings(unique_constraint_range_active, ranges[0].state);
+        try std.testing.expect(uniqueConstraintRangeRoutable(ranges[0]));
+    }
+
+    const split_request: UniqueConstraintRangeSplitRequest = .{
+        .selector = selector,
+        .split_encoded_value = "email:m",
+        .left_group_id = 7101,
+        .right_group_id = 7102,
+    };
+    try manager.beginUniqueConstraintRangeSplit(split_request);
+    {
+        const ranges = try manager.listUniqueConstraintRanges(std.testing.allocator);
+        defer manager.freeUniqueConstraintRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings(unique_constraint_range_splitting, ranges[0].state);
+        try std.testing.expect(!uniqueConstraintRangeRoutable(ranges[0]));
+    }
+
+    try manager.finishUniqueConstraintRangeSplit(split_request);
+    {
+        const ranges = try manager.listUniqueConstraintRanges(std.testing.allocator);
+        defer manager.freeUniqueConstraintRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 2), ranges.len);
+        var saw_left = false;
+        var saw_right = false;
+        for (ranges) |record| {
+            try std.testing.expectEqualStrings(unique_constraint_range_active, record.state);
+            if (std.mem.eql(u8, record.start_encoded_value, "")) {
+                try std.testing.expectEqualStrings("email:m", record.end_encoded_value.?);
+                try std.testing.expectEqual(@as(u64, 7101), record.group_id);
+                saw_left = true;
+            } else if (std.mem.eql(u8, record.start_encoded_value, "email:m")) {
+                try std.testing.expect(record.end_encoded_value == null);
+                try std.testing.expectEqual(@as(u64, 7102), record.group_id);
+                saw_right = true;
+            }
+        }
+        try std.testing.expect(saw_left and saw_right);
+    }
+
+    const merge_request: UniqueConstraintRangeMergeRequest = .{
+        .left_selector = selector,
+        .right_start_encoded_value = "email:m",
+        .merged_group_id = 7101,
+    };
+    try manager.beginUniqueConstraintRangeMerge(merge_request);
+    {
+        const ranges = try manager.listUniqueConstraintRanges(std.testing.allocator);
+        defer manager.freeUniqueConstraintRanges(std.testing.allocator, ranges);
+        for (ranges) |record| {
+            try std.testing.expectEqualStrings(unique_constraint_range_merging, record.state);
+            try std.testing.expect(!uniqueConstraintRangeRoutable(record));
+        }
+    }
+
+    try manager.finishUniqueConstraintRangeMerge(merge_request);
+    {
+        const ranges = try manager.listUniqueConstraintRanges(std.testing.allocator);
+        defer manager.freeUniqueConstraintRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings("", ranges[0].start_encoded_value);
+        try std.testing.expect(ranges[0].end_encoded_value == null);
+        try std.testing.expectEqual(@as(u64, 7101), ranges[0].group_id);
+        try std.testing.expectEqualStrings(unique_constraint_range_active, ranges[0].state);
+    }
 }
 
 test "table manager parses placement classes and checks compatibility" {
