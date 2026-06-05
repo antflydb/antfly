@@ -689,6 +689,8 @@ test "backend runtime owner close rejects recursive submit from draining job" {
 
     const Ctx = struct {
         lane: DurableJobLane,
+        started: std.atomic.Value(bool) = .init(false),
+        allow_submit: std.atomic.Value(bool) = .init(false),
         submit_rejected: std.atomic.Value(bool) = .init(false),
         run_count: std.atomic.Value(u32) = .init(0),
         deinits: std.atomic.Value(u32) = .init(0),
@@ -697,6 +699,10 @@ test "backend runtime owner close rejects recursive submit from draining job" {
         fn run(ptr: *anyopaque) !void {
             const ctx: *Ctx = @ptrCast(@alignCast(ptr));
             _ = ctx.run_count.fetchAdd(1, .release);
+            ctx.started.store(true, .release);
+            while (!ctx.allow_submit.load(.acquire)) {
+                std.atomic.spinLoopHint();
+            }
             ctx.lane.submit(.{
                 .owner_id = 92,
                 .class = .maintenance,
@@ -729,7 +735,12 @@ test "backend runtime owner close rejects recursive submit from draining job" {
         .run = Fns.run,
         .deinit = Fns.deinit,
     });
-    handle.ptr().durable_jobs.closeOwner(92);
+    while (!ctx.started.load(.acquire)) {
+        std.atomic.spinLoopHint();
+    }
+    try handle.ptr().threaded_jobs.?.markOwnerClosing(92);
+    ctx.allow_submit.store(true, .release);
+    handle.ptr().durable_jobs.drainOwner(92);
 
     try std.testing.expect(ctx.submit_rejected.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), ctx.run_count.load(.acquire));
