@@ -199,6 +199,9 @@ pub const EmbeddingPipeline = struct {
     /// Caller owns the returned slices and must free them with the allocator.
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
         if (texts.len == 0) return try self.allocator.alloc([]f32, 0);
+        if (self.session.backend() == .onnx and texts.len > 1) {
+            return try self.embedSerial(texts);
+        }
 
         const alloc = self.allocator;
         const max_len = self.config.max_length;
@@ -308,6 +311,28 @@ pub const EmbeddingPipeline = struct {
 
         if (self.text_projection) |proj| {
             try self.projectEmbeddings(embeddings, proj);
+        }
+
+        return embeddings;
+    }
+
+    fn embedSerial(self: *EmbeddingPipeline, texts: []const []const u8) anyerror![][]f32 {
+        const embeddings = try self.allocator.alloc([]f32, texts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (embeddings[0..initialized]) |embedding| self.allocator.free(embedding);
+            self.allocator.free(embeddings);
+        }
+
+        for (texts, 0..) |_, idx| {
+            const single = try self.embed(texts[idx .. idx + 1]);
+            if (single.len != 1) {
+                freeEmbeddingSlices(self.allocator, single);
+                return error.UnexpectedOutputShape;
+            }
+            embeddings[idx] = single[0];
+            self.allocator.free(single);
+            initialized += 1;
         }
 
         return embeddings;

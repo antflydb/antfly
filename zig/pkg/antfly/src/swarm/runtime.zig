@@ -81,6 +81,7 @@ const ResolvedPaths = struct {
 
 const SwarmHealthSource = struct {
     data_server: *antfly.data.runtime.DataServer,
+    unified_api_ready: *const std.atomic.Value(bool),
 
     fn readiness(self: *SwarmHealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
@@ -98,8 +99,10 @@ const SwarmHealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *SwarmHealthSource = @ptrCast(@alignCast(ptr));
-        var data_health = antfly.data.runtime.HealthSource{ .data_server = self.data_server };
-        return data_health.readiness().check();
+        return swarmReadyFromState(
+            self.data_server.http_server != null,
+            self.unified_api_ready.load(.acquire),
+        );
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
@@ -108,6 +111,10 @@ const SwarmHealthSource = struct {
         try data_health.metricsWriter().writeMetrics(writer);
     }
 };
+
+fn swarmReadyFromState(api_server_initialized: bool, unified_api_ready: bool) bool {
+    return api_server_initialized and unified_api_ready;
+}
 
 const LocalSwarmMetadata = struct {
     alloc: std.mem.Allocator,
@@ -730,6 +737,7 @@ pub fn runFromIterator(
 
     const bind_host = public_listener.bind_host;
     const bind_port = public_listener.bind_port;
+    var unified_api_ready = std.atomic.Value(bool).init(false);
 
     const thread = std.Thread.spawn(.{}, serveUnified, .{
         alloc,
@@ -738,6 +746,7 @@ pub fn runFromIterator(
         &handler,
         &antfly_node,
         api_server,
+        &unified_api_ready,
     }) catch |err| {
         std.log.err("swarm startup failed step=spawn_unified_http err={}", .{err});
         return err;
@@ -749,6 +758,7 @@ pub fn runFromIterator(
 
     var swarm_health = SwarmHealthSource{
         .data_server = &data_server,
+        .unified_api_ready = &unified_api_ready,
     };
     const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
     const health_port = if (health_enabled)
@@ -1101,8 +1111,10 @@ fn serveUnified(
     handler: *AntflyApiHandler,
     antfly_node: ?*inference.server.Node,
     api_server: *antfly.public_api.http_server.ApiHttpServer,
+    unified_api_ready: *std.atomic.Value(bool),
 ) void {
-    serveUnifiedInner(alloc, bind_host, bind_port, handler, antfly_node, api_server) catch |err| {
+    serveUnifiedInner(alloc, bind_host, bind_port, handler, antfly_node, api_server, unified_api_ready) catch |err| {
+        unified_api_ready.store(false, .release);
         std.debug.print("unified server error: {}\n", .{err});
     };
 }
@@ -1114,6 +1126,7 @@ fn serveUnifiedInner(
     handler: *AntflyApiHandler,
     antfly_node: ?*inference.server.Node,
     api_server: *antfly.public_api.http_server.ApiHttpServer,
+    unified_api_ready: *std.atomic.Value(bool),
 ) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1146,6 +1159,7 @@ fn serveUnifiedInner(
     try registerAntfarmRoutes(&server);
 
     try server.bind();
+    unified_api_ready.store(true, .release);
 
     if (server.boundAddress()) |addr| {
         std.debug.print("swarm public api listening on http://{}\n", .{addr});
@@ -2081,6 +2095,13 @@ test "swarm public api caps keep alive request reuse" {
 
 test "swarm public api body limit matches common http listener" {
     try std.testing.expectEqual(antfly.common.http.default_max_request_bytes, public_api_max_body_size);
+}
+
+test "swarm readiness follows api initialization and unified listener" {
+    try std.testing.expect(!swarmReadyFromState(false, false));
+    try std.testing.expect(!swarmReadyFromState(false, true));
+    try std.testing.expect(!swarmReadyFromState(true, false));
+    try std.testing.expect(swarmReadyFromState(true, true));
 }
 
 test "parse cli accepts inference budget overrides" {
