@@ -54,6 +54,7 @@ const tests = [_]common.TestSpec{
         .root_source_file = "src/finetune/test/test_gliner2_run_validation.zig",
         .description = "Run GLiNER2 autodiff training artifact and metrics validation tests",
         .imports = &.{ .build_options, .inference_internal },
+        .native_link = .default,
     },
     .{
         .step_name = "test-entity-cleanup-data",
@@ -65,6 +66,7 @@ const tests = [_]common.TestSpec{
         .root_source_file = "src/test_entity_cleanup_model.zig",
         .description = "Run isolated learned entity cleanup model tests",
         .imports = &.{ .build_options, .inference_hf_tokenizer },
+        .native_link = .default,
     },
     .{
         .step_name = "test-entity-cleanup-gliner-cache",
