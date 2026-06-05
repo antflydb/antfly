@@ -572,6 +572,51 @@ test "std http listener and executor round-trip raft batch route" {
     try std.testing.expectEqual(@as(usize, 1), handler.seen);
 }
 
+test "std http executor enforces request timeout while waiting for response" {
+    const std_http_executor = @import("std_http_executor.zig");
+
+    const SlowApp = struct {
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+            _ = req;
+            sleepMs(50);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "late"),
+            };
+        }
+    };
+
+    var app = SlowApp{};
+    var listener = StdHttpListener.init(std.testing.allocator, .{}, app.iface());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/slow", .{base_uri});
+    defer std.testing.allocator.free(uri);
+
+    var executor: std_http_executor.StdHttpExecutor = undefined;
+    executor.initInPlace(std.testing.allocator, .{});
+    defer executor.deinit();
+
+    try std.testing.expectError(error.Timeout, executor.executor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = uri,
+        .timeout_ms = 5,
+    }));
+}
+
 test "std http listener and executor round-trip snapshot routes" {
     const raft_engine = @import("raft_engine");
     const http_server = @import("../../raft/transport/http_server.zig");

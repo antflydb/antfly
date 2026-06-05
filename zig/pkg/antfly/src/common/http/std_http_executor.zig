@@ -125,6 +125,71 @@ pub const StdHttpExecutor = struct {
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         const self: *StdHttpExecutor = @ptrCast(@alignCast(ptr));
+        if (req.timeout_ms) |timeout_ms| {
+            return try self.executeWithTimeout(alloc, req, timeout_ms);
+        }
+        return try self.executeDirect(alloc, req);
+    }
+
+    fn executeWithTimeout(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest, timeout_ms: u32) !common.HttpResponse {
+        if (timeout_ms == 0) return error.Timeout;
+
+        const RequestResult = anyerror!common.HttpResponse;
+        const TimeoutResult = anyerror!void;
+        const SelectResult = union(enum) {
+            request: RequestResult,
+            timeout: TimeoutResult,
+        };
+
+        const Task = struct {
+            fn requestTask(http_executor: *StdHttpExecutor, request_alloc: std.mem.Allocator, request: common.HttpRequest) RequestResult {
+                return http_executor.executeDirect(request_alloc, request);
+            }
+
+            fn timeoutTask(io: std.Io, timeout: std.Io.Timeout) TimeoutResult {
+                return timeout.sleep(io);
+            }
+
+            fn drainLateResult(result: SelectResult, response_alloc: std.mem.Allocator) void {
+                switch (result) {
+                    .request => |request_result| {
+                        if (request_result) |response_value| {
+                            var response = response_value;
+                            response.deinit(response_alloc);
+                        } else |_| {}
+                    },
+                    .timeout => {},
+                }
+            }
+        };
+
+        const io = self.io_impl.io();
+        var select_buffer: [2]SelectResult = undefined;
+        var select = std.Io.Select(SelectResult).init(io, &select_buffer);
+        try select.concurrent(.request, Task.requestTask, .{ self, alloc, req });
+        select.async(.timeout, Task.timeoutTask, .{
+            io,
+            std.Io.Timeout{ .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
+                .clock = .awake,
+            } },
+        });
+
+        const first = try select.await();
+        switch (first) {
+            .request => |request_result| {
+                select.cancelDiscard();
+                return try request_result;
+            },
+            .timeout => |timeout_result| {
+                try timeout_result;
+                while (select.cancel()) |late| Task.drainLateResult(late, alloc);
+                return error.Timeout;
+            },
+        }
+    }
+
+    fn executeDirect(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         try self.beginRequest();
         defer self.endRequest();
 
