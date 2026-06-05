@@ -1593,10 +1593,7 @@ fn resolveSpanLabelPositiveWeights(
         const label = std.mem.trim(u8, item[0..eq_idx], " \t\r\n");
         const value_text = std.mem.trim(u8, item[eq_idx + 1 ..], " \t\r\n");
         if (label.len == 0 or value_text.len == 0) return error.InvalidSpanLabelPositiveWeights;
-        const label_idx = indexOfEntityLabel(entity_labels, label) orelse {
-            print("error: unknown label in --span-label-positive-weights: {s}\n", .{label});
-            return error.UnknownSpanLabelPositiveWeight;
-        };
+        const label_idx = indexOfEntityLabel(entity_labels, label) orelse return error.UnknownSpanLabelPositiveWeight;
         if (seen[label_idx]) return error.DuplicateSpanLabelPositiveWeight;
         const weight = try std.fmt.parseFloat(f32, value_text);
         if (!std.math.isFinite(weight) or weight <= 0.0) return error.InvalidSpanPositiveWeight;

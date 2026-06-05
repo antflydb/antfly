@@ -204,6 +204,14 @@ For v1:
   `on_update: "no_action"` validate the final reverse-reference state for parent
   deletes and referenced unique tuple changes; `restrict` remains restrictive
   and is never relaxed into deferred `no_action` semantics.
+  Transaction participants can carry a durable
+  `foreign_key_constraint_timing_overrides` prepare field for named constraints.
+  The production-supported override shape is intentionally narrow: an enforced
+  schema-deferred FK may be forced to `immediate` for that transaction. The
+  override is persisted as a transaction metadata intent, collected during
+  intent resolution/recovery, and applied to the relational participant before
+  row intents are replayed, so recovery sees the same effective timing as the
+  original prepare.
   Distributed/routed child writes and
   reference-changing transforms externalize deferred parent-existence checks
   through exact prepare-time proof records: the coordinator registers the
@@ -1652,6 +1660,9 @@ Implemented:
 - deferred `on_update: "no_action"` checks referenced unique parent tuple
   changes against the final reverse-reference state, so parent updates and child
   reference rewrites can be prepared in either order;
+- transaction-level timing overrides for named schema-deferred constraints can
+  force `immediate` behavior and are persisted with transaction intents so
+  replay/recovery uses the same effective timing;
 - distributed/routed child writes and reference-changing transforms register
   parent or unique-owner participants and carry exact deferred proof records to
   child participants, so the child side skips only the FK reference that the

@@ -857,6 +857,11 @@ pub const ForeignKeyParentCheck = struct {
     timing: Timing = .immediate,
 };
 
+pub const ForeignKeyConstraintTimingOverride = struct {
+    constraint_name: []const u8,
+    timing: ForeignKeyParentCheck.Timing,
+};
+
 pub const ForeignKeyParentDeleteCheck = struct {
     pub const Operation = enum(u8) {
         delete,
@@ -955,6 +960,7 @@ pub const TransactionIntentRequest = struct {
     foreign_key_ref_writes: []const ForeignKeyRefMutation = &.{},
     foreign_key_ref_deletes: []const ForeignKeyRefMutation = &.{},
     foreign_key_externalized_parent_checks: []const ForeignKeyParentCheck = &.{},
+    foreign_key_constraint_timing_overrides: []const ForeignKeyConstraintTimingOverride = &.{},
     unique_constraint_writes: []const UniqueConstraintMutation = &.{},
     unique_constraint_deletes: []const UniqueConstraintMutation = &.{},
     foreign_key_parent_checks_externalized: bool = false,

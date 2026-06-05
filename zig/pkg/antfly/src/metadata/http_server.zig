@@ -422,12 +422,15 @@ pub const AdminSource = struct {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
         var normalized_req = req;
         const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
         const prepared_indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
         defer alloc.free(prepared_indexes_json);
         normalized_req.indexes_json = prepared_indexes_json;
         const table = tables_api.deriveTableRecord(table_name, normalized_req);
+        try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, table);
         const ranges = try tables_api.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
@@ -463,6 +466,7 @@ pub const AdminSource = struct {
 
         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
+        try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
         try svc.upsertTable(updated);
         try flushMetadataServiceMutation(svc);
     }
@@ -661,12 +665,15 @@ pub const AdminSource = struct {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
         var normalized_req = req;
         const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
         const prepared_indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
         defer alloc.free(prepared_indexes_json);
         normalized_req.indexes_json = prepared_indexes_json;
         const table = tables_api.deriveTableRecord(table_name, normalized_req);
+        try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, table);
         const ranges = try tables_api.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
@@ -705,6 +712,7 @@ pub const AdminSource = struct {
 
         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
+        try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
         try svc.upsertTable(updated);
         try flushMetadataHttpServiceMutation(svc);
     }
@@ -2571,6 +2579,148 @@ fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []co
         if (std.mem.eql(u8, table.name, table_name)) return table;
     }
     return null;
+}
+
+fn validateRelationalForeignKeyCatalogReferences(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    candidate_table: metadata_table_manager.TableRecord,
+) !void {
+    if (candidate_table.schema_json.len == 0) return;
+    var parsed_child = try tables_api.parseValidatedTableSchema(alloc, candidate_table.schema_json);
+    defer parsed_child.deinit(alloc);
+    const child_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_child);
+    defer storage_schema.freeSchema(alloc, child_schema);
+    if (child_schema.storage_mode != .relational) return;
+
+    for (child_schema.foreign_keys) |foreign_key| {
+        const parent_table_name = if (std.mem.eql(u8, foreign_key.parent_table, child_schema.default_type))
+            candidate_table.name
+        else
+            foreign_key.parent_table;
+        const parent_table = if (std.mem.eql(u8, parent_table_name, candidate_table.name))
+            candidate_table
+        else
+            (findTableByName(snapshot, parent_table_name) orelse return error.InvalidSchemaUpdateRequest).*;
+
+        var parsed_parent = try tables_api.parseValidatedTableSchema(alloc, parent_table.schema_json);
+        defer parsed_parent.deinit(alloc);
+        const parent_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_parent);
+        defer storage_schema.freeSchema(alloc, parent_schema);
+        if (parent_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
+
+        if (foreignKeyReferencesPrimaryKey(foreign_key)) continue;
+        _ = findUniqueConstraintByColumns(parent_schema.unique_constraints, foreign_key.parent_columns) orelse return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.child_columns.len != foreign_key.parent_columns.len) return error.InvalidSchemaUpdateRequest;
+        for (foreign_key.child_columns, foreign_key.parent_columns) |child_column_name, parent_column_name| {
+            const child_column = findRelationalColumn(child_schema.relational_columns, child_column_name) orelse return error.InvalidSchemaUpdateRequest;
+            const parent_column = findRelationalColumn(parent_schema.relational_columns, parent_column_name) orelse return error.InvalidSchemaUpdateRequest;
+            if (child_column.field_type != parent_column.field_type) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn foreignKeyReferencesPrimaryKey(foreign_key: storage_schema.ForeignKey) bool {
+    return foreign_key.parent_columns.len == 1 and std.mem.eql(u8, foreign_key.parent_columns[0], "_id");
+}
+
+fn findUniqueConstraintByColumns(constraints: []const storage_schema.UniqueConstraint, columns: []const []const u8) ?storage_schema.UniqueConstraint {
+    for (constraints) |constraint| {
+        if (stringSlicesEqual(constraint.columns, columns)) return constraint;
+    }
+    return null;
+}
+
+fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+fn findRelationalColumn(columns: []const storage_schema.RelationalColumn, name: []const u8) ?storage_schema.RelationalColumn {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.name, name)) return column;
+    }
+    return null;
+}
+
+test "metadata catalog validation requires cross-table foreign keys to reference parent unique columns" {
+    const orders: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "orders",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_email":{"type":"keyword"},"region":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_email_fkey","columns":["customer_email","region"],"references":{"table":"customers","columns":["email","region"]}}]}
+        ,
+        .placement_role = "data",
+    };
+    const customers_without_unique: metadata_table_manager.TableRecord = .{
+        .table_id = 8,
+        .name = "customers",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"},"region":{"type":"keyword"}},"additionalProperties":false}}}}
+        ,
+        .placement_role = "data",
+    };
+    const customers_with_unique: metadata_table_manager.TableRecord = .{
+        .table_id = 8,
+        .name = "customers",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"},"region":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"customers_email_region_key","columns":["email","region"]}]}
+        ,
+        .placement_role = "data",
+    };
+    const customers_type_mismatch: metadata_table_manager.TableRecord = .{
+        .table_id = 8,
+        .name = "customers",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"numeric"},"region":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"customers_email_region_key","columns":["email","region"]}]}
+        ,
+        .placement_role = "data",
+    };
+
+    var missing_unique_tables = [_]metadata_table_manager.TableRecord{customers_without_unique};
+    var missing_unique_snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = missing_unique_tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &missing_unique_snapshot, orders),
+    );
+
+    var valid_parent_tables = [_]metadata_table_manager.TableRecord{customers_with_unique};
+    var valid_parent_snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = valid_parent_tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    try validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &valid_parent_snapshot, orders);
+
+    var type_mismatch_tables = [_]metadata_table_manager.TableRecord{customers_type_mismatch};
+    var type_mismatch_snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = type_mismatch_tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &type_mismatch_snapshot, orders),
+    );
 }
 
 fn findRangeForKey(ranges: []const metadata_table_manager.RangeRecord, table_id: u64, key: []const u8) ?u64 {

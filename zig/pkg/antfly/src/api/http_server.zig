@@ -3178,13 +3178,6 @@ pub const ApiHttpServer = struct {
                         },
                         else => return err,
                     };
-                    self.waitForProjectedTableWriteQuorum(table_path.table_name) catch |err| switch (err) {
-                        error.TableVisibilityTimeout => {
-                            std.log.err("public create table write quorum timed out table={s}", .{table_path.table_name});
-                            return try textResponse(self.alloc, 500, "table create did not converge");
-                        },
-                        else => return err,
-                    };
                 } else {
                     const metadata_wait_handled = self.source.waitTableLifecycle(table_path.table_name, .present) catch |err| lifecycle: {
                         break :lifecycle switch (err) {

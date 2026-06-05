@@ -210,6 +210,7 @@ const foreign_key_action_schedule_key_prefix = "\x00\x00__metadata__:foreign_key
 const unique_constraint_integrity_progress_key_prefix = "\x00\x00__metadata__:unique_constraint_integrity_progress";
 const foreign_key_parent_checks_externalized_intent_key_prefix = "\x00\x00__metadata__:txn_fk_parent_checks_externalized:";
 const foreign_key_externalized_parent_check_intent_key_prefix = "\x00\x00__metadata__:txn_fk_externalized_parent_check:";
+const foreign_key_constraint_timing_override_intent_key_prefix = "\x00\x00__metadata__:txn_fk_constraint_timing:";
 pub const ReplayProgress = struct {
     sequence: u64 = 0,
     target_sequence: u64 = 0,
@@ -6274,8 +6275,9 @@ pub const DB = struct {
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
         var effective_ops = try coalesceKeyValueRequest(self, types.TransactionWrite, req.writes, req.deletes, req.transforms);
         defer effective_ops.deinit(self.alloc);
+        try self.validateForeignKeyConstraintTimingOverrides(req.foreign_key_constraint_timing_overrides);
         if (req.foreign_key_parent_checks_externalized or req.foreign_key_externalized_parent_checks.len > 0) {
-            try self.validateExternalizedForeignKeyParentChecks(req.foreign_key_externalized_parent_checks, effective_ops.writes);
+            try self.validateExternalizedForeignKeyParentChecks(req.foreign_key_externalized_parent_checks, req.foreign_key_constraint_timing_overrides, effective_ops.writes);
         }
         try self.validateForeignKeyParentChecks(req.foreign_key_parent_checks, effective_ops.writes, effective_ops.deletes, req.unique_constraint_writes, req.unique_constraint_deletes);
         try self.validateForeignKeyRefMutations(req.foreign_key_ref_writes);
@@ -6356,7 +6358,7 @@ pub const DB = struct {
             monotonicTimeNs(),
         );
         try self.validateUniqueConstraintMutations(req.unique_constraint_writes, req.unique_constraint_deletes);
-        try self.validateForeignKeyParentDeleteChecks(req.foreign_key_parent_delete_checks, effective_ops.writes, effective_ops.deletes, req.foreign_key_ref_writes, req.foreign_key_ref_deletes);
+        try self.validateForeignKeyParentDeleteChecks(req.foreign_key_parent_delete_checks, req.foreign_key_constraint_timing_overrides, effective_ops.writes, effective_ops.deletes, req.foreign_key_ref_writes, req.foreign_key_ref_deletes);
         var owned_fk_ref_keys = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (owned_fk_ref_keys.items) |key| self.alloc.free(key);
@@ -6392,6 +6394,13 @@ pub const DB = struct {
             &owned_metadata_keys,
             &owned_metadata_values,
             req.foreign_key_externalized_parent_checks,
+        );
+        try self.appendForeignKeyConstraintTimingOverrideIntents(
+            txn_id,
+            &intents,
+            &owned_metadata_keys,
+            &owned_metadata_values,
+            req.foreign_key_constraint_timing_overrides,
         );
 
         try self.writeIntents(txn_id, intents.items, predicates.items);
@@ -6462,6 +6471,25 @@ pub const DB = struct {
             const key = try foreignKeyExternalizedParentCheckIntentKeyAlloc(self.alloc, txn_id, check);
             errdefer self.alloc.free(key);
             const value = try encodeForeignKeyExternalizedParentCheckIntentValueAlloc(self.alloc, check);
+            errdefer self.alloc.free(value);
+            try owned_keys.append(self.alloc, key);
+            try owned_values.append(self.alloc, value);
+            try intents.append(self.alloc, .{ .key = key, .value = value });
+        }
+    }
+
+    fn appendForeignKeyConstraintTimingOverrideIntents(
+        self: *DB,
+        txn_id: types.TxnId,
+        intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        overrides: []const types.ForeignKeyConstraintTimingOverride,
+    ) !void {
+        for (overrides) |override| {
+            const key = try foreignKeyConstraintTimingOverrideIntentKeyAlloc(self.alloc, txn_id, override);
+            errdefer self.alloc.free(key);
+            const value = try encodeForeignKeyConstraintTimingOverrideIntentValueAlloc(self.alloc, override);
             errdefer self.alloc.free(value);
             try owned_keys.append(self.alloc, key);
             try owned_values.append(self.alloc, value);
@@ -6839,6 +6867,7 @@ pub const DB = struct {
     fn validateExternalizedForeignKeyParentChecks(
         self: *DB,
         checks: []const types.ForeignKeyParentCheck,
+        constraint_timing_overrides: []const types.ForeignKeyConstraintTimingOverride,
         writes: []const types.TransactionWrite,
     ) !void {
         const runtime_schema = self.core.schema orelse {
@@ -6853,7 +6882,7 @@ pub const DB = struct {
             if (check.constraint_name.len == 0 or check.child_table.len == 0 or check.child_key.len == 0 or check.parent_table.len == 0 or check.parent_key.len == 0) return error.ForeignKeyViolation;
             const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, check.constraint_name) orelse return error.ForeignKeyViolation;
             if (foreign_key.validation_state != .enforced) return error.ForeignKeyViolation;
-            if (check.timing != foreignKeyParentCheckTiming(foreign_key)) return error.ForeignKeyViolation;
+            if (check.timing != effectiveForeignKeyParentCheckTiming(foreign_key, constraint_timing_overrides)) return error.ForeignKeyViolation;
             if (!std.mem.eql(u8, check.child_table, runtime_schema.default_type)) return error.ForeignKeyViolation;
             if (!std.mem.eql(u8, check.parent_table, foreign_key.parent_table)) return error.ForeignKeyViolation;
             if (!isForeignKeyExternalDocKey(check.child_key)) return error.ForeignKeyViolation;
@@ -6871,7 +6900,7 @@ pub const DB = struct {
         }
         if (writes.len == 0) return;
         for (runtime_schema.foreign_keys) |foreign_key| {
-            if (foreign_key.validation_state != .enforced or foreign_key.timing != .deferred) continue;
+            if (foreign_key.validation_state != .enforced or effectiveForeignKeyParentCheckTiming(foreign_key, constraint_timing_overrides) != .deferred) continue;
             for (writes) |write| {
                 if (isMetadataKey(write.key) or internal_keys.isInternalPhysicalTableDataKey(write.key)) continue;
                 const parent_key = (try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema.relational_columns, foreign_key, write.value)) orelse continue;
@@ -6898,6 +6927,35 @@ pub const DB = struct {
             return true;
         }
         return false;
+    }
+
+    fn validateForeignKeyConstraintTimingOverrides(
+        self: *DB,
+        overrides: []const types.ForeignKeyConstraintTimingOverride,
+    ) !void {
+        if (overrides.len == 0) return;
+        const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
+        if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
+        for (overrides, 0..) |override, i| {
+            if (override.constraint_name.len == 0) return error.ForeignKeyViolation;
+            if (override.timing != .immediate) return error.ForeignKeyViolation;
+            for (overrides[0..i]) |previous| {
+                if (std.mem.eql(u8, previous.constraint_name, override.constraint_name)) return error.ForeignKeyViolation;
+            }
+            const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, override.constraint_name) orelse return error.ForeignKeyViolation;
+            if (foreign_key.validation_state != .enforced) return error.ForeignKeyViolation;
+            if (foreign_key.timing != .deferred) return error.ForeignKeyViolation;
+        }
+    }
+
+    fn effectiveForeignKeyParentCheckTiming(
+        foreign_key: schema_mod.ForeignKey,
+        overrides: []const types.ForeignKeyConstraintTimingOverride,
+    ) types.ForeignKeyParentCheck.Timing {
+        for (overrides) |override| {
+            if (std.mem.eql(u8, override.constraint_name, foreign_key.name)) return override.timing;
+        }
+        return foreignKeyParentCheckTiming(foreign_key);
     }
 
     fn foreignKeyParentCheckTiming(foreign_key: schema_mod.ForeignKey) types.ForeignKeyParentCheck.Timing {
@@ -6932,6 +6990,7 @@ pub const DB = struct {
     fn validateForeignKeyParentDeleteChecks(
         self: *DB,
         checks: []const types.ForeignKeyParentDeleteCheck,
+        constraint_timing_overrides: []const types.ForeignKeyConstraintTimingOverride,
         writes: []const types.TransactionWrite,
         deletes: []const []const u8,
         ref_writes: []const types.ForeignKeyRefMutation,
@@ -6944,7 +7003,7 @@ pub const DB = struct {
             if (check.constraint_name.len == 0 or check.parent_table.len == 0 or check.parent_key.len == 0) return error.ForeignKeyViolation;
             const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, check.constraint_name) orelse return error.ForeignKeyViolation;
             if (foreign_key.validation_state != .enforced) return error.ForeignKeyViolation;
-            if (check.timing != foreignKeyParentCheckTiming(foreign_key)) return error.ForeignKeyViolation;
+            if (check.timing != effectiveForeignKeyParentCheckTiming(foreign_key, constraint_timing_overrides)) return error.ForeignKeyViolation;
             switch (check.operation) {
                 .delete => if (!foreignKeyDeleteActionRestricts(foreign_key)) continue,
                 .update => if (!foreignKeyUpdateActionRestricts(foreign_key)) continue,
@@ -7187,6 +7246,12 @@ pub const DB = struct {
                     &relational_skip_intent_keys,
                 );
                 defer freeExternalizedForeignKeyParentChecks(self.alloc, externalized_fk_parent_checks);
+                const fk_constraint_timing_overrides = try collectTransactionForeignKeyConstraintTimingOverridesAlloc(
+                    self.alloc,
+                    mutations,
+                    &relational_skip_intent_keys,
+                );
+                defer freeRelationalForeignKeyConstraintTimingOverrides(self.alloc, fk_constraint_timing_overrides);
                 var relational_intent_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
                 defer relational_intent_delete_keys.deinit(self.alloc);
                 for (mutations) |mutation| {
@@ -7217,6 +7282,7 @@ pub const DB = struct {
                     relational_table_name = runtime_schema.default_type;
                     relational_participant.configureForeignKeys(runtime_schema.default_type, runtime_schema.foreign_keys, relational_intent_delete_keys.items, foreign_key_parent_checks_externalized);
                     relational_participant.configureExternalizedForeignKeyParentChecks(externalized_fk_parent_checks);
+                    relational_participant.configureForeignKeyConstraintTimingOverrides(fk_constraint_timing_overrides);
                     relational_participant.configureUniqueConstraints(runtime_schema.unique_constraints);
                 }
                 var relational_participant_prepared = false;
@@ -11305,8 +11371,8 @@ pub const DB = struct {
         const has_diagnostics = violation_samples_json != null or violation_sample_count != null or violations_truncated != null;
         const pass_has_violations = !valid or
             foreignKeyIntegrityReportHasViolations(report) or
-            (violation_sample_count orelse existing.violation_sample_count) > 0 or
-            (violations_truncated orelse existing.violations_truncated);
+            (violation_sample_count orelse 0) > 0 or
+            (violations_truncated orelse false);
 
         const record = ForeignKeyIntegrityJobRecord{
             .job_id = existing.job_id,
@@ -18521,6 +18587,15 @@ fn foreignKeyExternalizedParentCheckIntentKeyAlloc(alloc: Allocator, txn_id: tra
     return try out.toOwnedSlice(alloc);
 }
 
+fn foreignKeyConstraintTimingOverrideIntentKeyAlloc(alloc: Allocator, txn_id: transactions_mod.TxnId, override: types.ForeignKeyConstraintTimingOverride) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, foreign_key_constraint_timing_override_intent_key_prefix);
+    try appendHexBytes(alloc, &out, txn_id[0..]);
+    try appendHexField(alloc, &out, override.constraint_name);
+    return try out.toOwnedSlice(alloc);
+}
+
 fn appendHexField(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
     try out.append(alloc, ':');
     try appendHexBytes(alloc, out, value);
@@ -18541,6 +18616,10 @@ fn isForeignKeyParentChecksExternalizedIntentKey(key: []const u8) bool {
 
 fn isForeignKeyExternalizedParentCheckIntentKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, foreign_key_externalized_parent_check_intent_key_prefix);
+}
+
+fn isForeignKeyConstraintTimingOverrideIntentKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, foreign_key_constraint_timing_override_intent_key_prefix);
 }
 
 fn transactionMutationsHaveForeignKeyParentChecksExternalizedMarker(mutations: []const transactions_mod.OwnedIntentMutation) bool {
@@ -18580,6 +18659,21 @@ fn encodeForeignKeyExternalizedParentCheckIntentValueAlloc(alloc: Allocator, che
     return try out.toOwnedSlice(alloc);
 }
 
+fn encodeForeignKeyConstraintTimingOverrideIntentValueAlloc(alloc: Allocator, override: types.ForeignKeyConstraintTimingOverride) ![]u8 {
+    const timing = switch (override.timing) {
+        .immediate => "immediate",
+        .deferred => "deferred",
+    };
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"constraint_name\":{f},\"timing\":{f}}}",
+        .{
+            std.json.fmt(override.constraint_name, .{}),
+            std.json.fmt(timing, .{}),
+        },
+    );
+}
+
 fn collectTransactionExternalizedForeignKeyParentChecksAlloc(
     alloc: Allocator,
     mutations: []const transactions_mod.OwnedIntentMutation,
@@ -18606,6 +18700,36 @@ fn collectTransactionExternalizedForeignKeyParentChecksAlloc(
         skip_key_owned = false;
         try out.append(alloc, check);
         check_owned = false;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn collectTransactionForeignKeyConstraintTimingOverridesAlloc(
+    alloc: Allocator,
+    mutations: []const transactions_mod.OwnedIntentMutation,
+    skip_keys: *std.ArrayListUnmanaged([]const u8),
+) ![]relational_store_mod.ForeignKeyConstraintTimingOverride {
+    var out = std.ArrayListUnmanaged(relational_store_mod.ForeignKeyConstraintTimingOverride).empty;
+    errdefer {
+        for (out.items) |*override| freeRelationalForeignKeyConstraintTimingOverride(alloc, override);
+        out.deinit(alloc);
+    }
+    for (mutations) |mutation| {
+        if (!isForeignKeyConstraintTimingOverrideIntentKey(mutation.key)) continue;
+        const raw = mutation.value orelse continue;
+        const override = try parseForeignKeyConstraintTimingOverrideIntentValueAlloc(alloc, raw);
+        var override_owned = true;
+        errdefer if (override_owned) {
+            var owned = override;
+            freeRelationalForeignKeyConstraintTimingOverride(alloc, &owned);
+        };
+        const skip_key = try alloc.dupe(u8, mutation.key);
+        var skip_key_owned = true;
+        errdefer if (skip_key_owned) alloc.free(skip_key);
+        try skip_keys.append(alloc, skip_key);
+        skip_key_owned = false;
+        try out.append(alloc, override);
+        override_owned = false;
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -18645,6 +18769,23 @@ fn parseForeignKeyExternalizedParentCheckIntentValueAlloc(alloc: Allocator, raw:
     };
 }
 
+fn parseForeignKeyConstraintTimingOverrideIntentValueAlloc(alloc: Allocator, raw: []const u8) !relational_store_mod.ForeignKeyConstraintTimingOverride {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.ForeignKeyViolation,
+    };
+    const timing = jsonObjectString(obj, "timing") orelse return error.ForeignKeyViolation;
+    if (!std.mem.eql(u8, timing, "deferred") and !std.mem.eql(u8, timing, "immediate")) return error.ForeignKeyViolation;
+    const constraint_name = try alloc.dupe(u8, jsonObjectString(obj, "constraint_name") orelse return error.ForeignKeyViolation);
+    errdefer alloc.free(constraint_name);
+    return .{
+        .constraint_name = constraint_name,
+        .timing = if (std.mem.eql(u8, timing, "deferred")) .deferred else .immediate,
+    };
+}
+
 fn jsonObjectString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = obj.get(key) orelse return null;
     return switch (value) {
@@ -18666,6 +18807,16 @@ fn freeExternalizedForeignKeyParentCheck(alloc: Allocator, check: *relational_st
     alloc.free(@constCast(check.parent_key));
     if (check.parent_constraint_name) |name| alloc.free(@constCast(name));
     check.* = undefined;
+}
+
+fn freeRelationalForeignKeyConstraintTimingOverrides(alloc: Allocator, overrides: []relational_store_mod.ForeignKeyConstraintTimingOverride) void {
+    for (overrides) |*override| freeRelationalForeignKeyConstraintTimingOverride(alloc, override);
+    if (overrides.len > 0) alloc.free(overrides);
+}
+
+fn freeRelationalForeignKeyConstraintTimingOverride(alloc: Allocator, override: *relational_store_mod.ForeignKeyConstraintTimingOverride) void {
+    alloc.free(@constCast(override.constraint_name));
+    override.* = undefined;
 }
 
 fn shouldWriteTimestamp(key: []const u8) bool {
@@ -47687,6 +47838,68 @@ test "db deferred foreign keys validate at local transaction commit and reject e
     const exact_child = (try db.get(alloc, "aa-order:exact-externalized")) orelse return error.TestExpectedEqual;
     defer alloc.free(exact_child);
     try std.testing.expectEqualStrings("{\"id\":\"aa-order:exact-externalized\",\"customer_id\":\"zz-customer:exact-externalized\"}", exact_child);
+}
+
+test "db transaction foreign key timing override survives intent resolution" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"manager_email":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"row_email_key","columns":["email"]}],"foreign_keys":[{"name":"row_manager_email_fkey","columns":["manager_email"],"references":{"table":"row","columns":["email"]},"on_update":"no_action","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "aa-parent:deferred", .value = "{\"id\":\"aa-parent:deferred\",\"email\":\"old-a\"}" },
+            .{ .key = "zz-child:deferred", .value = "{\"id\":\"zz-child:deferred\",\"manager_email\":\"old-a\"}" },
+            .{ .key = "aa-parent:forced", .value = "{\"id\":\"aa-parent:forced\",\"email\":\"old-b\"}" },
+            .{ .key = "zz-child:forced", .value = "{\"id\":\"zz-child:forced\",\"manager_email\":\"old-b\"}" },
+        },
+        .timestamp_ns = 15_000,
+    });
+
+    const deferred_txn = try db.beginTransaction(15_100);
+    try db.writeTransaction(deferred_txn, .{
+        .writes = &.{
+            .{ .key = "aa-parent:deferred", .value = "{\"id\":\"aa-parent:deferred\",\"email\":\"new-a\"}" },
+            .{ .key = "zz-child:deferred", .value = "{\"id\":\"zz-child:deferred\",\"manager_email\":\"new-a\"}" },
+        },
+    });
+    try db.resolveTransactionIntents(deferred_txn, .committed, 15_101);
+
+    const deferred_child = (try db.get(alloc, "zz-child:deferred")) orelse return error.TestExpectedEqual;
+    defer alloc.free(deferred_child);
+    try std.testing.expectEqualStrings("{\"id\":\"zz-child:deferred\",\"manager_email\":\"new-a\"}", deferred_child);
+
+    const forced_txn = try db.beginTransaction(15_200);
+    try db.writeTransaction(forced_txn, .{
+        .writes = &.{
+            .{ .key = "aa-parent:forced", .value = "{\"id\":\"aa-parent:forced\",\"email\":\"new-b\"}" },
+            .{ .key = "zz-child:forced", .value = "{\"id\":\"zz-child:forced\",\"manager_email\":\"new-b\"}" },
+        },
+        .foreign_key_constraint_timing_overrides = &.{.{
+            .constraint_name = "row_manager_email_fkey",
+            .timing = .immediate,
+        }},
+    });
+    try std.testing.expectError(error.ForeignKeyViolation, db.resolveTransactionIntents(forced_txn, .committed, 15_201));
+    try db.abortTransaction(forced_txn, 15_202);
+
+    const forced_parent = (try db.get(alloc, "aa-parent:forced")) orelse return error.TestExpectedEqual;
+    defer alloc.free(forced_parent);
+    try std.testing.expectEqualStrings("{\"id\":\"aa-parent:forced\",\"email\":\"old-b\"}", forced_parent);
 }
 
 test "db deferred foreign keys preserve exact externalized unique parent proofs through commit" {

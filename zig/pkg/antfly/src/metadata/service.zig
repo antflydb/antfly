@@ -2201,6 +2201,7 @@ pub const MetadataService = struct {
             replica_root_dir,
             api_table_catalog.CatalogSource.fromMetadataService(self),
         );
+        defer write_source.deinit();
         write_source.backend_runtime = try self.ensureBackendRuntime();
         _ = write_source.withSecretStore(self.secret_store);
         for (0..foreignKeySchemaControllerFollowupBudget(self.foreign_key_schema_controller)) |_| {
@@ -4531,10 +4532,10 @@ test "metadata fk schema controller config builds bounded maintenance options" {
         .results = invalid_table_results[0..],
     });
     const status_with_report = runtime_status.snapshot(cfg);
-    try std.testing.expectEqual(@as(u64, 2), status_with_report.rounds_total);
+    try std.testing.expectEqual(@as(u64, 3), status_with_report.rounds_total);
     try std.testing.expectEqual(@as(u64, 6), status_with_report.missing_parent_rows_total);
-    try std.testing.expectEqual(@as(u64, 3), status_with_report.missing_ref_rows_total);
-    try std.testing.expectEqual(@as(u64, 4), status_with_report.stale_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 8), status_with_report.missing_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 10), status_with_report.stale_ref_rows_total);
     try std.testing.expectEqual(@as(u64, 2), status_with_report.last_missing_parent_rows);
     try std.testing.expectEqual(@as(u64, 1), status_with_report.last_missing_ref_rows);
     try std.testing.expectEqual(@as(u64, 3), status_with_report.last_stale_ref_rows);

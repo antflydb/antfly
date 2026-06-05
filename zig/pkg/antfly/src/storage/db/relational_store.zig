@@ -73,6 +73,11 @@ pub const ExternalizedForeignKeyParentCheck = struct {
     timing: schema_mod.ForeignKeyTiming = .immediate,
 };
 
+pub const ForeignKeyConstraintTimingOverride = struct {
+    constraint_name: []const u8,
+    timing: schema_mod.ForeignKeyTiming,
+};
+
 pub const ForeignKeyIntegrityReport = struct {
     scanned_child_rows: u64 = 0,
     referenced_child_rows: u64 = 0,
@@ -236,6 +241,7 @@ pub const WriteParticipant = struct {
     planned_delete_keys: []const []const u8 = &.{},
     parent_checks_externalized: bool = false,
     externalized_parent_checks: []const ExternalizedForeignKeyParentCheck = &.{},
+    constraint_timing_overrides: []const ForeignKeyConstraintTimingOverride = &.{},
     pending_fk_parent_checks: std.ArrayListUnmanaged(PendingForeignKeyParentCheck) = .empty,
     pending_fk_reference_absence_checks: std.ArrayListUnmanaged(PendingForeignKeyReferenceAbsenceCheck) = .empty,
     set_null_update_count: usize = 0,
@@ -300,6 +306,13 @@ pub const WriteParticipant = struct {
         externalized_parent_checks: []const ExternalizedForeignKeyParentCheck,
     ) void {
         self.externalized_parent_checks = externalized_parent_checks;
+    }
+
+    pub fn configureForeignKeyConstraintTimingOverrides(
+        self: *WriteParticipant,
+        constraint_timing_overrides: []const ForeignKeyConstraintTimingOverride,
+    ) void {
+        self.constraint_timing_overrides = constraint_timing_overrides;
     }
 
     pub fn configureUniqueConstraints(
@@ -384,6 +397,21 @@ pub const WriteParticipant = struct {
 
     fn effectiveTableName(self: *const WriteParticipant) []const u8 {
         return if (self.table_name.len > 0) self.table_name else "_default";
+    }
+
+    fn effectiveForeignKeyTiming(self: *const WriteParticipant, foreign_key: schema_mod.ForeignKey) schema_mod.ForeignKeyTiming {
+        for (self.constraint_timing_overrides) |override| {
+            if (std.mem.eql(u8, override.constraint_name, foreign_key.name)) return override.timing;
+        }
+        return foreign_key.timing;
+    }
+
+    fn foreignKeyDefersNoActionUpdate(self: *const WriteParticipant, foreign_key: schema_mod.ForeignKey) bool {
+        return foreign_key.on_update == .no_action and self.effectiveForeignKeyTiming(foreign_key) == .deferred;
+    }
+
+    fn foreignKeyDefersNoActionDelete(self: *const WriteParticipant, foreign_key: schema_mod.ForeignKey) bool {
+        return foreign_key.on_delete == .no_action and self.effectiveForeignKeyTiming(foreign_key) == .deferred;
     }
 
     fn prepareUniqueConstraintUpsert(self: *WriteParticipant, doc_key: []const u8, new_row: []const u8) !void {
@@ -515,7 +543,7 @@ pub const WriteParticipant = struct {
             if (!std.mem.eql(u8, check.child_key, child_key)) continue;
             if (!std.mem.eql(u8, check.parent_table, foreign_key.parent_table)) continue;
             if (!std.mem.eql(u8, check.parent_key, parent_key)) continue;
-            if (check.timing != foreign_key.timing) continue;
+            if (check.timing != self.effectiveForeignKeyTiming(foreign_key)) continue;
             if (foreignKeyReferencesPrimaryKey(foreign_key)) {
                 if (check.parent_constraint_name != null) continue;
             } else {
@@ -910,7 +938,7 @@ pub const WriteParticipant = struct {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (!foreignKeyDeleteActionRestricts(foreign_key)) continue;
             if (!foreignKeyReferencesPrimaryKey(foreign_key)) continue;
-            if (foreignKeyDefersNoActionDelete(foreign_key)) {
+            if (self.foreignKeyDefersNoActionDelete(foreign_key)) {
                 try self.deferForeignKeyReferenceAbsenceCheck(foreign_key, parent_key);
             } else {
                 try self.requireNoRestrictingForeignKeyRefsForIdentity(foreign_key, parent_key);
@@ -927,7 +955,7 @@ pub const WriteParticipant = struct {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (!foreignKeyDeleteActionRestricts(foreign_key)) continue;
             if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) continue;
-            if (foreignKeyDefersNoActionDelete(foreign_key)) {
+            if (self.foreignKeyDefersNoActionDelete(foreign_key)) {
                 try self.deferForeignKeyReferenceAbsenceCheck(foreign_key, encoded_value);
             } else {
                 try self.requireNoRestrictingForeignKeyRefsForIdentity(foreign_key, encoded_value);
@@ -944,7 +972,7 @@ pub const WriteParticipant = struct {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (!foreignKeyUpdateActionRestricts(foreign_key)) continue;
             if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) continue;
-            if (foreignKeyDefersNoActionUpdate(foreign_key)) {
+            if (self.foreignKeyDefersNoActionUpdate(foreign_key)) {
                 try self.deferForeignKeyReferenceAbsenceCheck(foreign_key, encoded_value);
             } else {
                 try self.requireNoRestrictingForeignKeyRefsForIdentity(foreign_key, encoded_value);
@@ -1148,14 +1176,6 @@ fn foreignKeyDeleteActionRestricts(foreign_key: schema_mod.ForeignKey) bool {
 
 fn foreignKeyUpdateActionRestricts(foreign_key: schema_mod.ForeignKey) bool {
     return foreign_key.on_update == .restrict or foreign_key.on_update == .no_action;
-}
-
-fn foreignKeyDefersNoActionUpdate(foreign_key: schema_mod.ForeignKey) bool {
-    return foreign_key.on_update == .no_action and foreign_key.timing == .deferred;
-}
-
-fn foreignKeyDefersNoActionDelete(foreign_key: schema_mod.ForeignKey) bool {
-    return foreign_key.on_delete == .no_action and foreign_key.timing == .deferred;
 }
 
 fn findUniqueConstraintByColumns(constraints: []const schema_mod.UniqueConstraint, columns: []const []const u8) ?schema_mod.UniqueConstraint {
@@ -3276,6 +3296,74 @@ test "relational write participant defers no action parent delete until final st
     const child_after = (try getMaterializedAlloc(alloc, &store, "order:deferred-delete")) orelse return error.TestExpectedEqual;
     defer alloc.free(child_after);
     try std.testing.expectEqualStrings("{}", child_after);
+}
+
+test "relational write participant can force deferred no action constraint immediate" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const foreign_keys = [_]schema_mod.ForeignKey{.{
+        .name = "orders_customer_id_fkey",
+        .child_columns = &.{"customer_id"},
+        .parent_table = "row",
+        .parent_columns = &.{"_id"},
+        .on_delete = .no_action,
+        .timing = .deferred,
+    }};
+    const timing_overrides = [_]ForeignKeyConstraintTimingOverride{.{
+        .constraint_name = "orders_customer_id_fkey",
+        .timing = .immediate,
+    }};
+
+    const parent_row = try relational_row_codec.serialize(alloc, &.{});
+    defer alloc.free(parent_row);
+    const child_row = try relational_row_codec.serialize(alloc, &.{.{
+        .path = "customer_id",
+        .value_type = .bytes_val,
+        .value = .{ .bytes_val = "customer:forced-immediate" },
+    }});
+    defer alloc.free(child_row);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    var seed = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys, &owned_values);
+    seed.configureForeignKeys("row", foreign_keys[0..], &.{}, false);
+    try seed.prepareUpsert("row", "customer:forced-immediate", parent_row, null);
+    try seed.prepareUpsert("row", "order:forced-immediate", child_row, null);
+    try seed.commit(null, 1);
+    try store.putBatch(writes.items, deletes.items);
+
+    writes.clearRetainingCapacity();
+    deletes.clearRetainingCapacity();
+
+    var immediate_delete = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys, &owned_values);
+    immediate_delete.configureForeignKeys("row", foreign_keys[0..], &.{"customer:forced-immediate"}, false);
+    immediate_delete.configureForeignKeyConstraintTimingOverrides(timing_overrides[0..]);
+    try std.testing.expectError(
+        error.ForeignKeyViolation,
+        immediate_delete.prepareDelete("row", "customer:forced-immediate", null),
+    );
+    immediate_delete.abort(null);
+
+    const parent_after = (try getRawAlloc(alloc, &store, "customer:forced-immediate")) orelse return error.TestExpectedEqual;
+    alloc.free(parent_after);
 }
 
 test "relational write participant rejects set null fanout beyond local limit" {
