@@ -8,7 +8,9 @@
 
 version: 2
 
-builds: []
+builds:
+  - id: antfly-go-disabled
+    skip: true
 archives: []
 
 changelog:
