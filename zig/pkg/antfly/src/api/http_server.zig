@@ -5581,6 +5581,7 @@ pub const ApiHttpServer = struct {
 
     const ForeignKeyIntegrityRequest = struct {
         action: ?[]const u8 = null,
+        phase: ?[]const u8 = null,
         constraint_name: ?[]const u8 = null,
         doc_key: ?[]const u8 = null,
         lower_doc_key: ?[]const u8 = null,
@@ -5590,6 +5591,7 @@ pub const ApiHttpServer = struct {
         worker_id: ?[]const u8 = null,
         lease_ms: ?u64 = null,
         max_work_units: ?usize = null,
+        controller: ?[]const u8 = null,
     };
 
     fn parseForeignKeyIntegrityAction(value: ?[]const u8) !table_writes.ForeignKeyIntegrityAction {
@@ -5640,14 +5642,46 @@ pub const ApiHttpServer = struct {
         const upper_doc_key = if (action == .explain_delete) "" else parsed.value.upper_doc_key orelse "";
         if (parsed.value.worker_id) |worker_id| {
             if (worker_id.len == 0) return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            if (parsed.value.controller) |controller| {
+                if (!std.mem.eql(u8, controller, "schema")) return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+                if (parsed.value.job_id != null) return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+                var result = (source.foreignKeyIntegritySchemaControllerPass(
+                    self.alloc,
+                    table_name,
+                    action,
+                    worker_id,
+                    parsed.value.lease_ms orelse 60_000,
+                    @max(1, parsed.value.max_work_units orelse 1),
+                    parsed.value.constraint_name,
+                    lower_doc_key,
+                    upper_doc_key,
+                    violation_limit,
+                ) catch |err| switch (err) {
+                    error.InvalidForeignKeyIntegrityRequest => return try textResponse(self.alloc, 400, "invalid foreign key integrity request"),
+                    error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.ForeignKeyNotFound => return try textResponse(self.alloc, 404, "foreign key not found"),
+                    error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                    error.ReadOnly => return try textResponse(self.alloc, 405, "method not allowed"),
+                    else => return err,
+                }) orelse return try textResponse(self.alloc, 404, "not found");
+                defer result.deinit(self.alloc);
+                return try jsonResponse(self.alloc, result);
+            }
             if (parsed.value.job_id) |job_id| {
                 if (job_id.len == 0) return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
             }
+            const generated_job_id = if (parsed.value.job_id == null)
+                try table_writes.stableForeignKeyIntegrityJobIdAlloc(self.alloc, table_name, action, parsed.value.constraint_name, lower_doc_key, upper_doc_key)
+            else
+                null;
+            defer if (generated_job_id) |job_id| self.alloc.free(job_id);
+            const effective_job_id = parsed.value.job_id orelse generated_job_id.?;
             var result = (source.foreignKeyIntegrityWorkerPass(
                 self.alloc,
                 table_name,
                 action,
-                parsed.value.job_id,
+                effective_job_id,
                 worker_id,
                 parsed.value.lease_ms orelse 60_000,
                 @max(1, parsed.value.max_work_units orelse 1),
@@ -10344,7 +10378,7 @@ test "api http server exposes relational foreign key integrity repair" {
     }
     try db.applyTableSchemaJson(
         alloc,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"},"account_id":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"},{"name":"orders_account_id_fkey","columns":["account_id"],"references":{"table":"accounts","columns":["_id"]},"on_delete":"restrict"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"},"account_id":{"type":"keyword"},"region_id":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"},{"name":"orders_account_id_fkey","columns":["account_id"],"references":{"table":"accounts","columns":["_id"]},"on_delete":"restrict"},{"name":"orders_region_id_fkey","columns":["region_id"],"references":{"table":"regions","columns":["_id"]},"on_delete":"restrict","validation_state":"unvalidated"}]}
     ,
         .{},
     );
@@ -10352,7 +10386,8 @@ test "api http server exposes relational foreign key integrity repair" {
         .writes = &.{
             .{ .key = "customer:a", .value = "{\"_type\":\"customers\"}" },
             .{ .key = "account:a", .value = "{\"_type\":\"accounts\"}" },
-            .{ .key = "order:1", .value = "{\"customer_id\":\"customer:a\",\"account_id\":\"account:a\"}" },
+            .{ .key = "region:a", .value = "{\"_type\":\"regions\"}" },
+            .{ .key = "order:1", .value = "{\"customer_id\":\"customer:a\",\"account_id\":\"account:a\",\"region_id\":\"region:a\"}" },
         },
         .sync_level = .write,
     });
@@ -10379,6 +10414,7 @@ test "api http server exposes relational foreign key integrity repair" {
     };
 
     const IntegrityResponse = struct {
+        job_id: ?[]const u8 = null,
         valid: bool,
         complete: bool = true,
         report: struct {
@@ -10519,6 +10555,7 @@ test "api http server exposes relational foreign key integrity repair" {
     try std.testing.expectEqual(@as(u16, 200), worker_resp.status);
     var worker_body = try std.json.parseFromSlice(IntegrityResponse, alloc, worker_resp.body, .{ .ignore_unknown_fields = true });
     defer worker_body.deinit();
+    try std.testing.expectEqualStrings("job:http-fk-integrity", worker_body.value.job_id.?);
     try std.testing.expect(worker_body.value.valid);
     try std.testing.expect(worker_body.value.complete);
     try std.testing.expectEqual(@as(usize, 1), worker_body.value.work_units.len);
@@ -10541,6 +10578,55 @@ test "api http server exposes relational foreign key integrity repair" {
     try std.testing.expect(worker_job.completed);
     try std.testing.expect(worker_job.valid.?);
     try std.testing.expectEqual(@as(usize, 1), worker_job.max_work_units);
+
+    var generated_job_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"validate\",\"constraint_name\":\"orders_account_id_fkey\",\"worker_id\":\"worker:auto-scheduler\",\"lease_ms\":60000,\"max_work_units\":1}",
+    });
+    defer generated_job_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), generated_job_resp.status);
+    var generated_job_body = try std.json.parseFromSlice(IntegrityResponse, alloc, generated_job_resp.body, .{ .ignore_unknown_fields = true });
+    defer generated_job_body.deinit();
+    try std.testing.expect(generated_job_body.value.job_id != null);
+    try std.testing.expect(std.mem.startsWith(u8, generated_job_body.value.job_id.?, "fk-integrity:"));
+    try std.testing.expect(generated_job_body.value.complete);
+    const generated_worker_job = (try db.loadForeignKeyIntegrityJobRecord(generated_job_body.value.job_id.?)) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityJobRecord(generated_worker_job);
+    try std.testing.expectEqualStrings("docs", generated_worker_job.table_name);
+    try std.testing.expectEqualStrings("validate", generated_worker_job.action);
+    try std.testing.expectEqualStrings("worker:auto-scheduler", generated_worker_job.worker_id);
+    try std.testing.expectEqualStrings("orders_account_id_fkey", generated_worker_job.constraint_name.?);
+    try std.testing.expectEqualStrings("complete", generated_worker_job.status);
+    try std.testing.expect(generated_worker_job.completed);
+    try std.testing.expect(generated_worker_job.valid.?);
+
+    var schema_controller_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"repair\",\"controller\":\"schema\",\"worker_id\":\"worker:schema-controller\",\"lease_ms\":60000,\"max_work_units\":1}",
+    });
+    defer schema_controller_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), schema_controller_resp.status);
+    var schema_controller_body = try std.json.parseFromSlice(IntegrityResponse, alloc, schema_controller_resp.body, .{ .ignore_unknown_fields = true });
+    defer schema_controller_body.deinit();
+    try std.testing.expect(schema_controller_body.value.job_id != null);
+    try std.testing.expect(std.mem.startsWith(u8, schema_controller_body.value.job_id.?, "fk-integrity:"));
+    try std.testing.expect(schema_controller_body.value.complete);
+    try std.testing.expectEqual(@as(usize, 1), schema_controller_body.value.work_units.len);
+    try std.testing.expectEqualStrings("orders_region_id_fkey", schema_controller_body.value.work_units[0].constraint_name.?);
+    try std.testing.expectEqual(@as(u64, 1), schema_controller_body.value.report.repaired_ref_rows);
+    const schema_controller_job = (try db.loadForeignKeyIntegrityJobRecord(schema_controller_body.value.job_id.?)) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityJobRecord(schema_controller_job);
+    try std.testing.expectEqualStrings("docs", schema_controller_job.table_name);
+    try std.testing.expectEqualStrings("repair", schema_controller_job.action);
+    try std.testing.expectEqualStrings("worker:schema-controller", schema_controller_job.worker_id);
+    try std.testing.expectEqualStrings("orders_region_id_fkey", schema_controller_job.constraint_name.?);
+    try std.testing.expectEqualStrings("complete", schema_controller_job.status);
+    try std.testing.expect(schema_controller_job.completed);
+    try std.testing.expect(schema_controller_job.valid.?);
 
     var validate_resp = try server.handle(.{
         .method = .POST,
@@ -10691,21 +10777,24 @@ test "api http server exposes relational foreign key integrity repair" {
     try std.testing.expectEqual(@as(u16, 200), progress_resp.status);
     var progress_body = try std.json.parseFromSlice(IntegrityResponse, alloc, progress_resp.body, .{ .ignore_unknown_fields = true });
     defer progress_body.deinit();
-    try std.testing.expectEqual(@as(usize, 4), progress_body.value.progress.len);
+    try std.testing.expectEqual(@as(usize, 5), progress_body.value.progress.len);
     var saw_validate_customer = false;
     var saw_validate_account = false;
     var saw_dry_run_customer = false;
     var saw_repair_customer = false;
+    var saw_repair_region = false;
     for (progress_body.value.progress) |entry| {
         if (std.mem.eql(u8, entry.mode, "validate") and entry.constraint_name != null and std.mem.eql(u8, entry.constraint_name.?, "orders_customer_id_fkey")) saw_validate_customer = true;
         if (std.mem.eql(u8, entry.mode, "validate") and entry.constraint_name != null and std.mem.eql(u8, entry.constraint_name.?, "orders_account_id_fkey")) saw_validate_account = true;
         if (std.mem.eql(u8, entry.mode, "dry_run") and entry.constraint_name != null and std.mem.eql(u8, entry.constraint_name.?, "orders_customer_id_fkey")) saw_dry_run_customer = true;
         if (std.mem.eql(u8, entry.mode, "repair") and entry.constraint_name != null and std.mem.eql(u8, entry.constraint_name.?, "orders_customer_id_fkey")) saw_repair_customer = true;
+        if (std.mem.eql(u8, entry.mode, "repair") and entry.constraint_name != null and std.mem.eql(u8, entry.constraint_name.?, "orders_region_id_fkey")) saw_repair_region = true;
     }
     try std.testing.expect(saw_validate_customer);
     try std.testing.expect(saw_validate_account);
     try std.testing.expect(saw_dry_run_customer);
     try std.testing.expect(saw_repair_customer);
+    try std.testing.expect(saw_repair_region);
 }
 
 test "api http server exposes relational unique integrity repair" {

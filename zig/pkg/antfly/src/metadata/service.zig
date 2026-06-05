@@ -38,6 +38,7 @@ const raft_host = @import("../raft/host.zig");
 const raft_managed_host = @import("../raft/managed_host.zig");
 const raft_service = @import("../raft/service.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const api_tables = @import("../api/tables.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
@@ -48,6 +49,7 @@ const internal_keys = @import("../storage/internal_keys.zig");
 const foreign_mod = @import("../foreign/mod.zig");
 
 const cdc_replication_round_interval_ms: u64 = 1_000;
+pub const default_fk_schema_controller_worker_id = "metadata-fk-schema-controller";
 
 const LifecycleSignal = struct {
     alloc: std.mem.Allocator,
@@ -212,9 +214,98 @@ pub const MetadataServiceConfig = struct {
     raft: raft_service.ManagedServiceConfig = .{},
     reconcile_lease: metadata_reconcile_lease.Config = .{},
     observe_local_replica_root: bool = true,
+    foreign_key_schema_controller: ForeignKeySchemaControllerConfig = .{},
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     metadata_orchestration_urls: []const MetadataOrchestrationUrl = &.{},
     secret_store: ?*common_secrets.FileStore = null,
+};
+
+pub const ForeignKeySchemaControllerConfig = struct {
+    enabled: bool = true,
+    worker_id: []const u8 = default_fk_schema_controller_worker_id,
+    lease_ms: u64 = 60_000,
+    max_tables: usize = 4,
+    max_work_units_per_table: usize = 1,
+    violation_limit: usize = 100,
+
+    fn toMaintenanceOptions(self: ForeignKeySchemaControllerConfig) api_table_writes.ForeignKeyIntegritySchemaControllerOptions {
+        return .{
+            .action = .repair,
+            .worker_id = self.worker_id,
+            .lease_ms = self.lease_ms,
+            .max_tables = self.max_tables,
+            .max_work_units_per_table = self.max_work_units_per_table,
+            .violation_limit = self.violation_limit,
+        };
+    }
+};
+
+const ForeignKeySchemaControllerRuntimeStatus = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    counters: metadata_api.ForeignKeySchemaControllerStatus = .{},
+
+    fn snapshot(self: *ForeignKeySchemaControllerRuntimeStatus, config: ForeignKeySchemaControllerConfig) metadata_api.ForeignKeySchemaControllerStatus {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        var out = self.counters;
+        out.enabled = config.enabled;
+        out.worker_id = config.worker_id;
+        return out;
+    }
+
+    fn recordSummary(
+        self: *ForeignKeySchemaControllerRuntimeStatus,
+        config: ForeignKeySchemaControllerConfig,
+        summary: api_table_writes.ForeignKeyIntegritySchemaControllerResult,
+    ) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        self.counters.enabled = config.enabled;
+        self.counters.worker_id = config.worker_id;
+        self.counters.rounds_total +%= 1;
+        self.counters.tables_scanned_total +%= summary.tables_scanned;
+        self.counters.tables_with_pending_constraints_total +%= summary.tables_with_pending_constraints;
+        self.counters.tables_executed_total +%= summary.tables_executed;
+        self.counters.claim_attempts_total +%= summary.claim_attempts;
+        self.counters.terminal_valid_results_total +%= summary.terminal_valid_results;
+        self.counters.terminal_invalid_results_total +%= summary.terminal_invalid_results;
+        self.counters.last_run_at_ms = nowMs();
+        self.counters.last_tables_scanned = summary.tables_scanned;
+        self.counters.last_tables_with_pending_constraints = summary.tables_with_pending_constraints;
+        self.counters.last_tables_executed = summary.tables_executed;
+        self.counters.last_claim_attempts = summary.claim_attempts;
+        self.counters.last_terminal_valid_results = summary.terminal_valid_results;
+        self.counters.last_terminal_invalid_results = summary.terminal_invalid_results;
+        self.counters.last_complete = summary.complete;
+        self.counters.last_valid = summary.valid;
+        self.counters.last_scanned_child_rows = 0;
+        self.counters.last_referenced_child_rows = 0;
+        self.counters.last_scanned_ref_rows = 0;
+        self.counters.last_missing_parent_rows = 0;
+        self.counters.last_missing_ref_rows = 0;
+        self.counters.last_stale_ref_rows = 0;
+        self.counters.last_repaired_ref_rows = 0;
+        self.counters.last_deleted_stale_ref_rows = 0;
+        for (summary.results) |entry| {
+            const report = entry.result.report;
+            self.counters.scanned_child_rows_total +%= report.scanned_child_rows;
+            self.counters.referenced_child_rows_total +%= report.referenced_child_rows;
+            self.counters.scanned_ref_rows_total +%= report.scanned_ref_rows;
+            self.counters.missing_parent_rows_total +%= report.missing_parent_rows;
+            self.counters.missing_ref_rows_total +%= report.missing_ref_rows;
+            self.counters.stale_ref_rows_total +%= report.stale_ref_rows;
+            self.counters.repaired_ref_rows_total +%= report.repaired_ref_rows;
+            self.counters.deleted_stale_ref_rows_total +%= report.deleted_stale_ref_rows;
+            self.counters.last_scanned_child_rows +%= report.scanned_child_rows;
+            self.counters.last_referenced_child_rows +%= report.referenced_child_rows;
+            self.counters.last_scanned_ref_rows +%= report.scanned_ref_rows;
+            self.counters.last_missing_parent_rows +%= report.missing_parent_rows;
+            self.counters.last_missing_ref_rows +%= report.missing_ref_rows;
+            self.counters.last_stale_ref_rows +%= report.stale_ref_rows;
+            self.counters.last_repaired_ref_rows +%= report.repaired_ref_rows;
+            self.counters.last_deleted_stale_ref_rows +%= report.deleted_stale_ref_rows;
+        }
+    }
 };
 
 pub const MetadataOrchestrationUrl = struct {
@@ -757,6 +848,8 @@ pub const MetadataService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
+    foreign_key_schema_controller: ForeignKeySchemaControllerConfig,
+    foreign_key_schema_controller_status: ForeignKeySchemaControllerRuntimeStatus = .{},
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
@@ -790,6 +883,7 @@ pub const MetadataService = struct {
             .lifecycle_signal = LifecycleSignal.init(alloc),
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
+            .foreign_key_schema_controller = cfg.foreign_key_schema_controller,
             .raft = try raft_service.ManagedHostService.init(alloc, host_cfg, deps.host, cfg.raft, deps.raft),
         };
         errdefer service.deinit();
@@ -1211,6 +1305,17 @@ pub const MetadataService = struct {
             else => return err,
         };
         try self.completeRestoreIntentsIfReady();
+        self.runForeignKeySchemaControllerMaintenanceRound() catch |err| switch (err) {
+            error.TableNotFound,
+            error.ForeignKeyNotFound,
+            error.InvalidSchemaUpdateRequest,
+            error.FileNotFound,
+            error.WriterLocked,
+            error.LmdbUnexpected,
+            error.Corrupted,
+            => std.log.warn("metadata fk schema-controller round skipped: {s}", .{@errorName(err)}),
+            else => return err,
+        };
         try self.runLifecycleReconcileHookIfRequested();
     }
 
@@ -1318,6 +1423,14 @@ pub const MetadataService = struct {
         var current_status = try snapshotStatus(self.alloc, self.metadata_group_id, self, self.metrics());
         current_status.metadata_epoch = self.lifecycle_signal.currentEpoch();
         return current_status;
+    }
+
+    pub fn foreignKeySchemaControllerStatus(self: *MetadataService) metadata_api.ForeignKeySchemaControllerStatus {
+        return self.foreign_key_schema_controller_status.snapshot(self.foreign_key_schema_controller);
+    }
+
+    fn recordForeignKeySchemaControllerMaintenanceSummary(self: *MetadataService, summary: api_table_writes.ForeignKeyIntegritySchemaControllerResult) void {
+        self.foreign_key_schema_controller_status.recordSummary(self.foreign_key_schema_controller, summary);
     }
 
     pub fn adminSnapshot(self: *MetadataService) !metadata_api.AdminSnapshot {
@@ -1940,6 +2053,19 @@ pub const MetadataService = struct {
             );
         }
     }
+
+    fn runForeignKeySchemaControllerMaintenanceRound(self: *MetadataService) !void {
+        if (!self.foreign_key_schema_controller.enabled) return;
+        const replica_root_dir = self.replica_root_dir orelse return;
+        if (!self.raft.host.host.isLocalLeader(self.metadata_group_id)) return;
+        var write_source = api_table_writes.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            api_table_catalog.CatalogSource.fromMetadataService(self),
+        );
+        write_source.backend_runtime = try self.ensureBackendRuntime();
+        _ = write_source.withSecretStore(self.secret_store);
+        try runForeignKeySchemaControllerMaintenanceForService(self, write_source.source(), self.foreign_key_schema_controller);
+    }
 };
 
 pub const MetadataHttpService = struct {
@@ -1990,6 +2116,8 @@ pub const MetadataHttpService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
+    foreign_key_schema_controller: ForeignKeySchemaControllerConfig,
+    foreign_key_schema_controller_status: ForeignKeySchemaControllerRuntimeStatus = .{},
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
@@ -2024,6 +2152,7 @@ pub const MetadataHttpService = struct {
             .lifecycle_signal = LifecycleSignal.init(alloc),
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
+            .foreign_key_schema_controller = cfg.foreign_key_schema_controller,
             .metadata_orchestration_urls = try cloneMetadataOrchestrationUrls(alloc, cfg.metadata_orchestration_urls),
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, deps.http, cfg.raft, deps.raft),
         };
@@ -2518,6 +2647,17 @@ pub const MetadataHttpService = struct {
         };
         try self.completeRestoreIntentsIfReady(&local_projection_inputs, &local_placement_inputs);
         try self.runReplicationBackfillRound();
+        self.runForeignKeySchemaControllerMaintenanceRound() catch |err| switch (err) {
+            error.TableNotFound,
+            error.ForeignKeyNotFound,
+            error.InvalidSchemaUpdateRequest,
+            error.FileNotFound,
+            error.WriterLocked,
+            error.LmdbUnexpected,
+            error.Corrupted,
+            => std.log.warn("metadata http fk schema-controller round skipped: {s}", .{@errorName(err)}),
+            else => return err,
+        };
         try self.runLifecycleReconcileHookIfRequested();
         _ = try self.raft.stepTransitions();
     }
@@ -2710,6 +2850,14 @@ pub const MetadataHttpService = struct {
         current_status.metrics = self.metrics();
         self.storeMetadataStatusCache(current_status, now_ms + metadata_status_cache_refresh_interval_ms);
         return current_status;
+    }
+
+    pub fn foreignKeySchemaControllerStatus(self: *MetadataHttpService) metadata_api.ForeignKeySchemaControllerStatus {
+        return self.foreign_key_schema_controller_status.snapshot(self.foreign_key_schema_controller);
+    }
+
+    fn recordForeignKeySchemaControllerMaintenanceSummary(self: *MetadataHttpService, summary: api_table_writes.ForeignKeyIntegritySchemaControllerResult) void {
+        self.foreign_key_schema_controller_status.recordSummary(self.foreign_key_schema_controller, summary);
     }
 
     pub fn adminSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
@@ -3528,6 +3676,23 @@ pub const MetadataHttpService = struct {
             );
         }
     }
+
+    fn runForeignKeySchemaControllerMaintenanceRound(self: *MetadataHttpService) !void {
+        if (!self.foreign_key_schema_controller.enabled) return;
+        const replica_root_dir = self.replica_root_dir orelse return;
+        if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id)) return;
+        const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+        var group_router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
+        var write_source = api_table_writes.HostedProvisionedTableWriteSource.init(
+            replica_root_dir,
+            catalog,
+            group_router.router(),
+            self.raft.host.http_host.request_executor,
+        );
+        _ = write_source.withBackendRuntime(try self.ensureBackendRuntime());
+        _ = write_source.withSecretStore(self.secret_store);
+        try runForeignKeySchemaControllerMaintenanceForService(self, write_source.source(), self.foreign_key_schema_controller);
+    }
 };
 
 fn syncLocalSchemaProgress(
@@ -3554,6 +3719,353 @@ fn runReplicationBackfillIfLeaseHeld(service: anytype) !bool {
     if (!has_reconcile_lease) return false;
     try service.runReplicationBackfillRound();
     return true;
+}
+
+fn foreignKeyIntegrityResultConstraintName(result: api_table_writes.ForeignKeyIntegrityResult) ?[]const u8 {
+    for (result.work_units) |unit| {
+        if (unit.constraint_name) |constraint_name| return constraint_name;
+    }
+    for (result.work_statuses) |status| {
+        if (status.constraint_name) |constraint_name| return constraint_name;
+    }
+    return null;
+}
+
+fn shouldPromoteForeignKeySchemaControllerResult(result: api_table_writes.ForeignKeyIntegrityResult) bool {
+    return switch (result.action) {
+        .validate, .repair => result.complete and result.valid,
+        else => false,
+    };
+}
+
+fn isTerminalInvalidForeignKeySchemaControllerResult(result: api_table_writes.ForeignKeyIntegrityResult) bool {
+    return switch (result.action) {
+        .validate, .repair => result.complete and !result.valid,
+        else => false,
+    };
+}
+
+fn findTableRecordByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) ?*const metadata_table_manager.TableRecord {
+    for (snapshot.tables) |*table| {
+        if (std.mem.eql(u8, table.name, table_name)) return table;
+    }
+    return null;
+}
+
+fn foreignKeyValidationMetadataAlloc(
+    alloc: std.mem.Allocator,
+    current_json: []const u8,
+    constraint_name: []const u8,
+    result: ?api_table_writes.ForeignKeyIntegrityResult,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, if (current_json.len > 0) current_json else "{}", .{});
+    defer parsed.deinit();
+    const json_alloc = parsed.arena.allocator();
+    const root = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.InvalidMetadataTransitionEncoding,
+    };
+    const foreign_keys_value = root.get("foreign_keys") orelse blk: {
+        const object = std.json.ObjectMap.empty;
+        try root.put(json_alloc, try json_alloc.dupe(u8, "foreign_keys"), .{ .object = object });
+        break :blk root.get("foreign_keys").?;
+    };
+    if (foreign_keys_value != .object) return error.InvalidMetadataTransitionEncoding;
+    const foreign_keys = root.getPtr("foreign_keys").?;
+    if (foreign_keys.* != .object) return error.InvalidMetadataTransitionEncoding;
+
+    if (result) |entry| {
+        var object = std.json.ObjectMap.empty;
+        try object.put(json_alloc, try json_alloc.dupe(u8, "validation_state"), .{ .string = try json_alloc.dupe(u8, "invalid") });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "action"), .{ .string = try json_alloc.dupe(u8, @tagName(entry.action)) });
+        if (entry.job_id) |job_id| {
+            try object.put(json_alloc, try json_alloc.dupe(u8, "job_id"), .{ .string = try json_alloc.dupe(u8, job_id) });
+        }
+        try object.put(json_alloc, try json_alloc.dupe(u8, "updated_at_ms"), .{ .integer = @intCast(nowMs()) });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "complete"), .{ .bool = entry.complete });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "valid"), .{ .bool = entry.valid });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "missing_parent_rows"), .{ .integer = @intCast(entry.report.missing_parent_rows) });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "missing_ref_rows"), .{ .integer = @intCast(entry.report.missing_ref_rows) });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "stale_ref_rows"), .{ .integer = @intCast(entry.report.stale_ref_rows) });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "violations_truncated"), .{ .bool = entry.violations_truncated });
+        _ = foreign_keys.object.fetchSwapRemove(constraint_name);
+        try foreign_keys.object.put(json_alloc, try json_alloc.dupe(u8, constraint_name), .{ .object = object });
+    } else {
+        _ = foreign_keys.object.fetchSwapRemove(constraint_name);
+    }
+
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+}
+
+fn tableWithForeignKeyValidationMetadataAlloc(
+    alloc: std.mem.Allocator,
+    table: metadata_table_manager.TableRecord,
+    constraint_name: []const u8,
+    result: ?api_table_writes.ForeignKeyIntegrityResult,
+) !metadata_table_manager.TableRecord {
+    var updated = try metadata_table_manager.cloneTable(alloc, table);
+    errdefer metadata_table_manager.freeTable(alloc, updated);
+    const validation_json = try foreignKeyValidationMetadataAlloc(alloc, table.foreign_key_validation_json, constraint_name, result);
+    errdefer alloc.free(validation_json);
+    alloc.free(updated.foreign_key_validation_json);
+    updated.foreign_key_validation_json = validation_json;
+    return updated;
+}
+
+fn promoteForeignKeySchemaControllerResult(
+    service: anytype,
+    table_name: []const u8,
+    result: api_table_writes.ForeignKeyIntegrityResult,
+) !void {
+    if (!shouldPromoteForeignKeySchemaControllerResult(result)) return;
+    const constraint_name = foreignKeyIntegrityResultConstraintName(result) orelse return;
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    const table = findTableRecordByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const schema_json = try api_tables.schemaWithForeignKeyValidationStateAlloc(
+        service.alloc,
+        table.schema_json,
+        constraint_name,
+        .enforced,
+    );
+    defer service.alloc.free(schema_json);
+    const schema_updated = try api_tables.applySchemaUpdateRecord(service.alloc, table, schema_json);
+    defer metadata_table_manager.freeTable(service.alloc, schema_updated);
+    const metadata_updated = try tableWithForeignKeyValidationMetadataAlloc(service.alloc, schema_updated, constraint_name, null);
+    defer metadata_table_manager.freeTable(service.alloc, metadata_updated);
+    try service.upsertTable(metadata_updated);
+}
+
+fn recordInvalidForeignKeySchemaControllerResult(
+    service: anytype,
+    table_name: []const u8,
+    result: api_table_writes.ForeignKeyIntegrityResult,
+) !void {
+    if (!isTerminalInvalidForeignKeySchemaControllerResult(result)) return;
+    const constraint_name = foreignKeyIntegrityResultConstraintName(result) orelse return;
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    const table = findTableRecordByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const updated = try tableWithForeignKeyValidationMetadataAlloc(service.alloc, table.*, constraint_name, result);
+    defer metadata_table_manager.freeTable(service.alloc, updated);
+    try service.upsertTable(updated);
+}
+
+fn runForeignKeySchemaControllerMaintenanceForService(
+    service: anytype,
+    write_source: api_table_writes.TableWriteSource,
+    config: ForeignKeySchemaControllerConfig,
+) !void {
+    var summary = (try write_source.foreignKeyIntegritySchemaControllerMaintenancePass(service.alloc, config.toMaintenanceOptions())) orelse return;
+    defer summary.deinit(service.alloc);
+    if (@hasDecl(@TypeOf(service.*), "recordForeignKeySchemaControllerMaintenanceSummary")) {
+        service.recordForeignKeySchemaControllerMaintenanceSummary(summary);
+    }
+
+    if (summary.tables_with_pending_constraints > 0 or summary.tables_executed > 0 or summary.terminal_valid_results > 0 or summary.terminal_invalid_results > 0) {
+        std.log.info(
+            "metadata fk schema-controller round worker_id={s} scanned={d} pending={d} executed={d} claims={d} terminal_valid={d} terminal_invalid={d} complete={any} valid={any}",
+            .{
+                config.worker_id,
+                summary.tables_scanned,
+                summary.tables_with_pending_constraints,
+                summary.tables_executed,
+                summary.claim_attempts,
+                summary.terminal_valid_results,
+                summary.terminal_invalid_results,
+                summary.complete,
+                summary.valid,
+            },
+        );
+    }
+
+    for (summary.results) |entry| {
+        if (isTerminalInvalidForeignKeySchemaControllerResult(entry.result)) {
+            std.log.warn(
+                "metadata fk schema-controller terminal invalid table={s} constraint={s} job_id={s} missing_parent_rows={d} missing_ref_rows={d}",
+                .{
+                    entry.table_name,
+                    foreignKeyIntegrityResultConstraintName(entry.result) orelse "",
+                    entry.result.job_id orelse "",
+                    entry.result.report.missing_parent_rows,
+                    entry.result.report.missing_ref_rows,
+                },
+            );
+            try recordInvalidForeignKeySchemaControllerResult(service, entry.table_name, entry.result);
+            continue;
+        }
+        try promoteForeignKeySchemaControllerResult(service, entry.table_name, entry.result);
+    }
+}
+
+test "metadata fk schema controller config builds bounded maintenance options" {
+    const cfg = ForeignKeySchemaControllerConfig{
+        .enabled = true,
+        .worker_id = "metadata-fk-test-worker",
+        .lease_ms = 1234,
+        .max_tables = 7,
+        .max_work_units_per_table = 3,
+        .violation_limit = 42,
+    };
+    const options = cfg.toMaintenanceOptions();
+    try std.testing.expectEqual(api_table_writes.ForeignKeyIntegrityAction.repair, options.action);
+    try std.testing.expectEqualStrings("metadata-fk-test-worker", options.worker_id);
+    try std.testing.expectEqual(@as(u64, 1234), options.lease_ms);
+    try std.testing.expectEqual(@as(usize, 7), options.max_tables);
+    try std.testing.expectEqual(@as(usize, 3), options.max_work_units_per_table);
+    try std.testing.expectEqual(@as(usize, 42), options.violation_limit);
+
+    const defaults = (ForeignKeySchemaControllerConfig{}).toMaintenanceOptions();
+    try std.testing.expectEqualStrings(default_fk_schema_controller_worker_id, defaults.worker_id);
+    try std.testing.expectEqual(@as(u64, 60_000), defaults.lease_ms);
+    try std.testing.expectEqual(@as(usize, 4), defaults.max_tables);
+    try std.testing.expectEqual(@as(usize, 1), defaults.max_work_units_per_table);
+    try std.testing.expectEqual(@as(usize, 100), defaults.violation_limit);
+
+    var runtime_status = ForeignKeySchemaControllerRuntimeStatus{};
+    runtime_status.recordSummary(cfg, .{
+        .tables_scanned = 9,
+        .tables_with_pending_constraints = 5,
+        .tables_executed = 3,
+        .claim_attempts = 2,
+        .terminal_valid_results = 1,
+        .terminal_invalid_results = 1,
+        .complete = false,
+        .valid = false,
+    });
+    const status = runtime_status.snapshot(cfg);
+    try std.testing.expect(status.enabled);
+    try std.testing.expectEqualStrings("metadata-fk-test-worker", status.worker_id);
+    try std.testing.expectEqual(@as(u64, 1), status.rounds_total);
+    try std.testing.expectEqual(@as(u64, 9), status.tables_scanned_total);
+    try std.testing.expectEqual(@as(u64, 5), status.tables_with_pending_constraints_total);
+    try std.testing.expectEqual(@as(u64, 3), status.tables_executed_total);
+    try std.testing.expectEqual(@as(u64, 2), status.claim_attempts_total);
+    try std.testing.expectEqual(@as(u64, 1), status.terminal_valid_results_total);
+    try std.testing.expectEqual(@as(u64, 1), status.terminal_invalid_results_total);
+    try std.testing.expectEqual(@as(usize, 9), status.last_tables_scanned);
+    try std.testing.expectEqual(@as(usize, 5), status.last_tables_with_pending_constraints);
+    try std.testing.expectEqual(@as(usize, 3), status.last_tables_executed);
+    try std.testing.expectEqual(@as(usize, 2), status.last_claim_attempts);
+    try std.testing.expectEqual(@as(usize, 1), status.last_terminal_valid_results);
+    try std.testing.expectEqual(@as(usize, 1), status.last_terminal_invalid_results);
+    try std.testing.expect(!status.last_complete);
+    try std.testing.expect(!status.last_valid);
+
+    var invalid_work_units = [_]api_table_writes.ForeignKeyIntegrityWorkUnit{.{
+        .group_id = 7,
+        .phase = @constCast("child_range"),
+        .planned_action = @constCast("validate"),
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .lower_doc_key = @constCast(""),
+        .upper_doc_key = @constCast(""),
+    }};
+    const invalid_result: api_table_writes.ForeignKeyIntegrityResult = .{
+        .action = .validate,
+        .job_id = @constCast("fk-integrity:orders:orders_customer_id_fkey"),
+        .complete = true,
+        .valid = false,
+        .violation_limit = 100,
+        .report = .{
+            .missing_parent_rows = 2,
+            .missing_ref_rows = 1,
+            .stale_ref_rows = 3,
+        },
+        .groups = &.{},
+        .violations = &.{},
+        .work_units = invalid_work_units[0..],
+        .violations_truncated = true,
+    };
+    var invalid_table_results = [_]api_table_writes.ForeignKeyIntegritySchemaControllerTableResult{.{
+        .table_name = @constCast("orders"),
+        .result = invalid_result,
+    }};
+    runtime_status.recordSummary(cfg, .{
+        .tables_scanned = 1,
+        .tables_with_pending_constraints = 1,
+        .tables_executed = 1,
+        .claim_attempts = 1,
+        .terminal_invalid_results = 1,
+        .complete = true,
+        .valid = false,
+        .results = invalid_table_results[0..],
+    });
+    const status_with_report = runtime_status.snapshot(cfg);
+    try std.testing.expectEqual(@as(u64, 2), status_with_report.rounds_total);
+    try std.testing.expectEqual(@as(u64, 2), status_with_report.missing_parent_rows_total);
+    try std.testing.expectEqual(@as(u64, 1), status_with_report.missing_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 3), status_with_report.stale_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 2), status_with_report.last_missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 1), status_with_report.last_missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 3), status_with_report.last_stale_ref_rows);
+
+    const invalid_json = try foreignKeyValidationMetadataAlloc(std.testing.allocator, "{}", "orders_customer_id_fkey", invalid_result);
+    defer std.testing.allocator.free(invalid_json);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"orders_customer_id_fkey\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"validation_state\":\"invalid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"job_id\":\"fk-integrity:orders:orders_customer_id_fkey\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"missing_parent_rows\":2") != null);
+
+    const cleared_json = try foreignKeyValidationMetadataAlloc(std.testing.allocator, invalid_json, "orders_customer_id_fkey", null);
+    defer std.testing.allocator.free(cleared_json);
+    try std.testing.expect(std.mem.indexOf(u8, cleared_json, "\"orders_customer_id_fkey\"") == null);
+
+    const FakeMetadataService = struct {
+        alloc: std.mem.Allocator,
+        table: metadata_table_manager.TableRecord,
+        upserted: ?metadata_table_manager.TableRecord = null,
+
+        fn deinit(self: *@This()) void {
+            if (self.upserted) |record| {
+                metadata_table_manager.freeTable(self.alloc, record);
+            }
+        }
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            const tables = try self.alloc.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer self.alloc.free(tables);
+            tables[0] = try metadata_table_manager.cloneTable(self.alloc, self.table);
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = tables,
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(self: *@This(), snapshot: *metadata_api.AdminSnapshot) void {
+            for (snapshot.tables) |table| {
+                metadata_table_manager.freeTable(self.alloc, table);
+            }
+            if (snapshot.tables.len > 0) self.alloc.free(snapshot.tables);
+            snapshot.* = undefined;
+        }
+
+        fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
+            if (self.upserted) |old| {
+                metadata_table_manager.freeTable(self.alloc, old);
+                self.upserted = null;
+            }
+            self.upserted = try metadata_table_manager.cloneTable(self.alloc, record);
+        }
+    };
+
+    var fake_service = FakeMetadataService{
+        .alloc = std.testing.allocator,
+        .table = .{
+            .table_id = 10,
+            .name = "orders",
+            .schema_json = "{\"version\":1}",
+        },
+    };
+    defer fake_service.deinit();
+    try recordInvalidForeignKeySchemaControllerResult(&fake_service, "orders", invalid_result);
+    try std.testing.expect(fake_service.upserted != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_service.upserted.?.foreign_key_validation_json, "\"orders_customer_id_fkey\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_service.upserted.?.foreign_key_validation_json, "\"validation_state\":\"invalid\"") != null);
 }
 
 fn syncLocalRestoreProgress(
@@ -5256,6 +5768,10 @@ pub fn snapshotStatus(
         service.getProjectedReconcileLease() catch null
     else
         null;
+    const foreign_key_schema_controller_status = if (@hasDecl(SourceDeclType, "foreignKeySchemaControllerStatus"))
+        service.foreignKeySchemaControllerStatus()
+    else
+        metadata_api.ForeignKeySchemaControllerStatus{};
     const projected_tables = try service.listProjectedTables(alloc);
     defer service.freeProjectedTables(alloc, projected_tables);
     const projected_ranges = try service.listProjectedRanges(alloc);
@@ -5500,6 +6016,7 @@ pub fn snapshotStatus(
         .metadata_raft_transport_served_groups = metadata_raft.transport_served_groups,
         .metadata_raft_transport_pending_retries = metadata_raft.transport_pending_retries,
         .metrics = metrics,
+        .foreign_key_schema_controller = foreign_key_schema_controller_status,
         .reconcile_lease_enabled = lease_stats.enabled,
         .reconcile_lease_owner_node_id = if (projected_reconcile_lease) |record| record.owner_node_id else lease_stats.owner_node_id,
         .reconcile_lease_expires_at_ms = if (projected_reconcile_lease) |record| record.expires_at_ms else lease_stats.expires_at_ms,

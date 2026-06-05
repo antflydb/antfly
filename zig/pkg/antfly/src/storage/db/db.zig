@@ -5788,6 +5788,43 @@ pub const DB = struct {
         return try self.reconcileForeignKeyRefOwnerForParentLocked(constraint_name, parent_table, parent_key, .repair);
     }
 
+    pub fn validateForeignKeyRefOwnerRange(
+        self: *DB,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        start_parent_key: []const u8,
+        end_parent_key: []const u8,
+    ) !ForeignKeyIntegrityReport {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.reconcileForeignKeyRefOwnerRangeLocked(constraint_name, parent_table, start_parent_key, end_parent_key, .validate);
+    }
+
+    pub fn dryRunRepairForeignKeyRefOwnerRange(
+        self: *DB,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        start_parent_key: []const u8,
+        end_parent_key: []const u8,
+    ) !ForeignKeyIntegrityReport {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.reconcileForeignKeyRefOwnerRangeLocked(constraint_name, parent_table, start_parent_key, end_parent_key, .dry_run);
+    }
+
+    pub fn repairForeignKeyRefOwnerRange(
+        self: *DB,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        start_parent_key: []const u8,
+        end_parent_key: []const u8,
+    ) !ForeignKeyIntegrityReport {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.reconcileForeignKeyRefOwnerRangeLocked(constraint_name, parent_table, start_parent_key, end_parent_key, .repair);
+    }
+
     pub fn explainForeignKeyDelete(self: *DB, doc_key: []const u8) !ForeignKeyDeletePlan {
         return try self.explainForeignKeyDeleteForConstraint(null, doc_key);
     }
@@ -5798,7 +5835,7 @@ pub const DB = struct {
 
         const runtime_schema = self.core.schema orelse return .{};
         if (runtime_schema.storage_mode != .relational or runtime_schema.foreign_keys.len == 0) return .{};
-        const foreign_keys = try activeForeignKeysForIntegrityConstraint(self.alloc, runtime_schema.foreign_keys, constraint_name);
+        const foreign_keys = try foreignKeysForIntegrityConstraint(self.alloc, runtime_schema.foreign_keys, constraint_name);
         defer if (constraint_name == null and foreign_keys.len > 0) self.alloc.free(foreign_keys);
         if (foreign_keys.len == 0) return .{};
         return try relational_store_mod.explainForeignKeyDelete(
@@ -5832,7 +5869,7 @@ pub const DB = struct {
         if (runtime_schema.storage_mode != .relational or runtime_schema.foreign_keys.len == 0) {
             return try self.alloc.alloc(ForeignKeyIntegrityViolation, 0);
         }
-        const foreign_keys = try activeForeignKeysForIntegrityConstraint(self.alloc, runtime_schema.foreign_keys, constraint_name);
+        const foreign_keys = try foreignKeysForIntegrityConstraint(self.alloc, runtime_schema.foreign_keys, constraint_name);
         defer if (constraint_name == null and foreign_keys.len > 0) self.alloc.free(foreign_keys);
         return try relational_store_mod.listForeignKeyViolationsInRange(
             self.alloc,
@@ -5979,7 +6016,7 @@ pub const DB = struct {
     ) !ForeignKeyIntegrityReport {
         const runtime_schema = self.core.schema orelse return .{};
         if (runtime_schema.storage_mode != .relational or runtime_schema.foreign_keys.len == 0) return .{};
-        const foreign_keys = try activeForeignKeysForIntegrityConstraint(self.alloc, runtime_schema.foreign_keys, constraint_name);
+        const foreign_keys = try foreignKeysForIntegrityConstraint(self.alloc, runtime_schema.foreign_keys, constraint_name);
         defer if (constraint_name == null and foreign_keys.len > 0) self.alloc.free(foreign_keys);
         if (foreign_keys.len == 0) return .{};
         const report = try relational_store_mod.reconcileForeignKeyRefsInRange(
@@ -6042,7 +6079,63 @@ pub const DB = struct {
         return report;
     }
 
-    fn activeForeignKeysForIntegrityConstraint(
+    fn reconcileForeignKeyRefOwnerRangeLocked(
+        self: *DB,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        start_parent_key: []const u8,
+        end_parent_key: []const u8,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+    ) !ForeignKeyIntegrityReport {
+        const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
+        if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
+        const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, constraint_name) orelse return error.ForeignKeyViolation;
+        if (!foreignKeyIsEnforcedImmediate(foreign_key)) return error.ForeignKeyViolation;
+        if (!std.mem.eql(u8, foreign_key.parent_table, parent_table)) return error.ForeignKeyViolation;
+        if (end_parent_key.len > 0 and std.mem.order(u8, start_parent_key, end_parent_key) != .lt) return error.ForeignKeyViolation;
+        const report = try relational_store_mod.reconcileForeignKeyRefOwnerRange(
+            self.alloc,
+            self.core.store,
+            runtime_schema.default_type,
+            &.{foreign_key},
+            constraint_name,
+            parent_table,
+            start_parent_key,
+            end_parent_key,
+            mode,
+        );
+        self.recordForeignKeyIntegrityReport(mode, report);
+        return report;
+    }
+
+    fn reconcileForeignKeyRefOwnerRangeForConstraintLocked(
+        self: *DB,
+        constraint_name: []const u8,
+        start_parent_key: []const u8,
+        end_parent_key: []const u8,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+    ) !ForeignKeyIntegrityReport {
+        const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
+        if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
+        const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, constraint_name) orelse return error.ForeignKeyViolation;
+        if (!foreignKeyIsEnforcedImmediate(foreign_key)) return error.ForeignKeyViolation;
+        if (end_parent_key.len > 0 and std.mem.order(u8, start_parent_key, end_parent_key) != .lt) return error.ForeignKeyViolation;
+        const report = try relational_store_mod.reconcileForeignKeyRefOwnerRange(
+            self.alloc,
+            self.core.store,
+            runtime_schema.default_type,
+            &.{foreign_key},
+            constraint_name,
+            foreign_key.parent_table,
+            start_parent_key,
+            end_parent_key,
+            mode,
+        );
+        try self.recordForeignKeyIntegrityProgressForPhaseLocked(self.alloc, "owner_range", mode, constraint_name, start_parent_key, end_parent_key, report);
+        return report;
+    }
+
+    fn foreignKeysForIntegrityConstraint(
         alloc: Allocator,
         foreign_keys: []const schema_mod.ForeignKey,
         constraint_name: ?[]const u8,
@@ -6059,10 +6152,14 @@ pub const DB = struct {
         const name = constraint_name.?;
         for (foreign_keys, 0..) |foreign_key, i| {
             if (!std.mem.eql(u8, foreign_key.name, name)) continue;
-            if (!foreignKeyIsEnforcedImmediate(foreign_key)) return error.ForeignKeyNotFound;
+            if (!foreignKeyCanRunIntegrity(foreign_key)) return error.ForeignKeyNotFound;
             return foreign_keys[i .. i + 1];
         }
         return error.ForeignKeyNotFound;
+    }
+
+    fn foreignKeyCanRunIntegrity(foreign_key: schema_mod.ForeignKey) bool {
+        return foreign_key.timing == .immediate;
     }
 
     fn foreignKeyIsEnforcedImmediate(foreign_key: schema_mod.ForeignKey) bool {
@@ -10100,6 +10197,7 @@ pub const DB = struct {
 
     pub const ForeignKeyIntegrityProgressRecord = struct {
         version: u32 = 1,
+        phase: []const u8 = "child_range",
         mode: []const u8,
         constraint_name: ?[]const u8 = null,
         lower_doc_key: []const u8,
@@ -10111,6 +10209,7 @@ pub const DB = struct {
     };
 
     pub fn freeForeignKeyIntegrityProgressRecord(self: *DB, record: ForeignKeyIntegrityProgressRecord) void {
+        if (record.phase.len > 0) self.alloc.free(record.phase);
         if (record.mode.len > 0) self.alloc.free(record.mode);
         if (record.constraint_name) |value| self.alloc.free(value);
         if (record.lower_doc_key.len > 0) self.alloc.free(record.lower_doc_key);
@@ -10127,7 +10226,7 @@ pub const DB = struct {
         claim_key: []const u8,
         worker_id: []const u8,
         group_id: u64,
-        phase: []const u8,
+        phase: []const u8 = "child_range",
         planned_action: []const u8,
         constraint_name: ?[]const u8 = null,
         lower_doc_key: []const u8,
@@ -10233,6 +10332,7 @@ pub const DB = struct {
 
             var cloned = ForeignKeyIntegrityProgressRecord{
                 .version = parsed.value.version,
+                .phase = &.{},
                 .mode = &.{},
                 .constraint_name = null,
                 .lower_doc_key = &.{},
@@ -10243,6 +10343,7 @@ pub const DB = struct {
                 .report = parsed.value.report,
             };
             errdefer self.freeForeignKeyIntegrityProgressRecord(cloned);
+            cloned.phase = try self.alloc.dupe(u8, parsed.value.phase);
             cloned.mode = try self.alloc.dupe(u8, parsed.value.mode);
             if (parsed.value.constraint_name) |value| cloned.constraint_name = try self.alloc.dupe(u8, value);
             cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
@@ -10343,13 +10444,32 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !?ForeignKeyIntegrityProgressRecord {
+        return try self.loadForeignKeyIntegrityProgressRecordForPhase("child_range", mode, constraint_name, lower_doc_key, upper_doc_key);
+    }
+
+    pub fn loadForeignKeyIntegrityProgressRecordForPhase(
+        self: *DB,
+        phase: []const u8,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !?ForeignKeyIntegrityProgressRecord {
         lockApply(self);
         defer self.core.unlockApply();
 
-        const key = try foreignKeyIntegrityProgressKeyAlloc(self.alloc, mode, constraint_name, lower_doc_key, upper_doc_key);
+        const key = try foreignKeyIntegrityProgressKeyAlloc(self.alloc, phase, mode, constraint_name, lower_doc_key, upper_doc_key);
         defer self.alloc.free(key);
         const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return null,
+            error.NotFound => blk: {
+                if (!std.mem.eql(u8, phase, "child_range")) return null;
+                const legacy_key = try foreignKeyIntegrityProgressLegacyKeyAlloc(self.alloc, mode, constraint_name, lower_doc_key, upper_doc_key);
+                defer self.alloc.free(legacy_key);
+                break :blk self.core.store.get(self.alloc, legacy_key) catch |legacy_err| switch (legacy_err) {
+                    error.NotFound => return null,
+                    else => return legacy_err,
+                };
+            },
             else => return err,
         };
         defer self.alloc.free(raw);
@@ -10362,6 +10482,7 @@ pub const DB = struct {
 
         var cloned = ForeignKeyIntegrityProgressRecord{
             .version = parsed.value.version,
+            .phase = &.{},
             .mode = &.{},
             .constraint_name = null,
             .lower_doc_key = &.{},
@@ -10372,6 +10493,7 @@ pub const DB = struct {
             .report = parsed.value.report,
         };
         errdefer self.freeForeignKeyIntegrityProgressRecord(cloned);
+        cloned.phase = try self.alloc.dupe(u8, parsed.value.phase);
         cloned.mode = try self.alloc.dupe(u8, parsed.value.mode);
         if (parsed.value.constraint_name) |value| cloned.constraint_name = try self.alloc.dupe(u8, value);
         cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
@@ -10462,11 +10584,25 @@ pub const DB = struct {
         upper_doc_key: []const u8,
         report: relational_store_mod.ForeignKeyIntegrityReport,
     ) !void {
+        return try self.recordForeignKeyIntegrityProgressForPhaseLocked(alloc, "child_range", mode, constraint_name, lower_doc_key, upper_doc_key, report);
+    }
+
+    fn recordForeignKeyIntegrityProgressForPhaseLocked(
+        self: *DB,
+        alloc: Allocator,
+        phase: []const u8,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        report: relational_store_mod.ForeignKeyIntegrityReport,
+    ) !void {
         self.recordForeignKeyIntegrityReport(mode, report);
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
-        const key = try foreignKeyIntegrityProgressKeyAlloc(alloc, mode, constraint_name, lower_doc_key, upper_doc_key);
+        const key = try foreignKeyIntegrityProgressKeyAlloc(alloc, phase, mode, constraint_name, lower_doc_key, upper_doc_key);
         defer alloc.free(key);
         const payload = try std.json.Stringify.valueAlloc(alloc, ForeignKeyIntegrityProgressRecord{
+            .phase = phase,
             .mode = foreignKeyIntegrityModeName(mode),
             .constraint_name = constraint_name,
             .lower_doc_key = lower_doc_key,
@@ -10780,6 +10916,13 @@ pub const DB = struct {
         );
         defer self.freeForeignKeyIntegrityClaimRecord(claim);
 
+        if (std.mem.eql(u8, phase, "owner_range")) {
+            const scoped_constraint = constraint_name orelse return error.InvalidForeignKeyIntegrityRequest;
+            lockApply(self);
+            defer self.core.unlockApply();
+            return try self.reconcileForeignKeyRefOwnerRangeForConstraintLocked(scoped_constraint, lower_doc_key, upper_doc_key, mode);
+        }
+        if (!std.mem.eql(u8, phase, "child_range")) return error.InvalidForeignKeyIntegrityRequest;
         return switch (mode) {
             .validate => try self.validateForeignKeyRefsInRangeForConstraint(constraint_name, lower_doc_key, upper_doc_key),
             .dry_run => try self.dryRunRepairForeignKeyRefsInRangeForConstraint(constraint_name, lower_doc_key, upper_doc_key),
@@ -10788,6 +10931,29 @@ pub const DB = struct {
     }
 
     fn foreignKeyIntegrityProgressKeyAlloc(
+        alloc: Allocator,
+        phase: []const u8,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) ![]u8 {
+        const constraint = constraint_name orelse "*";
+        return try std.fmt.allocPrint(alloc, "{s}:v2:{d}:{s}:{s}:{d}:{s}:{d}:{s}:{d}:{s}", .{
+            foreign_key_integrity_progress_key_prefix,
+            phase.len,
+            phase,
+            foreignKeyIntegrityModeName(mode),
+            constraint.len,
+            constraint,
+            lower_doc_key.len,
+            lower_doc_key,
+            upper_doc_key.len,
+            upper_doc_key,
+        });
+    }
+
+    fn foreignKeyIntegrityProgressLegacyKeyAlloc(
         alloc: Allocator,
         mode: relational_store_mod.ForeignKeyIntegrityMode,
         constraint_name: ?[]const u8,
@@ -45559,6 +45725,110 @@ test "db foreign key ref owner validation repairs stale parent prefix rows" {
     const final_report = try db.validateForeignKeyRefOwnerForParent("orders_customer_id_fkey", "customers", "customer:owner");
     try std.testing.expectEqual(@as(u64, 1), final_report.scanned_ref_rows);
     try std.testing.expectEqual(@as(u64, 0), final_report.stale_ref_rows);
+}
+
+test "db foreign key ref owner range validation repairs stale parent-key span rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:a", .value = "{\"id\":\"customer:a\"}" },
+            .{ .key = "customer:b", .value = "{\"id\":\"customer:b\"}" },
+            .{ .key = "customer:z", .value = "{\"id\":\"customer:z\"}" },
+            .{ .key = "order:a-valid", .value = "{\"id\":\"order:a-valid\",\"customer_id\":\"customer:a\"}" },
+            .{ .key = "order:b-moved", .value = "{\"id\":\"order:b-moved\",\"customer_id\":\"customer:z\"}" },
+        },
+    });
+
+    const stale_write_txn = try db.beginTransaction(30_000);
+    try db.writeTransaction(stale_write_txn, .{
+        .foreign_key_ref_writes = &.{
+            .{
+                .constraint_name = "orders_customer_id_fkey",
+                .parent_table = "customers",
+                .parent_key = "customer:b",
+                .child_table = "row",
+                .child_key = "order:missing-b",
+            },
+            .{
+                .constraint_name = "orders_customer_id_fkey",
+                .parent_table = "customers",
+                .parent_key = "customer:b",
+                .child_table = "row",
+                .child_key = "order:b-moved",
+            },
+            .{
+                .constraint_name = "orders_customer_id_fkey",
+                .parent_table = "customers",
+                .parent_key = "customer:z",
+                .child_table = "row",
+                .child_key = "order:missing-z",
+            },
+        },
+    });
+    try db.commitTransaction(stale_write_txn, 30_001);
+
+    const validate_report = try db.validateForeignKeyRefOwnerRange("orders_customer_id_fkey", "customers", "", "customer:m");
+    try std.testing.expectEqual(@as(u64, 3), validate_report.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), validate_report.stale_ref_rows);
+    try std.testing.expectEqual(@as(u64, 0), validate_report.deleted_stale_ref_rows);
+
+    const dry_run_report = try db.dryRunRepairForeignKeyRefOwnerRange("orders_customer_id_fkey", "customers", "", "customer:m");
+    try std.testing.expectEqual(@as(u64, 3), dry_run_report.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), dry_run_report.stale_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), dry_run_report.deleted_stale_ref_rows);
+
+    const worker_report = try db.claimAndRunForeignKeyIntegrityWorkUnitAt(
+        "claim:owner-low",
+        "worker:owner",
+        41,
+        "owner_range",
+        .repair,
+        "orders_customer_id_fkey",
+        "",
+        "customer:m",
+        60_000,
+        31_000,
+    );
+    try std.testing.expectEqual(@as(u64, 3), worker_report.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), worker_report.stale_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), worker_report.deleted_stale_ref_rows);
+
+    const worker_claim = (try db.loadForeignKeyIntegrityClaimRecord("claim:owner-low")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityClaimRecord(worker_claim);
+    try std.testing.expectEqualStrings("owner_range", worker_claim.phase);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", worker_claim.constraint_name.?);
+
+    const owner_progress = (try db.loadForeignKeyIntegrityProgressRecordForPhase("owner_range", .repair, "orders_customer_id_fkey", "", "customer:m")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityProgressRecord(owner_progress);
+    try std.testing.expectEqualStrings("owner_range", owner_progress.phase);
+    try std.testing.expectEqual(@as(u64, 2), owner_progress.report.deleted_stale_ref_rows);
+    try std.testing.expect((try db.loadForeignKeyIntegrityProgressRecord(.repair, "orders_customer_id_fkey", "", "customer:m")) == null);
+
+    const repaired_low = try db.validateForeignKeyRefOwnerRange("orders_customer_id_fkey", "customers", "", "customer:m");
+    try std.testing.expectEqual(@as(u64, 1), repaired_low.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 0), repaired_low.stale_ref_rows);
+
+    const untouched_high = try db.validateForeignKeyRefOwnerRange("orders_customer_id_fkey", "customers", "customer:m", "");
+    try std.testing.expectEqual(@as(u64, 2), untouched_high.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 1), untouched_high.stale_ref_rows);
 }
 
 test "db recoverTransactions auto-aborts stale pending intents" {

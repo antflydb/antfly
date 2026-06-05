@@ -977,6 +977,57 @@ fn foreignKeysSameDefinition(a: runtime_schema_mod.ForeignKey, b: runtime_schema
         a.timing == b.timing;
 }
 
+fn foreignKeyValidationStateString(state: runtime_schema_mod.ForeignKeyValidationState) ![]const u8 {
+    return switch (state) {
+        .enforced => "enforced",
+        .unvalidated => "unvalidated",
+        .validating, .invalid => error.InvalidSchemaUpdateRequest,
+    };
+}
+
+pub fn schemaWithForeignKeyValidationStateAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+    constraint_name: []const u8,
+    state: runtime_schema_mod.ForeignKeyValidationState,
+) ![]u8 {
+    const state_text = try foreignKeyValidationStateString(state);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const foreign_keys = root.getPtr("foreign_keys") orelse return error.ForeignKeyNotFound;
+    const foreign_key_items = switch (foreign_keys.*) {
+        .array => |*array| array.items,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+
+    var found = false;
+    for (foreign_key_items) |*foreign_key| {
+        const object = switch (foreign_key.*) {
+            .object => |*object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        const name = object.get("name") orelse return error.InvalidSchemaUpdateRequest;
+        if (name != .string) return error.InvalidSchemaUpdateRequest;
+        if (!std.mem.eql(u8, name.string, constraint_name)) continue;
+
+        try object.put(alloc, "validation_state", .{ .string = state_text });
+        found = true;
+        break;
+    }
+    if (!found) return error.ForeignKeyNotFound;
+
+    const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    errdefer alloc.free(updated);
+    var validated = try schema_mod.parseValidatedTableSchema(alloc, updated);
+    validated.deinit(alloc);
+    return updated;
+}
+
 fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |left, right| {
@@ -2754,6 +2805,41 @@ test "metadata.schema update rejects relational storage mode and base column cha
             &relational_fk_table,
             "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\",\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"cascade\"}]}",
         ),
+    );
+}
+
+test "metadata.schema update rewrites foreign key validation state and preserves definition" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","validation_state":"unvalidated"}]}
+    ;
+
+    const updated = try schemaWithForeignKeyValidationStateAlloc(
+        alloc,
+        schema_json,
+        "orders_customer_id_fkey",
+        .enforced,
+    );
+    defer alloc.free(updated);
+
+    var parsed = try parseValidatedTableSchema(alloc, updated);
+    defer parsed.deinit(alloc);
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema_mod.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.foreign_keys.len);
+    try std.testing.expectEqual(runtime_schema_mod.ForeignKeyValidationState.enforced, runtime.foreign_keys[0].validation_state);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", runtime.foreign_keys[0].name);
+    try std.testing.expectEqualStrings("customers", runtime.foreign_keys[0].parent_table);
+    try std.testing.expectEqual(runtime_schema_mod.ForeignKeyAction.restrict, runtime.foreign_keys[0].on_delete);
+
+    try std.testing.expectError(
+        error.ForeignKeyNotFound,
+        schemaWithForeignKeyValidationStateAlloc(alloc, schema_json, "missing_fkey", .enforced),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        schemaWithForeignKeyValidationStateAlloc(alloc, schema_json, "orders_customer_id_fkey", .validating),
     );
 }
 

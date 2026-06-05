@@ -3532,6 +3532,8 @@ fn appendTableRecord(
     try out.appendSlice(alloc, record.schema_json);
     try appendInt(alloc, out, u32, @intCast(record.read_schema_json.len));
     try out.appendSlice(alloc, record.read_schema_json);
+    try appendInt(alloc, out, u32, @intCast(record.foreign_key_validation_json.len));
+    try out.appendSlice(alloc, record.foreign_key_validation_json);
     try appendInt(alloc, out, u32, @intCast(record.indexes_json.len));
     try out.appendSlice(alloc, record.indexes_json);
     try appendInt(alloc, out, u32, @intCast(record.replication_sources_json.len));
@@ -3844,8 +3846,17 @@ fn readTableRecord(
     pos: *usize,
 ) !metadata.TableRecord {
     const start = pos.*;
-    const newest_record = readTableRecordWithRestoreIntent(alloc, encoded, pos) catch null;
+    const newest_record = readTableRecordWithForeignKeyValidation(alloc, encoded, pos) catch null;
     if (newest_record) |record| {
+        if (pos.* == encoded.len) return record;
+        metadata_table_manager.freeTable(alloc, record);
+        pos.* = start;
+    } else {
+        pos.* = start;
+    }
+
+    const restore_intent_record = readTableRecordWithRestoreIntent(alloc, encoded, pos) catch null;
+    if (restore_intent_record) |record| {
         if (pos.* == encoded.len) return record;
         metadata_table_manager.freeTable(alloc, record);
         pos.* = start;
@@ -3895,6 +3906,7 @@ fn readTableRecordLegacy(
         .description = description,
         .schema_json = schema_json,
         .read_schema_json = try alloc.dupe(u8, ""),
+        .foreign_key_validation_json = try alloc.dupe(u8, "{}"),
         .indexes_json = indexes_json,
         .replication_sources_json = replication_sources_json,
         .placement_role = placement_role,
@@ -3932,6 +3944,7 @@ fn readTableRecordWithReadSchema(
         .description = description,
         .schema_json = schema_json,
         .read_schema_json = read_schema_json,
+        .foreign_key_validation_json = try alloc.dupe(u8, "{}"),
         .indexes_json = indexes_json,
         .replication_sources_json = replication_sources_json,
         .placement_role = placement_role,
@@ -3974,6 +3987,52 @@ fn readTableRecordWithRestoreIntent(
         .description = description,
         .schema_json = schema_json,
         .read_schema_json = read_schema_json,
+        .foreign_key_validation_json = try alloc.dupe(u8, "{}"),
+        .indexes_json = indexes_json,
+        .replication_sources_json = replication_sources_json,
+        .placement_role = placement_role,
+        .restore_backup_id = restore_backup_id,
+        .restore_location = restore_location,
+        .desired_replica_count = desired_replica_count,
+        .min_ranges = min_ranges,
+    };
+}
+
+fn readTableRecordWithForeignKeyValidation(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata.TableRecord {
+    const table_id = try readInt(encoded, pos, u64);
+    const desired_replica_count = try readInt(encoded, pos, u16);
+    const min_ranges = try readInt(encoded, pos, u32);
+    const name = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(name);
+    const description = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(description);
+    const schema_json = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(schema_json);
+    const read_schema_json = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(read_schema_json);
+    const foreign_key_validation_json = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(foreign_key_validation_json);
+    const indexes_json = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(indexes_json);
+    const replication_sources_json = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(replication_sources_json);
+    const placement_role = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(placement_role);
+    const restore_backup_id = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(restore_backup_id);
+    const restore_location = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(restore_location);
+    return .{
+        .table_id = table_id,
+        .name = name,
+        .description = description,
+        .schema_json = schema_json,
+        .read_schema_json = read_schema_json,
+        .foreign_key_validation_json = foreign_key_validation_json,
         .indexes_json = indexes_json,
         .replication_sources_json = replication_sources_json,
         .placement_role = placement_role,
@@ -5836,6 +5895,7 @@ test "metadata.table record decoder accepts legacy table metadata encoding" {
     try std.testing.expectEqualStrings("docs table", decoded.description);
     try std.testing.expectEqualStrings("{\"kind\":\"demo\"}", decoded.schema_json);
     try std.testing.expectEqualStrings("", decoded.read_schema_json);
+    try std.testing.expectEqualStrings("{}", decoded.foreign_key_validation_json);
     try std.testing.expectEqualStrings("{\"default\":{}}", decoded.indexes_json);
     try std.testing.expectEqualStrings("[\"seed\"]", decoded.replication_sources_json);
     try std.testing.expectEqualStrings("data", decoded.placement_role);
@@ -5848,6 +5908,7 @@ test "metadata.table record decoder round-trips read schema metadata" {
         .description = "docs table",
         .schema_json = "{\"version\":1}",
         .read_schema_json = "{\"version\":0}",
+        .foreign_key_validation_json = "{\"foreign_keys\":{\"fk\":{\"validation_state\":\"invalid\"}}}",
         .indexes_json = "{\"default\":{}}",
         .replication_sources_json = "[\"seed\"]",
         .placement_role = "data",
@@ -5861,6 +5922,7 @@ test "metadata.table record decoder round-trips read schema metadata" {
 
     try std.testing.expectEqualStrings("{\"version\":1}", decoded.schema_json);
     try std.testing.expectEqualStrings("{\"version\":0}", decoded.read_schema_json);
+    try std.testing.expectEqualStrings("{\"foreign_keys\":{\"fk\":{\"validation_state\":\"invalid\"}}}", decoded.foreign_key_validation_json);
     try std.testing.expectEqualStrings("{\"default\":{}}", decoded.indexes_json);
 }
 

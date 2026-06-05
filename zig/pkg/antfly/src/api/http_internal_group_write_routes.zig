@@ -59,6 +59,7 @@ const CorruptEmbeddingArtifactRequest = struct {
 
 const ForeignKeyIntegrityRequestWire = struct {
     action: ?[]const u8 = null,
+    phase: ?[]const u8 = null,
     constraint_name: ?[]const u8 = null,
     doc_key: ?[]const u8 = null,
     lower_doc_key: ?[]const u8 = null,
@@ -240,6 +241,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
                 fk_route.group_id,
                 fk_route.table_name,
                 action,
+                parsed.value.phase orelse "child_range",
                 parsed.value.job_id,
                 claim_key,
                 worker_id,
@@ -963,6 +965,7 @@ const TestWriteSource = struct {
         group_id: u64,
         _: []const u8,
         action: table_writes.ForeignKeyIntegrityAction,
+        phase: []const u8,
         job_id: ?[]const u8,
         claim_key: []const u8,
         worker_id: []const u8,
@@ -983,7 +986,7 @@ const TestWriteSource = struct {
             .claim_key = try alloc.dupe(u8, claim_key),
             .worker_id = &.{},
             .group_id = group_id,
-            .phase = try alloc.dupe(u8, "child_range"),
+            .phase = try alloc.dupe(u8, phase),
             .planned_action = try alloc.dupe(u8, @tagName(action)),
             .constraint_name = null,
             .lower_doc_key = try alloc.dupe(u8, lower_doc_key),

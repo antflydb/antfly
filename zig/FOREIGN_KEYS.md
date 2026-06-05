@@ -163,13 +163,18 @@ For v1:
 - `validation_state` defaults to `enforced`. `unvalidated` is accepted for
   local online adoption: it records the catalog entry but does not enforce
   writes or maintain reverse-reference rows until the same constraint is applied
-  as `enforced`. Job-owned states such as `validating` and `invalid` are
-  reserved for hosted migration jobs and are rejected in public schema
-  creation/update today. Admin integrity validation, repair, list, and
-  parent-delete explain operate on active `enforced` / `immediate` constraints;
-  tables with no active constraints are no-ops that do not write progress rows,
-  and explicitly naming an inactive `unvalidated` constraint fails instead of
-  returning a misleading empty report.
+  as `enforced`. Job-owned states such as `validating` and `invalid` remain
+  reserved and are rejected in public schema creation/update today; terminal
+  invalid adoption state is represented by durable FK integrity job records,
+  metadata scheduler diagnostics, and an internal table-metadata validation
+  record keyed by constraint name. The internal record is separate from
+  runtime-applied schema JSON so the data plane never has to accept reserved
+  public states. Default admin integrity validation, repair, list, and
+  parent-delete explain operate on active `enforced` / `immediate` constraints.
+  Explicitly naming an immediate `unvalidated` constraint is allowed for online
+  adoption validation/repair, and the schema controller described below uses
+  that path to advance non-enforced catalog entries. Tables with no active
+  constraints are no-ops unless a specific adoption constraint is named.
 
 The API rejects unsupported shapes during schema validation rather than
 accepting constraints that silently degrade. Unknown fields on
@@ -227,7 +232,10 @@ constraint name through the synchronous validation path: additions validate
 existing child rows and install reverse-reference rows before the catalog flip;
 drops remove the old reverse-reference rows. Reusing a constraint name with
 different semantics is rejected; use an explicit drop plus a new name. Hosted
-distributed validation state remains future work.
+adoption progress is tracked through durable FK job/progress records; terminal
+valid results are promoted through the metadata table-update path, and terminal
+invalid results are stored in internal table metadata without changing the
+runtime FK schema.
 
 ## Physical State
 
@@ -618,22 +626,49 @@ through the normal internal group write route instead of opening group storage
 directly.
 The public `foreign-key-integrity` operation also accepts `worker_id`,
 `lease_ms`, `max_work_units`, and optional `job_id` for `validate`, `dry_run`,
-and `repair`. When `worker_id` is present, the table-write source runs a
-bounded scheduler pass: it plans child-range units, reads durable progress and
-claim state without mutating every unit, selects pending/incomplete or
-expired-lease units, claims and runs up to `max_work_units`, then returns
-refreshed progress, claims, and statuses. If `job_id` is supplied, the pass
-records durable job intent before claiming work and marks the job `complete` or
-`invalid` when the refreshed work statuses are terminal. Local/bound execution
-stores that record in the table DB. Provisioned execution stores the same
-record in every group DB that owns planned work for the pass, alongside the
-group-local claim and progress rows. Hosted execution routes selected units to
-the owning group leader through the same internal group claimed work-unit route.
-When the coordinator supplies `job_id`, that routed request carries the job
-identity and per-pass work-unit limit to the owning leader, which records the
-group-local job shard next to the claim/progress rows before and after the
-claimed unit runs. The bounded pass is therefore safe to call repeatedly by an
-external coordinator or future in-process background job.
+and `repair`. When `worker_id` is present, the public/admin handler runs a
+bounded scheduler pass: it plans child-range units for committed child rows and,
+for provisioned/hosted tables with active FK-ref owner ranges, owner-range units
+for the routed parent-key spans that store reverse-reference rows. Each unit's
+`phase` is part of its claim/progress identity. `child_range` units recreate
+missing owner rows from child rows; `owner_range` units scan the routed owner
+span and prune stale rows whose child row is missing or now references a
+different parent. The pass reads durable progress and claim state without
+mutating every unit, selects pending/incomplete or expired-lease units, claims
+and runs up to `max_work_units`, then returns refreshed progress, claims,
+statuses, and the effective `job_id`. If the caller does not supply `job_id`,
+the handler derives a stable one from table name, action, constraint scope, and
+document-key range, so repeated admin/controller passes resume the same durable
+job without external ID allocation. The pass records durable job intent before
+claiming work and marks the job `complete` or `invalid` when the refreshed work
+statuses are terminal. Local/bound execution stores that record in the table DB.
+Provisioned execution stores the same record in every group DB that owns
+planned work for the pass, alongside the group-local claim and progress rows.
+Hosted execution routes selected units to the owning group leader through the
+same internal group claimed work-unit route. That routed request carries the
+unit phase, job identity, and per-pass work-unit limit to the owning leader,
+which records the group-local job shard next to the claim/progress rows before
+and after the claimed unit runs. The bounded pass is therefore safe to call
+repeatedly by an external coordinator or future in-process background job.
+
+The same public/admin worker endpoint also accepts `controller: "schema"` with
+`worker_id`. In that mode the table-write source reads the authoritative table
+schema, selects the named FK when `constraint_name` is provided, or otherwise
+selects the first FK whose `validation_state` is not `enforced`, derives the
+stable `job_id` from that selected constraint and range, and then runs the same
+bounded worker pass. If no schema-declared FK needs adoption work, the
+controller returns a complete, valid empty result without creating a job record.
+This is the in-process controller primitive: hosted/local/provisioned sources
+all use the same durable claim, progress, routing, and job-record machinery as
+ordinary worker passes instead of maintaining a separate migration scanner.
+
+The write-source layer also exposes a bounded schema-controller maintenance
+pass. Bound/local sources apply it to their single table. Provisioned and hosted
+sources scan the authoritative catalog snapshot, find tables with non-enforced
+FK declarations, and run at most `max_tables` schema-controller worker passes
+per invocation. This gives hosted runtimes an in-process primitive that can be
+scheduled from an existing background loop without external HTTP polling while
+preserving the same stable job ids and durable per-group progress rows.
 
 Group DB FK integrity job records are keyed by `job_id`. A record stores table,
 action, worker identity, optional constraint scope, document-key range, lease
@@ -695,17 +730,46 @@ or constraint.
 
 Remaining hosted online-validation work is no longer range discovery, status
 correlation, group-local claim persistence, group-local claim-and-run
-execution/routing, or a bounded claimable-unit scheduler pass; those are exposed
-by `plan`, `work_units`, `work_statuses`, `work_claims`, durable claim rows,
+execution/routing, bounded claimable-unit scheduler passes, stable job identity,
+schema FK discovery, or catalog-wide table scanning; those are exposed by
+`plan`, `work_units`, `work_statuses`, `work_claims`, durable claim rows,
 durable per-range progress rows, the DB claim-and-run primitive, the internal
-group claimed work-unit route, the public worker-pass request fields, and
-bounded `job_id` job-record writes for local, provisioned, local-hosted, and
-remote-hosted claimed work. The missing production piece is a hosted job
-controller that creates jobs from schema adoption or admin requests,
-periodically invokes bounded worker passes with stable worker identity,
-aggregates violation details across passes, and resumes incomplete units after
-coordinator or worker restart without requiring an operator to poll the public
-endpoint manually.
+group claimed work-unit route, the public worker-pass request fields,
+schema-controller mode, the source-level schema-controller maintenance pass,
+stable public/admin `job_id` derivation, and bounded job-record writes for
+local, provisioned, local-hosted, and remote-hosted claimed work. Metadata-owned
+background rounds now provide the first automatic hosted/provisioned scheduling
+shape: the metadata leader runs one bounded schema-controller maintenance pass
+per round, with explicit service config for enablement, worker id, lease
+duration, maximum tables per round, maximum work units per table, and violation
+limit. The default worker id is `metadata-fk-schema-controller`; the default
+round advances at most four tables and one work unit per table. Each non-empty
+round logs scanned, pending, executed, claim, terminal-valid, terminal-invalid,
+completion, and validity counters, exposes cumulative and last-round counters
+in metadata status, accumulates cumulative and last-round FK integrity report
+counters for the work it actually ran, and promotes terminal valid adoption jobs
+through the metadata table-update path.
+Bound/local maintenance already performs the terminal catalog transition for
+local tables: after a `validate` or `repair` schema-controller pass completes
+and is valid, it rewrites the table schema to set the selected FK
+`validation_state` to `enforced` and applies that schema through the normal DB
+schema path, so the final flip re-runs enforcement validation before becoming
+durable. Provisioned and hosted sources intentionally do not mutate catalog
+state from table-write sources because they only hold a read-only catalog
+snapshot. Instead, metadata service rounds consume their terminal valid results,
+rewrite the selected FK to `enforced`, and enqueue the resulting table record
+through the same schema-update/table-upsert path used by admin schema changes.
+`AdminSource.updateForeignKeyValidationState` exposes the same catalog flip for
+external coordinators. Terminal invalid adoption results are surfaced through
+the durable FK job record (`status: "invalid"`, `valid: false`), metadata
+scheduler warnings, and `foreign_key_validation_json` in the internal table
+record. That metadata records the constraint name, action, optional job id,
+terminal validity, report counters, and truncation flag without writing
+reserved states into runtime schema JSON. A later terminal valid promotion
+clears the stale invalid entry for that constraint. The remaining production
+work is richer hosted job orchestration: aggregate sampled violation details
+across passes and compose child-range repair with owner-prefix cleanup across
+coordinator or worker restarts.
 
 Diagnostics should report:
 
@@ -870,12 +934,14 @@ Work:
   resolves configured FK-ref owner ranges, scans bounded owner prefixes, reports
   routed `restrict` blockers and first-hop `set_null` / `cascade` child counts,
   and fails closed on incomplete scans. The storage layer also has an
-  owner-prefix validation/dry-run/repair primitive for one routed
-  `(constraint, parent_table, parent_key)` prefix: it verifies each owner ref row
-  against the current child row and can prune stale owner rows without scanning
-  every child range. Hosted validation and repair still need resumable job
-  orchestration over that owner-prefix primitive plus the child-range pass that
-  creates missing owner rows;
+  owner validation/dry-run/repair primitive for both one routed
+  `(constraint, parent_table, parent_key)` prefix and a parent-key span owned by
+  one FK-ref range: it verifies each owner ref row against the current child row
+  and can prune stale owner rows without scanning every child range. Hosted
+  validation and repair use the existing plan/claim/run path with phase-aware
+  durable work units: `child_range` creates missing owner rows, and
+  `owner_range` prunes stale routed owner rows for the parent-key spans owned in
+  metadata;
 - retain fail-closed behavior for operations whose final FK value or affected
   FK-ref owner set cannot be known before prepare.
 
@@ -927,23 +993,30 @@ Implemented:
 - public bounded worker-pass execution for FK integrity `validate`, `dry_run`,
   and `repair`, using `worker_id`, `lease_ms`, and `max_work_units` to select
   unclaimed, incomplete, or expired-lease units, route them to their owning
-  groups, and return refreshed progress/claim/status state;
-- bounded `job_id` worker-pass persistence for local, provisioned, and hosted
-  claimed-unit execution, preserving job intent, worker identity, lease/pass
-  limits, status, attempts, completion, validity, and latest report across
-  reopen in the DBs that own the planned work;
-- DB owner-prefix validation/dry-run/repair for a single routed FK-ref owner
-  range. The primitive scans exactly one parent-key prefix, detects owner rows
-  whose child row is missing or now references a different parent, and repairs
-  by deleting those stale owner rows without mutating child rows.
+  groups, and return refreshed progress/claim/status state plus the effective
+  job id;
+- explicit or generated `job_id` worker-pass persistence for local,
+  provisioned, and hosted claimed-unit execution, preserving job intent, worker
+  identity, lease/pass limits, status, attempts, completion, validity, and
+  latest report across reopen in the DBs that own the planned work;
+- DB owner validation/dry-run/repair for a single parent-key prefix and for a
+  routed FK-ref owner range parent-key span. The primitive scans owner rows,
+  detects rows whose child row is missing or now references a different parent,
+  and repairs by deleting those stale owner rows without mutating child rows;
+- phase-aware worker planning and claimed execution for provisioned/hosted FK
+  integrity jobs. Worker plans append `owner_range` units for routable FK-ref
+  owner ranges that still match enforced immediate schema FKs, internal/remote
+  claimed-unit requests carry the phase, and progress records are keyed by
+  `(phase, mode, constraint, range)` so owner-range scans cannot overwrite
+  child-range checkpoints for the same constraint/span.
 
 Remaining work:
 
-- hosted resumable validation/repair controller that creates jobs from
-  schema/admin intent, invokes bounded worker passes outside the interactive
-  request path, retries idempotently, aggregates violation details across
-  passes, and composes the child-range pass that recreates missing owner rows
-  with the owner-prefix pass that prunes stale owner rows.
+- in-process hosted resumable validation/repair controller that discovers
+  schema/admin jobs without an external poller, invokes bounded worker passes
+  outside the interactive request path, retries idempotently, aggregates
+  violation details across passes, and drives large owner-range repair jobs
+  without relying on an operator or public HTTP request loop.
 
 Repair may rebuild missing/corrupt secondary metadata, but it must not silently
 mutate user rows. Orphaned child rows should be reported for explicit operator
@@ -1333,7 +1406,8 @@ Minimum coverage:
   owner participant;
 - FK-ref range split/merge preserves ownership and rejects stale topology epochs;
 - routed repair recreates missing FK-ref rows in the owner range and the
-  owner-prefix primitive prunes stale rows without mutating child rows.
+  DB owner-prefix/owner-range primitive prunes stale rows without mutating child
+  rows.
 - FK integrity `plan` returns deterministic per-group child-range work units
   clipped to the requested span, and hosted/provisioned validate, dry-run,
   repair, and list execute by those planned units.
@@ -1345,6 +1419,9 @@ Minimum coverage:
   takeover after reopen.
 - FK integrity group DBs can claim and run one validation, dry-run, or repair
   unit and persist progress for that exact unit boundary.
+- FK integrity worker planning includes routed `owner_range` units for active
+  FK-ref owner ranges, and group-local claim-and-run execution records
+  phase-isolated progress for those owner spans.
 
 ## Documentation Status
 
@@ -1356,14 +1433,30 @@ Minimum coverage:
 - Operational surface: `POST /tables/{table}/foreign-key-integrity` validates,
   dry-runs repairs, repairs, lists FK reverse-reference violations, plans
   per-range validation work, reports stored progress, exposes per-unit
-  worker-status claim keys, advances bounded worker passes with optional
-  durable `job_id` records, and explains parent deletes for local and hosted
-  table storage.
+  worker-status claim keys, advances bounded worker passes with explicit or
+  generated durable `job_id` records, and explains parent deletes for local and
+  hosted table storage.
+- In-process FK maintenance surface: table-write sources expose a bounded
+  schema-controller maintenance pass that scans bound/local or catalog-backed
+  tables for non-enforced FK declarations and advances durable repair/validation
+  jobs without requiring public HTTP polling. Bound/local maintenance also
+  promotes a terminal valid adoption job to `enforced` by applying the rewritten
+  schema through the ordinary local schema validator. Metadata-owned
+  provisioned/hosted rounds invoke the same bounded pass automatically and
+  promote terminal valid adoption jobs through the metadata table-update path;
+  service config controls whether the pass runs, worker id, lease duration,
+  table/work-unit limits, and violation limit. Non-empty rounds log aggregate
+  scheduler counters and metadata status exposes cumulative and last-round
+  scheduler counters plus cumulative and last-round FK integrity report
+  counters. Terminal invalid adoption jobs remain durable FK job records,
+  scheduler diagnostics, and internal table validation metadata instead of
+  runtime schema states. `AdminSource.updateForeignKeyValidationState` provides
+  the same explicit catalog transition primitive for external coordinators.
 - Unique operational surface: `POST /tables/{table}/unique-integrity`
   validates, dry-runs repair, repairs, and reports stored progress for unique
   integrity rows on local, provisioned, and hosted relational tables.
 - Planning surface: the DB and public/hosted operation can explain one parent
   delete using the same FK participant path as commit and return non-mutating
   set-null/cascade/reject counters.
-- Remaining operational docs: hosted background job-controller configuration and
-  explicit large-operation execution/recovery diagnostics.
+- Remaining operational docs: explicit large-operation execution/recovery
+  diagnostics and richer cross-pass hosted violation-detail summaries.

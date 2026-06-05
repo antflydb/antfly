@@ -3625,6 +3625,8 @@ pub fn build(b: *std.Build) void {
             "provisioned table write coalescer isolates failed waiters",
             "unique integrity owner topology inspection reports active and transitional ranges",
             "foreign key integrity plan clips requested span to table ranges",
+            "foreign key integrity worker plan includes active owner ranges",
+            "foreign key schema controller maintenance",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3818,6 +3820,8 @@ pub fn build(b: *std.Build) void {
             "metadata reconciler",
             "metadata transition state",
             "metadata server module compiles",
+            "metadata admin source advances foreign key validation state through schema update",
+            "metadata fk schema controller config builds bounded maintenance options",
             "metadata merge request validation rejects incompatible doc identity namespaces",
             "metadata split request validation rejects stale doc identity namespace",
             "metadata transition actions",

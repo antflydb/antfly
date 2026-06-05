@@ -31,6 +31,7 @@ pub const TableRecord = struct {
     description: []const u8 = "",
     schema_json: []const u8 = "",
     read_schema_json: []const u8 = "",
+    foreign_key_validation_json: []const u8 = "{}",
     indexes_json: []const u8 = "{}",
     replication_sources_json: []const u8 = "[]",
     placement_role: []const u8 = "data",
@@ -1302,6 +1303,8 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     errdefer alloc.free(schema_json);
     const read_schema_json = try alloc.dupe(u8, record.read_schema_json);
     errdefer alloc.free(read_schema_json);
+    const foreign_key_validation_json = try alloc.dupe(u8, record.foreign_key_validation_json);
+    errdefer alloc.free(foreign_key_validation_json);
     const indexes_json = try alloc.dupe(u8, record.indexes_json);
     errdefer alloc.free(indexes_json);
     const replication_sources_json = try alloc.dupe(u8, record.replication_sources_json);
@@ -1318,6 +1321,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
         .description = description,
         .schema_json = schema_json,
         .read_schema_json = read_schema_json,
+        .foreign_key_validation_json = foreign_key_validation_json,
         .indexes_json = indexes_json,
         .replication_sources_json = replication_sources_json,
         .placement_role = placement_role,
@@ -1333,6 +1337,7 @@ pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
     alloc.free(record.description);
     alloc.free(record.schema_json);
     alloc.free(record.read_schema_json);
+    alloc.free(record.foreign_key_validation_json);
     alloc.free(record.indexes_json);
     alloc.free(record.replication_sources_json);
     alloc.free(record.placement_role);

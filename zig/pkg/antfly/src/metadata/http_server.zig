@@ -23,6 +23,7 @@ const metadata_reconciler = @import("reconciler.zig");
 const metadata_transition_state = @import("transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const storage_schema = @import("../storage/schema.zig");
 const backups_api = @import("../api/backups.zig");
 const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
@@ -196,6 +197,26 @@ pub const AdminSource = struct {
     pub fn updateSchema(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const fn_ptr = self.vtable.update_schema orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, schema_json);
+    }
+
+    pub fn updateForeignKeyValidationState(
+        self: AdminSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        state: storage_schema.ForeignKeyValidationState,
+    ) !void {
+        var snapshot = try self.adminSnapshot();
+        defer self.freeAdminSnapshot(&snapshot);
+        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        const schema_json = try tables_api.schemaWithForeignKeyValidationStateAlloc(
+            alloc,
+            table.schema_json,
+            constraint_name,
+            state,
+        );
+        defer alloc.free(schema_json);
+        try self.updateSchema(alloc, table_name, schema_json);
     }
 
     pub fn createIndex(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -2846,6 +2867,93 @@ test "metadata http server serves status and filtered admin routes" {
     defer active_resp.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, active_resp.body, "\"transition_id\":9001") != null);
     try std.testing.expect(std.mem.indexOf(u8, active_resp.body, "\"transition_id\":9010") != null);
+}
+
+test "metadata admin source advances foreign key validation state through schema update" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        schema_json: []const u8 =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","validation_state":"unvalidated"}]}
+        ,
+        updated_schema_json: ?[]u8 = null,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.updated_schema_json) |value| allocator.free(value);
+            self.* = undefined;
+        }
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .update_schema = updateSchema,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metadata_epoch = 5, .metrics = .{} };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 77, .metadata_epoch = 5, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{
+                        .table_id = 1,
+                        .name = "orders",
+                        .schema_json = self.schema_json,
+                        .indexes_json = tables_api.default_indexes_json,
+                        .replication_sources_json = "[]",
+                        .placement_role = "data",
+                    },
+                })[0..]),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn updateSchema(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("orders", table_name);
+            if (self.updated_schema_json) |value| allocator.free(value);
+            self.updated_schema_json = try allocator.dupe(u8, schema_json);
+        }
+    };
+
+    var source = FakeSource{};
+    defer source.deinit(alloc);
+
+    try source.iface().updateForeignKeyValidationState(
+        alloc,
+        "orders",
+        "orders_customer_id_fkey",
+        .enforced,
+    );
+
+    const updated = source.updated_schema_json orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"validation_state\":\"enforced\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]}") != null);
+
+    try std.testing.expectError(
+        error.ForeignKeyNotFound,
+        source.iface().updateForeignKeyValidationState(alloc, "orders", "missing_fkey", .enforced),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        source.iface().updateForeignKeyValidationState(alloc, "orders", "orders_customer_id_fkey", .invalid),
+    );
 }
 
 test "metadata http server registers nodes and marks node stores draining for shutdown" {
