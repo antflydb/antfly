@@ -294,9 +294,28 @@ jobs:
         working-directory: zig
         run: zig build recall-test
 
-      - name: Run Zig recall harness
+      - name: Run Zig recall harness sweep
         working-directory: zig
-        run: zig build recall-harness -- --dataset-dir testdata/vectorsets
+        run: |
+          set -euo pipefail
+          datasets=(
+            images-512d-10k.gob
+            random-20d-1k.gob
+            fashionminst-784d-1k.gob
+            fashionminst-784d-10k.gob
+            laionclip-768d-1k.gob
+            laiongemini-1408d-1k.gob
+            laiongemini-512d-10k.gob
+            dbpedia-1536d-1k.gob
+            random-2048d-1k.gob
+            random-4096d-1k.gob
+            wikiarticles-768d-10k.gob
+          )
+          for dataset in "${datasets[@]}"; do
+            echo "::group::recall-harness ${dataset}"
+            zig build recall-harness -- --dataset-dir testdata/vectorsets --dataset "${dataset}"
+            echo "::endgroup::"
+          done
 
       - name: Run Zig chaos tests
         working-directory: zig
@@ -393,4 +412,6 @@ jobs:
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_DOWNLOAD: "1"
+          ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: openai-community/gpt2
         run: uv run --project e2e/inference pytest -q -x e2e/inference
