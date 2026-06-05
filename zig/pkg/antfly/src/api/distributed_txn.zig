@@ -150,6 +150,13 @@ pub const ParticipantWorker = struct {
             table_name: []const u8,
             req: ForeignKeyRefChildrenRequest,
         ) anyerror![]db_mod.types.ForeignKeyRefChild = null,
+        foreign_key_ref_children_page_group: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: ForeignKeyRefChildrenRequest,
+        ) anyerror!db_mod.types.ForeignKeyRefChildrenPage = null,
     };
 
     pub fn beginGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
@@ -182,6 +189,24 @@ pub const ParticipantWorker = struct {
     ) ![]db_mod.types.ForeignKeyRefChild {
         const fn_ptr = self.vtable.foreign_key_ref_children_group orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+    }
+
+    pub fn foreignKeyRefChildrenPageGroup(
+        self: ParticipantWorker,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: ForeignKeyRefChildrenRequest,
+    ) !db_mod.types.ForeignKeyRefChildrenPage {
+        if (self.vtable.foreign_key_ref_children_page_group) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+        }
+        if (req.start_after_child_table != null or req.start_after_child_key != null) return error.UnsupportedOperation;
+        const children = try self.foreignKeyRefChildrenGroup(alloc, group_id, table_name, req);
+        return .{
+            .children = @constCast(children),
+            .complete = true,
+        };
     }
 };
 
@@ -253,6 +278,7 @@ pub const HostedParticipantWorker = struct {
                 .status_group = statusGroup,
                 .lookup_group = lookupGroup,
                 .foreign_key_ref_children_group = foreignKeyRefChildrenGroup,
+                .foreign_key_ref_children_page_group = foreignKeyRefChildrenPageGroup,
             },
         };
     }
@@ -349,19 +375,21 @@ pub const HostedParticipantWorker = struct {
     }
 
     fn foreignKeyRefChildrenGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: ForeignKeyRefChildrenRequest) ![]db_mod.types.ForeignKeyRefChild {
+        var page = try foreignKeyRefChildrenPageGroup(ptr, alloc, group_id, table_name, req);
+        errdefer table_writes.freeForeignKeyRefChildrenPage(alloc, &page);
+        if (!page.complete) return error.ForeignKeyActionLimitExceeded;
+        const children = page.children;
+        page.children = &.{};
+        table_writes.freeForeignKeyRefChildrenPage(alloc, &page);
+        return children;
+    }
+
+    fn foreignKeyRefChildrenPageGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: ForeignKeyRefChildrenRequest) !db_mod.types.ForeignKeyRefChildrenPage {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         return switch (route) {
-            .local => blk: {
-                var page = (try self.writes.foreignKeyRefChildrenPageGroupLocal(alloc, group_id, table_name, req.constraint_name, req.parent_table, req.parent_key, req.start_after_child_table, req.start_after_child_key, req.limit)) orelse return error.UnknownGroup;
-                errdefer table_writes.freeForeignKeyRefChildrenPage(alloc, &page);
-                if (!page.complete) return error.ForeignKeyActionLimitExceeded;
-                const children = page.children;
-                page.children = &.{};
-                table_writes.freeForeignKeyRefChildrenPage(alloc, &page);
-                break :blk children;
-            },
+            .local => (try self.writes.foreignKeyRefChildrenPageGroupLocal(alloc, group_id, table_name, req.constraint_name, req.parent_table, req.parent_key, req.start_after_child_table, req.start_after_child_key, req.limit)) orelse error.UnknownGroup,
             .remote => |remote| blk: {
                 var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
                 const body = try encodeForeignKeyRefChildrenRequest(alloc, req);
@@ -370,11 +398,17 @@ pub const HostedParticipantWorker = struct {
                 defer response.deinit(alloc);
                 var parsed = try parseForeignKeyRefChildrenResponse(alloc, response.body);
                 errdefer freeForeignKeyRefChildrenResponse(alloc, &parsed);
-                if (!parsed.complete) return error.ForeignKeyActionLimitExceeded;
-                const children = parsed.children;
+                const page: db_mod.types.ForeignKeyRefChildrenPage = .{
+                    .children = @constCast(parsed.children),
+                    .complete = parsed.complete,
+                    .next_child_table = parsed.next_child_table,
+                    .next_child_key = parsed.next_child_key,
+                };
                 parsed.children = &.{};
+                parsed.next_child_table = null;
+                parsed.next_child_key = null;
                 freeForeignKeyRefChildrenResponse(alloc, &parsed);
-                break :blk @constCast(children);
+                break :blk page;
             },
         };
     }
@@ -403,6 +437,7 @@ pub const LocalTableWriteParticipantWorker = struct {
                 .status_group = statusGroup,
                 .lookup_group = lookupGroup,
                 .foreign_key_ref_children_group = foreignKeyRefChildrenGroup,
+                .foreign_key_ref_children_page_group = foreignKeyRefChildrenPageGroup,
             },
         };
     }
@@ -434,14 +469,18 @@ pub const LocalTableWriteParticipantWorker = struct {
     }
 
     fn foreignKeyRefChildrenGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: ForeignKeyRefChildrenRequest) ![]db_mod.types.ForeignKeyRefChild {
-        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        var page = (try self.writes.foreignKeyRefChildrenPageGroupLocal(alloc, group_id, table_name, req.constraint_name, req.parent_table, req.parent_key, req.start_after_child_table, req.start_after_child_key, req.limit)) orelse return error.UnknownGroup;
+        var page = try foreignKeyRefChildrenPageGroup(ptr, alloc, group_id, table_name, req);
         errdefer table_writes.freeForeignKeyRefChildrenPage(alloc, &page);
         if (!page.complete) return error.ForeignKeyActionLimitExceeded;
         const children = page.children;
         page.children = &.{};
         table_writes.freeForeignKeyRefChildrenPage(alloc, &page);
         return children;
+    }
+
+    fn foreignKeyRefChildrenPageGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: ForeignKeyRefChildrenRequest) !db_mod.types.ForeignKeyRefChildrenPage {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        return (try self.writes.foreignKeyRefChildrenPageGroupLocal(alloc, group_id, table_name, req.constraint_name, req.parent_table, req.parent_key, req.start_after_child_table, req.start_after_child_key, req.limit)) orelse error.UnknownGroup;
     }
 };
 
@@ -961,29 +1000,146 @@ fn explainRoutedForeignKeyRefOwnerChildren(
     if (foreign_key.on_delete != .restrict and foreign_key.on_delete != .set_null and foreign_key.on_delete != .cascade) return error.UnsupportedOperation;
     routed_owner_group_count.* +|= owner_groups.len;
     for (owner_groups) |group_id| {
-        const children = try worker.foreignKeyRefChildrenGroup(alloc, group_id, child_table_name, .{
-            .constraint_name = foreign_key.name,
+        try forEachForeignKeyRefOwnerChildPage(alloc, worker, group_id, child_table_name, foreign_key.name, parent_table_name, parent_key, .{
+            .ctx = .{ .explain = .{
+                .plan = plan,
+                .child_runtime_table = child_runtime_table,
+                .on_delete = foreign_key.on_delete,
+            } },
+            .callback = explainRoutedForeignKeyRefOwnerChildPage,
+        });
+    }
+}
+
+const foreign_key_ref_owner_page_limit: usize = 4096;
+
+const ForeignKeyRefOwnerPageCallback = struct {
+    ctx: Context,
+    callback: *const fn (ctx: Context, children: []const db_mod.types.ForeignKeyRefChild) anyerror!void,
+
+    const Context = union(enum) {
+        explain: ExplainContext,
+        route_actions: RouteActionsContext,
+    };
+
+    const ExplainContext = struct {
+        plan: *relational_store.ForeignKeyDeletePlan,
+        child_runtime_table: []const u8,
+        on_delete: storage_schema.ForeignKeyAction,
+    };
+
+    const RouteActionsContext = struct {
+        alloc: std.mem.Allocator,
+        catalog: table_catalog.CatalogSource,
+        participants: *std.ArrayListUnmanaged(ParticipantTxn),
+        child_table_name: []const u8,
+        child_runtime_table: []const u8,
+        foreign_key: storage_schema.ForeignKey,
+        parent_key: []const u8,
+        owner_group_id: u64,
+        owner_topology_epoch: u64,
+        child_topology_epoch: u64,
+    };
+};
+
+fn forEachForeignKeyRefOwnerChildPage(
+    alloc: std.mem.Allocator,
+    worker: ParticipantWorker,
+    group_id: u64,
+    child_table_name: []const u8,
+    constraint_name: []const u8,
+    parent_table_name: []const u8,
+    parent_key: []const u8,
+    callback: ForeignKeyRefOwnerPageCallback,
+) !void {
+    var start_after_child_table: ?[]const u8 = null;
+    var start_after_child_key: ?[]const u8 = null;
+    while (true) {
+        var page = try worker.foreignKeyRefChildrenPageGroup(alloc, group_id, child_table_name, .{
+            .constraint_name = constraint_name,
             .parent_table = parent_table_name,
             .parent_key = parent_key,
-            .limit = 4096,
+            .limit = foreign_key_ref_owner_page_limit,
+            .start_after_child_table = start_after_child_table,
+            .start_after_child_key = start_after_child_key,
         });
-        defer freeForeignKeyRefChildren(alloc, children);
-        for (children) |child| {
-            if (!std.mem.eql(u8, child.child_table, child_runtime_table)) return error.TopologyChanged;
-        }
-        switch (foreign_key.on_delete) {
-            .restrict => if (children.len > 0) {
-                plan.allowed = false;
-                if (plan.block_reason == .none) plan.block_reason = .restrict;
-            },
-            .set_null => {
-                plan.planned_set_null_updates +|= @intCast(children.len);
-                plan.planned_writes +|= @intCast(children.len);
-            },
-            .cascade => {
-                plan.planned_cascade_deletes +|= @intCast(children.len);
-                plan.planned_row_deletes +|= @intCast(children.len);
-            },
+        defer table_writes.freeForeignKeyRefChildrenPage(alloc, &page);
+
+        try callback.callback(callback.ctx, page.children);
+
+        if (page.complete) break;
+        start_after_child_table = page.next_child_table orelse return error.InvalidTxnRequest;
+        start_after_child_key = page.next_child_key orelse return error.InvalidTxnRequest;
+    }
+}
+
+fn explainRoutedForeignKeyRefOwnerChildPage(
+    ctx: ForeignKeyRefOwnerPageCallback.Context,
+    children: []const db_mod.types.ForeignKeyRefChild,
+) !void {
+    const explain = switch (ctx) {
+        .explain => |value| value,
+        else => return error.InvalidTxnRequest,
+    };
+    for (children) |child| {
+        if (!std.mem.eql(u8, child.child_table, explain.child_runtime_table)) return error.TopologyChanged;
+    }
+    switch (explain.on_delete) {
+        .restrict => if (children.len > 0) {
+            explain.plan.allowed = false;
+            if (explain.plan.block_reason == .none) explain.plan.block_reason = .restrict;
+        },
+        .set_null => {
+            explain.plan.planned_set_null_updates +|= @intCast(children.len);
+            explain.plan.planned_writes +|= @intCast(children.len);
+        },
+        .cascade => {
+            explain.plan.planned_cascade_deletes +|= @intCast(children.len);
+            explain.plan.planned_row_deletes +|= @intCast(children.len);
+        },
+        else => return error.UnsupportedOperation,
+    }
+}
+
+fn routeForeignKeyRefOwnerChildActionPage(
+    ctx: ForeignKeyRefOwnerPageCallback.Context,
+    children: []const db_mod.types.ForeignKeyRefChild,
+) !void {
+    const route = switch (ctx) {
+        .route_actions => |value| value,
+        else => return error.InvalidTxnRequest,
+    };
+    for (children) |child| {
+        if (!std.mem.eql(u8, child.child_table, route.child_runtime_table)) return error.TopologyChanged;
+        const owner_for_child = try ensureParticipantTxn(
+            route.alloc,
+            route.participants,
+            route.child_table_name,
+            route.owner_group_id,
+            route.owner_topology_epoch,
+        );
+        try appendForeignKeyRefMutation(route.alloc, &owner_for_child.foreign_key_ref_deletes, route.foreign_key, route.child_runtime_table, child.child_key, route.parent_key);
+
+        const child_group_id = (try table_catalog.resolveGroupForKeyPinned(
+            route.alloc,
+            route.catalog,
+            route.child_table_name,
+            child.child_key,
+            route.child_topology_epoch,
+        )) orelse return error.UnknownGroup;
+        const child_participant = try ensureParticipantTxn(
+            route.alloc,
+            route.participants,
+            route.child_table_name,
+            child_group_id,
+            route.child_topology_epoch,
+        );
+        if (route.foreign_key.on_delete == .set_null) {
+            try appendForeignKeySetNullChildAction(route.alloc, child_participant, route.foreign_key, route.parent_key, child.child_key);
+        } else if (route.foreign_key.on_delete == .cascade) {
+            try appendForeignKeyCascadeChildAction(route.alloc, child_participant, route.foreign_key, route.parent_key, child.child_key);
+        } else {
+            return error.UnsupportedOperation;
         }
     }
 }
@@ -1659,25 +1815,21 @@ fn addRoutedForeignKeyParentDeleteParticipants(
         } else {
             const owner_participant = try ensureParticipantTxn(alloc, participants, child_table_name, group_id, resolution.topology_epoch);
             try appendForeignKeyConflictCheck(alloc, owner_participant, foreign_key, parent_key);
-            const children = try worker.foreignKeyRefChildrenGroup(alloc, group_id, child_table_name, .{
-                .constraint_name = foreign_key.name,
-                .parent_table = foreign_key.parent_table,
-                .parent_key = parent_key,
-                .limit = 4096,
+            try forEachForeignKeyRefOwnerChildPage(alloc, worker, group_id, child_table_name, foreign_key.name, foreign_key.parent_table, parent_key, .{
+                .ctx = .{ .route_actions = .{
+                    .alloc = alloc,
+                    .catalog = catalog,
+                    .participants = participants,
+                    .child_table_name = child_table_name,
+                    .child_runtime_table = child_runtime_table,
+                    .foreign_key = foreign_key,
+                    .parent_key = parent_key,
+                    .owner_group_id = group_id,
+                    .owner_topology_epoch = resolution.topology_epoch,
+                    .child_topology_epoch = child_topology_epoch,
+                } },
+                .callback = routeForeignKeyRefOwnerChildActionPage,
             });
-            defer freeForeignKeyRefChildren(alloc, children);
-            for (children) |child| {
-                if (!std.mem.eql(u8, child.child_table, child_runtime_table)) return error.TopologyChanged;
-                const owner_for_child = try ensureParticipantTxn(alloc, participants, child_table_name, group_id, resolution.topology_epoch);
-                try appendForeignKeyRefMutation(alloc, &owner_for_child.foreign_key_ref_deletes, foreign_key, child_runtime_table, child.child_key, parent_key);
-                const child_group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, child_table_name, child.child_key, child_topology_epoch)) orelse return error.UnknownGroup;
-                const child_participant = try ensureParticipantTxn(alloc, participants, child_table_name, child_group_id, child_topology_epoch);
-                if (foreign_key.on_delete == .set_null) {
-                    try appendForeignKeySetNullChildAction(alloc, child_participant, foreign_key, parent_key, child.child_key);
-                } else {
-                    try appendForeignKeyCascadeChildAction(alloc, child_participant, foreign_key, parent_key, child.child_key);
-                }
-            }
         }
     }
     return true;
@@ -1740,25 +1892,21 @@ fn addRoutedUniqueForeignKeyParentDeleteParticipants(
 
         const owner_participant = try ensureParticipantTxn(alloc, participants, child_table_name, group_id, resolution.topology_epoch);
         try appendForeignKeyConflictCheck(alloc, owner_participant, foreign_key, encoded_parent);
-        const children = try worker.foreignKeyRefChildrenGroup(alloc, group_id, child_table_name, .{
-            .constraint_name = foreign_key.name,
-            .parent_table = foreign_key.parent_table,
-            .parent_key = encoded_parent,
-            .limit = 4096,
+        try forEachForeignKeyRefOwnerChildPage(alloc, worker, group_id, child_table_name, foreign_key.name, foreign_key.parent_table, encoded_parent, .{
+            .ctx = .{ .route_actions = .{
+                .alloc = alloc,
+                .catalog = catalog,
+                .participants = participants,
+                .child_table_name = child_table_name,
+                .child_runtime_table = child_runtime_table,
+                .foreign_key = foreign_key,
+                .parent_key = encoded_parent,
+                .owner_group_id = group_id,
+                .owner_topology_epoch = resolution.topology_epoch,
+                .child_topology_epoch = child_topology_epoch,
+            } },
+            .callback = routeForeignKeyRefOwnerChildActionPage,
         });
-        defer freeForeignKeyRefChildren(alloc, children);
-        for (children) |child| {
-            if (!std.mem.eql(u8, child.child_table, child_runtime_table)) return error.TopologyChanged;
-            const owner_for_child = try ensureParticipantTxn(alloc, participants, child_table_name, group_id, resolution.topology_epoch);
-            try appendForeignKeyRefMutation(alloc, &owner_for_child.foreign_key_ref_deletes, foreign_key, child_runtime_table, child.child_key, encoded_parent);
-            const child_group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, child_table_name, child.child_key, child_topology_epoch)) orelse return error.UnknownGroup;
-            const child_participant = try ensureParticipantTxn(alloc, participants, child_table_name, child_group_id, child_topology_epoch);
-            if (foreign_key.on_delete == .set_null) {
-                try appendForeignKeySetNullChildAction(alloc, child_participant, foreign_key, encoded_parent, child.child_key);
-            } else {
-                try appendForeignKeyCascadeChildAction(alloc, child_participant, foreign_key, encoded_parent, child.child_key);
-            }
-        }
     }
     return true;
 }
