@@ -3093,6 +3093,33 @@ pub const ProvisionedTableWriteSource = struct {
         self.endStructuralTableActivity(table_name);
     }
 
+    fn beginLocalRestoreMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        self.beginStructuralTableActivity(table_name);
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateWriteCache(table_name);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        self.local_db_mutex.unlock();
+    }
+
+    fn finishLocalRestoreMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateWriteCache(table_name);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        self.local_db_mutex.unlock();
+        self.endStructuralTableActivity(table_name);
+    }
+
+    fn abortLocalRestoreMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateReadCache(table_name);
+        self.invalidateWriteCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        self.local_db_mutex.unlock();
+        self.endStructuralTableActivity(table_name);
+    }
+
     fn abortLocalStructuralMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.invalidateReadCache(table_name);
         self.invalidateWriteCache(table_name);
@@ -4877,6 +4904,45 @@ pub const ProvisionedTableWriteSource = struct {
         return db;
     }
 
+    fn repairRestoredTableRuntimeStateBlocking(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        path: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+    ) !void {
+        if (!try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path)) return;
+
+        const indexes_json = (try loadTableIndexesJson(alloc, self.catalog, table_name)) orelse return error.TableVisibilityTimeout;
+        defer alloc.free(indexes_json);
+
+        var db = try self.openRestoreRepairDbForGroup(
+            alloc,
+            path,
+            group_id,
+            table_name,
+            indexes_json,
+        );
+        defer db.close();
+
+        const timeout_ns = 30 * std.time.ns_per_s;
+        const start_ns = platform_time.monotonicNs();
+        var attempts: usize = 0;
+        std.log.info("restore foreground repair begin table={s} group_id={d}", .{ table_name, group_id });
+        while (try db.restoreRuntimeRepairNeeded()) {
+            attempts += 1;
+            if (try db.repairRestoreRuntimeStateStepIfNeeded(alloc)) {
+                db.clearDenseHbcCaches();
+            }
+            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+        }
+        std.log.info("restore foreground repair complete table={s} group_id={d} attempts={d}", .{
+            table_name,
+            group_id,
+            attempts,
+        });
+    }
+
     const RestoreRepairCatchUpWork = struct {
         alloc: std.mem.Allocator,
         source: *ProvisionedTableWriteSource,
@@ -5683,8 +5749,8 @@ pub const ProvisionedTableWriteSource = struct {
         const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, plan.manifest.shards[0].snapshot_path });
         defer alloc.free(snapshot_root);
-        self.beginLocalStructuralMutation(table_name);
-        errdefer self.abortLocalStructuralMutation(table_name);
+        self.beginLocalRestoreMutation(table_name);
+        errdefer self.abortLocalRestoreMutation(table_name);
         var restore_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer restore_io_impl.deinit();
 
@@ -5725,10 +5791,11 @@ pub const ProvisionedTableWriteSource = struct {
             return err;
         };
 
-        self.finishLocalStructuralMutation(table_name);
+        try self.repairRestoredTableRuntimeStateBlocking(alloc, path, group_id, table_name);
+
+        self.finishLocalRestoreMutation(table_name);
         self.notifyLocalChange(table_name, .structural);
         self.notifyLocalChange(table_name, .data);
-        self.requestRestoreRepairCatchUp(table_name, group_id);
     }
 
     fn commitTransaction(
@@ -10415,6 +10482,7 @@ test "provisioned table write source backs up and restores a local table" {
         .backup_root = backup_root,
         .manifest = &manifest,
     });
+    try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
     db.close();
     db = try db_mod.DB.open(alloc, db_path, .{});
@@ -10626,6 +10694,7 @@ test "provisioned table write source backs up and restores full_text writes from
         .backup_root = backup_root,
         .manifest = &manifest,
     });
+    try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
     var read_source = table_reads.ProvisionedTableReadSource.init(
         path,
@@ -18775,6 +18844,7 @@ test "provisioned table write source restore table does not hold local db mutex 
     thread.join();
 
     if (worker.err) |err| return err;
+    try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
     db.close();
     db = try db_mod.DB.open(alloc, db_path, .{});
