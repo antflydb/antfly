@@ -20,8 +20,22 @@ const build_options = @import("build_options");
 const raft_engine = @import("raft_engine");
 const tracing = @import("../tracing/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
+const platform_time = @import("../platform/time.zig");
 
 const setup_io_thread_stack_size = 1 * 1024 * 1024;
+
+fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
+    return .{
+        .max_tick_batch = 32,
+        .max_pending_outbound_messages = 4096,
+        .max_pending_outbound_bytes = 16 * 1024 * 1024,
+        .max_transport_messages_per_round = 64,
+        .max_transport_bytes_per_round = 512 * 1024,
+        .max_pending_apply_tasks = 1024,
+        .max_pending_apply_bytes = 16 * 1024 * 1024,
+        .max_apply_tasks_per_round = 16,
+    };
+}
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
@@ -114,9 +128,8 @@ const ResolvedPaths = struct {
 
 /// Backs the metadata server's health/metrics endpoints. Exposes local raft
 /// host metrics and managed-service metrics as Prometheus text, and reports
-/// readiness by probing the metadata service status. Shared by the
-/// standalone metadata runtime and the swarm runtime so both expose the
-/// same metric set.
+/// readiness from a cached, constant-time probe flag. Shared by the standalone
+/// metadata runtime and the swarm runtime so both expose the same metric set.
 pub const HealthSource = struct {
     server: *Server,
 
@@ -136,8 +149,7 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
-        _ = self.server.metadataHttpService().status() catch return false;
-        return true;
+        return self.server.metadataHttpService().probeReady();
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
@@ -153,9 +165,25 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_ensure_replica_calls_total", "counter", "Total ensure_replica calls", @intCast(host_metrics.ensure_replica_calls));
         try append(writer, "antfly_raft_remove_replica_calls_total", "counter", "Total remove_replica calls", @intCast(host_metrics.remove_replica_calls));
         try append(writer, "antfly_raft_runtime_rounds_total", "counter", "Total raft runtime rounds", @intCast(host_metrics.runtime_rounds));
+        try append(writer, "antfly_raft_runtime_ticked_groups_total", "counter", "Total raft groups ticked by the runtime", @intCast(host_metrics.runtime_ticked_groups));
+        try append(writer, "antfly_raft_runtime_processed_groups_total", "counter", "Total raft ready groups processed by the runtime", @intCast(host_metrics.runtime_processed_groups));
+        try append(writer, "antfly_raft_runtime_transport_message_sends_total", "counter", "Total raft transport messages flushed by the runtime", @intCast(host_metrics.runtime_transport_message_sends));
+        try append(writer, "antfly_raft_runtime_pending_outbound_messages", "gauge", "Pending outbound raft messages inside the runtime", @intCast(host_metrics.runtime_pending_outbound_messages));
+        try append(writer, "antfly_raft_runtime_pending_outbound_bytes", "gauge", "Approximate pending outbound raft bytes inside the runtime", @intCast(host_metrics.runtime_pending_outbound_bytes));
+        try append(writer, "antfly_raft_runtime_pending_apply_tasks", "gauge", "Pending raft apply tasks inside the runtime", @intCast(host_metrics.runtime_pending_apply_tasks));
+        try append(writer, "antfly_raft_runtime_pending_apply_bytes", "gauge", "Approximate pending raft apply bytes inside the runtime", @intCast(host_metrics.runtime_pending_apply_bytes));
+        try append(writer, "antfly_raft_runtime_transport_queue_denials_total", "counter", "Total raft ready denials from outbound transport queue pressure", @intCast(host_metrics.runtime_transport_queue_denials));
+        try append(writer, "antfly_raft_runtime_apply_queue_denials_total", "counter", "Total raft ready denials from apply queue pressure", @intCast(host_metrics.runtime_apply_queue_denials));
         try append(writer, "antfly_raft_backup_bootstrap_attempts_total", "counter", "Total backup bootstrap attempts", @intCast(host_metrics.backup_bootstrap_attempts));
         try append(writer, "antfly_raft_backup_bootstrap_failures_total", "counter", "Total backup bootstrap failures", @intCast(host_metrics.backup_bootstrap_failures));
         try append(writer, "antfly_raft_backup_bootstrap_successes_total", "counter", "Total backup bootstrap successes", @intCast(host_metrics.backup_bootstrap_successes));
+        try append(writer, "antfly_raft_async_send_enqueued_total", "counter", "Total raft frames enqueued for async HTTP send", host_metrics.async_send_enqueued);
+        try append(writer, "antfly_raft_async_send_failed_total", "counter", "Total async raft HTTP send failures before retry or drop", host_metrics.async_send_failed);
+        try append(writer, "antfly_raft_async_send_retried_total", "counter", "Total async raft HTTP frames requeued for retry", host_metrics.async_send_retried);
+        try append(writer, "antfly_raft_async_send_dropped_total", "counter", "Total async raft HTTP frames dropped after retry or queue limits", host_metrics.async_send_dropped);
+        try append(writer, "antfly_raft_async_send_queue_full_total", "counter", "Total async raft HTTP global queue-full events", host_metrics.async_send_queue_full);
+        try append(writer, "antfly_raft_async_send_peer_queue_full_total", "counter", "Total async raft HTTP per-peer queue-full events", host_metrics.async_send_peer_queue_full);
+        try append(writer, "antfly_raft_async_send_pending", "gauge", "Pending async raft HTTP frames", @intCast(host_metrics.async_send_pending));
 
         try append(writer, "antfly_service_queued_updates", "gauge", "Pending metadata updates waiting to apply", @intCast(svc_metrics.queued_updates));
         try append(writer, "antfly_service_applied_updates_total", "counter", "Total applied metadata updates", @intCast(svc_metrics.applied_updates));
@@ -246,6 +274,7 @@ pub const Server = struct {
                     .host = .{
                         .local_node_id = cfg.local_node_id,
                         .metadata_group_id = cfg.metadata_group_id,
+                        .runtime = metadataRaftRuntimeConfig(),
                         .replica_root_dir = result.replica_root_dir,
                         .replica_catalog_path = result.replica_catalog_path,
                         .replica_state_backend = cfg.replica_state_backend,
@@ -569,8 +598,18 @@ pub fn runFromIterator(
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
     while (true) {
+        const run_round_start_ns = platform_time.monotonicNs();
         try server.runRound();
+        const run_round_elapsed_ns = platform_time.monotonicNs() -| run_round_start_ns;
+        if (run_round_elapsed_ns > std.time.ns_per_s) {
+            std.log.warn("metadata runRound slow elapsed_ms={d}", .{@divTrunc(run_round_elapsed_ns, std.time.ns_per_ms)});
+        }
+        const cdc_round_start_ns = platform_time.monotonicNs();
         try server.runCdcRound();
+        const cdc_round_elapsed_ns = platform_time.monotonicNs() -| cdc_round_start_ns;
+        if (cdc_round_elapsed_ns > std.time.ns_per_s) {
+            std.log.warn("metadata runCdcRound slow elapsed_ms={d}", .{@divTrunc(cdc_round_elapsed_ns, std.time.ns_per_ms)});
+        }
         const err = std.posix.errno(std.posix.system.nanosleep(&req, &req));
         switch (err) {
             .SUCCESS => {},

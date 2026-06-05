@@ -48,6 +48,17 @@ const internal_keys = @import("../storage/internal_keys.zig");
 const foreign_mod = @import("../foreign/mod.zig");
 
 const cdc_replication_round_interval_ms: u64 = 1_000;
+const metadata_run_round_slow_phase_threshold_ns: u64 = 500 * std.time.ns_per_ms;
+
+fn logMetadataRunRoundPhase(name: []const u8, start_ns: u64) void {
+    const elapsed_ns = platform_time.monotonicNs() -| start_ns;
+    if (elapsed_ns > metadata_run_round_slow_phase_threshold_ns) {
+        std.log.debug("metadata runRound phase slow phase={s} elapsed_ms={d}", .{
+            name,
+            @divTrunc(elapsed_ns, std.time.ns_per_ms),
+        });
+    }
+}
 
 const LifecycleSignal = struct {
     alloc: std.mem.Allocator,
@@ -209,7 +220,11 @@ pub const LocalReplicaRootReconcilePermitHook = struct {
 };
 
 pub const MetadataServiceConfig = struct {
-    raft: raft_service.ManagedServiceConfig = .{},
+    raft: raft_service.ManagedServiceConfig = .{
+        .max_inbound_messages = 128,
+        .max_tick_groups = 8,
+        .max_ready_groups = 8,
+    },
     reconcile_lease: metadata_reconcile_lease.Config = .{},
     observe_local_replica_root: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -700,7 +715,7 @@ pub const MetadataService = struct {
     local_schema_progress_epoch: ?u64,
     local_schema_progress_group_ids_fingerprint: ?u64,
     last_local_schema_progress_refresh_at_ms: u64,
-    cdc_runtime_mutex: std.atomic.Mutex = .unlocked,
+    cdc_runtime_mutex: std.Io.Mutex = .init,
     reconcile_lease: metadata_reconcile_lease.State,
     lifecycle_signal: LifecycleSignal,
     lifecycle_reconcile_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -717,7 +732,7 @@ pub const MetadataService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
-    backend_runtime_mutex: std.atomic.Mutex = .unlocked,
+    backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
     raft: raft_service.ManagedHostService,
@@ -772,10 +787,8 @@ pub const MetadataService = struct {
     }
 
     pub fn ensureBackendRuntime(self: *MetadataService) !*backend_runtime_mod.BackendRuntime {
-        while (!self.backend_runtime_mutex.tryLock()) {
-            std.Thread.yield() catch {};
-        }
-        defer self.backend_runtime_mutex.unlock();
+        self.backend_runtime_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.backend_runtime_mutex.unlock(std.Options.debug_io);
         if (self.backend_runtime == null) {
             self.owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(self.alloc, .{});
             self.backend_runtime = self.owned_backend_runtime.?.ptr();
@@ -1681,10 +1694,8 @@ pub const MetadataService = struct {
     fn runReplicationBackfillRound(self: *MetadataService) !void {
         const replica_root_dir = self.replica_root_dir orelse return;
         if (!self.raft.host.host.isLocalLeader(self.metadata_group_id)) return;
-        while (!self.cdc_runtime_mutex.tryLock()) {
-            std.Thread.yield() catch {};
-        }
-        defer self.cdc_runtime_mutex.unlock();
+        self.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.cdc_runtime_mutex.unlock(std.Options.debug_io);
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         if (now_ms < self.cdc_next_round_at_ms) return;
         self.cdc_next_round_at_ms = now_ms + cdc_replication_round_interval_ms;
@@ -1815,9 +1826,9 @@ pub const MetadataHttpService = struct {
     local_schema_progress_epoch: ?u64,
     local_schema_progress_group_ids_fingerprint: ?u64,
     last_local_schema_progress_refresh_at_ms: u64,
-    cdc_runtime_mutex: std.atomic.Mutex = .unlocked,
+    cdc_runtime_mutex: std.Io.Mutex = .init,
     reconcile_lease: metadata_reconcile_lease.State,
-    runtime_mutex: std.atomic.Mutex = .unlocked,
+    runtime_mutex: std.Io.Mutex = .init,
     lifecycle_signal: LifecycleSignal,
     lifecycle_reconcile_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     lifecycle_reconcile_hook: ?LifecycleReconcileHook = null,
@@ -1830,19 +1841,20 @@ pub const MetadataHttpService = struct {
     routed_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     reconcile_lease_projection_cache: ReconcileLeaseProjectionCache = .{},
     projected_core_snapshot_cache: ProjectedCoreSnapshotCache = .{},
-    metadata_status_cache_mutex: std.atomic.Mutex = .unlocked,
+    metadata_status_cache_mutex: std.Io.Mutex = .init,
     metadata_status_cache_valid: bool = false,
     metadata_status_cache: MetadataStatus = .{ .metadata_group_id = 0, .metrics = .{} },
     metadata_status_cache_next_refresh_at_ms: u64 = 0,
     metadata_status_cache_projection_epoch: u64 = 0,
     metadata_status_cache_placement_epoch: u64 = 0,
     metadata_status_cache_transition_epoch: u64 = 0,
+    probe_ready: std.atomic.Value(bool) = .init(false),
     store_status_backfill_probe_ticks: usize = 0,
     store_status_backfill_marker_cache: StoreStatusBackfillMarkerCache = .{},
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
-    backend_runtime_mutex: std.atomic.Mutex = .unlocked,
+    backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
     metadata_orchestration_urls: []MetadataOrchestrationUrl = &.{},
@@ -1855,6 +1867,14 @@ pub const MetadataHttpService = struct {
         cfg: MetadataServiceConfig,
     ) !MetadataHttpService {
         const metadata_group_id = host_cfg.http.host.metadata_group_id orelse return error.MissingMetadataGroupId;
+        var owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null;
+        errdefer if (owned_backend_runtime) |*runtime| runtime.deinit();
+        const backend_runtime = cfg.backend_runtime orelse blk: {
+            owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+            break :blk owned_backend_runtime.?.ptr();
+        };
+        var http_deps = deps.http;
+        http_deps.http.backend_runtime = backend_runtime;
         var service = MetadataHttpService{
             .alloc = alloc,
             .metadata_group_id = metadata_group_id,
@@ -1874,11 +1894,13 @@ pub const MetadataHttpService = struct {
             .last_local_schema_progress_refresh_at_ms = 0,
             .reconcile_lease = metadata_reconcile_lease.State.init(host_cfg.http.host.local_node_id, cfg.reconcile_lease),
             .lifecycle_signal = LifecycleSignal.init(alloc),
-            .backend_runtime = cfg.backend_runtime,
+            .backend_runtime = backend_runtime,
+            .owned_backend_runtime = owned_backend_runtime,
             .secret_store = cfg.secret_store,
             .metadata_orchestration_urls = try cloneMetadataOrchestrationUrls(alloc, cfg.metadata_orchestration_urls),
-            .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, deps.http, cfg.raft, deps.raft),
+            .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
         };
+        owned_backend_runtime = null;
         errdefer service.deinit();
         try foreign_mod.registerDefaultPostgresExecutor(alloc, &service.cdc_backfill_registry);
         return service;
@@ -1901,16 +1923,19 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn ensureBackendRuntime(self: *MetadataHttpService) !*backend_runtime_mod.BackendRuntime {
-        while (!self.backend_runtime_mutex.tryLock()) {
-            std.Thread.yield() catch {};
-        }
-        defer self.backend_runtime_mutex.unlock();
+        self.backend_runtime_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.backend_runtime_mutex.unlock(std.Options.debug_io);
         if (self.backend_runtime == null) {
             self.owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(self.alloc, .{});
             self.backend_runtime = self.owned_backend_runtime.?.ptr();
         }
         if (self.backend_runtime) |runtime| return runtime;
         unreachable;
+    }
+
+    pub fn apiIoImpl(self: *MetadataHttpService) ?*backend_runtime_mod.IoImpl {
+        const runtime = self.backend_runtime orelse return null;
+        return runtime.apiIoImpl();
     }
 
     pub fn lifecycleSignalCurrent(self: *const MetadataHttpService) u32 {
@@ -2243,9 +2268,12 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn runRound(self: *MetadataHttpService) !void {
+        var phase_start_ns = platform_time.monotonicNs();
         try self.ensureLifecycleListenerRegistered();
+        logMetadataRunRoundPhase("ensure_lifecycle_listener", phase_start_ns);
         defer self.refreshMetadataStatusCacheIfDue();
         defer self.lifecycle_signal.notify(null);
+        phase_start_ns = platform_time.monotonicNs();
         self.lockRuntime();
         {
             defer self.unlockRuntime();
@@ -2255,39 +2283,81 @@ pub const MetadataHttpService = struct {
                 try self.raft.runRaftRoundOnly();
             }
         }
+        self.refreshProbeReady();
+        logMetadataRunRoundPhase("raft_round", phase_start_ns);
         if (!self.observe_local_replica_root) return;
 
+        phase_start_ns = platform_time.monotonicNs();
         var local_projection_inputs = try captureLocalProjectionInputs(self);
         defer freeLocalProjectionInputs(self, &local_projection_inputs);
+        logMetadataRunRoundPhase("capture_projection_inputs", phase_start_ns);
 
+        phase_start_ns = platform_time.monotonicNs();
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForRound();
+        logMetadataRunRoundPhase("refresh_store_status_backfill_markers", phase_start_ns);
         if ((self.store_status_ticks >= 40 or backfill_markers.len > 0) and shouldRefreshLocalStoreStatus(self, backfill_markers)) {
             self.store_status_ticks = 0;
+            phase_start_ns = platform_time.monotonicNs();
             self.refreshLocalStoreStatusWithBackfillMarkers(backfill_markers, true) catch |err| switch (err) {
                 error.UnknownGroup, error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
                 else => return err,
             };
+            logMetadataRunRoundPhase("refresh_local_store_status", phase_start_ns);
         }
+        phase_start_ns = platform_time.monotonicNs();
         self.refreshLocalSchemaProgress(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
+        logMetadataRunRoundPhase("refresh_local_schema_progress", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
         const has_reconcile_lease = try self.ensureReconcileLease();
+        logMetadataRunRoundPhase("ensure_reconcile_lease", phase_start_ns);
         if (!has_reconcile_lease) return;
+        phase_start_ns = platform_time.monotonicNs();
         var local_placement_inputs = try captureLocalPlacementInputs(self);
         defer freeLocalPlacementInputs(self, &local_placement_inputs);
+        logMetadataRunRoundPhase("capture_placement_inputs", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
         var local_transition_inputs = try captureLocalTransitionInputs(self);
         defer freeLocalTransitionInputs(self, &local_transition_inputs);
+        logMetadataRunRoundPhase("capture_transition_inputs", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
         try self.refreshLocalPlacementIntents(&local_placement_inputs);
+        logMetadataRunRoundPhase("refresh_local_placement_intents", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
         try self.refreshLocalTransitions(&local_transition_inputs);
+        logMetadataRunRoundPhase("refresh_local_transitions", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
         _ = self.refreshLocalTableProvisioning(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,
         };
+        logMetadataRunRoundPhase("refresh_local_table_provisioning", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
         try self.completeRestoreIntentsIfReady(&local_projection_inputs, &local_placement_inputs);
+        logMetadataRunRoundPhase("complete_restore_intents", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
         try self.runReplicationBackfillRound();
+        logMetadataRunRoundPhase("run_replication_backfill", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
         try self.runLifecycleReconcileHookIfRequested();
+        logMetadataRunRoundPhase("run_lifecycle_reconcile_hook", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
         _ = try self.raft.stepTransitions();
+        logMetadataRunRoundPhase("step_transitions", phase_start_ns);
+    }
+
+    pub fn probeReady(self: *const MetadataHttpService) bool {
+        return self.probe_ready.load(.acquire);
+    }
+
+    fn refreshProbeReady(self: *MetadataHttpService) void {
+        const ready = switch (self.raft.host.status(self.metadata_group_id)) {
+            .active, .quiesced => true,
+            .absent, .starting, .snapshotting, .failed => false,
+        };
+        self.probe_ready.store(ready, .release);
     }
 
     pub fn runLifecycleRound(self: *MetadataHttpService) !void {
@@ -2420,7 +2490,7 @@ pub const MetadataHttpService = struct {
 
     fn loadMetadataStatusCache(self: *MetadataHttpService) ?MetadataStatus {
         self.lockMetadataStatusCache();
-        defer self.metadata_status_cache_mutex.unlock();
+        defer self.unlockMetadataStatusCache();
         if (!self.metadata_status_cache_valid) return null;
         if (self.metadata_status_cache_projection_epoch != self.projection_epoch.load(.monotonic)) return null;
         if (self.metadata_status_cache_placement_epoch != self.placement_epoch.load(.monotonic)) return null;
@@ -2433,7 +2503,7 @@ pub const MetadataHttpService = struct {
         const placement_epoch = self.placement_epoch.load(.monotonic);
         const transition_epoch = self.transition_epoch.load(.monotonic);
         self.lockMetadataStatusCache();
-        defer self.metadata_status_cache_mutex.unlock();
+        defer self.unlockMetadataStatusCache();
         self.metadata_status_cache = next_status;
         self.metadata_status_cache_valid = true;
         self.metadata_status_cache_next_refresh_at_ms = next_refresh_at_ms;
@@ -2443,9 +2513,11 @@ pub const MetadataHttpService = struct {
     }
 
     fn lockMetadataStatusCache(self: *MetadataHttpService) void {
-        while (!self.metadata_status_cache_mutex.tryLock()) {
-            std.Thread.yield() catch {};
-        }
+        self.metadata_status_cache_mutex.lockUncancelable(std.Options.debug_io);
+    }
+
+    fn unlockMetadataStatusCache(self: *MetadataHttpService) void {
+        self.metadata_status_cache_mutex.unlock(std.Options.debug_io);
     }
 
     fn refreshMetadataStatusCacheIfDue(self: *MetadataHttpService) void {
@@ -2453,7 +2525,7 @@ pub const MetadataHttpService = struct {
         self.lockMetadataStatusCache();
         const due = now_ms >= self.metadata_status_cache_next_refresh_at_ms;
         if (due) self.metadata_status_cache_next_refresh_at_ms = now_ms + metadata_status_cache_refresh_interval_ms;
-        self.metadata_status_cache_mutex.unlock();
+        self.unlockMetadataStatusCache();
         if (!due) return;
 
         var current_status = snapshotStatus(self.alloc, self.metadata_group_id, self, self.metrics()) catch |err| {
@@ -2749,13 +2821,11 @@ pub const MetadataHttpService = struct {
     }
 
     fn lockRuntime(self: *MetadataHttpService) void {
-        while (!self.runtime_mutex.tryLock()) {
-            std.Thread.yield() catch {};
-        }
+        self.runtime_mutex.lockUncancelable(std.Options.debug_io);
     }
 
     fn unlockRuntime(self: *MetadataHttpService) void {
-        self.runtime_mutex.unlock();
+        self.runtime_mutex.unlock(std.Options.debug_io);
     }
 
     fn refreshLocalPlacementIntents(self: *MetadataHttpService, round_inputs: ?*const LocalPlacementInputs) !void {
@@ -3140,10 +3210,8 @@ pub const MetadataHttpService = struct {
     fn runReplicationBackfillRound(self: *MetadataHttpService) !void {
         const replica_root_dir = self.replica_root_dir orelse return;
         if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id)) return;
-        while (!self.cdc_runtime_mutex.tryLock()) {
-            std.Thread.yield() catch {};
-        }
-        defer self.cdc_runtime_mutex.unlock();
+        self.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.cdc_runtime_mutex.unlock(std.Options.debug_io);
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         if (now_ms < self.cdc_next_round_at_ms) return;
         self.cdc_next_round_at_ms = now_ms + cdc_replication_round_interval_ms;

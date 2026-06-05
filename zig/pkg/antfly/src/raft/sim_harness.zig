@@ -34,6 +34,7 @@ const transition_runtime_mod = @import("transition_runtime.zig");
 const raft_state_machine = @import("state_machine/mod.zig");
 const raft_engine = @import("raft_engine");
 const data_mod = @import("../data/mod.zig");
+const backend_runtime_mod = @import("../storage/background_runtime.zig");
 
 pub const ManagedHostSimulationConfig = struct {
     host: managed_host.ManagedHostConfig,
@@ -50,6 +51,7 @@ pub const ManagedHttpHostSimulationConfig = struct {
     host: managed_host.ManagedHttpHostConfig,
     service: service.ManagedServiceConfig = .{},
     runtime: runtime_loop.RuntimeLoopConfig = .{},
+    async_transport: bool = true,
 };
 
 pub const ManagedHttpHostSimulationDeps = struct {
@@ -908,6 +910,7 @@ pub const ManagedHttpHostSimulation = struct {
     alloc: std.mem.Allocator,
     updates: *runtime_loop.MemoryUpdateSource,
     applier: metadata_apply.MetadataApplier,
+    backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
     runtime: runtime_loop.ManagedHttpHostRuntime,
     virtual_base_uri: ?[]u8 = null,
 
@@ -921,14 +924,23 @@ pub const ManagedHttpHostSimulation = struct {
         updates.* = runtime_loop.MemoryUpdateSource.init(alloc);
         errdefer updates.deinit();
 
+        var host_deps = deps.host;
+        var backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = if (cfg.async_transport)
+            try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{})
+        else
+            null;
+        errdefer if (backend_runtime) |*runtime| runtime.deinit();
+        if (backend_runtime) |*runtime| host_deps.http.backend_runtime = runtime.ptr();
+
         return .{
             .alloc = alloc,
             .updates = updates,
             .applier = metadata_apply.MetadataApplier.init(updates.sink()),
+            .backend_runtime = backend_runtime,
             .runtime = try runtime_loop.ManagedHttpHostRuntime.init(
                 alloc,
                 cfg.host,
-                deps.host,
+                host_deps,
                 cfg.service,
                 deps.service,
                 updates.source(),
@@ -940,6 +952,7 @@ pub const ManagedHttpHostSimulation = struct {
     pub fn deinit(self: *ManagedHttpHostSimulation) void {
         if (self.virtual_base_uri) |uri| self.alloc.free(uri);
         self.runtime.deinit();
+        if (self.backend_runtime) |*runtime| runtime.deinit();
         self.updates.deinit();
         self.alloc.destroy(self.updates);
         self.* = undefined;
@@ -1140,6 +1153,7 @@ pub const ManagedHttpClusterSimulation = struct {
 
         const owned_configs = try alloc.dupe(ManagedHttpHostSimulationConfig, configs);
         errdefer alloc.free(owned_configs);
+        for (owned_configs) |*cfg| cfg.async_transport = false;
         const owned_deps = try alloc.dupe(ManagedHttpHostSimulationDeps, deps);
         errdefer alloc.free(owned_deps);
         for (owned_deps) |*dep| dep.host.http.request_executor = network.executor();
@@ -1282,7 +1296,9 @@ pub const ManagedHttpClusterSimulation = struct {
     pub fn restartNode(self: *ManagedHttpClusterSimulation, index: usize) !void {
         if (self.started) self.nodes[index].stop();
         self.nodes[index].deinit();
-        self.nodes[index] = try ManagedHttpHostSimulation.init(self.alloc, self.configs[index], self.deps[index]);
+        var cfg = self.configs[index];
+        cfg.async_transport = false;
+        self.nodes[index] = try ManagedHttpHostSimulation.init(self.alloc, cfg, self.deps[index]);
         const node_id = self.configs[index].host.http.host.local_node_id;
         try self.nodes[index].useVirtualBaseUri(node_id);
         try self.network.registerNode(node_id, self.nodes[index].serverExecutor());
@@ -1566,6 +1582,7 @@ fn waitForLeader(
     var i: usize = 0;
     while (i < max_rounds) : (i += 1) {
         try stepHttpPair(a, b);
+        try sleepForNanos(std.time.ns_per_ms);
         if (a.raftStatus(group_id)) |status| {
             if (status.soft.role == .leader) return status.id;
         }
@@ -1587,6 +1604,7 @@ fn waitForLastIndex(
     while (i < max_rounds) : (i += 1) {
         if (try store.storage().lastIndex() >= target_index) return true;
         try stepHttpPair(a, b);
+        try sleepForNanos(std.time.ns_per_ms);
     }
     return (try store.storage().lastIndex()) >= target_index;
 }
@@ -2593,6 +2611,7 @@ test "managed http host simulations elect and replicate over real HTTP" {
     };
 
     var sim_a = try ManagedHttpHostSimulation.init(std.testing.allocator, .{
+        .async_transport = false,
         .host = .{
             .http = .{
                 .host = .{ .local_node_id = 1 },
@@ -2616,6 +2635,7 @@ test "managed http host simulations elect and replicate over real HTTP" {
     defer sim_a.deinit();
 
     var sim_b = try ManagedHttpHostSimulation.init(std.testing.allocator, .{
+        .async_transport = false,
         .host = .{
             .http = .{
                 .host = .{ .local_node_id = 2 },
@@ -2703,11 +2723,13 @@ test "managed http host simulations elect and replicate over real HTTP" {
     _ = try sim_b.stepOnce();
 
     try sim_a.campaignGroup(2001);
-    const leader = try waitForLeader(&sim_a, &sim_b, 2001, 64);
+    try sleepForNanos(20 * std.time.ns_per_ms);
+    const leader = try waitForLeader(&sim_a, &sim_b, 2001, 256);
     try std.testing.expectEqual(@as(?u64, 1), leader);
 
     try sim_a.propose(2001, "hello-http");
-    try std.testing.expect(try waitForLastIndex(&sim_a, &sim_b, &store_b, 2, 64));
+    try sleepForNanos(20 * std.time.ns_per_ms);
+    try std.testing.expect(try waitForLastIndex(&sim_a, &sim_b, &store_b, 2, 256));
 
     const entries = try store_b.storage().entries(std.testing.allocator, 1, 3, 0);
     defer raft_engine.core.types.freeEntries(std.testing.allocator, entries);

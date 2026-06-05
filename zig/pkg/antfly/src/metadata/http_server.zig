@@ -481,8 +481,8 @@ pub const AdminSource = struct {
 
     fn metadataServiceReseedReplicationSourceExactCutover(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) !ReseedExactCutoverResult {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        while (!svc.cdc_runtime_mutex.tryLock()) std.atomic.spinLoopHint();
-        defer svc.cdc_runtime_mutex.unlock();
+        svc.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+        defer svc.cdc_runtime_mutex.unlock(std.Options.debug_io);
         return try reseedReplicationSourceExactCutoverForService(service.MetadataService, svc, alloc, table_name, source_ordinal, flushMetadataServiceMutation);
     }
 
@@ -688,8 +688,8 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceReseedReplicationSourceExactCutover(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) !ReseedExactCutoverResult {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        while (!svc.cdc_runtime_mutex.tryLock()) std.atomic.spinLoopHint();
-        defer svc.cdc_runtime_mutex.unlock();
+        svc.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+        defer svc.cdc_runtime_mutex.unlock(std.Options.debug_io);
         return try reseedReplicationSourceExactCutoverForService(service.MetadataHttpService, svc, alloc, table_name, source_ordinal, flushMetadataHttpServiceMutation);
     }
 };
