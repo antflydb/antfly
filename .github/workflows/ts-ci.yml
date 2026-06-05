@@ -75,7 +75,7 @@ jobs:
     steps:
       - name: Configure cache directories
         run: |
-          playwright_browsers_path="${RUNNER_TEMP}/playwright-browsers"
+          playwright_browsers_path="${HOME}/.cache/ms-playwright"
           xdg_cache_home="${RUNNER_TEMP}/xdg"
           tmpdir="${RUNNER_TEMP}/tmp"
 
@@ -127,7 +127,7 @@ jobs:
 
       - name: Install Playwright Chromium
         working-directory: ts/apps/antfarm
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           set -euxo pipefail
           time pnpm exec playwright install chromium
@@ -136,7 +136,7 @@ jobs:
 
       - name: Install Playwright Firefox
         working-directory: ts/apps/antfarm
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           set -euxo pipefail
           time pnpm exec playwright install firefox
