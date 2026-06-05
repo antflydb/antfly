@@ -55,11 +55,13 @@ pub const TableSchema = struct {
 
 pub const ForeignKeyAction = enum {
     restrict,
+    no_action,
     set_null,
     cascade,
 
     pub fn fromString(text: []const u8) ?ForeignKeyAction {
         if (std.mem.eql(u8, text, "restrict")) return .restrict;
+        if (std.mem.eql(u8, text, "no_action")) return .no_action;
         if (std.mem.eql(u8, text, "set_null")) return .set_null;
         if (std.mem.eql(u8, text, "cascade")) return .cascade;
         return null;
@@ -73,6 +75,19 @@ pub const ForeignKeyTiming = enum {
     pub fn fromString(text: []const u8) ?ForeignKeyTiming {
         if (std.mem.eql(u8, text, "immediate")) return .immediate;
         if (std.mem.eql(u8, text, "deferred")) return .deferred;
+        return null;
+    }
+};
+
+pub const ForeignKeyMatch = enum {
+    simple,
+    full,
+    partial,
+
+    pub fn fromString(text: []const u8) ?ForeignKeyMatch {
+        if (std.mem.eql(u8, text, "simple")) return .simple;
+        if (std.mem.eql(u8, text, "full")) return .full;
+        if (std.mem.eql(u8, text, "partial")) return .partial;
         return null;
     }
 };
@@ -109,7 +124,9 @@ pub const ForeignKey = struct {
     columns: [][]const u8 = &.{},
     references: ForeignKeyReference,
     on_delete: ForeignKeyAction = .restrict,
+    on_update: ForeignKeyAction = .restrict,
     timing: ForeignKeyTiming = .immediate,
+    match: ForeignKeyMatch = .simple,
     validation_state: ForeignKeyValidationState = .enforced,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -769,13 +786,18 @@ fn validateForeignKeys(value: std.json.Value) !void {
         if (object.get("on_delete")) |on_delete| {
             if (on_delete != .string or ForeignKeyAction.fromString(on_delete.string) == null) return error.InvalidSchemaUpdateRequest;
         }
+        if (object.get("on_update")) |on_update| {
+            if (on_update != .string or ForeignKeyAction.fromString(on_update.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
         if (object.get("timing")) |timing| {
             if (timing != .string or ForeignKeyTiming.fromString(timing.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("match")) |match| {
+            if (match != .string or ForeignKeyMatch.fromString(match.string) == null) return error.InvalidSchemaUpdateRequest;
         }
         if (object.get("validation_state")) |validation_state| {
             if (validation_state != .string or ForeignKeyValidationState.fromString(validation_state.string) == null) return error.InvalidSchemaUpdateRequest;
         }
-        if (object.get("on_update")) |_| return error.InvalidSchemaUpdateRequest;
     }
 }
 
@@ -784,7 +806,9 @@ fn isAllowedForeignKeyField(field: []const u8) bool {
         std.mem.eql(u8, field, "columns") or
         std.mem.eql(u8, field, "references") or
         std.mem.eql(u8, field, "on_delete") or
+        std.mem.eql(u8, field, "on_update") or
         std.mem.eql(u8, field, "timing") or
+        std.mem.eql(u8, field, "match") or
         std.mem.eql(u8, field, "validation_state");
 }
 
@@ -1675,11 +1699,14 @@ fn validateRelationalForeignKeys(schema: TableSchema) !void {
         if (foreign_key.columns.len == 0) return error.InvalidSchemaUpdateRequest;
         if (foreign_key.references.columns.len == 0) return error.InvalidSchemaUpdateRequest;
         if (foreign_key.validation_state == .validating or foreign_key.validation_state == .invalid) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.on_update != .restrict and foreign_key.on_update != .no_action and foreign_key.on_update != .set_null and foreign_key.on_update != .cascade) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.match == .partial) return error.InvalidSchemaUpdateRequest;
         if (foreignKeyReferencesPrimaryKey(foreign_key)) {
             if (foreign_key.columns.len != 1) return error.InvalidSchemaUpdateRequest;
             const child_property = findDocumentProperty(schema.document_schemas[0].properties, foreign_key.columns[0]) orelse return error.InvalidSchemaUpdateRequest;
             if (!isRelationalForeignKeyColumn(child_property)) return error.InvalidSchemaUpdateRequest;
         } else {
+            if (foreignKeyReferencesPrimaryKeyComponent(foreign_key)) return error.InvalidSchemaUpdateRequest;
             if (foreign_key.columns.len != foreign_key.references.columns.len) return error.InvalidSchemaUpdateRequest;
             const same_table_parent = std.mem.eql(u8, foreign_key.references.table, schema.default_type);
             const parent_unique = if (same_table_parent) findUniqueConstraintByColumns(schema.unique_constraints, foreign_key.references.columns) orelse return error.InvalidSchemaUpdateRequest else null;
@@ -1692,7 +1719,7 @@ fn validateRelationalForeignKeys(schema: TableSchema) !void {
                 }
             }
         }
-        if (foreign_key.on_delete == .set_null) {
+        if (foreign_key.on_delete == .set_null or foreign_key.on_update == .set_null) {
             for (foreign_key.columns) |column| {
                 if (requiredFieldsContain(schema.document_schemas[0].required_fields, column)) return error.InvalidSchemaUpdateRequest;
             }
@@ -1704,13 +1731,19 @@ fn validateRelationalForeignKeys(schema: TableSchema) !void {
         }
         for (schema.foreign_keys[0..i]) |previous| {
             if (std.mem.eql(u8, previous.name, foreign_key.name)) return error.InvalidSchemaUpdateRequest;
-            if (stringSlicesEqual(previous.columns, foreign_key.columns)) return error.InvalidSchemaUpdateRequest;
         }
     }
 }
 
 fn foreignKeyReferencesPrimaryKey(foreign_key: ForeignKey) bool {
     return foreign_key.references.columns.len == 1 and std.mem.eql(u8, foreign_key.references.columns[0], "_id");
+}
+
+fn foreignKeyReferencesPrimaryKeyComponent(foreign_key: ForeignKey) bool {
+    for (foreign_key.references.columns) |column| {
+        if (std.mem.eql(u8, column, "_id")) return true;
+    }
+    return false;
 }
 
 fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) bool {
@@ -2810,10 +2843,18 @@ fn parseForeignKeys(alloc: std.mem.Allocator, value: std.json.Value) ![]ForeignK
                 ForeignKeyAction.fromString(on_delete.string).?
             else
                 .restrict,
+            .on_update = if (object.get("on_update")) |on_update|
+                ForeignKeyAction.fromString(on_update.string).?
+            else
+                .restrict,
             .timing = if (object.get("timing")) |timing|
                 ForeignKeyTiming.fromString(timing.string).?
             else
                 .immediate,
+            .match = if (object.get("match")) |match|
+                ForeignKeyMatch.fromString(match.string).?
+            else
+                .simple,
             .validation_state = if (object.get("validation_state")) |validation_state|
                 ForeignKeyValidationState.fromString(validation_state.string).?
             else
@@ -3941,7 +3982,7 @@ test "relational embedded document schema is scoped to explicit json columns" {
 test "relational schema parses primary-key foreign keys and unique constraints" {
     var parsed = try parseSchema(
         std.testing.allocator,
-        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"}},\"required\":[\"id\",\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"restrict\",\"timing\":\"immediate\",\"validation_state\":\"enforced\"},{\"name\":\"orders_customer_email_fkey\",\"columns\":[\"customer_id\",\"email\"],\"references\":{\"table\":\"order\",\"columns\":[\"customer_id\",\"email\"]},\"on_delete\":\"restrict\"}],\"unique_constraints\":[{\"name\":\"orders_customer_email_key\",\"columns\":[\"customer_id\",\"email\"]}]}",
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"}},\"required\":[\"id\",\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"restrict\",\"on_update\":\"no_action\",\"timing\":\"immediate\",\"match\":\"simple\",\"validation_state\":\"enforced\"},{\"name\":\"orders_customer_email_fkey\",\"columns\":[\"customer_id\",\"email\"],\"references\":{\"table\":\"order\",\"columns\":[\"customer_id\",\"email\"]},\"on_delete\":\"no_action\",\"on_update\":\"restrict\"}],\"unique_constraints\":[{\"name\":\"orders_customer_email_key\",\"columns\":[\"customer_id\",\"email\"]}]}",
     );
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), parsed.foreign_keys.len);
@@ -3949,15 +3990,19 @@ test "relational schema parses primary-key foreign keys and unique constraints" 
     try std.testing.expectEqualStrings("customer_id", parsed.foreign_keys[0].columns[0]);
     try std.testing.expectEqualStrings("customers", parsed.foreign_keys[0].references.table);
     try std.testing.expectEqualStrings("_id", parsed.foreign_keys[0].references.columns[0]);
+    try std.testing.expectEqual(ForeignKeyAction.no_action, parsed.foreign_keys[0].on_update);
     try std.testing.expectEqual(ForeignKeyTiming.immediate, parsed.foreign_keys[0].timing);
+    try std.testing.expectEqual(ForeignKeyMatch.simple, parsed.foreign_keys[0].match);
     try std.testing.expectEqual(ForeignKeyValidationState.enforced, parsed.foreign_keys[0].validation_state);
     try std.testing.expectEqualStrings("orders_customer_email_fkey", parsed.foreign_keys[1].name);
+    try std.testing.expectEqual(ForeignKeyAction.no_action, parsed.foreign_keys[1].on_delete);
     try std.testing.expectEqual(@as(usize, 2), parsed.foreign_keys[1].columns.len);
     try std.testing.expectEqualStrings("customer_id", parsed.foreign_keys[1].columns[0]);
     try std.testing.expectEqualStrings("email", parsed.foreign_keys[1].columns[1]);
     try std.testing.expectEqual(@as(usize, 2), parsed.foreign_keys[1].references.columns.len);
     try std.testing.expectEqualStrings("customer_id", parsed.foreign_keys[1].references.columns[0]);
     try std.testing.expectEqualStrings("email", parsed.foreign_keys[1].references.columns[1]);
+    try std.testing.expectEqual(ForeignKeyAction.restrict, parsed.foreign_keys[1].on_update);
     try std.testing.expectEqual(@as(usize, 1), parsed.unique_constraints.len);
     try std.testing.expectEqualStrings("orders_customer_email_key", parsed.unique_constraints[0].name);
     try std.testing.expectEqual(@as(usize, 2), parsed.unique_constraints[0].columns.len);
@@ -3970,6 +4015,12 @@ test "relational schema parses primary-key foreign keys and unique constraints" 
     );
     defer parsed_set_null.deinit(std.testing.allocator);
     try std.testing.expectEqual(ForeignKeyAction.set_null, parsed_set_null.foreign_keys[0].on_delete);
+    var parsed_update_set_null = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_update\":\"set_null\"}]}",
+    );
+    defer parsed_update_set_null.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.set_null, parsed_update_set_null.foreign_keys[0].on_update);
 
     var parsed_cascade = try parseSchema(
         std.testing.allocator,
@@ -3977,6 +4028,12 @@ test "relational schema parses primary-key foreign keys and unique constraints" 
     );
     defer parsed_cascade.deinit(std.testing.allocator);
     try std.testing.expectEqual(ForeignKeyAction.cascade, parsed_cascade.foreign_keys[0].on_delete);
+    var parsed_update_cascade = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\",\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_update\":\"cascade\"}]}",
+    );
+    defer parsed_update_cascade.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.cascade, parsed_update_cascade.foreign_keys[0].on_update);
 }
 
 test "relational schema rejects unsupported foreign key shapes" {
@@ -4008,17 +4065,36 @@ test "relational schema rejects unsupported foreign key shapes" {
             "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"set_null\"}]}",
         ),
     );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_update\":\"set_null\"}]}",
+        ),
+    );
     var parsed_deferred = try parseSchema(
         std.testing.allocator,
         "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"deferred\"}]}",
     );
     defer parsed_deferred.deinit(std.testing.allocator);
     try std.testing.expectEqual(ForeignKeyTiming.deferred, parsed_deferred.foreign_keys[0].timing);
+    var parsed_match_simple = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"match\":\"simple\"}]}",
+    );
+    defer parsed_match_simple.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyMatch.simple, parsed_match_simple.foreign_keys[0].match);
+    var parsed_match_full = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"match\":\"full\"}]}",
+    );
+    defer parsed_match_full.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyMatch.full, parsed_match_full.foreign_keys[0].match);
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
         parseSchema(
             std.testing.allocator,
-            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"match\":\"simple\"}]}",
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"match\":\"partial\"}]}",
         ),
     );
     try std.testing.expectError(
@@ -4059,7 +4135,24 @@ test "relational schema rejects unsupported foreign key shapes" {
         error.InvalidSchemaUpdateRequest,
         parseSchema(
             std.testing.allocator,
-            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]}},{\"name\":\"orders_customer_id_fkey_copy\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]}}]}",
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"},\"customer_email\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\",\"customer_email\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\",\"email\"]}}]}",
+        ),
+    );
+    var parsed_shared_columns = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_customers_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]}},{\"name\":\"orders_customer_id_accounts_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"accounts\",\"columns\":[\"_id\"]}}]}",
+    );
+    defer parsed_shared_columns.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), parsed_shared_columns.foreign_keys.len);
+    try std.testing.expectEqualStrings("orders_customer_id_customers_fkey", parsed_shared_columns.foreign_keys[0].name);
+    try std.testing.expectEqualStrings("orders_customer_id_accounts_fkey", parsed_shared_columns.foreign_keys[1].name);
+    try std.testing.expectEqualStrings("customer_id", parsed_shared_columns.foreign_keys[0].columns[0]);
+    try std.testing.expectEqualStrings("customer_id", parsed_shared_columns.foreign_keys[1].columns[0]);
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]}},{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"accounts\",\"columns\":[\"_id\"]}}]}",
         ),
     );
 }

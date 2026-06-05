@@ -78,6 +78,24 @@ const UniqueIntegrityRequestWire = struct {
     upper_doc_key: ?[]const u8 = null,
 };
 
+const ForeignKeyActionJobRequestWire = struct {
+    job_id: ?[]const u8 = null,
+    action: ?[]const u8 = null,
+    worker_id: ?[]const u8 = null,
+    constraint_name: ?[]const u8 = null,
+    parent_table: ?[]const u8 = null,
+    parent_key: ?[]const u8 = null,
+    updated_parent_key: ?[]const u8 = null,
+    page_limit: ?usize = null,
+    lease_ms: ?u64 = null,
+    schedule_only: bool = false,
+};
+
+const ForeignKeyActionScheduleRequestWire = struct {
+    schedule_id: ?[]const u8 = null,
+    scheduled_groups: ?u64 = null,
+};
+
 fn parseForeignKeyIntegrityAction(value: ?[]const u8) !table_writes.ForeignKeyIntegrityAction {
     const text = value orelse "validate";
     if (std.mem.eql(u8, text, "plan")) return .plan;
@@ -342,6 +360,112 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             .content_type = try ctx.alloc.dupe(u8, "application/json"),
             .body = body,
         };
+    }
+    if (routes.Routes.matchGroupForeignKeyActionJob(path)) |fk_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(ForeignKeyActionJobRequestWire, ctx.alloc, if (req.body.len == 0) "{}" else req.body, .{
+            .ignore_unknown_fields = true,
+        }) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+        defer parsed.deinit();
+        const job_id = parsed.value.job_id orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+        const action = parsed.value.action orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+        const worker_id = parsed.value.worker_id orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+        const constraint_name = parsed.value.constraint_name orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+        const parent_table = parsed.value.parent_table orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+        const parent_key = parsed.value.parent_key orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+        if (job_id.len == 0 or action.len == 0 or worker_id.len == 0 or constraint_name.len == 0 or parent_table.len == 0 or parent_key.len == 0) {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+        }
+        const maybe_status = if (parsed.value.schedule_only)
+            writes.foreignKeyActionJobGroupLocalSchedule(
+                ctx.alloc,
+                fk_route.group_id,
+                fk_route.table_name,
+                job_id,
+                action,
+                worker_id,
+                constraint_name,
+                parent_table,
+                parent_key,
+                parsed.value.updated_parent_key,
+                @min(parsed.value.page_limit orelse 1024, 10_000),
+            )
+        else
+            writes.foreignKeyActionJobGroupLocal(
+                ctx.alloc,
+                fk_route.group_id,
+                fk_route.table_name,
+                job_id,
+                action,
+                worker_id,
+                constraint_name,
+                parent_table,
+                parent_key,
+                parsed.value.updated_parent_key,
+                @min(parsed.value.page_limit orelse 1024, 10_000),
+                parsed.value.lease_ms orelse 60_000,
+            );
+        var status = (maybe_status catch |err| switch (err) {
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.InvalidForeignKeyActionJob, error.ForeignKeyViolation => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request"),
+            error.ForeignKeyIntegrityClaimBusy => return try http_route_helpers.textResponse(ctx.alloc, 409, "foreign key action job claim busy"),
+            error.ForeignKeyNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "foreign key not found"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer status.deinit(ctx.alloc);
+        return try http_route_helpers.jsonResponse(ctx.alloc, status);
+    }
+    if (routes.Routes.matchGroupForeignKeyActionJobProgress(path)) |fk_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var progress = (writes.foreignKeyActionJobGroupLocalProgress(
+            ctx.alloc,
+            fk_route.group_id,
+            fk_route.table_name,
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer progress.deinit(ctx.alloc);
+        return try http_route_helpers.jsonResponse(ctx.alloc, progress);
+    }
+    if (routes.Routes.matchGroupForeignKeyActionScheduleProgress(path)) |fk_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var progress = (writes.foreignKeyActionScheduleGroupLocalProgress(
+            ctx.alloc,
+            fk_route.group_id,
+            fk_route.table_name,
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer progress.deinit(ctx.alloc);
+        return try http_route_helpers.jsonResponse(ctx.alloc, progress);
+    }
+    if (routes.Routes.matchGroupForeignKeyActionSchedule(path)) |fk_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(ForeignKeyActionScheduleRequestWire, ctx.alloc, if (req.body.len == 0) "{}" else req.body, .{
+            .ignore_unknown_fields = true,
+        }) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
+        defer parsed.deinit();
+        const schedule_id = parsed.value.schedule_id orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
+        if (schedule_id.len == 0) return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
+        var status = (writes.foreignKeyActionScheduleGroupLocalMarkSeeded(
+            ctx.alloc,
+            fk_route.group_id,
+            fk_route.table_name,
+            schedule_id,
+            parsed.value.scheduled_groups orelse 0,
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.InvalidForeignKeyActionJob => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request"),
+            error.UnknownGroup, error.TableNotFound, error.ForeignKeyActionScheduleNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer status.deinit(ctx.alloc);
+        return try http_route_helpers.jsonResponse(ctx.alloc, status);
     }
     if (routes.Routes.matchGroupTxnBegin(path)) |txn_route| {
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");

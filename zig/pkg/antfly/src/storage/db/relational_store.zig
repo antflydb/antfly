@@ -63,6 +63,16 @@ pub const ForeignKeyIntegrityMode = enum {
     repair,
 };
 
+pub const ExternalizedForeignKeyParentCheck = struct {
+    constraint_name: []const u8,
+    child_table: []const u8,
+    child_key: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    parent_constraint_name: ?[]const u8 = null,
+    timing: schema_mod.ForeignKeyTiming = .immediate,
+};
+
 pub const ForeignKeyIntegrityReport = struct {
     scanned_child_rows: u64 = 0,
     referenced_child_rows: u64 = 0,
@@ -204,6 +214,11 @@ pub const WriteParticipant = struct {
         parent_key: []const u8,
     };
 
+    const PendingForeignKeyReferenceAbsenceCheck = struct {
+        foreign_key: schema_mod.ForeignKey,
+        parent_key: []const u8,
+    };
+
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
@@ -220,7 +235,9 @@ pub const WriteParticipant = struct {
     unique_constraints: []const schema_mod.UniqueConstraint = &.{},
     planned_delete_keys: []const []const u8 = &.{},
     parent_checks_externalized: bool = false,
+    externalized_parent_checks: []const ExternalizedForeignKeyParentCheck = &.{},
     pending_fk_parent_checks: std.ArrayListUnmanaged(PendingForeignKeyParentCheck) = .empty,
+    pending_fk_reference_absence_checks: std.ArrayListUnmanaged(PendingForeignKeyReferenceAbsenceCheck) = .empty,
     set_null_update_count: usize = 0,
     set_null_update_limit: usize = default_max_set_null_updates,
     cascade_depth: usize = 0,
@@ -275,6 +292,14 @@ pub const WriteParticipant = struct {
         self.foreign_keys = foreign_keys;
         self.planned_delete_keys = planned_delete_keys;
         self.parent_checks_externalized = parent_checks_externalized;
+        self.externalized_parent_checks = &.{};
+    }
+
+    pub fn configureExternalizedForeignKeyParentChecks(
+        self: *WriteParticipant,
+        externalized_parent_checks: []const ExternalizedForeignKeyParentCheck,
+    ) void {
+        self.externalized_parent_checks = externalized_parent_checks;
     }
 
     pub fn configureUniqueConstraints(
@@ -321,7 +346,9 @@ pub const WriteParticipant = struct {
         _ = commit_version;
         if (self.closed) return error.ParticipantClosed;
         try self.validatePendingForeignKeyParentChecks();
+        try self.validatePendingForeignKeyReferenceAbsenceChecks();
         self.clearPendingForeignKeyParentChecks();
+        self.clearPendingForeignKeyReferenceAbsenceChecks();
         self.closed = true;
     }
 
@@ -336,6 +363,7 @@ pub const WriteParticipant = struct {
             self.deletes.shrinkRetainingCapacity(self.deletes_start);
         }
         self.clearPendingForeignKeyParentChecks();
+        self.clearPendingForeignKeyReferenceAbsenceChecks();
         self.closed = true;
     }
 
@@ -370,11 +398,22 @@ pub const WriteParticipant = struct {
             const new_value = if (final_state_deleted) null else try uniqueConstraintTupleValueAlloc(self.alloc, new_row, constraint);
             defer if (new_value) |value| self.alloc.free(value);
             if (optionalBytesEqual(old_value, new_value)) continue;
+            var new_value_written = false;
+            if (old_value != null) {
+                if (new_value) |value| {
+                    try self.requireUniqueConstraintAvailable(constraint, value, doc_key);
+                    try self.appendUniqueConstraintWrite(constraint, value, doc_key);
+                    new_value_written = true;
+                }
+            }
             if (old_value) |value| {
-                try self.requireNoRestrictingUniqueForeignKeyRefs(constraint, value);
+                try self.applySetNullUpdatingUniqueForeignKeyRefs(constraint, value);
+                if (new_value != null) try self.applyCascadeUpdatingUniqueForeignKeyRefs(constraint, value, new_row);
+                try self.requireNoUpdatingUniqueForeignKeyRefs(constraint, value);
                 try self.appendUniqueConstraintDelete(constraint, value);
             }
             if (new_value) |value| {
+                if (new_value_written) continue;
                 try self.requireUniqueConstraintAvailable(constraint, value, doc_key);
                 try self.appendUniqueConstraintWrite(constraint, value, doc_key);
             }
@@ -462,10 +501,34 @@ pub const WriteParticipant = struct {
             if (optionalBytesEqual(old_parent, new_parent)) continue;
             if (old_parent) |parent_key| try self.appendForeignKeyRefDelete(foreign_key, parent_key, doc_key);
             if (new_parent) |parent_key| {
-                if (!self.parent_checks_externalized) try self.deferForeignKeyParentCheck(foreign_key, parent_key);
+                if (!self.parentCheckExternalized(foreign_key, doc_key, parent_key)) try self.deferForeignKeyParentCheck(foreign_key, parent_key);
                 try self.appendForeignKeyRefWrite(foreign_key, parent_key, doc_key);
             }
         }
+    }
+
+    fn parentCheckExternalized(self: *const WriteParticipant, foreign_key: schema_mod.ForeignKey, child_key: []const u8, parent_key: []const u8) bool {
+        if (self.parent_checks_externalized and foreign_key.timing == .immediate) return true;
+        for (self.externalized_parent_checks) |check| {
+            if (!std.mem.eql(u8, check.constraint_name, foreign_key.name)) continue;
+            if (!std.mem.eql(u8, check.child_table, self.effectiveTableName())) continue;
+            if (!std.mem.eql(u8, check.child_key, child_key)) continue;
+            if (!std.mem.eql(u8, check.parent_table, foreign_key.parent_table)) continue;
+            if (!std.mem.eql(u8, check.parent_key, parent_key)) continue;
+            if (check.timing != foreign_key.timing) continue;
+            if (foreignKeyReferencesPrimaryKey(foreign_key)) {
+                if (check.parent_constraint_name != null) continue;
+            } else {
+                const check_constraint_name = check.parent_constraint_name orelse continue;
+                if (check_constraint_name.len == 0) continue;
+                if (std.mem.eql(u8, foreign_key.parent_table, self.effectiveTableName())) {
+                    const parent_constraint = findUniqueConstraintByColumns(self.unique_constraints, foreign_key.parent_columns) orelse continue;
+                    if (!std.mem.eql(u8, check_constraint_name, parent_constraint.name)) continue;
+                }
+            }
+            return true;
+        }
+        return false;
     }
 
     fn prepareForeignKeyDelete(self: *WriteParticipant, doc_key: []const u8) anyerror!void {
@@ -526,6 +589,20 @@ pub const WriteParticipant = struct {
         try self.prepareSetNullForeignKeyChild(foreign_key, parent_key, child_key);
     }
 
+    pub fn prepareSetNullForeignKeyUpdateChildAction(
+        self: *WriteParticipant,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        child_key: []const u8,
+    ) !void {
+        const foreign_key = findForeignKeyByName(self.foreign_keys, constraint_name) orelse return error.ForeignKeyViolation;
+        if (!foreignKeyIsEnforced(foreign_key)) return error.ForeignKeyViolation;
+        if (foreign_key.on_update != .set_null) return error.ForeignKeyViolation;
+        if (!std.mem.eql(u8, foreign_key.parent_table, parent_table)) return error.ForeignKeyViolation;
+        try self.prepareSetNullForeignKeyChild(foreign_key, parent_key, child_key);
+    }
+
     pub fn prepareCascadeForeignKeyChildAction(
         self: *WriteParticipant,
         constraint_name: []const u8,
@@ -543,6 +620,21 @@ pub const WriteParticipant = struct {
         defer self.alloc.free(current_parent);
         if (!std.mem.eql(u8, current_parent, parent_key)) return;
         try self.prepareCascadeForeignKeyChild(child_key);
+    }
+
+    pub fn prepareCascadeForeignKeyUpdateChildAction(
+        self: *WriteParticipant,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: []const u8,
+        child_key: []const u8,
+    ) !void {
+        const foreign_key = findForeignKeyByName(self.foreign_keys, constraint_name) orelse return error.ForeignKeyViolation;
+        if (!foreignKeyIsEnforced(foreign_key)) return error.ForeignKeyViolation;
+        if (foreign_key.on_update != .cascade) return error.ForeignKeyViolation;
+        if (!std.mem.eql(u8, foreign_key.parent_table, parent_table)) return error.ForeignKeyViolation;
+        try self.prepareCascadeUpdateForeignKeyChildFromParentKey(foreign_key, parent_key, updated_parent_key, child_key);
     }
 
     fn isRowDeletePlanned(self: *WriteParticipant, doc_key: []const u8) !bool {
@@ -739,6 +831,35 @@ pub const WriteParticipant = struct {
         self.pending_fk_parent_checks = .empty;
     }
 
+    fn deferForeignKeyReferenceAbsenceCheck(
+        self: *WriteParticipant,
+        foreign_key: schema_mod.ForeignKey,
+        parent_key: []const u8,
+    ) !void {
+        const parent_key_owned = try self.alloc.dupe(u8, parent_key);
+        var parent_key_transferred = false;
+        errdefer if (!parent_key_transferred) self.alloc.free(parent_key_owned);
+        try self.pending_fk_reference_absence_checks.append(self.alloc, .{
+            .foreign_key = foreign_key,
+            .parent_key = parent_key_owned,
+        });
+        parent_key_transferred = true;
+    }
+
+    fn validatePendingForeignKeyReferenceAbsenceChecks(self: *WriteParticipant) !void {
+        for (self.pending_fk_reference_absence_checks.items) |check| {
+            try self.requireNoRestrictingForeignKeyRefsForIdentity(check.foreign_key, check.parent_key);
+        }
+    }
+
+    fn clearPendingForeignKeyReferenceAbsenceChecks(self: *WriteParticipant) void {
+        for (self.pending_fk_reference_absence_checks.items) |check| {
+            self.alloc.free(@constCast(check.parent_key));
+        }
+        self.pending_fk_reference_absence_checks.deinit(self.alloc);
+        self.pending_fk_reference_absence_checks = .empty;
+    }
+
     fn requireForeignKeyParentExists(self: *WriteParticipant, foreign_key: schema_mod.ForeignKey, parent_key: []const u8) !void {
         if (!foreignKeyReferencesPrimaryKey(foreign_key)) {
             const unique_constraint = findUniqueConstraintByColumns(self.unique_constraints, foreign_key.parent_columns) orelse return error.ForeignKeyViolation;
@@ -787,9 +908,13 @@ pub const WriteParticipant = struct {
     fn requireNoRestrictingPrimaryKeyForeignKeyRefs(self: *WriteParticipant, parent_key: []const u8) !void {
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
-            if (foreign_key.on_delete != .restrict) continue;
+            if (!foreignKeyDeleteActionRestricts(foreign_key)) continue;
             if (!foreignKeyReferencesPrimaryKey(foreign_key)) continue;
-            try self.requireNoRestrictingForeignKeyRefsForIdentity(foreign_key, parent_key);
+            if (foreignKeyDefersNoActionDelete(foreign_key)) {
+                try self.deferForeignKeyReferenceAbsenceCheck(foreign_key, parent_key);
+            } else {
+                try self.requireNoRestrictingForeignKeyRefsForIdentity(foreign_key, parent_key);
+            }
         }
     }
 
@@ -800,9 +925,144 @@ pub const WriteParticipant = struct {
     ) !void {
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
+            if (!foreignKeyDeleteActionRestricts(foreign_key)) continue;
             if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) continue;
-            try self.requireNoRestrictingForeignKeyRefsForIdentity(foreign_key, encoded_value);
+            if (foreignKeyDefersNoActionDelete(foreign_key)) {
+                try self.deferForeignKeyReferenceAbsenceCheck(foreign_key, encoded_value);
+            } else {
+                try self.requireNoRestrictingForeignKeyRefsForIdentity(foreign_key, encoded_value);
+            }
         }
+    }
+
+    fn requireNoUpdatingUniqueForeignKeyRefs(
+        self: *WriteParticipant,
+        constraint: schema_mod.UniqueConstraint,
+        encoded_value: []const u8,
+    ) !void {
+        for (self.foreign_keys) |foreign_key| {
+            if (!foreignKeyIsEnforced(foreign_key)) continue;
+            if (!foreignKeyUpdateActionRestricts(foreign_key)) continue;
+            if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) continue;
+            if (foreignKeyDefersNoActionUpdate(foreign_key)) {
+                try self.deferForeignKeyReferenceAbsenceCheck(foreign_key, encoded_value);
+            } else {
+                try self.requireNoRestrictingForeignKeyRefsForIdentity(foreign_key, encoded_value);
+            }
+        }
+    }
+
+    fn applySetNullUpdatingUniqueForeignKeyRefs(
+        self: *WriteParticipant,
+        constraint: schema_mod.UniqueConstraint,
+        encoded_value: []const u8,
+    ) anyerror!void {
+        for (self.foreign_keys) |foreign_key| {
+            if (!foreignKeyIsEnforced(foreign_key)) continue;
+            if (foreign_key.on_update != .set_null) continue;
+            if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) continue;
+            try self.applySetNullForeignKeyRefsForIdentity(foreign_key, encoded_value);
+        }
+    }
+
+    fn applyCascadeUpdatingUniqueForeignKeyRefs(
+        self: *WriteParticipant,
+        constraint: schema_mod.UniqueConstraint,
+        old_encoded_value: []const u8,
+        new_parent_row: []const u8,
+    ) anyerror!void {
+        for (self.foreign_keys) |foreign_key| {
+            if (!foreignKeyIsEnforced(foreign_key)) continue;
+            if (foreign_key.on_update != .cascade) continue;
+            if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) continue;
+            try self.applyCascadeUpdateForeignKeyRefsForIdentity(foreign_key, old_encoded_value, new_parent_row);
+        }
+    }
+
+    fn applyCascadeUpdateForeignKeyRefsForIdentity(
+        self: *WriteParticipant,
+        foreign_key: schema_mod.ForeignKey,
+        old_parent_key: []const u8,
+        new_parent_row: []const u8,
+    ) anyerror!void {
+        const prefix = try internal_keys.relationalForeignKeyRefParentPrefixAlloc(
+            self.alloc,
+            foreign_key.name,
+            foreign_key.parent_table,
+            old_parent_key,
+        );
+        defer self.alloc.free(prefix);
+        const upper = try internal_keys.relationalForeignKeyRefParentPrefixUpperAlloc(
+            self.alloc,
+            foreign_key.name,
+            foreign_key.parent_table,
+            old_parent_key,
+        );
+        defer if (upper) |buf| self.alloc.free(buf);
+
+        const writes_end = self.writes.items.len;
+        for (self.writes.items[0..writes_end]) |write| {
+            if (!std.mem.startsWith(u8, write.key, prefix)) continue;
+            if (containsBatchDelete(self.deletes.items, write.key)) continue;
+            var decoded = (try internal_keys.decodeRelationalForeignKeyRefKeyAlloc(self.alloc, write.key)) orelse continue;
+            defer decoded.deinit(self.alloc);
+            try self.prepareCascadeUpdateForeignKeyChild(foreign_key, old_parent_key, new_parent_row, decoded.child_key);
+        }
+
+        const scanned = try self.store.scanRange(self.alloc, prefix, if (upper) |buf| buf else "");
+        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+        for (scanned) |entry| {
+            if (containsBatchDelete(self.deletes.items, entry.key)) continue;
+            var decoded = (try internal_keys.decodeRelationalForeignKeyRefKeyAlloc(self.alloc, entry.key)) orelse continue;
+            defer decoded.deinit(self.alloc);
+            try self.prepareCascadeUpdateForeignKeyChild(foreign_key, old_parent_key, new_parent_row, decoded.child_key);
+        }
+    }
+
+    fn prepareCascadeUpdateForeignKeyChild(
+        self: *WriteParticipant,
+        foreign_key: schema_mod.ForeignKey,
+        old_parent_key: []const u8,
+        new_parent_row: []const u8,
+        child_key: []const u8,
+    ) anyerror!void {
+        if (containsKey(self.planned_delete_keys, child_key)) return;
+        const row = (try self.getPendingOrStoredRawRowAlloc(child_key)) orelse return;
+        defer self.alloc.free(row);
+
+        const current_parent = (try foreignKeyReferenceValueAlloc(self.alloc, row, foreign_key)) orelse return;
+        defer self.alloc.free(current_parent);
+        if (!std.mem.eql(u8, current_parent, old_parent_key)) return;
+
+        const rewritten = try relationalRowWithForeignKeyColumnsFromParentAlloc(self.alloc, row, new_parent_row, foreign_key);
+        var rewritten_owned = true;
+        errdefer if (rewritten_owned) self.alloc.free(rewritten);
+        try self.prepareUpsert(self.effectiveTableName(), child_key, rewritten, null);
+        try self.owned_values.append(self.alloc, rewritten);
+        rewritten_owned = false;
+    }
+
+    fn prepareCascadeUpdateForeignKeyChildFromParentKey(
+        self: *WriteParticipant,
+        foreign_key: schema_mod.ForeignKey,
+        old_parent_key: []const u8,
+        new_parent_key: []const u8,
+        child_key: []const u8,
+    ) anyerror!void {
+        if (containsKey(self.planned_delete_keys, child_key)) return;
+        const row = (try self.getPendingOrStoredRawRowAlloc(child_key)) orelse return;
+        defer self.alloc.free(row);
+
+        const current_parent = (try foreignKeyReferenceValueAlloc(self.alloc, row, foreign_key)) orelse return;
+        defer self.alloc.free(current_parent);
+        if (!std.mem.eql(u8, current_parent, old_parent_key)) return;
+
+        const rewritten = try relationalRowWithForeignKeyColumnsFromParentKeyAlloc(self.alloc, row, new_parent_key, foreign_key);
+        var rewritten_owned = true;
+        errdefer if (rewritten_owned) self.alloc.free(rewritten);
+        try self.prepareUpsert(self.effectiveTableName(), child_key, rewritten, null);
+        try self.owned_values.append(self.alloc, rewritten);
+        rewritten_owned = false;
     }
 
     fn requireNoRestrictingForeignKeyRefsForIdentity(self: *WriteParticipant, foreign_key: schema_mod.ForeignKey, parent_key: []const u8) !void {
@@ -882,6 +1142,22 @@ fn foreignKeyIsEnforced(foreign_key: schema_mod.ForeignKey) bool {
     return foreign_key.validation_state == .enforced;
 }
 
+fn foreignKeyDeleteActionRestricts(foreign_key: schema_mod.ForeignKey) bool {
+    return foreign_key.on_delete == .restrict or foreign_key.on_delete == .no_action;
+}
+
+fn foreignKeyUpdateActionRestricts(foreign_key: schema_mod.ForeignKey) bool {
+    return foreign_key.on_update == .restrict or foreign_key.on_update == .no_action;
+}
+
+fn foreignKeyDefersNoActionUpdate(foreign_key: schema_mod.ForeignKey) bool {
+    return foreign_key.on_update == .no_action and foreign_key.timing == .deferred;
+}
+
+fn foreignKeyDefersNoActionDelete(foreign_key: schema_mod.ForeignKey) bool {
+    return foreign_key.on_delete == .no_action and foreign_key.timing == .deferred;
+}
+
 fn findUniqueConstraintByColumns(constraints: []const schema_mod.UniqueConstraint, columns: []const []const u8) ?schema_mod.UniqueConstraint {
     for (constraints) |constraint| {
         if (stringSlicesEqual(constraint.columns, columns)) return constraint;
@@ -923,9 +1199,35 @@ fn foreignKeyParentExists(
 
 pub fn foreignKeyReferenceValueAlloc(alloc: Allocator, row_value: []const u8, foreign_key: schema_mod.ForeignKey) !?[]u8 {
     if (!foreignKeyReferencesPrimaryKey(foreign_key)) {
-        return try uniqueConstraintColumnsTupleValueAlloc(alloc, row_value, foreign_key.child_columns);
+        return try foreignKeyCompositeReferenceValueAlloc(alloc, row_value, foreign_key);
     }
     return try foreignKeyPrimaryKeyValueAlloc(alloc, row_value, foreign_key.child_columns[0]);
+}
+
+fn foreignKeyCompositeReferenceValueAlloc(alloc: Allocator, row_value: []const u8, foreign_key: schema_mod.ForeignKey) !?[]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    var present_components: usize = 0;
+    for (foreign_key.child_columns) |column_path| {
+        const component = (try uniqueConstraintColumnValueAlloc(alloc, row_value, column_path)) orelse continue;
+        defer alloc.free(component);
+        present_components += 1;
+        try internal_keys.appendEncodedComponent(&out, alloc, component);
+    }
+
+    if (present_components == 0) {
+        out.deinit(alloc);
+        return null;
+    }
+    if (present_components != foreign_key.child_columns.len) {
+        if (foreign_key.match == .simple) {
+            out.deinit(alloc);
+            return null;
+        }
+        return error.ForeignKeyViolation;
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 fn foreignKeyPrimaryKeyValueAlloc(alloc: Allocator, row_value: []const u8, column_path: []const u8) !?[]u8 {
@@ -946,6 +1248,208 @@ fn relationalRowWithoutColumnsAlloc(alloc: Allocator, row_value: []const u8, col
         try cells.append(alloc, cell);
     }
     return try relational_row_codec.serialize(alloc, cells.items);
+}
+
+fn relationalRowWithForeignKeyColumnsFromParentAlloc(
+    alloc: Allocator,
+    child_row_value: []const u8,
+    parent_row_value: []const u8,
+    foreign_key: schema_mod.ForeignKey,
+) ![]u8 {
+    var child_row = try relational_row_codec.deserialize(alloc, child_row_value);
+    defer child_row.deinit(alloc);
+    var parent_row = try relational_row_codec.deserialize(alloc, parent_row_value);
+    defer parent_row.deinit(alloc);
+
+    var cells = std.ArrayListUnmanaged(relational_row_codec.Cell).empty;
+    defer cells.deinit(alloc);
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+    var replaced = try alloc.alloc(bool, foreign_key.child_columns.len);
+    defer alloc.free(replaced);
+    @memset(replaced, false);
+
+    for (child_row.cells) |cell| {
+        const replacement_index = foreignKeyChildColumnIndex(foreign_key, cell.path) orelse {
+            try cells.append(alloc, cell);
+            continue;
+        };
+        const parent_cell = findCellInRow(parent_row.cells, foreign_key.parent_columns[replacement_index]) orelse return error.InvalidColumnValue;
+        const cloned_value = try cloneTypedValue(alloc, parent_cell.value_type, parent_cell.value);
+        var value_owned = parent_cell.value_type == .bytes_val;
+        errdefer if (value_owned) alloc.free(cloned_value.bytes_val);
+        try cells.append(alloc, .{
+            .path = foreign_key.child_columns[replacement_index],
+            .value_type = parent_cell.value_type,
+            .is_json = parent_cell.is_json,
+            .value = cloned_value,
+        });
+        if (value_owned) {
+            try owned_values.append(alloc, @constCast(cloned_value.bytes_val));
+            value_owned = false;
+        }
+        replaced[replacement_index] = true;
+    }
+
+    for (replaced, 0..) |was_replaced, i| {
+        if (was_replaced) continue;
+        const parent_cell = findCellInRow(parent_row.cells, foreign_key.parent_columns[i]) orelse return error.InvalidColumnValue;
+        const cloned_value = try cloneTypedValue(alloc, parent_cell.value_type, parent_cell.value);
+        var value_owned = parent_cell.value_type == .bytes_val;
+        errdefer if (value_owned) alloc.free(cloned_value.bytes_val);
+        try cells.append(alloc, .{
+            .path = foreign_key.child_columns[i],
+            .value_type = parent_cell.value_type,
+            .is_json = parent_cell.is_json,
+            .value = cloned_value,
+        });
+        if (value_owned) {
+            try owned_values.append(alloc, @constCast(cloned_value.bytes_val));
+            value_owned = false;
+        }
+    }
+
+    return try relational_row_codec.serialize(alloc, cells.items);
+}
+
+fn relationalRowWithForeignKeyColumnsFromParentKeyAlloc(
+    alloc: Allocator,
+    child_row_value: []const u8,
+    encoded_parent_key: []const u8,
+    foreign_key: schema_mod.ForeignKey,
+) ![]u8 {
+    var child_row = try relational_row_codec.deserialize(alloc, child_row_value);
+    defer child_row.deinit(alloc);
+
+    const replacement_cells = try foreignKeyParentKeyReplacementCellsAlloc(alloc, encoded_parent_key, foreign_key);
+    defer {
+        for (replacement_cells) |cell| {
+            if (cell.value_type == .bytes_val) alloc.free(cell.value.bytes_val);
+        }
+        alloc.free(replacement_cells);
+    }
+
+    var cells = std.ArrayListUnmanaged(relational_row_codec.Cell).empty;
+    defer cells.deinit(alloc);
+    var replaced = try alloc.alloc(bool, replacement_cells.len);
+    defer alloc.free(replaced);
+    @memset(replaced, false);
+
+    for (child_row.cells) |cell| {
+        const replacement_index = foreignKeyChildColumnIndex(foreign_key, cell.path) orelse {
+            try cells.append(alloc, cell);
+            continue;
+        };
+        try cells.append(alloc, replacement_cells[replacement_index]);
+        replaced[replacement_index] = true;
+    }
+
+    for (replaced, 0..) |was_replaced, i| {
+        if (!was_replaced) try cells.append(alloc, replacement_cells[i]);
+    }
+
+    return try relational_row_codec.serialize(alloc, cells.items);
+}
+
+fn foreignKeyParentKeyReplacementCellsAlloc(
+    alloc: Allocator,
+    encoded_parent_key: []const u8,
+    foreign_key: schema_mod.ForeignKey,
+) ![]relational_row_codec.Cell {
+    var cells = try alloc.alloc(relational_row_codec.Cell, foreign_key.child_columns.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cells[0..initialized]) |cell| {
+            if (cell.value_type == .bytes_val) alloc.free(cell.value.bytes_val);
+        }
+        alloc.free(cells);
+    }
+
+    var pos: usize = 0;
+    for (foreign_key.child_columns, 0..) |child_column, i| {
+        const term = internal_keys.findComponentTerminator(encoded_parent_key, pos) orelse return error.InvalidColumnValue;
+        cells[i] = try foreignKeyParentKeyComponentCellAlloc(alloc, child_column, encoded_parent_key[pos..term]);
+        initialized += 1;
+        pos = term + 2;
+    }
+    if (pos != encoded_parent_key.len) return error.InvalidColumnValue;
+    return cells;
+}
+
+fn foreignKeyParentKeyComponentCellAlloc(
+    alloc: Allocator,
+    child_column: []const u8,
+    encoded_component: []const u8,
+) !relational_row_codec.Cell {
+    const component = try internal_keys.decodeBodyAlloc(alloc, encoded_component);
+    defer alloc.free(component);
+    if (component.len == 0) return error.InvalidColumnValue;
+    const value_type = typedValueTypeFromByte(component[0]) orelse return error.InvalidColumnValue;
+    const payload = component[1..];
+    return switch (value_type) {
+        .u64_val => blk: {
+            if (payload.len != 8) return error.InvalidColumnValue;
+            break :blk .{
+                .path = child_column,
+                .value_type = .u64_val,
+                .is_json = false,
+                .value = .{ .u64_val = std.mem.readInt(u64, payload[0..8], .big) },
+            };
+        },
+        .f64_val => blk: {
+            if (payload.len != 8) return error.InvalidColumnValue;
+            break :blk .{
+                .path = child_column,
+                .value_type = .f64_val,
+                .is_json = false,
+                .value = .{ .f64_val = @bitCast(std.mem.readInt(u64, payload[0..8], .big)) },
+            };
+        },
+        .bool_val => blk: {
+            if (payload.len != 1) return error.InvalidColumnValue;
+            break :blk .{
+                .path = child_column,
+                .value_type = .bool_val,
+                .is_json = false,
+                .value = .{ .bool_val = payload[0] != 0 },
+            };
+        },
+        .geo_point => blk: {
+            if (payload.len != 16) return error.InvalidColumnValue;
+            break :blk .{
+                .path = child_column,
+                .value_type = .geo_point,
+                .is_json = false,
+                .value = .{ .geo_point = .{
+                    .lat = @bitCast(std.mem.readInt(u64, payload[0..8], .big)),
+                    .lon = @bitCast(std.mem.readInt(u64, payload[8..16], .big)),
+                } },
+            };
+        },
+        .bytes_val => .{
+            .path = child_column,
+            .value_type = .bytes_val,
+            .is_json = false,
+            .value = .{ .bytes_val = try alloc.dupe(u8, payload) },
+        },
+    };
+}
+
+fn foreignKeyChildColumnIndex(foreign_key: schema_mod.ForeignKey, child_column: []const u8) ?usize {
+    for (foreign_key.child_columns, 0..) |column, i| {
+        if (std.mem.eql(u8, column, child_column)) return i;
+    }
+    return null;
+}
+
+fn findCellInRow(cells: []const relational_row_codec.Cell, path: []const u8) ?relational_row_codec.Cell {
+    for (cells) |cell| {
+        if (std.mem.eql(u8, cell.path, path)) return cell;
+    }
+    return null;
 }
 
 pub fn uniqueConstraintTupleValueAlloc(alloc: Allocator, row_value: []const u8, constraint: schema_mod.UniqueConstraint) !?[]u8 {
@@ -2584,6 +3088,194 @@ test "relational write participant prepares commit and abort boundaries" {
     const deleted_raw = try getRawAlloc(alloc, &store, "doc:a");
     defer if (deleted_raw) |value| alloc.free(value);
     try std.testing.expect(deleted_raw == null);
+}
+
+test "relational foreign key reference extraction implements match simple for composite nullable components" {
+    const alloc = std.testing.allocator;
+    const foreign_key = schema_mod.ForeignKey{
+        .name = "orders_customer_email_fkey",
+        .child_columns = &.{ "tenant_id", "customer_email" },
+        .parent_table = "row",
+        .parent_columns = &.{ "tenant_id", "email" },
+        .match = .simple,
+    };
+
+    const complete_row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "tenant_id",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "tenant:1" },
+        },
+        .{
+            .path = "customer_email",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "ada@example.test" },
+        },
+    });
+    defer alloc.free(complete_row);
+    const complete_parent = (try foreignKeyReferenceValueAlloc(alloc, complete_row, foreign_key)) orelse return error.TestExpectedEqual;
+    defer alloc.free(complete_parent);
+    try std.testing.expect(complete_parent.len > 0);
+
+    const missing_component_row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "tenant_id",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "tenant:1" },
+        },
+    });
+    defer alloc.free(missing_component_row);
+    try std.testing.expect((try foreignKeyReferenceValueAlloc(alloc, missing_component_row, foreign_key)) == null);
+}
+
+test "relational foreign key reference extraction implements match full for composite nullable components" {
+    const alloc = std.testing.allocator;
+    const foreign_key = schema_mod.ForeignKey{
+        .name = "orders_customer_email_fkey",
+        .child_columns = &.{ "tenant_id", "customer_email" },
+        .parent_table = "row",
+        .parent_columns = &.{ "tenant_id", "email" },
+        .match = .full,
+    };
+
+    const complete_row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "tenant_id",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "tenant:1" },
+        },
+        .{
+            .path = "customer_email",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "ada@example.test" },
+        },
+    });
+    defer alloc.free(complete_row);
+    const complete_parent = (try foreignKeyReferenceValueAlloc(alloc, complete_row, foreign_key)) orelse return error.TestExpectedEqual;
+    defer alloc.free(complete_parent);
+    try std.testing.expect(complete_parent.len > 0);
+
+    const all_null_row = try relational_row_codec.serialize(alloc, &.{});
+    defer alloc.free(all_null_row);
+    try std.testing.expect((try foreignKeyReferenceValueAlloc(alloc, all_null_row, foreign_key)) == null);
+
+    const partial_null_row = try relational_row_codec.serialize(alloc, &.{.{
+        .path = "tenant_id",
+        .value_type = .bytes_val,
+        .value = .{ .bytes_val = "tenant:1" },
+    }});
+    defer alloc.free(partial_null_row);
+    try std.testing.expectError(error.ForeignKeyViolation, foreignKeyReferenceValueAlloc(alloc, partial_null_row, foreign_key));
+}
+
+test "relational write participant rejects partial match full composite foreign key references" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    const foreign_keys = [_]schema_mod.ForeignKey{.{
+        .name = "orders_customer_email_fkey",
+        .child_columns = &.{ "tenant_id", "customer_email" },
+        .parent_table = "row",
+        .parent_columns = &.{ "tenant_id", "email" },
+        .match = .full,
+    }};
+    var participant = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys, &owned_values);
+    participant.configureForeignKeys("row", foreign_keys[0..], &.{}, false);
+
+    const partial_null_row = try relational_row_codec.serialize(alloc, &.{.{
+        .path = "tenant_id",
+        .value_type = .bytes_val,
+        .value = .{ .bytes_val = "tenant:1" },
+    }});
+    defer alloc.free(partial_null_row);
+
+    try std.testing.expectError(error.ForeignKeyViolation, participant.prepareUpsert("row", "order:partial", partial_null_row, null));
+    participant.abort(null);
+}
+
+test "relational write participant defers no action parent delete until final state" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const foreign_keys = [_]schema_mod.ForeignKey{.{
+        .name = "orders_customer_id_fkey",
+        .child_columns = &.{"customer_id"},
+        .parent_table = "row",
+        .parent_columns = &.{"_id"},
+        .on_delete = .no_action,
+        .timing = .deferred,
+    }};
+
+    const parent_row = try relational_row_codec.serialize(alloc, &.{});
+    defer alloc.free(parent_row);
+    const child_row = try relational_row_codec.serialize(alloc, &.{.{
+        .path = "customer_id",
+        .value_type = .bytes_val,
+        .value = .{ .bytes_val = "customer:deferred-delete" },
+    }});
+    defer alloc.free(child_row);
+    const child_without_ref = try relational_row_codec.serialize(alloc, &.{});
+    defer alloc.free(child_without_ref);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    var seed = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys, &owned_values);
+    seed.configureForeignKeys("row", foreign_keys[0..], &.{}, false);
+    try seed.prepareUpsert("row", "customer:deferred-delete", parent_row, null);
+    try seed.prepareUpsert("row", "order:deferred-delete", child_row, null);
+    try seed.commit(null, 1);
+    try store.putBatch(writes.items, deletes.items);
+
+    writes.clearRetainingCapacity();
+    deletes.clearRetainingCapacity();
+
+    var deferred_delete = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys, &owned_values);
+    deferred_delete.configureForeignKeys("row", foreign_keys[0..], &.{"customer:deferred-delete"}, false);
+    try deferred_delete.prepareDelete("row", "customer:deferred-delete", null);
+    try deferred_delete.prepareUpsert("row", "order:deferred-delete", child_without_ref, null);
+    try deferred_delete.commit(null, 2);
+    try store.putBatch(writes.items, deletes.items);
+
+    try std.testing.expect((try getRawAlloc(alloc, &store, "customer:deferred-delete")) == null);
+    const child_after = (try getMaterializedAlloc(alloc, &store, "order:deferred-delete")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child_after);
+    try std.testing.expectEqualStrings("{}", child_after);
 }
 
 test "relational write participant rejects set null fanout beyond local limit" {

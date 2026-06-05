@@ -843,18 +843,31 @@ pub const TransactionVersionPredicate = struct {
 };
 
 pub const ForeignKeyParentCheck = struct {
+    pub const Timing = enum(u8) {
+        immediate,
+        deferred,
+    };
+
     constraint_name: []const u8,
     child_table: []const u8,
     child_key: []const u8,
     parent_table: []const u8,
     parent_key: []const u8,
     parent_constraint_name: ?[]const u8 = null,
+    timing: Timing = .immediate,
 };
 
 pub const ForeignKeyParentDeleteCheck = struct {
+    pub const Operation = enum(u8) {
+        delete,
+        update,
+    };
+
     constraint_name: []const u8,
     parent_table: []const u8,
     parent_key: []const u8,
+    timing: ForeignKeyParentCheck.Timing = .immediate,
+    operation: Operation = .delete,
 };
 
 pub const ForeignKeyConflictCheck = struct {
@@ -884,17 +897,42 @@ pub const ForeignKeyRefChildrenPage = struct {
 };
 
 pub const ForeignKeySetNullChildAction = struct {
+    pub const Operation = enum(u8) {
+        delete,
+        update,
+    };
+
     constraint_name: []const u8,
     parent_table: []const u8,
     parent_key: []const u8,
     child_key: []const u8,
+    operation: Operation = .delete,
 };
 
 pub const ForeignKeyCascadeChildAction = struct {
+    pub const Operation = enum(u8) {
+        delete,
+        update,
+    };
+
     constraint_name: []const u8,
     parent_table: []const u8,
     parent_key: []const u8,
     child_key: []const u8,
+    updated_parent_key: ?[]const u8 = null,
+    operation: Operation = .delete,
+};
+
+pub const ForeignKeyActionScheduleMutation = struct {
+    schedule_id: []const u8,
+    action_job_id: []const u8,
+    action: []const u8,
+    worker_id: []const u8,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    updated_parent_key: ?[]const u8 = null,
+    page_limit: usize,
 };
 
 pub const UniqueConstraintMutation = struct {
@@ -913,8 +951,10 @@ pub const TransactionIntentRequest = struct {
     foreign_key_conflict_checks: []const ForeignKeyConflictCheck = &.{},
     foreign_key_set_null_children: []const ForeignKeySetNullChildAction = &.{},
     foreign_key_cascade_children: []const ForeignKeyCascadeChildAction = &.{},
+    foreign_key_action_schedules: []const ForeignKeyActionScheduleMutation = &.{},
     foreign_key_ref_writes: []const ForeignKeyRefMutation = &.{},
     foreign_key_ref_deletes: []const ForeignKeyRefMutation = &.{},
+    foreign_key_externalized_parent_checks: []const ForeignKeyParentCheck = &.{},
     unique_constraint_writes: []const UniqueConstraintMutation = &.{},
     unique_constraint_deletes: []const UniqueConstraintMutation = &.{},
     foreign_key_parent_checks_externalized: bool = false,

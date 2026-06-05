@@ -241,8 +241,11 @@ pub const ForeignKeySchemaControllerConfig = struct {
     lease_ms: u64 = 60_000,
     max_tables: usize = 4,
     max_jobs: usize = 16,
+    max_action_jobs: usize = 16,
     max_work_units_per_table: usize = 1,
+    action_job_page_limit: usize = 1024,
     violation_limit: usize = 100,
+    max_followup_rounds: usize = 4,
 
     fn toMaintenanceOptions(self: ForeignKeySchemaControllerConfig) api_table_writes.ForeignKeyIntegritySchemaControllerOptions {
         return .{
@@ -251,7 +254,9 @@ pub const ForeignKeySchemaControllerConfig = struct {
             .lease_ms = self.lease_ms,
             .max_tables = self.max_tables,
             .max_jobs = self.max_jobs,
+            .max_action_jobs = self.max_action_jobs,
             .max_work_units_per_table = self.max_work_units_per_table,
+            .action_job_page_limit = self.action_job_page_limit,
             .violation_limit = self.violation_limit,
         };
     }
@@ -260,6 +265,24 @@ pub const ForeignKeySchemaControllerConfig = struct {
 const ForeignKeySchemaControllerRuntimeStatus = struct {
     mutex: std.atomic.Mutex = .unlocked,
     counters: metadata_api.ForeignKeySchemaControllerStatus = .{},
+    last_failed_action_job_id_buf: [128]u8 = undefined,
+    last_failed_action_job_action_buf: [32]u8 = undefined,
+    last_failed_action_job_status_buf: [64]u8 = undefined,
+    last_failed_action_job_error_buf: [128]u8 = undefined,
+    last_failed_action_job_constraint_name_buf: [128]u8 = undefined,
+    last_failed_action_job_parent_table_buf: [128]u8 = undefined,
+    last_failed_action_job_parent_key_buf: [128]u8 = undefined,
+    last_failed_action_job_next_child_table_buf: [128]u8 = undefined,
+    last_failed_action_job_next_child_key_buf: [128]u8 = undefined,
+    last_terminal_invalid_table_name_buf: [128]u8 = undefined,
+    last_terminal_invalid_constraint_name_buf: [128]u8 = undefined,
+    last_terminal_invalid_job_id_buf: [128]u8 = undefined,
+    last_terminal_invalid_violation_kind_buf: [32]u8 = undefined,
+    last_terminal_invalid_violation_child_table_buf: [128]u8 = undefined,
+    last_terminal_invalid_violation_child_key_buf: [128]u8 = undefined,
+    last_terminal_invalid_violation_parent_table_buf: [128]u8 = undefined,
+    last_terminal_invalid_violation_parent_key_buf: [128]u8 = undefined,
+    last_terminal_invalid_violation_observed_parent_key_buf: [128]u8 = undefined,
 
     fn snapshot(self: *ForeignKeySchemaControllerRuntimeStatus, config: ForeignKeySchemaControllerConfig) metadata_api.ForeignKeySchemaControllerStatus {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -285,6 +308,10 @@ const ForeignKeySchemaControllerRuntimeStatus = struct {
         self.counters.tables_executed_total +%= summary.tables_executed;
         self.counters.jobs_scanned_total +%= summary.jobs_scanned;
         self.counters.jobs_executed_total +%= summary.jobs_executed;
+        self.counters.action_schedules_scanned_total +%= summary.action_schedules_scanned;
+        self.counters.action_schedules_executed_total +%= summary.action_schedules_executed;
+        self.counters.action_jobs_scanned_total +%= summary.action_jobs_scanned;
+        self.counters.action_jobs_executed_total +%= summary.action_jobs_executed;
         self.counters.claim_attempts_total +%= summary.claim_attempts;
         self.counters.terminal_valid_results_total +%= summary.terminal_valid_results;
         self.counters.terminal_invalid_results_total +%= summary.terminal_invalid_results;
@@ -294,6 +321,59 @@ const ForeignKeySchemaControllerRuntimeStatus = struct {
         self.counters.last_tables_executed = summary.tables_executed;
         self.counters.last_jobs_scanned = summary.jobs_scanned;
         self.counters.last_jobs_executed = summary.jobs_executed;
+        self.counters.last_action_schedules_scanned = summary.action_schedules_scanned;
+        self.counters.last_action_schedules_executed = summary.action_schedules_executed;
+        self.counters.last_action_jobs_scanned = summary.action_jobs_scanned;
+        self.counters.last_action_jobs_executed = summary.action_jobs_executed;
+        self.counters.last_action_jobs_completed = 0;
+        self.counters.last_action_jobs_failed = 0;
+        self.counters.last_action_job_applied_children = 0;
+        self.counters.last_failed_action_job_group_id = 0;
+        self.counters.last_failed_action_job_id = "";
+        self.counters.last_failed_action_job_action = "";
+        self.counters.last_failed_action_job_status = "";
+        self.counters.last_failed_action_job_error = "";
+        self.counters.last_failed_action_job_constraint_name = "";
+        self.counters.last_failed_action_job_parent_table = "";
+        self.counters.last_failed_action_job_parent_key = "";
+        self.counters.last_failed_action_job_next_child_table = "";
+        self.counters.last_failed_action_job_next_child_key = "";
+        self.counters.last_failed_action_job_attempts = 0;
+        self.counters.last_failed_action_job_applied_children = 0;
+        self.counters.last_terminal_invalid_table_name = "";
+        self.counters.last_terminal_invalid_constraint_name = "";
+        self.counters.last_terminal_invalid_job_id = "";
+        self.counters.last_terminal_invalid_missing_parent_rows = 0;
+        self.counters.last_terminal_invalid_missing_ref_rows = 0;
+        self.counters.last_terminal_invalid_stale_ref_rows = 0;
+        self.counters.last_terminal_invalid_violation_sample_count = 0;
+        self.counters.last_terminal_invalid_violations_truncated = false;
+        self.counters.last_terminal_invalid_violation_group_id = 0;
+        self.counters.last_terminal_invalid_violation_kind = "";
+        self.counters.last_terminal_invalid_violation_child_table = "";
+        self.counters.last_terminal_invalid_violation_child_key = "";
+        self.counters.last_terminal_invalid_violation_parent_table = "";
+        self.counters.last_terminal_invalid_violation_parent_key = "";
+        self.counters.last_terminal_invalid_violation_observed_parent_key = "";
+        for (summary.action_jobs) |job| {
+            if (job.completed) self.counters.last_action_jobs_completed += 1;
+            self.counters.last_action_job_applied_children +%= job.applied_children;
+            if (job.last_error == null and !std.mem.eql(u8, job.status, "invalid")) continue;
+            self.counters.last_action_jobs_failed += 1;
+            self.counters.last_failed_action_job_group_id = job.group_id;
+            self.counters.last_failed_action_job_id = copyForeignKeyStatusText(&self.last_failed_action_job_id_buf, job.job_id);
+            self.counters.last_failed_action_job_action = copyForeignKeyStatusText(&self.last_failed_action_job_action_buf, job.action);
+            self.counters.last_failed_action_job_status = copyForeignKeyStatusText(&self.last_failed_action_job_status_buf, job.status);
+            self.counters.last_failed_action_job_error = copyForeignKeyStatusText(&self.last_failed_action_job_error_buf, job.last_error orelse job.status);
+            self.counters.last_failed_action_job_constraint_name = copyForeignKeyStatusText(&self.last_failed_action_job_constraint_name_buf, job.constraint_name);
+            self.counters.last_failed_action_job_parent_table = copyForeignKeyStatusText(&self.last_failed_action_job_parent_table_buf, job.parent_table);
+            self.counters.last_failed_action_job_parent_key = copyForeignKeyStatusText(&self.last_failed_action_job_parent_key_buf, job.parent_key);
+            self.counters.last_failed_action_job_next_child_table = copyForeignKeyStatusText(&self.last_failed_action_job_next_child_table_buf, job.next_child_table orelse "");
+            self.counters.last_failed_action_job_next_child_key = copyForeignKeyStatusText(&self.last_failed_action_job_next_child_key_buf, job.next_child_key orelse "");
+            self.counters.last_failed_action_job_attempts = job.attempts;
+            self.counters.last_failed_action_job_applied_children = job.applied_children;
+        }
+        self.counters.action_jobs_failed_total +%= self.counters.last_action_jobs_failed;
         self.counters.last_claim_attempts = summary.claim_attempts;
         self.counters.last_terminal_valid_results = summary.terminal_valid_results;
         self.counters.last_terminal_invalid_results = summary.terminal_invalid_results;
@@ -325,9 +405,51 @@ const ForeignKeySchemaControllerRuntimeStatus = struct {
             self.counters.last_stale_ref_rows +%= report.stale_ref_rows;
             self.counters.last_repaired_ref_rows +%= report.repaired_ref_rows;
             self.counters.last_deleted_stale_ref_rows +%= report.deleted_stale_ref_rows;
+            if (isTerminalInvalidForeignKeySchemaControllerResult(entry.result)) {
+                self.counters.terminal_invalid_missing_parent_rows_total +%= report.missing_parent_rows;
+                self.counters.terminal_invalid_missing_ref_rows_total +%= report.missing_ref_rows;
+                self.counters.terminal_invalid_stale_ref_rows_total +%= report.stale_ref_rows;
+                self.counters.terminal_invalid_violation_samples_total +%= entry.result.violations.len;
+                if (entry.result.violations_truncated) self.counters.terminal_invalid_violations_truncated_total +%= 1;
+                for (entry.result.violations) |violation| {
+                    switch (violation.kind) {
+                        .missing_parent => self.counters.terminal_invalid_missing_parent_violations_total +%= 1,
+                        .missing_ref => self.counters.terminal_invalid_missing_ref_violations_total +%= 1,
+                        .stale_ref => self.counters.terminal_invalid_stale_ref_violations_total +%= 1,
+                    }
+                }
+                self.counters.last_terminal_invalid_table_name = copyForeignKeyStatusText(&self.last_terminal_invalid_table_name_buf, entry.table_name);
+                self.counters.last_terminal_invalid_constraint_name = copyForeignKeyStatusText(&self.last_terminal_invalid_constraint_name_buf, foreignKeyIntegrityResultConstraintName(entry.result) orelse "");
+                self.counters.last_terminal_invalid_job_id = copyForeignKeyStatusText(&self.last_terminal_invalid_job_id_buf, entry.result.job_id orelse "");
+                self.counters.last_terminal_invalid_missing_parent_rows = report.missing_parent_rows;
+                self.counters.last_terminal_invalid_missing_ref_rows = report.missing_ref_rows;
+                self.counters.last_terminal_invalid_stale_ref_rows = report.stale_ref_rows;
+                self.counters.last_terminal_invalid_violation_sample_count = entry.result.violations.len;
+                self.counters.last_terminal_invalid_violations_truncated = entry.result.violations_truncated;
+                if (entry.result.violations.len > 0) {
+                    const violation = entry.result.violations[0];
+                    self.counters.last_terminal_invalid_violation_group_id = violation.group_id;
+                    self.counters.last_terminal_invalid_violation_kind = copyForeignKeyStatusText(&self.last_terminal_invalid_violation_kind_buf, @tagName(violation.kind));
+                    self.counters.last_terminal_invalid_violation_child_table = copyForeignKeyStatusText(&self.last_terminal_invalid_violation_child_table_buf, violation.child_table);
+                    self.counters.last_terminal_invalid_violation_child_key = copyForeignKeyStatusText(&self.last_terminal_invalid_violation_child_key_buf, violation.child_key);
+                    self.counters.last_terminal_invalid_violation_parent_table = copyForeignKeyStatusText(&self.last_terminal_invalid_violation_parent_table_buf, violation.parent_table);
+                    self.counters.last_terminal_invalid_violation_parent_key = copyForeignKeyStatusText(&self.last_terminal_invalid_violation_parent_key_buf, violation.parent_key);
+                    self.counters.last_terminal_invalid_violation_observed_parent_key = copyForeignKeyStatusText(&self.last_terminal_invalid_violation_observed_parent_key_buf, violation.observed_parent_key orelse "");
+                }
+            }
         }
     }
 };
+
+fn foreignKeySchemaControllerFollowupBudget(config: ForeignKeySchemaControllerConfig) usize {
+    return @max(@as(usize, 1), config.max_followup_rounds);
+}
+
+fn copyForeignKeyStatusText(buf: []u8, text: []const u8) []const u8 {
+    const len = @min(buf.len, text.len);
+    @memcpy(buf[0..len], text[0..len]);
+    return buf[0..len];
+}
 
 pub const MetadataOrchestrationUrl = struct {
     node_id: u64,
@@ -2081,7 +2203,11 @@ pub const MetadataService = struct {
         );
         write_source.backend_runtime = try self.ensureBackendRuntime();
         _ = write_source.withSecretStore(self.secret_store);
-        try runForeignKeySchemaControllerMaintenanceForService(self, write_source.source(), self.foreign_key_schema_controller);
+        for (0..foreignKeySchemaControllerFollowupBudget(self.foreign_key_schema_controller)) |_| {
+            const round_status = try runForeignKeySchemaControllerMaintenanceForService(self, write_source.source(), self.foreign_key_schema_controller);
+            if (round_status != .incomplete) break;
+            self.lifecycle_signal.notify(null);
+        }
     }
 };
 
@@ -3767,7 +3893,11 @@ pub const MetadataHttpService = struct {
         );
         _ = write_source.withBackendRuntime(try self.ensureBackendRuntime());
         _ = write_source.withSecretStore(self.secret_store);
-        try runForeignKeySchemaControllerMaintenanceForService(self, write_source.source(), self.foreign_key_schema_controller);
+        for (0..foreignKeySchemaControllerFollowupBudget(self.foreign_key_schema_controller)) |_| {
+            const round_status = try runForeignKeySchemaControllerMaintenanceForService(self, write_source.source(), self.foreign_key_schema_controller);
+            if (round_status != .incomplete) break;
+            self.lifecycle_signal.notify(null);
+        }
     }
 };
 
@@ -3828,6 +3958,74 @@ fn findTableRecordByName(snapshot: *const metadata_api.AdminSnapshot, table_name
     return null;
 }
 
+const foreign_key_validation_metadata_sample_limit: usize = 8;
+
+fn foreignKeyViolationMetadataObjectAlloc(
+    json_alloc: std.mem.Allocator,
+    violation: api_table_writes.ForeignKeyIntegrityViolation,
+) !std.json.ObjectMap {
+    var object = std.json.ObjectMap.empty;
+    try object.put(json_alloc, try json_alloc.dupe(u8, "group_id"), .{ .integer = @intCast(violation.group_id) });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "kind"), .{ .string = try json_alloc.dupe(u8, @tagName(violation.kind)) });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "constraint_name"), .{ .string = try json_alloc.dupe(u8, violation.constraint_name) });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "child_table"), .{ .string = try json_alloc.dupe(u8, violation.child_table) });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "child_key"), .{ .string = try json_alloc.dupe(u8, violation.child_key) });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "parent_table"), .{ .string = try json_alloc.dupe(u8, violation.parent_table) });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "parent_key"), .{ .string = try json_alloc.dupe(u8, violation.parent_key) });
+    if (violation.parent_values.len > 0) {
+        try object.put(
+            json_alloc,
+            try json_alloc.dupe(u8, "parent_values"),
+            .{ .array = try foreignKeyTupleValuesMetadataArrayAlloc(json_alloc, violation.parent_values) },
+        );
+    }
+    if (violation.observed_parent_key) |observed| {
+        try object.put(json_alloc, try json_alloc.dupe(u8, "observed_parent_key"), .{ .string = try json_alloc.dupe(u8, observed) });
+    }
+    if (violation.observed_parent_values.len > 0) {
+        try object.put(
+            json_alloc,
+            try json_alloc.dupe(u8, "observed_parent_values"),
+            .{ .array = try foreignKeyTupleValuesMetadataArrayAlloc(json_alloc, violation.observed_parent_values) },
+        );
+    }
+    return object;
+}
+
+fn foreignKeyTupleValuesMetadataArrayAlloc(
+    json_alloc: std.mem.Allocator,
+    values: []const api_table_writes.ForeignKeyIntegrityTupleValue,
+) !std.json.Array {
+    var out = std.json.Array.init(json_alloc);
+    for (values) |value| {
+        var object = std.json.ObjectMap.empty;
+        try object.put(json_alloc, try json_alloc.dupe(u8, "column"), .{ .string = try json_alloc.dupe(u8, value.column) });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "value"), .{ .string = try json_alloc.dupe(u8, value.value) });
+        try out.append(.{ .object = object });
+    }
+    return out;
+}
+
+fn foreignKeyViolationKindCountsMetadataObjectAlloc(
+    json_alloc: std.mem.Allocator,
+    violations: []const api_table_writes.ForeignKeyIntegrityViolation,
+) !std.json.ObjectMap {
+    var missing_parent: i64 = 0;
+    var missing_ref: i64 = 0;
+    var stale_ref: i64 = 0;
+    for (violations) |violation| switch (violation.kind) {
+        .missing_parent => missing_parent += 1,
+        .missing_ref => missing_ref += 1,
+        .stale_ref => stale_ref += 1,
+    };
+
+    var object = std.json.ObjectMap.empty;
+    try object.put(json_alloc, try json_alloc.dupe(u8, "missing_parent"), .{ .integer = missing_parent });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "missing_ref"), .{ .integer = missing_ref });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "stale_ref"), .{ .integer = stale_ref });
+    return object;
+}
+
 fn foreignKeyValidationMetadataAlloc(
     alloc: std.mem.Allocator,
     current_json: []const u8,
@@ -3864,6 +4062,26 @@ fn foreignKeyValidationMetadataAlloc(
         try object.put(json_alloc, try json_alloc.dupe(u8, "missing_ref_rows"), .{ .integer = @intCast(entry.report.missing_ref_rows) });
         try object.put(json_alloc, try json_alloc.dupe(u8, "stale_ref_rows"), .{ .integer = @intCast(entry.report.stale_ref_rows) });
         try object.put(json_alloc, try json_alloc.dupe(u8, "violations_truncated"), .{ .bool = entry.violations_truncated });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "violation_sample_count"), .{ .integer = @intCast(entry.violations.len) });
+        if (entry.violations.len > 0) {
+            try object.put(
+                json_alloc,
+                try json_alloc.dupe(u8, "violation_kind_counts"),
+                .{ .object = try foreignKeyViolationKindCountsMetadataObjectAlloc(json_alloc, entry.violations) },
+            );
+            var samples = std.json.Array.init(json_alloc);
+            const limit = @min(entry.violations.len, foreign_key_validation_metadata_sample_limit);
+            for (entry.violations[0..limit]) |violation| {
+                try samples.append(.{ .object = try foreignKeyViolationMetadataObjectAlloc(json_alloc, violation) });
+            }
+            try object.put(json_alloc, try json_alloc.dupe(u8, "violation_samples"), .{ .array = samples });
+            try object.put(
+                json_alloc,
+                try json_alloc.dupe(u8, "metadata_violation_samples_truncated"),
+                .{ .bool = entry.violations.len > foreign_key_validation_metadata_sample_limit },
+            );
+            try object.put(json_alloc, try json_alloc.dupe(u8, "first_violation"), .{ .object = try foreignKeyViolationMetadataObjectAlloc(json_alloc, entry.violations[0]) });
+        }
         _ = foreign_keys.object.fetchSwapRemove(constraint_name);
         try foreign_keys.object.put(json_alloc, try json_alloc.dupe(u8, constraint_name), .{ .object = object });
     } else {
@@ -3927,20 +4145,26 @@ fn recordInvalidForeignKeySchemaControllerResult(
     try service.upsertTable(updated);
 }
 
+const ForeignKeySchemaControllerRoundStatus = enum {
+    no_source,
+    complete,
+    incomplete,
+};
+
 fn runForeignKeySchemaControllerMaintenanceForService(
     service: anytype,
     write_source: api_table_writes.TableWriteSource,
     config: ForeignKeySchemaControllerConfig,
-) !void {
-    var summary = (try write_source.foreignKeyIntegritySchemaControllerMaintenancePass(service.alloc, config.toMaintenanceOptions())) orelse return;
+) !ForeignKeySchemaControllerRoundStatus {
+    var summary = (try write_source.foreignKeyIntegritySchemaControllerMaintenancePass(service.alloc, config.toMaintenanceOptions())) orelse return .no_source;
     defer summary.deinit(service.alloc);
     if (@hasDecl(@TypeOf(service.*), "recordForeignKeySchemaControllerMaintenanceSummary")) {
         service.recordForeignKeySchemaControllerMaintenanceSummary(summary);
     }
 
-    if (summary.tables_with_pending_constraints > 0 or summary.tables_executed > 0 or summary.jobs_executed > 0 or summary.terminal_valid_results > 0 or summary.terminal_invalid_results > 0) {
+    if (summary.tables_with_pending_constraints > 0 or summary.tables_executed > 0 or summary.jobs_executed > 0 or summary.action_schedules_executed > 0 or summary.action_jobs_executed > 0 or summary.terminal_valid_results > 0 or summary.terminal_invalid_results > 0) {
         std.log.info(
-            "metadata fk schema-controller round worker_id={s} scanned={d} pending={d} executed={d} jobs_scanned={d} jobs_executed={d} claims={d} terminal_valid={d} terminal_invalid={d} complete={any} valid={any}",
+            "metadata fk schema-controller round worker_id={s} scanned={d} pending={d} executed={d} jobs_scanned={d} jobs_executed={d} action_schedules_scanned={d} action_schedules_executed={d} action_jobs_scanned={d} action_jobs_executed={d} claims={d} terminal_valid={d} terminal_invalid={d} complete={any} valid={any}",
             .{
                 config.worker_id,
                 summary.tables_scanned,
@@ -3948,6 +4172,10 @@ fn runForeignKeySchemaControllerMaintenanceForService(
                 summary.tables_executed,
                 summary.jobs_scanned,
                 summary.jobs_executed,
+                summary.action_schedules_scanned,
+                summary.action_schedules_executed,
+                summary.action_jobs_scanned,
+                summary.action_jobs_executed,
                 summary.claim_attempts,
                 summary.terminal_valid_results,
                 summary.terminal_invalid_results,
@@ -3975,6 +4203,7 @@ fn runForeignKeySchemaControllerMaintenanceForService(
         }
         try promoteForeignKeySchemaControllerResult(service, entry.table_name, entry.result);
     }
+    return if (summary.complete) .complete else .incomplete;
 }
 
 test "metadata fk schema controller config builds bounded maintenance options" {
@@ -3984,8 +4213,11 @@ test "metadata fk schema controller config builds bounded maintenance options" {
         .lease_ms = 1234,
         .max_tables = 7,
         .max_jobs = 11,
+        .max_action_jobs = 13,
         .max_work_units_per_table = 3,
+        .action_job_page_limit = 5,
         .violation_limit = 42,
+        .max_followup_rounds = 9,
     };
     const options = cfg.toMaintenanceOptions();
     try std.testing.expectEqual(api_table_writes.ForeignKeyIntegrityAction.repair, options.action);
@@ -3993,22 +4225,105 @@ test "metadata fk schema controller config builds bounded maintenance options" {
     try std.testing.expectEqual(@as(u64, 1234), options.lease_ms);
     try std.testing.expectEqual(@as(usize, 7), options.max_tables);
     try std.testing.expectEqual(@as(usize, 11), options.max_jobs);
+    try std.testing.expectEqual(@as(usize, 13), options.max_action_jobs);
     try std.testing.expectEqual(@as(usize, 3), options.max_work_units_per_table);
+    try std.testing.expectEqual(@as(usize, 5), options.action_job_page_limit);
     try std.testing.expectEqual(@as(usize, 42), options.violation_limit);
+    try std.testing.expectEqual(@as(usize, 9), foreignKeySchemaControllerFollowupBudget(cfg));
 
     const defaults = (ForeignKeySchemaControllerConfig{}).toMaintenanceOptions();
     try std.testing.expectEqualStrings(default_fk_schema_controller_worker_id, defaults.worker_id);
     try std.testing.expectEqual(@as(u64, 60_000), defaults.lease_ms);
     try std.testing.expectEqual(@as(usize, 4), defaults.max_tables);
     try std.testing.expectEqual(@as(usize, 16), defaults.max_jobs);
+    try std.testing.expectEqual(@as(usize, 16), defaults.max_action_jobs);
     try std.testing.expectEqual(@as(usize, 1), defaults.max_work_units_per_table);
+    try std.testing.expectEqual(@as(usize, 1024), defaults.action_job_page_limit);
     try std.testing.expectEqual(@as(usize, 100), defaults.violation_limit);
+    try std.testing.expectEqual(@as(usize, 4), foreignKeySchemaControllerFollowupBudget(.{}));
+    try std.testing.expectEqual(@as(usize, 1), foreignKeySchemaControllerFollowupBudget(.{ .max_followup_rounds = 0 }));
 
+    var failed_action_jobs = [_]api_table_writes.ForeignKeyActionJobStatus{ .{
+        .group_id = 7,
+        .job_id = @constCast("fk-action:cascade:failed"),
+        .action = @constCast("cascade"),
+        .worker_id = @constCast("metadata-fk-test-worker"),
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .parent_table = @constCast("customers"),
+        .parent_key = @constCast("customer:hot"),
+        .page_limit = 16,
+        .status = @constCast("invalid"),
+        .created_at_ns = 1,
+        .updated_at_ns = 2,
+        .attempts = 1,
+        .applied_children = 3,
+        .next_child_table = @constCast("row"),
+        .next_child_key = @constCast("order:cursor"),
+        .last_error = @constCast("ForeignKeyViolation"),
+    }, .{
+        .group_id = 8,
+        .job_id = @constCast("fk-action:set-null:complete"),
+        .action = @constCast("set_null"),
+        .worker_id = @constCast("metadata-fk-test-worker"),
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .parent_table = @constCast("customers"),
+        .parent_key = @constCast("customer:wide"),
+        .page_limit = 16,
+        .status = @constCast("complete"),
+        .created_at_ns = 1,
+        .updated_at_ns = 3,
+        .attempts = 2,
+        .completed = true,
+        .applied_children = 11,
+    } };
+    var terminal_invalid_work_units = [_]api_table_writes.ForeignKeyIntegrityWorkUnit{.{
+        .group_id = 9,
+        .phase = @constCast("child_range"),
+        .planned_action = @constCast("validate"),
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .lower_doc_key = @constCast(""),
+        .upper_doc_key = @constCast(""),
+    }};
+    var terminal_invalid_violations = [_]api_table_writes.ForeignKeyIntegrityViolation{.{
+        .group_id = 9,
+        .kind = .missing_parent,
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .child_table = @constCast("row"),
+        .child_key = @constCast("order:invalid"),
+        .parent_table = @constCast("customers"),
+        .parent_key = @constCast("customer:missing"),
+    }};
+    var terminal_invalid_results = [_]api_table_writes.ForeignKeyIntegritySchemaControllerTableResult{.{
+        .table_name = @constCast("orders"),
+        .schema_adoption = true,
+        .result = .{
+            .job_id = @constCast("fk-integrity:orders:orders_customer_id_fkey"),
+            .action = .validate,
+            .valid = false,
+            .complete = true,
+            .violation_limit = 1,
+            .violations_truncated = true,
+            .report = .{
+                .missing_parent_rows = 4,
+                .missing_ref_rows = 2,
+                .stale_ref_rows = 1,
+            },
+            .groups = &.{},
+            .work_units = terminal_invalid_work_units[0..],
+            .violations = terminal_invalid_violations[0..],
+        },
+    }};
     var runtime_status = ForeignKeySchemaControllerRuntimeStatus{};
     runtime_status.recordSummary(cfg, .{
         .tables_scanned = 9,
         .tables_with_pending_constraints = 5,
         .tables_executed = 3,
+        .action_schedules_scanned = 6,
+        .action_schedules_executed = 4,
+        .action_jobs_scanned = 8,
+        .action_jobs_executed = 7,
+        .results = terminal_invalid_results[0..],
+        .action_jobs = failed_action_jobs[0..],
         .claim_attempts = 2,
         .terminal_valid_results = 1,
         .terminal_invalid_results = 1,
@@ -4022,17 +4337,120 @@ test "metadata fk schema controller config builds bounded maintenance options" {
     try std.testing.expectEqual(@as(u64, 9), status.tables_scanned_total);
     try std.testing.expectEqual(@as(u64, 5), status.tables_with_pending_constraints_total);
     try std.testing.expectEqual(@as(u64, 3), status.tables_executed_total);
+    try std.testing.expectEqual(@as(u64, 6), status.action_schedules_scanned_total);
+    try std.testing.expectEqual(@as(u64, 4), status.action_schedules_executed_total);
+    try std.testing.expectEqual(@as(u64, 8), status.action_jobs_scanned_total);
+    try std.testing.expectEqual(@as(u64, 7), status.action_jobs_executed_total);
+    try std.testing.expectEqual(@as(u64, 1), status.action_jobs_failed_total);
     try std.testing.expectEqual(@as(u64, 2), status.claim_attempts_total);
     try std.testing.expectEqual(@as(u64, 1), status.terminal_valid_results_total);
     try std.testing.expectEqual(@as(u64, 1), status.terminal_invalid_results_total);
     try std.testing.expectEqual(@as(usize, 9), status.last_tables_scanned);
     try std.testing.expectEqual(@as(usize, 5), status.last_tables_with_pending_constraints);
     try std.testing.expectEqual(@as(usize, 3), status.last_tables_executed);
+    try std.testing.expectEqual(@as(usize, 6), status.last_action_schedules_scanned);
+    try std.testing.expectEqual(@as(usize, 4), status.last_action_schedules_executed);
+    try std.testing.expectEqual(@as(usize, 8), status.last_action_jobs_scanned);
+    try std.testing.expectEqual(@as(usize, 7), status.last_action_jobs_executed);
+    try std.testing.expectEqual(@as(usize, 1), status.last_action_jobs_completed);
+    try std.testing.expectEqual(@as(usize, 1), status.last_action_jobs_failed);
+    try std.testing.expectEqual(@as(u64, 14), status.last_action_job_applied_children);
+    try std.testing.expectEqual(@as(u64, 7), status.last_failed_action_job_group_id);
+    try std.testing.expectEqualStrings("fk-action:cascade:failed", status.last_failed_action_job_id);
+    try std.testing.expectEqualStrings("cascade", status.last_failed_action_job_action);
+    try std.testing.expectEqualStrings("invalid", status.last_failed_action_job_status);
+    try std.testing.expectEqualStrings("ForeignKeyViolation", status.last_failed_action_job_error);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", status.last_failed_action_job_constraint_name);
+    try std.testing.expectEqualStrings("customers", status.last_failed_action_job_parent_table);
+    try std.testing.expectEqualStrings("customer:hot", status.last_failed_action_job_parent_key);
+    try std.testing.expectEqualStrings("row", status.last_failed_action_job_next_child_table);
+    try std.testing.expectEqualStrings("order:cursor", status.last_failed_action_job_next_child_key);
+    try std.testing.expectEqual(@as(u32, 1), status.last_failed_action_job_attempts);
+    try std.testing.expectEqual(@as(u64, 3), status.last_failed_action_job_applied_children);
+    try std.testing.expectEqualStrings("orders", status.last_terminal_invalid_table_name);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", status.last_terminal_invalid_constraint_name);
+    try std.testing.expectEqualStrings("fk-integrity:orders:orders_customer_id_fkey", status.last_terminal_invalid_job_id);
+    try std.testing.expectEqual(@as(u64, 4), status.last_terminal_invalid_missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 2), status.last_terminal_invalid_missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 1), status.last_terminal_invalid_stale_ref_rows);
+    try std.testing.expectEqual(@as(usize, 1), status.last_terminal_invalid_violation_sample_count);
+    try std.testing.expect(status.last_terminal_invalid_violations_truncated);
+    try std.testing.expectEqual(@as(u64, 9), status.last_terminal_invalid_violation_group_id);
+    try std.testing.expectEqualStrings("missing_parent", status.last_terminal_invalid_violation_kind);
+    try std.testing.expectEqualStrings("row", status.last_terminal_invalid_violation_child_table);
+    try std.testing.expectEqualStrings("order:invalid", status.last_terminal_invalid_violation_child_key);
+    try std.testing.expectEqualStrings("customers", status.last_terminal_invalid_violation_parent_table);
+    try std.testing.expectEqualStrings("customer:missing", status.last_terminal_invalid_violation_parent_key);
+    try std.testing.expectEqualStrings("", status.last_terminal_invalid_violation_observed_parent_key);
     try std.testing.expectEqual(@as(usize, 2), status.last_claim_attempts);
     try std.testing.expectEqual(@as(usize, 1), status.last_terminal_valid_results);
     try std.testing.expectEqual(@as(usize, 1), status.last_terminal_invalid_results);
     try std.testing.expect(!status.last_complete);
     try std.testing.expect(!status.last_valid);
+    try std.testing.expectEqual(@as(u64, 4), status.terminal_invalid_missing_parent_rows_total);
+    try std.testing.expectEqual(@as(u64, 2), status.terminal_invalid_missing_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 1), status.terminal_invalid_stale_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 1), status.terminal_invalid_violation_samples_total);
+    try std.testing.expectEqual(@as(u64, 1), status.terminal_invalid_violations_truncated_total);
+    try std.testing.expectEqual(@as(u64, 1), status.terminal_invalid_missing_parent_violations_total);
+    try std.testing.expectEqual(@as(u64, 0), status.terminal_invalid_missing_ref_violations_total);
+    try std.testing.expectEqual(@as(u64, 0), status.terminal_invalid_stale_ref_violations_total);
+
+    var second_terminal_invalid_violations = [_]api_table_writes.ForeignKeyIntegrityViolation{ .{
+        .group_id = 10,
+        .kind = .missing_ref,
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .child_table = @constCast("row"),
+        .child_key = @constCast("order:missing-ref"),
+        .parent_table = @constCast("customers"),
+        .parent_key = @constCast("customer:expected"),
+    }, .{
+        .group_id = 11,
+        .kind = .stale_ref,
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .child_table = @constCast("row"),
+        .child_key = @constCast("order:stale-ref"),
+        .parent_table = @constCast("customers"),
+        .parent_key = @constCast("customer:stale"),
+        .observed_parent_key = @constCast("customer:actual"),
+    } };
+    var second_terminal_invalid_results = [_]api_table_writes.ForeignKeyIntegritySchemaControllerTableResult{.{
+        .table_name = @constCast("orders"),
+        .schema_adoption = true,
+        .result = .{
+            .job_id = @constCast("fk-integrity:orders:orders_customer_id_fkey:second"),
+            .action = .validate,
+            .valid = false,
+            .complete = true,
+            .violation_limit = 2,
+            .violations_truncated = false,
+            .report = .{
+                .missing_ref_rows = 5,
+                .stale_ref_rows = 6,
+            },
+            .groups = &.{},
+            .work_units = &.{},
+            .violations = second_terminal_invalid_violations[0..],
+        },
+    }};
+    runtime_status.recordSummary(cfg, .{
+        .results = second_terminal_invalid_results[0..],
+        .terminal_invalid_results = 1,
+        .complete = true,
+        .valid = false,
+    });
+    const status_after_second_pass = runtime_status.snapshot(cfg);
+    try std.testing.expectEqual(@as(u64, 2), status_after_second_pass.terminal_invalid_results_total);
+    try std.testing.expectEqual(@as(u64, 4), status_after_second_pass.terminal_invalid_missing_parent_rows_total);
+    try std.testing.expectEqual(@as(u64, 7), status_after_second_pass.terminal_invalid_missing_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 7), status_after_second_pass.terminal_invalid_stale_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 3), status_after_second_pass.terminal_invalid_violation_samples_total);
+    try std.testing.expectEqual(@as(u64, 1), status_after_second_pass.terminal_invalid_violations_truncated_total);
+    try std.testing.expectEqual(@as(u64, 1), status_after_second_pass.terminal_invalid_missing_parent_violations_total);
+    try std.testing.expectEqual(@as(u64, 1), status_after_second_pass.terminal_invalid_missing_ref_violations_total);
+    try std.testing.expectEqual(@as(u64, 1), status_after_second_pass.terminal_invalid_stale_ref_violations_total);
+    try std.testing.expectEqualStrings("fk-integrity:orders:orders_customer_id_fkey:second", status_after_second_pass.last_terminal_invalid_job_id);
+    try std.testing.expectEqualStrings("missing_ref", status_after_second_pass.last_terminal_invalid_violation_kind);
 
     var invalid_work_units = [_]api_table_writes.ForeignKeyIntegrityWorkUnit{.{
         .group_id = 7,
@@ -4042,6 +4460,46 @@ test "metadata fk schema controller config builds bounded maintenance options" {
         .lower_doc_key = @constCast(""),
         .upper_doc_key = @constCast(""),
     }};
+    var missing_parent_values = [_]api_table_writes.ForeignKeyIntegrityTupleValue{.{
+        .column = @constCast("email"),
+        .value = @constCast("missing@example.test"),
+    }};
+    var observed_parent_values = [_]api_table_writes.ForeignKeyIntegrityTupleValue{.{
+        .column = @constCast("email"),
+        .value = @constCast("actual@example.test"),
+    }};
+    var invalid_violations = [_]api_table_writes.ForeignKeyIntegrityViolation{
+        .{
+            .group_id = 7,
+            .kind = .missing_parent,
+            .constraint_name = @constCast("orders_customer_id_fkey"),
+            .child_table = @constCast("row"),
+            .child_key = @constCast("order:broken"),
+            .parent_table = @constCast("customers"),
+            .parent_key = @constCast("customer:missing"),
+            .parent_values = missing_parent_values[0..],
+        },
+        .{
+            .group_id = 8,
+            .kind = .missing_ref,
+            .constraint_name = @constCast("orders_customer_id_fkey"),
+            .child_table = @constCast("row"),
+            .child_key = @constCast("order:missing-ref"),
+            .parent_table = @constCast("customers"),
+            .parent_key = @constCast("customer:missing-ref"),
+        },
+        .{
+            .group_id = 9,
+            .kind = .stale_ref,
+            .constraint_name = @constCast("orders_customer_id_fkey"),
+            .child_table = @constCast("row"),
+            .child_key = @constCast("order:stale"),
+            .parent_table = @constCast("customers"),
+            .parent_key = @constCast("customer:old"),
+            .observed_parent_key = @constCast("customer:actual"),
+            .observed_parent_values = observed_parent_values[0..],
+        },
+    };
     const invalid_result: api_table_writes.ForeignKeyIntegrityResult = .{
         .action = .validate,
         .job_id = @constCast("fk-integrity:orders:orders_customer_id_fkey"),
@@ -4054,7 +4512,7 @@ test "metadata fk schema controller config builds bounded maintenance options" {
             .stale_ref_rows = 3,
         },
         .groups = &.{},
-        .violations = &.{},
+        .violations = invalid_violations[0..],
         .work_units = invalid_work_units[0..],
         .violations_truncated = true,
     };
@@ -4074,12 +4532,27 @@ test "metadata fk schema controller config builds bounded maintenance options" {
     });
     const status_with_report = runtime_status.snapshot(cfg);
     try std.testing.expectEqual(@as(u64, 2), status_with_report.rounds_total);
-    try std.testing.expectEqual(@as(u64, 2), status_with_report.missing_parent_rows_total);
-    try std.testing.expectEqual(@as(u64, 1), status_with_report.missing_ref_rows_total);
-    try std.testing.expectEqual(@as(u64, 3), status_with_report.stale_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 6), status_with_report.missing_parent_rows_total);
+    try std.testing.expectEqual(@as(u64, 3), status_with_report.missing_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 4), status_with_report.stale_ref_rows_total);
     try std.testing.expectEqual(@as(u64, 2), status_with_report.last_missing_parent_rows);
     try std.testing.expectEqual(@as(u64, 1), status_with_report.last_missing_ref_rows);
     try std.testing.expectEqual(@as(u64, 3), status_with_report.last_stale_ref_rows);
+    try std.testing.expectEqualStrings("orders", status_with_report.last_terminal_invalid_table_name);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", status_with_report.last_terminal_invalid_constraint_name);
+    try std.testing.expectEqualStrings("fk-integrity:orders:orders_customer_id_fkey", status_with_report.last_terminal_invalid_job_id);
+    try std.testing.expectEqual(@as(u64, 2), status_with_report.last_terminal_invalid_missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 1), status_with_report.last_terminal_invalid_missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 3), status_with_report.last_terminal_invalid_stale_ref_rows);
+    try std.testing.expectEqual(@as(usize, 3), status_with_report.last_terminal_invalid_violation_sample_count);
+    try std.testing.expect(status_with_report.last_terminal_invalid_violations_truncated);
+    try std.testing.expectEqual(@as(u64, 7), status_with_report.last_terminal_invalid_violation_group_id);
+    try std.testing.expectEqualStrings("missing_parent", status_with_report.last_terminal_invalid_violation_kind);
+    try std.testing.expectEqualStrings("row", status_with_report.last_terminal_invalid_violation_child_table);
+    try std.testing.expectEqualStrings("order:broken", status_with_report.last_terminal_invalid_violation_child_key);
+    try std.testing.expectEqualStrings("customers", status_with_report.last_terminal_invalid_violation_parent_table);
+    try std.testing.expectEqualStrings("customer:missing", status_with_report.last_terminal_invalid_violation_parent_key);
+    try std.testing.expectEqualStrings("", status_with_report.last_terminal_invalid_violation_observed_parent_key);
 
     const invalid_json = try foreignKeyValidationMetadataAlloc(std.testing.allocator, "{}", "orders_customer_id_fkey", invalid_result);
     defer std.testing.allocator.free(invalid_json);
@@ -4087,6 +4560,21 @@ test "metadata fk schema controller config builds bounded maintenance options" {
     try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"validation_state\":\"invalid\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"job_id\":\"fk-integrity:orders:orders_customer_id_fkey\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"missing_parent_rows\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"violation_sample_count\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"violation_kind_counts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"missing_parent\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"missing_ref\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"stale_ref\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"violation_samples\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"metadata_violation_samples_truncated\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"first_violation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"child_key\":\"order:broken\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"parent_key\":\"customer:missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"parent_values\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "missing@example.test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"child_key\":\"order:missing-ref\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"observed_parent_key\":\"customer:actual\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "actual@example.test") != null);
 
     const cleared_json = try foreignKeyValidationMetadataAlloc(std.testing.allocator, invalid_json, "orders_customer_id_fkey", null);
     defer std.testing.allocator.free(cleared_json);

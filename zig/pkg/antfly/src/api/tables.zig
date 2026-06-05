@@ -974,7 +974,30 @@ fn foreignKeysSameDefinition(a: runtime_schema_mod.ForeignKey, b: runtime_schema
         std.mem.eql(u8, a.parent_table, b.parent_table) and
         stringSlicesEqual(a.parent_columns, b.parent_columns) and
         a.on_delete == b.on_delete and
-        a.timing == b.timing;
+        a.on_update == b.on_update and
+        a.timing == b.timing and
+        a.match == b.match;
+}
+
+test "foreign key definition equality includes SQL compatibility fields" {
+    const base = runtime_schema_mod.ForeignKey{
+        .name = "orders_customer_id_fkey",
+        .child_columns = &.{"customer_id"},
+        .parent_table = "customers",
+        .parent_columns = &.{"_id"},
+        .on_delete = .restrict,
+        .on_update = .restrict,
+        .timing = .immediate,
+        .match = .simple,
+    };
+
+    var changed_update = base;
+    changed_update.on_update = .no_action;
+    try std.testing.expect(!foreignKeysSameDefinition(base, changed_update));
+
+    var changed_match = base;
+    changed_match.match = .full;
+    try std.testing.expect(!foreignKeysSameDefinition(base, changed_match));
 }
 
 fn foreignKeyValidationStateString(state: runtime_schema_mod.ForeignKeyValidationState) ![]const u8 {
@@ -2608,6 +2631,15 @@ test "validated table schema parses default type and dynamic templates" {
     try std.testing.expect(parsed.enforce_types);
     try std.testing.expectEqual(@as(usize, 1), parsed.document_schemas.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.dynamic_templates.len);
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseValidatedTableSchema(std.testing.allocator, "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"},\"customer_email\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\",\"customer_email\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\",\"email\"]}}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseValidatedTableSchema(std.testing.allocator, "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"match\":\"partial\"}]}"),
+    );
 }
 
 test "relational schema implies enforced closed validation" {

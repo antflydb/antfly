@@ -205,8 +205,11 @@ pub const local_schema_json_key = "\x00\x00__metadata__:schema_json";
 const foreign_key_integrity_progress_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_progress";
 const foreign_key_integrity_claim_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_claim";
 const foreign_key_integrity_job_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_job";
+const foreign_key_action_job_key_prefix = "\x00\x00__metadata__:foreign_key_action_job";
+const foreign_key_action_schedule_key_prefix = "\x00\x00__metadata__:foreign_key_action_schedule";
 const unique_constraint_integrity_progress_key_prefix = "\x00\x00__metadata__:unique_constraint_integrity_progress";
 const foreign_key_parent_checks_externalized_intent_key_prefix = "\x00\x00__metadata__:txn_fk_parent_checks_externalized:";
+const foreign_key_externalized_parent_check_intent_key_prefix = "\x00\x00__metadata__:txn_fk_externalized_parent_check:";
 pub const ReplayProgress = struct {
     sequence: u64 = 0,
     target_sequence: u64 = 0,
@@ -6271,7 +6274,9 @@ pub const DB = struct {
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
         var effective_ops = try coalesceKeyValueRequest(self, types.TransactionWrite, req.writes, req.deletes, req.transforms);
         defer effective_ops.deinit(self.alloc);
-        if (req.foreign_key_parent_checks_externalized) try self.validateNoDeferredForeignKeyParentChecksExternalized(effective_ops.writes);
+        if (req.foreign_key_parent_checks_externalized or req.foreign_key_externalized_parent_checks.len > 0) {
+            try self.validateExternalizedForeignKeyParentChecks(req.foreign_key_externalized_parent_checks, effective_ops.writes);
+        }
         try self.validateForeignKeyParentChecks(req.foreign_key_parent_checks, effective_ops.writes, effective_ops.deletes, req.unique_constraint_writes, req.unique_constraint_deletes);
         try self.validateForeignKeyRefMutations(req.foreign_key_ref_writes);
         try self.validateForeignKeyRefMutations(req.foreign_key_ref_deletes);
@@ -6299,6 +6304,11 @@ pub const DB = struct {
         defer {
             for (owned_metadata_keys.items) |key| self.alloc.free(key);
             owned_metadata_keys.deinit(self.alloc);
+        }
+        var owned_metadata_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_metadata_values.items) |value| self.alloc.free(value);
+            owned_metadata_values.deinit(self.alloc);
         }
 
         for (effective_ops.writes) |write| {
@@ -6337,6 +6347,14 @@ pub const DB = struct {
             &owned_fk_action_values,
             req.foreign_key_cascade_children,
         );
+        try self.appendForeignKeyActionScheduleIntents(
+            &intents,
+            &predicates,
+            &owned_metadata_keys,
+            &owned_metadata_values,
+            req.foreign_key_action_schedules,
+            monotonicTimeNs(),
+        );
         try self.validateUniqueConstraintMutations(req.unique_constraint_writes, req.unique_constraint_deletes);
         try self.validateForeignKeyParentDeleteChecks(req.foreign_key_parent_delete_checks, effective_ops.writes, effective_ops.deletes, req.foreign_key_ref_writes, req.foreign_key_ref_deletes);
         var owned_fk_ref_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -6368,8 +6386,87 @@ pub const DB = struct {
                 .value = "true",
             });
         }
+        try self.appendForeignKeyExternalizedParentCheckIntents(
+            txn_id,
+            &intents,
+            &owned_metadata_keys,
+            &owned_metadata_values,
+            req.foreign_key_externalized_parent_checks,
+        );
 
         try self.writeIntents(txn_id, intents.items, predicates.items);
+    }
+
+    fn appendForeignKeyActionScheduleIntents(
+        self: *DB,
+        intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+        predicates: *std.ArrayListUnmanaged(transactions_mod.VersionPredicate),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        schedules: []const types.ForeignKeyActionScheduleMutation,
+        now_ns: u64,
+    ) !void {
+        for (schedules) |schedule| {
+            if (schedule.schedule_id.len == 0 or schedule.action_job_id.len == 0 or schedule.page_limit == 0) return error.InvalidForeignKeyActionJob;
+            try validateForeignKeyActionJobIdentity(schedule.action_job_id, schedule.action, schedule.worker_id, schedule.constraint_name, schedule.parent_table, schedule.parent_key, schedule.updated_parent_key);
+
+            const key = try foreignKeyActionScheduleKeyAlloc(self.alloc, schedule.schedule_id);
+            errdefer self.alloc.free(key);
+            if (self.core.store.get(self.alloc, key)) |raw| {
+                defer self.alloc.free(raw);
+                const existing = try self.cloneForeignKeyActionScheduleRecordFromJson(raw);
+                defer self.freeForeignKeyActionScheduleRecord(existing);
+                try validateForeignKeyActionScheduleMatches(existing, schedule.action_job_id, schedule.action, schedule.constraint_name, schedule.parent_table, schedule.parent_key, schedule.updated_parent_key);
+                self.alloc.free(key);
+                continue;
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+
+            const record = ForeignKeyActionScheduleRecord{
+                .schedule_id = schedule.schedule_id,
+                .action_job_id = schedule.action_job_id,
+                .action = schedule.action,
+                .worker_id = schedule.worker_id,
+                .constraint_name = schedule.constraint_name,
+                .parent_table = schedule.parent_table,
+                .parent_key = schedule.parent_key,
+                .updated_parent_key = schedule.updated_parent_key,
+                .page_limit = schedule.page_limit,
+                .status = "pending",
+                .created_at_ns = now_ns,
+                .updated_at_ns = now_ns,
+                .completed = false,
+                .scheduled_groups = 0,
+                .last_error = null,
+            };
+            const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+            errdefer self.alloc.free(payload);
+            try owned_keys.append(self.alloc, key);
+            try owned_values.append(self.alloc, payload);
+            try predicates.append(self.alloc, .{ .key = key, .expected_version = 0 });
+            try intents.append(self.alloc, .{ .key = key, .value = payload });
+        }
+    }
+
+    fn appendForeignKeyExternalizedParentCheckIntents(
+        self: *DB,
+        txn_id: types.TxnId,
+        intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        checks: []const types.ForeignKeyParentCheck,
+    ) !void {
+        for (checks) |check| {
+            const key = try foreignKeyExternalizedParentCheckIntentKeyAlloc(self.alloc, txn_id, check);
+            errdefer self.alloc.free(key);
+            const value = try encodeForeignKeyExternalizedParentCheckIntentValueAlloc(self.alloc, check);
+            errdefer self.alloc.free(value);
+            try owned_keys.append(self.alloc, key);
+            try owned_values.append(self.alloc, value);
+            try intents.append(self.alloc, .{ .key = key, .value = value });
+        }
     }
 
     fn validateUniqueConstraintMutations(
@@ -6514,6 +6611,7 @@ pub const DB = struct {
         defer if (prepared and !closed) participant.abort(null);
 
         for (checks) |check| {
+            if (check.operation != .delete) continue;
             const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, check.constraint_name) orelse return error.ForeignKeyViolation;
             if (foreign_key.on_delete != .set_null) continue;
             if (check.constraint_name.len == 0 or check.parent_table.len == 0 or check.parent_key.len == 0) return error.ForeignKeyViolation;
@@ -6568,7 +6666,10 @@ pub const DB = struct {
             if (!isForeignKeyExternalDocKey(action.child_key)) return error.ForeignKeyViolation;
             const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, action.constraint_name) orelse return error.ForeignKeyViolation;
             if (foreignKeyReferencesPrimaryKey(foreign_key) and !isForeignKeyExternalDocKey(action.parent_key)) return error.ForeignKeyViolation;
-            try participant.prepareSetNullForeignKeyChildAction(action.constraint_name, action.parent_table, action.parent_key, action.child_key);
+            switch (action.operation) {
+                .delete => try participant.prepareSetNullForeignKeyChildAction(action.constraint_name, action.parent_table, action.parent_key, action.child_key),
+                .update => try participant.prepareSetNullForeignKeyUpdateChildAction(action.constraint_name, action.parent_table, action.parent_key, action.child_key),
+            }
             prepared = true;
         }
         if (!prepared) return;
@@ -6618,7 +6719,14 @@ pub const DB = struct {
             if (!isForeignKeyExternalDocKey(action.child_key)) return error.ForeignKeyViolation;
             const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, action.constraint_name) orelse return error.ForeignKeyViolation;
             if (foreignKeyReferencesPrimaryKey(foreign_key) and !isForeignKeyExternalDocKey(action.parent_key)) return error.ForeignKeyViolation;
-            try participant.prepareCascadeForeignKeyChildAction(action.constraint_name, action.parent_table, action.parent_key, action.child_key);
+            switch (action.operation) {
+                .delete => try participant.prepareCascadeForeignKeyChildAction(action.constraint_name, action.parent_table, action.parent_key, action.child_key),
+                .update => {
+                    const updated_parent_key = action.updated_parent_key orelse return error.ForeignKeyViolation;
+                    if (foreignKeyReferencesPrimaryKey(foreign_key) and !isForeignKeyExternalDocKey(updated_parent_key)) return error.ForeignKeyViolation;
+                    try participant.prepareCascadeForeignKeyUpdateChildAction(action.constraint_name, action.parent_table, action.parent_key, updated_parent_key, action.child_key);
+                },
+            }
             prepared = true;
         }
         if (!prepared) return;
@@ -6685,8 +6793,7 @@ pub const DB = struct {
 
     fn foreignKeyNeedsRestrictConflictKey(foreign_key: schema_mod.ForeignKey) bool {
         return foreign_key.validation_state == .enforced and
-            foreign_key.timing == .immediate and
-            foreign_key.on_delete == .restrict and
+            foreignKeyDeleteActionRestricts(foreign_key) and
             foreign_key.parent_columns.len == 1 and
             std.mem.eql(u8, foreign_key.parent_columns[0], "_id");
     }
@@ -6705,6 +6812,7 @@ pub const DB = struct {
         for (checks) |check| {
             if (check.parent_key.len == 0 or check.parent_table.len == 0 or check.constraint_name.len == 0 or check.child_table.len == 0 or check.child_key.len == 0) return error.ForeignKeyViolation;
             if (!isForeignKeyExternalDocKey(check.child_key)) return error.ForeignKeyViolation;
+            if (!std.mem.eql(u8, runtime_schema.default_type, check.parent_table)) return error.ForeignKeyViolation;
             if (check.parent_constraint_name) |constraint_name| {
                 if (findUniqueConstraintByName(runtime_schema.unique_constraints, constraint_name) == null) return error.ForeignKeyViolation;
                 if (findUniqueConstraintMutation(unique_deletes, constraint_name, check.parent_key) != null and
@@ -6720,7 +6828,6 @@ pub const DB = struct {
                 continue;
             }
             if (!isForeignKeyExternalDocKey(check.parent_key)) return error.ForeignKeyViolation;
-            if (!std.mem.eql(u8, runtime_schema.default_type, check.parent_table)) return error.ForeignKeyViolation;
             if (containsString(deletes, check.parent_key)) return error.ForeignKeyViolation;
             if (containsTransactionWrite(writes, check.parent_key)) continue;
             const existing = try self.get(self.alloc, check.parent_key);
@@ -6729,22 +6836,83 @@ pub const DB = struct {
         }
     }
 
-    fn validateNoDeferredForeignKeyParentChecksExternalized(
+    fn validateExternalizedForeignKeyParentChecks(
         self: *DB,
+        checks: []const types.ForeignKeyParentCheck,
         writes: []const types.TransactionWrite,
     ) !void {
+        const runtime_schema = self.core.schema orelse {
+            if (checks.len > 0) return error.ForeignKeyViolation;
+            return;
+        };
+        if (runtime_schema.storage_mode != .relational or runtime_schema.foreign_keys.len == 0) {
+            if (checks.len > 0) return error.ForeignKeyViolation;
+            return;
+        }
+        for (checks) |check| {
+            if (check.constraint_name.len == 0 or check.child_table.len == 0 or check.child_key.len == 0 or check.parent_table.len == 0 or check.parent_key.len == 0) return error.ForeignKeyViolation;
+            const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, check.constraint_name) orelse return error.ForeignKeyViolation;
+            if (foreign_key.validation_state != .enforced) return error.ForeignKeyViolation;
+            if (check.timing != foreignKeyParentCheckTiming(foreign_key)) return error.ForeignKeyViolation;
+            if (!std.mem.eql(u8, check.child_table, runtime_schema.default_type)) return error.ForeignKeyViolation;
+            if (!std.mem.eql(u8, check.parent_table, foreign_key.parent_table)) return error.ForeignKeyViolation;
+            if (!isForeignKeyExternalDocKey(check.child_key)) return error.ForeignKeyViolation;
+            if (foreignKeyReferencesPrimaryKey(foreign_key)) {
+                if (!isForeignKeyExternalDocKey(check.parent_key)) return error.ForeignKeyViolation;
+                if (check.parent_constraint_name != null) return error.ForeignKeyViolation;
+            } else {
+                const parent_constraint_name = check.parent_constraint_name orelse return error.ForeignKeyViolation;
+                if (parent_constraint_name.len == 0) return error.ForeignKeyViolation;
+                if (std.mem.eql(u8, foreign_key.parent_table, runtime_schema.default_type)) {
+                    const parent_constraint = findUniqueConstraintByName(runtime_schema.unique_constraints, parent_constraint_name) orelse return error.ForeignKeyViolation;
+                    if (!stringSlicesEqual(parent_constraint.columns, foreign_key.parent_columns)) return error.ForeignKeyViolation;
+                }
+            }
+        }
         if (writes.len == 0) return;
-        const runtime_schema = self.core.schema orelse return;
-        if (runtime_schema.storage_mode != .relational or runtime_schema.foreign_keys.len == 0) return;
         for (runtime_schema.foreign_keys) |foreign_key| {
             if (foreign_key.validation_state != .enforced or foreign_key.timing != .deferred) continue;
             for (writes) |write| {
                 if (isMetadataKey(write.key) or internal_keys.isInternalPhysicalTableDataKey(write.key)) continue;
                 const parent_key = (try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema.relational_columns, foreign_key, write.value)) orelse continue;
-                self.alloc.free(parent_key);
-                return error.ForeignKeyViolation;
+                defer self.alloc.free(parent_key);
+                if (!containsExternalizedForeignKeyParentCheck(checks, foreign_key, runtime_schema.default_type, write.key, parent_key)) return error.ForeignKeyViolation;
             }
         }
+    }
+
+    fn containsExternalizedForeignKeyParentCheck(
+        checks: []const types.ForeignKeyParentCheck,
+        foreign_key: schema_mod.ForeignKey,
+        child_table: []const u8,
+        child_key: []const u8,
+        parent_key: []const u8,
+    ) bool {
+        for (checks) |check| {
+            if (check.timing != .deferred) continue;
+            if (!std.mem.eql(u8, check.constraint_name, foreign_key.name)) continue;
+            if (!std.mem.eql(u8, check.child_table, child_table)) continue;
+            if (!std.mem.eql(u8, check.child_key, child_key)) continue;
+            if (!std.mem.eql(u8, check.parent_table, foreign_key.parent_table)) continue;
+            if (!std.mem.eql(u8, check.parent_key, parent_key)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    fn foreignKeyParentCheckTiming(foreign_key: schema_mod.ForeignKey) types.ForeignKeyParentCheck.Timing {
+        return switch (foreign_key.timing) {
+            .immediate => .immediate,
+            .deferred => .deferred,
+        };
+    }
+
+    fn foreignKeyDeleteActionRestricts(foreign_key: schema_mod.ForeignKey) bool {
+        return foreign_key.on_delete == .restrict or foreign_key.on_delete == .no_action;
+    }
+
+    fn foreignKeyUpdateActionRestricts(foreign_key: schema_mod.ForeignKey) bool {
+        return foreign_key.on_update == .restrict or foreign_key.on_update == .no_action;
     }
 
     fn containsTransactionWrite(writes: []const types.TransactionWrite, key: []const u8) bool {
@@ -6775,8 +6943,12 @@ pub const DB = struct {
         for (checks) |check| {
             if (check.constraint_name.len == 0 or check.parent_table.len == 0 or check.parent_key.len == 0) return error.ForeignKeyViolation;
             const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, check.constraint_name) orelse return error.ForeignKeyViolation;
-            if (!foreignKeyIsEnforcedImmediate(foreign_key)) return error.ForeignKeyViolation;
-            if (foreign_key.on_delete != .restrict) continue;
+            if (foreign_key.validation_state != .enforced) return error.ForeignKeyViolation;
+            if (check.timing != foreignKeyParentCheckTiming(foreign_key)) return error.ForeignKeyViolation;
+            switch (check.operation) {
+                .delete => if (!foreignKeyDeleteActionRestricts(foreign_key)) continue,
+                .update => if (!foreignKeyUpdateActionRestricts(foreign_key)) continue,
+            }
             if (foreignKeyReferencesPrimaryKey(foreign_key) and !isForeignKeyExternalDocKey(check.parent_key)) return error.ForeignKeyViolation;
             if (!std.mem.eql(u8, foreign_key.parent_table, check.parent_table)) return error.ForeignKeyViolation;
 
@@ -6817,7 +6989,7 @@ pub const DB = struct {
             if (!isForeignKeyExternalDocKey(mutation.child_key)) return error.ForeignKeyViolation;
             if (!std.mem.eql(u8, mutation.child_table, runtime_schema.default_type)) return error.ForeignKeyViolation;
             const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, mutation.constraint_name) orelse return error.ForeignKeyViolation;
-            if (!foreignKeyIsEnforcedImmediate(foreign_key)) return error.ForeignKeyViolation;
+            if (foreign_key.validation_state != .enforced) return error.ForeignKeyViolation;
             if (!std.mem.eql(u8, foreign_key.parent_table, mutation.parent_table)) return error.ForeignKeyViolation;
             if (foreignKeyReferencesPrimaryKey(foreign_key)) {
                 if (!isForeignKeyExternalDocKey(mutation.parent_key)) return error.ForeignKeyViolation;
@@ -6950,6 +7122,34 @@ pub const DB = struct {
             for (raw_identity_deletes.items) |key| {
                 if (!isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) try identity_deletes.append(self.alloc, key);
             }
+            const metadata_mutations = try self.core.collectTransactionIntentMutations(self.alloc, txn_id);
+            defer {
+                for (metadata_mutations) |*mutation| mutation.deinit(self.alloc);
+                if (metadata_mutations.len > 0) self.alloc.free(metadata_mutations);
+            }
+            for (metadata_mutations) |mutation| {
+                if (!isForeignKeyActionScheduleMetadataKey(mutation.key)) continue;
+                const skip_key = try self.alloc.dupe(u8, mutation.key);
+                var skip_key_owned = true;
+                errdefer if (skip_key_owned) self.alloc.free(skip_key);
+                try relational_skip_intent_keys.append(self.alloc, skip_key);
+                skip_key_owned = false;
+
+                const metadata_key = try self.alloc.dupe(u8, mutation.key);
+                var metadata_key_owned = true;
+                errdefer if (metadata_key_owned) self.alloc.free(metadata_key);
+                if (mutation.value) |value| {
+                    const metadata_value = try self.alloc.dupe(u8, value);
+                    var metadata_value_owned = true;
+                    errdefer if (metadata_value_owned) self.alloc.free(metadata_value);
+                    try relational_extra_writes.append(self.alloc, .{ .key = metadata_key, .value = metadata_value });
+                    metadata_key_owned = false;
+                    metadata_value_owned = false;
+                } else {
+                    try relational_extra_deletes.append(self.alloc, metadata_key);
+                    metadata_key_owned = false;
+                }
+            }
             try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
                 self.alloc,
                 self.core.store,
@@ -6981,6 +7181,12 @@ pub const DB = struct {
                     try relational_skip_intent_keys.append(self.alloc, marker_skip_key);
                     marker_skip_key_owned = false;
                 }
+                const externalized_fk_parent_checks = try collectTransactionExternalizedForeignKeyParentChecksAlloc(
+                    self.alloc,
+                    mutations,
+                    &relational_skip_intent_keys,
+                );
+                defer freeExternalizedForeignKeyParentChecks(self.alloc, externalized_fk_parent_checks);
                 var relational_intent_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
                 defer relational_intent_delete_keys.deinit(self.alloc);
                 for (mutations) |mutation| {
@@ -7010,6 +7216,7 @@ pub const DB = struct {
                 if (self.core.schema) |runtime_schema| {
                     relational_table_name = runtime_schema.default_type;
                     relational_participant.configureForeignKeys(runtime_schema.default_type, runtime_schema.foreign_keys, relational_intent_delete_keys.items, foreign_key_parent_checks_externalized);
+                    relational_participant.configureExternalizedForeignKeyParentChecks(externalized_fk_parent_checks);
                     relational_participant.configureUniqueConstraints(runtime_schema.unique_constraints);
                 }
                 var relational_participant_prepared = false;
@@ -7028,6 +7235,7 @@ pub const DB = struct {
                         const row_value = try self.alloc.dupe(u8, value);
                         var row_value_owned = true;
                         errdefer if (row_value_owned) self.alloc.free(row_value);
+                        relational_participant_prepared = true;
                         relational_participant.prepareUpsert(
                             relational_table_name,
                             mutation.key,
@@ -7037,7 +7245,6 @@ pub const DB = struct {
                             if (err == error.ForeignKeyViolation) self.recordForeignKeyChildWriteReject();
                             return err;
                         };
-                        relational_participant_prepared = true;
                         try relational_extra_owned_values.append(self.alloc, row_value);
                         row_value_owned = false;
                         if (shouldWriteTimestamp(mutation.key)) {
@@ -7054,6 +7261,7 @@ pub const DB = struct {
                             try relational_extra_writes.append(self.alloc, .{ .key = timestamp_key, .value = timestamp_value });
                         }
                     } else {
+                        relational_participant_prepared = true;
                         relational_participant.prepareDelete(
                             relational_table_name,
                             mutation.key,
@@ -7062,7 +7270,6 @@ pub const DB = struct {
                             if (err == error.ForeignKeyViolation) self.recordForeignKeyParentDeleteReject();
                             return err;
                         };
-                        relational_participant_prepared = true;
                         if (shouldWriteTimestamp(mutation.key)) {
                             const timestamp_key = try makeTimestampKey(self.alloc, mutation.key);
                             var timestamp_key_owned = true;
@@ -10299,6 +10506,10 @@ pub const DB = struct {
         violation_samples_json: []const u8 = "[]",
         violation_sample_count: usize = 0,
         violations_truncated: bool = false,
+        diagnostic_passes: u64 = 0,
+        violating_passes: u64 = 0,
+        first_violation_at_ns: ?u64 = null,
+        last_violation_at_ns: ?u64 = null,
     };
 
     pub fn freeForeignKeyIntegrityJobRecord(self: *DB, record: ForeignKeyIntegrityJobRecord) void {
@@ -10315,6 +10526,85 @@ pub const DB = struct {
 
     pub fn freeForeignKeyIntegrityJobRecords(self: *DB, records: []ForeignKeyIntegrityJobRecord) void {
         for (records) |record| self.freeForeignKeyIntegrityJobRecord(record);
+        if (records.len > 0) self.alloc.free(records);
+    }
+
+    pub const ForeignKeyActionJobRecord = struct {
+        version: u32 = 1,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8 = null,
+        page_limit: usize,
+        status: []const u8,
+        created_at_ns: u64,
+        updated_at_ns: u64,
+        claimed_at_ns: u64,
+        lease_until_ns: u64,
+        attempts: u32 = 0,
+        completed: bool = false,
+        applied_children: u64 = 0,
+        next_child_table: ?[]const u8 = null,
+        next_child_key: ?[]const u8 = null,
+        last_error: ?[]const u8 = null,
+    };
+
+    pub fn freeForeignKeyActionJobRecord(self: *DB, record: ForeignKeyActionJobRecord) void {
+        if (record.job_id.len > 0) self.alloc.free(record.job_id);
+        if (record.action.len > 0) self.alloc.free(record.action);
+        if (record.worker_id.len > 0) self.alloc.free(record.worker_id);
+        if (record.constraint_name.len > 0) self.alloc.free(record.constraint_name);
+        if (record.parent_table.len > 0) self.alloc.free(record.parent_table);
+        if (record.parent_key.len > 0) self.alloc.free(record.parent_key);
+        if (record.updated_parent_key) |value| self.alloc.free(value);
+        if (record.status.len > 0) self.alloc.free(record.status);
+        if (record.next_child_table) |value| self.alloc.free(value);
+        if (record.next_child_key) |value| self.alloc.free(value);
+        if (record.last_error) |value| self.alloc.free(value);
+    }
+
+    pub fn freeForeignKeyActionJobRecords(self: *DB, records: []ForeignKeyActionJobRecord) void {
+        for (records) |record| self.freeForeignKeyActionJobRecord(record);
+        if (records.len > 0) self.alloc.free(records);
+    }
+
+    pub const ForeignKeyActionScheduleRecord = struct {
+        version: u32 = 1,
+        schedule_id: []const u8,
+        action_job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8 = null,
+        page_limit: usize,
+        status: []const u8,
+        created_at_ns: u64,
+        updated_at_ns: u64,
+        completed: bool = false,
+        scheduled_groups: u64 = 0,
+        last_error: ?[]const u8 = null,
+    };
+
+    pub fn freeForeignKeyActionScheduleRecord(self: *DB, record: ForeignKeyActionScheduleRecord) void {
+        if (record.schedule_id.len > 0) self.alloc.free(record.schedule_id);
+        if (record.action_job_id.len > 0) self.alloc.free(record.action_job_id);
+        if (record.action.len > 0) self.alloc.free(record.action);
+        if (record.worker_id.len > 0) self.alloc.free(record.worker_id);
+        if (record.constraint_name.len > 0) self.alloc.free(record.constraint_name);
+        if (record.parent_table.len > 0) self.alloc.free(record.parent_table);
+        if (record.parent_key.len > 0) self.alloc.free(record.parent_key);
+        if (record.updated_parent_key) |value| self.alloc.free(value);
+        if (record.status.len > 0) self.alloc.free(record.status);
+        if (record.last_error) |value| self.alloc.free(value);
+    }
+
+    pub fn freeForeignKeyActionScheduleRecords(self: *DB, records: []ForeignKeyActionScheduleRecord) void {
+        for (records) |record| self.freeForeignKeyActionScheduleRecord(record);
         if (records.len > 0) self.alloc.free(records);
     }
 
@@ -10423,6 +10713,78 @@ pub const DB = struct {
         for (scanned) |entry| {
             const cloned = try self.cloneForeignKeyIntegrityJobRecordFromJson(entry.value);
             errdefer self.freeForeignKeyIntegrityJobRecord(cloned);
+            try out.append(self.alloc, cloned);
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn loadForeignKeyActionJobRecord(self: *DB, job_id: []const u8) !?ForeignKeyActionJobRecord {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyActionJobKeyAlloc(self.alloc, job_id);
+        defer self.alloc.free(key);
+        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        return try self.cloneForeignKeyActionJobRecordFromJson(raw);
+    }
+
+    pub fn listForeignKeyActionJobRecords(self: *DB) ![]ForeignKeyActionJobRecord {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const upper = try metadataPrefixUpperAlloc(self.alloc, foreign_key_action_job_key_prefix);
+        defer if (upper) |buf| self.alloc.free(buf);
+        const scanned = try self.core.store.scanRange(self.alloc, foreign_key_action_job_key_prefix, if (upper) |buf| buf else "");
+        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+        var out = std.ArrayListUnmanaged(ForeignKeyActionJobRecord).empty;
+        errdefer {
+            for (out.items) |record| self.freeForeignKeyActionJobRecord(record);
+            out.deinit(self.alloc);
+        }
+        for (scanned) |entry| {
+            const cloned = try self.cloneForeignKeyActionJobRecordFromJson(entry.value);
+            errdefer self.freeForeignKeyActionJobRecord(cloned);
+            try out.append(self.alloc, cloned);
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn loadForeignKeyActionScheduleRecord(self: *DB, schedule_id: []const u8) !?ForeignKeyActionScheduleRecord {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyActionScheduleKeyAlloc(self.alloc, schedule_id);
+        defer self.alloc.free(key);
+        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        return try self.cloneForeignKeyActionScheduleRecordFromJson(raw);
+    }
+
+    pub fn listForeignKeyActionScheduleRecords(self: *DB) ![]ForeignKeyActionScheduleRecord {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const upper = try metadataPrefixUpperAlloc(self.alloc, foreign_key_action_schedule_key_prefix);
+        defer if (upper) |buf| self.alloc.free(buf);
+        const scanned = try self.core.store.scanRange(self.alloc, foreign_key_action_schedule_key_prefix, if (upper) |buf| buf else "");
+        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+        var out = std.ArrayListUnmanaged(ForeignKeyActionScheduleRecord).empty;
+        errdefer {
+            for (out.items) |record| self.freeForeignKeyActionScheduleRecord(record);
+            out.deinit(self.alloc);
+        }
+        for (scanned) |entry| {
+            const cloned = try self.cloneForeignKeyActionScheduleRecordFromJson(entry.value);
+            errdefer self.freeForeignKeyActionScheduleRecord(cloned);
             try out.append(self.alloc, cloned);
         }
         return try out.toOwnedSlice(self.alloc);
@@ -10639,7 +11001,7 @@ pub const DB = struct {
             .lower_doc_key = lower_doc_key,
             .upper_doc_key = upper_doc_key,
             .valid = foreignKeyIntegrityProgressValid(mode, report),
-            .updated_at_ns = monotonicTimeNs(),
+            .updated_at_ns = currentTimeNs(),
             .report = report,
         }, .{ .emit_null_optional_fields = false });
         defer alloc.free(payload);
@@ -10662,7 +11024,7 @@ pub const DB = struct {
             .lower_doc_key = lower_doc_key,
             .upper_doc_key = upper_doc_key,
             .valid = uniqueConstraintIntegrityProgressValid(mode, report),
-            .updated_at_ns = monotonicTimeNs(),
+            .updated_at_ns = currentTimeNs(),
             .report = report,
         }, .{});
         defer alloc.free(payload);
@@ -10691,7 +11053,7 @@ pub const DB = struct {
             lower_doc_key,
             upper_doc_key,
             lease_ms,
-            monotonicTimeNs(),
+            currentTimeNs(),
         );
     }
 
@@ -10774,7 +11136,7 @@ pub const DB = struct {
             lease_ms,
             max_work_units,
             status,
-            monotonicTimeNs(),
+            currentTimeNs(),
         );
     }
 
@@ -10807,6 +11169,11 @@ pub const DB = struct {
         defer if (preserved_violation_samples_json) |value| self.alloc.free(value);
         var violation_sample_count: usize = 0;
         var violations_truncated = false;
+        var last_report: relational_store_mod.ForeignKeyIntegrityReport = .{};
+        var diagnostic_passes: u64 = 0;
+        var violating_passes: u64 = 0;
+        var first_violation_at_ns: ?u64 = null;
+        var last_violation_at_ns: ?u64 = null;
         if (self.core.store.get(self.alloc, key)) |raw| {
             defer self.alloc.free(raw);
             const existing = try self.cloneForeignKeyIntegrityJobRecordFromJson(raw);
@@ -10817,6 +11184,11 @@ pub const DB = struct {
             violation_samples_json = preserved_violation_samples_json.?;
             violation_sample_count = existing.violation_sample_count;
             violations_truncated = existing.violations_truncated;
+            last_report = existing.last_report;
+            diagnostic_passes = existing.diagnostic_passes;
+            violating_passes = existing.violating_passes;
+            first_violation_at_ns = existing.first_violation_at_ns;
+            last_violation_at_ns = existing.last_violation_at_ns;
         } else |err| switch (err) {
             error.NotFound => {},
             else => return err,
@@ -10838,10 +11210,14 @@ pub const DB = struct {
             .attempts = attempts,
             .completed = false,
             .valid = null,
-            .last_report = .{},
+            .last_report = last_report,
             .violation_samples_json = violation_samples_json,
             .violation_sample_count = violation_sample_count,
             .violations_truncated = violations_truncated,
+            .diagnostic_passes = diagnostic_passes,
+            .violating_passes = violating_passes,
+            .first_violation_at_ns = first_violation_at_ns,
+            .last_violation_at_ns = last_violation_at_ns,
         };
         const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(payload);
@@ -10856,7 +11232,7 @@ pub const DB = struct {
         valid: bool,
         report: relational_store_mod.ForeignKeyIntegrityReport,
     ) !ForeignKeyIntegrityJobRecord {
-        return try self.completeForeignKeyIntegrityJobRecordAt(job_id, status, valid, report, monotonicTimeNs());
+        return try self.completeForeignKeyIntegrityJobRecordAt(job_id, status, valid, report, currentTimeNs());
     }
 
     pub fn completeForeignKeyIntegrityJobRecordWithDiagnostics(
@@ -10877,7 +11253,7 @@ pub const DB = struct {
             violation_samples_json,
             violation_sample_count,
             violations_truncated,
-            monotonicTimeNs(),
+            currentTimeNs(),
         );
     }
 
@@ -10926,6 +11302,11 @@ pub const DB = struct {
         defer self.alloc.free(raw);
         const existing = try self.cloneForeignKeyIntegrityJobRecordFromJson(raw);
         defer self.freeForeignKeyIntegrityJobRecord(existing);
+        const has_diagnostics = violation_samples_json != null or violation_sample_count != null or violations_truncated != null;
+        const pass_has_violations = !valid or
+            foreignKeyIntegrityReportHasViolations(report) or
+            (violation_sample_count orelse existing.violation_sample_count) > 0 or
+            (violations_truncated orelse existing.violations_truncated);
 
         const record = ForeignKeyIntegrityJobRecord{
             .job_id = existing.job_id,
@@ -10947,6 +11328,10 @@ pub const DB = struct {
             .violation_samples_json = violation_samples_json orelse existing.violation_samples_json,
             .violation_sample_count = violation_sample_count orelse existing.violation_sample_count,
             .violations_truncated = violations_truncated orelse existing.violations_truncated,
+            .diagnostic_passes = existing.diagnostic_passes +| @as(u64, if (has_diagnostics) 1 else 0),
+            .violating_passes = existing.violating_passes +| @as(u64, if (pass_has_violations) 1 else 0),
+            .first_violation_at_ns = foreignKeyIntegrityFirstViolationAt(existing.first_violation_at_ns, pass_has_violations, now_ns),
+            .last_violation_at_ns = if (pass_has_violations) now_ns else existing.last_violation_at_ns,
         };
         const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(payload);
@@ -10966,13 +11351,69 @@ pub const DB = struct {
             violation_samples_json,
             violation_sample_count,
             violations_truncated,
-            monotonicTimeNs(),
+            currentTimeNs(),
+        );
+    }
+
+    pub fn updateForeignKeyIntegrityJobDiagnosticsWithReport(
+        self: *DB,
+        job_id: []const u8,
+        report: relational_store_mod.ForeignKeyIntegrityReport,
+        violation_samples_json: []const u8,
+        violation_sample_count: usize,
+        violations_truncated: bool,
+    ) !ForeignKeyIntegrityJobRecord {
+        return try self.updateForeignKeyIntegrityJobDiagnosticsWithReportAt(
+            job_id,
+            report,
+            violation_samples_json,
+            violation_sample_count,
+            violations_truncated,
+            currentTimeNs(),
         );
     }
 
     pub fn updateForeignKeyIntegrityJobDiagnosticsAt(
         self: *DB,
         job_id: []const u8,
+        violation_samples_json: []const u8,
+        violation_sample_count: usize,
+        violations_truncated: bool,
+        now_ns: u64,
+    ) !ForeignKeyIntegrityJobRecord {
+        return try self.updateForeignKeyIntegrityJobDiagnosticsMaybeReportAt(
+            job_id,
+            null,
+            violation_samples_json,
+            violation_sample_count,
+            violations_truncated,
+            now_ns,
+        );
+    }
+
+    pub fn updateForeignKeyIntegrityJobDiagnosticsWithReportAt(
+        self: *DB,
+        job_id: []const u8,
+        report: relational_store_mod.ForeignKeyIntegrityReport,
+        violation_samples_json: []const u8,
+        violation_sample_count: usize,
+        violations_truncated: bool,
+        now_ns: u64,
+    ) !ForeignKeyIntegrityJobRecord {
+        return try self.updateForeignKeyIntegrityJobDiagnosticsMaybeReportAt(
+            job_id,
+            report,
+            violation_samples_json,
+            violation_sample_count,
+            violations_truncated,
+            now_ns,
+        );
+    }
+
+    fn updateForeignKeyIntegrityJobDiagnosticsMaybeReportAt(
+        self: *DB,
+        job_id: []const u8,
+        report: ?relational_store_mod.ForeignKeyIntegrityReport,
         violation_samples_json: []const u8,
         violation_sample_count: usize,
         violations_truncated: bool,
@@ -10992,6 +11433,9 @@ pub const DB = struct {
         defer self.alloc.free(raw);
         const existing = try self.cloneForeignKeyIntegrityJobRecordFromJson(raw);
         defer self.freeForeignKeyIntegrityJobRecord(existing);
+        const pass_has_violations = foreignKeyIntegrityReportHasViolations(report orelse existing.last_report) or
+            violation_sample_count > 0 or
+            violations_truncated;
 
         const record = ForeignKeyIntegrityJobRecord{
             .job_id = existing.job_id,
@@ -11009,15 +11453,785 @@ pub const DB = struct {
             .attempts = existing.attempts,
             .completed = existing.completed,
             .valid = existing.valid,
-            .last_report = existing.last_report,
+            .last_report = report orelse existing.last_report,
             .violation_samples_json = violation_samples_json,
             .violation_sample_count = violation_sample_count,
             .violations_truncated = violations_truncated,
+            .diagnostic_passes = existing.diagnostic_passes +| 1,
+            .violating_passes = existing.violating_passes +| @as(u64, if (pass_has_violations) 1 else 0),
+            .first_violation_at_ns = foreignKeyIntegrityFirstViolationAt(existing.first_violation_at_ns, pass_has_violations, now_ns),
+            .last_violation_at_ns = if (pass_has_violations) now_ns else existing.last_violation_at_ns,
         };
         const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(payload);
         try self.core.store.put(key, payload);
         return try self.cloneForeignKeyIntegrityJobRecordFromJson(payload);
+    }
+
+    pub fn claimAndRunForeignKeyActionJobPage(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        page_limit: usize,
+        lease_ms: u64,
+    ) !ForeignKeyActionJobRecord {
+        return try self.claimAndRunForeignKeyActionJobPageAt(
+            job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            page_limit,
+            lease_ms,
+            currentTimeNs(),
+        );
+    }
+
+    pub fn scheduleForeignKeyActionJob(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        page_limit: usize,
+    ) !ForeignKeyActionJobRecord {
+        return try self.scheduleForeignKeyActionJobWithUpdatedParentKeyAt(
+            job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            null,
+            page_limit,
+            currentTimeNs(),
+        );
+    }
+
+    pub fn scheduleForeignKeyActionJobWithUpdatedParentKey(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+    ) !ForeignKeyActionJobRecord {
+        return try self.scheduleForeignKeyActionJobWithUpdatedParentKeyAt(
+            job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            updated_parent_key,
+            page_limit,
+            currentTimeNs(),
+        );
+    }
+
+    pub fn scheduleForeignKeyActionJobAt(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        page_limit: usize,
+        now_ns: u64,
+    ) !ForeignKeyActionJobRecord {
+        return try self.scheduleForeignKeyActionJobWithUpdatedParentKeyAt(
+            job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            null,
+            page_limit,
+            now_ns,
+        );
+    }
+
+    pub fn scheduleForeignKeyActionJobWithUpdatedParentKeyAt(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+        now_ns: u64,
+    ) !ForeignKeyActionJobRecord {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (page_limit == 0) return error.InvalidForeignKeyActionJob;
+        try validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyActionJobKeyAlloc(self.alloc, job_id);
+        defer self.alloc.free(key);
+
+        if (self.core.store.get(self.alloc, key)) |raw| {
+            defer self.alloc.free(raw);
+            const existing = try self.cloneForeignKeyActionJobRecordFromJson(raw);
+            errdefer self.freeForeignKeyActionJobRecord(existing);
+            try validateForeignKeyActionJobMatches(existing, action, constraint_name, parent_table, parent_key, updated_parent_key);
+            return existing;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+
+        const record = ForeignKeyActionJobRecord{
+            .job_id = job_id,
+            .action = action,
+            .worker_id = worker_id,
+            .constraint_name = constraint_name,
+            .parent_table = parent_table,
+            .parent_key = parent_key,
+            .updated_parent_key = updated_parent_key,
+            .page_limit = page_limit,
+            .status = "pending",
+            .created_at_ns = now_ns,
+            .updated_at_ns = now_ns,
+            .claimed_at_ns = 0,
+            .lease_until_ns = 0,
+            .attempts = 0,
+            .completed = false,
+            .applied_children = 0,
+            .next_child_table = null,
+            .next_child_key = null,
+            .last_error = null,
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(payload);
+        try self.core.store.put(key, payload);
+        return try self.cloneForeignKeyActionJobRecordFromJson(payload);
+    }
+
+    pub fn scheduleForeignKeyActionSchedule(
+        self: *DB,
+        schedule_id: []const u8,
+        action_job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        page_limit: usize,
+    ) !ForeignKeyActionScheduleRecord {
+        return try self.scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(
+            schedule_id,
+            action_job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            null,
+            page_limit,
+            currentTimeNs(),
+        );
+    }
+
+    pub fn scheduleForeignKeyActionScheduleWithUpdatedParentKey(
+        self: *DB,
+        schedule_id: []const u8,
+        action_job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+    ) !ForeignKeyActionScheduleRecord {
+        return try self.scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(
+            schedule_id,
+            action_job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            updated_parent_key,
+            page_limit,
+            currentTimeNs(),
+        );
+    }
+
+    pub fn scheduleForeignKeyActionScheduleAt(
+        self: *DB,
+        schedule_id: []const u8,
+        action_job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        page_limit: usize,
+        now_ns: u64,
+    ) !ForeignKeyActionScheduleRecord {
+        return try self.scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(
+            schedule_id,
+            action_job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            null,
+            page_limit,
+            now_ns,
+        );
+    }
+
+    pub fn scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(
+        self: *DB,
+        schedule_id: []const u8,
+        action_job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+        now_ns: u64,
+    ) !ForeignKeyActionScheduleRecord {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (schedule_id.len == 0 or action_job_id.len == 0 or page_limit == 0) return error.InvalidForeignKeyActionJob;
+        try validateForeignKeyActionJobIdentity(action_job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyActionScheduleKeyAlloc(self.alloc, schedule_id);
+        defer self.alloc.free(key);
+        if (self.core.store.get(self.alloc, key)) |raw| {
+            defer self.alloc.free(raw);
+            const existing = try self.cloneForeignKeyActionScheduleRecordFromJson(raw);
+            errdefer self.freeForeignKeyActionScheduleRecord(existing);
+            try validateForeignKeyActionScheduleMatches(existing, action_job_id, action, constraint_name, parent_table, parent_key, updated_parent_key);
+            return existing;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+
+        const record = ForeignKeyActionScheduleRecord{
+            .schedule_id = schedule_id,
+            .action_job_id = action_job_id,
+            .action = action,
+            .worker_id = worker_id,
+            .constraint_name = constraint_name,
+            .parent_table = parent_table,
+            .parent_key = parent_key,
+            .updated_parent_key = updated_parent_key,
+            .page_limit = page_limit,
+            .status = "pending",
+            .created_at_ns = now_ns,
+            .updated_at_ns = now_ns,
+            .completed = false,
+            .scheduled_groups = 0,
+            .last_error = null,
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(payload);
+        try self.core.store.put(key, payload);
+        return try self.cloneForeignKeyActionScheduleRecordFromJson(payload);
+    }
+
+    pub fn markForeignKeyActionScheduleSeeded(
+        self: *DB,
+        schedule_id: []const u8,
+        scheduled_groups: u64,
+    ) !ForeignKeyActionScheduleRecord {
+        return try self.markForeignKeyActionScheduleSeededAt(schedule_id, scheduled_groups, currentTimeNs());
+    }
+
+    pub fn markForeignKeyActionScheduleSeededAt(
+        self: *DB,
+        schedule_id: []const u8,
+        scheduled_groups: u64,
+        now_ns: u64,
+    ) !ForeignKeyActionScheduleRecord {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (schedule_id.len == 0) return error.InvalidForeignKeyActionJob;
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyActionScheduleKeyAlloc(self.alloc, schedule_id);
+        defer self.alloc.free(key);
+        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return error.ForeignKeyActionScheduleNotFound,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        const existing = try self.cloneForeignKeyActionScheduleRecordFromJson(raw);
+        defer self.freeForeignKeyActionScheduleRecord(existing);
+        if (existing.completed) return try self.cloneForeignKeyActionScheduleRecordOwned(existing);
+
+        const record = ForeignKeyActionScheduleRecord{
+            .schedule_id = existing.schedule_id,
+            .action_job_id = existing.action_job_id,
+            .action = existing.action,
+            .worker_id = existing.worker_id,
+            .constraint_name = existing.constraint_name,
+            .parent_table = existing.parent_table,
+            .parent_key = existing.parent_key,
+            .updated_parent_key = existing.updated_parent_key,
+            .page_limit = existing.page_limit,
+            .status = if (scheduled_groups == 0) "invalid" else "seeded",
+            .created_at_ns = existing.created_at_ns,
+            .updated_at_ns = now_ns,
+            .completed = scheduled_groups != 0,
+            .scheduled_groups = scheduled_groups,
+            .last_error = if (scheduled_groups == 0) "NoForeignKeyActionOwnerGroups" else null,
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(payload);
+        try self.core.store.put(key, payload);
+        return try self.cloneForeignKeyActionScheduleRecordFromJson(payload);
+    }
+
+    pub fn claimAndRunForeignKeyActionJobPageAt(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        page_limit: usize,
+        lease_ms: u64,
+        now_ns: u64,
+    ) !ForeignKeyActionJobRecord {
+        return try self.claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAt(
+            job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            null,
+            page_limit,
+            lease_ms,
+            now_ns,
+        );
+    }
+
+    pub fn claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAt(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+        lease_ms: u64,
+        now_ns: u64,
+    ) !ForeignKeyActionJobRecord {
+        if (page_limit == 0 or lease_ms == 0) return error.InvalidForeignKeyActionJob;
+        try validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
+
+        const claimed = try self.claimForeignKeyActionJobRecordAt(
+            job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            updated_parent_key,
+            page_limit,
+            lease_ms,
+            now_ns,
+        );
+        defer self.freeForeignKeyActionJobRecord(claimed);
+        if (claimed.completed) return try self.cloneForeignKeyActionJobRecordOwned(claimed);
+
+        return self.runClaimedForeignKeyActionJobPageAt(claimed, action, constraint_name, parent_table, parent_key, page_limit, now_ns) catch |err| {
+            const failed = self.updateForeignKeyActionJobRecordAfterPageAt(
+                claimed,
+                0,
+                false,
+                claimed.next_child_table,
+                claimed.next_child_key,
+                @errorName(err),
+                now_ns +| 1,
+            ) catch null;
+            if (failed) |record| self.freeForeignKeyActionJobRecord(record);
+            return err;
+        };
+    }
+
+    pub fn claimForeignKeyActionJobPage(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        page_limit: usize,
+        lease_ms: u64,
+    ) !ForeignKeyActionJobRecord {
+        return try self.claimForeignKeyActionJobPageAt(
+            job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            page_limit,
+            lease_ms,
+            currentTimeNs(),
+        );
+    }
+
+    pub fn claimForeignKeyActionJobPageAt(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        page_limit: usize,
+        lease_ms: u64,
+        now_ns: u64,
+    ) !ForeignKeyActionJobRecord {
+        return try self.claimForeignKeyActionJobPageWithUpdatedParentKeyAt(
+            job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            null,
+            page_limit,
+            lease_ms,
+            now_ns,
+        );
+    }
+
+    pub fn claimForeignKeyActionJobPageWithUpdatedParentKeyAt(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+        lease_ms: u64,
+        now_ns: u64,
+    ) !ForeignKeyActionJobRecord {
+        return try self.claimForeignKeyActionJobRecordAt(
+            job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            updated_parent_key,
+            page_limit,
+            lease_ms,
+            now_ns,
+        );
+    }
+
+    pub fn finishClaimedForeignKeyActionJobPage(
+        self: *DB,
+        claimed: ForeignKeyActionJobRecord,
+        applied_count: usize,
+        complete: bool,
+        next_child_table: ?[]const u8,
+        next_child_key: ?[]const u8,
+        last_error: ?[]const u8,
+    ) !ForeignKeyActionJobRecord {
+        return try self.finishClaimedForeignKeyActionJobPageAt(
+            claimed,
+            applied_count,
+            complete,
+            next_child_table,
+            next_child_key,
+            last_error,
+            currentTimeNs(),
+        );
+    }
+
+    pub fn finishClaimedForeignKeyActionJobPageAt(
+        self: *DB,
+        claimed: ForeignKeyActionJobRecord,
+        applied_count: usize,
+        complete: bool,
+        next_child_table: ?[]const u8,
+        next_child_key: ?[]const u8,
+        last_error: ?[]const u8,
+        now_ns: u64,
+    ) !ForeignKeyActionJobRecord {
+        return try self.updateForeignKeyActionJobRecordAfterPageAt(
+            claimed,
+            applied_count,
+            complete,
+            next_child_table,
+            next_child_key,
+            last_error,
+            now_ns,
+        );
+    }
+
+    fn runClaimedForeignKeyActionJobPageAt(
+        self: *DB,
+        claimed: ForeignKeyActionJobRecord,
+        action: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        page_limit: usize,
+        now_ns: u64,
+    ) !ForeignKeyActionJobRecord {
+        var page = try self.listForeignKeyRefChildrenPageForParent(
+            self.alloc,
+            constraint_name,
+            parent_table,
+            parent_key,
+            claimed.next_child_table,
+            claimed.next_child_key,
+            page_limit,
+        );
+        defer self.freeForeignKeyRefChildrenPage(self.alloc, &page);
+
+        if (page.children.len > 0) {
+            const txn_id = try self.beginTransaction(now_ns);
+            var txn_open = true;
+            errdefer if (txn_open) self.abortTransaction(txn_id, now_ns +| 1) catch {};
+
+            if (std.mem.eql(u8, action, "set_null")) {
+                const actions = try self.alloc.alloc(types.ForeignKeySetNullChildAction, page.children.len);
+                defer self.alloc.free(actions);
+                for (page.children, 0..) |child, i| {
+                    actions[i] = .{
+                        .constraint_name = constraint_name,
+                        .parent_table = parent_table,
+                        .parent_key = parent_key,
+                        .child_key = child.child_key,
+                    };
+                }
+                try self.writeTransaction(txn_id, .{ .foreign_key_set_null_children = actions });
+            } else if (std.mem.eql(u8, action, "update_set_null")) {
+                const actions = try self.alloc.alloc(types.ForeignKeySetNullChildAction, page.children.len);
+                defer self.alloc.free(actions);
+                for (page.children, 0..) |child, i| {
+                    actions[i] = .{
+                        .constraint_name = constraint_name,
+                        .parent_table = parent_table,
+                        .parent_key = parent_key,
+                        .child_key = child.child_key,
+                        .operation = .update,
+                    };
+                }
+                try self.writeTransaction(txn_id, .{ .foreign_key_set_null_children = actions });
+            } else if (std.mem.eql(u8, action, "cascade")) {
+                const actions = try self.alloc.alloc(types.ForeignKeyCascadeChildAction, page.children.len);
+                defer self.alloc.free(actions);
+                for (page.children, 0..) |child, i| {
+                    actions[i] = .{
+                        .constraint_name = constraint_name,
+                        .parent_table = parent_table,
+                        .parent_key = parent_key,
+                        .child_key = child.child_key,
+                    };
+                }
+                try self.writeTransaction(txn_id, .{ .foreign_key_cascade_children = actions });
+            } else if (std.mem.eql(u8, action, "update_cascade")) {
+                const updated_parent_key = claimed.updated_parent_key orelse return error.InvalidForeignKeyActionJob;
+                const actions = try self.alloc.alloc(types.ForeignKeyCascadeChildAction, page.children.len);
+                defer self.alloc.free(actions);
+                for (page.children, 0..) |child, i| {
+                    actions[i] = .{
+                        .constraint_name = constraint_name,
+                        .parent_table = parent_table,
+                        .parent_key = parent_key,
+                        .updated_parent_key = updated_parent_key,
+                        .child_key = child.child_key,
+                        .operation = .update,
+                    };
+                }
+                try self.writeTransaction(txn_id, .{ .foreign_key_cascade_children = actions });
+            } else {
+                return error.InvalidForeignKeyActionJob;
+            }
+            try self.commitTransaction(txn_id, now_ns +| 1);
+            txn_open = false;
+        }
+
+        return try self.updateForeignKeyActionJobRecordAfterPageAt(
+            claimed,
+            page.children.len,
+            page.complete,
+            page.next_child_table,
+            page.next_child_key,
+            null,
+            now_ns +| 1,
+        );
+    }
+
+    fn claimForeignKeyActionJobRecordAt(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+        lease_ms: u64,
+        now_ns: u64,
+    ) !ForeignKeyActionJobRecord {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (page_limit == 0 or lease_ms == 0) return error.InvalidForeignKeyActionJob;
+        try validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyActionJobKeyAlloc(self.alloc, job_id);
+        defer self.alloc.free(key);
+
+        var created_at_ns = now_ns;
+        var attempts: u32 = 1;
+        var completed = false;
+        var applied_children: u64 = 0;
+        var next_child_table: ?[]const u8 = null;
+        var next_child_key: ?[]const u8 = null;
+        var existing_next_child_table: ?[]u8 = null;
+        var existing_next_child_key: ?[]u8 = null;
+        defer {
+            if (existing_next_child_table) |value| self.alloc.free(value);
+            if (existing_next_child_key) |value| self.alloc.free(value);
+        }
+        if (self.core.store.get(self.alloc, key)) |raw| {
+            defer self.alloc.free(raw);
+            const existing = try self.cloneForeignKeyActionJobRecordFromJson(raw);
+            defer self.freeForeignKeyActionJobRecord(existing);
+            try validateForeignKeyActionJobMatches(existing, action, constraint_name, parent_table, parent_key, updated_parent_key);
+            if (!existing.completed and !std.mem.eql(u8, existing.worker_id, worker_id) and existing.lease_until_ns > now_ns) {
+                return error.ForeignKeyIntegrityClaimBusy;
+            }
+            created_at_ns = existing.created_at_ns;
+            attempts = existing.attempts +| 1;
+            completed = existing.completed;
+            applied_children = existing.applied_children;
+            if (existing.next_child_table) |value| {
+                existing_next_child_table = try self.alloc.dupe(u8, value);
+                next_child_table = existing_next_child_table.?;
+            }
+            if (existing.next_child_key) |value| {
+                existing_next_child_key = try self.alloc.dupe(u8, value);
+                next_child_key = existing_next_child_key.?;
+            }
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+
+        const lease_ns = std.math.mul(u64, lease_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+        const lease_until_ns = now_ns +| lease_ns;
+        const record = ForeignKeyActionJobRecord{
+            .job_id = job_id,
+            .action = action,
+            .worker_id = worker_id,
+            .constraint_name = constraint_name,
+            .parent_table = parent_table,
+            .parent_key = parent_key,
+            .updated_parent_key = updated_parent_key,
+            .page_limit = page_limit,
+            .status = if (completed) "complete" else "claimed",
+            .created_at_ns = created_at_ns,
+            .updated_at_ns = now_ns,
+            .claimed_at_ns = now_ns,
+            .lease_until_ns = lease_until_ns,
+            .attempts = attempts,
+            .completed = completed,
+            .applied_children = applied_children,
+            .next_child_table = next_child_table,
+            .next_child_key = next_child_key,
+            .last_error = null,
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(payload);
+        try self.core.store.put(key, payload);
+        return try self.cloneForeignKeyActionJobRecordFromJson(payload);
+    }
+
+    fn updateForeignKeyActionJobRecordAfterPageAt(
+        self: *DB,
+        existing: ForeignKeyActionJobRecord,
+        applied_count: usize,
+        complete: bool,
+        next_child_table: ?[]const u8,
+        next_child_key: ?[]const u8,
+        last_error: ?[]const u8,
+        now_ns: u64,
+    ) !ForeignKeyActionJobRecord {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyActionJobKeyAlloc(self.alloc, existing.job_id);
+        defer self.alloc.free(key);
+        const current_raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return error.ForeignKeyActionJobNotFound,
+            else => return err,
+        };
+        defer self.alloc.free(current_raw);
+        const current = try self.cloneForeignKeyActionJobRecordFromJson(current_raw);
+        defer self.freeForeignKeyActionJobRecord(current);
+        try validateForeignKeyActionJobMatches(current, existing.action, existing.constraint_name, existing.parent_table, existing.parent_key, existing.updated_parent_key);
+        if (!foreignKeyActionJobClaimsMatch(current, existing)) return error.ForeignKeyIntegrityClaimBusy;
+
+        const record = ForeignKeyActionJobRecord{
+            .job_id = current.job_id,
+            .action = current.action,
+            .worker_id = current.worker_id,
+            .constraint_name = current.constraint_name,
+            .parent_table = current.parent_table,
+            .parent_key = current.parent_key,
+            .updated_parent_key = current.updated_parent_key,
+            .page_limit = current.page_limit,
+            .status = if (last_error != null) "invalid" else if (complete) "complete" else "pending",
+            .created_at_ns = current.created_at_ns,
+            .updated_at_ns = now_ns,
+            .claimed_at_ns = current.claimed_at_ns,
+            .lease_until_ns = current.lease_until_ns,
+            .attempts = current.attempts,
+            .completed = complete and last_error == null,
+            .applied_children = current.applied_children +| @as(u64, @intCast(applied_count)),
+            .next_child_table = if (complete) null else next_child_table,
+            .next_child_key = if (complete) null else next_child_key,
+            .last_error = last_error,
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(payload);
+        try self.core.store.put(key, payload);
+        return try self.cloneForeignKeyActionJobRecordFromJson(payload);
     }
 
     pub fn claimAndRunForeignKeyIntegrityWorkUnit(
@@ -11042,7 +12256,7 @@ pub const DB = struct {
             lower_doc_key,
             upper_doc_key,
             lease_ms,
-            monotonicTimeNs(),
+            currentTimeNs(),
         );
     }
 
@@ -11152,6 +12366,28 @@ pub const DB = struct {
         });
     }
 
+    fn foreignKeyActionJobKeyAlloc(
+        alloc: Allocator,
+        job_id: []const u8,
+    ) ![]u8 {
+        return try std.fmt.allocPrint(alloc, "{s}:{d}:{s}", .{
+            foreign_key_action_job_key_prefix,
+            job_id.len,
+            job_id,
+        });
+    }
+
+    fn foreignKeyActionScheduleKeyAlloc(
+        alloc: Allocator,
+        schedule_id: []const u8,
+    ) ![]u8 {
+        return try std.fmt.allocPrint(alloc, "{s}:{d}:{s}", .{
+            foreign_key_action_schedule_key_prefix,
+            schedule_id.len,
+            schedule_id,
+        });
+    }
+
     fn uniqueConstraintIntegrityProgressKeyAlloc(
         alloc: Allocator,
         mode: relational_store_mod.ForeignKeyIntegrityMode,
@@ -11228,6 +12464,10 @@ pub const DB = struct {
             .violation_samples_json = &.{},
             .violation_sample_count = parsed.value.violation_sample_count,
             .violations_truncated = parsed.value.violations_truncated,
+            .diagnostic_passes = parsed.value.diagnostic_passes,
+            .violating_passes = parsed.value.violating_passes,
+            .first_violation_at_ns = parsed.value.first_violation_at_ns,
+            .last_violation_at_ns = parsed.value.last_violation_at_ns,
         };
         errdefer self.freeForeignKeyIntegrityJobRecord(cloned);
         cloned.job_id = try self.alloc.dupe(u8, parsed.value.job_id);
@@ -11239,6 +12479,101 @@ pub const DB = struct {
         cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
         cloned.status = try self.alloc.dupe(u8, parsed.value.status);
         cloned.violation_samples_json = try self.alloc.dupe(u8, parsed.value.violation_samples_json);
+        return cloned;
+    }
+
+    fn cloneForeignKeyActionJobRecordFromJson(self: *DB, raw: []const u8) !ForeignKeyActionJobRecord {
+        var parsed = try std.json.parseFromSlice(ForeignKeyActionJobRecord, self.alloc, raw, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        var cloned = ForeignKeyActionJobRecord{
+            .version = parsed.value.version,
+            .job_id = &.{},
+            .action = &.{},
+            .worker_id = &.{},
+            .constraint_name = &.{},
+            .parent_table = &.{},
+            .parent_key = &.{},
+            .updated_parent_key = null,
+            .page_limit = parsed.value.page_limit,
+            .status = &.{},
+            .created_at_ns = parsed.value.created_at_ns,
+            .updated_at_ns = parsed.value.updated_at_ns,
+            .claimed_at_ns = parsed.value.claimed_at_ns,
+            .lease_until_ns = parsed.value.lease_until_ns,
+            .attempts = parsed.value.attempts,
+            .completed = parsed.value.completed,
+            .applied_children = parsed.value.applied_children,
+            .next_child_table = null,
+            .next_child_key = null,
+            .last_error = null,
+        };
+        errdefer self.freeForeignKeyActionJobRecord(cloned);
+        cloned.job_id = try self.alloc.dupe(u8, parsed.value.job_id);
+        cloned.action = try self.alloc.dupe(u8, parsed.value.action);
+        cloned.worker_id = try self.alloc.dupe(u8, parsed.value.worker_id);
+        cloned.constraint_name = try self.alloc.dupe(u8, parsed.value.constraint_name);
+        cloned.parent_table = try self.alloc.dupe(u8, parsed.value.parent_table);
+        cloned.parent_key = try self.alloc.dupe(u8, parsed.value.parent_key);
+        if (parsed.value.updated_parent_key) |value| cloned.updated_parent_key = try self.alloc.dupe(u8, value);
+        cloned.status = try self.alloc.dupe(u8, parsed.value.status);
+        if (parsed.value.next_child_table) |value| cloned.next_child_table = try self.alloc.dupe(u8, value);
+        if (parsed.value.next_child_key) |value| cloned.next_child_key = try self.alloc.dupe(u8, value);
+        if (parsed.value.last_error) |value| cloned.last_error = try self.alloc.dupe(u8, value);
+        return cloned;
+    }
+
+    fn cloneForeignKeyActionJobRecordOwned(self: *DB, record: ForeignKeyActionJobRecord) !ForeignKeyActionJobRecord {
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(payload);
+        return try self.cloneForeignKeyActionJobRecordFromJson(payload);
+    }
+
+    fn cloneForeignKeyActionScheduleRecordOwned(self: *DB, record: ForeignKeyActionScheduleRecord) !ForeignKeyActionScheduleRecord {
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(payload);
+        return try self.cloneForeignKeyActionScheduleRecordFromJson(payload);
+    }
+
+    fn cloneForeignKeyActionScheduleRecordFromJson(self: *DB, raw: []const u8) !ForeignKeyActionScheduleRecord {
+        var parsed = try std.json.parseFromSlice(ForeignKeyActionScheduleRecord, self.alloc, raw, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        var cloned = ForeignKeyActionScheduleRecord{
+            .version = parsed.value.version,
+            .schedule_id = &.{},
+            .action_job_id = &.{},
+            .action = &.{},
+            .worker_id = &.{},
+            .constraint_name = &.{},
+            .parent_table = &.{},
+            .parent_key = &.{},
+            .updated_parent_key = null,
+            .page_limit = parsed.value.page_limit,
+            .status = &.{},
+            .created_at_ns = parsed.value.created_at_ns,
+            .updated_at_ns = parsed.value.updated_at_ns,
+            .completed = parsed.value.completed,
+            .scheduled_groups = parsed.value.scheduled_groups,
+            .last_error = null,
+        };
+        errdefer self.freeForeignKeyActionScheduleRecord(cloned);
+        cloned.schedule_id = try self.alloc.dupe(u8, parsed.value.schedule_id);
+        cloned.action_job_id = try self.alloc.dupe(u8, parsed.value.action_job_id);
+        cloned.action = try self.alloc.dupe(u8, parsed.value.action);
+        cloned.worker_id = try self.alloc.dupe(u8, parsed.value.worker_id);
+        cloned.constraint_name = try self.alloc.dupe(u8, parsed.value.constraint_name);
+        cloned.parent_table = try self.alloc.dupe(u8, parsed.value.parent_table);
+        cloned.parent_key = try self.alloc.dupe(u8, parsed.value.parent_key);
+        if (parsed.value.updated_parent_key) |value| cloned.updated_parent_key = try self.alloc.dupe(u8, value);
+        cloned.status = try self.alloc.dupe(u8, parsed.value.status);
+        if (parsed.value.last_error) |value| cloned.last_error = try self.alloc.dupe(u8, value);
         return cloned;
     }
 
@@ -11265,6 +12600,92 @@ pub const DB = struct {
         };
     }
 
+    fn foreignKeyActionJobActionSupported(action: []const u8) bool {
+        return std.mem.eql(u8, action, "set_null") or
+            std.mem.eql(u8, action, "cascade") or
+            std.mem.eql(u8, action, "update_set_null") or
+            std.mem.eql(u8, action, "update_cascade");
+    }
+
+    fn foreignKeyActionJobIsUpdate(action: []const u8) bool {
+        return std.mem.eql(u8, action, "update_set_null") or std.mem.eql(u8, action, "update_cascade");
+    }
+
+    fn foreignKeyActionUpdatedParentKeyMatches(existing: ?[]const u8, expected: ?[]const u8) bool {
+        if (existing) |existing_value| {
+            const expected_value = expected orelse return false;
+            return std.mem.eql(u8, existing_value, expected_value);
+        }
+        return expected == null;
+    }
+
+    fn validateForeignKeyActionJobIdentity(
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+    ) !void {
+        if (job_id.len == 0 or action.len == 0 or worker_id.len == 0 or constraint_name.len == 0 or parent_table.len == 0 or parent_key.len == 0) {
+            return error.InvalidForeignKeyActionJob;
+        }
+        if (!foreignKeyActionJobActionSupported(action)) return error.InvalidForeignKeyActionJob;
+        if (std.mem.eql(u8, action, "update_cascade")) {
+            if (updated_parent_key == null or updated_parent_key.?.len == 0) return error.InvalidForeignKeyActionJob;
+        } else if (!foreignKeyActionJobIsUpdate(action) and updated_parent_key != null) {
+            return error.InvalidForeignKeyActionJob;
+        }
+    }
+
+    fn validateForeignKeyActionJobMatches(
+        existing: ForeignKeyActionJobRecord,
+        action: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+    ) !void {
+        if (!std.mem.eql(u8, existing.action, action) or
+            !std.mem.eql(u8, existing.constraint_name, constraint_name) or
+            !std.mem.eql(u8, existing.parent_table, parent_table) or
+            !std.mem.eql(u8, existing.parent_key, parent_key) or
+            !foreignKeyActionUpdatedParentKeyMatches(existing.updated_parent_key, updated_parent_key))
+        {
+            return error.InvalidForeignKeyActionJob;
+        }
+    }
+
+    fn foreignKeyActionJobClaimsMatch(current: ForeignKeyActionJobRecord, claimed: ForeignKeyActionJobRecord) bool {
+        return !current.completed and
+            std.mem.eql(u8, current.status, "claimed") and
+            std.mem.eql(u8, current.worker_id, claimed.worker_id) and
+            current.claimed_at_ns == claimed.claimed_at_ns and
+            current.lease_until_ns == claimed.lease_until_ns and
+            current.attempts == claimed.attempts;
+    }
+
+    fn validateForeignKeyActionScheduleMatches(
+        existing: ForeignKeyActionScheduleRecord,
+        action_job_id: []const u8,
+        action: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+    ) !void {
+        if (!std.mem.eql(u8, existing.action_job_id, action_job_id) or
+            !std.mem.eql(u8, existing.action, action) or
+            !std.mem.eql(u8, existing.constraint_name, constraint_name) or
+            !std.mem.eql(u8, existing.parent_table, parent_table) or
+            !std.mem.eql(u8, existing.parent_key, parent_key) or
+            !foreignKeyActionUpdatedParentKeyMatches(existing.updated_parent_key, updated_parent_key))
+        {
+            return error.InvalidForeignKeyActionJob;
+        }
+    }
+
     fn foreignKeyIntegrityProgressValid(
         mode: relational_store_mod.ForeignKeyIntegrityMode,
         report: relational_store_mod.ForeignKeyIntegrityReport,
@@ -11273,6 +12694,17 @@ pub const DB = struct {
             .validate, .dry_run => report.valid(),
             .repair => report.missing_parent_rows == 0,
         };
+    }
+
+    fn foreignKeyIntegrityReportHasViolations(report: relational_store_mod.ForeignKeyIntegrityReport) bool {
+        return report.missing_parent_rows != 0 or
+            report.missing_ref_rows != 0 or
+            report.stale_ref_rows != 0;
+    }
+
+    fn foreignKeyIntegrityFirstViolationAt(existing: ?u64, pass_has_violations: bool, now_ns: u64) ?u64 {
+        if (existing) |timestamp| return timestamp;
+        return if (pass_has_violations) now_ns else null;
     }
 
     fn uniqueConstraintIntegrityProgressValid(
@@ -15139,6 +16571,10 @@ fn isMetadataKey(key: []const u8) bool {
         internal_keys.isTtlKey(key);
 }
 
+fn isForeignKeyActionScheduleMetadataKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, foreign_key_action_schedule_key_prefix);
+}
+
 fn isBaseDocumentStoreKeyForMode(relational_base_rows: bool, key: []const u8) bool {
     return if (relational_base_rows)
         internal_keys.isRelationalRowKey(key)
@@ -17072,8 +18508,39 @@ fn foreignKeyParentChecksExternalizedIntentKeyAlloc(alloc: Allocator, txn_id: tr
     return key;
 }
 
+fn foreignKeyExternalizedParentCheckIntentKeyAlloc(alloc: Allocator, txn_id: transactions_mod.TxnId, check: types.ForeignKeyParentCheck) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, foreign_key_externalized_parent_check_intent_key_prefix);
+    try appendHexBytes(alloc, &out, txn_id[0..]);
+    try appendHexField(alloc, &out, check.constraint_name);
+    try appendHexField(alloc, &out, check.child_table);
+    try appendHexField(alloc, &out, check.child_key);
+    try appendHexField(alloc, &out, check.parent_table);
+    try appendHexField(alloc, &out, check.parent_key);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendHexField(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    try out.append(alloc, ':');
+    try appendHexBytes(alloc, out, value);
+}
+
+fn appendHexBytes(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const hex = "0123456789abcdef";
+    try out.ensureUnusedCapacity(alloc, value.len * 2);
+    for (value) |byte| {
+        out.appendAssumeCapacity(hex[byte >> 4]);
+        out.appendAssumeCapacity(hex[byte & 0x0f]);
+    }
+}
+
 fn isForeignKeyParentChecksExternalizedIntentKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, foreign_key_parent_checks_externalized_intent_key_prefix);
+}
+
+fn isForeignKeyExternalizedParentCheckIntentKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, foreign_key_externalized_parent_check_intent_key_prefix);
 }
 
 fn transactionMutationsHaveForeignKeyParentChecksExternalizedMarker(mutations: []const transactions_mod.OwnedIntentMutation) bool {
@@ -17081,6 +18548,124 @@ fn transactionMutationsHaveForeignKeyParentChecksExternalizedMarker(mutations: [
         if (mutation.value != null and isForeignKeyParentChecksExternalizedIntentKey(mutation.key)) return true;
     }
     return false;
+}
+
+fn encodeForeignKeyExternalizedParentCheckIntentValueAlloc(alloc: Allocator, check: types.ForeignKeyParentCheck) ![]u8 {
+    const timing = switch (check.timing) {
+        .immediate => "immediate",
+        .deferred => "deferred",
+    };
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    const prefix = try std.fmt.allocPrint(
+        alloc,
+        "{{\"constraint_name\":{f},\"child_table\":{f},\"child_key\":{f},\"parent_table\":{f},\"parent_key\":{f},\"timing\":{f}",
+        .{
+            std.json.fmt(check.constraint_name, .{}),
+            std.json.fmt(check.child_table, .{}),
+            std.json.fmt(check.child_key, .{}),
+            std.json.fmt(check.parent_table, .{}),
+            std.json.fmt(check.parent_key, .{}),
+            std.json.fmt(timing, .{}),
+        },
+    );
+    defer alloc.free(prefix);
+    try out.appendSlice(alloc, prefix);
+    if (check.parent_constraint_name) |name| {
+        const encoded = try std.fmt.allocPrint(alloc, ",\"parent_constraint_name\":{f}", .{std.json.fmt(name, .{})});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn collectTransactionExternalizedForeignKeyParentChecksAlloc(
+    alloc: Allocator,
+    mutations: []const transactions_mod.OwnedIntentMutation,
+    skip_keys: *std.ArrayListUnmanaged([]const u8),
+) ![]relational_store_mod.ExternalizedForeignKeyParentCheck {
+    var out = std.ArrayListUnmanaged(relational_store_mod.ExternalizedForeignKeyParentCheck).empty;
+    errdefer {
+        for (out.items) |*check| freeExternalizedForeignKeyParentCheck(alloc, check);
+        out.deinit(alloc);
+    }
+    for (mutations) |mutation| {
+        if (!isForeignKeyExternalizedParentCheckIntentKey(mutation.key)) continue;
+        const raw = mutation.value orelse continue;
+        const check = try parseForeignKeyExternalizedParentCheckIntentValueAlloc(alloc, raw);
+        var check_owned = true;
+        errdefer if (check_owned) {
+            var owned = check;
+            freeExternalizedForeignKeyParentCheck(alloc, &owned);
+        };
+        const skip_key = try alloc.dupe(u8, mutation.key);
+        var skip_key_owned = true;
+        errdefer if (skip_key_owned) alloc.free(skip_key);
+        try skip_keys.append(alloc, skip_key);
+        skip_key_owned = false;
+        try out.append(alloc, check);
+        check_owned = false;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn parseForeignKeyExternalizedParentCheckIntentValueAlloc(alloc: Allocator, raw: []const u8) !relational_store_mod.ExternalizedForeignKeyParentCheck {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.ForeignKeyViolation,
+    };
+    const timing = jsonObjectString(obj, "timing") orelse return error.ForeignKeyViolation;
+    if (!std.mem.eql(u8, timing, "deferred") and !std.mem.eql(u8, timing, "immediate")) return error.ForeignKeyViolation;
+    const constraint_name = try alloc.dupe(u8, jsonObjectString(obj, "constraint_name") orelse return error.ForeignKeyViolation);
+    errdefer alloc.free(constraint_name);
+    const child_table = try alloc.dupe(u8, jsonObjectString(obj, "child_table") orelse return error.ForeignKeyViolation);
+    errdefer alloc.free(child_table);
+    const child_key = try alloc.dupe(u8, jsonObjectString(obj, "child_key") orelse return error.ForeignKeyViolation);
+    errdefer alloc.free(child_key);
+    const parent_table = try alloc.dupe(u8, jsonObjectString(obj, "parent_table") orelse return error.ForeignKeyViolation);
+    errdefer alloc.free(parent_table);
+    const parent_key = try alloc.dupe(u8, jsonObjectString(obj, "parent_key") orelse return error.ForeignKeyViolation);
+    errdefer alloc.free(parent_key);
+    const parent_constraint_name = if (jsonObjectString(obj, "parent_constraint_name")) |name|
+        try alloc.dupe(u8, name)
+    else
+        null;
+    errdefer if (parent_constraint_name) |name| alloc.free(name);
+    return .{
+        .constraint_name = constraint_name,
+        .child_table = child_table,
+        .child_key = child_key,
+        .parent_table = parent_table,
+        .parent_key = parent_key,
+        .parent_constraint_name = parent_constraint_name,
+        .timing = if (std.mem.eql(u8, timing, "deferred")) .deferred else .immediate,
+    };
+}
+
+fn jsonObjectString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn freeExternalizedForeignKeyParentChecks(alloc: Allocator, checks: []relational_store_mod.ExternalizedForeignKeyParentCheck) void {
+    for (checks) |*check| freeExternalizedForeignKeyParentCheck(alloc, check);
+    if (checks.len > 0) alloc.free(checks);
+}
+
+fn freeExternalizedForeignKeyParentCheck(alloc: Allocator, check: *relational_store_mod.ExternalizedForeignKeyParentCheck) void {
+    alloc.free(@constCast(check.constraint_name));
+    alloc.free(@constCast(check.child_table));
+    alloc.free(@constCast(check.child_key));
+    alloc.free(@constCast(check.parent_table));
+    alloc.free(@constCast(check.parent_key));
+    if (check.parent_constraint_name) |name| alloc.free(@constCast(name));
+    check.* = undefined;
 }
 
 fn shouldWriteTimestamp(key: []const u8) bool {
@@ -43066,6 +44651,42 @@ test "db relational foreign keys enforce parent existence and restrict deletes" 
     try std.testing.expectEqual(@as(u64, 2), stats.foreign_keys.repaired_ref_rows);
 }
 
+test "db relational foreign keys no_action preserves action and blocks parent deletes" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"no_action"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+    try std.testing.expectEqual(schema_mod.ForeignKeyAction.no_action, runtime_schema.foreign_keys[0].on_delete);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:no-action", .value = "{\"id\":\"customer:no-action\"}" },
+            .{ .key = "order:no-action", .value = "{\"id\":\"order:no-action\",\"customer_id\":\"customer:no-action\"}" },
+        },
+    });
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"customer:no-action"},
+    }));
+
+    try db.batch(.{ .deletes = &.{ "order:no-action", "customer:no-action" } });
+    try std.testing.expect((try db.get(alloc, "customer:no-action")) == null);
+}
+
 test "db foreign key integrity progress is durable per range" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -43260,6 +44881,440 @@ test "db foreign key integrity work claims are leased and durable" {
     try std.testing.expectEqual(@as(u32, 3), persisted.attempts);
 }
 
+test "db foreign key maintenance leases use durable realtime clock" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const before_claim_ns = currentTimeNs();
+    const claim = try db.claimForeignKeyIntegrityWorkUnit(
+        "claim:realtime",
+        "worker:realtime",
+        17,
+        "child_range",
+        "validate",
+        "orders_customer_id_fkey",
+        "",
+        "",
+        60_000,
+    );
+    defer db.freeForeignKeyIntegrityClaimRecord(claim);
+    try std.testing.expect(claim.claimed_at_ns >= before_claim_ns);
+    try std.testing.expect(claim.lease_until_ns > currentTimeNs());
+
+    const before_action_ns = currentTimeNs();
+    const action = try db.scheduleForeignKeyActionJob(
+        "fk-action:realtime",
+        "set_null",
+        "worker:realtime",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:realtime",
+        16,
+    );
+    defer db.freeForeignKeyActionJobRecord(action);
+    try std.testing.expect(action.created_at_ns >= before_action_ns);
+    try std.testing.expectEqual(@as(u64, 0), action.lease_until_ns);
+
+    const before_action_claim_ns = currentTimeNs();
+    const claimed_action = try db.claimAndRunForeignKeyActionJobPage(
+        "fk-action:realtime:claim",
+        "set_null",
+        "worker:realtime",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:realtime",
+        16,
+        60_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(claimed_action);
+    try std.testing.expect(claimed_action.claimed_at_ns >= before_action_claim_ns);
+    try std.testing.expect(claimed_action.lease_until_ns > currentTimeNs());
+}
+
+test "db foreign key action job applies set-null children in durable pages" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"set_null"}]}
+        ;
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "customer:wide-job", .value = "{\"id\":\"customer:wide-job\"}" },
+                .{ .key = "order:wide-job:1", .value = "{\"id\":\"order:wide-job:1\",\"customer_id\":\"customer:wide-job\",\"status\":\"open\"}" },
+                .{ .key = "order:wide-job:2", .value = "{\"id\":\"order:wide-job:2\",\"customer_id\":\"customer:wide-job\",\"status\":\"open\"}" },
+                .{ .key = "order:wide-job:3", .value = "{\"id\":\"order:wide-job:3\",\"customer_id\":\"customer:wide-job\",\"status\":\"open\"}" },
+            },
+        });
+
+        const scheduled = try db.scheduleForeignKeyActionJobAt(
+            "fk-action:set-null:customer-wide-job",
+            "set_null",
+            "worker:fk-action:scheduler",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:wide-job",
+            2,
+            100_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(scheduled);
+        try std.testing.expectEqualStrings("pending", scheduled.status);
+        try std.testing.expect(!scheduled.completed);
+        try std.testing.expectEqual(@as(u32, 0), scheduled.attempts);
+        try std.testing.expectEqual(@as(u64, 0), scheduled.claimed_at_ns);
+        try std.testing.expectEqual(@as(u64, 0), scheduled.lease_until_ns);
+
+        const scheduled_again = try db.scheduleForeignKeyActionJobAt(
+            "fk-action:set-null:customer-wide-job",
+            "set_null",
+            "worker:fk-action:scheduler",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:wide-job",
+            2,
+            150_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(scheduled_again);
+        try std.testing.expectEqualStrings("pending", scheduled_again.status);
+        try std.testing.expectEqual(@as(u64, scheduled.created_at_ns), scheduled_again.created_at_ns);
+
+        const first = try db.claimAndRunForeignKeyActionJobPageAt(
+            "fk-action:set-null:customer-wide-job",
+            "set_null",
+            "worker:fk-action:a",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:wide-job",
+            2,
+            1,
+            200_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(first);
+        try std.testing.expectEqualStrings("pending", first.status);
+        try std.testing.expect(!first.completed);
+        try std.testing.expectEqual(@as(u64, 2), first.applied_children);
+        try std.testing.expect(first.next_child_table != null);
+        try std.testing.expect(first.next_child_key != null);
+
+        const row_one = (try db.get(alloc, "order:wide-job:1")) orelse return error.TestExpectedEqual;
+        defer alloc.free(row_one);
+        const row_two = (try db.get(alloc, "order:wide-job:2")) orelse return error.TestExpectedEqual;
+        defer alloc.free(row_two);
+        const row_three = (try db.get(alloc, "order:wide-job:3")) orelse return error.TestExpectedEqual;
+        defer alloc.free(row_three);
+        try std.testing.expect(std.mem.indexOf(u8, row_one, "customer_id") == null);
+        try std.testing.expect(std.mem.indexOf(u8, row_two, "customer_id") == null);
+        try std.testing.expect(std.mem.indexOf(u8, row_three, "\"customer_id\":\"customer:wide-job\"") != null);
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const loaded = (try db.loadForeignKeyActionJobRecord("fk-action:set-null:customer-wide-job")) orelse return error.TestExpectedEqual;
+        defer db.freeForeignKeyActionJobRecord(loaded);
+        try std.testing.expectEqualStrings("pending", loaded.status);
+        try std.testing.expectEqual(@as(u64, 2), loaded.applied_children);
+        try std.testing.expect(loaded.next_child_table != null);
+        try std.testing.expect(loaded.next_child_key != null);
+
+        const second = try db.claimAndRunForeignKeyActionJobPageAt(
+            "fk-action:set-null:customer-wide-job",
+            "set_null",
+            "worker:fk-action:b",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:wide-job",
+            2,
+            1,
+            2_000_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(second);
+        try std.testing.expectEqualStrings("complete", second.status);
+        try std.testing.expect(second.completed);
+        try std.testing.expectEqual(@as(u64, 3), second.applied_children);
+        try std.testing.expect(second.next_child_table == null);
+        try std.testing.expect(second.next_child_key == null);
+
+        const row_three = (try db.get(alloc, "order:wide-job:3")) orelse return error.TestExpectedEqual;
+        defer alloc.free(row_three);
+        try std.testing.expect(std.mem.indexOf(u8, row_three, "customer_id") == null);
+    }
+}
+
+test "db foreign key action job rejects stale page finish after lease handoff" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const scheduled = try db.scheduleForeignKeyActionJobAt(
+        "fk-action:set-null:stale-finish",
+        "set_null",
+        "worker:fk-action:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:stale-finish",
+        2,
+        100_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(scheduled);
+
+    const first_claim = try db.claimForeignKeyActionJobPageAt(
+        "fk-action:set-null:stale-finish",
+        "set_null",
+        "worker:fk-action:a",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:stale-finish",
+        2,
+        1,
+        200_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(first_claim);
+    try std.testing.expectEqualStrings("claimed", first_claim.status);
+    try std.testing.expectEqual(@as(u32, 1), first_claim.attempts);
+
+    const second_claim = try db.claimForeignKeyActionJobPageAt(
+        "fk-action:set-null:stale-finish",
+        "set_null",
+        "worker:fk-action:b",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:stale-finish",
+        2,
+        60_000,
+        first_claim.lease_until_ns +| 1,
+    );
+    defer db.freeForeignKeyActionJobRecord(second_claim);
+    try std.testing.expectEqualStrings("claimed", second_claim.status);
+    try std.testing.expectEqualStrings("worker:fk-action:b", second_claim.worker_id);
+    try std.testing.expectEqual(@as(u32, 2), second_claim.attempts);
+
+    try std.testing.expectError(error.ForeignKeyIntegrityClaimBusy, db.finishClaimedForeignKeyActionJobPageAt(
+        first_claim,
+        1,
+        false,
+        "row",
+        "order:stale",
+        null,
+        second_claim.claimed_at_ns +| 1,
+    ));
+
+    const loaded = (try db.loadForeignKeyActionJobRecord("fk-action:set-null:stale-finish")) orelse return error.TestExpectedEqual;
+    defer db.freeForeignKeyActionJobRecord(loaded);
+    try std.testing.expectEqualStrings("claimed", loaded.status);
+    try std.testing.expectEqualStrings("worker:fk-action:b", loaded.worker_id);
+    try std.testing.expectEqual(@as(u32, 2), loaded.attempts);
+    try std.testing.expectEqual(@as(u64, 0), loaded.applied_children);
+    try std.testing.expect(loaded.next_child_table == null);
+    try std.testing.expect(loaded.next_child_key == null);
+
+    const finished = try db.finishClaimedForeignKeyActionJobPageAt(
+        second_claim,
+        1,
+        false,
+        "row",
+        "order:cursor",
+        null,
+        second_claim.claimed_at_ns +| 2,
+    );
+    defer db.freeForeignKeyActionJobRecord(finished);
+    try std.testing.expectEqualStrings("pending", finished.status);
+    try std.testing.expectEqual(@as(u64, 1), finished.applied_children);
+    try std.testing.expect(finished.next_child_table != null);
+    try std.testing.expectEqualStrings("row", finished.next_child_table.?);
+    try std.testing.expect(finished.next_child_key != null);
+    try std.testing.expectEqualStrings("order:cursor", finished.next_child_key.?);
+}
+
+test "db transaction writes durable foreign key action schedules atomically" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const txn_id = try db.beginTransaction(31_000);
+    try db.writeTransaction(txn_id, .{
+        .foreign_key_action_schedules = &.{.{
+            .schedule_id = "fk-action-schedule:orders:customers:customer:txn",
+            .action_job_id = "fk-action:orders:customers:customer:txn",
+            .action = "set_null",
+            .worker_id = "worker:txn",
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:txn",
+            .page_limit = 128,
+        }},
+    });
+
+    try std.testing.expect((try db.loadForeignKeyActionScheduleRecord("fk-action-schedule:orders:customers:customer:txn")) == null);
+    try db.commitTransaction(txn_id, 31_001);
+
+    const loaded = (try db.loadForeignKeyActionScheduleRecord("fk-action-schedule:orders:customers:customer:txn")) orelse return error.TestExpectedEqual;
+    defer db.freeForeignKeyActionScheduleRecord(loaded);
+    try std.testing.expectEqualStrings("fk-action:orders:customers:customer:txn", loaded.action_job_id);
+    try std.testing.expectEqualStrings("set_null", loaded.action);
+    try std.testing.expectEqualStrings("worker:txn", loaded.worker_id);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", loaded.constraint_name);
+    try std.testing.expectEqualStrings("customers", loaded.parent_table);
+    try std.testing.expectEqualStrings("customer:txn", loaded.parent_key);
+    try std.testing.expectEqual(@as(usize, 128), loaded.page_limit);
+    try std.testing.expectEqualStrings("pending", loaded.status);
+    try std.testing.expect(!loaded.completed);
+
+    const retry_txn = try db.beginTransaction(31_010);
+    try db.writeTransaction(retry_txn, .{
+        .foreign_key_action_schedules = &.{.{
+            .schedule_id = "fk-action-schedule:orders:customers:customer:txn",
+            .action_job_id = "fk-action:orders:customers:customer:txn",
+            .action = "set_null",
+            .worker_id = "worker:txn",
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:txn",
+            .page_limit = 128,
+        }},
+    });
+    try db.commitTransaction(retry_txn, 31_011);
+
+    const conflicting_txn = try db.beginTransaction(31_020);
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.writeTransaction(conflicting_txn, .{
+        .foreign_key_action_schedules = &.{.{
+            .schedule_id = "fk-action-schedule:orders:customers:customer:txn",
+            .action_job_id = "fk-action:orders:customers:customer:other",
+            .action = "cascade",
+            .worker_id = "worker:txn",
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:txn",
+            .page_limit = 128,
+        }},
+    }));
+}
+
+test "db foreign key action schedule records zero-owner seed failures durably" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const scheduled = try db.scheduleForeignKeyActionSchedule(
+        "fk-action-schedule:set-null:no-owners",
+        "fk-action:set-null:no-owners",
+        "set_null",
+        "worker:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:no-owners",
+        128,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(scheduled);
+
+    const failed = try db.markForeignKeyActionScheduleSeededAt(
+        "fk-action-schedule:set-null:no-owners",
+        0,
+        32_000,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(failed);
+    try std.testing.expectEqualStrings("invalid", failed.status);
+    try std.testing.expect(!failed.completed);
+    try std.testing.expectEqual(@as(u64, 0), failed.scheduled_groups);
+    try std.testing.expect(failed.last_error != null);
+    try std.testing.expectEqualStrings("NoForeignKeyActionOwnerGroups", failed.last_error.?);
+
+    const retried = try db.markForeignKeyActionScheduleSeededAt(
+        "fk-action-schedule:set-null:no-owners",
+        2,
+        32_001,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(retried);
+    try std.testing.expectEqualStrings("seeded", retried.status);
+    try std.testing.expect(retried.completed);
+    try std.testing.expectEqual(@as(u64, 2), retried.scheduled_groups);
+    try std.testing.expect(retried.last_error == null);
+}
+
+test "db foreign key action job records page execution failures" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"set_null"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:bad-action", .value = "{\"id\":\"customer:bad-action\"}" },
+            .{ .key = "order:bad-action", .value = "{\"id\":\"order:bad-action\",\"customer_id\":\"customer:bad-action\",\"status\":\"open\"}" },
+        },
+    });
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.claimAndRunForeignKeyActionJobPageAt(
+        "fk-action:cascade:set-null-schema",
+        "cascade",
+        "worker:fk-action:bad",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:bad-action",
+        8,
+        60_000,
+        300_000,
+    ));
+
+    const failed = (try db.loadForeignKeyActionJobRecord("fk-action:cascade:set-null-schema")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyActionJobRecord(failed);
+    try std.testing.expectEqualStrings("invalid", failed.status);
+    try std.testing.expect(!failed.completed);
+    try std.testing.expectEqual(@as(u64, 0), failed.applied_children);
+    try std.testing.expect(failed.last_error != null);
+    try std.testing.expectEqualStrings("ForeignKeyViolation", failed.last_error.?);
+}
+
 test "db foreign key integrity job records persist intent and completion" {
     const alloc = std.testing.allocator;
 
@@ -43303,6 +45358,10 @@ test "db foreign key integrity job records persist intent and completion" {
         try std.testing.expectEqualStrings("[]", created.violation_samples_json);
         try std.testing.expectEqual(@as(usize, 0), created.violation_sample_count);
         try std.testing.expect(!created.violations_truncated);
+        try std.testing.expectEqual(@as(u64, 0), created.diagnostic_passes);
+        try std.testing.expectEqual(@as(u64, 0), created.violating_passes);
+        try std.testing.expect(created.first_violation_at_ns == null);
+        try std.testing.expect(created.last_violation_at_ns == null);
 
         const resumed = try db.upsertForeignKeyIntegrityJobRecordAt(
             "job:fk:orders:validate",
@@ -43336,6 +45395,10 @@ test "db foreign key integrity job records persist intent and completion" {
         try std.testing.expectEqualStrings("[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]", diagnosed.violation_samples_json);
         try std.testing.expectEqual(@as(usize, 1), diagnosed.violation_sample_count);
         try std.testing.expect(diagnosed.violations_truncated);
+        try std.testing.expectEqual(@as(u64, 1), diagnosed.diagnostic_passes);
+        try std.testing.expectEqual(@as(u64, 1), diagnosed.violating_passes);
+        try std.testing.expectEqual(@as(u64, 25_000), diagnosed.first_violation_at_ns.?);
+        try std.testing.expectEqual(@as(u64, 25_000), diagnosed.last_violation_at_ns.?);
 
         const completed = try db.completeForeignKeyIntegrityJobRecordAt(
             "job:fk:orders:validate",
@@ -43352,6 +45415,10 @@ test "db foreign key integrity job records persist intent and completion" {
         try std.testing.expectEqualStrings("[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]", completed.violation_samples_json);
         try std.testing.expectEqual(@as(usize, 1), completed.violation_sample_count);
         try std.testing.expect(completed.violations_truncated);
+        try std.testing.expectEqual(@as(u64, 1), completed.diagnostic_passes);
+        try std.testing.expectEqual(@as(u64, 1), completed.violating_passes);
+        try std.testing.expectEqual(@as(u64, 25_000), completed.first_violation_at_ns.?);
+        try std.testing.expectEqual(@as(u64, 25_000), completed.last_violation_at_ns.?);
 
         const all = try db.listForeignKeyIntegrityJobRecords();
         defer db.freeForeignKeyIntegrityJobRecords(all);
@@ -43371,6 +45438,10 @@ test "db foreign key integrity job records persist intent and completion" {
     try std.testing.expectEqualStrings("[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]", persisted.violation_samples_json);
     try std.testing.expectEqual(@as(usize, 1), persisted.violation_sample_count);
     try std.testing.expect(persisted.violations_truncated);
+    try std.testing.expectEqual(@as(u64, 1), persisted.diagnostic_passes);
+    try std.testing.expectEqual(@as(u64, 1), persisted.violating_passes);
+    try std.testing.expectEqual(@as(u64, 25_000), persisted.first_violation_at_ns.?);
+    try std.testing.expectEqual(@as(u64, 25_000), persisted.last_violation_at_ns.?);
 }
 
 test "db relational foreign keys setSchema accepts deferred and rejects controller-only states" {
@@ -43499,14 +45570,16 @@ test "db relational foreign keys integrity ignores unvalidated constraints" {
     try std.testing.expectEqual(@as(u64, 0), stats.foreign_keys.repair_runs);
     try std.testing.expectEqual(@as(u64, 0), stats.foreign_keys.scanned_child_rows);
 
-    try std.testing.expectError(
-        error.ForeignKeyNotFound,
-        db.validateForeignKeyRefsInRangeForConstraint("orders_customer_id_fkey", "", ""),
-    );
-    try std.testing.expectError(
-        error.ForeignKeyNotFound,
-        db.listForeignKeyViolationsInRangeForConstraint("orders_customer_id_fkey", "", ""),
-    );
+    const adoption_report = try db.validateForeignKeyRefsInRangeForConstraint("orders_customer_id_fkey", "", "");
+    try std.testing.expect(!adoption_report.valid());
+    try std.testing.expectEqual(@as(u64, 1), adoption_report.scanned_child_rows);
+    try std.testing.expectEqual(@as(u64, 1), adoption_report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 1), adoption_report.missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 1), adoption_report.missing_ref_rows);
+
+    const adoption_violations = try db.listForeignKeyViolationsInRangeForConstraint("orders_customer_id_fkey", "", "");
+    defer db.freeForeignKeyIntegrityViolations(adoption_violations);
+    try std.testing.expectEqual(@as(usize, 2), adoption_violations.len);
 }
 
 test "db relational foreign keys set nullable children null on parent delete" {
@@ -43678,6 +45751,357 @@ test "db relational foreign keys can reference local unique parent columns" {
     try std.testing.expectEqualStrings("diag@example.com", diag_violations[0].parent_values[0].value);
     try std.testing.expect(diag_violations[0].observed_parent_key == null);
     try std.testing.expectEqual(@as(usize, 0), diag_violations[0].observed_parent_values.len);
+}
+
+test "db relational foreign key on update stays restrictive when delete cascades" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_delete":"cascade","on_update":"no_action"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+    try std.testing.expectEqual(schema_mod.ForeignKeyAction.cascade, runtime_schema.foreign_keys[0].on_delete);
+    try std.testing.expectEqual(schema_mod.ForeignKeyAction.no_action, runtime_schema.foreign_keys[0].on_update);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"parent@example.com\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"parent@example.com\"}" },
+        },
+    });
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"updated@example.com\"}" }},
+    }));
+
+    try db.batch(.{ .deletes = &.{"user:parent"} });
+    try std.testing.expect((try db.get(alloc, "user:parent")) == null);
+    try std.testing.expect((try db.get(alloc, "user:child")) == null);
+}
+
+test "db relational foreign key on update set null rewrites local unique children" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_update":"set_null"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+    try std.testing.expectEqual(schema_mod.ForeignKeyAction.set_null, runtime_schema.foreign_keys[0].on_update);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"parent@example.com\",\"status\":\"active\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"parent@example.com\",\"status\":\"open\"}" },
+        },
+    });
+    const old_parent_raw = (try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:parent")) orelse return error.TestExpectedEqual;
+    defer alloc.free(old_parent_raw);
+    const old_parent_key = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, old_parent_raw, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(old_parent_key);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"updated@example.com\",\"status\":\"active\"}" }},
+    });
+
+    const child_after = (try db.get(alloc, "user:child")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child_after);
+    try std.testing.expectEqualStrings("{\"id\":\"user:child\",\"status\":\"open\"}", child_after);
+
+    const old_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "users_ref_email_fkey", "row", "parent@example.com", "row", "user:child");
+    defer alloc.free(old_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, old_ref));
+
+    const report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(report.valid());
+    try std.testing.expectEqual(@as(u64, 0), report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 0), report.scanned_ref_rows);
+}
+
+test "db relational foreign key on update cascade rewrites local unique children" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_update":"cascade"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+    try std.testing.expectEqual(schema_mod.ForeignKeyAction.cascade, runtime_schema.foreign_keys[0].on_update);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"parent@example.com\",\"status\":\"active\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"parent@example.com\",\"status\":\"open\"}" },
+        },
+    });
+    const old_parent_raw = (try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:parent")) orelse return error.TestExpectedEqual;
+    defer alloc.free(old_parent_raw);
+    const old_parent_key = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, old_parent_raw, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(old_parent_key);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"updated@example.com\",\"status\":\"active\"}" }},
+    });
+
+    const child_after = (try db.get(alloc, "user:child")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child_after);
+    try std.testing.expectEqualStrings("{\"id\":\"user:child\",\"ref_email\":\"updated@example.com\",\"status\":\"open\"}", child_after);
+
+    const old_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "users_ref_email_fkey", "row", old_parent_key, "row", "user:child");
+    defer alloc.free(old_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, old_ref));
+    const new_parent_raw = (try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:parent")) orelse return error.TestExpectedEqual;
+    defer alloc.free(new_parent_raw);
+    const new_parent_key = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, new_parent_raw, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(new_parent_key);
+    const new_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "users_ref_email_fkey", "row", new_parent_key, "row", "user:child");
+    defer alloc.free(new_ref);
+    const new_ref_value = try db.core.store.get(alloc, new_ref);
+    alloc.free(new_ref_value);
+
+    const report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(report.valid());
+    try std.testing.expectEqual(@as(u64, 1), report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 1), report.scanned_ref_rows);
+}
+
+test "db deferred no action foreign key update validates final transaction state" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_update":"no_action","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"old@example.com\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"old@example.com\"}" },
+        },
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"new@example.com\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"new@example.com\"}" },
+        },
+    });
+
+    const parent = (try db.get(alloc, "user:parent")) orelse return error.TestExpectedEqual;
+    defer alloc.free(parent);
+    try std.testing.expectEqualStrings("{\"id\":\"user:parent\",\"email\":\"new@example.com\"}", parent);
+
+    const child = (try db.get(alloc, "user:child")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"user:child\",\"ref_email\":\"new@example.com\"}", child);
+
+    const report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(report.valid());
+}
+
+test "db deferred restrict foreign key update remains immediate" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_update":"restrict","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"old@example.com\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"old@example.com\"}" },
+        },
+    });
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"new@example.com\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"new@example.com\"}" },
+        },
+    }));
+}
+
+test "db deferred no action foreign key delete validates final transaction state" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"row","columns":["_id"]},"on_delete":"no_action","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:delete", .value = "{\"id\":\"customer:delete\"}" },
+            .{ .key = "order:delete", .value = "{\"id\":\"order:delete\",\"customer_id\":\"customer:delete\"}" },
+        },
+    });
+
+    const txn = try db.beginTransaction(31_000);
+    try db.writeTransaction(txn, .{
+        .deletes = &.{"customer:delete"},
+    });
+    try db.writeTransaction(txn, .{
+        .writes = &.{.{ .key = "order:delete", .value = "{\"id\":\"order:delete\"}" }},
+    });
+    try db.commitTransaction(txn, 31_001);
+
+    try std.testing.expect((try db.get(alloc, "customer:delete")) == null);
+    const child = (try db.get(alloc, "order:delete")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"order:delete\"}", child);
+
+    const report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(report.valid());
+}
+
+test "db deferred restrict foreign key delete remains restrictive" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"row","columns":["_id"]},"on_delete":"restrict","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:delete", .value = "{\"id\":\"customer:delete\"}" },
+            .{ .key = "order:delete", .value = "{\"id\":\"order:delete\",\"customer_id\":\"customer:delete\"}" },
+        },
+    });
+
+    const txn = try db.beginTransaction(31_100);
+    try db.writeTransaction(txn, .{
+        .deletes = &.{"customer:delete"},
+    });
+    try std.testing.expectError(error.ForeignKeyViolation, db.commitTransaction(txn, 31_101));
+    try db.abortTransaction(txn, 31_101);
+}
+
+test "db relational foreign keys allow multiple constraints on the same child columns" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_row_fkey","columns":["customer_id"],"references":{"table":"row","columns":["_id"]},"on_delete":"restrict"},{"name":"orders_customer_id_customers_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "parent:shared", .value = "{\"id\":\"parent:shared\"}" },
+            .{ .key = "order:shared", .value = "{\"id\":\"order:shared\",\"customer_id\":\"parent:shared\",\"status\":\"open\"}" },
+        },
+    });
+
+    const row_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_row_fkey", "row", "parent:shared", "row", "order:shared");
+    defer alloc.free(row_ref);
+    const row_ref_value = try db.core.store.get(alloc, row_ref);
+    defer alloc.free(row_ref_value);
+    try std.testing.expectEqualStrings("", row_ref_value);
+
+    const customers_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_customers_fkey", "customers", "parent:shared", "row", "order:shared");
+    defer alloc.free(customers_ref);
+    const customers_ref_value = try db.core.store.get(alloc, customers_ref);
+    defer alloc.free(customers_ref_value);
+    try std.testing.expectEqualStrings("", customers_ref_value);
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"parent:shared"},
+    }));
 }
 
 test "db relational unique constraints enforce committed scalar values" {
@@ -45149,6 +47573,55 @@ test "db transaction externalized foreign key parent checks still maintain refs"
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
 }
 
+test "db externalized foreign key proof records require local fk schema" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schemaless_txn = try db.beginTransaction(14_600);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(schemaless_txn, .{
+        .writes = &.{.{ .key = "order:schemaless-proof", .value = "{\"customer_id\":\"customer:proof\"}" }},
+        .foreign_key_parent_checks_externalized = true,
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "row",
+            .child_key = "order:schemaless-proof",
+            .parent_table = "customers",
+            .parent_key = "customer:proof",
+        }},
+    }));
+    try db.abortTransaction(schemaless_txn, 14_601);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const no_fk_txn = try db.beginTransaction(14_610);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(no_fk_txn, .{
+        .writes = &.{.{ .key = "order:no-fk-proof", .value = "{\"customer_id\":\"customer:proof\"}" }},
+        .foreign_key_parent_checks_externalized = true,
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "row",
+            .child_key = "order:no-fk-proof",
+            .parent_table = "customers",
+            .parent_key = "customer:proof",
+        }},
+    }));
+    try db.abortTransaction(no_fk_txn, 14_611);
+}
+
 test "db deferred foreign keys validate at local transaction commit and reject externalized checks" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -45195,6 +47668,164 @@ test "db deferred foreign keys validate at local transaction commit and reject e
         .foreign_key_parent_checks_externalized = true,
     }));
     try db.abortTransaction(externalized_txn, 14_851);
+
+    const exact_externalized_txn = try db.beginTransaction(14_900);
+    try db.writeTransaction(exact_externalized_txn, .{
+        .writes = &.{.{ .key = "aa-order:exact-externalized", .value = "{\"id\":\"aa-order:exact-externalized\",\"customer_id\":\"zz-customer:exact-externalized\"}" }},
+        .foreign_key_parent_checks_externalized = true,
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "row",
+            .child_key = "aa-order:exact-externalized",
+            .parent_table = "row",
+            .parent_key = "zz-customer:exact-externalized",
+            .timing = .deferred,
+        }},
+    });
+    try db.commitTransaction(exact_externalized_txn, 14_901);
+
+    const exact_child = (try db.get(alloc, "aa-order:exact-externalized")) orelse return error.TestExpectedEqual;
+    defer alloc.free(exact_child);
+    try std.testing.expectEqualStrings("{\"id\":\"aa-order:exact-externalized\",\"customer_id\":\"zz-customer:exact-externalized\"}", exact_child);
+}
+
+test "db deferred foreign keys preserve exact externalized unique parent proofs through commit" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"handle":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]},{"name":"users_handle_key","columns":["handle"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_delete":"restrict","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const child_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"id\":\"user:child\",\"ref_email\":\"proof@example.test\"}", runtime_schema.relational_columns);
+    defer alloc.free(child_row);
+    const encoded_parent = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, child_row, runtime_schema.foreign_keys[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(encoded_parent);
+
+    const missing_constraint_txn = try db.beginTransaction(14_920);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(missing_constraint_txn, .{
+        .writes = &.{.{ .key = "user:missing-constraint", .value = "{\"id\":\"user:missing-constraint\",\"ref_email\":\"proof@example.test\"}" }},
+        .foreign_key_parent_checks_externalized = true,
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .child_table = "row",
+            .child_key = "user:missing-constraint",
+            .parent_table = "row",
+            .parent_key = encoded_parent,
+            .timing = .deferred,
+        }},
+    }));
+    try db.abortTransaction(missing_constraint_txn, 14_921);
+
+    const wrong_constraint_txn = try db.beginTransaction(14_930);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(wrong_constraint_txn, .{
+        .writes = &.{.{ .key = "user:wrong-constraint", .value = "{\"id\":\"user:wrong-constraint\",\"ref_email\":\"proof@example.test\"}" }},
+        .foreign_key_parent_checks_externalized = true,
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .child_table = "row",
+            .child_key = "user:wrong-constraint",
+            .parent_table = "row",
+            .parent_key = encoded_parent,
+            .parent_constraint_name = "users_handle_key",
+            .timing = .deferred,
+        }},
+    }));
+    try db.abortTransaction(wrong_constraint_txn, 14_931);
+
+    const exact_txn = try db.beginTransaction(14_940);
+    try db.writeTransaction(exact_txn, .{
+        .writes = &.{.{ .key = "user:exact-unique", .value = "{\"id\":\"user:exact-unique\",\"ref_email\":\"proof@example.test\"}" }},
+        .foreign_key_parent_checks_externalized = true,
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .child_table = "row",
+            .child_key = "user:exact-unique",
+            .parent_table = "row",
+            .parent_key = encoded_parent,
+            .parent_constraint_name = "users_email_key",
+            .timing = .deferred,
+        }},
+    });
+    try db.commitTransaction(exact_txn, 14_941);
+
+    const child = (try db.get(alloc, "user:exact-unique")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"user:exact-unique\",\"ref_email\":\"proof@example.test\"}", child);
+}
+
+test "db deferred foreign keys require named cross-table unique parent proofs" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_email_fkey","columns":["customer_email"],"references":{"table":"customers","columns":["email"]},"on_delete":"restrict","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const child_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"id\":\"order:child\",\"customer_email\":\"ada@example.test\"}", runtime_schema.relational_columns);
+    defer alloc.free(child_row);
+    const encoded_parent = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, child_row, runtime_schema.foreign_keys[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(encoded_parent);
+
+    const empty_constraint_txn = try db.beginTransaction(14_950);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(empty_constraint_txn, .{
+        .writes = &.{.{ .key = "order:empty-proof", .value = "{\"id\":\"order:empty-proof\",\"customer_email\":\"ada@example.test\"}" }},
+        .foreign_key_parent_checks_externalized = true,
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .child_table = "row",
+            .child_key = "order:empty-proof",
+            .parent_table = "customers",
+            .parent_key = encoded_parent,
+            .parent_constraint_name = "",
+            .timing = .deferred,
+        }},
+    }));
+    try db.abortTransaction(empty_constraint_txn, 14_951);
+
+    const named_constraint_txn = try db.beginTransaction(14_960);
+    try db.writeTransaction(named_constraint_txn, .{
+        .writes = &.{.{ .key = "order:named-proof", .value = "{\"id\":\"order:named-proof\",\"customer_email\":\"ada@example.test\"}" }},
+        .foreign_key_parent_checks_externalized = true,
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .child_table = "row",
+            .child_key = "order:named-proof",
+            .parent_table = "customers",
+            .parent_key = encoded_parent,
+            .parent_constraint_name = "customers_email_key",
+            .timing = .deferred,
+        }},
+    });
+    try db.commitTransaction(named_constraint_txn, 14_961);
+
+    const child = (try db.get(alloc, "order:named-proof")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"order:named-proof\",\"customer_email\":\"ada@example.test\"}", child);
 }
 
 test "db transaction foreign key parent checks validate final prepared state" {
@@ -45364,6 +47995,24 @@ test "db transaction foreign key parent checks validate unique tuple state" {
     }));
     try db.abortTransaction(missing_txn, 18_101);
 
+    const wrong_table_txn = try db.beginTransaction(18_150);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(wrong_table_txn, .{
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .child_table = "orders",
+            .child_key = "order:wrong-parent-table",
+            .parent_table = "accounts",
+            .parent_key = parent_key,
+            .parent_constraint_name = "customers_email_key",
+        }},
+        .unique_constraint_writes = &.{.{
+            .constraint_name = "customers_email_key",
+            .encoded_value = parent_key,
+            .owner_key = "customer:ada",
+        }},
+    }));
+    try db.abortTransaction(wrong_table_txn, 18_151);
+
     const create_txn = try db.beginTransaction(18_200);
     try db.writeTransaction(create_txn, .{
         .foreign_key_parent_checks = &.{.{
@@ -45461,6 +48110,54 @@ test "db transaction foreign key parent delete checks support unique tuple keys"
     try db.commitTransaction(allowed_txn, 18_451);
 }
 
+test "db transaction foreign key parent update checks use update action semantics" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_delete":"set_null","on_update":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"ada@example.test\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"ada@example.test\"}" },
+        },
+    });
+
+    const parent_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"id\":\"user:parent\",\"email\":\"ada@example.test\"}", runtime_schema.relational_columns);
+    defer alloc.free(parent_row);
+    const encoded_parent = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, parent_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(encoded_parent);
+
+    const update_check_txn = try db.beginTransaction(18_475);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(update_check_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .parent_table = "row",
+            .parent_key = encoded_parent,
+            .operation = .update,
+        }},
+    }));
+    try db.abortTransaction(update_check_txn, 18_476);
+
+    const child = (try db.get(alloc, "user:child")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"user:child\",\"ref_email\":\"ada@example.test\"}", child);
+}
+
 test "db transaction foreign key parent delete checks support cross-table unique tuple keys" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -45524,6 +48221,78 @@ test "db transaction foreign key parent delete checks support cross-table unique
         }},
     });
     try db.commitTransaction(allowed_txn, 18_491);
+}
+
+test "db transaction foreign key parent delete checks honor deferred timing" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const ref_txn = try db.beginTransaction(18_495);
+    try db.writeTransaction(ref_txn, .{
+        .foreign_key_ref_writes = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:deferred-delete",
+            .child_table = "row",
+            .child_key = "order:deferred-delete",
+        }},
+    });
+    try db.commitTransaction(ref_txn, 18_496);
+
+    const timing_mismatch_txn = try db.beginTransaction(18_497);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(timing_mismatch_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:deferred-delete",
+        }},
+    }));
+    try db.abortTransaction(timing_mismatch_txn, 18_498);
+
+    const blocked_txn = try db.beginTransaction(18_499);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(blocked_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:deferred-delete",
+            .timing = .deferred,
+        }},
+    }));
+    try db.abortTransaction(blocked_txn, 18_500);
+
+    const allowed_txn = try db.beginTransaction(18_501);
+    try db.writeTransaction(allowed_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:deferred-delete",
+            .timing = .deferred,
+        }},
+        .foreign_key_ref_deletes = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:deferred-delete",
+            .child_table = "row",
+            .child_key = "order:deferred-delete",
+        }},
+    });
+    try db.commitTransaction(allowed_txn, 18_502);
 }
 
 test "db transaction foreign key parent delete checks validate child references" {

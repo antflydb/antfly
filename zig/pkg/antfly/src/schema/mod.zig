@@ -240,12 +240,24 @@ fn deriveRuntimeForeignKeys(alloc: std.mem.Allocator, schema: ParsedTableSchema)
             .parent_columns = try cloneStringSlice(alloc, foreign_key.references.columns),
             .on_delete = switch (foreign_key.on_delete) {
                 .restrict => .restrict,
+                .no_action => .no_action,
+                .set_null => .set_null,
+                .cascade => .cascade,
+            },
+            .on_update = switch (foreign_key.on_update) {
+                .restrict => .restrict,
+                .no_action => .no_action,
                 .set_null => .set_null,
                 .cascade => .cascade,
             },
             .timing = switch (foreign_key.timing) {
                 .immediate => .immediate,
                 .deferred => .deferred,
+            },
+            .match = switch (foreign_key.match) {
+                .simple => .simple,
+                .full => .full,
+                .partial => .partial,
             },
             .validation_state = switch (foreign_key.validation_state) {
                 .enforced => .enforced,
@@ -955,7 +967,7 @@ fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?stor
 test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}]}
     );
     defer parsed.deinit(alloc);
 
@@ -982,6 +994,8 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expectEqualStrings("customer_id", runtime.foreign_keys[0].child_columns[0]);
     try std.testing.expectEqualStrings("customers", runtime.foreign_keys[0].parent_table);
     try std.testing.expectEqualStrings("_id", runtime.foreign_keys[0].parent_columns[0]);
+    try std.testing.expectEqual(storage_schema.ForeignKeyAction.no_action, runtime.foreign_keys[0].on_update);
+    try std.testing.expectEqual(storage_schema.ForeignKeyMatch.simple, runtime.foreign_keys[0].match);
 }
 
 test "deriveRuntimeTableSchema projects embedded json schema as prefixed document fields" {

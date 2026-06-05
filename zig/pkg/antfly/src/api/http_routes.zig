@@ -62,6 +62,10 @@ pub const Routes = struct {
     pub const foreign_key_integrity_suffix = "/foreign-key-integrity";
     pub const unique_integrity_suffix = "/unique-integrity";
     pub const foreign_key_ref_children_suffix = "/foreign-key-ref-children";
+    pub const foreign_key_action_job_suffix = "/foreign-key-action-job";
+    pub const foreign_key_action_job_progress_suffix = "/foreign-key-action-job-progress";
+    pub const foreign_key_action_schedule_suffix = "/foreign-key-action-schedule";
+    pub const foreign_key_action_schedule_progress_suffix = "/foreign-key-action-schedule-progress";
     pub const query_suffix = "/query";
     pub const query_preflight_suffix = "/query-preflight";
     pub const text_stats_suffix = "/text-stats";
@@ -303,6 +307,26 @@ pub const Routes = struct {
     };
 
     pub const GroupForeignKeyRefChildren = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupForeignKeyActionJob = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupForeignKeyActionJobProgress = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupForeignKeyActionSchedule = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupForeignKeyActionScheduleProgress = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -696,6 +720,46 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupForeignKeyActionJob(path: []const u8) ?GroupForeignKeyActionJob {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, foreign_key_action_job_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - foreign_key_action_job_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupForeignKeyActionJobProgress(path: []const u8) ?GroupForeignKeyActionJobProgress {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, foreign_key_action_job_progress_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - foreign_key_action_job_progress_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupForeignKeyActionSchedule(path: []const u8) ?GroupForeignKeyActionSchedule {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, foreign_key_action_schedule_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - foreign_key_action_schedule_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupForeignKeyActionScheduleProgress(path: []const u8) ?GroupForeignKeyActionScheduleProgress {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, foreign_key_action_schedule_progress_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - foreign_key_action_schedule_progress_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchInternalTableCorruptEmbeddingArtifact(path: []const u8) ?InternalTableCorruptEmbeddingArtifact {
         if (!std.mem.startsWith(u8, path, internal_tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, corrupt_embedding_artifact_suffix)) return null;
@@ -965,6 +1029,18 @@ test "public api routes compile" {
     const group_fk_ref_children = Routes.matchGroupForeignKeyRefChildren("/internal/v1/groups/7/tables/docs/foreign-key-ref-children").?;
     try std.testing.expectEqual(@as(u64, 7), group_fk_ref_children.group_id);
     try std.testing.expectEqualStrings("docs", group_fk_ref_children.table_name);
+    const group_fk_action_job = Routes.matchGroupForeignKeyActionJob("/internal/v1/groups/7/tables/docs/foreign-key-action-job").?;
+    try std.testing.expectEqual(@as(u64, 7), group_fk_action_job.group_id);
+    try std.testing.expectEqualStrings("docs", group_fk_action_job.table_name);
+    const group_fk_action_job_progress = Routes.matchGroupForeignKeyActionJobProgress("/internal/v1/groups/7/tables/docs/foreign-key-action-job-progress").?;
+    try std.testing.expectEqual(@as(u64, 7), group_fk_action_job_progress.group_id);
+    try std.testing.expectEqualStrings("docs", group_fk_action_job_progress.table_name);
+    const group_fk_action_schedule = Routes.matchGroupForeignKeyActionSchedule("/internal/v1/groups/7/tables/docs/foreign-key-action-schedule").?;
+    try std.testing.expectEqual(@as(u64, 7), group_fk_action_schedule.group_id);
+    try std.testing.expectEqualStrings("docs", group_fk_action_schedule.table_name);
+    const group_fk_action_schedule_progress = Routes.matchGroupForeignKeyActionScheduleProgress("/internal/v1/groups/7/tables/docs/foreign-key-action-schedule-progress").?;
+    try std.testing.expectEqual(@as(u64, 7), group_fk_action_schedule_progress.group_id);
+    try std.testing.expectEqualStrings("docs", group_fk_action_schedule_progress.table_name);
     const group_graph_expand = Routes.matchGroupGraphExpand("/internal/v1/groups/7/tables/docs/graph-expand").?;
     try std.testing.expectEqual(@as(u64, 7), group_graph_expand.group_id);
     const group_graph_hydrate = Routes.matchGroupGraphHydrate("/internal/v1/groups/7/tables/docs/graph-hydrate").?;
