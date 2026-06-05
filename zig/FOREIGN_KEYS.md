@@ -158,8 +158,12 @@ For v1:
   parent delete through the same participant path without mutating rows, so
   operators can see whether a delete would be allowed and how many set-null or
   cascade child rows it would plan.
-- `timing` defaults to `immediate`. `deferred` is a reserved catalog value and
-  is rejected until distributed transaction-local constraint sets exist.
+- `timing` defaults to `immediate`. `deferred` is accepted for local relational
+  transactions and validates parent existence against the participant's final
+  staged state at commit. Distributed/routed FK parent checks are immediate-only
+  today; writes that would need externalized parent checks for a deferred
+  constraint fail closed until distributed transaction-local constraint sets
+  exist.
 - `validation_state` defaults to `enforced`. `unvalidated` is accepted for
   local online adoption: it records the catalog entry but does not enforce
   writes or maintain reverse-reference rows until the same constraint is applied
@@ -812,8 +816,9 @@ and should continue to grow around them:
 - `foreign_keys`;
 - `unique_constraints`;
 - action policy (`restrict`, `set_null`, `cascade`);
-- timing policy (`immediate`, with `deferred` reserved in the runtime catalog
-  but rejected by public schema validation until the distributed planner exists);
+- timing policy (`immediate`, and local `deferred` commit-time validation;
+  distributed/routed deferred validation remains reserved for the distributed
+  planner);
 - validation state (`enforced` and local `unvalidated` are public schema states;
   `validating` and `invalid` are reserved for hosted online validation jobs);
 - backing physical index names;
@@ -1358,12 +1363,14 @@ explicit intermediate state.
 Deferrable constraints validate final transaction state instead of each write as
 it arrives.
 
-Implemented stepping stone:
+Implemented:
 
-- local FK parent-existence checks are staged and validated against the
-  participant's final planned state before commit, so immediate constraints are
-  no longer sensitive to parent/child input ordering inside one local batch or
-  transaction-intent resolution.
+- local `timing: "deferred"` FK parent-existence checks are staged and
+  validated against the participant's final planned state before commit;
+- same-transaction parent/child writes can be prepared in either input order;
+- missing parents still reject at local commit;
+- distributed/routed parent-check externalization remains immediate-only, and
+  deferred FK writes fail closed rather than skipping local validation.
 
 Work:
 
@@ -1371,7 +1378,6 @@ Work:
 - record pending child references, parent creates, parent deletes, unique
   changes, cascades, and set-null updates;
 - validate the final transaction state at prepare/commit;
-- expose `immediate` vs `deferred` timing in the catalog;
 - require all validation participants to be locked or registered before prepare.
 
 Deferrable constraints should come last because they depend on the distributed
@@ -1392,12 +1398,12 @@ Ship the remaining work in this order:
    paginated owner scans and resumable child-action execution.
 8. Distributed recursive graph and large-operation hardening for
    `on_delete: cascade`.
-9. Deferrable constraints.
+9. Distributed deferrable constraint sets.
 
 This keeps the integrity substrate sound before adding features that multiply
-write-planning complexity. Cascades and deferrable constraints should come late
-because they require full transaction planning across all affected rows, not
-just validation.
+write-planning complexity. Distributed cascades and distributed deferrable
+constraint sets should come late because they require full transaction planning
+across all affected rows, not just validation.
 
 ## Testing Plan
 

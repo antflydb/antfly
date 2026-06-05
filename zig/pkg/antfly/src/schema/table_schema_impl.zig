@@ -1674,7 +1674,6 @@ fn validateRelationalForeignKeys(schema: TableSchema) !void {
     for (schema.foreign_keys, 0..) |foreign_key, i| {
         if (foreign_key.columns.len == 0) return error.InvalidSchemaUpdateRequest;
         if (foreign_key.references.columns.len == 0) return error.InvalidSchemaUpdateRequest;
-        if (foreign_key.timing != .immediate) return error.InvalidSchemaUpdateRequest;
         if (foreign_key.validation_state == .validating or foreign_key.validation_state == .invalid) return error.InvalidSchemaUpdateRequest;
         if (foreignKeyReferencesPrimaryKey(foreign_key)) {
             if (foreign_key.columns.len != 1) return error.InvalidSchemaUpdateRequest;
@@ -4009,13 +4008,12 @@ test "relational schema rejects unsupported foreign key shapes" {
             "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"set_null\"}]}",
         ),
     );
-    try std.testing.expectError(
-        error.InvalidSchemaUpdateRequest,
-        parseSchema(
-            std.testing.allocator,
-            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"deferred\"}]}",
-        ),
+    var parsed_deferred = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"deferred\"}]}",
     );
+    defer parsed_deferred.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyTiming.deferred, parsed_deferred.foreign_keys[0].timing);
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
         parseSchema(

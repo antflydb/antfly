@@ -155,6 +155,7 @@ const DelegatedPackageStep = struct {
 
 const DelegatedInferenceBuildSteps = struct {
     inference_test: *std.Build.Step,
+    inference_finetune_test: *std.Build.Step,
 };
 
 fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) void {
@@ -247,6 +248,7 @@ fn addDelegatedInferenceBuildSteps(
     blas_root: ?[]const u8,
 ) DelegatedInferenceBuildSteps {
     var test_step: ?*std.Build.Step = null;
+    var finetune_test_step: ?*std.Build.Step = null;
     for (inference_delegated_steps) |step_name| {
         const delegated = addDelegatedPackageStep(b, "inference", "pkg/inference", step_name, "pkg/inference");
         const run = delegated.run;
@@ -254,10 +256,13 @@ fn addDelegatedInferenceBuildSteps(
         forwardBuildArgs(b, run);
         if (std.mem.eql(u8, step_name, "test")) {
             test_step = delegated.step;
+        } else if (std.mem.eql(u8, step_name, "test-finetune")) {
+            finetune_test_step = delegated.step;
         }
     }
     return .{
         .inference_test = test_step.?,
+        .inference_finetune_test = finetune_test_step.?,
     };
 }
 
@@ -4137,6 +4142,8 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
+    unit_test_step.dependOn(delegated_inference_steps.inference_test);
+    unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_swarm_runtime_test_step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
@@ -4473,6 +4480,7 @@ pub fn build(b: *std.Build) void {
         .root_module = db_test_mod,
         .filters = &.{
             "db transaction externalized foreign key parent checks still maintain refs",
+            "db deferred foreign keys validate at local transaction commit and reject externalized checks",
             "db transaction foreign key parent checks validate final prepared state",
             "db transaction foreign key parent checks validate unique tuple state",
             "db transaction foreign key parent delete checks support unique tuple keys",
@@ -6225,6 +6233,7 @@ pub fn build(b: *std.Build) void {
         mod.addImport("raft_engine", raft_engine_mod);
         mod.addImport("structlog", structlog_mod);
         mod.addImport("antfly_platform", platform_mod);
+        mod.addImport("handlebars", handlebars_mod);
         mod.addOptions("build_options", build_options);
         break :blk mod;
     } else blk: {

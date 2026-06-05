@@ -110,7 +110,7 @@ pub const ForeignKey = struct {
     references: ?ForeignKeyReference = null,
     /// Delete action. "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
     on_delete: ?[]const u8 = null,
-    /// Constraint timing. Only immediate enforcement is currently accepted; deferred constraints are reserved for the distributed constraint planner.
+    /// Constraint timing. "deferred" is enforced for local relational transactions at commit and is not eligible for distributed/routed parent-check externalization yet.
     timing: ?[]const u8 = null,
     /// Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
     validation_state: ?[]const u8 = null,

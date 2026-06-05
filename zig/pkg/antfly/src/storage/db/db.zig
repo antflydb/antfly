@@ -270,6 +270,7 @@ const AsyncContext = struct {
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     allow_graph_materialization: bool = true,
+    require_graph_resolution_contract: bool = false,
     query_visibility_hook: ?QueryVisibilityHook = null,
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
@@ -2757,6 +2758,7 @@ pub const DB = struct {
             .index_manager = async_resources.index_manager,
             .apply_mutex = async_resources.apply_mutex,
             .io = self.backend_runtime.io(),
+            .require_graph_resolution_contract = true,
             .query_visibility_hook = null,
             .text_merge_runtime = null,
             .relational_base_rows = self.relationalColumnsForStore() != null,
@@ -5377,7 +5379,6 @@ pub const DB = struct {
     fn validateRuntimeSchemaFeatureLevel(table_schema: schema_mod.TableSchema) !void {
         if (table_schema.storage_mode != .relational) return;
         for (table_schema.foreign_keys) |foreign_key| {
-            if (foreign_key.timing != .immediate) return error.InvalidSchemaUpdateRequest;
             if (foreign_key.validation_state == .validating or foreign_key.validation_state == .invalid) return error.InvalidSchemaUpdateRequest;
         }
     }
@@ -6144,7 +6145,7 @@ pub const DB = struct {
             var active = std.ArrayListUnmanaged(schema_mod.ForeignKey).empty;
             errdefer active.deinit(alloc);
             for (foreign_keys) |foreign_key| {
-                if (!foreignKeyIsEnforcedImmediate(foreign_key)) continue;
+                if (!foreignKeyIsLocallyEnforced(foreign_key)) continue;
                 try active.append(alloc, foreign_key);
             }
             return try active.toOwnedSlice(alloc);
@@ -6159,11 +6160,16 @@ pub const DB = struct {
     }
 
     fn foreignKeyCanRunIntegrity(foreign_key: schema_mod.ForeignKey) bool {
-        return foreign_key.timing == .immediate;
+        return foreign_key.timing == .immediate or foreign_key.timing == .deferred;
     }
 
     fn foreignKeyIsEnforcedImmediate(foreign_key: schema_mod.ForeignKey) bool {
         return foreign_key.validation_state == .enforced and foreign_key.timing == .immediate;
+    }
+
+    fn foreignKeyIsLocallyEnforced(foreign_key: schema_mod.ForeignKey) bool {
+        return foreign_key.validation_state == .enforced and
+            (foreign_key.timing == .immediate or foreign_key.timing == .deferred);
     }
 
     /// Refresh schema-derived algebraic index configs for callers that have
@@ -6265,6 +6271,7 @@ pub const DB = struct {
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
         var effective_ops = try coalesceKeyValueRequest(self, types.TransactionWrite, req.writes, req.deletes, req.transforms);
         defer effective_ops.deinit(self.alloc);
+        if (req.foreign_key_parent_checks_externalized) try self.validateNoDeferredForeignKeyParentChecksExternalized(effective_ops.writes);
         try self.validateForeignKeyParentChecks(req.foreign_key_parent_checks, effective_ops.writes, effective_ops.deletes, req.unique_constraint_writes, req.unique_constraint_deletes);
         try self.validateForeignKeyRefMutations(req.foreign_key_ref_writes);
         try self.validateForeignKeyRefMutations(req.foreign_key_ref_deletes);
@@ -6719,6 +6726,24 @@ pub const DB = struct {
             const existing = try self.get(self.alloc, check.parent_key);
             defer if (existing) |body| self.alloc.free(body);
             if (existing == null) return error.ForeignKeyViolation;
+        }
+    }
+
+    fn validateNoDeferredForeignKeyParentChecksExternalized(
+        self: *DB,
+        writes: []const types.TransactionWrite,
+    ) !void {
+        if (writes.len == 0) return;
+        const runtime_schema = self.core.schema orelse return;
+        if (runtime_schema.storage_mode != .relational or runtime_schema.foreign_keys.len == 0) return;
+        for (runtime_schema.foreign_keys) |foreign_key| {
+            if (foreign_key.validation_state != .enforced or foreign_key.timing != .deferred) continue;
+            for (writes) |write| {
+                if (isMetadataKey(write.key) or internal_keys.isInternalPhysicalTableDataKey(write.key)) continue;
+                const parent_key = (try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema.relational_columns, foreign_key, write.value)) orelse continue;
+                self.alloc.free(parent_key);
+                return error.ForeignKeyViolation;
+            }
         }
     }
 
@@ -7524,29 +7549,31 @@ pub const DB = struct {
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
         try self.retireResolverReplayBeforeCatalogRemoval();
 
-        var removed = false;
         const retirement_sequence = blk: {
             lockApply(self);
             defer self.core.unlockApply();
 
-            const cfg = (try self.resolverConfigByNameAlloc(name)) orelse break :blk null;
+            const cfg = (try self.resolverConfigByNameAlloc(name)) orelse return false;
             defer {
                 var owned = cfg;
                 owned.deinit(self.alloc);
             }
 
-            const sequence = try self.retireResolverArtifactsLocked(cfg);
-            if (!try self.core.removeResolver(name)) return false;
-            removed = true;
-            break :blk sequence;
+            break :blk try self.retireResolverArtifactsLocked(cfg);
         };
 
-        if (!removed) return false;
         if (retirement_sequence) |sequence| {
             self.executor.notifySequence(sequence);
             self.notifyResolverReplayRuntimesForced(sequence);
             try self.runUntilIdle();
         }
+
+        {
+            lockApply(self);
+            defer self.core.unlockApply();
+            if (!try self.core.removeResolver(name)) return false;
+        }
+
         self.stopResolverReplayRuntimesIfUnconfigured();
         return true;
     }
@@ -18620,7 +18647,7 @@ fn applyDerivedBatchToIndexReplayContext(
 ) !bool {
     const replay_ctx: *const ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
     const ctx = replay_ctx.batch;
-    if (!try batchAdvancesManagedIndexApplyState(ctx.index_manager, batch, index_ref)) return false;
+    if (!try batchAdvancesManagedIndexApplyStateForReplay(ctx.index_manager, batch, index_ref)) return false;
 
     const async_ctx = AsyncContext{
         .alloc = ctx.alloc,
@@ -18630,6 +18657,7 @@ fn applyDerivedBatchToIndexReplayContext(
         .apply_mutex = ctx.apply_mutex,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .relational_base_rows = ctx.relational_base_rows,
+        .require_graph_resolution_contract = true,
     };
     if (benchMetricsEnabled()) {
         var profile = BatchProfile{};
@@ -19209,7 +19237,17 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try applyGraphDocClearsForIndex(ctx, batch.graph_doc_clears, index_ref.name);
 
             const materialized_artifact_keys = if (ctx.allow_graph_materialization)
-                try materializeGraphSourceArtifactsForIndex(ctx.alloc, ctx.store, ctx.index_manager, batch.changed_artifact_keys, index_ref.name, ctx.relational_base_rows)
+                try materializeGraphSourceArtifactsForIndex(
+                    ctx.alloc,
+                    ctx.store,
+                    ctx.index_manager,
+                    batch.changed_artifact_keys,
+                    index_ref.name,
+                    .{
+                        .relational_base_rows = ctx.relational_base_rows,
+                        .require_resolution_contract = ctx.require_graph_resolution_contract,
+                    },
+                )
             else
                 try ctx.alloc.alloc([]u8, 0);
             defer freeOwnedKeySlice(ctx.alloc, materialized_artifact_keys);
@@ -19261,59 +19299,65 @@ fn batchHasEmbeddingArtifactForManagedIndex(
     return false;
 }
 
-fn batchAffectsManagedIndex(
+const ManagedIndexBatchApplicability = enum {
+    irrelevant,
+    relevant,
+    missing_dependency,
+};
+
+fn managedIndexBatchApplicability(
     index_manager: *index_manager_mod.IndexManager,
     batch: derived_types.DerivedBatch,
     index_ref: index_manager_mod.ManagedIndexRef,
-) bool {
+) ManagedIndexBatchApplicability {
     switch (index_ref.kind) {
         .full_text, .algebraic => {
-            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return true;
+            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
             for (batch.documents) |doc| {
-                if (doc.action == .upsert) return true;
+                if (doc.action == .upsert) return .relevant;
             }
-            return false;
+            return .irrelevant;
         },
         .dense_vector => {
-            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return true;
+            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
             for (batch.documents) |doc| {
-                if (doc.action == .upsert) return true;
+                if (doc.action == .upsert) return .relevant;
             }
             for (batch.dense_embeddings) |embedding| {
-                if (std.mem.eql(u8, embedding.index_name, index_ref.name)) return true;
+                if (std.mem.eql(u8, embedding.index_name, index_ref.name)) return .relevant;
             }
-            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return true;
-            return false;
+            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return .relevant;
+            return .irrelevant;
         },
         .sparse_vector => {
-            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return true;
+            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
             for (batch.documents) |doc| {
-                if (doc.action == .upsert) return true;
+                if (doc.action == .upsert) return .relevant;
             }
             for (batch.sparse_embeddings) |embedding| {
-                if (std.mem.eql(u8, embedding.index_name, index_ref.name)) return true;
+                if (std.mem.eql(u8, embedding.index_name, index_ref.name)) return .relevant;
             }
-            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return true;
-            return false;
+            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return .relevant;
+            return .irrelevant;
         },
         .graph => {
-            if (batch.deleted_keys.len > 0) return true;
+            if (batch.deleted_keys.len > 0) return .relevant;
             for (batch.graph_doc_clears) |clear| {
                 for (clear.index_names) |index_name| {
-                    if (std.mem.eql(u8, index_name, index_ref.name)) return true;
+                    if (std.mem.eql(u8, index_name, index_ref.name)) return .relevant;
                 }
             }
             for (batch.graph_writes) |write| {
-                if (std.mem.eql(u8, write.index_name, index_ref.name)) return true;
+                if (std.mem.eql(u8, write.index_name, index_ref.name)) return .relevant;
             }
             for (batch.graph_deletes) |delete| {
-                if (std.mem.eql(u8, delete.index_name, index_ref.name)) return true;
+                if (std.mem.eql(u8, delete.index_name, index_ref.name)) return .relevant;
             }
             for (batch.changed_artifact_keys) |artifact_key| {
                 if (internal_keys.isAssetArtifactKey(artifact_key)) {
                     var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
                     defer artifact_ref.deinit(index_manager.alloc);
-                    if (artifact_ref.kind == .asset and index_manager.graphIndexConsumesAssetArtifact(index_ref.name, artifact_ref.name)) return true;
+                    if (artifact_ref.kind == .asset and index_manager.graphIndexConsumesAssetArtifact(index_ref.name, artifact_ref.name)) return .relevant;
                     continue;
                 }
                 if (internal_keys.isResolutionArtifactKey(artifact_key)) {
@@ -19324,8 +19368,9 @@ fn batchAffectsManagedIndex(
                         index_manager.alloc.free(parsed.doc_key);
                         index_manager.alloc.free(parsed.artifact_name);
                     }
-                    if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return true;
-                    continue;
+                    if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
+                    return .missing_dependency;
                 }
                 if (internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
                     const parsed = (internal_keys.parseGraphEdgeArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
@@ -19335,12 +19380,32 @@ fn batchAffectsManagedIndex(
                         index_manager.alloc.free(parsed.edge_type);
                         index_manager.alloc.free(parsed.target_doc_key);
                     }
-                    if (std.mem.eql(u8, parsed.index_name, index_ref.name)) return true;
+                    if (std.mem.eql(u8, parsed.index_name, index_ref.name)) return .relevant;
                 }
             }
-            return false;
+            return .irrelevant;
         },
     }
+}
+
+fn batchAffectsManagedIndex(
+    index_manager: *index_manager_mod.IndexManager,
+    batch: derived_types.DerivedBatch,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) bool {
+    return managedIndexBatchApplicability(index_manager, batch, index_ref) == .relevant;
+}
+
+fn batchAffectsManagedIndexForReplay(
+    index_manager: *index_manager_mod.IndexManager,
+    batch: derived_types.DerivedBatch,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) !bool {
+    return switch (managedIndexBatchApplicability(index_manager, batch, index_ref)) {
+        .irrelevant => false,
+        .relevant => true,
+        .missing_dependency => true,
+    };
 }
 
 fn batchAdvancesManagedIndexApplyState(
@@ -19368,6 +19433,18 @@ fn batchAdvancesManagedIndexApplyState(
         },
         else => return true,
     }
+}
+
+fn batchAdvancesManagedIndexApplyStateForReplay(
+    index_manager: *index_manager_mod.IndexManager,
+    batch: derived_types.DerivedBatch,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) !bool {
+    return switch (managedIndexBatchApplicability(index_manager, batch, index_ref)) {
+        .irrelevant => false,
+        .missing_dependency => true,
+        .relevant => try batchAdvancesManagedIndexApplyState(index_manager, batch, index_ref),
+    };
 }
 
 const OwnedBatchWrites = struct {
@@ -20257,13 +20334,18 @@ fn concatArtifactKeyViews(alloc: Allocator, lhs: []const []const u8, rhs: []cons
     return out;
 }
 
+const GraphMaterializationOptions = struct {
+    relational_base_rows: bool = false,
+    require_resolution_contract: bool = false,
+};
+
 fn materializeGraphSourceArtifactsForIndex(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     index_manager: *index_manager_mod.IndexManager,
     changed_artifact_keys: []const []const u8,
     index_name: []const u8,
-    relational_base_rows: bool,
+    options: GraphMaterializationOptions,
 ) ![][]u8 {
     const source = index_manager.graphArtifactSource(index_name) orelse return try alloc.alloc([]u8, 0);
 
@@ -20272,7 +20354,7 @@ fn materializeGraphSourceArtifactsForIndex(
 
     for (changed_artifact_keys) |artifact_key| {
         if (internal_keys.isResolutionArtifactKey(artifact_key)) {
-            try materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key);
+            try materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key, options);
             continue;
         }
         if (!internal_keys.isAssetArtifactKey(artifact_key)) continue;
@@ -20302,7 +20384,7 @@ fn materializeGraphSourceArtifactsForIndex(
         }
 
         if (raw) |value| {
-            const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id, relational_base_rows);
+            const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id, options.relational_base_rows);
             defer if (raw_doc) |doc_value| alloc.free(doc_value);
             const graph_writes = try graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc);
             defer freeGraphWrites(alloc, graph_writes);
@@ -20367,13 +20449,23 @@ fn materializeMentionEdgesForResolutionKey(
     index_name: []const u8,
     source: index_manager_mod.GraphArtifactSource,
     resolution_key: []const u8,
+    options: GraphMaterializationOptions,
 ) !void {
     if (source.mention_edge_type.len == 0) return;
     const parsed_key = (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, resolution_key)) orelse return;
     defer alloc.free(parsed_key.doc_key);
     defer alloc.free(parsed_key.artifact_name);
 
-    const cfg = resolverConfigForResolution(index_manager, source.artifact_name, parsed_key.artifact_name) orelse return;
+    const raw_resolution = store.get(alloc, resolution_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (raw_resolution) |raw| alloc.free(raw);
+
+    const cfg = resolverConfigForResolution(index_manager, source.artifact_name, parsed_key.artifact_name) orelse {
+        if (options.require_resolution_contract) return error.MissingResolverArtifactContract;
+        return;
+    };
     const state_name = try mentionGraphStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
     defer alloc.free(state_name);
     const state_key = try graphAssetStateKeyAlloc(alloc, parsed_key.doc_key, index_name, state_name);
@@ -20392,12 +20484,6 @@ fn materializeMentionEdgesForResolutionKey(
         for (deletes.items) |key| alloc.free(@constCast(key));
         deletes.deinit(alloc);
     }
-
-    const raw_resolution = store.get(alloc, resolution_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
-    defer if (raw_resolution) |raw| alloc.free(raw);
 
     if (raw_resolution) |raw| {
         const raw_extraction = loadSourceExtractionForResolution(alloc, store, parsed_key.doc_key, cfg.source_artifact) catch null;
@@ -20471,6 +20557,16 @@ fn resolverConfigForResolution(
         {
             return cfg;
         }
+    }
+    return null;
+}
+
+fn resolverConfigForResolutionArtifact(
+    index_manager: *index_manager_mod.IndexManager,
+    resolution_artifact: []const u8,
+) ?*const index_manager_mod.ResolverConfig {
+    for (index_manager.resolvers.items) |*cfg| {
+        if (std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact)) return cfg;
     }
     return null;
 }
@@ -21213,7 +21309,7 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
     const replay_ctx: *ReplayApplyContext = @ptrCast(@alignCast(ctx_ptr));
     const self = replay_ctx.db;
     const resources = self.core.asyncResources();
-    if (!try batchAdvancesManagedIndexApplyState(resources.index_manager, batch, index_ref)) return false;
+    if (!try batchAdvancesManagedIndexApplyStateForReplay(resources.index_manager, batch, index_ref)) return false;
     const ctx = AsyncContext{
         .alloc = self.alloc,
         .store = resources.store,
@@ -21222,6 +21318,7 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
         .apply_mutex = resources.apply_mutex,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .relational_base_rows = self.relationalColumnsForStore() != null,
+        .require_graph_resolution_contract = true,
     };
     try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
     return true;
@@ -22202,7 +22299,7 @@ fn resetPath(path: []const u8) !void {
 
 fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
-    if (!batchAffectsManagedIndex(ctx.index_manager, batch, index_ref)) return false;
+    if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) return false;
     if (index_ref.kind == .dense_vector and ctx.active_external_dense_bulk_sessions.load(.acquire) != 0) {
         return error.ReplayDocumentNotVisible;
     }
@@ -29161,6 +29258,141 @@ test "db graph index materializes relation asset artifacts into graph edge artif
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), edges[0].weight, 0.0001);
 }
 
+test "db graph replay blocks resolution artifact without resolver contract" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const batch = derived_types.DerivedBatch{
+        .sequence = 1,
+        .changed_artifact_keys = &.{resolution_key},
+    };
+    const index_ref = index_manager_mod.ManagedIndexRef{
+        .name = "prov_graph",
+        .kind = .graph,
+    };
+
+    try db.core.store.put(resolution_key, "{}");
+
+    try std.testing.expect(!batchAffectsManagedIndex(db.core.index_manager, batch, index_ref));
+    try std.testing.expect(try batchAffectsManagedIndexForReplay(db.core.index_manager, batch, index_ref));
+    try std.testing.expect(try batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, index_ref));
+    try std.testing.expectError(
+        error.MissingResolverArtifactContract,
+        materializeGraphSourceArtifactsForIndex(
+            alloc,
+            db.core.store,
+            db.core.index_manager,
+            &.{resolution_key},
+            "prov_graph",
+            .{ .require_resolution_contract = true },
+        ),
+    );
+
+    try db.core.store.delete(resolution_key);
+    try std.testing.expectError(
+        error.MissingResolverArtifactContract,
+        materializeGraphSourceArtifactsForIndex(
+            alloc,
+            db.core.store,
+            db.core.index_manager,
+            &.{resolution_key},
+            "prov_graph",
+            .{ .require_resolution_contract = true },
+        ),
+    );
+
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try std.testing.expect(batchAffectsManagedIndex(db.core.index_manager, batch, index_ref));
+    try std.testing.expect(try batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, index_ref));
+}
+
+test "db graph replay ignores resolution artifacts bound to another source contract" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_a",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_a","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_a","kind":"asset","field":"relations_a","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addIndex(.{
+        .name = "graph_b",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_b","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_b","kind":"asset","field":"relations_b","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg_b",
+        .table = "entities",
+        .source_artifact = "relations_b",
+        .resolution_artifact = "resolution_b",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_b");
+    defer alloc.free(resolution_key);
+    const batch = derived_types.DerivedBatch{
+        .sequence = 1,
+        .changed_artifact_keys = &.{resolution_key},
+    };
+
+    const graph_a = index_manager_mod.ManagedIndexRef{ .name = "graph_a", .kind = .graph };
+    try std.testing.expect(!batchAffectsManagedIndex(db.core.index_manager, batch, graph_a));
+    try std.testing.expect(!try batchAffectsManagedIndexForReplay(db.core.index_manager, batch, graph_a));
+    try std.testing.expect(!try batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, graph_a));
+
+    const graph_b = index_manager_mod.ManagedIndexRef{ .name = "graph_b", .kind = .graph };
+    try std.testing.expect(batchAffectsManagedIndex(db.core.index_manager, batch, graph_b));
+    try std.testing.expect(try batchAffectsManagedIndexForReplay(db.core.index_manager, batch, graph_b));
+    try std.testing.expect(try batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, graph_b));
+}
+
 test "db materializes doc->entity mention edges as provenance and clears them on delete" {
     const alloc = std.testing.allocator;
 
@@ -30297,7 +30529,7 @@ test "db async asset producer mention edges come from resolution artifacts" {
 
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
     defer alloc.free(asset_key);
-    const changed = try materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph", false);
+    const changed = try materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph", .{});
     defer freeOwnedKeySlice(alloc, changed);
 
     const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
@@ -43141,7 +43373,7 @@ test "db foreign key integrity job records persist intent and completion" {
     try std.testing.expect(persisted.violations_truncated);
 }
 
-test "db relational foreign keys setSchema rejects reserved runtime states" {
+test "db relational foreign keys setSchema accepts deferred and rejects controller-only states" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -43164,13 +43396,13 @@ test "db relational foreign keys setSchema rejects reserved runtime states" {
         .on_delete = .restrict,
         .timing = .deferred,
     }};
-    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.setSchema(.{
+    try db.setSchema(.{
         .version = 1,
         .default_type = "row",
         .storage_mode = .relational,
         .relational_columns = relational_columns[0..],
         .foreign_keys = deferred_foreign_keys[0..],
-    }));
+    });
 
     const validating_foreign_keys = [_]schema_mod.ForeignKey{.{
         .name = "orders_customer_id_fkey",
@@ -44915,6 +45147,54 @@ test "db transaction externalized foreign key parent checks still maintain refs"
     const marker_key = try foreignKeyParentChecksExternalizedIntentKeyAlloc(alloc, routed_txn);
     defer alloc.free(marker_key);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
+}
+
+test "db deferred foreign keys validate at local transaction commit and reject externalized checks" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"row","columns":["_id"]},"on_delete":"restrict","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const missing_txn = try db.beginTransaction(14_750);
+    try db.writeTransaction(missing_txn, .{
+        .writes = &.{.{ .key = "aa-order:missing", .value = "{\"id\":\"aa-order:missing\",\"customer_id\":\"zz-customer:missing\"}" }},
+    });
+    try std.testing.expectError(error.ForeignKeyViolation, db.commitTransaction(missing_txn, 14_751));
+    try db.abortTransaction(missing_txn, 14_752);
+
+    const ordered_txn = try db.beginTransaction(14_800);
+    try db.writeTransaction(ordered_txn, .{
+        .writes = &.{
+            .{ .key = "aa-order:deferred", .value = "{\"id\":\"aa-order:deferred\",\"customer_id\":\"zz-customer:deferred\"}" },
+            .{ .key = "zz-customer:deferred", .value = "{\"id\":\"zz-customer:deferred\"}" },
+        },
+    });
+    try db.commitTransaction(ordered_txn, 14_801);
+
+    const child = (try db.get(alloc, "aa-order:deferred")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"aa-order:deferred\",\"customer_id\":\"zz-customer:deferred\"}", child);
+
+    const externalized_txn = try db.beginTransaction(14_850);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(externalized_txn, .{
+        .writes = &.{.{ .key = "aa-order:externalized", .value = "{\"id\":\"aa-order:externalized\",\"customer_id\":\"zz-customer:externalized\"}" }},
+        .foreign_key_parent_checks_externalized = true,
+    }));
+    try db.abortTransaction(externalized_txn, 14_851);
 }
 
 test "db transaction foreign key parent checks validate final prepared state" {

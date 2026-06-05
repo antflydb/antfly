@@ -309,16 +309,20 @@ pub fn createSessionWithOptions(
 
     // Set thread count
     _ = api.SetIntraOpNumThreads.?(session_options.?, 4);
+    // ORT memory caches can keep allocation plans from early runs. Antfly serves
+    // dynamic batch and sequence shapes from long-lived sessions, so reusing a
+    // shape-specific buffer can fail when a later request has a different batch
+    // size.
+    try checkStatus(api, api.DisableMemPattern.?(session_options.?));
+    try checkStatus(api, api.DisableCpuMemArena.?(session_options.?));
+    try checkStatus(api, api.AddSessionConfigEntry.?(
+        session_options.?,
+        c.kOrtSessionOptionsConfigDisablePrepacking,
+        "1",
+    ));
     if (options.low_memory) {
         try checkStatus(api, api.SetSessionGraphOptimizationLevel.?(session_options.?, c.ORT_DISABLE_ALL));
         try checkStatus(api, api.SetSessionExecutionMode.?(session_options.?, c.ORT_SEQUENTIAL));
-        try checkStatus(api, api.DisableMemPattern.?(session_options.?));
-        try checkStatus(api, api.DisableCpuMemArena.?(session_options.?));
-        try checkStatus(api, api.AddSessionConfigEntry.?(
-            session_options.?,
-            c.kOrtSessionOptionsConfigDisablePrepacking,
-            "1",
-        ));
     }
 
     // Only probe CUDA on Linux builds where a CUDA-enabled ORT is plausible.

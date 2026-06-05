@@ -148,8 +148,8 @@ components:
           description: Delete action. "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
         timing:
           type: string
-          enum: [immediate]
-          description: Constraint timing. Only immediate enforcement is currently accepted; deferred constraints are reserved for the distributed constraint planner.
+          enum: [immediate, deferred]
+          description: Constraint timing. "deferred" is enforced for local relational transactions at commit and is not eligible for distributed/routed parent-check externalization yet.
         validation_state:
           type: string
           enum: [enforced, unvalidated]

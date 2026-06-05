@@ -288,12 +288,14 @@ columns from affected child rows during parent delete, while `"cascade"`
 recursively deletes affected child rows through the relational participant.
 Required child fields continue to be enforced by the row schema.
 The runtime schema persists the normalized FK catalog, including `timing` and
-`validation_state`. Public schema validation currently accepts `"immediate"`
-timing with `"enforced"` or `"unvalidated"` validation state. `unvalidated`
-foreign keys are catalog-only: they do not enforce writes or maintain
-reverse-reference rows until the same FK definition is applied later as
-`"enforced"`, which validates existing rows and builds the missing
-reverse-reference rows before the catalog flip. Deferred timing plus job-owned
+`validation_state`. Public schema validation accepts `"immediate"` and local
+`"deferred"` timing with `"enforced"` or `"unvalidated"` validation state.
+`deferred` validates parent existence against the local participant's final
+staged state at commit and is not eligible for distributed/routed parent-check
+externalization yet. `unvalidated` foreign keys are catalog-only: they do not
+enforce writes or maintain reverse-reference rows until the same FK definition
+is applied later as `"enforced"`, which validates existing rows and builds the
+missing reverse-reference rows before the catalog flip. Job-owned
 `"validating"` and `"invalid"` states are reserved for distributed constraint
 jobs. The relational participant maintains reverse-reference rows
 transactionally with the child row once a FK is enforced.
