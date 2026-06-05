@@ -10569,6 +10569,7 @@ pub const DB = struct {
         completed: bool = false,
         valid: ?bool = null,
         last_report: relational_store_mod.ForeignKeyIntegrityReport = .{},
+        aggregate_report: relational_store_mod.ForeignKeyIntegrityReport = .{},
         violation_samples_json: []const u8 = "[]",
         violation_sample_count: usize = 0,
         violations_truncated: bool = false,
@@ -11236,6 +11237,7 @@ pub const DB = struct {
         var violation_sample_count: usize = 0;
         var violations_truncated = false;
         var last_report: relational_store_mod.ForeignKeyIntegrityReport = .{};
+        var aggregate_report: relational_store_mod.ForeignKeyIntegrityReport = .{};
         var diagnostic_passes: u64 = 0;
         var violating_passes: u64 = 0;
         var first_violation_at_ns: ?u64 = null;
@@ -11251,6 +11253,7 @@ pub const DB = struct {
             violation_sample_count = existing.violation_sample_count;
             violations_truncated = existing.violations_truncated;
             last_report = existing.last_report;
+            aggregate_report = existing.aggregate_report;
             diagnostic_passes = existing.diagnostic_passes;
             violating_passes = existing.violating_passes;
             first_violation_at_ns = existing.first_violation_at_ns;
@@ -11277,6 +11280,7 @@ pub const DB = struct {
             .completed = false,
             .valid = null,
             .last_report = last_report,
+            .aggregate_report = aggregate_report,
             .violation_samples_json = violation_samples_json,
             .violation_sample_count = violation_sample_count,
             .violations_truncated = violations_truncated,
@@ -11391,6 +11395,7 @@ pub const DB = struct {
             .completed = true,
             .valid = valid,
             .last_report = report,
+            .aggregate_report = foreignKeyIntegrityReportAdd(existing.aggregate_report, report),
             .violation_samples_json = violation_samples_json orelse existing.violation_samples_json,
             .violation_sample_count = violation_sample_count orelse existing.violation_sample_count,
             .violations_truncated = violations_truncated orelse existing.violations_truncated,
@@ -11520,6 +11525,7 @@ pub const DB = struct {
             .completed = existing.completed,
             .valid = existing.valid,
             .last_report = report orelse existing.last_report,
+            .aggregate_report = if (report) |value| foreignKeyIntegrityReportAdd(existing.aggregate_report, value) else existing.aggregate_report,
             .violation_samples_json = violation_samples_json,
             .violation_sample_count = violation_sample_count,
             .violations_truncated = violations_truncated,
@@ -12527,6 +12533,7 @@ pub const DB = struct {
             .completed = parsed.value.completed,
             .valid = parsed.value.valid,
             .last_report = parsed.value.last_report,
+            .aggregate_report = parsed.value.aggregate_report,
             .violation_samples_json = &.{},
             .violation_sample_count = parsed.value.violation_sample_count,
             .violations_truncated = parsed.value.violations_truncated,
@@ -12766,6 +12773,22 @@ pub const DB = struct {
         return report.missing_parent_rows != 0 or
             report.missing_ref_rows != 0 or
             report.stale_ref_rows != 0;
+    }
+
+    fn foreignKeyIntegrityReportAdd(
+        left: relational_store_mod.ForeignKeyIntegrityReport,
+        right: relational_store_mod.ForeignKeyIntegrityReport,
+    ) relational_store_mod.ForeignKeyIntegrityReport {
+        return .{
+            .scanned_child_rows = left.scanned_child_rows +| right.scanned_child_rows,
+            .referenced_child_rows = left.referenced_child_rows +| right.referenced_child_rows,
+            .scanned_ref_rows = left.scanned_ref_rows +| right.scanned_ref_rows,
+            .missing_parent_rows = left.missing_parent_rows +| right.missing_parent_rows,
+            .missing_ref_rows = left.missing_ref_rows +| right.missing_ref_rows,
+            .stale_ref_rows = left.stale_ref_rows +| right.stale_ref_rows,
+            .repaired_ref_rows = left.repaired_ref_rows +| right.repaired_ref_rows,
+            .deleted_stale_ref_rows = left.deleted_stale_ref_rows +| right.deleted_stale_ref_rows,
+        };
     }
 
     fn foreignKeyIntegrityFirstViolationAt(existing: ?u64, pass_has_violations: bool, now_ns: u64) ?u64 {
@@ -45509,6 +45532,9 @@ test "db foreign key integrity job records persist intent and completion" {
         try std.testing.expectEqualStrings("[]", created.violation_samples_json);
         try std.testing.expectEqual(@as(usize, 0), created.violation_sample_count);
         try std.testing.expect(!created.violations_truncated);
+        try std.testing.expectEqual(@as(u64, 0), created.aggregate_report.missing_parent_rows);
+        try std.testing.expectEqual(@as(u64, 0), created.aggregate_report.missing_ref_rows);
+        try std.testing.expectEqual(@as(u64, 0), created.aggregate_report.stale_ref_rows);
         try std.testing.expectEqual(@as(u64, 0), created.diagnostic_passes);
         try std.testing.expectEqual(@as(u64, 0), created.violating_passes);
         try std.testing.expect(created.first_violation_at_ns == null);
@@ -45535,8 +45561,9 @@ test "db foreign key integrity job records persist intent and completion" {
         try std.testing.expectEqual(@as(u64, 120_000), resumed.lease_ms);
         try std.testing.expectEqual(@as(usize, 8), resumed.max_work_units);
 
-        const diagnosed = try db.updateForeignKeyIntegrityJobDiagnosticsAt(
+        const diagnosed = try db.updateForeignKeyIntegrityJobDiagnosticsWithReportAt(
             "job:fk:orders:validate",
+            .{ .missing_parent_rows = 1 },
             "[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]",
             1,
             true,
@@ -45550,6 +45577,8 @@ test "db foreign key integrity job records persist intent and completion" {
         try std.testing.expectEqual(@as(u64, 1), diagnosed.violating_passes);
         try std.testing.expectEqual(@as(u64, 25_000), diagnosed.first_violation_at_ns.?);
         try std.testing.expectEqual(@as(u64, 25_000), diagnosed.last_violation_at_ns.?);
+        try std.testing.expectEqual(@as(u64, 1), diagnosed.last_report.missing_parent_rows);
+        try std.testing.expectEqual(@as(u64, 1), diagnosed.aggregate_report.missing_parent_rows);
 
         const completed = try db.completeForeignKeyIntegrityJobRecordAt(
             "job:fk:orders:validate",
@@ -45563,6 +45592,8 @@ test "db foreign key integrity job records persist intent and completion" {
         try std.testing.expect(completed.valid.?);
         try std.testing.expectEqualStrings("complete", completed.status);
         try std.testing.expectEqual(@as(u64, 12), completed.last_report.referenced_child_rows);
+        try std.testing.expectEqual(@as(u64, 12), completed.aggregate_report.referenced_child_rows);
+        try std.testing.expectEqual(@as(u64, 1), completed.aggregate_report.missing_parent_rows);
         try std.testing.expectEqualStrings("[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]", completed.violation_samples_json);
         try std.testing.expectEqual(@as(usize, 1), completed.violation_sample_count);
         try std.testing.expect(completed.violations_truncated);
@@ -45586,6 +45617,8 @@ test "db foreign key integrity job records persist intent and completion" {
     try std.testing.expectEqualStrings("complete", persisted.status);
     try std.testing.expectEqual(@as(u32, 2), persisted.attempts);
     try std.testing.expectEqual(@as(u64, 12), persisted.last_report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 12), persisted.aggregate_report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 1), persisted.aggregate_report.missing_parent_rows);
     try std.testing.expectEqualStrings("[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]", persisted.violation_samples_json);
     try std.testing.expectEqual(@as(usize, 1), persisted.violation_sample_count);
     try std.testing.expect(persisted.violations_truncated);

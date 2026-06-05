@@ -211,7 +211,13 @@ For v1:
   override is persisted as a transaction metadata intent, collected during
   intent resolution/recovery, and applied to the relational participant before
   row intents are replayed, so recovery sees the same effective timing as the
-  original prepare.
+  original prepare. Distributed commit requests expose the same capability as a
+  table-scoped option on the child table that owns the FK constraint. The
+  coordinator uses the effective timing when building parent-existence,
+  externalized-proof, and parent-delete/update absence checks, and it sends the
+  durable override only to participants for that child table; parent-table
+  participants validate proof records without being asked to accept a constraint
+  they do not own.
   Distributed/routed child writes and
   reference-changing transforms externalize deferred parent-existence checks
   through exact prepare-time proof records: the coordinator registers the
@@ -1009,11 +1015,13 @@ the durable FK job record (`status: "invalid"`, `valid: false`, aggregate
 report, and bounded violation sample diagnostics), metadata scheduler warnings,
 and `foreign_key_validation_json` in the internal table record. That metadata
 records the constraint name, action, optional job id, terminal validity, report
-counters, truncation flag, bounded-sample count, compact per-kind sample counts,
-and a small `violation_samples` array with decoded parent/observed tuple values
+counters, aggregate report counters across diagnostic/completion passes,
+truncation flag, bounded-sample count, compact per-kind sample counts, and a
+small `violation_samples` array with decoded parent/observed tuple values
 without writing reserved states into runtime schema JSON. The durable job record
 remains the source for the full bounded sample set merged across passes. A later
-terminal valid promotion clears the stale invalid entry for that constraint.
+terminal valid promotion clears the stale invalid entry for that constraint
+while the job's aggregate report preserves the earlier diagnostic history.
 Durable validate/dry-run/repair jobs are also resumed by the same metadata-owned
 background pass without relying on request polling.
 
@@ -1661,7 +1669,8 @@ Implemented:
   changes against the final reverse-reference state, so parent updates and child
   reference rewrites can be prepared in either order;
 - transaction-level timing overrides for named schema-deferred constraints can
-  force `immediate` behavior and are persisted with transaction intents so
+  force `immediate` behavior, are planned by distributed commits as
+  child-table-scoped options, and are persisted with transaction intents so
   replay/recovery uses the same effective timing;
 - distributed/routed child writes and reference-changing transforms register
   parent or unique-owner participants and carry exact deferred proof records to

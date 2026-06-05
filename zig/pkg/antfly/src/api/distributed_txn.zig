@@ -5335,6 +5335,8 @@ test "distributed txn coordinator externalizes deferred foreign key parent check
     const Recorder = struct {
         prepared_child: bool = false,
         prepared_parent: bool = false,
+        expected_timing: db_mod.types.ForeignKeyParentCheck.Timing = .deferred,
+        expect_child_override: bool = false,
 
         fn worker(self: *@This()) ParticipantWorker {
             return .{
@@ -5365,18 +5367,26 @@ test "distributed txn coordinator externalizes deferred foreign key parent check
                 try std.testing.expectEqualStrings("doc:a-order", check.child_key);
                 try std.testing.expectEqualStrings("customers", check.parent_table);
                 try std.testing.expectEqualStrings("cust:z-customer", check.parent_key);
-                try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, check.timing);
+                try std.testing.expectEqual(self.expected_timing, check.timing);
+                if (self.expect_child_override) {
+                    try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_constraint_timing_overrides.len);
+                    try std.testing.expectEqualStrings("orders_customer_id_fkey", req.req.foreign_key_constraint_timing_overrides[0].constraint_name);
+                    try std.testing.expectEqual(self.expected_timing, req.req.foreign_key_constraint_timing_overrides[0].timing);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), req.req.foreign_key_constraint_timing_overrides.len);
+                }
                 self.prepared_child = true;
             } else if (group_id == 8002) {
                 try std.testing.expectEqualStrings("customers", table_name);
                 try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_parent_checks.len);
+                try std.testing.expectEqual(@as(usize, 0), req.req.foreign_key_constraint_timing_overrides.len);
                 const check = req.req.foreign_key_parent_checks[0];
                 try std.testing.expectEqualStrings("orders_customer_id_fkey", check.constraint_name);
                 try std.testing.expectEqualStrings("docs", check.child_table);
                 try std.testing.expectEqualStrings("doc:a-order", check.child_key);
                 try std.testing.expectEqualStrings("customers", check.parent_table);
                 try std.testing.expectEqualStrings("cust:z-customer", check.parent_key);
-                try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, check.timing);
+                try std.testing.expectEqual(self.expected_timing, check.timing);
                 self.prepared_parent = true;
             } else return error.UnexpectedGroup;
         }
@@ -5406,6 +5416,32 @@ test "distributed txn coordinator externalizes deferred foreign key parent check
     try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
     try std.testing.expect(recorder.prepared_child);
     try std.testing.expect(recorder.prepared_parent);
+
+    var immediate_recorder = Recorder{
+        .expected_timing = .immediate,
+        .expect_child_override = true,
+    };
+    const immediate_txn_id = try parseTxnIdHex("1111222233334444555566667777999a");
+    const immediate_result = try executeMultiTableCommit(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        immediate_recorder.worker(),
+        immediate_txn_id,
+        10_002,
+        10_003,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{.{ .key = "doc:a-order", .value = "{\"customer_id\":\"cust:z-customer\"}" }},
+            .foreign_key_constraint_timing_overrides = &.{.{
+                .constraint_name = "orders_customer_id_fkey",
+                .timing = .immediate,
+            }},
+        }},
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 2), immediate_result.committed.participant_count);
+    try std.testing.expect(immediate_recorder.prepared_child);
+    try std.testing.expect(immediate_recorder.prepared_parent);
 }
 
 test "single-table distributed txn coordinator registers foreign key parent groups" {
