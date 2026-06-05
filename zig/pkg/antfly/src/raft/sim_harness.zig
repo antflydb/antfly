@@ -2611,6 +2611,7 @@ test "managed http host simulations elect and replicate over real HTTP" {
     };
 
     var sim_a = try ManagedHttpHostSimulation.init(std.testing.allocator, .{
+        .async_transport = false,
         .host = .{
             .http = .{
                 .host = .{ .local_node_id = 1 },
@@ -2634,6 +2635,7 @@ test "managed http host simulations elect and replicate over real HTTP" {
     defer sim_a.deinit();
 
     var sim_b = try ManagedHttpHostSimulation.init(std.testing.allocator, .{
+        .async_transport = false,
         .host = .{
             .http = .{
                 .host = .{ .local_node_id = 2 },

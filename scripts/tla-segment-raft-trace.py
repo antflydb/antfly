@@ -83,23 +83,28 @@ def segment_trace(lines):
             new_run = True
 
         if new_run:
+            current_has_activity = any(
+                json.loads(l)["event"]["name"] not in BOOTSTRAP_EVENTS
+                for l in current
+            )
             # Pull back trailing bootstrap events that belong to the new run.
             overflow = []
-            while current:
-                prev = json.loads(current[-1])
-                if prev["event"]["name"] in BOOTSTRAP_EVENTS:
-                    pnid = prev["event"]["nid"]
-                    has_activity = any(
-                        json.loads(l)["event"]["nid"] == pnid
-                        and json.loads(l)["event"]["name"] not in BOOTSTRAP_EVENTS
-                        for l in current
-                    )
-                    if not has_activity:
-                        overflow.insert(0, current.pop())
+            if current_has_activity:
+                while current:
+                    prev = json.loads(current[-1])
+                    if prev["event"]["name"] in BOOTSTRAP_EVENTS:
+                        pnid = prev["event"]["nid"]
+                        has_activity = any(
+                            json.loads(l)["event"]["nid"] == pnid
+                            and json.loads(l)["event"]["name"] not in BOOTSTRAP_EVENTS
+                            for l in current
+                        )
+                        if not has_activity:
+                            overflow.insert(0, current.pop())
+                        else:
+                            break
                     else:
                         break
-                else:
-                    break
 
             if current:
                 segments.append(current)
@@ -166,6 +171,18 @@ def main():
                 missing = bootstrap_nids - nids
                 print(f"  SKIP nseg-{i} ({len(seg)} events, missing nodes {missing})")
                 continue
+        message_nids = set()
+        for l in seg:
+            o = json.loads(l)
+            msg = o["event"].get("msg")
+            if msg:
+                message_nids.add(msg.get("from"))
+                message_nids.add(msg.get("to"))
+        message_nids.discard(None)
+        if not message_nids.issubset(nids):
+            missing = message_nids - nids
+            print(f"  SKIP nseg-{i} ({len(seg)} events, messages reference missing nodes {missing})")
+            continue
         # Every node's first bootstrap event must come before its first
         # non-bootstrap event. TLA+ BootstrapLogIndicesForServer(i) requires
         # a bootstrap prefix for each node.
