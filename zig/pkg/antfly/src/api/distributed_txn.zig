@@ -1052,8 +1052,12 @@ fn forEachForeignKeyRefOwnerChildPage(
     parent_key: []const u8,
     callback: ForeignKeyRefOwnerPageCallback,
 ) !void {
-    var start_after_child_table: ?[]const u8 = null;
-    var start_after_child_key: ?[]const u8 = null;
+    var start_after_child_table: ?[]u8 = null;
+    var start_after_child_key: ?[]u8 = null;
+    defer {
+        if (start_after_child_table) |value| alloc.free(value);
+        if (start_after_child_key) |value| alloc.free(value);
+    }
     while (true) {
         var page = try worker.foreignKeyRefChildrenPageGroup(alloc, group_id, child_table_name, .{
             .constraint_name = constraint_name,
@@ -1068,8 +1072,18 @@ fn forEachForeignKeyRefOwnerChildPage(
         try callback.callback(callback.ctx, page.children);
 
         if (page.complete) break;
-        start_after_child_table = page.next_child_table orelse return error.InvalidTxnRequest;
-        start_after_child_key = page.next_child_key orelse return error.InvalidTxnRequest;
+        const next_child_table = page.next_child_table orelse return error.InvalidTxnRequest;
+        const next_child_key = page.next_child_key orelse return error.InvalidTxnRequest;
+        const next = blk: {
+            const table_copy = try alloc.dupe(u8, next_child_table);
+            errdefer alloc.free(table_copy);
+            const key_copy = try alloc.dupe(u8, next_child_key);
+            break :blk .{ .table = table_copy, .key = key_copy };
+        };
+        if (start_after_child_table) |value| alloc.free(value);
+        if (start_after_child_key) |value| alloc.free(value);
+        start_after_child_table = next.table;
+        start_after_child_key = next.key;
     }
 }
 
@@ -1097,7 +1111,6 @@ fn explainRoutedForeignKeyRefOwnerChildPage(
             explain.plan.planned_cascade_deletes +|= @intCast(children.len);
             explain.plan.planned_row_deletes +|= @intCast(children.len);
         },
-        else => return error.UnsupportedOperation,
     }
 }
 
@@ -7692,6 +7705,7 @@ test "distributed txn coordinator routes distributed foreign key set-null action
         checked_child_groups: u8 = 0,
         prepared_parent_delete: bool = false,
         prepared_owner_conflict: bool = false,
+        owner_page_calls: u8 = 0,
 
         fn worker(self: *@This()) ParticipantWorker {
             return .{
@@ -7701,7 +7715,7 @@ test "distributed txn coordinator routes distributed foreign key set-null action
                     .prepare_group = prepare,
                     .resolve_group = resolve,
                     .status_group = status,
-                    .foreign_key_ref_children_group = foreignKeyRefChildrenGroup,
+                    .foreign_key_ref_children_page_group = foreignKeyRefChildrenPageGroup,
                 },
             };
         }
@@ -7751,33 +7765,64 @@ test "distributed txn coordinator routes distributed foreign key set-null action
             return .pending;
         }
 
-        fn foreignKeyRefChildrenGroup(
-            _: *anyopaque,
+        fn foreignKeyRefChildrenPageGroup(
+            ptr: *anyopaque,
             alloc: std.mem.Allocator,
             group_id: u64,
             table_name: []const u8,
             req: ForeignKeyRefChildrenRequest,
-        ) ![]db_mod.types.ForeignKeyRefChild {
+        ) !db_mod.types.ForeignKeyRefChildrenPage {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(u64, 9001), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("orders_customer_id_fkey", req.constraint_name);
             try std.testing.expectEqualStrings("customers", req.parent_table);
             try std.testing.expectEqualStrings("cust:z-customer", req.parent_key);
-            const children = try alloc.alloc(db_mod.types.ForeignKeyRefChild, 2);
+
+            self.owner_page_calls += 1;
+            const children = try alloc.alloc(db_mod.types.ForeignKeyRefChild, 1);
             errdefer alloc.free(children);
-            children[0] = .{
-                .child_table = try alloc.dupe(u8, "row"),
-                .child_key = try alloc.dupe(u8, "doc:a-order"),
-            };
-            errdefer {
-                alloc.free(@constCast(children[0].child_table));
-                alloc.free(@constCast(children[0].child_key));
+            if (self.owner_page_calls == 1) {
+                try std.testing.expect(req.start_after_child_table == null);
+                try std.testing.expect(req.start_after_child_key == null);
+                children[0] = try makeRefChild(alloc, "doc:a-order");
+                errdefer freeRefChild(alloc, children[0]);
+                const cursor = blk: {
+                    const table = try alloc.dupe(u8, "row");
+                    errdefer alloc.free(table);
+                    const key = try alloc.dupe(u8, "doc:a-order");
+                    break :blk .{ .table = table, .key = key };
+                };
+                return .{
+                    .children = children,
+                    .complete = false,
+                    .next_child_table = cursor.table,
+                    .next_child_key = cursor.key,
+                };
             }
-            children[1] = .{
-                .child_table = try alloc.dupe(u8, "row"),
-                .child_key = try alloc.dupe(u8, "doc:z-order"),
+            try std.testing.expectEqual(@as(u8, 2), self.owner_page_calls);
+            try std.testing.expectEqualStrings("row", req.start_after_child_table orelse return error.TestUnexpectedResult);
+            try std.testing.expectEqualStrings("doc:a-order", req.start_after_child_key orelse return error.TestUnexpectedResult);
+            children[0] = try makeRefChild(alloc, "doc:z-order");
+            return .{
+                .children = children,
+                .complete = true,
             };
-            return children;
+        }
+
+        fn makeRefChild(alloc: std.mem.Allocator, child_key: []const u8) !db_mod.types.ForeignKeyRefChild {
+            const child_table = try alloc.dupe(u8, "row");
+            errdefer alloc.free(child_table);
+            const key = try alloc.dupe(u8, child_key);
+            return .{
+                .child_table = child_table,
+                .child_key = key,
+            };
+        }
+
+        fn freeRefChild(alloc: std.mem.Allocator, child: db_mod.types.ForeignKeyRefChild) void {
+            alloc.free(@constCast(child.child_table));
+            alloc.free(@constCast(child.child_key));
         }
     };
 
@@ -7799,6 +7844,7 @@ test "distributed txn coordinator routes distributed foreign key set-null action
     try std.testing.expectEqual(@as(usize, 4), result.committed.participant_count);
     try std.testing.expect(recorder.prepared_parent_delete);
     try std.testing.expectEqual(@as(u8, 2), recorder.checked_child_groups);
+    try std.testing.expectEqual(@as(u8, 2), recorder.owner_page_calls);
     try std.testing.expect(recorder.prepared_owner_conflict);
 }
 

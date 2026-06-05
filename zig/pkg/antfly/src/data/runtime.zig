@@ -317,10 +317,9 @@ const RaftTableApplyStateMachine = struct {
     }
 };
 
-/// Backs the standalone data server's health/metrics endpoints. The data
-/// server has no local raft, so readiness is delegated to its remote
-/// metadata status source (which mirrors the existing `/readyz` logic on
-/// the main API port) and metrics export a minimal up gauge.
+/// Backs the standalone data server's health/metrics endpoints. Readiness is
+/// local-only so Kubernetes probes cannot block indefinitely behind a wedged
+/// remote metadata API.
 pub const HealthSource = struct {
     data_server: *DataServer,
 
@@ -340,8 +339,7 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
-        _ = self.data_server.status_source.status() catch return false;
-        return true;
+        return self.data_server.http_server != null and self.data_server.listener != null;
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
@@ -1914,27 +1912,31 @@ pub const DataServer = struct {
             self.data_raft_base_uri = try raft.baseUri(self.alloc);
         }
         if (self.listener == null) {
-            self.listener = antfly.raft.transport.std_http_listener.StdHttpListener.init(
-                self.alloc,
-                self.listener_cfg,
-                self.http_server.?.executor(),
-            );
+            self.listener = if (self.backend_runtime) |runtime|
+                if (runtime.apiIoImpl()) |io_impl|
+                    antfly.raft.transport.std_http_listener.StdHttpListener.initShared(
+                        self.alloc,
+                        self.listener_cfg,
+                        self.http_server.?.executor(),
+                        io_impl,
+                    )
+                else
+                    antfly.raft.transport.std_http_listener.StdHttpListener.init(
+                        self.alloc,
+                        self.listener_cfg,
+                        self.http_server.?.executor(),
+                    )
+            else
+                antfly.raft.transport.std_http_listener.StdHttpListener.init(
+                    self.alloc,
+                    self.listener_cfg,
+                    self.http_server.?.executor(),
+                );
         }
         self.listener.?.setStreamingExecutor(self.http_server.?.streamingExecutor());
         try self.listener.?.start();
         if (self.store_registration != null) {
             self.store_status_dirty = true;
-            self.registerNodeIfConfigured() catch |err| switch (err) {
-                error.HttpConnectionClosing,
-                error.ConnectionResetByPeer,
-                error.ConnectionRefused,
-                error.BrokenPipe,
-                error.EndOfStream,
-                error.UnexpectedHttpStatus,
-                error.NotListening,
-                => std.log.warn("data node registration deferred err={}", .{err}),
-                else => return err,
-            };
         }
         self.requestRuntimeStatusRefresh() catch |err| switch (err) {
             error.ThreadQuotaExceeded,
@@ -5486,6 +5488,10 @@ pub const DataServer = struct {
         remote_metadata.* = try RemoteMetadataSource.init(alloc, metadata_api_urls);
         errdefer remote_metadata.deinit();
 
+        var owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null;
+        errdefer if (owned_backend_runtime) |*runtime| runtime.deinit();
+        var backend_runtime = cfg.backend_runtime;
+
         var data_raft_store: ?*raft_engine.core.MemoryStorage = null;
         errdefer if (data_raft_store) |store| {
             store.deinit();
@@ -5509,6 +5515,12 @@ pub const DataServer = struct {
 
         if (cfg.enable_data_raft) {
             if (cfg.store_registration) |registration| {
+                if (backend_runtime == null) {
+                    owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+                    backend_runtime = owned_backend_runtime.?.ptr();
+                }
+                const raft_backend_runtime = backend_runtime.?;
+
                 data_raft_store = try alloc.create(raft_engine.core.MemoryStorage);
                 data_raft_store.?.* = raft_engine.core.MemoryStorage.init(alloc);
 
@@ -5520,7 +5532,7 @@ pub const DataServer = struct {
                     alloc,
                     cfg.replica_root_dir,
                     remote_metadata.catalogSource(),
-                    cfg.backend_runtime,
+                    raft_backend_runtime,
                 );
 
                 data_raft = try alloc.create(antfly.raft.ManagedHttpHostService);
@@ -5544,6 +5556,7 @@ pub const DataServer = struct {
                     },
                 }, .{
                     .http = .{
+                        .backend_runtime = raft_backend_runtime,
                         .host = .{
                             .descriptor_factory = data_raft_factory.?.iface(),
                             .runtime_hooks = .{
@@ -5557,7 +5570,7 @@ pub const DataServer = struct {
             }
         }
 
-        return .{
+        const server = DataServer{
             .alloc = alloc,
             .remote_metadata = remote_metadata,
             .data_raft = data_raft,
@@ -5581,9 +5594,12 @@ pub const DataServer = struct {
             .status_source = remote_metadata.statusSource(),
             .api_server_cfg = cfg.api_server_cfg,
             .query_async_limit = cfg.query_async_limit,
-            .backend_runtime = cfg.backend_runtime,
+            .backend_runtime = backend_runtime,
+            .owned_backend_runtime = owned_backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
+        owned_backend_runtime = null;
+        return server;
     }
 };
 

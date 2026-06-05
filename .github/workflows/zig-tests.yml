@@ -254,6 +254,7 @@ jobs:
   full-default:
     if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
+    timeout-minutes: 60
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
@@ -279,7 +280,27 @@ jobs:
         run: zig version
 
       - name: Run full Zig unit tests
-        run: make zig-test
+        run: make zig-unit-test
+
+      - name: Run Zig simulation tests
+        working-directory: zig
+        run: zig build sim-test
+
+      - name: Run Zig integration tests
+        working-directory: zig
+        run: zig build integration-test
+
+      - name: Run Zig recall tests
+        working-directory: zig
+        run: zig build recall-test
+
+      - name: Run Zig recall harness
+        working-directory: zig
+        run: zig build recall-harness -- --dataset-dir testdata/vectorsets
+
+      - name: Run Zig chaos tests
+        working-directory: zig
+        run: zig build chaos-test
 
   e2e-base:
     needs: changes

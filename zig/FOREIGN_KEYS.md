@@ -32,11 +32,12 @@ Hosted primary-key `set_null` and bounded primary-key `cascade` parent deletes
 use the same owner topology when it is available: the coordinator scans the
 FK-ref owner prefix through a deterministic child-table/child-key page contract
 before prepare, registers the exact child-row participants discovered by the
-bounded page, sends explicit FK-ref delete mutations to the owner participant,
-and sends direct child-key set-null or cascade actions to each child
-participant. The current interactive coordinator consumes one bounded page and
-fails closed if the owner scan is incomplete; the same cursor contract is the
-substrate for future resumable large-operation execution. That gives
+cursor-drained scan, sends explicit FK-ref delete mutations to the owner
+participant, and sends direct child-key set-null or cascade actions to each
+child participant. The current interactive coordinator drains all owner pages
+into one 2PC before prepare; the same cursor contract is the substrate for
+future durable, multi-round large-operation execution when a hot parent should
+not be planned in one foreground request. That gives
 cross-table primary-key FKs the same recovery substrate as ordinary relational
 writes, makes missing parents fail prepare on the parent participant, and makes
 known child references fail prepare, rewrite, or delete on the FK-ref owner or
@@ -937,8 +938,9 @@ Work:
   for primary-key `restrict` FKs when owner ranges are configured, with broad
   child-table fanout retained only as the no-owner-topology fallback. Owner
   scans use a deterministic child-table/child-key page cursor in the internal
-  storage/API contract; interactive parent deletes still require the first
-  bounded page to be complete before prepare;
+  storage/API contract; interactive parent deletes drain those cursor pages
+  before prepare and fail closed if the owner topology or cursor contract is
+  invalid;
 - use the FK-ref owner participant as the conflict point between child reference
   creation and parent delete;
 - support split/merge/rebuild of FK-ref ranges using topology epochs. The
@@ -1037,9 +1039,10 @@ Remaining work:
 - distributed large-operation execution and recovery for high-fanout
   `set_null` / `cascade` parent deletes. The validation/repair controller can
   already discover and advance durable integrity jobs without a public request
-  loop; high-fanout data-changing operations still need a durable operation
-  plan, resume cursor, idempotent participant execution, and operator-visible
-  recovery diagnostics.
+  loop, and routed parent-delete planning now consumes FK-ref owner pages by
+  cursor; high-fanout data-changing operations still need a durable operation
+  record, persisted resume cursor, idempotent participant execution across
+  bounded rounds, and operator-visible recovery diagnostics.
 
 Repair may rebuild missing/corrupt secondary metadata, but it must not silently
 mutate user rows. Orphaned child rows should be reported for explicit operator
@@ -1277,20 +1280,23 @@ Implemented:
 - the public/hosted foreign-key integrity operation exposes the same
   parent-delete explain report through `action: "explain_delete"`. Hosted and
   provisioned explain use exact FK-ref owner discovery when owner topology
-  exists, scan the bounded owner prefix, report the first-hop child set-null
-  count, and fail closed on incomplete owner scans; otherwise they route to the
-  target document key's owning group.
+  exists, drain the owner prefix through child-table/child-key cursor pages,
+  report the first-hop child set-null count, and fail closed only if owner
+  topology or page cursors are invalid; otherwise they route to the target
+  document key's owning group.
 - hosted distributed parent deletes for primary-key and declared unique-target
   `set_null` use exact routed FK-ref owner discovery when owner topology exists.
   The coordinator scans the owner prefix for the deleted parent key or encoded
-  unique tuple using the internal page cursor, registers only the discovered
-  child-row participants, sends FK-ref delete mutations to the owner
+  unique tuple using the internal page cursor until the scan is complete,
+  registers only the discovered child-row participants, sends FK-ref delete
+  mutations to the owner
   participant, and sends direct child-key set-null actions to each child
   participant. Each child participant validates the FK metadata, rewrites the
   nullable FK columns for that exact child key, and updates derived indexes and
   local reverse refs through the normal relational write participant.
-  Interactive execution still requires the bounded page to be complete before
-  prepare.
+  Interactive execution still stages all discovered child actions in one 2PC;
+  durable chunked execution is the remaining large-operation step for very hot
+  parent keys.
 - without FK-ref owner topology, hosted distributed parent deletes for
   primary-key `set_null` fall back to broad child-range fanout. Each child
   participant receives a parent-delete instruction, scans its local
@@ -1300,9 +1306,10 @@ Implemented:
 
 Remaining work:
 
-- add hosted resumable execution on top of the owner-scan cursor for scans that
-  exceed the interactive action limit;
-- add explicit large-operation mode for distributed fanout, retry, and recovery.
+- add hosted durable execution on top of the owner-scan cursor for fanout that
+  should not be planned in one foreground 2PC;
+- add explicit large-operation mode for distributed fanout, retry, recovery,
+  and progress diagnostics.
 
 ### 8. `on_delete: cascade`
 
@@ -1322,20 +1329,21 @@ Implemented:
 - the public/hosted foreign-key integrity operation exposes the same
   parent-delete explain report through `action: "explain_delete"`. Hosted and
   provisioned explain use exact FK-ref owner discovery when owner topology
-  exists, scan the bounded owner prefix, report the first-hop cascade child
-  delete count, and fail closed on incomplete owner scans; otherwise they route
-  to the target document key's owning group.
+  exists, drain the owner prefix through child-table/child-key cursor pages,
+  report the first-hop cascade child delete count, and fail closed only if
+  owner topology or page cursors are invalid; otherwise they route to the target
+  document key's owning group.
 - hosted distributed parent deletes for primary-key and declared unique-target
   cascade use exact routed FK-ref owner discovery when owner topology exists.
   The coordinator scans the bounded owner prefix for the deleted parent key or
-  encoded unique tuple using the internal page cursor, registers only the
-  discovered child-row participants, sends FK-ref delete mutations to the owner
-  participant, and sends direct child-key cascade actions to each child
-  participant. Each child participant validates the FK metadata, verifies the
-  child still references the parent identity, and deletes the exact child row
-  through the normal relational write participant. Local recursive cascade
-  planning still runs on that participant, so same-range descendants are deleted
-  with the same row/index/reverse-ref cleanup.
+  encoded unique tuple using the internal page cursor until the scan is
+  complete, registers only the discovered child-row participants, sends FK-ref
+  delete mutations to the owner participant, and sends direct child-key cascade
+  actions to each child participant. Each child participant validates the FK
+  metadata, verifies the child still references the parent identity, and deletes
+  the exact child row through the normal relational write participant. Local
+  recursive cascade planning still runs on that participant, so same-range
+  descendants are deleted with the same row/index/reverse-ref cleanup.
 - hosted distributed parent deletes for primary-key and declared unique-target
   cascade fail closed when FK-ref owner topology is absent; broad child-range
   fanout is not used for cascade because it is not a deterministic dependency
