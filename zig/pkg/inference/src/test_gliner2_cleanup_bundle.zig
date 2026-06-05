@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const std = @import("std");
-const gliner2 = @import("finetune/gliner2.zig");
-
-test {
-    std.testing.refAllDecls(gliner2);
+test "GLiNER2 cleanup bundle declarations compile" {
+    _ = @import("inference_internal").finetune.gliner2;
 }

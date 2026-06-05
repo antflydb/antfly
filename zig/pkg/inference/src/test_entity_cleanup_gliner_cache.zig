@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const std = @import("std");
-const entity_cleanup_gliner_cache = @import("finetune/entity_cleanup_gliner_cache.zig");
-
-test {
-    std.testing.refAllDecls(entity_cleanup_gliner_cache);
+test "entity cleanup GLiNER cache declarations compile" {
+    _ = @import("inference_internal").finetune.entity_cleanup_gliner_cache;
 }

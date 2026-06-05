@@ -70,14 +70,14 @@ const tests = [_]common.TestSpec{
         .step_name = "test-entity-cleanup-gliner-cache",
         .root_source_file = "src/test_entity_cleanup_gliner_cache.zig",
         .description = "Run isolated GLiNER2-native entity cleanup cache tests",
-        .imports = &.{ .antfly_platform, .build_options, .inference_hf_tokenizer, .inference_linalg, .ml, .onnx_graph },
+        .imports = &.{ .antfly_platform, .build_options, .inference_hf_tokenizer, .inference_linalg, .ml, .onnx_graph, .inference_internal },
         .native_link = .default,
     },
     .{
         .step_name = "test-gliner2-cleanup-bundle",
         .root_source_file = "src/test_gliner2_cleanup_bundle.zig",
         .description = "Run GLiNER2 cleanup bundle propagation tests",
-        .imports = &.{ .antfly_platform, .build_options, .ml, .pjrt, .inference_linalg, .onnx_graph },
+        .imports = &.{ .antfly_platform, .build_options, .ml, .pjrt, .inference_linalg, .onnx_graph, .inference_internal },
         .native_link = .default,
     },
     .{
