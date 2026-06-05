@@ -548,6 +548,17 @@ pub const BatchResponse = struct {
     transformed: ?i64 = null,
 };
 
+/// Structured primary-key identity. Keys are the declared `primary_key.columns`; values are JSON scalar values coerced with the table's relational column types.
+pub const RowPrimarySelector = struct {};
+
+/// Reserved structured unique-key selector. Public APIs reject this shape until unique selectors resolve through durable unique-owner rows.
+pub const RowUniqueSelector = struct {
+    /// Unique constraint name.
+    name: []const u8,
+    /// Values for the declared unique-constraint columns.
+    values: std.json.Value,
+};
+
 /// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
 pub const TransactionReadItem = struct {
     /// Table name the key belongs to
@@ -1425,6 +1436,12 @@ pub const TransactionCommitResponse = struct {
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
 };
 
+/// Structured row selector. `primary` is supported for declared primary-key tables. `unique` is reserved until routed unique-owner resolution is exposed publicly.
+pub const RowSelector = struct {
+    primary: ?RowPrimarySelector = null,
+    unique: ?RowUniqueSelector = null,
+};
+
 pub const TransactionStageReadResponse = struct {
     status: []const u8,
     transaction_id: []const u8,
@@ -1725,6 +1742,31 @@ pub const TransactionSessionCommitResponse = struct {
     transaction_id: []const u8,
 };
 
+/// Structured relational row mutation. `insert` fails if the primary identity already exists, `upsert` overwrites or creates, `update` applies a non-upsert patch by primary identity, and `delete` removes by primary identity. `update.patch` cannot change primary-key components.
+pub const RowOperation = struct {
+    op: []const u8,
+    /// Full row document for insert/upsert. Must include primary-key columns.
+    row: ?std.json.Value = null,
+    where: ?RowSelector = null,
+    /// Top-level field patch for update operations.
+    patch: ?std.json.Value = null,
+};
+
+pub const RowsGetRequest = struct {
+    keys: []const RowSelector,
+    /// Include the diagnostic storage-owned physical key in each result.
+    include_physical_key: ?bool = null,
+};
+
+pub const RowsGetResult = struct {
+    identity: ?RowSelector = null,
+    found: ?bool = null,
+    row: ?std.json.Value = null,
+    version: ?i64 = null,
+    /// Diagnostic storage-owned physical key. Do not persist as public row identity.
+    physical_key: ?[]const u8 = null,
+};
+
 pub const SSEStepCompleted = AgentStep;
 
 /// Result from the retrieval agent
@@ -1845,6 +1887,15 @@ pub const BatchRequest = struct {
     /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($currentDate) - Manage arrays (add/remove tags, items) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
     sync_level: ?SyncLevel = null,
+};
+
+pub const RowsBatchRequest = struct {
+    operations: []const RowOperation,
+    sync_level: ?SyncLevel = null,
+};
+
+pub const RowsGetResponse = struct {
+    rows: ?[]const RowsGetResult = null,
 };
 
 pub const QueryRequest = struct {

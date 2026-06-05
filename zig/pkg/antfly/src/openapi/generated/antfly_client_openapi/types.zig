@@ -573,6 +573,17 @@ pub const BatchResponse = struct {
     transformed: ?i64 = null,
 };
 
+/// Structured primary-key identity. Keys are the declared `primary_key.columns`; values are JSON scalar values coerced with the table's relational column types.
+pub const RowPrimarySelector = struct {};
+
+/// Reserved structured unique-key selector. Public APIs reject this shape until unique selectors resolve through durable unique-owner rows.
+pub const RowUniqueSelector = struct {
+    /// Unique constraint name.
+    name: []const u8,
+    /// Values for the declared unique-constraint columns.
+    values: std.json.Value,
+};
+
 /// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
 pub const TransactionReadItem = struct {
     /// Table name the key belongs to
@@ -2020,6 +2031,12 @@ pub const ForeignKeyReference = struct {
     columns: ?[]const []const u8 = null,
 };
 
+/// Relational primary-key constraint.
+pub const PrimaryKey = struct {
+    /// Primary-key columns. One or more ordered required non-json relational columns are supported.
+    columns: ?[]const []const u8 = null,
+};
+
 /// Relational unique constraint.
 pub const UniqueConstraint = struct {
     /// Constraint name, unique within the table schema.
@@ -3278,6 +3295,12 @@ pub const TransactionCommitResponse = struct {
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
 };
 
+/// Structured row selector. `primary` is supported for declared primary-key tables. `unique` is reserved until routed unique-owner resolution is exposed publicly.
+pub const RowSelector = struct {
+    primary: ?RowPrimarySelector = null,
+    unique: ?RowUniqueSelector = null,
+};
+
 pub const TransactionStageReadResponse = struct {
     status: []const u8,
     transaction_id: []const u8,
@@ -3701,10 +3724,10 @@ pub const ForeignKey = struct {
     on_delete: ?[]const u8 = null,
     /// Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
     on_update: ?[]const u8 = null,
-    /// Constraint timing. "deferred" is enforced for local relational transactions at commit and routed child writes through exact parent-check proof records.
+    /// Constraint timing. Canonical values are "immediate" and "deferred"; SQL-shaped aliases such as "INITIALLY DEFERRED" and combined deferrability clauses are accepted and normalized by schema parsing.
     timing: ?[]const u8 = null,
-    /// Whether transaction-level timing overrides may change this constraint's effective timing. Omitted defaults to false unless timing is "deferred" for compatibility; true with timing "immediate" represents DEFERRABLE INITIALLY IMMEDIATE.
-    deferrable: ?bool = null,
+    /// Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility.
+    deferrable: ?std.json.Value = null,
     /// Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
     match: ?[]const u8 = null,
     /// Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
@@ -4273,6 +4296,31 @@ pub const TransactionSessionCommitResponse = struct {
     /// Per-table batch results (only present when status is "committed")
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
     transaction_id: []const u8,
+};
+
+/// Structured relational row mutation. `insert` fails if the primary identity already exists, `upsert` overwrites or creates, `update` applies a non-upsert patch by primary identity, and `delete` removes by primary identity. `update.patch` cannot change primary-key components.
+pub const RowOperation = struct {
+    op: []const u8,
+    /// Full row document for insert/upsert. Must include primary-key columns.
+    row: ?std.json.Value = null,
+    where: ?RowSelector = null,
+    /// Top-level field patch for update operations.
+    patch: ?std.json.Value = null,
+};
+
+pub const RowsGetRequest = struct {
+    keys: []const RowSelector,
+    /// Include the diagnostic storage-owned physical key in each result.
+    include_physical_key: ?bool = null,
+};
+
+pub const RowsGetResult = struct {
+    identity: ?RowSelector = null,
+    found: ?bool = null,
+    row: ?std.json.Value = null,
+    version: ?i64 = null,
+    /// Diagnostic storage-owned physical key. Do not persist as public row identity.
+    physical_key: ?[]const u8 = null,
 };
 
 pub const SSEStepCompleted = AgentStep;
@@ -4852,6 +4900,15 @@ pub const BatchRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
+pub const RowsBatchRequest = struct {
+    operations: []const RowOperation,
+    sync_level: ?SyncLevel = null,
+};
+
+pub const RowsGetResponse = struct {
+    rows: ?[]const RowsGetResult = null,
+};
+
 /// Declarative graph query to execute after full-text/vector searches
 pub const GraphQuery = struct {
     type: GraphQueryType,
@@ -5009,6 +5066,8 @@ pub const TableSchema = struct {
     dynamic_templates: ?[]const DynamicTemplate = null,
     /// Relational-mode referential constraints. Supported targets are a parent table's `_id` document key or a same-table declared unique parent column tuple with `on_delete: "restrict"` / `on_delete: "no_action"` or bounded local nullable-column `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`. `on_update: "restrict"` and `on_update: "no_action"` are accepted as parent-key update checks, and mutating `set_null`/`cascade` update actions are supported where owner topology is configured. `match: "simple"` is the default; `full` is accepted for composite nullable references, and `partial` is rejected until row-subset parent matching is implemented. Cross-table unique targets require routed parent-table unique participants. Unsupported shapes are rejected during schema validation.
     foreign_keys: ?[]const ForeignKey = null,
+    /// Relational-mode primary key over one or more ordered declared non-json relational columns. Every component must be required and present on every row. When omitted, `_id` remains the document-key primary identity. `_id` cannot be mixed into a declared composite primary-key tuple.
+    primary_key: ?PrimaryKey = null,
     /// Relational-mode unique constraints over one or more ordered declared non-json relational columns. Present scalar tuples are enforced by committed integrity rows; rows with any absent nullable component do not create unique rows.
     unique_constraints: ?[]const UniqueConstraint = null,
 };

@@ -87,6 +87,8 @@ const ForeignKeyActionJobRequestWire = struct {
     parent_key: ?[]const u8 = null,
     updated_parent_key: ?[]const u8 = null,
     page_limit: ?usize = null,
+    cascade_depth: ?u32 = null,
+    cascade_max_depth: ?u32 = null,
     lease_ms: ?u64 = null,
     schedule_only: bool = false,
     requeue_only: bool = false,
@@ -94,28 +96,57 @@ const ForeignKeyActionJobRequestWire = struct {
 
 const ForeignKeyActionScheduleRequestWire = struct {
     schedule_id: ?[]const u8 = null,
+    action_job_id: ?[]const u8 = null,
+    action: ?[]const u8 = null,
+    worker_id: ?[]const u8 = null,
+    constraint_name: ?[]const u8 = null,
+    parent_table: ?[]const u8 = null,
+    parent_key: ?[]const u8 = null,
+    updated_parent_key: ?[]const u8 = null,
+    page_limit: ?usize = null,
     scheduled_groups: ?u64 = null,
+    requeue_only: bool = false,
 };
 
 fn parseForeignKeyIntegrityAction(value: ?[]const u8) !table_writes.ForeignKeyIntegrityAction {
     const text = value orelse "validate";
-    if (std.mem.eql(u8, text, "plan")) return .plan;
-    if (std.mem.eql(u8, text, "validate")) return .validate;
-    if (std.mem.eql(u8, text, "dry_run")) return .dry_run;
-    if (std.mem.eql(u8, text, "repair")) return .repair;
-    if (std.mem.eql(u8, text, "list")) return .list;
-    if (std.mem.eql(u8, text, "explain_delete")) return .explain_delete;
-    if (std.mem.eql(u8, text, "progress")) return .progress;
+    if (enumTokenEql(text, "plan")) return .plan;
+    if (enumTokenEql(text, "validate")) return .validate;
+    if (enumTokenEql(text, "dry_run")) return .dry_run;
+    if (enumTokenEql(text, "repair")) return .repair;
+    if (enumTokenEql(text, "list")) return .list;
+    if (enumTokenEql(text, "explain_delete")) return .explain_delete;
+    if (enumTokenEql(text, "progress")) return .progress;
     return error.InvalidForeignKeyIntegrityRequest;
 }
 
 fn parseUniqueIntegrityAction(value: ?[]const u8) !table_writes.UniqueConstraintIntegrityAction {
     const text = value orelse "validate";
-    if (std.mem.eql(u8, text, "validate")) return .validate;
-    if (std.mem.eql(u8, text, "dry_run")) return .dry_run;
-    if (std.mem.eql(u8, text, "repair")) return .repair;
-    if (std.mem.eql(u8, text, "progress")) return .progress;
+    if (enumTokenEql(text, "validate")) return .validate;
+    if (enumTokenEql(text, "dry_run")) return .dry_run;
+    if (enumTokenEql(text, "repair")) return .repair;
+    if (enumTokenEql(text, "progress")) return .progress;
     return error.InvalidUniqueIntegrityRequest;
+}
+
+fn enumTokenEql(actual: []const u8, expected: []const u8) bool {
+    var actual_index: usize = 0;
+    var expected_index: usize = 0;
+    while (true) {
+        while (actual_index < actual.len and enumTokenSeparator(actual[actual_index])) actual_index += 1;
+        while (expected_index < expected.len and enumTokenSeparator(expected[expected_index])) expected_index += 1;
+        if (actual_index == actual.len or expected_index == expected.len) break;
+        if (std.ascii.toLower(actual[actual_index]) != std.ascii.toLower(expected[expected_index])) return false;
+        actual_index += 1;
+        expected_index += 1;
+    }
+    while (actual_index < actual.len and enumTokenSeparator(actual[actual_index])) actual_index += 1;
+    while (expected_index < expected.len and enumTokenSeparator(expected[expected_index])) expected_index += 1;
+    return actual_index == actual.len and expected_index == expected.len;
+}
+
+fn enumTokenSeparator(ch: u8) bool {
+    return ch == ' ' or ch == '_' or ch == '-';
 }
 
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
@@ -380,8 +411,13 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         if (parsed.value.schedule_only and parsed.value.requeue_only) {
             return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
         }
-        const maybe_status = if (parsed.value.schedule_only)
-            writes.foreignKeyActionJobGroupLocalSchedule(
+        const maybe_status = if (parsed.value.schedule_only) blk: {
+            const cascade_depth = parsed.value.cascade_depth orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+            const cascade_max_depth = parsed.value.cascade_max_depth orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+            if (cascade_max_depth == 0 or cascade_depth > cascade_max_depth) {
+                return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+            }
+            break :blk writes.foreignKeyActionJobGroupLocalSchedule(
                 ctx.alloc,
                 fk_route.group_id,
                 fk_route.table_name,
@@ -393,8 +429,10 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
                 parent_key,
                 parsed.value.updated_parent_key,
                 @min(parsed.value.page_limit orelse 1024, 10_000),
-            )
-        else if (parsed.value.requeue_only)
+                cascade_depth,
+                cascade_max_depth,
+            );
+        } else if (parsed.value.requeue_only)
             writes.foreignKeyActionJobGroupLocalRequeue(
                 ctx.alloc,
                 fk_route.group_id,
@@ -408,8 +446,13 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
                 parsed.value.updated_parent_key,
                 @min(parsed.value.page_limit orelse 1024, 10_000),
             )
-        else
-            writes.foreignKeyActionJobGroupLocal(
+        else blk: {
+            const cascade_depth = parsed.value.cascade_depth orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+            const cascade_max_depth = parsed.value.cascade_max_depth orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+            if (cascade_max_depth == 0 or cascade_depth > cascade_max_depth) {
+                return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+            }
+            break :blk writes.foreignKeyActionJobGroupLocal(
                 ctx.alloc,
                 fk_route.group_id,
                 fk_route.table_name,
@@ -422,7 +465,10 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
                 parsed.value.updated_parent_key,
                 @min(parsed.value.page_limit orelse 1024, 10_000),
                 parsed.value.lease_ms orelse 60_000,
+                cascade_depth,
+                cascade_max_depth,
             );
+        };
         var status = (maybe_status catch |err| switch (err) {
             error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             error.InvalidForeignKeyActionJob, error.ForeignKeyViolation => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request"),
@@ -470,18 +516,50 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         defer parsed.deinit();
         const schedule_id = parsed.value.schedule_id orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
         if (schedule_id.len == 0) return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
-        var status = (writes.foreignKeyActionScheduleGroupLocalMarkSeeded(
-            ctx.alloc,
-            fk_route.group_id,
-            fk_route.table_name,
-            schedule_id,
-            parsed.value.scheduled_groups orelse 0,
-        ) catch |err| switch (err) {
-            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
-            error.InvalidForeignKeyActionJob => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request"),
-            error.UnknownGroup, error.TableNotFound, error.ForeignKeyActionScheduleNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
-            else => return err,
-        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var status = if (parsed.value.requeue_only) blk: {
+            const action_job_id = parsed.value.action_job_id orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
+            const action = parsed.value.action orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
+            const worker_id = parsed.value.worker_id orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
+            const constraint_name = parsed.value.constraint_name orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
+            const parent_table = parsed.value.parent_table orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
+            const parent_key = parsed.value.parent_key orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
+            const page_limit = parsed.value.page_limit orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
+            if (action_job_id.len == 0 or action.len == 0 or worker_id.len == 0 or constraint_name.len == 0 or parent_table.len == 0 or parent_key.len == 0 or page_limit == 0) {
+                return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request");
+            }
+            break :blk (writes.foreignKeyActionScheduleGroupLocalRequeue(
+                ctx.alloc,
+                fk_route.group_id,
+                fk_route.table_name,
+                schedule_id,
+                action_job_id,
+                action,
+                worker_id,
+                constraint_name,
+                parent_table,
+                parent_key,
+                parsed.value.updated_parent_key,
+                page_limit,
+            ) catch |err| switch (err) {
+                error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+                error.InvalidForeignKeyActionJob => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request"),
+                error.UnknownGroup, error.TableNotFound, error.ForeignKeyActionScheduleNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        } else blk: {
+            break :blk (writes.foreignKeyActionScheduleGroupLocalMarkSeeded(
+                ctx.alloc,
+                fk_route.group_id,
+                fk_route.table_name,
+                schedule_id,
+                parsed.value.scheduled_groups orelse 0,
+            ) catch |err| switch (err) {
+                error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+                error.InvalidForeignKeyActionJob => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action schedule request"),
+                error.UnknownGroup, error.TableNotFound, error.ForeignKeyActionScheduleNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        };
         defer status.deinit(ctx.alloc);
         return try http_route_helpers.jsonResponse(ctx.alloc, status);
     }
@@ -800,7 +878,7 @@ test "internal group write routes expose foreign key integrity" {
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/foreign-key-integrity",
-        .body = "{\"action\":\"dry_run\"}",
+        .body = "{\"action\":\"DRY RUN\"}",
     }, "/internal/v1/groups/7/tables/docs/foreign-key-integrity")).?;
     defer dry_run_resp.deinit(alloc);
 
@@ -883,6 +961,68 @@ test "internal group write routes expose foreign key action job requeue" {
     try std.testing.expectEqualStrings("row", parsed.value.next_child_table.?);
     try std.testing.expectEqualStrings("order:cursor", parsed.value.next_child_key.?);
 
+    var claimed_resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/foreign-key-action-job",
+        .body = "{\"job_id\":\"fk-action:cascade:7\",\"action\":\"cascade\",\"worker_id\":\"worker:claim\",\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"parent_key\":\"customer:7\",\"page_limit\":12,\"lease_ms\":30,\"cascade_depth\":2,\"cascade_max_depth\":8}",
+    }, "/internal/v1/groups/7/tables/docs/foreign-key-action-job")).?;
+    defer claimed_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), claimed_resp.status);
+    var claimed_parsed = try std.json.parseFromSlice(table_writes.ForeignKeyActionJobStatus, alloc, claimed_resp.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer claimed_parsed.deinit();
+    try std.testing.expectEqualStrings("claimed", claimed_parsed.value.status);
+    try std.testing.expectEqual(@as(u32, 2), claimed_parsed.value.cascade_depth);
+    try std.testing.expectEqual(@as(u32, 8), claimed_parsed.value.cascade_max_depth);
+
+    var schedule_resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/foreign-key-action-job",
+        .body = "{\"job_id\":\"fk-action:cascade:7\",\"action\":\"cascade\",\"worker_id\":\"worker:schedule\",\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"parent_key\":\"customer:7\",\"page_limit\":12,\"cascade_depth\":3,\"cascade_max_depth\":9,\"schedule_only\":true}",
+    }, "/internal/v1/groups/7/tables/docs/foreign-key-action-job")).?;
+    defer schedule_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), schedule_resp.status);
+    var schedule_parsed = try std.json.parseFromSlice(table_writes.ForeignKeyActionJobStatus, alloc, schedule_resp.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer schedule_parsed.deinit();
+    try std.testing.expectEqualStrings("scheduled", schedule_parsed.value.status);
+    try std.testing.expectEqual(@as(u32, 3), schedule_parsed.value.cascade_depth);
+    try std.testing.expectEqual(@as(u32, 9), schedule_parsed.value.cascade_max_depth);
+
+    var missing_lineage_resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/foreign-key-action-job",
+        .body = "{\"job_id\":\"fk-action:cascade:7\",\"action\":\"cascade\",\"worker_id\":\"worker:schedule\",\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"parent_key\":\"customer:7\",\"page_limit\":12,\"schedule_only\":true}",
+    }, "/internal/v1/groups/7/tables/docs/foreign-key-action-job")).?;
+    defer missing_lineage_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 400), missing_lineage_resp.status);
+    try std.testing.expectEqualStrings("invalid foreign key action job request", missing_lineage_resp.body);
+
     var invalid_resp = (try handle(.{
         .alloc = alloc,
         .shard_ops = null,
@@ -912,7 +1052,7 @@ test "internal group write routes expose unique integrity" {
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/unique-integrity",
-        .body = "{\"action\":\"repair\"}",
+        .body = "{\"action\":\"REPAIR\"}",
     }, "/internal/v1/groups/7/tables/docs/unique-integrity")).?;
     defer resp.deinit(alloc);
 
@@ -1281,8 +1421,13 @@ const TestWriteSource = struct {
         updated_parent_key: ?[]const u8,
         page_limit: usize,
         _: u64,
+        cascade_depth: u32,
+        cascade_max_depth: u32,
     ) !?table_writes.ForeignKeyActionJobStatus {
-        return try testForeignKeyActionJobStatus(alloc, group_id, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, "claimed");
+        var status = try testForeignKeyActionJobStatus(alloc, group_id, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, "claimed");
+        status.cascade_depth = cascade_depth;
+        status.cascade_max_depth = cascade_max_depth;
+        return status;
     }
 
     fn foreignKeyActionJobGroupLocalSchedule(
@@ -1298,8 +1443,13 @@ const TestWriteSource = struct {
         parent_key: []const u8,
         updated_parent_key: ?[]const u8,
         page_limit: usize,
+        cascade_depth: u32,
+        cascade_max_depth: u32,
     ) !?table_writes.ForeignKeyActionJobStatus {
-        return try testForeignKeyActionJobStatus(alloc, group_id, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, "scheduled");
+        var status = try testForeignKeyActionJobStatus(alloc, group_id, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, "scheduled");
+        status.cascade_depth = cascade_depth;
+        status.cascade_max_depth = cascade_max_depth;
+        return status;
     }
 
     fn foreignKeyActionJobGroupLocalRequeue(

@@ -78,6 +78,12 @@ pub const ForeignKeyReference = struct {
     columns: ?[]const []const u8 = null,
 };
 
+/// Relational primary-key constraint.
+pub const PrimaryKey = struct {
+    /// Primary-key columns. One or more ordered required non-json relational columns are supported.
+    columns: ?[]const []const u8 = null,
+};
+
 /// Relational unique constraint.
 pub const UniqueConstraint = struct {
     /// Constraint name, unique within the table schema.
@@ -112,10 +118,10 @@ pub const ForeignKey = struct {
     on_delete: ?[]const u8 = null,
     /// Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
     on_update: ?[]const u8 = null,
-    /// Constraint timing. "deferred" is enforced for local relational transactions at commit and routed child writes through exact parent-check proof records.
+    /// Constraint timing. Canonical values are "immediate" and "deferred"; SQL-shaped aliases such as "INITIALLY DEFERRED" and combined deferrability clauses are accepted and normalized by schema parsing.
     timing: ?[]const u8 = null,
-    /// Whether transaction-level timing overrides may change this constraint's effective timing. Omitted defaults to false unless timing is "deferred" for compatibility; true with timing "immediate" represents DEFERRABLE INITIALLY IMMEDIATE.
-    deferrable: ?bool = null,
+    /// Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility.
+    deferrable: ?std.json.Value = null,
     /// Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
     match: ?[]const u8 = null,
     /// Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
@@ -159,6 +165,8 @@ pub const TableSchema = struct {
     dynamic_templates: ?[]const DynamicTemplate = null,
     /// Relational-mode referential constraints. Supported targets are a parent table's `_id` document key or a same-table declared unique parent column tuple with `on_delete: "restrict"` / `on_delete: "no_action"` or bounded local nullable-column `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`. `on_update: "restrict"` and `on_update: "no_action"` are accepted as parent-key update checks, and mutating `set_null`/`cascade` update actions are supported where owner topology is configured. `match: "simple"` is the default; `full` is accepted for composite nullable references, and `partial` is rejected until row-subset parent matching is implemented. Cross-table unique targets require routed parent-table unique participants. Unsupported shapes are rejected during schema validation.
     foreign_keys: ?[]const ForeignKey = null,
+    /// Relational-mode primary key over one or more ordered declared non-json relational columns. Every component must be required and present on every row. When omitted, `_id` remains the document-key primary identity. `_id` cannot be mixed into a declared composite primary-key tuple.
+    primary_key: ?PrimaryKey = null,
     /// Relational-mode unique constraints over one or more ordered declared non-json relational columns. Present scalar tuples are enforced by committed integrity rows; rows with any absent nullable component do not create unique rows.
     unique_constraints: ?[]const UniqueConstraint = null,
 };

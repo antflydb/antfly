@@ -2603,6 +2603,117 @@ components:
         transformed:
           type: integer
           description: Number of documents successfully transformed
+    RowPrimarySelector:
+      type: object
+      additionalProperties: true
+      description: |
+        Structured primary-key identity. Keys are the declared
+        `primary_key.columns`; values are JSON scalar values coerced with the
+        table's relational column types.
+      example:
+        tenant_id: "t1"
+        order_id: "o9"
+    RowUniqueSelector:
+      type: object
+      description: |
+        Reserved structured unique-key selector. Public APIs reject this shape
+        until unique selectors resolve through durable unique-owner rows.
+      properties:
+        name:
+          type: string
+          description: Unique constraint name.
+        values:
+          type: object
+          additionalProperties: true
+          description: Values for the declared unique-constraint columns.
+      required:
+        - name
+        - values
+    RowSelector:
+      type: object
+      description: |
+        Structured row selector. `primary` is supported for declared
+        primary-key tables. `unique` is reserved until routed unique-owner
+        resolution is exposed publicly.
+      properties:
+        primary:
+          $ref: "#/components/schemas/RowPrimarySelector"
+        unique:
+          $ref: "#/components/schemas/RowUniqueSelector"
+    RowOperation:
+      type: object
+      description: |
+        Structured relational row mutation. `insert` fails if the primary
+        identity already exists, `upsert` overwrites or creates, `update`
+        applies a non-upsert patch by primary identity, and `delete` removes by
+        primary identity. `update.patch` cannot change primary-key components.
+      properties:
+        op:
+          type: string
+          enum:
+            - insert
+            - upsert
+            - update
+            - delete
+        row:
+          type: object
+          additionalProperties: true
+          description: Full row document for insert/upsert. Must include primary-key columns.
+        where:
+          $ref: "#/components/schemas/RowSelector"
+        patch:
+          type: object
+          additionalProperties: true
+          description: Top-level field patch for update operations.
+      required:
+        - op
+    RowsBatchRequest:
+      type: object
+      properties:
+        operations:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowOperation"
+        sync_level:
+          $ref: "#/components/schemas/SyncLevel"
+      required:
+        - operations
+    RowsGetRequest:
+      type: object
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowSelector"
+        include_physical_key:
+          type: boolean
+          default: false
+          description: Include the diagnostic storage-owned physical key in each result.
+      required:
+        - keys
+    RowsGetResult:
+      type: object
+      properties:
+        identity:
+          $ref: "#/components/schemas/RowSelector"
+        found:
+          type: boolean
+        row:
+          type: object
+          additionalProperties: true
+        version:
+          type: integer
+          format: uint64
+        physical_key:
+          type: string
+          description: Diagnostic storage-owned physical key. Do not persist as public row identity.
+    RowsGetResponse:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsGetResult"
     MultiBatchRequest:
       type: object
       description: |
@@ -6649,6 +6760,81 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/rows:batch:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Perform structured relational row writes by primary identity
+      tags:
+        - data_operations
+      operationId: rowsBatchWrite
+      description: |
+        Relational row batch endpoint for tables with a declared `primary_key`.
+        Callers address rows by structured primary-key identity instead of
+        physical document keys. The server derives the storage-owned physical
+        row key from the canonical typed primary-key tuple and executes through
+        the normal batch/2PC path. Unique selectors are reserved until they can
+        resolve through durable unique-owner rows.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RowsBatchRequest"
+      responses:
+        "201":
+          description: Row batch operation successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/rows:get:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Lookup relational rows by structured primary identity
+      tags:
+        - data_operations
+      operationId: rowsGet
+      description: |
+        Point lookup endpoint for relational tables with a declared
+        `primary_key`. The request uses structured primary-key selectors and
+        returns row JSON, version, and optional diagnostic physical keys.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RowsGetRequest"
+      responses:
+        "200":
+          description: Row lookup response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RowsGetResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":

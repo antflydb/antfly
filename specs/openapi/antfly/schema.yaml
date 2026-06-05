@@ -109,6 +109,14 @@ components:
             parent matching is implemented.
             Cross-table unique targets require routed parent-table unique participants.
             Unsupported shapes are rejected during schema validation.
+        primary_key:
+          $ref: "#/components/schemas/PrimaryKey"
+          description: |
+            Relational-mode primary key over one or more ordered declared
+            non-json relational columns. Every component must be required and
+            present on every row. When omitted, `_id` remains the document-key
+            primary identity. `_id` cannot be mixed into a declared composite
+            primary-key tuple.
         unique_constraints:
           type: array
           items:
@@ -132,6 +140,17 @@ components:
           items:
             type: string
           description: Referenced parent columns. Use ["_id"] for the document-key primary key, or an ordered column tuple backed by a declared unique constraint.
+
+    PrimaryKey:
+      type: object
+      additionalProperties: false
+      description: Relational primary-key constraint.
+      properties:
+        columns:
+          type: array
+          items:
+            type: string
+          description: Primary-key columns. One or more ordered required non-json relational columns are supported.
 
     ForeignKey:
       type: object
@@ -158,11 +177,12 @@ components:
           description: Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
         timing:
           type: string
-          enum: [immediate, deferred]
-          description: Constraint timing. "deferred" is enforced for local relational transactions at commit and routed child writes through exact parent-check proof records.
+          description: Constraint timing. Canonical values are "immediate" and "deferred"; SQL-shaped aliases such as "INITIALLY DEFERRED" and combined deferrability clauses are accepted and normalized by schema parsing.
         deferrable:
-          type: boolean
-          description: Whether transaction-level timing overrides may change this constraint's effective timing. Omitted defaults to false unless timing is "deferred" for compatibility; true with timing "immediate" represents DEFERRABLE INITIALLY IMMEDIATE.
+          oneOf:
+            - type: boolean
+            - type: string
+          description: Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility.
         match:
           type: string
           enum: [simple, full]

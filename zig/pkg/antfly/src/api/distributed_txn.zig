@@ -27,9 +27,7 @@ const storage_schema = @import("../storage/schema.zig");
 const relational_store = @import("../storage/db/relational_store.zig");
 const document_mapper = @import("../storage/db/document_mapper.zig");
 
-pub const table_participant_prefix = "table:";
 const table_participant_v2_prefix = "table2:";
-pub const group_participant_marker = ":group:";
 
 pub const TxnBeginRequest = struct {
     txn_id: db_mod.types.TxnId,
@@ -623,7 +621,6 @@ pub fn executeCrossGroup(
                 .unique_constraint_writes = participant.unique_constraint_writes.items,
                 .unique_constraint_deletes = participant.unique_constraint_deletes.items,
                 .foreign_key_constraint_timing_overrides = participant.foreign_key_constraint_timing_overrides.items,
-                .foreign_key_parent_checks_externalized = participant.foreign_key_parent_checks_externalized,
             },
         });
     }
@@ -698,13 +695,14 @@ pub fn executeForeignKeyActionPage(
     const parent_catalog_table_name = foreignKeyParentCatalogTableName(child_table_name, runtime_schema.default_type, foreign_key);
     const parent_ref_table_name = foreign_key.parent_table;
     if (!std.mem.eql(u8, parent_catalog_table_name, parent_table_name) and !std.mem.eql(u8, parent_ref_table_name, parent_table_name)) return error.UnsupportedOperation;
-    if (std.mem.eql(u8, action, "set_null")) {
+    const canonical_action = foreignKeyActionPageCanonicalAction(action) orelse return error.UnsupportedOperation;
+    if (std.mem.eql(u8, canonical_action, "set_null")) {
         if (foreign_key.on_delete != .set_null) return error.UnsupportedOperation;
-    } else if (std.mem.eql(u8, action, "cascade")) {
+    } else if (std.mem.eql(u8, canonical_action, "cascade")) {
         if (foreign_key.on_delete != .cascade) return error.UnsupportedOperation;
-    } else if (std.mem.eql(u8, action, "update_set_null")) {
+    } else if (std.mem.eql(u8, canonical_action, "update_set_null")) {
         if (foreign_key.on_update != .set_null) return error.UnsupportedOperation;
-    } else if (std.mem.eql(u8, action, "update_cascade")) {
+    } else if (std.mem.eql(u8, canonical_action, "update_cascade")) {
         if (foreign_key.on_update != .cascade or updated_parent_key == null) return error.UnsupportedOperation;
     } else {
         return error.UnsupportedOperation;
@@ -767,14 +765,30 @@ pub fn executeForeignKeyActionPage(
         .child_table_name = child_table_name,
         .child_runtime_table = runtime_schema.default_type,
         .foreign_key = foreign_key,
-        .action = action,
+        .action = canonical_action,
         .parent_key = parent_key,
         .updated_parent_key = updated_parent_key,
         .owner_group_id = owner_group_id,
         .owner_topology_epoch = resolution.topology_epoch,
         .child_topology_epoch = child_topology_epoch,
     } }, page.children);
-    if (std.mem.eql(u8, action, "cascade")) {
+    if (foreignKeyActionPageUpdatesChildren(canonical_action)) {
+        try addForeignKeyUpdateActionPageDownstreamParticipants(
+            alloc,
+            catalog,
+            worker,
+            &participants,
+            child_table_name,
+            runtime_schema,
+            foreign_key,
+            canonical_action,
+            parent_key,
+            updated_parent_key,
+            child_topology_epoch,
+            page.children,
+        );
+    }
+    if (std.mem.eql(u8, canonical_action, "cascade")) {
         if (cascade_depth >= cascade_max_depth and try tableHasMutatingForeignKeyDeleteDependents(alloc, catalog, child_table_name)) {
             return error.ForeignKeyCascadeDepthLimit;
         }
@@ -805,6 +819,85 @@ pub fn executeForeignKeyActionPage(
         trace_writer,
     )).participant_count;
     return out;
+}
+
+fn foreignKeyActionPageUpdatesChildren(action: []const u8) bool {
+    return std.mem.eql(u8, action, "set_null") or
+        std.mem.eql(u8, action, "update_set_null") or
+        std.mem.eql(u8, action, "update_cascade");
+}
+
+fn addForeignKeyUpdateActionPageDownstreamParticipants(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    worker: ParticipantWorker,
+    participants: *std.ArrayListUnmanaged(ParticipantTxn),
+    child_table_name: []const u8,
+    child_runtime_schema: storage_schema.TableSchema,
+    foreign_key: storage_schema.ForeignKey,
+    action: []const u8,
+    old_parent_key: []const u8,
+    updated_parent_key: ?[]const u8,
+    child_topology_epoch: u64,
+    children: []const db_mod.types.ForeignKeyRefChild,
+) !void {
+    for (children) |child| {
+        const child_group_id = (try table_catalog.resolveGroupForKeyPinned(
+            alloc,
+            catalog,
+            child_table_name,
+            child.child_key,
+            child_topology_epoch,
+        )) orelse return error.UnknownGroup;
+        const child_participant = try ensureParticipantTxn(
+            alloc,
+            participants,
+            child_table_name,
+            child_group_id,
+            child_topology_epoch,
+        );
+        var lookup = (try worker.lookupGroup(alloc, child_group_id, child_table_name, child.child_key)) orelse continue;
+        defer lookup.deinit(alloc);
+        try appendInjectedVersionPredicate(alloc, child_participant, child.child_key, lookup.version);
+
+        const child_row = try document_mapper.buildRelationalRowValueAlloc(alloc, lookup.json, child_runtime_schema.relational_columns);
+        defer alloc.free(child_row);
+        const current_parent = (try relational_store.foreignKeyReferenceValueAlloc(alloc, child_row, foreign_key)) orelse continue;
+        defer alloc.free(current_parent);
+        if (!std.mem.eql(u8, current_parent, old_parent_key)) continue;
+
+        const rewritten_row = if (std.mem.eql(u8, action, "update_cascade")) blk: {
+            const next_parent_key = updated_parent_key orelse return error.UnsupportedOperation;
+            break :blk try relational_store.relationalRowWithForeignKeyColumnsFromParentKeyAlloc(alloc, child_row, next_parent_key, foreign_key);
+        } else if (std.mem.eql(u8, action, "set_null") or std.mem.eql(u8, action, "update_set_null")) blk: {
+            break :blk try relational_store.relationalRowWithoutColumnsAlloc(alloc, child_row, foreign_key.child_columns);
+        } else return error.UnsupportedOperation;
+        defer alloc.free(rewritten_row);
+        const rewritten_json = try document_mapper.materializeRelationalRowValueAlloc(alloc, rewritten_row);
+        defer alloc.free(rewritten_json);
+
+        try addUniqueConstraintOwnerMutationsForWrite(
+            alloc,
+            catalog,
+            participants,
+            child_table_name,
+            child_runtime_schema.relational_columns,
+            child_runtime_schema.unique_constraints,
+            child.child_key,
+            lookup.json,
+            rewritten_json,
+        );
+        try addForeignKeyParentUpdateParticipantsForWrite(
+            alloc,
+            catalog,
+            participants,
+            child_table_name,
+            child_runtime_schema,
+            lookup.json,
+            rewritten_json,
+            &.{},
+        );
+    }
 }
 
 fn executeParticipantTxns(
@@ -868,7 +961,6 @@ fn executeParticipantTxns(
                 .unique_constraint_writes = participant.unique_constraint_writes.items,
                 .unique_constraint_deletes = participant.unique_constraint_deletes.items,
                 .foreign_key_constraint_timing_overrides = participant.foreign_key_constraint_timing_overrides.items,
-                .foreign_key_parent_checks_externalized = participant.foreign_key_parent_checks_externalized,
             },
         });
     }
@@ -1019,7 +1111,6 @@ fn executeMultiTableCommitOnce(
                 .unique_constraint_writes = participant.unique_constraint_writes.items,
                 .unique_constraint_deletes = participant.unique_constraint_deletes.items,
                 .foreign_key_constraint_timing_overrides = participant.foreign_key_constraint_timing_overrides.items,
-                .foreign_key_parent_checks_externalized = participant.foreign_key_parent_checks_externalized,
             },
         }) catch |err| switch (err) {
             error.IntentConflict, error.VersionConflict => {
@@ -1241,10 +1332,10 @@ fn explainRoutedUniqueForeignKeyParentDelete(
     const parent_runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_parent_schema);
     defer storage_schema.freeSchema(alloc, parent_runtime_schema);
     if (parent_runtime_schema.storage_mode != .relational) return error.UnsupportedOperation;
-    const parent_constraint = findUniqueConstraintByColumns(parent_runtime_schema.unique_constraints, foreign_key.parent_columns) orelse return error.UnsupportedOperation;
+    const parent_constraint = findParentTupleConstraintByColumns(parent_runtime_schema, foreign_key.parent_columns) orelse return error.UnsupportedOperation;
     const parent_row = try document_mapper.buildRelationalRowValueAlloc(alloc, parent_json, parent_runtime_schema.relational_columns);
     defer alloc.free(parent_row);
-    const encoded_parent = (try relational_store.uniqueConstraintTupleValueAlloc(alloc, parent_row, parent_constraint)) orelse return true;
+    const encoded_parent = try parentTupleValueAlloc(alloc, parent_row, parent_runtime_schema, parent_constraint);
     defer alloc.free(encoded_parent);
 
     var resolution = try table_catalog.resolveForeignKeyRefOwnerGroups(
@@ -1471,7 +1562,6 @@ const ParticipantTxn = struct {
     unique_constraint_writes: std.ArrayListUnmanaged(db_mod.types.UniqueConstraintMutation) = .empty,
     unique_constraint_deletes: std.ArrayListUnmanaged(db_mod.types.UniqueConstraintMutation) = .empty,
     foreign_key_constraint_timing_overrides: std.ArrayListUnmanaged(db_mod.types.ForeignKeyConstraintTimingOverride) = .empty,
-    foreign_key_parent_checks_externalized: bool = false,
 
     fn deinit(self: *ParticipantTxn, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
@@ -1652,17 +1742,6 @@ fn appendInjectedVersionPredicate(
     errdefer alloc.free(owned_key);
     try participant.predicates.append(alloc, .{ .key = owned_key, .expected_version = expected_version });
     try participant.owned_predicate_keys.append(alloc, owned_key);
-}
-
-fn markForeignKeyParentChecksExternalized(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    participants: *std.ArrayListUnmanaged(ParticipantTxn),
-    child_table_name: []const u8,
-    child_key: []const u8,
-) !void {
-    const child_participant = try foreignKeyChildParticipantForKey(alloc, catalog, participants, child_table_name, child_key);
-    child_participant.foreign_key_parent_checks_externalized = true;
 }
 
 fn foreignKeyChildParticipantForKey(
@@ -1983,17 +2062,18 @@ fn addForeignKeyParentUpdateParticipants(
     defer parsed_schema.deinit(alloc);
     const parent_runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
     defer storage_schema.freeSchema(alloc, parent_runtime_schema);
-    if (parent_runtime_schema.storage_mode != .relational or parent_runtime_schema.unique_constraints.len == 0) return;
+    if (parent_runtime_schema.storage_mode != .relational or (parent_runtime_schema.primary_key == null and parent_runtime_schema.unique_constraints.len == 0)) return;
     if (!try catalogHasForeignKeysReferencingParentUniqueConstraints(
         alloc,
         catalog,
         parent_table_name,
+        parent_runtime_schema.primary_key,
         parent_runtime_schema.unique_constraints,
     )) return;
 
     for (writes) |write| {
         if (deleteContainsKey(deletes, write.key)) continue;
-        if (try keyHasUniqueConstraintTransform(alloc, parent_runtime_schema.unique_constraints, write.key, transforms)) continue;
+        if (try keyHasRuntimeOwnerConstraintTransform(alloc, parent_runtime_schema, write.key, transforms)) continue;
         var old_row = try lookupWriteRowForConstraintProof(alloc, catalog, worker, participants, parent_table_name, write.key, predicates);
         defer if (old_row) |*row| row.deinit(alloc);
         const old = old_row orelse continue;
@@ -2011,7 +2091,7 @@ fn addForeignKeyParentUpdateParticipants(
 
     for (transforms, 0..) |transform, transform_index| {
         if (transformKeySeenBefore(transforms, transform_index)) continue;
-        if (!try keyHasUniqueConstraintTransform(alloc, parent_runtime_schema.unique_constraints, transform.key, transforms)) continue;
+        if (!try keyHasRuntimeOwnerConstraintTransform(alloc, parent_runtime_schema, transform.key, transforms)) continue;
 
         var old_row = try lookupWriteRowForConstraintProof(alloc, catalog, worker, participants, parent_table_name, transform.key, predicates);
         defer if (old_row) |*row| row.deinit(alloc);
@@ -2049,6 +2129,7 @@ fn catalogHasForeignKeysReferencingParentUniqueConstraints(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
     parent_table_name: []const u8,
+    parent_primary_key: ?storage_schema.PrimaryKey,
     parent_constraints: []const storage_schema.UniqueConstraint,
 ) !bool {
     var snapshot = try catalog.adminSnapshot();
@@ -2063,6 +2144,9 @@ fn catalogHasForeignKeysReferencingParentUniqueConstraints(
         for (child_runtime_schema.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (!std.mem.eql(u8, foreignKeyParentCatalogTableName(table.name, child_runtime_schema.default_type, foreign_key), parent_table_name)) continue;
+            if (parent_primary_key) |primary_key| {
+                if (stringSlicesEqual(foreign_key.parent_columns, primary_key.columns)) return true;
+            }
             for (parent_constraints) |constraint| {
                 if (stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) return true;
             }
@@ -2085,6 +2169,26 @@ fn addForeignKeyParentUpdateParticipantsForWrite(
     defer alloc.free(old_row);
     const new_row = try document_mapper.buildRelationalRowValueAlloc(alloc, new_json, parent_runtime_schema.relational_columns);
     defer alloc.free(new_row);
+
+    if (parent_runtime_schema.primary_key) |primary_key| {
+        const constraint = primaryKeyAsUniqueConstraint(primary_key);
+        const old_value = try relational_store.primaryKeyTupleValueAlloc(alloc, old_row, primary_key);
+        defer alloc.free(old_value);
+        const new_value = try relational_store.primaryKeyTupleValueAlloc(alloc, new_row, primary_key);
+        defer alloc.free(new_value);
+        if (!std.mem.eql(u8, old_value, new_value)) {
+            try addForeignKeyParentUpdateParticipantsForUniqueValue(
+                alloc,
+                catalog,
+                participants,
+                parent_table_name,
+                constraint,
+                old_value,
+                new_value,
+                constraint_timing_overrides,
+            );
+        }
+    }
 
     for (parent_runtime_schema.unique_constraints) |constraint| {
         const old_value = try relational_store.uniqueConstraintTupleValueAlloc(alloc, old_row, constraint);
@@ -2387,10 +2491,6 @@ fn addForeignKeyParentDeleteParticipants(
         }
         if (!has_supported_parent_delete_check) continue;
 
-        var child_topology_epoch: u64 = 0;
-        var child_groups: []u64 = &.{};
-        defer if (child_groups.len > 0) alloc.free(child_groups);
-
         for (runtime_schema.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (!std.mem.eql(u8, foreignKeyParentCatalogTableName(table.name, runtime_schema.default_type, foreign_key), parent_table_name)) continue;
@@ -2401,21 +2501,8 @@ fn addForeignKeyParentDeleteParticipants(
                 } else {
                     if (!foreignKeySupportsRoutedUniqueParentDeleteCheck(foreign_key)) return error.UnsupportedOperation;
                     if (try addRoutedUniqueForeignKeyParentDeleteParticipants(alloc, catalog, worker, participants, table.name, runtime_schema.default_type, foreign_key, parent_table_name, parent_key, predicates, constraint_timing_overrides, cascade_depth, cascade_max_depth)) continue;
-                    return error.UnsupportedOperation;
                 }
-                if (foreign_key.on_delete == .cascade) return error.UnsupportedOperation;
-                if (child_topology_epoch == 0) {
-                    child_topology_epoch = try table_catalog.topologyEpoch(alloc, catalog, table.name);
-                    if (child_topology_epoch == 0) return error.TableNotFound;
-                }
-                if (child_groups.len == 0) {
-                    child_groups = try table_catalog.resolveGroupsForSpan(alloc, catalog, table.name, "", "");
-                    if (child_groups.len == 0) return error.UnknownGroup;
-                }
-                for (child_groups) |child_group_id| {
-                    const child_participant = try ensureParticipantTxn(alloc, participants, table.name, child_group_id, child_topology_epoch);
-                    try appendForeignKeyParentDeleteCheck(alloc, child_participant, foreign_key, parent_key, effectiveForeignKeyParentCheckTiming(table.name, foreign_key, constraint_timing_overrides));
-                }
+                return error.UnsupportedOperation;
             }
         }
     }
@@ -2515,14 +2602,14 @@ fn addRoutedUniqueForeignKeyParentDeleteParticipants(
     const parent_runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_parent_schema);
     defer storage_schema.freeSchema(alloc, parent_runtime_schema);
     if (parent_runtime_schema.storage_mode != .relational) return error.UnsupportedOperation;
-    const parent_constraint = findUniqueConstraintByColumns(parent_runtime_schema.unique_constraints, foreign_key.parent_columns) orelse return error.UnsupportedOperation;
+    const parent_constraint = findParentTupleConstraintByColumns(parent_runtime_schema, foreign_key.parent_columns) orelse return error.UnsupportedOperation;
 
     var parent_row_lookup = try lookupDeleteRowForConstraintProof(alloc, catalog, worker, participants, parent_table_name, parent_doc_key, predicates);
     defer if (parent_row_lookup) |*row| row.deinit(alloc);
     const parent_lookup = parent_row_lookup orelse return true;
     const parent_row = try document_mapper.buildRelationalRowValueAlloc(alloc, parent_lookup.json, parent_runtime_schema.relational_columns);
     defer alloc.free(parent_row);
-    const encoded_parent = (try relational_store.uniqueConstraintTupleValueAlloc(alloc, parent_row, parent_constraint)) orelse return true;
+    const encoded_parent = try parentTupleValueAlloc(alloc, parent_row, parent_runtime_schema, parent_constraint);
     defer alloc.free(encoded_parent);
 
     var resolution = try table_catalog.resolveForeignKeyRefOwnerGroups(
@@ -2657,7 +2744,9 @@ fn addUniqueConstraintOwnerParticipants(
     defer parsed_schema.deinit(alloc);
     const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
     defer storage_schema.freeSchema(alloc, runtime_schema);
-    if (runtime_schema.storage_mode != .relational or runtime_schema.unique_constraints.len == 0) return;
+    if (runtime_schema.storage_mode != .relational or (runtime_schema.primary_key == null and runtime_schema.unique_constraints.len == 0)) return;
+    const owner_constraints = try runtimeOwnerConstraintsAlloc(alloc, runtime_schema);
+    defer alloc.free(owner_constraints);
 
     const groups = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
     defer alloc.free(groups);
@@ -2665,22 +2754,22 @@ fn addUniqueConstraintOwnerParticipants(
     if (groups.len == 1) return;
 
     for (writes) |write| {
-        if (try keyHasUniqueConstraintTransform(alloc, runtime_schema.unique_constraints, write.key, transforms)) continue;
+        if (try keyHasUniqueConstraintTransform(alloc, owner_constraints, write.key, transforms)) continue;
         var old_row = try lookupWriteRowForConstraintProof(alloc, catalog, worker, participants, table_name, write.key, predicates);
         defer if (old_row) |*row| row.deinit(alloc);
-        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema.relational_columns, runtime_schema.unique_constraints, write.key, if (old_row) |row| row.json else null, write.value);
+        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema.relational_columns, owner_constraints, write.key, if (old_row) |row| row.json else null, write.value);
     }
     for (deletes) |key| {
         if (findWriteValueForKey(writes, key) != null) continue;
-        if (try keyHasUniqueConstraintTransform(alloc, runtime_schema.unique_constraints, key, transforms)) continue;
+        if (try keyHasUniqueConstraintTransform(alloc, owner_constraints, key, transforms)) continue;
         var old_row = try lookupDeleteRowForConstraintProof(alloc, catalog, worker, participants, table_name, key, predicates);
         defer if (old_row) |*row| row.deinit(alloc);
         const old = old_row orelse continue;
-        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema.relational_columns, runtime_schema.unique_constraints, key, old.json, null);
+        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema.relational_columns, owner_constraints, key, old.json, null);
     }
     for (transforms, 0..) |transform, transform_index| {
         if (transformKeySeenBefore(transforms, transform_index)) continue;
-        if (!try keyHasUniqueConstraintTransform(alloc, runtime_schema.unique_constraints, transform.key, transforms)) continue;
+        if (!try keyHasUniqueConstraintTransform(alloc, owner_constraints, transform.key, transforms)) continue;
 
         var old_row = try lookupWriteRowForConstraintProof(alloc, catalog, worker, participants, table_name, transform.key, predicates);
         defer if (old_row) |*row| row.deinit(alloc);
@@ -2702,7 +2791,7 @@ fn addUniqueConstraintOwnerParticipants(
         }
         if (final_json == null and old_row == null) continue;
 
-        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema.relational_columns, runtime_schema.unique_constraints, transform.key, if (old_row) |row| row.json else null, final_json);
+        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema.relational_columns, owner_constraints, transform.key, if (old_row) |row| row.json else null, final_json);
     }
 }
 
@@ -2729,6 +2818,17 @@ fn transformTouchesUniqueConstraint(
     return false;
 }
 
+fn keyHasRuntimeOwnerConstraintTransform(
+    alloc: std.mem.Allocator,
+    runtime_schema: storage_schema.TableSchema,
+    key: []const u8,
+    transforms: []const db_mod.types.DocumentTransform,
+) !bool {
+    const owner_constraints = try runtimeOwnerConstraintsAlloc(alloc, runtime_schema);
+    defer alloc.free(owner_constraints);
+    return try keyHasUniqueConstraintTransform(alloc, owner_constraints, key, transforms);
+}
+
 fn keyHasUniqueConstraintTransform(
     alloc: std.mem.Allocator,
     constraints: []const storage_schema.UniqueConstraint,
@@ -2740,6 +2840,21 @@ fn keyHasUniqueConstraintTransform(
         if (try transformTouchesUniqueConstraint(alloc, constraints, transform)) return true;
     }
     return false;
+}
+
+fn runtimeOwnerConstraintsAlloc(alloc: std.mem.Allocator, runtime_schema: storage_schema.TableSchema) ![]storage_schema.UniqueConstraint {
+    const extra: usize = if (runtime_schema.primary_key != null) 1 else 0;
+    const constraints = try alloc.alloc(storage_schema.UniqueConstraint, runtime_schema.unique_constraints.len + extra);
+    var index: usize = 0;
+    if (runtime_schema.primary_key) |primary_key| {
+        constraints[index] = primaryKeyAsUniqueConstraint(primary_key);
+        index += 1;
+    }
+    for (runtime_schema.unique_constraints) |constraint| {
+        constraints[index] = constraint;
+        index += 1;
+    }
+    return constraints;
 }
 
 fn addUniqueConstraintOwnerMutationsForWrite(
@@ -2895,10 +3010,43 @@ fn foreignKeyParentUniqueConstraintNameAlloc(
     const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
     defer storage_schema.freeSchema(alloc, runtime_schema);
     if (runtime_schema.storage_mode != .relational) return null;
+    if (runtime_schema.primary_key) |primary_key| {
+        if (stringSlicesEqual(primary_key.columns, foreign_key.parent_columns)) {
+            return try alloc.dupe(u8, relational_store.primary_key_constraint_name);
+        }
+    }
     for (runtime_schema.unique_constraints) |constraint| {
         if (stringSlicesEqual(constraint.columns, foreign_key.parent_columns)) return try alloc.dupe(u8, constraint.name);
     }
     return null;
+}
+
+fn findParentTupleConstraintByColumns(runtime_schema: storage_schema.TableSchema, columns: []const []const u8) ?storage_schema.UniqueConstraint {
+    if (runtime_schema.primary_key) |primary_key| {
+        if (stringSlicesEqual(primary_key.columns, columns)) return primaryKeyAsUniqueConstraint(primary_key);
+    }
+    return findUniqueConstraintByColumns(runtime_schema.unique_constraints, columns);
+}
+
+fn primaryKeyAsUniqueConstraint(primary_key: storage_schema.PrimaryKey) storage_schema.UniqueConstraint {
+    return .{
+        .name = relational_store.primary_key_constraint_name,
+        .columns = primary_key.columns,
+    };
+}
+
+fn parentTupleValueAlloc(
+    alloc: std.mem.Allocator,
+    row: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    constraint: storage_schema.UniqueConstraint,
+) ![]u8 {
+    if (runtime_schema.primary_key) |primary_key| {
+        if (std.mem.eql(u8, constraint.name, relational_store.primary_key_constraint_name)) {
+            return try relational_store.primaryKeyTupleValueAlloc(alloc, row, primary_key);
+        }
+    }
+    return (try relational_store.uniqueConstraintTupleValueAlloc(alloc, row, constraint)) orelse return error.UnsupportedOperation;
 }
 
 fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
@@ -2928,7 +3076,6 @@ fn addForeignKeyParentCheckParticipant(
         const parent_participant = try ensureParticipantTxn(alloc, participants, parent_table_name, parent_group_id, parent_topology_epoch);
         try appendForeignKeyParentCheck(alloc, parent_participant, foreign_key, child_table_name, child_key, parent_key, null, timing);
         const child_participant = try foreignKeyChildParticipantForKey(alloc, catalog, participants, child_table_name, child_key);
-        child_participant.foreign_key_parent_checks_externalized = true;
         try appendForeignKeyExternalizedParentCheck(alloc, child_participant, foreign_key, child_runtime_table, child_key, parent_key, null, timing);
         return;
     }
@@ -2943,7 +3090,6 @@ fn addForeignKeyParentCheckParticipant(
     const parent_participant = try ensureParticipantTxn(alloc, participants, parent_table_name, resolution.groups[0], resolution.topology_epoch);
     try appendForeignKeyParentCheck(alloc, parent_participant, foreign_key, child_table_name, child_key, parent_key, parent_constraint_name, timing);
     const child_participant = try foreignKeyChildParticipantForKey(alloc, catalog, participants, child_table_name, child_key);
-    child_participant.foreign_key_parent_checks_externalized = true;
     try appendForeignKeyExternalizedParentCheck(alloc, child_participant, foreign_key, child_runtime_table, child_key, parent_key, parent_constraint_name, timing);
 }
 
@@ -3330,25 +3476,16 @@ pub const ParticipantRef = struct {
 };
 
 pub fn parseParticipantRef(participant: []const u8) ?ParticipantRef {
-    if (std.mem.startsWith(u8, participant, table_participant_v2_prefix)) {
-        const body = participant[table_participant_v2_prefix.len..];
-        if (body.len < 9 or body[8] != ':') return null;
-        const table_name_len = std.fmt.parseUnsigned(u32, body[0..8], 16) catch return null;
-        const table_start: usize = 9;
-        const group_separator = table_start + @as(usize, table_name_len);
-        if (body.len <= group_separator or body[group_separator] != ':') return null;
-        const table_name = body[table_start..group_separator];
-        if (table_name.len == 0) return null;
-        const group_id = std.fmt.parseUnsigned(u64, body[group_separator + 1 ..], 10) catch return null;
-        return .{ .table_name = table_name, .group_id = group_id };
-    }
-
-    if (!std.mem.startsWith(u8, participant, table_participant_prefix)) return null;
-    const rest = participant[table_participant_prefix.len..];
-    const marker_index = std.mem.indexOf(u8, rest, group_participant_marker) orelse return null;
-    const table_name = rest[0..marker_index];
+    if (!std.mem.startsWith(u8, participant, table_participant_v2_prefix)) return null;
+    const body = participant[table_participant_v2_prefix.len..];
+    if (body.len < 9 or body[8] != ':') return null;
+    const table_name_len = std.fmt.parseUnsigned(u32, body[0..8], 16) catch return null;
+    const table_start: usize = 9;
+    const group_separator = table_start + @as(usize, table_name_len);
+    if (body.len <= group_separator or body[group_separator] != ':') return null;
+    const table_name = body[table_start..group_separator];
     if (table_name.len == 0) return null;
-    const group_id = std.fmt.parseUnsigned(u64, rest[marker_index + group_participant_marker.len ..], 10) catch return null;
+    const group_id = std.fmt.parseUnsigned(u64, body[group_separator + 1 ..], 10) catch return null;
     return .{ .table_name = table_name, .group_id = group_id };
 }
 
@@ -3363,9 +3500,7 @@ test "distributed txn participant ids preserve embedded group markers" {
     try std.testing.expectEqualStrings(table_name, parsed.table_name);
     try std.testing.expectEqual(@as(u64, 42), parsed.group_id);
 
-    const legacy = parseParticipantRef("table:docs:group:42") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("docs", legacy.table_name);
-    try std.testing.expectEqual(@as(u64, 42), legacy.group_id);
+    try std.testing.expect(parseParticipantRef("table:docs:group:42") == null);
 }
 
 pub fn resolveParticipant(
@@ -3620,7 +3755,11 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
             defer alloc.free(replacement);
             try out.appendSlice(alloc, replacement);
         }
-        const suffix = try std.fmt.allocPrint(alloc, ",\"page_limit\":{d}}}", .{schedule.page_limit});
+        const suffix = try std.fmt.allocPrint(
+            alloc,
+            ",\"page_limit\":{d},\"cascade_depth\":{d},\"cascade_max_depth\":{d}}}",
+            .{ schedule.page_limit, schedule.cascade_depth, schedule.cascade_max_depth },
+        );
         defer alloc.free(suffix);
         try out.appendSlice(alloc, suffix);
     }
@@ -3677,11 +3816,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
-    if (req.req.foreign_key_parent_checks_externalized) {
-        try out.appendSlice(alloc, "],\"foreign_key_parent_checks_externalized\":true}");
-    } else {
-        try out.appendSlice(alloc, "]}");
-    }
+    try out.appendSlice(alloc, "]}");
     return try out.toOwnedSlice(alloc);
 }
 
@@ -3939,10 +4074,6 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     else
         &.{};
     errdefer freeTxnUniqueConstraintMutations(alloc, unique_constraint_deletes);
-    const foreign_key_parent_checks_externalized = if (obj.get("foreign_key_parent_checks_externalized")) |flag| switch (flag) {
-        .bool => |value| value,
-        else => return error.InvalidTxnRequest,
-    } else false;
     return .{
         .txn_id = txn_id,
         .topology_epoch = requireInteger(obj, "topology_epoch"),
@@ -3963,7 +4094,6 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
             .foreign_key_constraint_timing_overrides = foreign_key_constraint_timing_overrides,
             .unique_constraint_writes = unique_constraint_writes,
             .unique_constraint_deletes = unique_constraint_deletes,
-            .foreign_key_parent_checks_externalized = foreign_key_parent_checks_externalized,
         },
     };
 }
@@ -4343,7 +4473,7 @@ fn parseTxnForeignKeyParentChecks(alloc: std.mem.Allocator, value: std.json.Valu
             else => return error.InvalidTxnRequest,
         } else null;
         const timing: db_mod.types.ForeignKeyParentCheck.Timing = if (obj.get("timing")) |field_value| switch (field_value) {
-            .string => |name| parseForeignKeyTimingName(name) orelse return error.InvalidTxnRequest,
+            .string => |name| parseForeignKeyTimingNameForConstraint(name, constraint_name) orelse return error.InvalidTxnRequest,
             else => return error.InvalidTxnRequest,
         } else .immediate;
         if (constraint_name.len == 0 or child_table.len == 0 or child_key.len == 0 or parent_table.len == 0 or parent_key.len == 0) return error.InvalidTxnRequest;
@@ -4392,7 +4522,7 @@ fn parseTxnForeignKeyConstraintTimingOverrides(alloc: std.mem.Allocator, value: 
         };
         const constraint_name = requireString(obj, "constraint_name");
         const timing: db_mod.types.ForeignKeyParentCheck.Timing = if (obj.get("timing")) |field_value| switch (field_value) {
-            .string => |name| parseForeignKeyTimingName(name) orelse return error.InvalidTxnRequest,
+            .string => |name| parseForeignKeyTimingNameForConstraint(name, constraint_name) orelse return error.InvalidTxnRequest,
             else => return error.InvalidTxnRequest,
         } else return error.InvalidTxnRequest;
         if (constraint_name.len == 0) return error.InvalidTxnRequest;
@@ -4434,16 +4564,11 @@ fn parseTxnForeignKeyParentDeleteChecks(alloc: std.mem.Allocator, value: std.jso
         const parent_table = requireString(obj, "parent_table");
         const parent_key = requireString(obj, "parent_key");
         const timing: db_mod.types.ForeignKeyParentCheck.Timing = if (obj.get("timing")) |field_value| switch (field_value) {
-            .string => |name| parseForeignKeyTimingName(name) orelse return error.InvalidTxnRequest,
+            .string => |name| parseForeignKeyTimingNameForConstraint(name, constraint_name) orelse return error.InvalidTxnRequest,
             else => return error.InvalidTxnRequest,
         } else .immediate;
         const operation: db_mod.types.ForeignKeyParentDeleteCheck.Operation = if (obj.get("operation")) |field_value| switch (field_value) {
-            .string => |name| if (std.mem.eql(u8, name, "delete"))
-                .delete
-            else if (std.mem.eql(u8, name, "update"))
-                .update
-            else
-                return error.InvalidTxnRequest,
+            .string => |name| parseForeignKeyMutationOperation(name) orelse return error.InvalidTxnRequest,
             else => return error.InvalidTxnRequest,
         } else .delete;
         if (constraint_name.len == 0 or parent_table.len == 0 or parent_key.len == 0) return error.InvalidTxnRequest;
@@ -4460,8 +4585,187 @@ fn parseTxnForeignKeyParentDeleteChecks(alloc: std.mem.Allocator, value: std.jso
 }
 
 fn parseForeignKeyTimingName(name: []const u8) ?db_mod.types.ForeignKeyParentCheck.Timing {
-    if (enumTokenEql(name, "immediate") or enumTokenEql(name, "initially_immediate")) return .immediate;
-    if (enumTokenEql(name, "deferred") or enumTokenEql(name, "initially_deferred")) return .deferred;
+    return parseForeignKeyTimingNameForConstraint(name, null);
+}
+
+fn parseForeignKeyTimingNameForConstraint(name: []const u8, expected_constraint_name: ?[]const u8) ?db_mod.types.ForeignKeyParentCheck.Timing {
+    if (enumTokenEql(name, "immediate") or
+        enumTokenEql(name, "initially_immediate") or
+        enumTokenEql(name, "set_constraint_immediate") or
+        enumTokenEql(name, "set_constraints_immediate") or
+        enumTokenEql(name, "set_constraints_all_immediate"))
+    {
+        return .immediate;
+    }
+    if (enumTokenEql(name, "deferred") or
+        enumTokenEql(name, "initially_deferred") or
+        enumTokenEql(name, "set_constraint_deferred") or
+        enumTokenEql(name, "set_constraints_deferred") or
+        enumTokenEql(name, "set_constraints_all_deferred"))
+    {
+        return .deferred;
+    }
+    if (parseSetConstraintsTimingName(name, expected_constraint_name)) |timing| return timing;
+    return null;
+}
+
+fn parseSetConstraintsTimingName(name: []const u8, expected_constraint_name: ?[]const u8) ?db_mod.types.ForeignKeyParentCheck.Timing {
+    const statement = trimSqlStatementTerminator(name) orelse return null;
+    var index: usize = 0;
+    const set_token = nextEnumTokenSpan(statement, &index) orelse return null;
+    if (!asciiTokenEql(set_token.text, "set")) return null;
+    const constraints_token = nextEnumTokenSpan(statement, &index) orelse return null;
+    if (!asciiTokenEql(constraints_token.text, "constraint") and !asciiTokenEql(constraints_token.text, "constraints")) return null;
+
+    const target_start = constraints_token.end;
+    var last_token: ?EnumTokenSpan = null;
+    while (nextEnumTokenSpan(statement, &index)) |token| {
+        last_token = token;
+    }
+    const timing_token = last_token orelse return null;
+    const timing = if (asciiTokenEql(timing_token.text, "immediate"))
+        db_mod.types.ForeignKeyParentCheck.Timing.immediate
+    else if (asciiTokenEql(timing_token.text, "deferred"))
+        db_mod.types.ForeignKeyParentCheck.Timing.deferred
+    else
+        return null;
+    if (expected_constraint_name) |expected| {
+        const target = trimEnumTokenSeparators(statement[target_start..timing_token.start]);
+        if (!setConstraintsTargetMatchesExpected(target, expected)) return null;
+    }
+    return timing;
+}
+
+fn trimSqlStatementTerminator(name: []const u8) ?[]const u8 {
+    var statement = std.mem.trim(u8, name, &std.ascii.whitespace);
+    if (statement.len > 0 and statement[statement.len - 1] == ';') {
+        statement = std.mem.trim(u8, statement[0 .. statement.len - 1], &std.ascii.whitespace);
+    }
+    if (std.mem.indexOfScalar(u8, statement, ';') != null) return null;
+    return statement;
+}
+
+fn setConstraintsTargetMatchesExpected(target: []const u8, expected: []const u8) bool {
+    if (target.len == 0) return true;
+    if (enumTokenEql(target, "all")) return true;
+
+    var saw_target = false;
+    var target_index: usize = 0;
+    while (nextSetConstraintsTargetPart(target, &target_index)) |part| {
+        const trimmed = trimEnumTokenSeparators(part);
+        if (trimmed.len == 0) return false;
+        saw_target = true;
+        if (setConstraintsTargetIdentifierMatchesExpected(trimmed, expected)) return true;
+    }
+    return !saw_target;
+}
+
+fn nextSetConstraintsTargetPart(target: []const u8, index: *usize) ?[]const u8 {
+    if (index.* > target.len) return null;
+    if (index.* == target.len) {
+        index.* = target.len + 1;
+        return "";
+    }
+    const start = index.*;
+    var in_quote = false;
+    while (index.* < target.len) {
+        const ch = target[index.*];
+        if (ch == '"') {
+            if (in_quote and index.* + 1 < target.len and target[index.* + 1] == '"') {
+                index.* += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+            index.* += 1;
+            continue;
+        }
+        if (!in_quote and ch == ',') {
+            const end = index.*;
+            index.* += 1;
+            return target[start..end];
+        }
+        index.* += 1;
+    }
+    index.* = target.len + 1;
+    return target[start..target.len];
+}
+
+fn setConstraintsTargetIdentifierMatchesExpected(target: []const u8, expected: []const u8) bool {
+    if (enumTokenEql(target, expected)) return true;
+    return quotedSqlIdentifierEql(target, expected);
+}
+
+fn quotedSqlIdentifierEql(target: []const u8, expected: []const u8) bool {
+    if (target.len < 2 or target[0] != '"') return false;
+    var target_index: usize = 1;
+    var expected_index: usize = 0;
+    while (target_index < target.len) {
+        const ch = target[target_index];
+        if (ch == '"') {
+            if (target_index + 1 < target.len and target[target_index + 1] == '"') {
+                if (expected_index == expected.len or expected[expected_index] != '"') return false;
+                expected_index += 1;
+                target_index += 2;
+                continue;
+            }
+            return target_index + 1 == target.len and expected_index == expected.len;
+        }
+        if (expected_index == expected.len or expected[expected_index] != ch) return false;
+        expected_index += 1;
+        target_index += 1;
+    }
+    return false;
+}
+
+const EnumTokenSpan = struct {
+    text: []const u8,
+    start: usize,
+    end: usize,
+};
+
+fn nextEnumTokenSpan(text: []const u8, index: *usize) ?EnumTokenSpan {
+    while (index.* < text.len and enumTokenSeparator(text[index.*])) index.* += 1;
+    if (index.* == text.len) return null;
+    const start = index.*;
+    while (index.* < text.len and !enumTokenSeparator(text[index.*])) index.* += 1;
+    return .{
+        .text = text[start..index.*],
+        .start = start,
+        .end = index.*,
+    };
+}
+
+fn trimEnumTokenSeparators(text: []const u8) []const u8 {
+    var start: usize = 0;
+    var end: usize = text.len;
+    while (start < end and enumTokenSeparator(text[start])) start += 1;
+    while (end > start and enumTokenSeparator(text[end - 1])) end -= 1;
+    return text[start..end];
+}
+
+fn foreignKeyActionPageCanonicalAction(action: []const u8) ?[]const u8 {
+    if (enumTokenEql(action, "set_null") or enumTokenEql(action, "delete_set_null") or enumTokenEql(action, "on_delete_set_null")) return "set_null";
+    if (enumTokenEql(action, "cascade") or enumTokenEql(action, "delete_cascade") or enumTokenEql(action, "on_delete_cascade")) return "cascade";
+    if (enumTokenEql(action, "update_set_null") or enumTokenEql(action, "on_update_set_null")) return "update_set_null";
+    if (enumTokenEql(action, "update_cascade") or enumTokenEql(action, "on_update_cascade")) return "update_cascade";
+    return null;
+}
+
+fn parseForeignKeyMutationOperation(name: []const u8) ?db_mod.types.ForeignKeyParentDeleteCheck.Operation {
+    if (enumTokenEql(name, "delete") or
+        enumTokenEql(name, "parent_delete") or
+        enumTokenEql(name, "on_delete") or
+        enumTokenEql(name, "on_delete_check"))
+    {
+        return .delete;
+    }
+    if (enumTokenEql(name, "update") or
+        enumTokenEql(name, "parent_update") or
+        enumTokenEql(name, "on_update") or
+        enumTokenEql(name, "on_update_check"))
+    {
+        return .update;
+    }
     return null;
 }
 
@@ -4481,15 +4785,54 @@ fn enumTokenEql(actual: []const u8, expected: []const u8) bool {
     return actual_index == actual.len and expected_index == expected.len;
 }
 
+fn asciiTokenEql(actual: []const u8, expected: []const u8) bool {
+    if (actual.len != expected.len) return false;
+    for (actual, expected) |actual_ch, expected_ch| {
+        if (std.ascii.toLower(actual_ch) != std.ascii.toLower(expected_ch)) return false;
+    }
+    return true;
+}
+
 fn enumTokenSeparator(ch: u8) bool {
-    return ch == ' ' or ch == '_' or ch == '-';
+    return std.ascii.isWhitespace(ch) or ch == '_' or ch == '-';
 }
 
 test "txn foreign key timing parser accepts SQL spellings" {
     try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parseForeignKeyTimingName("INITIALLY DEFERRED").?);
     try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parseForeignKeyTimingName("initially-deferred").?);
     try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.immediate, parseForeignKeyTimingName("initially immediate").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parseForeignKeyTimingName("SET CONSTRAINTS DEFERRED").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.immediate, parseForeignKeyTimingName("set-constraints-all-immediate").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parseForeignKeyTimingName("SET CONSTRAINTS orders_customer_id_fkey DEFERRED").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.immediate, parseForeignKeyTimingName("set-constraint-orders-customer-id-fkey-immediate").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS orders_customer_id_fkey DEFERRED", "orders_customer_id_fkey").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parseForeignKeyTimingNameForConstraint("SET\tCONSTRAINTS\torders_customer_id_fkey\tDEFERRED;", "orders_customer_id_fkey").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.immediate, parseForeignKeyTimingNameForConstraint(" SET CONSTRAINTS ALL IMMEDIATE ; ", "orders_customer_id_fkey").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.immediate, parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS ALL IMMEDIATE", "orders_customer_id_fkey").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS other_customer_id_fkey, orders_customer_id_fkey DEFERRED", "orders_customer_id_fkey").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS \"orders_customer_id_fkey\" DEFERRED", "orders_customer_id_fkey").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.immediate, parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS other_customer_id_fkey, \"orders_customer_id_fkey\" IMMEDIATE", "orders_customer_id_fkey").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS \"orders_customer\"\"id_fkey\" DEFERRED", "orders_customer\"id_fkey").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS other_customer_id_fkey, \"orders,customer_fkey\" DEFERRED", "orders,customer_fkey").?);
+    try std.testing.expect(parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS other_customer_id_fkey DEFERRED", "orders_customer_id_fkey") == null);
+    try std.testing.expect(parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS other_customer_id_fkey, third_customer_id_fkey DEFERRED", "orders_customer_id_fkey") == null);
+    try std.testing.expect(parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS other_customer_id_fkey, DEFERRED", "orders_customer_id_fkey") == null);
+    try std.testing.expect(parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS \"Orders_Customer_Id_Fkey\" DEFERRED", "orders_customer_id_fkey") == null);
+    try std.testing.expect(parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS \"orders_customer_id_fkey DEFERRED", "orders_customer_id_fkey") == null);
+    try std.testing.expect(parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS orders_customer_id_fkey; DEFERRED", "orders_customer_id_fkey") == null);
+    try std.testing.expect(parseForeignKeyTimingNameForConstraint("SET CONSTRAINTS orders_customer_id_fkey DEFERRED;;", "orders_customer_id_fkey") == null);
+    try std.testing.expect(parseForeignKeyTimingName("SET CONSTRAINTS orders_customer_id_fkey") == null);
     try std.testing.expect(parseForeignKeyTimingName("eventually") == null);
+}
+
+test "txn foreign key mutation operation parser accepts SQL spellings" {
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentDeleteCheck.Operation.delete, parseForeignKeyMutationOperation("DELETE").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentDeleteCheck.Operation.delete, parseForeignKeyMutationOperation("parent-delete").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentDeleteCheck.Operation.delete, parseForeignKeyMutationOperation("ON DELETE").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentDeleteCheck.Operation.update, parseForeignKeyMutationOperation("UPDATE").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentDeleteCheck.Operation.update, parseForeignKeyMutationOperation("parent_update").?);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentDeleteCheck.Operation.update, parseForeignKeyMutationOperation("on update check").?);
+    try std.testing.expect(parseForeignKeyMutationOperation("merge") == null);
 }
 
 fn freeTxnForeignKeyParentDeleteChecks(alloc: std.mem.Allocator, checks: []const db_mod.types.ForeignKeyParentDeleteCheck) void {
@@ -4570,12 +4913,10 @@ fn parseTxnForeignKeySetNullChildren(alloc: std.mem.Allocator, value: std.json.V
         const parent_key = requireString(obj, "parent_key");
         const child_key = requireString(obj, "child_key");
         const operation: db_mod.types.ForeignKeySetNullChildAction.Operation = if (obj.get("operation")) |field_value| switch (field_value) {
-            .string => |text| if (std.mem.eql(u8, text, "delete"))
-                .delete
-            else if (std.mem.eql(u8, text, "update"))
-                .update
-            else
-                return error.InvalidTxnRequest,
+            .string => |text| switch (parseForeignKeyMutationOperation(text) orelse return error.InvalidTxnRequest) {
+                .delete => .delete,
+                .update => .update,
+            },
             else => return error.InvalidTxnRequest,
         } else .delete;
         if (constraint_name.len == 0 or parent_table.len == 0 or parent_key.len == 0 or child_key.len == 0) return error.InvalidTxnRequest;
@@ -4632,12 +4973,10 @@ fn parseTxnForeignKeyCascadeChildren(alloc: std.mem.Allocator, value: std.json.V
             else => return error.InvalidTxnRequest,
         } else null;
         const operation: db_mod.types.ForeignKeyCascadeChildAction.Operation = if (obj.get("operation")) |field_value| switch (field_value) {
-            .string => |text| if (std.mem.eql(u8, text, "delete"))
-                .delete
-            else if (std.mem.eql(u8, text, "update"))
-                .update
-            else
-                return error.InvalidTxnRequest,
+            .string => |text| switch (parseForeignKeyMutationOperation(text) orelse return error.InvalidTxnRequest) {
+                .delete => .delete,
+                .update => .update,
+            },
             else => return error.InvalidTxnRequest,
         } else .delete;
         if (constraint_name.len == 0 or parent_table.len == 0 or parent_key.len == 0 or child_key.len == 0) return error.InvalidTxnRequest;
@@ -4697,8 +5036,11 @@ fn parseTxnForeignKeyActionSchedules(alloc: std.mem.Allocator, value: std.json.V
             else => return error.InvalidTxnRequest,
         } else null;
         const page_limit = requireInteger(obj, "page_limit");
+        const cascade_depth = requireInteger(obj, "cascade_depth");
+        const cascade_max_depth = requireInteger(obj, "cascade_max_depth");
         if (schedule_id.len == 0 or action_job_id.len == 0 or action.len == 0 or worker_id.len == 0 or constraint_name.len == 0 or parent_table.len == 0 or parent_key.len == 0 or page_limit == 0) return error.InvalidTxnRequest;
         if (updated_parent_key != null and updated_parent_key.?.len == 0) return error.InvalidTxnRequest;
+        if (cascade_max_depth == 0 or cascade_depth > cascade_max_depth or cascade_depth > std.math.maxInt(u32) or cascade_max_depth > std.math.maxInt(u32)) return error.InvalidTxnRequest;
         out[initialized] = .{
             .schedule_id = try alloc.dupe(u8, schedule_id),
             .action_job_id = try alloc.dupe(u8, action_job_id),
@@ -4709,6 +5051,8 @@ fn parseTxnForeignKeyActionSchedules(alloc: std.mem.Allocator, value: std.json.V
             .parent_key = try alloc.dupe(u8, parent_key),
             .updated_parent_key = if (updated_parent_key) |updated_key| try alloc.dupe(u8, updated_key) else null,
             .page_limit = @intCast(page_limit),
+            .cascade_depth = @intCast(cascade_depth),
+            .cascade_max_depth = @intCast(cascade_max_depth),
         };
         initialized += 1;
     }
@@ -4968,6 +5312,8 @@ test "txn prepare parser round-trips constraint participant intents" {
                 .parent_table = "customers",
                 .parent_key = "customer:8",
                 .page_limit = 512,
+                .cascade_depth = 3,
+                .cascade_max_depth = 9,
             }},
             .foreign_key_ref_writes = &.{.{
                 .constraint_name = "orders_customer_id_fkey",
@@ -5005,7 +5351,6 @@ test "txn prepare parser round-trips constraint participant intents" {
                 .encoded_value = "email:grace",
                 .owner_key = "user:2",
             }},
-            .foreign_key_parent_checks_externalized = true,
         },
     });
     defer alloc.free(body);
@@ -5049,6 +5394,8 @@ test "txn prepare parser round-trips constraint participant intents" {
     try std.testing.expectEqualStrings("customers", parsed.req.foreign_key_action_schedules[0].parent_table);
     try std.testing.expectEqualStrings("customer:8", parsed.req.foreign_key_action_schedules[0].parent_key);
     try std.testing.expectEqual(@as(usize, 512), parsed.req.foreign_key_action_schedules[0].page_limit);
+    try std.testing.expectEqual(@as(u32, 3), parsed.req.foreign_key_action_schedules[0].cascade_depth);
+    try std.testing.expectEqual(@as(u32, 9), parsed.req.foreign_key_action_schedules[0].cascade_max_depth);
     try std.testing.expectEqual(@as(usize, 1), parsed.req.foreign_key_ref_writes.len);
     try std.testing.expectEqualStrings("orders_customer_id_fkey", parsed.req.foreign_key_ref_writes[0].constraint_name);
     try std.testing.expectEqualStrings("customers", parsed.req.foreign_key_ref_writes[0].parent_table);
@@ -5079,7 +5426,73 @@ test "txn prepare parser round-trips constraint participant intents" {
     try std.testing.expectEqualStrings("users_email_key", parsed.req.unique_constraint_deletes[0].constraint_name);
     try std.testing.expectEqualStrings("email:grace", parsed.req.unique_constraint_deletes[0].encoded_value);
     try std.testing.expectEqualStrings("user:2", parsed.req.unique_constraint_deletes[0].owner_key);
-    try std.testing.expect(parsed.req.foreign_key_parent_checks_externalized);
+    try expectTxnPrepareSqlStyleForeignKeyOperationSpellings(alloc);
+}
+
+fn expectTxnPrepareSqlStyleForeignKeyOperationSpellings(alloc: std.mem.Allocator) !void {
+    var parsed = try parseTxnPrepareRequest(alloc,
+        \\{
+        \\  "txn_id":"00112233445566778899aabbccddeeff",
+        \\  "topology_epoch":7,
+        \\  "writes":[],
+        \\  "deletes":[],
+        \\  "transforms":[],
+        \\  "predicates":[],
+        \\  "foreign_key_parent_delete_checks":[{
+        \\    "constraint_name":"orders_customer_id_fkey",
+        \\    "parent_table":"customers",
+        \\    "parent_key":"customer:1",
+        \\    "operation":"ON UPDATE",
+        \\    "timing":"SET CONSTRAINTS ALL DEFERRED"
+        \\  }],
+        \\  "foreign_key_set_null_children":[{
+        \\    "constraint_name":"orders_customer_id_fkey",
+        \\    "parent_table":"customers",
+        \\    "parent_key":"customer:2",
+        \\    "child_key":"order:2",
+        \\    "operation":"parent-delete"
+        \\  }],
+        \\  "foreign_key_cascade_children":[{
+        \\    "constraint_name":"orders_customer_id_fkey",
+        \\    "parent_table":"customers",
+        \\    "parent_key":"customer:3",
+        \\    "child_key":"order:3",
+        \\    "operation":"on update check",
+        \\    "updated_parent_key":"customer:4"
+        \\  }],
+        \\  "foreign_key_constraint_timing_overrides":[{
+        \\    "constraint_name":"orders_customer_id_fkey",
+        \\    "timing":"SET CONSTRAINTS other_customer_id_fkey, \"orders_customer_id_fkey\" DEFERRED"
+        \\  }]
+        \\}
+    );
+    defer freeTxnPrepareRequest(alloc, &parsed);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.foreign_key_parent_delete_checks.len);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentDeleteCheck.Operation.update, parsed.req.foreign_key_parent_delete_checks[0].operation);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parsed.req.foreign_key_parent_delete_checks[0].timing);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.foreign_key_set_null_children.len);
+    try std.testing.expectEqual(db_mod.types.ForeignKeySetNullChildAction.Operation.delete, parsed.req.foreign_key_set_null_children[0].operation);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.foreign_key_cascade_children.len);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyCascadeChildAction.Operation.update, parsed.req.foreign_key_cascade_children[0].operation);
+    try std.testing.expectEqualStrings("customer:4", parsed.req.foreign_key_cascade_children[0].updated_parent_key.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.foreign_key_constraint_timing_overrides.len);
+    try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parsed.req.foreign_key_constraint_timing_overrides[0].timing);
+
+    try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(alloc,
+        \\{
+        \\  "txn_id":"00112233445566778899aabbccddeeff",
+        \\  "topology_epoch":7,
+        \\  "writes":[],
+        \\  "deletes":[],
+        \\  "transforms":[],
+        \\  "predicates":[],
+        \\  "foreign_key_constraint_timing_overrides":[{
+        \\    "constraint_name":"orders_customer_id_fkey",
+        \\    "timing":"SET CONSTRAINTS other_customer_id_fkey DEFERRED"
+        \\  }]
+        \\}
+    ));
 }
 
 fn requireInteger(obj: std.json.ObjectMap, key: []const u8) u64 {
@@ -5473,7 +5886,6 @@ test "distributed txn coordinator externalizes deferred foreign key parent check
             if (group_id == 7001) {
                 try std.testing.expectEqualStrings("docs", table_name);
                 try std.testing.expectEqual(@as(usize, 1), req.req.writes.len);
-                try std.testing.expect(req.req.foreign_key_parent_checks_externalized);
                 try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_externalized_parent_checks.len);
                 const check = req.req.foreign_key_externalized_parent_checks[0];
                 try std.testing.expectEqualStrings("orders_customer_id_fkey", check.constraint_name);
@@ -5820,12 +6232,12 @@ test "distributed txn coordinator routes foreign key child writes through ref ow
                 try std.testing.expectEqual(@as(usize, 1), req.req.predicates.len);
                 try std.testing.expectEqualStrings("doc:a-order", req.req.predicates[0].key);
                 try std.testing.expectEqual(@as(u64, 0), req.req.predicates[0].expected_version);
-                try std.testing.expect(req.req.foreign_key_parent_checks_externalized);
+                try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_externalized_parent_checks.len);
                 self.prepared_child = true;
             } else if (group_id == 8001) {
                 try std.testing.expectEqualStrings("customers", table_name);
                 try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_parent_checks.len);
-                try std.testing.expect(!req.req.foreign_key_parent_checks_externalized);
+                try std.testing.expectEqual(@as(usize, 0), req.req.foreign_key_externalized_parent_checks.len);
                 try std.testing.expectEqualStrings("orders_customer_id_fkey", req.req.foreign_key_parent_checks[0].constraint_name);
                 try std.testing.expectEqualStrings("docs", req.req.foreign_key_parent_checks[0].child_table);
                 try std.testing.expectEqualStrings("doc:a-order", req.req.foreign_key_parent_checks[0].child_key);
@@ -5840,7 +6252,7 @@ test "distributed txn coordinator routes foreign key child writes through ref ow
                 try std.testing.expectEqualStrings("cust:z-customer", req.req.foreign_key_ref_writes[0].parent_key);
                 try std.testing.expectEqualStrings("row", req.req.foreign_key_ref_writes[0].child_table);
                 try std.testing.expectEqualStrings("doc:a-order", req.req.foreign_key_ref_writes[0].child_key);
-                try std.testing.expect(!req.req.foreign_key_parent_checks_externalized);
+                try std.testing.expectEqual(@as(usize, 0), req.req.foreign_key_externalized_parent_checks.len);
                 self.prepared_owner = true;
             } else return error.UnexpectedGroup;
         }
@@ -7258,12 +7670,12 @@ test "distributed txn coordinator routes foreign key checks through unique owner
             if (group_id == 7001) {
                 try std.testing.expectEqual(@as(usize, 1), req.req.writes.len);
                 try std.testing.expectEqual(@as(usize, 0), req.req.foreign_key_parent_checks.len);
-                try std.testing.expect(req.req.foreign_key_parent_checks_externalized);
+                try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_externalized_parent_checks.len);
                 self.row_prepared = true;
             } else if (group_id == 9001) {
                 try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
                 try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_parent_checks.len);
-                try std.testing.expect(!req.req.foreign_key_parent_checks_externalized);
+                try std.testing.expectEqual(@as(usize, 0), req.req.foreign_key_externalized_parent_checks.len);
                 const check = req.req.foreign_key_parent_checks[0];
                 try std.testing.expectEqualStrings("users_ref_email_fkey", check.constraint_name);
                 try std.testing.expectEqualStrings("docs", check.child_table);
@@ -7386,13 +7798,13 @@ test "distributed txn coordinator routes cross-table foreign key checks through 
                 try std.testing.expectEqualStrings("docs", table_name);
                 try std.testing.expectEqual(@as(usize, 1), req.req.writes.len);
                 try std.testing.expectEqual(@as(usize, 0), req.req.foreign_key_parent_checks.len);
-                try std.testing.expect(req.req.foreign_key_parent_checks_externalized);
+                try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_externalized_parent_checks.len);
                 self.row_prepared = true;
             } else if (group_id == 9001) {
                 try std.testing.expectEqualStrings("customers", table_name);
                 try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
                 try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_parent_checks.len);
-                try std.testing.expect(!req.req.foreign_key_parent_checks_externalized);
+                try std.testing.expectEqual(@as(usize, 0), req.req.foreign_key_externalized_parent_checks.len);
                 const check = req.req.foreign_key_parent_checks[0];
                 try std.testing.expectEqualStrings("orders_customer_email_fkey", check.constraint_name);
                 try std.testing.expectEqualStrings("docs", check.child_table);
@@ -7811,13 +8223,13 @@ test "distributed txn coordinator routes cross-table composite foreign key check
                 try std.testing.expectEqualStrings("docs", table_name);
                 try std.testing.expectEqual(@as(usize, 1), req.req.writes.len);
                 try std.testing.expectEqual(@as(usize, 0), req.req.foreign_key_parent_checks.len);
-                try std.testing.expect(req.req.foreign_key_parent_checks_externalized);
+                try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_externalized_parent_checks.len);
                 self.row_prepared = true;
             } else if (group_id == 9001) {
                 try std.testing.expectEqualStrings("customers", table_name);
                 try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
                 try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_parent_checks.len);
-                try std.testing.expect(!req.req.foreign_key_parent_checks_externalized);
+                try std.testing.expectEqual(@as(usize, 0), req.req.foreign_key_externalized_parent_checks.len);
                 const check = req.req.foreign_key_parent_checks[0];
                 try std.testing.expectEqualStrings("orders_customer_identity_fkey", check.constraint_name);
                 try std.testing.expectEqualStrings("docs", check.child_table);
@@ -7855,6 +8267,133 @@ test "distributed txn coordinator routes cross-table composite foreign key check
     try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
     try std.testing.expect(recorder.row_prepared);
     try std.testing.expect(recorder.unique_parent_prepared);
+}
+
+test "distributed txn coordinator routes cross-table composite foreign key checks through parent primary key owner ranges" {
+    const orders_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_region":{"type":"keyword"},"customer_email":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_identity_fkey","columns":["customer_region","customer_email"],"references":{"table":"customers","columns":["region","email"]},"on_delete":"restrict"}]}
+    ;
+    const customers_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"customers","enforce_types":true,"document_schemas":{"customers":{"schema":{"type":"object","properties":{"region":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"}},"required":["region","email"],"additionalProperties":false}}},"primary_key":{"columns":["region","email"]}}
+    ;
+    var parent_schema = try schema_mod.parseValidatedTableSchema(std.testing.allocator, customers_schema_json);
+    defer parent_schema.deinit(std.testing.allocator);
+    const parent_runtime_schema = try schema_mod.deriveRuntimeTableSchema(std.testing.allocator, parent_schema);
+    defer storage_schema.freeSchema(std.testing.allocator, parent_runtime_schema);
+    const parent_row = try document_mapper.buildRelationalRowValueAlloc(std.testing.allocator, "{\"region\":\"us-east\",\"email\":\"ada@example.test\"}", parent_runtime_schema.relational_columns);
+    defer std.testing.allocator.free(parent_row);
+    const expected_parent_key = try relational_store.primaryKeyTupleValueAlloc(std.testing.allocator, parent_row, parent_runtime_schema.primary_key.?);
+    defer std.testing.allocator.free(expected_parent_key);
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const metadata_table_manager = @import("../metadata/table_manager.zig");
+            const raft_reconciler = @import("../raft/reconciler.zig");
+            const metadata_transition_state = @import("../metadata/transition_state.zig");
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 7, .name = "docs", .schema_json = orders_schema_json, .placement_role = "data" },
+                    .{ .table_id = 8, .name = "customers", .schema_json = customers_schema_json, .placement_role = "data" },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                    .{ .group_id = 8001, .table_id = 8, .start_key = "", .end_key = null },
+                })[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{
+                    .{ .table_id = 8, .constraint_name = relational_store.primary_key_constraint_name, .start_encoded_value = "", .end_encoded_value = null, .group_id = 9001 },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+    };
+
+    const Recorder = struct {
+        expected_parent_key: []const u8,
+        row_prepared: bool = false,
+        primary_parent_prepared: bool = false,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .begin_group = begin,
+                    .prepare_group = prepare,
+                    .resolve_group = resolve,
+                    .status_group = status,
+                },
+            };
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnBeginRequest) !void {
+            try std.testing.expectEqual(@as(usize, 2), req.participants.len);
+        }
+
+        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (group_id == 7001) {
+                try std.testing.expectEqualStrings("docs", table_name);
+                try std.testing.expectEqual(@as(usize, 1), req.req.writes.len);
+                try std.testing.expectEqual(@as(usize, 0), req.req.foreign_key_parent_checks.len);
+                try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_externalized_parent_checks.len);
+                self.row_prepared = true;
+            } else if (group_id == 9001) {
+                try std.testing.expectEqualStrings("customers", table_name);
+                try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
+                try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_parent_checks.len);
+                try std.testing.expectEqual(@as(usize, 0), req.req.foreign_key_externalized_parent_checks.len);
+                const check = req.req.foreign_key_parent_checks[0];
+                try std.testing.expectEqualStrings("orders_customer_identity_fkey", check.constraint_name);
+                try std.testing.expectEqualStrings("docs", check.child_table);
+                try std.testing.expectEqualStrings("order:a", check.child_key);
+                try std.testing.expectEqualStrings("customers", check.parent_table);
+                try std.testing.expectEqualStrings(self.expected_parent_key, check.parent_key);
+                try std.testing.expect(check.parent_constraint_name != null);
+                try std.testing.expectEqualStrings(relational_store.primary_key_constraint_name, check.parent_constraint_name.?);
+                self.primary_parent_prepared = true;
+            } else return error.UnexpectedGroup;
+        }
+
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
+
+        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            return .pending;
+        }
+    };
+
+    var recorder = Recorder{ .expected_parent_key = expected_parent_key };
+    const result = try executeMultiTableCommit(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        try parseTxnIdHex("aaaabbbbccccddddeeeeffff00002223"),
+        10_000,
+        10_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{.{ .key = "order:a", .value = "{\"customer_region\":\"us-east\",\"customer_email\":\"ada@example.test\"}" }},
+            .predicates = &.{.{ .key = "order:a", .expected_version = 0 }},
+        }},
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
+    try std.testing.expect(recorder.row_prepared);
+    try std.testing.expect(recorder.primary_parent_prepared);
 }
 
 test "distributed txn coordinator routes unique foreign key parent deletes through ref owners" {
@@ -9083,7 +9622,7 @@ test "distributed txn coordinator allows non-reference transforms on foreign key
     try std.testing.expectEqual(@as(usize, 1), recorder.resolve_calls);
 }
 
-test "distributed txn coordinator registers foreign key parent delete participants" {
+test "distributed txn coordinator fails closed without foreign key ref owner parent delete ranges" {
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
     ;
@@ -9125,8 +9664,7 @@ test "distributed txn coordinator registers foreign key parent delete participan
     };
 
     const Recorder = struct {
-        checked_child_groups: u8 = 0,
-        prepared_parent_delete: bool = false,
+        begin_calls: usize = 0,
 
         fn worker(self: *@This()) ParticipantWorker {
             return .{
@@ -9140,39 +9678,28 @@ test "distributed txn coordinator registers foreign key parent delete participan
             };
         }
 
-        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnBeginRequest) !void {
-            try std.testing.expectEqual(@as(usize, 3), req.participants.len);
-        }
-
-        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
+        fn begin(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (group_id == 8002) {
-                try std.testing.expectEqualStrings("customers", table_name);
-                try std.testing.expectEqual(@as(usize, 1), req.req.deletes.len);
-                try std.testing.expectEqualStrings("cust:z-customer", req.req.deletes[0]);
-                self.prepared_parent_delete = true;
-            } else if (group_id == 7001 or group_id == 7002) {
-                try std.testing.expectEqualStrings("docs", table_name);
-                try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
-                try std.testing.expectEqual(@as(usize, 0), req.req.deletes.len);
-                try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_parent_delete_checks.len);
-                try std.testing.expectEqualStrings("orders_customer_id_fkey", req.req.foreign_key_parent_delete_checks[0].constraint_name);
-                try std.testing.expectEqualStrings("customers", req.req.foreign_key_parent_delete_checks[0].parent_table);
-                try std.testing.expectEqualStrings("cust:z-customer", req.req.foreign_key_parent_delete_checks[0].parent_key);
-                self.checked_child_groups += 1;
-            } else return error.UnexpectedGroup;
+            self.begin_calls += 1;
+            return error.UnexpectedWorkerCall;
         }
 
-        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+            return error.UnexpectedWorkerCall;
+        }
+
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {
+            return error.UnexpectedWorkerCall;
+        }
 
         fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
-            return .pending;
+            return error.UnexpectedWorkerCall;
         }
     };
 
     var recorder = Recorder{};
     const txn_id = try parseTxnIdHex("3333444455556666777788889999aaaa");
-    const result = try executeMultiTableCommit(
+    try std.testing.expectError(error.UnsupportedOperation, executeMultiTableCommit(
         std.testing.allocator,
         FakeCatalog.iface(),
         recorder.worker(),
@@ -9184,10 +9711,8 @@ test "distributed txn coordinator registers foreign key parent delete participan
             .deletes = &.{"cust:z-customer"},
         }},
         null,
-    );
-    try std.testing.expectEqual(@as(usize, 3), result.committed.participant_count);
-    try std.testing.expect(recorder.prepared_parent_delete);
-    try std.testing.expectEqual(@as(u8, 2), recorder.checked_child_groups);
+    ));
+    try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
 }
 
 test "distributed txn coordinator routes foreign key parent deletes through ref owners when configured" {
@@ -9862,6 +10387,7 @@ test "foreign key action page executes owner ref cleanup and child mutation thro
                     .prepare_group = prepare,
                     .resolve_group = resolve,
                     .status_group = status,
+                    .lookup_group = lookup,
                     .foreign_key_ref_children_page_group = foreignKeyRefChildrenPageGroup,
                 },
             };
@@ -9893,6 +10419,9 @@ test "foreign key action page executes owner ref cleanup and child mutation thro
                 try std.testing.expectEqualStrings("customers", req.req.foreign_key_set_null_children[0].parent_table);
                 try std.testing.expectEqualStrings("cust:z-customer", req.req.foreign_key_set_null_children[0].parent_key);
                 try std.testing.expectEqualStrings("doc:z-order", req.req.foreign_key_set_null_children[0].child_key);
+                try std.testing.expectEqual(@as(usize, 1), req.req.predicates.len);
+                try std.testing.expectEqualStrings("doc:z-order", req.req.predicates[0].key);
+                try std.testing.expectEqual(@as(u64, 88), req.req.predicates[0].expected_version);
                 self.prepared_child = true;
             } else return error.UnexpectedGroup;
         }
@@ -9907,6 +10436,16 @@ test "foreign key action page executes owner ref cleanup and child mutation thro
 
         fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
             return .pending;
+        }
+
+        fn lookup(_: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8) !?table_reads.LookupResponse {
+            try std.testing.expectEqual(@as(u64, 7002), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:z-order", key);
+            return .{
+                .json = try alloc.dupe(u8, "{\"customer_id\":\"cust:z-customer\"}"),
+                .version = 88,
+            };
         }
 
         fn foreignKeyRefChildrenPageGroup(
@@ -9950,7 +10489,7 @@ test "foreign key action page executes owner ref cleanup and child mutation thro
         11_001,
         "docs",
         9001,
-        "set_null",
+        "ON DELETE SET NULL",
         "orders_customer_id_fkey",
         "customers",
         "cust:z-customer",
@@ -9975,7 +10514,7 @@ test "foreign key action page executes owner ref cleanup and child mutation thro
 
 test "foreign key action page routes update cascade child mutations with replacement parent key" {
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_update":"cascade"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"orders_customer_id_key","columns":["customer_id"]}],"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_update":"cascade"}]}
     ;
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -10011,6 +10550,15 @@ test "foreign key action page routes update cascade child mutations with replace
                     .group_id = 9001,
                     .topology_epoch = 42,
                 }})[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{.{
+                    .table_id = 7,
+                    .constraint_name = "orders_customer_id_key",
+                    .start_encoded_value = "",
+                    .end_encoded_value = null,
+                    .group_id = 9101,
+                    .topology_epoch = 9,
+                    .state = metadata_table_manager.unique_constraint_range_active,
+                }})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -10036,6 +10584,7 @@ test "foreign key action page routes update cascade child mutations with replace
                     .prepare_group = prepare,
                     .resolve_group = resolve,
                     .status_group = status,
+                    .lookup_group = lookup,
                     .foreign_key_ref_children_page_group = foreignKeyRefChildrenPageGroup,
                 },
             };
@@ -10044,8 +10593,8 @@ test "foreign key action page routes update cascade child mutations with replace
         fn begin(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expect(group_id == 9001 or group_id == 7002);
-            try std.testing.expectEqual(@as(usize, 2), req.participants.len);
+            try std.testing.expect(group_id == 9001 or group_id == 7002 or group_id == 9101);
+            try std.testing.expectEqual(@as(usize, 3), req.participants.len);
             self.began += 1;
         }
 
@@ -10070,20 +10619,43 @@ test "foreign key action page routes update cascade child mutations with replace
                 try std.testing.expectEqualStrings("cust:old", action.parent_key);
                 try std.testing.expectEqualStrings("cust:new", action.updated_parent_key orelse return error.TestUnexpectedResult);
                 try std.testing.expectEqualStrings("doc:z-order", action.child_key);
+                try std.testing.expectEqual(@as(usize, 1), req.req.predicates.len);
+                try std.testing.expectEqualStrings("doc:z-order", req.req.predicates[0].key);
+                try std.testing.expectEqual(@as(u64, 77), req.req.predicates[0].expected_version);
                 self.prepared_child = true;
+            } else if (group_id == 9101) {
+                try std.testing.expectEqual(@as(usize, 1), req.req.unique_constraint_deletes.len);
+                try std.testing.expectEqual(@as(usize, 1), req.req.unique_constraint_writes.len);
+                try std.testing.expectEqualStrings("orders_customer_id_key", req.req.unique_constraint_deletes[0].constraint_name);
+                try std.testing.expectEqualStrings("orders_customer_id_key", req.req.unique_constraint_writes[0].constraint_name);
+                try std.testing.expectEqualStrings("doc:z-order", req.req.unique_constraint_deletes[0].owner_key);
+                try std.testing.expectEqualStrings("doc:z-order", req.req.unique_constraint_writes[0].owner_key);
+                try std.testing.expect(req.req.unique_constraint_deletes[0].encoded_value.len > 0);
+                try std.testing.expect(req.req.unique_constraint_writes[0].encoded_value.len > 0);
+                try std.testing.expect(!std.mem.eql(u8, req.req.unique_constraint_deletes[0].encoded_value, req.req.unique_constraint_writes[0].encoded_value));
             } else return error.UnexpectedGroup;
         }
 
         fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expect(group_id == 9001 or group_id == 7002);
+            try std.testing.expect(group_id == 9001 or group_id == 7002 or group_id == 9101);
             try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
             self.resolved += 1;
         }
 
         fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
             return .pending;
+        }
+
+        fn lookup(_: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8) !?table_reads.LookupResponse {
+            try std.testing.expectEqual(@as(u64, 7002), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:z-order", key);
+            return .{
+                .json = try alloc.dupe(u8, "{\"customer_id\":\"cust:old\"}"),
+                .version = 77,
+            };
         }
 
         fn foreignKeyRefChildrenPageGroup(
@@ -10127,7 +10699,7 @@ test "foreign key action page routes update cascade child mutations with replace
         11_001,
         "docs",
         9001,
-        "update_cascade",
+        "ON UPDATE CASCADE",
         "orders_customer_id_fkey",
         "customers",
         "cust:old",
@@ -10142,12 +10714,12 @@ test "foreign key action page routes update cascade child mutations with replace
     defer execution.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), execution.applied_children);
     try std.testing.expect(execution.complete);
-    try std.testing.expectEqual(@as(usize, 2), execution.participant_count);
+    try std.testing.expectEqual(@as(usize, 3), execution.participant_count);
     try std.testing.expect(recorder.paged_owner);
-    try std.testing.expectEqual(@as(usize, 2), recorder.began);
+    try std.testing.expectEqual(@as(usize, 3), recorder.began);
     try std.testing.expect(recorder.prepared_owner);
     try std.testing.expect(recorder.prepared_child);
-    try std.testing.expectEqual(@as(usize, 2), recorder.resolved);
+    try std.testing.expectEqual(@as(usize, 3), recorder.resolved);
 }
 
 test "foreign key action page schedules recursive cascade work for deleted children" {
@@ -10435,6 +11007,7 @@ test "foreign key action page accepts same table runtime parent identity for dur
                     .prepare_group = prepare,
                     .resolve_group = resolve,
                     .status_group = status,
+                    .lookup_group = lookup,
                     .foreign_key_ref_children_page_group = foreignKeyRefChildrenPageGroup,
                 },
             };
@@ -10465,6 +11038,9 @@ test "foreign key action page accepts same table runtime parent identity for dur
                 try std.testing.expectEqualStrings("row", req.req.foreign_key_set_null_children[0].parent_table);
                 try std.testing.expectEqualStrings("doc:parent", req.req.foreign_key_set_null_children[0].parent_key);
                 try std.testing.expectEqualStrings("doc:z-child", req.req.foreign_key_set_null_children[0].child_key);
+                try std.testing.expectEqual(@as(usize, 1), req.req.predicates.len);
+                try std.testing.expectEqualStrings("doc:z-child", req.req.predicates[0].key);
+                try std.testing.expectEqual(@as(u64, 99), req.req.predicates[0].expected_version);
                 self.prepared_child = true;
             } else return error.UnexpectedGroup;
         }
@@ -10479,6 +11055,16 @@ test "foreign key action page accepts same table runtime parent identity for dur
 
         fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
             return .pending;
+        }
+
+        fn lookup(_: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8) !?table_reads.LookupResponse {
+            try std.testing.expectEqual(@as(u64, 7002), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:z-child", key);
+            return .{
+                .json = try alloc.dupe(u8, "{\"manager_id\":\"doc:parent\"}"),
+                .version = 99,
+            };
         }
 
         fn foreignKeyRefChildrenPageGroup(

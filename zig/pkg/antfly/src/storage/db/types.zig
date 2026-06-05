@@ -938,8 +938,8 @@ pub const ForeignKeyActionScheduleMutation = struct {
     parent_key: []const u8,
     updated_parent_key: ?[]const u8 = null,
     page_limit: usize,
-    cascade_depth: u32 = 0,
-    cascade_max_depth: u32 = 64,
+    cascade_depth: u32,
+    cascade_max_depth: u32,
 };
 
 pub const UniqueConstraintMutation = struct {
@@ -965,7 +965,6 @@ pub const TransactionIntentRequest = struct {
     foreign_key_constraint_timing_overrides: []const ForeignKeyConstraintTimingOverride = &.{},
     unique_constraint_writes: []const UniqueConstraintMutation = &.{},
     unique_constraint_deletes: []const UniqueConstraintMutation = &.{},
-    foreign_key_parent_checks_externalized: bool = false,
 };
 
 pub const SplitState = struct {

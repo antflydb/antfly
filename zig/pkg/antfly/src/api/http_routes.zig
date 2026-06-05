@@ -56,6 +56,8 @@ pub const Routes = struct {
     pub const internal_groups_prefix = "/internal/v1/groups/";
     pub const internal_tables_prefix = "/internal/v1/tables/";
     pub const batch_suffix = "/batch";
+    pub const rows_batch_suffix = "/rows:batch";
+    pub const rows_get_suffix = "/rows:get";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const restore_suffix = "/restore";
@@ -108,6 +110,10 @@ pub const Routes = struct {
     };
 
     pub const TableBatch = struct {
+        table_name: []const u8,
+    };
+
+    pub const TableRows = struct {
         table_name: []const u8,
     };
 
@@ -382,6 +388,22 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, batch_suffix)) return null;
         const table_name = path[tables_prefix.len .. path.len - batch_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableRowsBatch(path: []const u8) ?TableRows {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, rows_batch_suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - rows_batch_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableRowsGet(path: []const u8) ?TableRows {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, rows_get_suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - rows_get_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
     }

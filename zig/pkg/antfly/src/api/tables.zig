@@ -928,6 +928,7 @@ fn validateRelationalStorageModeUpdateAlloc(
 }
 
 fn validateConstraintCatalogTransition(current_runtime: runtime_schema_mod.TableSchema, next_runtime: runtime_schema_mod.TableSchema) !void {
+    if (!primaryKeysEqual(current_runtime.primary_key, next_runtime.primary_key)) return error.InvalidSchemaUpdateRequest;
     for (current_runtime.unique_constraints) |constraint| {
         if (findUniqueConstraintByName(next_runtime.unique_constraints, constraint.name)) |next_constraint| {
             if (!uniqueConstraintsEqual(constraint, next_constraint)) return error.InvalidSchemaUpdateRequest;
@@ -948,6 +949,12 @@ fn validateConstraintCatalogTransition(current_runtime: runtime_schema_mod.Table
             if (!foreignKeysSameDefinition(current_foreign_key, foreign_key)) return error.InvalidSchemaUpdateRequest;
         }
     }
+}
+
+fn primaryKeysEqual(a: ?runtime_schema_mod.PrimaryKey, b: ?runtime_schema_mod.PrimaryKey) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return stringSlicesEqual(a.?.columns, b.?.columns);
 }
 
 fn findUniqueConstraintByName(unique_constraints: []const runtime_schema_mod.UniqueConstraint, name: []const u8) ?runtime_schema_mod.UniqueConstraint {
@@ -2815,6 +2822,15 @@ test "metadata.schema update rejects relational storage mode and base column cha
             std.testing.allocator,
             &relational_table,
             "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"keyword\"}},\"required\":[\"tenant\"],\"additionalProperties\":false}}}}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        applySchemaUpdateRecord(
+            std.testing.allocator,
+            &relational_table,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"numeric\"}},\"required\":[\"tenant\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"tenant\"]}}",
         ),
     );
 

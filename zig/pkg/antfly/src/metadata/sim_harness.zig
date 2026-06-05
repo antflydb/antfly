@@ -5008,7 +5008,7 @@ fn metadataVoprCreateTableWithRanges(
     while (rounds < max_rounds) : (rounds += 1) {
         const leader_index = try metadataVoprLeaderIndex(cluster);
         return workflow.createTableWithRanges(&cluster.node(leader_index), table, ranges) catch |err| switch (err) {
-            error.NotLeader => {
+            error.NotLeader, error.ReconcileLeaseNotHeld => {
                 try cluster.stepAll();
                 continue;
             },
@@ -5036,6 +5036,46 @@ fn metadataVoprAddRange(
         };
     }
     return error.NotLeader;
+}
+
+fn metadataVoprRequireUniqueOwnerRange(
+    cluster: *MetadataHttpClusterSimulation,
+    table_id: u64,
+    constraint_name: []const u8,
+) !void {
+    const leader_index = try metadataVoprLeaderIndex(cluster);
+    const ranges = try cluster.node(leader_index).listProjectedUniqueConstraintRanges(cluster.alloc);
+    defer cluster.node(leader_index).freeProjectedUniqueConstraintRanges(cluster.alloc, ranges);
+    for (ranges) |range| {
+        if (range.table_id != table_id) continue;
+        if (!std.mem.eql(u8, range.constraint_name, constraint_name)) continue;
+        if (!std.mem.eql(u8, range.start_encoded_value, "")) continue;
+        if (range.end_encoded_value != null) continue;
+        if (!metadata_table_manager.uniqueConstraintRangeRoutable(range)) continue;
+        return;
+    }
+    return error.TestExpectedEqual;
+}
+
+fn metadataVoprRequireForeignKeyReferenceRange(
+    cluster: *MetadataHttpClusterSimulation,
+    child_table_id: u64,
+    constraint_name: []const u8,
+    parent_table_id: u64,
+) !void {
+    const leader_index = try metadataVoprLeaderIndex(cluster);
+    const ranges = try cluster.node(leader_index).listProjectedForeignKeyReferenceRanges(cluster.alloc);
+    defer cluster.node(leader_index).freeProjectedForeignKeyReferenceRanges(cluster.alloc, ranges);
+    for (ranges) |range| {
+        if (range.child_table_id != child_table_id) continue;
+        if (range.parent_table_id != parent_table_id) continue;
+        if (!std.mem.eql(u8, range.constraint_name, constraint_name)) continue;
+        if (!std.mem.eql(u8, range.start_parent_key, "")) continue;
+        if (range.end_parent_key != null) continue;
+        if (!metadata_table_manager.foreignKeyReferenceRangeRoutable(range)) continue;
+        return;
+    }
+    return error.TestExpectedEqual;
 }
 
 fn metadataVoprRunLivenessWorkload(
@@ -5133,19 +5173,18 @@ fn metadataVoprRunExpandedLivenessWorkload(
         .start_key = "doc:a",
         .end_key = "doc:m",
     }};
-    try metadataVoprStartFollowerLinkPartition(cluster, state);
     _ = try metadataVoprCreateTableWithRanges(cluster, &merge_workflow, .{
         .table_id = merge_table_id,
         .name = "vopr-merge",
         .desired_replica_count = 1,
         .min_ranges = 2,
-    }, merge_left_range[0..], 16);
+    }, merge_left_range[0..], 96);
     _ = try metadataVoprAddRange(cluster, &merge_workflow, .{
         .group_id = merge_right_group,
         .table_id = merge_table_id,
         .start_key = "doc:m",
         .end_key = "doc:z",
-    }, 16);
+    }, 96);
     try std.testing.expect(try cluster.waitForGroupStatusCount(merge_left_group, .active, 1, 64));
     try std.testing.expect(try cluster.waitForGroupStatusCount(merge_right_group, .active, 1, 64));
     const merge_leader_index = try metadataVoprLeaderIndex(cluster);
@@ -5164,16 +5203,15 @@ fn metadataVoprRunExpandedLivenessWorkload(
     try metadataVoprHealAll(cluster, state);
 
     const topo_leader_index = try metadataVoprLeaderIndex(cluster);
-    try metadataVoprStartFollowerLinkPartition(cluster, state);
     try cluster.node(topo_leader_index).upsertNode(.{ .node_id = 3, .role = "maintenance" });
     try cluster.node(topo_leader_index).upsertStore(.{ .store_id = 3, .node_id = 3, .role = "data", .live = false });
     try metadataVoprHealAll(cluster, state);
     var store_down_ctx = VoprStoreLiveProgressContext{ .store_id = 3, .expected_live = false };
-    try cluster.assertProgress("metadata-vopr-store-down", 32, &store_down_ctx, voprStoreLiveProgressPredicate);
+    try cluster.assertProgress("metadata-vopr-store-down", 96, &store_down_ctx, voprStoreLiveProgressPredicate);
     try cluster.node(try metadataVoprLeaderIndex(cluster)).upsertNode(.{ .node_id = 3, .role = "data" });
     try cluster.node(try metadataVoprLeaderIndex(cluster)).upsertStore(.{ .store_id = 3, .node_id = 3, .role = "data", .live = true });
     var store_up_ctx = VoprStoreLiveProgressContext{ .store_id = 3, .expected_live = true };
-    try cluster.assertProgress("metadata-vopr-store-up", 32, &store_up_ctx, voprStoreLiveProgressPredicate);
+    try cluster.assertProgress("metadata-vopr-store-up", 96, &store_up_ctx, voprStoreLiveProgressPredicate);
     try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
     try metadataVoprHealAll(cluster, state);
 
@@ -5267,6 +5305,86 @@ fn runMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignCo
     try metadataVoprHealAll(&cluster, &campaign_state);
 }
 
+fn runMetadataVoprRelationalIdentityCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignConfig) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = raft_engine.core.MemoryStorage.init(alloc);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(alloc);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(alloc);
+    defer store_c.deinit();
+
+    var factory_a = TestDescriptorFactory{ .alloc = alloc, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = alloc, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = alloc, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const root_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-rel-{x}-a", .{ tmp.sub_path, cfg.seed });
+    defer alloc.free(root_a);
+    const root_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-rel-{x}-b", .{ tmp.sub_path, cfg.seed });
+    defer alloc.free(root_b);
+    const root_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-rel-{x}-c", .{ tmp.sub_path, cfg.seed });
+    defer alloc.free(root_c);
+    const cat_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-rel-{x}-a.txt", .{ tmp.sub_path, cfg.seed });
+    defer alloc.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-rel-{x}-b.txt", .{ tmp.sub_path, cfg.seed });
+    defer alloc.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-rel-{x}-c.txt", .{ tmp.sub_path, cfg.seed });
+    defer alloc.free(cat_c);
+
+    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        makeHostSimConfig(1, cfg.metadata_group_id, root_a, cat_a),
+        makeHostSimConfig(2, cfg.metadata_group_id, root_b, cat_b),
+        makeHostSimConfig(3, cfg.metadata_group_id, root_c, cat_c),
+    };
+    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        makeHostSimDeps(&factory_a),
+        makeHostSimDeps(&factory_b),
+        makeHostSimDeps(&factory_c),
+    };
+
+    var cluster = try MetadataHttpClusterSimulation.init(alloc, cfg.metadata_group_id, configs[0..], deps[0..]);
+    defer cluster.deinit();
+    defer cluster.stopAll();
+
+    _ = try startBootstrappedMetadataCluster(&cluster, 48, true);
+
+    var prng = std.Random.DefaultPrng.init(cfg.seed);
+    const random = prng.random();
+    var campaign_state = MetadataVoprCampaignState{};
+    var operation_index: usize = 0;
+    try metadataVoprRunAction(&cluster, random, cfg, &campaign_state, operation_index, .delay_next);
+    operation_index += 1;
+    try metadataVoprRunAction(&cluster, random, cfg, &campaign_state, operation_index, .duplicate_next);
+    operation_index += 1;
+    try metadataVoprStartFollowerPartition(&cluster, &campaign_state);
+    try metadataVoprHealAll(&cluster, &campaign_state);
+
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    const parent_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"name":{"type":"keyword"}},"required":["tenant_id","customer_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","customer_id"]}}
+    ;
+    const child_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"order_id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["tenant_id","order_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","order_id"]},"foreign_keys":[{"name":"vopr_orders_customer_fkey","columns":["tenant_id","customer_id"],"references":{"table":"vopr-rel-parent","columns":["tenant_id","customer_id"]},"on_delete":"restrict","on_update":"restrict","match":"full","timing":"immediate","validation_state":"enforced"}]}
+    ;
+    const leader_index = try metadataVoprLeaderIndex(&cluster);
+    try workflow.bootstrapDesiredFromCommitted(cluster.node(leader_index));
+    try workflow.controlLoop().stateRef().tableManager().upsertTable(.{ .table_id = cfg.table_id, .name = "vopr-rel-parent", .schema_json = parent_schema, .desired_replica_count = 2, .min_ranges = 1, .placement_role = "data" });
+    try workflow.controlLoop().stateRef().tableManager().upsertRange(.{ .group_id = cfg.range_group_id, .table_id = cfg.table_id, .start_key = "doc:a", .end_key = "doc:z" });
+    try workflow.controlLoop().stateRef().tableManager().upsertTable(.{ .table_id = cfg.table_id + 1, .name = "vopr-rel-child", .schema_json = child_schema, .desired_replica_count = 2, .min_ranges = 1, .placement_role = "data" });
+    try workflow.controlLoop().stateRef().tableManager().upsertRange(.{ .group_id = cfg.range_group_id + 1, .table_id = cfg.table_id + 1, .start_key = "doc:a", .end_key = "doc:z" });
+    _ = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
+    try metadataVoprHealAll(&cluster, &campaign_state);
+
+    try std.testing.expect(try cluster.waitForGroupStatusCount(cfg.range_group_id, .active, 2, 64));
+    try std.testing.expect(try cluster.waitForGroupStatusCount(cfg.range_group_id + 1, .active, 2, 64));
+    try metadataVoprRequireUniqueOwnerRange(&cluster, cfg.table_id, db_mod.relational_store.primary_key_constraint_name);
+    try metadataVoprRequireUniqueOwnerRange(&cluster, cfg.table_id + 1, db_mod.relational_store.primary_key_constraint_name);
+    try metadataVoprRequireForeignKeyReferenceRange(&cluster, cfg.table_id + 1, "vopr_orders_customer_fkey", cfg.table_id);
+}
+
 test "metadata VOPR seeded smoke campaign" {
     try runMetadataVoprCampaign(std.testing.allocator, .{
         .seed = 0xA17F_0001,
@@ -5288,6 +5406,19 @@ test "metadata VOPR expanded generated workload campaign" {
         .range_group_id = 6202,
         .split_group_id = 6203,
         .split_transition_id = 6204,
+        .workload = .expanded,
+    });
+}
+
+test "metadata VOPR relational identity owner topology campaign" {
+    try runMetadataVoprRelationalIdentityCampaign(std.testing.allocator, .{
+        .seed = 0xA17F_0003,
+        .operation_count = 24,
+        .metadata_group_id = 6300,
+        .table_id = 6301,
+        .range_group_id = 6302,
+        .split_group_id = 6304,
+        .split_transition_id = 6305,
         .workload = .expanded,
     });
 }

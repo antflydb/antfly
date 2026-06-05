@@ -177,6 +177,10 @@ pub const UniqueConstraint = struct {
     columns: []const []const u8 = &.{},
 };
 
+pub const PrimaryKey = struct {
+    columns: []const []const u8 = &.{},
+};
+
 pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []const RelationalColumn) bool {
     if (current.len != next.len) return false;
     for (current, next) |a, b| {
@@ -187,6 +191,12 @@ pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []
         if (a.indexed != b.indexed) return false;
     }
     return true;
+}
+
+pub fn primaryKeyCatalogsEqual(current: ?PrimaryKey, next: ?PrimaryKey) bool {
+    if (current == null and next == null) return true;
+    if (current == null or next == null) return false;
+    return stringSlicesEqual(current.?.columns, next.?.columns);
 }
 
 pub fn foreignKeyCatalogsEqual(current: []const ForeignKey, next: []const ForeignKey) bool {
@@ -233,6 +243,7 @@ pub const TableSchema = struct {
     dynamic_templates: []const DynamicTemplate = &.{},
     full_text_documents: []const FullTextDocument = &.{},
     relational_columns: []const RelationalColumn = &.{},
+    primary_key: ?PrimaryKey = null,
     foreign_keys: []const ForeignKey = &.{},
     unique_constraints: []const UniqueConstraint = &.{},
 };
@@ -255,7 +266,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 16); // format version
+    try appendU32(&buf, alloc, 17); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -343,6 +354,15 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         for (constraint.columns) |column| try appendStr(&buf, alloc, column);
     }
 
+    // Primary-key catalog (format version 17+).
+    if (schema.primary_key) |primary_key| {
+        try buf.append(alloc, 1);
+        try appendU32(&buf, alloc, @intCast(primary_key.columns.len));
+        for (primary_key.columns) |column| try appendStr(&buf, alloc, column);
+    } else {
+        try buf.append(alloc, 0);
+    }
+
     const result = try alloc.dupe(u8, buf.items);
     buf.deinit(alloc);
     return result;
@@ -356,7 +376,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 16) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 17) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -724,6 +744,17 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         }
         break :blk constraints;
     } else &.{};
+    errdefer freeUniqueConstraintsSlice(alloc, unique_constraints);
+
+    const primary_key: ?PrimaryKey = if (fmt_version >= 17 and data[pos] == 1) key_blk: {
+        pos += 1;
+        const columns = try readStringSliceAlloc(alloc, data, &pos);
+        break :key_blk .{ .columns = columns };
+    } else key_blk: {
+        if (fmt_version >= 17) pos += 1;
+        break :key_blk null;
+    };
+    errdefer if (primary_key) |key| freePrimaryKey(alloc, key);
 
     return .{
         .version = version,
@@ -735,6 +766,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .dynamic_templates = templates,
         .full_text_documents = full_text_documents,
         .relational_columns = relational_columns,
+        .primary_key = primary_key,
         .foreign_keys = foreign_keys,
         .unique_constraints = unique_constraints,
     };
@@ -756,6 +788,7 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
     if (s.dynamic_templates.len > 0) alloc.free(s.dynamic_templates);
     freeFullTextDocumentsSlice(alloc, s.full_text_documents);
     freeRelationalColumnsSlice(alloc, s.relational_columns);
+    if (s.primary_key) |primary_key| freePrimaryKey(alloc, primary_key);
     freeForeignKeysSlice(alloc, s.foreign_keys);
     freeUniqueConstraintsSlice(alloc, s.unique_constraints);
 }
@@ -788,6 +821,10 @@ fn freeUniqueConstraintsSlice(alloc: Allocator, constraints: []const UniqueConst
 fn freeUniqueConstraint(alloc: Allocator, constraint: UniqueConstraint) void {
     alloc.free(constraint.name);
     freeStringSlice(alloc, constraint.columns);
+}
+
+fn freePrimaryKey(alloc: Allocator, primary_key: PrimaryKey) void {
+    freeStringSlice(alloc, primary_key.columns);
 }
 
 fn freeStringSlice(alloc: Allocator, values: []const []const u8) void {
@@ -1338,10 +1375,12 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
         .storage_mode = .relational,
         .relational_columns = &.{
             .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "tenant_id", .path = "tenant_id", .field_type = .keyword, .nullable = false },
             .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
             .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true },
             .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true, .indexed = false },
         },
+        .primary_key = .{ .columns = &.{ "tenant_id", "id" } },
         .foreign_keys = &.{
             .{
                 .name = "orders_customer_id_fkey",
@@ -1384,16 +1423,22 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     defer freeSchema(alloc, loaded);
 
     try std.testing.expectEqual(StorageMode.relational, loaded.storage_mode);
-    try std.testing.expectEqual(@as(usize, 4), loaded.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 5), loaded.relational_columns.len);
     try std.testing.expectEqualStrings("id", loaded.relational_columns[0].name);
     try std.testing.expectEqualStrings("id", loaded.relational_columns[0].path);
     try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[0].field_type);
     try std.testing.expect(!loaded.relational_columns[0].nullable);
-    try std.testing.expectEqual(AntflyType.numeric, loaded.relational_columns[1].field_type);
-    try std.testing.expectEqual(AntflyType.datetime, loaded.relational_columns[2].field_type);
-    try std.testing.expect(loaded.relational_columns[2].nullable);
-    try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[3].field_type);
-    try std.testing.expect(!loaded.relational_columns[3].indexed);
+    try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[1].field_type);
+    try std.testing.expect(!loaded.relational_columns[1].nullable);
+    try std.testing.expect(loaded.primary_key != null);
+    try std.testing.expectEqual(@as(usize, 2), loaded.primary_key.?.columns.len);
+    try std.testing.expectEqualStrings("tenant_id", loaded.primary_key.?.columns[0]);
+    try std.testing.expectEqualStrings("id", loaded.primary_key.?.columns[1]);
+    try std.testing.expectEqual(AntflyType.numeric, loaded.relational_columns[2].field_type);
+    try std.testing.expectEqual(AntflyType.datetime, loaded.relational_columns[3].field_type);
+    try std.testing.expect(loaded.relational_columns[3].nullable);
+    try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[4].field_type);
+    try std.testing.expect(!loaded.relational_columns[4].indexed);
     try std.testing.expectEqual(@as(usize, 3), loaded.foreign_keys.len);
     try std.testing.expectEqualStrings("orders_customer_id_fkey", loaded.foreign_keys[0].name);
     try std.testing.expectEqualStrings("customer_id", loaded.foreign_keys[0].child_columns[0]);

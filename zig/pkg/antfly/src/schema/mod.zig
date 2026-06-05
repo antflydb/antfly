@@ -67,6 +67,8 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
 
     const relational_columns = try deriveRuntimeRelationalColumns(alloc, schema);
     errdefer freeRuntimeRelationalColumns(alloc, relational_columns);
+    const primary_key = try deriveRuntimePrimaryKey(alloc, schema);
+    errdefer if (primary_key) |key| freeRuntimePrimaryKey(alloc, key);
     const foreign_keys = try deriveRuntimeForeignKeys(alloc, schema);
     errdefer freeRuntimeForeignKeys(alloc, foreign_keys);
     const unique_constraints = try deriveRuntimeUniqueConstraints(alloc, schema);
@@ -96,6 +98,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .dynamic_templates = dynamic_templates,
         .full_text_documents = full_text_documents,
         .relational_columns = relational_columns,
+        .primary_key = primary_key,
         .foreign_keys = foreign_keys,
         .unique_constraints = unique_constraints,
     };
@@ -219,6 +222,18 @@ fn freeRuntimeRelationalColumns(alloc: std.mem.Allocator, columns: []storage_sch
         alloc.free(column.path);
     }
     if (columns.len > 0) alloc.free(columns);
+}
+
+fn deriveRuntimePrimaryKey(alloc: std.mem.Allocator, schema: ParsedTableSchema) !?storage_schema.PrimaryKey {
+    const primary_key = schema.primary_key orelse return null;
+    return .{
+        .columns = try cloneStringSlice(alloc, primary_key.columns),
+    };
+}
+
+fn freeRuntimePrimaryKey(alloc: std.mem.Allocator, primary_key: storage_schema.PrimaryKey) void {
+    for (primary_key.columns) |column| alloc.free(column);
+    if (primary_key.columns.len > 0) alloc.free(primary_key.columns);
 }
 
 fn deriveRuntimeForeignKeys(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.ForeignKey {
@@ -968,7 +983,7 @@ fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?stor
 test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}]}
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}]}
     );
     defer parsed.deinit(alloc);
 
@@ -976,13 +991,17 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     defer storage_schema.freeSchema(alloc, runtime);
 
     try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
-    try std.testing.expectEqual(@as(usize, 6), runtime.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 7), runtime.relational_columns.len);
 
     const id = findRuntimeColumn(runtime, "id").?;
     try std.testing.expectEqual(storage_schema.AntflyType.keyword, id.field_type);
     try std.testing.expectEqualStrings("id", id.path);
     try std.testing.expect(!id.nullable); // required
     try std.testing.expect(id.indexed);
+    try std.testing.expect(runtime.primary_key != null);
+    try std.testing.expectEqual(@as(usize, 2), runtime.primary_key.?.columns.len);
+    try std.testing.expectEqualStrings("tenant_id", runtime.primary_key.?.columns[0]);
+    try std.testing.expectEqualStrings("id", runtime.primary_key.?.columns[1]);
     try std.testing.expectEqual(storage_schema.AntflyType.numeric, findRuntimeColumn(runtime, "amount").?.field_type);
     try std.testing.expect(findRuntimeColumn(runtime, "amount").?.nullable);
     try std.testing.expect(!findRuntimeColumn(runtime, "amount").?.indexed);

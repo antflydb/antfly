@@ -7,6 +7,7 @@ pub const AntflyType = types.AntflyType;
 pub const DocumentSchema = types.DocumentSchema;
 pub const TableSchema = types.TableSchema;
 pub const ForeignKeyReference = types.ForeignKeyReference;
+pub const PrimaryKey = types.PrimaryKey;
 pub const ForeignKey = types.ForeignKey;
 pub const UniqueConstraint = types.UniqueConstraint;
 pub const DynamicTemplate = types.DynamicTemplate;

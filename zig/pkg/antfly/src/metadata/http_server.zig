@@ -2610,7 +2610,9 @@ fn validateRelationalForeignKeyCatalogReferences(
         if (parent_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
 
         if (foreignKeyReferencesPrimaryKey(foreign_key)) continue;
-        _ = findUniqueConstraintByColumns(parent_schema.unique_constraints, foreign_key.parent_columns) orelse return error.InvalidSchemaUpdateRequest;
+        if (!primaryKeyColumnsEqual(parent_schema.primary_key, foreign_key.parent_columns)) {
+            _ = findUniqueConstraintByColumns(parent_schema.unique_constraints, foreign_key.parent_columns) orelse return error.InvalidSchemaUpdateRequest;
+        }
         if (foreign_key.child_columns.len != foreign_key.parent_columns.len) return error.InvalidSchemaUpdateRequest;
         for (foreign_key.child_columns, foreign_key.parent_columns) |child_column_name, parent_column_name| {
             const child_column = findRelationalColumn(child_schema.relational_columns, child_column_name) orelse return error.InvalidSchemaUpdateRequest;
@@ -2622,6 +2624,11 @@ fn validateRelationalForeignKeyCatalogReferences(
 
 fn foreignKeyReferencesPrimaryKey(foreign_key: storage_schema.ForeignKey) bool {
     return foreign_key.parent_columns.len == 1 and std.mem.eql(u8, foreign_key.parent_columns[0], "_id");
+}
+
+fn primaryKeyColumnsEqual(primary_key: ?storage_schema.PrimaryKey, columns: []const []const u8) bool {
+    const key = primary_key orelse return false;
+    return stringSlicesEqual(key.columns, columns);
 }
 
 fn findUniqueConstraintByColumns(constraints: []const storage_schema.UniqueConstraint, columns: []const []const u8) ?storage_schema.UniqueConstraint {

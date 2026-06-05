@@ -22,6 +22,7 @@ const batch_api = @import("batch.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
 const linear_merge_api = @import("linear_merge.zig");
+const relational_rows_api = @import("relational_rows.zig");
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
 const table_contract = @import("table_contract.zig");
@@ -33,6 +34,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const metadata_table_workflow = @import("../metadata/table_workflow.zig");
 const schema_mod = @import("../schema/mod.zig");
+const runtime_schema_mod = @import("../storage/schema.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
@@ -3420,6 +3422,16 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST) {
+            if (routes.Routes.matchTableRowsBatch(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsBatch(rows_route.table_name, req.body);
+            }
+        }
+        if (req.method == .POST) {
+            if (routes.Routes.matchTableRowsGet(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsGet(rows_route.table_name, req.body, authenticated_identity);
+            }
+        }
+        if (req.method == .POST) {
             if (routes.Routes.matchTableBatch(uri_parts.path)) |batch_route| {
                 return try self.handlePublicTableBatch(batch_route.table_name, req.body);
             }
@@ -5463,6 +5475,106 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    pub fn handlePublicTableRowsBatch(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
+        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var rows_req = relational_rows_api.parseRowsBatchRequest(self.alloc, body, schema) catch |err| switch (err) {
+            error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
+            else => return try textResponse(self.alloc, 400, "invalid rows request"),
+        };
+        defer rows_req.deinit(self.alloc);
+
+        _ = (source.batch(self.alloc, table_name, rows_req.req) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows request"),
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+            error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
+            else => {
+                std.log.err("public table rows batch failed table={s} err={}", .{ table_name, err });
+                return try textResponse(self.alloc, 500, "rows batch failed");
+            },
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+
+        const response_body = try relational_rows_api.encodeRowsBatchResponseAlloc(self.alloc, rows_req);
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 201, response_body);
+    }
+
+    pub fn handlePublicTableRowsGet(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var rows_req = relational_rows_api.parseRowsGetRequest(self.alloc, body, schema) catch |err| switch (err) {
+            error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
+            else => return try textResponse(self.alloc, 400, "invalid rows request"),
+        };
+        defer rows_req.deinit(self.alloc);
+
+        var results = try self.alloc.alloc(relational_rows_api.RowLookupResult, rows_req.keys.len);
+        defer self.alloc.free(results);
+        var initialized: usize = 0;
+        defer {
+            for (results[0..initialized]) |row| {
+                if (row.row_json) |json| self.alloc.free(json);
+            }
+        }
+
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+
+        for (rows_req.keys, 0..) |key, i| {
+            results[i] = .{
+                .identity_json = rows_req.identities_json[i],
+                .physical_key = key,
+                .found = false,
+            };
+            initialized += 1;
+            var lookup = (try source.lookup(self.alloc, table_name, key, .{}, .read_index)) orelse continue;
+            defer lookup.deinit(self.alloc);
+            if (row_filter_json) |value| {
+                if (!(try self.docJsonMatchesRowFilter(key, lookup.json, value))) continue;
+            }
+            results[i].found = true;
+            results[i].row_json = try self.alloc.dupe(u8, lookup.json);
+            results[i].version = lookup.version;
+        }
+
+        const response_body = try relational_rows_api.encodeRowsGetResponseAlloc(self.alloc, results, rows_req.include_physical_key);
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    fn runtimeSchemaForPublicRows(self: *ApiHttpServer, table_name: []const u8) !runtime_schema_mod.TableSchema {
+        var snapshot = (try self.source.adminSnapshot()) orelse return error.TableNotFound;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (table.schema_json.len == 0) return error.InvalidRowsRequest;
+        var parsed_schema = schema_mod.parseValidatedTableSchema(self.alloc, table.schema_json) catch return error.InvalidRowsRequest;
+        defer parsed_schema.deinit(self.alloc);
+        const derived_schema = schema_mod.deriveRuntimeTableSchema(self.alloc, parsed_schema) catch return error.InvalidRowsRequest;
+        if (derived_schema.storage_mode != .relational or derived_schema.primary_key == null) {
+            runtime_schema_mod.freeSchema(self.alloc, derived_schema);
+            return error.InvalidRowsRequest;
+        }
+        return derived_schema;
+    }
+
     pub fn handlePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
@@ -5585,6 +5697,9 @@ pub const ApiHttpServer = struct {
         lease_ms: ?u64 = null,
         max_work_units: ?usize = null,
         controller: ?[]const u8 = null,
+        schedule_id: ?[]const u8 = null,
+        action_schedule_action_job_id: ?[]const u8 = null,
+        action_schedule_action: ?[]const u8 = null,
         action_job_action: ?[]const u8 = null,
         parent_table: ?[]const u8 = null,
         parent_key: ?[]const u8 = null,
@@ -5594,13 +5709,13 @@ pub const ApiHttpServer = struct {
 
     fn parseForeignKeyIntegrityAction(value: ?[]const u8) !table_writes.ForeignKeyIntegrityAction {
         const text = value orelse "validate";
-        if (std.mem.eql(u8, text, "plan")) return .plan;
-        if (std.mem.eql(u8, text, "validate")) return .validate;
-        if (std.mem.eql(u8, text, "dry_run")) return .dry_run;
-        if (std.mem.eql(u8, text, "repair")) return .repair;
-        if (std.mem.eql(u8, text, "list")) return .list;
-        if (std.mem.eql(u8, text, "explain_delete")) return .explain_delete;
-        if (std.mem.eql(u8, text, "progress")) return .progress;
+        if (enumTokenEql(text, "plan")) return .plan;
+        if (enumTokenEql(text, "validate")) return .validate;
+        if (enumTokenEql(text, "dry_run")) return .dry_run;
+        if (enumTokenEql(text, "repair")) return .repair;
+        if (enumTokenEql(text, "list")) return .list;
+        if (enumTokenEql(text, "explain_delete")) return .explain_delete;
+        if (enumTokenEql(text, "progress")) return .progress;
         return error.InvalidForeignKeyIntegrityRequest;
     }
 
@@ -5612,11 +5727,31 @@ pub const ApiHttpServer = struct {
 
     fn parseUniqueIntegrityAction(value: ?[]const u8) !table_writes.UniqueConstraintIntegrityAction {
         const text = value orelse "validate";
-        if (std.mem.eql(u8, text, "validate")) return .validate;
-        if (std.mem.eql(u8, text, "dry_run")) return .dry_run;
-        if (std.mem.eql(u8, text, "repair")) return .repair;
-        if (std.mem.eql(u8, text, "progress")) return .progress;
+        if (enumTokenEql(text, "validate")) return .validate;
+        if (enumTokenEql(text, "dry_run")) return .dry_run;
+        if (enumTokenEql(text, "repair")) return .repair;
+        if (enumTokenEql(text, "progress")) return .progress;
         return error.InvalidUniqueIntegrityRequest;
+    }
+
+    fn enumTokenEql(actual: []const u8, expected: []const u8) bool {
+        var actual_index: usize = 0;
+        var expected_index: usize = 0;
+        while (true) {
+            while (actual_index < actual.len and enumTokenSeparator(actual[actual_index])) actual_index += 1;
+            while (expected_index < expected.len and enumTokenSeparator(expected[expected_index])) expected_index += 1;
+            if (actual_index == actual.len or expected_index == expected.len) break;
+            if (std.ascii.toLower(actual[actual_index]) != std.ascii.toLower(expected[expected_index])) return false;
+            actual_index += 1;
+            expected_index += 1;
+        }
+        while (actual_index < actual.len and enumTokenSeparator(actual[actual_index])) actual_index += 1;
+        while (expected_index < expected.len and enumTokenSeparator(expected[expected_index])) expected_index += 1;
+        return actual_index == actual.len and expected_index == expected.len;
+    }
+
+    fn enumTokenSeparator(ch: u8) bool {
+        return ch == ' ' or ch == '_' or ch == '-';
     }
 
     pub fn handlePublicTableForeignKeyIntegrity(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -5630,7 +5765,7 @@ pub const ApiHttpServer = struct {
         defer parsed.deinit();
 
         const action_text = parsed.value.action orelse "validate";
-        if (std.mem.eql(u8, action_text, "requeue_action_job")) {
+        if (enumTokenEql(action_text, "requeue_action_job")) {
             const job_id = parsed.value.job_id orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
             const action_job_action = parsed.value.action_job_action orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
             const worker_id = parsed.value.worker_id orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
@@ -5665,6 +5800,46 @@ pub const ApiHttpServer = struct {
                 error.ReadOnly => return try textResponse(self.alloc, 405, "method not allowed"),
                 else => return err,
             }) orelse return try textResponse(self.alloc, 404, "not found");
+            defer result.deinit(self.alloc);
+            return try jsonResponse(self.alloc, result);
+        }
+        if (enumTokenEql(action_text, "requeue_action_schedule")) {
+            const schedule_id = parsed.value.schedule_id orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const action_job_id = parsed.value.action_schedule_action_job_id orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const schedule_action = parsed.value.action_schedule_action orelse parsed.value.action_job_action orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const worker_id = parsed.value.worker_id orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const constraint_name = parsed.value.constraint_name orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const parent_table = parsed.value.parent_table orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const parent_key = parsed.value.parent_key orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const page_limit = @min(parsed.value.page_limit orelse 1024, 10_000);
+            if (schedule_id.len == 0 or action_job_id.len == 0 or schedule_action.len == 0 or worker_id.len == 0 or constraint_name.len == 0 or parent_table.len == 0 or parent_key.len == 0 or page_limit == 0) {
+                return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            }
+            if (parsed.value.controller != null or parsed.value.phase != null or parsed.value.doc_key != null or parsed.value.job_id != null) {
+                return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            }
+            var result = (source.foreignKeyActionScheduleRequeue(
+                self.alloc,
+                table_name,
+                schedule_id,
+                action_job_id,
+                schedule_action,
+                worker_id,
+                constraint_name,
+                parent_table,
+                parent_key,
+                parsed.value.updated_parent_key,
+                page_limit,
+            ) catch |err| switch (err) {
+                error.InvalidForeignKeyActionJob, error.InvalidForeignKeyIntegrityRequest => return try textResponse(self.alloc, 400, "invalid foreign key integrity request"),
+                error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+                error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.ForeignKeyNotFound => return try textResponse(self.alloc, 404, "foreign key not found"),
+                error.ForeignKeyActionScheduleNotFound => return try textResponse(self.alloc, 404, "foreign key action schedule not found"),
+                error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                error.ReadOnly => return try textResponse(self.alloc, 405, "method not allowed"),
+                else => return err,
+            }) orelse return try textResponse(self.alloc, 404, "foreign key action schedule not found");
             defer result.deinit(self.alloc);
             return try jsonResponse(self.alloc, result);
         }
@@ -6112,6 +6287,16 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
         .resource_type = .table,
         .resource = query.table_name,
         .permission_type = .read,
+    };
+    if (routes.Routes.matchTableRowsGet(path)) |rows| return .{
+        .resource_type = .table,
+        .resource = rows.table_name,
+        .permission_type = .read,
+    };
+    if (routes.Routes.matchTableRowsBatch(path)) |rows| return .{
+        .resource_type = .table,
+        .resource = rows.table_name,
+        .permission_type = .write,
     };
     if (routes.Routes.matchTablePath(path)) |table_path| {
         return .{
@@ -10551,6 +10736,25 @@ test "api http server exposes relational foreign key integrity repair" {
             last_error: ?[]const u8 = null,
         },
     };
+    const ActionScheduleResponse = struct {
+        group_id: u64,
+        schedule_id: []const u8,
+        action_job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        page_limit: usize,
+        status: []const u8,
+        completed: bool,
+        scheduled_groups: u64 = 0,
+        cascade_depth: u32 = 0,
+        cascade_max_depth: u32 = 64,
+        requeue_count: u64 = 0,
+        last_requeued_at_ns: ?u64 = null,
+        last_error: ?[]const u8 = null,
+    };
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, table_source.source());
@@ -10594,7 +10798,7 @@ test "api http server exposes relational foreign key integrity repair" {
         .method = .POST,
         .uri = "/tables/docs/foreign-key-integrity",
         .content_type = "application/json",
-        .body = "{\"action\":\"requeue_action_job\",\"job_id\":\"fk-action:http-requeue\",\"action_job_action\":\"set_null\",\"worker_id\":\"worker:http-action-retry\",\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"parent_key\":\"customer:a\",\"page_limit\":4}",
+        .body = "{\"action\":\"REQUEUE ACTION JOB\",\"job_id\":\"fk-action:http-requeue\",\"action_job_action\":\"SET NULL\",\"worker_id\":\"worker:http-action-retry\",\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"parent_key\":\"customer:a\",\"page_limit\":4}",
     });
     defer requeue_action_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), requeue_action_resp.status);
@@ -10625,6 +10829,63 @@ test "api http server exposes relational foreign key integrity repair" {
     try std.testing.expectEqualStrings("row", requeue_action_body.value.groups[0].next_child_table.?);
     try std.testing.expectEqualStrings("order:action:cursor", requeue_action_body.value.groups[0].next_child_key.?);
     try std.testing.expect(requeue_action_body.value.groups[0].last_error == null);
+
+    const scheduled_action_schedule = try db.scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(
+        "fk-action-schedule:http-requeue",
+        "fk-action:http-schedule-requeue",
+        "set_null",
+        "worker:http-schedule-seed",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:a",
+        null,
+        8,
+        15_000,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(scheduled_action_schedule);
+    const failed_action_schedule = try db.markForeignKeyActionScheduleSeededAt(
+        "fk-action-schedule:http-requeue",
+        0,
+        15_100,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(failed_action_schedule);
+    try std.testing.expectEqualStrings("invalid", failed_action_schedule.status);
+
+    var requeue_schedule_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"REQUEUE ACTION SCHEDULE\",\"schedule_id\":\"fk-action-schedule:http-requeue\",\"action_schedule_action_job_id\":\"fk-action:http-schedule-requeue\",\"action_schedule_action\":\"ON DELETE SET NULL\",\"worker_id\":\"worker:http-schedule-retry\",\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"parent_key\":\"customer:a\",\"page_limit\":6}",
+    });
+    defer requeue_schedule_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), requeue_schedule_resp.status);
+    var requeue_schedule_body = try std.json.parseFromSlice(ActionScheduleResponse, alloc, requeue_schedule_resp.body, .{ .ignore_unknown_fields = true });
+    defer requeue_schedule_body.deinit();
+    try std.testing.expectEqual(@as(u64, 0), requeue_schedule_body.value.group_id);
+    try std.testing.expectEqualStrings("fk-action-schedule:http-requeue", requeue_schedule_body.value.schedule_id);
+    try std.testing.expectEqualStrings("fk-action:http-schedule-requeue", requeue_schedule_body.value.action_job_id);
+    try std.testing.expectEqualStrings("set_null", requeue_schedule_body.value.action);
+    try std.testing.expectEqualStrings("worker:http-schedule-retry", requeue_schedule_body.value.worker_id);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", requeue_schedule_body.value.constraint_name);
+    try std.testing.expectEqualStrings("customers", requeue_schedule_body.value.parent_table);
+    try std.testing.expectEqualStrings("customer:a", requeue_schedule_body.value.parent_key);
+    try std.testing.expectEqual(@as(usize, 6), requeue_schedule_body.value.page_limit);
+    try std.testing.expectEqualStrings("pending", requeue_schedule_body.value.status);
+    try std.testing.expect(!requeue_schedule_body.value.completed);
+    try std.testing.expectEqual(@as(u64, 0), requeue_schedule_body.value.scheduled_groups);
+    try std.testing.expectEqual(@as(u64, 1), requeue_schedule_body.value.requeue_count);
+    try std.testing.expect(requeue_schedule_body.value.last_requeued_at_ns != null);
+    try std.testing.expect(requeue_schedule_body.value.last_error == null);
+
+    var missing_action_schedule_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"requeue_action_schedule\",\"schedule_id\":\"fk-action-schedule:missing\",\"action_schedule_action_job_id\":\"fk-action:http-schedule-requeue\",\"action_schedule_action\":\"set_null\",\"worker_id\":\"worker:http-schedule-retry\",\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"parent_key\":\"customer:a\"}",
+    });
+    defer missing_action_schedule_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), missing_action_schedule_resp.status);
+    try std.testing.expectEqualStrings("foreign key action schedule not found", missing_action_schedule_resp.body);
 
     var missing_action_job_resp = try server.handle(.{
         .method = .POST,
@@ -10864,7 +11125,7 @@ test "api http server exposes relational foreign key integrity repair" {
         .method = .POST,
         .uri = "/tables/docs/foreign-key-integrity",
         .content_type = "application/json",
-        .body = "{\"action\":\"dry_run\",\"constraint_name\":\"orders_customer_id_fkey\"}",
+        .body = "{\"action\":\"DRY RUN\",\"constraint_name\":\"orders_customer_id_fkey\"}",
     });
     defer dry_run_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), dry_run_resp.status);
@@ -11061,7 +11322,7 @@ test "api http server exposes relational unique integrity repair" {
         .method = .POST,
         .uri = "/tables/docs/unique-integrity",
         .content_type = "application/json",
-        .body = "{\"action\":\"dry_run\"}",
+        .body = "{\"action\":\"dry-run\"}",
     });
     defer dry_run_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), dry_run_resp.status);

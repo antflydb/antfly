@@ -24,12 +24,10 @@ full-row child writes read the current child row before prepare, inject either
 the observed row version or `expected_version: 0` for a missing row as a
 row-participant predicate, and use that proof to route FK-ref deletes for old
 parent keys plus FK-ref writes for new parent keys.
-Hosted restrict parent deletes use routed FK-ref owner ranges for exact
-parent-key checks when that topology is configured; otherwise they
-conservatively register all ranges of child tables that declare a matching
-primary-key FK and scan child reverse-reference rows plus staged child writes.
-Hosted primary-key `set_null` and bounded primary-key `cascade` parent deletes
-use the same owner topology when it is available: the coordinator registers the
+Hosted restrict parent deletes require routed FK-ref owner ranges for exact
+parent-key checks and fail before prepare when owner topology is absent or
+transitional. Hosted primary-key `set_null` and bounded primary-key `cascade`
+parent deletes use the same owner topology: the coordinator registers the
 FK-ref owner participants as conflict points and writes a deterministic durable
 FK action schedule mutation to one owner participant in the same 2PC as the
 parent delete. The schedule record stores the action (`set_null` or `cascade`),
@@ -63,14 +61,7 @@ parent row before prepare, inject the observed row version as a row-participant
 predicate when the caller did not supply one, encode the deleted unique tuple,
 and route `restrict`, `set_null`, or bounded `cascade` enforcement through the
 FK-ref owner range for that encoded tuple. Missing unique-owner or FK-ref owner
-topology still fails closed before prepare. Without FK-ref owner topology,
-hosted
-primary-key `set_null`
-falls back to broad child-range fanout: every matching child range joins the
-2PC and the child participant plans the nullable-column rewrite from its local
-reverse-reference rows. Hosted primary-key `cascade` does not use that fallback;
-it requires routed owner topology so the coordinator can send exact child-key
-delete actions. The
+topology fails closed before prepare. The
 transaction prepare contract has explicit FK-ref mutation, child-key set-null,
 and child-key cascade surfaces so a routed FK-ref owner participant can durably
 write/delete reverse-reference rows without pretending they are user documents,
@@ -79,7 +70,8 @@ scanning unrelated child ranges.
 The metadata and API catalog layers expose FK-ref owner-range records and a
 resolver for `(child_table, constraint, parent_table, parent_key) -> owner
 groups`, and the metadata control loop treats those owner ranges as first-class
-reconciled topology. Broader SQL constraint support remains future work.
+reconciled topology. SQL constraint families outside the implemented foreign-key
+and unique-constraint model remain future work.
 
 ## Goals
 
@@ -91,20 +83,100 @@ reconciled topology. Broader SQL constraint support remains future work.
 - Leave graph indexes and join planning as query/relationship tools, not as the
   source of truth for integrity constraints.
 
-## Non-Goals For The First Cut
+## Out Of Scope
 
-- General SQL constraint coverage.
+- General SQL constraint coverage outside foreign keys and unique constraints.
 - References to arbitrary non-unique parent columns.
-- Composite row identity.
-- Deferrable constraints.
-- Legacy compatibility with alternate relational encodings.
+- Alternate FK encodings for this initial feature set. The routed FK-ref
+  keyspace is the durable production encoding; future changes should use
+  explicit catalog/schema migrations instead of compatibility fallbacks.
+
+## Composite Primary Keys
+
+Composite primary keys should be first-class relational row identity, not a
+thin alias for ordinary unique constraints. The durable storage layer can still
+keep a hidden physical row key for placement, WAL, and row-version ownership,
+but the public relational identity for a table with
+`primary_key.columns = ["tenant_id", "order_id"]` is the typed tuple in that
+declared order.
+
+Current production shape:
+
+- Table schemas accept an explicit `primary_key` definition with ordered relational
+  columns. `_id` remains the default single-column document-key identity for
+  tables that do not declare `primary_key`; `_id` cannot be mixed into a
+  composite primary-key tuple.
+- Every primary-key component must be declared, scalar, non-null, and
+  type-stable. Missing, null, array, object, or dynamically typed primary-key
+  components fail before prepare.
+- Primary-key tuples use the same canonical typed tuple encoder used
+  by unique constraints and FK parent tuples. The encoding must include type
+  tags, stable column order, and unambiguous absent/null handling so tuple keys
+  remain byte-sortable, reproducible after restart, and safe across schema
+  reload.
+- The reconciler derives a reserved primary-key owner range named
+  `__antfly_primary_key__` using the same owner-range model as unique-owner
+  ranges. Splits, merges, placement changes, and repair preserve owner-range
+  epochs and fail closed when topology is missing or transitional.
+- Storage maintains a durable primary-key index mapping encoded primary tuple to the
+  hidden physical row key. The primary-key owner participant is the conflict
+  point for duplicate detection, parent existence checks, and FK proof rows.
+- Primary-key component updates are parent-key updates. They route through the
+  existing update action semantics and maintain the primary-key owner row plus
+  FK-ref movement; silent in-place key mutation is not allowed.
+- Foreign keys can reference a parent table's primary-key tuple by naming the
+  parent primary-key columns. The coordinator registers the
+  primary-key owner participant, not broad-fanout parent ranges, for existence,
+  restrict, set-null, cascade, deferred proof, and repair operations.
+- Keep unique constraints as secondary candidate keys. A FK to a composite
+  primary key and a FK to a composite unique constraint share tuple encoding and
+  FK-ref row shape, but they resolve through distinct catalog owner records.
+- Unique-owner integrity validation and repair include the reserved primary-key
+  owner, so missing primary-key owner rows can be rebuilt from committed base
+  rows.
+
+Public API shape:
+
+- Relational clients address rows through structured primary-key selectors,
+  for example
+  `{ "primary": { "tenant_id": "t1", "order_id": "o9" } }`, not by the hidden
+  physical row key.
+- `POST /tables/{table}/rows:batch` accepts `insert`, `upsert`, `update`, and
+  `delete` operations. `insert` compiles to the existing batch write path with a
+  non-existence version predicate on the derived row identity; `upsert` uses the
+  existing overwrite-or-create batch semantics; `update` compiles to a
+  non-upsert transform and rejects primary-key component patches; `delete`
+  compiles to a normal batch delete.
+- `POST /tables/{table}/rows:get` accepts primary-key selectors and returns the
+  structured identity, row JSON, version, and optional physical key for
+  diagnostics.
+- The public physical key, when requested, is diagnostic only. It is derived
+  from the canonical typed primary-key tuple and remains storage-owned for
+  placement, WAL, row-version ownership, and hidden base-row addressing.
+- Unique-key selectors are reserved until the public API can resolve them
+  through durable unique-owner rows. They must not be implemented as query scans
+  because FK, uniqueness, and SQL `ON CONFLICT` semantics require the same
+  exact owner-routing contract as storage.
+- A future SQL DSL should compile `PRIMARY KEY (tenant_id, order_id)`,
+  `REFERENCES customers(tenant_id, customer_id)`, `INSERT`, `ON CONFLICT`,
+  point `UPDATE`, and point `DELETE` into this structured API rather than making
+  SQL text the primitive storage API.
+
+Remaining follow-up work:
+
+- More chaos coverage should combine row writes, owner-range movement, action
+  jobs, and repair in one modeled workload. The current VOPR coverage includes
+  metadata owner-topology convergence for composite primary-key parent/child
+  schemas under deterministic transport faults.
+- SQL-facing adapters should map `PRIMARY KEY (a, b)` and references to that
+  key into the catalog form above.
 
 ## Public Contract
 
-The supported shape is `on_delete: "restrict"`, bounded local nullable-column
-`on_delete: "set_null"`, or bounded local `on_delete: "cascade"` foreign keys
-to either a parent table's `_id` or, for same-table local constraints, a
-declared unique parent column tuple.
+The supported shape is `on_delete: "restrict"`, bounded nullable-column
+`on_delete: "set_null"`, or bounded `on_delete: "cascade"` foreign keys to a
+parent table's `_id`, declared `primary_key.columns`, or declared
+`unique_constraints.columns` tuple with routed owner topology.
 
 ```json
 {
@@ -172,17 +244,25 @@ For v1:
 - schema input accepts canonical JSON enum tokens and SQL-style spellings for
   supported values: case is ignored, spaces/hyphens/underscores are equivalent,
   `NO ACTION` maps to `no_action`, `SET NULL` maps to `set_null`,
-  `INITIALLY DEFERRED` maps to `deferred`, `MATCH FULL` maps to `full`, and
+  full clause-shaped action tokens such as `ON DELETE CASCADE` and
+  `ON UPDATE SET NULL` map to their canonical action values,
+  `INITIALLY DEFERRED` maps to `deferred`, compound deferrability clauses such
+  as `DEFERRABLE INITIALLY DEFERRED` and
+  `NOT DEFERRABLE INITIALLY IMMEDIATE` are normalized into canonical
+  `deferrable`/`timing` catalog fields, `MATCH FULL` maps to `full`, and
   `NOT VALID` maps to the canonical `unvalidated` validation state.
   `deferrable` accepts either JSON booleans or SQL-style string tokens
-  `DEFERRABLE` / `NOT DEFERRABLE`; the runtime/catalog form remains canonical
-  boolean state.
+  `DEFERRABLE` / `NOT DEFERRABLE`; compound string clauses may also supply the
+  initial timing when the separate `timing` field is omitted. Compound
+  deferrability clauses are accepted in either `timing` or `deferrable`; if both
+  fields provide timing or deferrability, the values must agree.
   The compiled schema remains canonical. Unsupported SQL actions such as
   `SET DEFAULT` are rejected instead of being stored as inert catalog values.
 - referenced parent tables must be relational tables.
 - `on_update` defaults to `restrict`. `restrict` and `no_action` are enforced
-  as parent-key update checks for supported unique parent targets: changing a
-  referenced unique parent tuple is rejected while live child references exist.
+  as parent-key update checks for supported primary-key and unique parent
+  targets: changing a referenced parent tuple is rejected while live child
+  references exist.
   `restrict` is never relaxed by `timing: "deferred"`; deferred `no_action` is
   checked against the transaction's final staged reverse-reference state, so the
   parent tuple and the child references can be rewritten in either order inside
@@ -193,10 +273,14 @@ For v1:
   same-table unique-parent `on_update: "cascade"` is also implemented: changing
   the referenced unique tuple rewrites affected child FK columns to the new
   parent tuple and moves reverse-reference rows from the old tuple to the new
-  tuple. SQL-facing adapters that expose statement boundaries must map
+  tuple. Distributed mutating update actions are represented by the same durable
+  action schedule/job/page executor used for high-fanout parent deletes:
+  `update_set_null` and `update_cascade` pages route child-row rewrites through
+  source-layer 2PC, pin the affected child rows, and register downstream unique
+  and FK participants before prepare. SQL-facing adapters that expose statement
+  boundaries must map
   `restrict` to a statement-time check, while the raw DB transaction API
-  prepares row intents at commit. Distributed mutating update actions remain
-  reserved until the FK action-job executor can rewrite child rows durably.
+  prepares row intents at commit.
 - `on_delete` supports `restrict`, `no_action`, `set_null`, and `cascade`;
   `no_action` is preserved as a first-class catalog value. `restrict` is never
   relaxed by `timing: "deferred"`; deferred `no_action` validates the final
@@ -232,6 +316,21 @@ For v1:
   intents are replayed, so recovery sees the same effective timing as the
   original prepare. Distributed commit requests expose the same capability as a
   table-scoped option on the child table that owns the FK constraint. The
+  structured request keeps `constraint_name` separate from `timing`, but timing
+  accepts SQL-shaped aliases such as `SET CONSTRAINTS DEFERRED`,
+  `SET CONSTRAINTS ALL IMMEDIATE`, and
+  `SET CONSTRAINTS orders_customer_id_fkey DEFERRED` in addition to
+  canonical `deferred`/`immediate`. If a SQL-shaped timing value names a
+  specific constraint, that name must match the structured `constraint_name`
+  field or appear in its comma-separated constraint target list. Unquoted
+  targets use the same case-insensitive space/hyphen/underscore normalization as
+  other enum-like schema tokens; double-quoted SQL identifiers match exactly and
+  may escape a literal quote by doubling it. Unquoted `ALL` is accepted as an
+  explicit broadcast target.
+  Internal prepare and action-page operation fields likewise accept canonical
+  `delete` / `update` plus SQL-shaped variants such as `ON DELETE`,
+  `ON UPDATE`, `parent-delete`, and `parent_update`; durable records and
+  responses still use canonical operation names.
   coordinator uses the effective timing when building parent-existence,
   externalized-proof, and parent-delete/update absence checks, and it sends the
   durable override only to participants for that child table; parent-table
@@ -376,14 +475,11 @@ corrupt, they must be rebuildable from the committed relational child rows.
 
 ### Routed reverse-reference ownership
 
-The current hosted parent-delete planner is conservative: for primary-key
-`restrict` FKs it registers every range of each matching child table, then each
-child participant scans its local reverse-reference rows for the deleted parent
-key. That is correct, but it is not the desired distributed shape. The desired
-shape is a parent-key-routed FK reverse-reference index with catalog-visible
-ownership, similar in spirit to distributed SQL backing indexes for constraints:
-the system pays synchronous index write amplification so FK checks become
-targeted key/range lookups instead of broad child-table fanout.
+Hosted parent-delete planning uses a parent-key-routed FK reverse-reference
+index with catalog-visible ownership, similar in spirit to distributed SQL
+backing indexes for constraints: the system pays synchronous index write
+amplification so FK checks become targeted key/range lookups instead of broad
+child-table fanout.
 
 The routed keyspace should be owned by the referenced parent key, not by the
 child row key:
@@ -444,8 +540,9 @@ internal range-owned state:
 - repair that can recreate missing FK-ref rows and prune stale rows without
   mutating user rows;
 - large-operation planning for hot parent keys with many child refs;
-- migration-free adoption for this new feature set by making the routed keyspace
-  the only hosted distributed FK-ref layout.
+- one production FK-ref layout for this new feature set: routed ownership is the
+  durable encoding, and future format changes must be explicit catalog/schema
+  migrations rather than hidden fallback paths.
 
 Parent-key ownership can create hot spots for high-fanout parents. That is an
 expected property of exact FK enforcement, not a reason to fall back to table
@@ -516,9 +613,10 @@ owning group, verifies the read version matches the predicate, and routes FK-ref
 deletes for old parent keys before prepare. Without either insert-only proof or
 a version-bound old row, owner-ranged child writes/deletes fail before prepare
 because they could otherwise leave stale reverse-reference rows behind.
-Primary-key `restrict` parent deletes use exact FK-ref owner ranges when
-configured; if no owner topology exists, they fall back to registering all
-matching child table ranges.
+Primary-key `restrict`, `set_null`, and bounded `cascade` parent deletes require
+exact FK-ref owner ranges. If owner topology is missing, transitional, or cannot
+cover the parent key, the coordinator fails before prepare instead of widening to
+child-table fanout.
 
 The catalog-facing owner range record, resolver, first-class raft transitions,
 durable projection, metadata status count, reconciliation-plan convergence, and
@@ -528,16 +626,16 @@ between desired and committed FK-ref owner topology. The storage transaction
 layer accepts explicit FK-ref write/delete mutations in the prepare request.
 Those mutations are validated against the runtime FK catalog, materialize as
 exact internal reverse-reference keys on commit, delete those keys on commit
-when requested, and are considered by parent-delete validation. Remaining hosted
-coordinator work is resumable large-operation execution for wide
-set-null/cascade fanout, online validation/rebuild jobs, and deferrable
-constraint planning.
+when requested, and are considered by parent-delete validation. Hosted
+coordinator work now uses exact FK-ref owner routing for wide
+`set_null`/`cascade`, durable validation/repair jobs for online adoption and
+repair, and explicit deferrable timing/proof records in distributed prepare.
 
 ## Transaction And 2PC Semantics
 
 Existing 2PC gives the atomic commit substrate, but it does not by itself define
-foreign-key semantics. FK support still needs constraint-aware participants and
-conflict protection.
+foreign-key semantics. FK support layers constraint-aware participants and exact
+FK-ref/unique-owner conflict protection onto that substrate.
 
 For single-shard parent/child writes, the relational participant writes reverse
 rows in the local prepare path and validates parent existence against the final
@@ -575,10 +673,10 @@ For cross-shard or cross-table writes:
   `default_type` matches the requested `parent_table`, and malformed or
   cross-table-mismatched prepare payloads are rejected before ordinary key
   existence is considered;
-- hosted restrict parent deletes register the exact FK-ref owner range for the
-  deleted parent key when routed ownership is configured. Without owner
-  topology, they conservatively register every range of each child table whose
-  schema declares a matching primary-key FK to the parent table;
+- hosted restrict parent deletes require the exact FK-ref owner range for the
+  deleted parent key. Missing, transitional, or incomplete owner topology fails
+  before prepare; no broad child-table fallback is used for this new feature
+  set;
 - FK-ref owner or child participants receive parent-delete validation
   instructions and reject prepare when committed reverse-reference rows or
   staged child writes would leave a surviving child reference. A participant
@@ -600,15 +698,13 @@ For cross-shard or cross-table writes:
   action schedule record for the encoded tuple. Missing unique-owner or FK-ref
   owner topology still fails before prepare.
   Primary-key `set_null` and bounded primary-key `cascade` use exact routed
-  owner discovery when FK-ref owner topology exists: the coordinator registers
-  the owner participants as conflict points and writes one durable action
-  schedule record to a resolved FK-ref owner in the same 2PC as the parent
-  delete. Controller maintenance then seeds idempotent action jobs across the
-  current owner groups, and those jobs page through child rows to apply exact
-  set-null or cascade actions. Without owner topology,
-  `set_null` falls back to broad child-range fanout and child participants plan
-  the local nullable-column rewrites during prepare; cascade fails closed
-  because broad fanout is not a deterministic cascade graph;
+  owner discovery: the coordinator registers the owner participants as conflict
+  points and writes one durable action schedule record to a resolved FK-ref owner
+  in the same 2PC as the parent delete. Controller maintenance then seeds
+  idempotent action jobs across the current owner groups, and those jobs page
+  through child rows to apply exact set-null or cascade actions. Missing,
+  transitional, or incomplete owner topology fails before prepare because broad
+  child-table fanout is not a deterministic dependency graph;
 - hosted transforms on tables with active foreign keys are planned from the same
   final-row semantics as storage transforms when the coordinator can prove that
   final value before prepare. Non-reference transforms are routed normally.
@@ -695,6 +791,9 @@ is present, every local, provisioned, hosted, and internal group execution path
 validates the name against the runtime FK catalog and scans only that
 constraint's reverse-reference metadata; unknown names fail instead of returning
 a misleading empty report.
+Public and internal integrity action names accept case-insensitive
+space/hyphen/underscore variants such as `DRY RUN` or `explain-delete`, while
+responses and durable progress rows keep canonical snake_case mode names.
 The same public/admin endpoint accepts `{"action":"requeue_action_job"}` for
 operator retry of failed high-fanout `set_null`/`cascade` action jobs. Requeue
 requires the durable action-job identity (`job_id`, `action_job_action`,
@@ -702,7 +801,22 @@ requires the durable action-job identity (`job_id`, `action_job_action`,
 `updated_parent_key`/`page_limit`), resolves the appropriate owner groups
 through the table-write source, and returns the owner action-job statuses after
 clearing failed claim/error state while preserving the stored child cursor and
-applied-child count.
+applied-child count. Healthy pending or claimed jobs are retried by normal
+controller rounds; the DB rejects explicit requeue unless the durable job is
+dead-lettered with `status: "invalid"` or a retained `last_error`.
+It also accepts `{"action":"requeue_action_schedule"}` for failed action
+schedules that could not seed owner jobs, usually because FK-ref ownership was
+missing or stale when the parent delete committed. Schedule requeue requires
+the durable schedule identity (`schedule_id`, `action_schedule_action_job_id`,
+`action_schedule_action`, `constraint_name`, `parent_table`, `parent_key`,
+`worker_id`, and optional `updated_parent_key`/`page_limit`), resolves the
+schedule owner through the table-write source, and returns the requeued
+schedule status after clearing the terminal error and moving it back to
+`pending`. Requeue increments a durable schedule-level `requeue_count` and
+records `last_requeued_at_ns`, so repeated topology-recovery attempts remain
+visible after DB reopen and through public/admin status responses. Healthy
+pending schedules are retried by normal controller rounds and do not consume
+explicit requeue counters.
 `dry_run` runs the repair traversal and reports the reverse-reference rows that
 would be created or deleted without mutating the store. Hosted execution fans out
 through the same internal group RPC family used by write routing, forwards the
@@ -849,12 +963,10 @@ and returns `delete_plan` with existence, allow/block status, block reason,
 planned set-null updates, planned cascade deletes, planned row deletes, planned
 index deletes, and planned writes. `doc_key` is required for this action; range
 bounds are ignored. Local storage runs the delete planner without committing its
-prepared batch. Hosted/provisioned routing uses FK-ref owner ranges when they
-are configured: the planner reads the parent row, resolves each applicable
-owner range, drains the owner prefix through child-table/child-key cursor pages,
-and fails closed rather than returning a partial plan if the owner topology or
-cursor contract is invalid. When no routed owner topology applies, explain
-falls back to the existing local/group path.
+prepared batch. Hosted/provisioned routing uses FK-ref owner ranges: the planner
+reads the parent row, resolves each applicable owner range, drains the owner
+prefix through child-table/child-key cursor pages, and fails closed rather than
+returning a partial plan if the owner topology or cursor contract is invalid.
 
 DB-local FK action jobs provide the first durable data-changing
 large-operation unit. A job is keyed by `job_id`, action (`set_null` or
@@ -884,6 +996,11 @@ match the worker's claimed record before the DB accepts a cursor/status update.
 If a lease expires and another worker reclaims the job, the stale worker's
 finish is rejected as a busy claim and cannot roll back the newer worker's
 cursor, status, or applied-child count.
+Finish also validates page outcome shape before touching the durable row:
+successful incomplete pages must provide both resume-cursor fields, complete
+pages must not provide a cursor or error, cursor fields must be both present or
+both absent, and failed pages that report applied children must include the
+cursor needed for explicit requeue.
 If page execution fails after the lease is claimed, the DB records the failed
 pass durably with `status: "invalid"` and `last_error` while preserving the
 resume cursor and applied-child count. The job also persists
@@ -894,10 +1011,17 @@ automatically; an explicit action-job requeue is required after the cause is
 fixed so pathological failures do not spin forever. Requeue clears the active
 claim/error state but increments `requeue_count` and records
 `last_requeued_at_ns` while preserving the durable cursor and failure history.
+The DB rejects requeue for healthy pending or claimed jobs, so those recovery
+counters only represent explicit dead-letter recovery attempts.
 The DB claim path enforces the same dead-letter policy: an incomplete action
 job with `status: "invalid"` or a retained `last_error` cannot be claimed again
 by a direct worker call, even after its old lease expires, until the requeue API
 clears the failure state.
+Completed action jobs are also idempotent at the claim boundary: a later worker
+claim with the same durable job identity returns the completed record unchanged
+instead of renewing the lease or rewriting the worker id, page limit, claim time,
+or attempt count. This keeps completion metadata stable when hosted controllers,
+admin tools, or retried client requests rediscover an already-drained job.
 
 DB-local FK action schedule records provide the next queue level above action
 jobs. A schedule record is keyed by a stable `schedule_id` and stores the
@@ -905,13 +1029,16 @@ action-job id plus action, constraint, parent table, parent key, and page
 limit. Generated action-job ids and schedule ids include the mutating action
 (`set_null` or `cascade`) as part of their versioned identity, so a later schema
 revision that changes the action for the same constraint and parent key cannot
-collide with an older durable action queue. Generated cascade action records
-also carry `cascade_depth` and `cascade_max_depth`. Root parent-delete
-schedules start at depth `0`, recursive cascade pages seed downstream schedules
-at `depth + 1`, and the depth/max fields are persisted on both schedule and job
-records so controller retries, requeues, and DB reopen do not reset the policy.
-Custom/operator-supplied action ids keep the default max-depth policy unless
-they use the generated v4 id shape. The metadata FK controller lists
+collide with an older durable action queue. Action schedules and jobs carry
+`cascade_depth` and `cascade_max_depth` as explicit durable fields rather than
+deriving policy from the id string. Root parent-delete schedules start at depth
+`0`, recursive cascade pages seed downstream schedules at `depth + 1`, and the
+depth/max fields are persisted on both schedule and job records so controller
+retries, requeues, and DB reopen do not reset the policy. Hosted/internal
+requests that create or seed action work must send both lineage fields; requeue
+uses the stored record lineage and cannot replace policy from the request. The
+DB rejects records whose max depth is zero or whose depth exceeds the max. The
+metadata FK controller lists
 pending schedule records, seeds the owner action jobs idempotently, marks the
 schedule `seeded`, and then lets the existing action-job controller advance the
 child-cursor pages. This survives DB reopen and avoids requiring the foreground
@@ -928,10 +1055,16 @@ Controller maintenance returns action-schedule scan/seed counters and the
 seeded schedule statuses separately from action-job page statuses. Metadata
 runtime status records the same counters, so operators can distinguish "the
 large operation was discovered and seeded" from "all child pages have drained"
-without manually correlating schedule records with owner action jobs. It also
+without manually correlating schedule records with owner action jobs. Terminal
+invalid schedules are counted separately and are not repeatedly re-seeded by
+autonomous controller rounds until their owner topology problem is corrected.
+Metadata status keeps the latest failed schedule group, schedule id,
+action-job id, action, status, error, constraint, parent identity, scheduled
+group count, cascade depth, requeue count, and last requeued timestamp. It also
 records last-round completed action-job counts, the last-round observed
-`applied_children` sum from returned action-job statuses, failed action-job
-totals, and the latest failed action-job group, id, action, status, error,
+`applied_children` sum from returned action-job statuses, invalid action-job
+counts, failed action-job totals, and the latest failed action-job group, id,
+action, status, error,
 constraint, parent identity, resume child cursor, attempts, and applied-child
 count, preserving the most recent controller-visible page failure after the
 round result has been freed.
@@ -950,10 +1083,19 @@ stale status sample without scraping controller logs.
 Action schedules fail closed if seeding resolves no owner action jobs: the
 controller records the schedule as `invalid` with
 `last_error: "NoForeignKeyActionOwnerGroups"`, reports the round incomplete,
-and does not acknowledge the schedule as `seeded` until a later retry can create
-at least one durable owner job. The invalid schedule remains retryable; when
-owner topology becomes routable and seeding succeeds, the same durable schedule
-transitions to `seeded` and clears `last_error`.
+and does not acknowledge the schedule as `seeded` until a retry can create at
+least one durable owner job. Invalid schedules are terminal for autonomous
+controller rounds, but the DB, table-write source, public/admin endpoint, and
+hosted internal group route expose an explicit requeue primitive. Requeue
+validates the durable schedule/action-job identity, rejects completed
+schedules and healthy pending schedules, clears `last_error`, updates the
+intended worker/page limit, and returns the schedule to `pending` after the
+owner topology problem has been corrected. The DB seeded transition enforces
+the same terminal policy as the controller: an invalid schedule or a schedule
+with retained `last_error` cannot be marked seeded directly until the explicit
+requeue path clears the failure state. Schedule requeue preserves the failure
+history by incrementing `requeue_count` and recording `last_requeued_at_ns`;
+later successful seeding keeps those fields on the durable schedule record.
 
 Provisioned and hosted-local bounded page execution is deliberately split by
 ownership. If the catalog proves the whole child table and, when configured,
@@ -972,6 +1114,11 @@ that reference the child table, fails closed if any required FK-ref owner
 topology is missing, and writes downstream action schedules/conflict checks into
 the same 2PC. Recursive/deep cascades therefore advance one durable action-page
 boundary at a time instead of depending on an unbounded foreground transaction.
+The 2PC transaction id for a routed action page is derived from the durable
+action-job identity, resume cursor, page limit, cascade depth, and requeue
+generation. Lease handoff after a process crash therefore retries the same
+unrecorded page with the same participant transaction identity, while cursor
+advancement or explicit operator requeue produces a distinct transaction id.
 If a routed cascade page is already at `cascade_max_depth`, planning fails
 closed before commit when the deleted child table has enforced downstream
 `cascade` or `set_null` dependents. The owning action job is then recorded as
@@ -1005,12 +1152,14 @@ job snapshot includes `cascade_depth`, `cascade_max_depth`, and whether the
 depth limit was exhausted. The same snapshot includes the durable failure and
 requeue counters/timestamps so operators can distinguish a first failed page
 from a repeatedly requeued job that is still failing. Hosted autonomous
-scheduling is owned
-by the metadata leader: each metadata lifecycle round runs bounded controller
-passes when enabled, and incomplete rounds receive a configurable follow-up
-budget before yielding. Remaining hosted hardening is deeper distributed
-completion/recovery semantics for recursive/high-fanout cascades and broader
-permanent-failure policy, not basic request-independent controller ownership.
+scheduling is owned by the metadata leader: each metadata lifecycle round runs
+bounded controller passes when enabled, and incomplete rounds receive a
+configurable follow-up budget before yielding. The production execution model is
+request-independent controller ownership plus durable owner-routed action
+schedules/jobs. Further hardening should concentrate on additional
+failure-injection evidence for recursive/high-fanout cascades and operator
+policy for permanent failures, not on adding compatibility fanout or
+request-polling fallback paths.
 
 DB runtime stats expose cumulative `foreign_keys` counters for child-write
 rejects, parent-delete rejects, validation/dry-run/repair runs, scanned child
@@ -1032,15 +1181,15 @@ parent rows; the report still preserves the repaired/deleted reference counters.
 resolved group without running validation, dry-run, or repair, so operators can
 list outstanding or recent integrity work without knowing its exact mode, range,
 or constraint. Progress also returns durable FK integrity job records with the
-cumulative aggregate report, latest merged violation sample set, sample count,
-and truncation flag, so schema-controller and worker-pass diagnostics survive
-across bounded passes and do not depend on the caller observing the failing pass
-live.
+latest pass report, a cumulative aggregate report that adds each pass exactly
+once, the latest merged violation sample set, sample count, and truncation flag,
+so schema-controller and worker-pass diagnostics survive across bounded passes
+and do not depend on the caller observing the failing pass live.
 
-Remaining hosted online-validation work is no longer range discovery, status
-correlation, group-local claim persistence, group-local claim-and-run
-execution/routing, bounded claimable-unit scheduler passes, stable job identity,
-schema FK discovery, or catalog-wide table scanning; those are exposed by
+Hosted online validation is built from range discovery, status correlation,
+group-local claim persistence, group-local claim-and-run execution/routing,
+bounded claimable-unit scheduler passes, stable job identity, schema FK
+discovery, and catalog-wide table scanning. Those surfaces are exposed by
 `plan`, `work_units`, `work_statuses`, `work_claims`, durable claim rows,
 durable per-range progress rows, the DB claim-and-run primitive, the internal
 group claimed work-unit route, the public worker-pass request fields,
@@ -1061,20 +1210,30 @@ four tables, sixteen durable validation jobs, sixteen durable action jobs, one
 work unit per table/pass, action pages of 1024 children, and four follow-up
 passes. Each non-empty pass logs
 scanned, pending, executed, job-scanned, job-executed, claim, terminal-valid,
-terminal-invalid, completion, and validity counters, exposes cumulative and
-last-round counters in metadata status, accumulates cumulative and last-round FK
+terminal-invalid, invalid-action-schedule, invalid-action-job, completion, and
+validity counters, exposes cumulative and last-round counters in metadata
+status, accumulates cumulative and last-round FK
 integrity report counters for the work it actually ran, and promotes terminal
 valid adoption jobs through the metadata table-update path. Metadata status
-also records the last failed action-job group/id/action/status/error,
-constraint, parent identity, resume cursor, attempts, and applied-child count,
-plus the last terminal invalid validation/adoption table, constraint, job id,
-missing-parent, missing-ref, stale-ref, per-kind sampled-violation counts,
+also records the last failed action-schedule group/id/action-job/action/status/error,
+constraint, parent identity, scheduled group count, cascade depth, requeue
+count, last requeued timestamp, the last failed action-job
+group/id/action/status/error, constraint, parent identity, resume cursor,
+attempts, and applied-child count, plus the last terminal
+invalid validation/adoption table, constraint, job id,
+diagnostic pass count, violating pass count, first/last violation timestamps,
+missing-parent, missing-ref, stale-ref, per-kind aggregate violation counts,
 sample-count, truncation fields, and a compact first-violation snapshot with
 group, kind, child identity, parent identity, and observed parent key when
 applicable. The durable
 integrity job record remains the source for full bounded violation samples and
 cross-pass merged diagnostics, while status gives operators an allocation-free
-summary of the latest controller-visible failure.
+summary of the latest controller-visible failure. Terminal worker/controller
+results are hydrated from that durable job record before metadata adoption and
+status accounting consume them, so the public result, metadata status, and
+`foreign_key_validation_json` all reflect the cross-pass aggregate report and
+merged violation samples rather than only the final work unit that completed the
+job.
 Hosted/provisioned progress discovery skips catalog ranges whose local group DB
 is not materialized yet and retries on the next round; correctness-bearing
 execution still requires the addressed group to exist.
@@ -1131,15 +1290,17 @@ and should continue to grow around them:
 
 - `foreign_keys`;
 - `unique_constraints`;
-- delete action policy (`restrict` / `no_action`, `set_null`, `cascade`) and update action
-  policy (`restrict` / `no_action` today; mutating update actions remain
-  reserved for FK action jobs);
+- delete action policy (`restrict` / `no_action`, `set_null`, `cascade`) and
+  update action policy (`restrict` / `no_action`, `set_null`, `cascade`), with
+  mutating update actions using the same durable FK action schedule/job/page
+  executor as high-fanout parent deletes;
 - timing policy (`immediate`, local `deferred` commit-time parent-existence
   validation, local deferred `no_action` delete/update final-state
   reverse-reference validation, distributed deferred child parent checks backed
   by exact coordinator proof records, and restrictive deferred parent-delete
-  checks backed by timed FK-ref owner proofs; mutating deferred action sets
-  remain reserved for full final-state reverse-reference planning);
+  checks backed by timed FK-ref owner proofs. Distributed mutating action sets
+  use durable action schedules/jobs so the same final-state checks and exact
+  owner-routed child rewrites can be resumed across bounded pages);
 - validation state (`enforced` and local `unvalidated` are public schema states;
   `validating` and `invalid` are reserved for hosted online validation jobs);
 - backing physical index names;
@@ -1153,9 +1314,10 @@ the runtime schema is persisted. New `unvalidated` foreign keys persist the
 catalog entry without write-time enforcement or reverse-reference maintenance.
 Applying the same FK definition later with `validation_state: "enforced"` runs
 the same validation/repair build before the catalog flip. Changes that reuse a
-constraint name with different semantics are rejected. Distributed
-validation-state jobs still need hosted resumable cursors before online
-migrations can span tables, ranges, and groups.
+constraint name with different semantics are rejected. Hosted and provisioned
+online validation/adoption runs through durable, cursor-backed FK integrity jobs
+that can be advanced by public worker passes or autonomous metadata-owned
+controller rounds.
 
 ### Constraint indexes
 
@@ -1192,8 +1354,10 @@ all row/index/constraint metadata mutations or abort all of them.
 
 ### 1. Distributed primary-key `restrict` with routed FK-ref ownership
 
-Generalize the current local-store and broad-fanout hosted primary-key FK to
-real cross-table and cross-shard enforcement with exact parent-key routing.
+Use exact parent-key-routed FK-ref ownership for cross-table and cross-shard
+enforcement. Hosted mutation planning does not use broad child-table fanout for
+this new feature set; missing, transitional, or incomplete owner topology fails
+closed before prepare.
 
 Work:
 
@@ -1231,10 +1395,10 @@ Work:
   propose those semantic commands. Internal metadata HTTP routes and client
   helpers expose the same name-based lifecycle contract for operators and
   controllers: child table from the route, constraint name and parent table from
-  the request body, and range selection by parent-key span. Production still
-  needs higher-level admin/public endpoints, controllers that drive data
-  movement before finishing lifecycle transitions, and hosted validation of
-  rebuilt owner ranges;
+  the request body, and range selection by parent-key span. Public/admin
+  orchestration for split/merge/rebuild data movement should drive these typed
+  lifecycle operations instead of issuing raw upsert/remove metadata changes
+  directly;
 - add a catalog resolver for
   `(child_table, constraint, parent_table, parent_key) -> owner group`. The
   resolver is implemented over `AdminSnapshot.foreign_key_ref_ranges` and
@@ -1255,20 +1419,20 @@ Work:
   Transforms that target unsupported non-primary FK shapes remain fail-closed;
 - make parent deletes register only the FK-ref owner ranges for each deleted
   parent key and referencing constraint. This exact routed path is implemented
-  for primary-key `restrict` FKs when owner ranges are configured, with broad
-  child-table fanout retained only as the no-owner-topology fallback. Owner
-  scans use a deterministic child-table/child-key page cursor in the internal
-  storage/API contract; interactive parent deletes drain those cursor pages
-  before prepare and fail closed if the owner topology or cursor contract is
-  invalid;
+  for primary-key and declared unique-target `restrict`, `set_null`, and bounded
+  `cascade` FKs. Owner scans use a deterministic child-table/child-key page
+  cursor in the internal storage/API contract; interactive parent deletes drain
+  those cursor pages before prepare and fail closed if the owner topology or
+  cursor contract is invalid;
 - use the FK-ref owner participant as the conflict point between child reference
   creation and parent delete;
 - support split/merge/rebuild of FK-ref ranges using topology epochs. The
   table-manager protocol, raft transition commands, metadata service helpers,
   simulation helpers, table workflow methods, internal metadata HTTP routes, and
-  HTTP client methods for those state transitions exist. Public/admin
-  orchestration endpoints, controllers, and data-movement observation still need
-  to drive them instead of issuing raw upsert/remove metadata changes directly;
+  HTTP client methods for those state transitions are the control-plane shape.
+  Public/admin orchestration must drive these typed lifecycle transitions and
+  observe data-movement progress; raw upsert/remove metadata changes are not a
+  compatibility interface for this new feature set;
 - make parent-delete explain use the same FK-ref owner resolver rather than
   child-table range fanout. Hosted/provisioned explain now reads the parent row,
   resolves configured FK-ref owner ranges, scans bounded owner prefixes, reports
@@ -1339,11 +1503,12 @@ Implemented:
   provisioned, and hosted claimed-unit execution, preserving job intent, worker
   identity, lease/pass limits, status, attempts, completion, validity, and
   latest report across reopen in the DBs that own the planned work;
-- bounded FK job violation diagnostics: every worker pass merges its latest
-  report and distinct reported violations into a bounded JSON sample, sample
-  count, truncation flag, diagnostic-pass counters, violating-pass counters, and
-  first/last violation timestamps, while completion without fresh samples
-  preserves any prior diagnostic sample for the same durable job;
+- bounded FK job violation diagnostics: every worker pass stores its own latest
+  report, adds that pass once to the aggregate report, and merges distinct
+  reported violations into a bounded JSON sample, sample count, truncation flag,
+  diagnostic-pass counters, violating-pass counters, and first/last violation
+  timestamps, while completion without fresh samples preserves any prior
+  diagnostic sample for the same durable job;
 - DB owner validation/dry-run/repair for a single parent-key prefix and for a
   routed FK-ref owner range parent-key span. The primitive scans owner rows,
   detects rows whose child row is missing or now references a different parent,
@@ -1360,20 +1525,36 @@ Implemented:
   count before the next pass. Page completion is claim-fenced against the
   current durable worker, claim timestamp, lease deadline, and attempt number, so
   stale workers cannot advance cursors after lease handoff. Failed page execution
-  persists `last_error` and an invalid status for diagnostics/retry visibility.
+  persists `last_error` and an invalid status for diagnostics/retry visibility,
+  and the finish path rejects ambiguous cursor/error combinations before
+  updating the durable job row. A duplicate finish for an already-finished claim
+  is also rejected and cannot double-count `applied_children` or rewind the
+  resume cursor.
   Durable records canonicalize SQL-style action aliases before storage, so
   direct DB callers, transaction action-schedule mutations, hosted internal
-  routes, and public/admin requeue operations compare the same canonical action
-  identity across retries.
+  routes, public/admin requeue operations, and source-layer distributed action
+  pages compare the same canonical action identity across retries. Source-layer
+  distributed action pages derive their 2PC transaction id from the durable
+  action-job identity, resume cursor, page limit, cascade depth, and requeue
+  count so lease handoff after a crash reuses the same transaction identity but
+  cursor advancement or explicit requeue creates a new one.
   Operators/controllers can explicitly requeue an incomplete failed job after
   the underlying cause is corrected; requeue validates the durable action
-  identity, rejects completed jobs, clears claim/error/lease state, updates the
-  intended worker/page limit, and preserves the existing child cursor, attempt
-  count, and applied-child count so large operations resume rather than restart.
+  identity, rejects completed jobs and healthy pending/claimed jobs, clears
+  claim/error/lease state, updates the intended worker/page limit, and preserves
+  the existing child cursor, attempt count, and applied-child count so large
+  operations resume rather than restart.
   The table-write source layer exposes the same operation for local,
   provisioned, hosted-local, and hosted-remote owner groups, and the internal
   group route accepts `requeue_only` action-job requests so hosted controllers
   can drive owner-local retry without waiting for stale leases to expire.
+  Action schedules have the same explicit requeue shape for topology failures
+  before owner jobs exist: DB-local, table-write source, public/admin, and
+  hosted internal group routes validate the schedule/action-job identity,
+  reject completed schedules and healthy pending schedules, clear `last_error`,
+  update worker/page limits, increment `requeue_count`, record
+  `last_requeued_at_ns`, and move the schedule back to `pending` for a later
+  bounded seeding pass.
   FK progress rows, validation/repair claim leases, action schedules, and
   action-job claim leases are timestamped with realtime so autonomous hosted
   controllers can make consistent expiry decisions across owner DBs instead of
@@ -1415,18 +1596,14 @@ Implemented:
   incomplete work, and expose cumulative/last-round counters plus compact last
   action-job and terminal-invalid diagnostics in metadata status.
 
-Remaining work:
+Ongoing hardening:
 
-- distributed large-operation recovery hardening for high-fanout `set_null` /
-  `cascade` parent deletes. Routed parent-delete admission now writes durable
-  per-owner-group schedule records instead of foreground child fanout,
-  DB-local/table-write action jobs persist a data-changing resume cursor, and
-  the source/controller layer can create, seed, discover, and resume those
-  records across
-  local/provisioned/hosted-local/hosted-remote owner groups. Remaining work is
-  stronger idempotence and recovery proofs across bounded distributed
-  participant rounds and broader operational policy for
-  pathological retry loops and permanently failing action jobs.
+- keep expanding failure-injection coverage for durable `set_null` / `cascade`
+  schedule and action-job recovery across participant retries, topology
+  transitions, process restarts, and lease handoff. The production shape is
+  already exact owner-routed scheduling plus idempotent, cursor-backed action
+  pages; future work should prove more interleavings, not add broad fanout
+  fallback paths.
 
 Repair may rebuild missing/corrupt secondary metadata, but it must not silently
 mutate user rows. Orphaned child rows should be reported for explicit operator
@@ -1558,6 +1735,9 @@ Implemented:
   bounds. Local/bound sources execute directly, provisioned sources fan out
   across every resolved local table range, and hosted sources route each group
   to its leader through the internal group `unique-integrity` operation.
+  Public and internal unique-integrity action names use the same
+  case-insensitive space/hyphen/underscore normalization as FK integrity
+  actions, while responses keep canonical snake_case mode names.
   Responses include aggregate counters, per-group counters, and stored progress
   rows. `validate`, `dry_run`, and `repair` persist durable progress records
   keyed by `(mode, lower_doc_key, upper_doc_key)`; `progress` lists those rows
@@ -1615,12 +1795,17 @@ Implemented:
 - hosted unversioned same-table and cross-table parent deletes over unique
   tuples read the parent row before prepare, inject the observed row version as
   a parent-row predicate, encode the old unique tuple from that read, and route
-  `restrict`, `set_null`, or bounded `cascade` through the FK-ref owner range.
-
-Remaining work:
-
-- make parent-update and child-reference races use distributed range/participant
-  conflict protection instead of the current local-store reverse-reference scan.
+  `restrict`, `set_null`, or bounded `cascade` through the FK-ref owner range;
+- hosted parent updates that change a referenced unique tuple read and
+  version-pin the old parent row, route the old encoded tuple through the
+  FK-ref owner participant, and either send an update absence check for
+  `restrict`/`no_action` or write a conflict check plus durable `update_set_null`
+  / `update_cascade` action schedule for mutating actions;
+- child reference writes, child reference deletes, parent delete/update absence
+  checks, and mutating parent action schedules all stage the same durable
+  FK-conflict intent keyed by `(constraint, parent_table, parent_key)`, so
+  child-reference and parent-delete/update races meet at the FK-ref owner
+  participant before commit.
 
 ### 6. Composite FKs
 
@@ -1669,30 +1854,29 @@ Implemented:
   set-null updates, cascade deletes, row deletes, index deletes, and writes;
 - the public/hosted foreign-key integrity operation exposes the same
   parent-delete explain report through `action: "explain_delete"`. Hosted and
-  provisioned explain use exact FK-ref owner discovery when owner topology
-  exists, drain the owner prefix through child-table/child-key cursor pages,
-  report the first-hop child set-null count, and fail closed only if owner
-  topology or page cursors are invalid; otherwise they route to the target
-  document key's owning group.
+  provisioned explain use exact FK-ref owner discovery, drain the owner prefix
+  through child-table/child-key cursor pages, report the first-hop child set-null
+  count, and fail closed when owner topology or page cursors are invalid;
+  otherwise they route to the target document key's owning group.
 - hosted distributed parent deletes for primary-key and declared unique-target
-  `set_null` use exact routed FK-ref owner discovery when owner topology exists.
+  `set_null` use exact routed FK-ref owner discovery.
   The coordinator writes a deterministic FK action schedule mutation to a
   resolved FK-ref owner in the same 2PC as the parent delete. Controller
   maintenance seeds idempotent action jobs across the current owner groups, and
   each job drains child-cursor pages to validate FK metadata, rewrite nullable
   FK columns or delete child rows, and update derived indexes and local reverse
   refs through the normal relational write participant.
-- without FK-ref owner topology, hosted distributed parent deletes for
-  primary-key `set_null` fall back to broad child-range fanout. Each child
-  participant receives a parent-delete instruction, scans its local
-  reverse-reference rows for the deleted parent key, stages child row rewrites
-  that remove the FK columns, and removes the local FK-ref rows in the same 2PC
-  prepare. This is bounded by the same local set-null limit on each participant.
+- missing, transitional, or incomplete FK-ref owner topology fails before
+  prepare. There is no broad child-range fallback for hosted distributed
+  `set_null`; exact owner routing is the production contract for this new
+  feature set.
 
-Remaining work:
+Ongoing hardening:
 
-- add explicit large-operation mode for distributed fanout, retry, recovery,
-  and progress diagnostics on top of the durable schedule/action-job records;
+- keep expanding operator policy and alerting around the existing durable
+  schedule/action-job diagnostics, especially thresholds for repeated
+  dead-letter schedules, stuck leases, topology churn during page execution, and
+  permanent action-job failures.
 
 ### 8. `on_delete: cascade`
 
@@ -1711,13 +1895,12 @@ Implemented:
   counters;
 - the public/hosted foreign-key integrity operation exposes the same
   parent-delete explain report through `action: "explain_delete"`. Hosted and
-  provisioned explain use exact FK-ref owner discovery when owner topology
-  exists, drain the owner prefix through child-table/child-key cursor pages,
-  report the first-hop cascade child delete count, and fail closed only if
-  owner topology or page cursors are invalid; otherwise they route to the target
-  document key's owning group.
+  provisioned explain use exact FK-ref owner discovery, drain the owner prefix
+  through child-table/child-key cursor pages, report the first-hop cascade child
+  delete count, and fail closed when owner topology or page cursors are invalid;
+  otherwise they route to the target document key's owning group.
 - hosted distributed parent deletes for primary-key and declared unique-target
-  cascade use exact routed FK-ref owner discovery when owner topology exists.
+  cascade use exact routed FK-ref owner discovery.
   The coordinator writes a deterministic FK action schedule to a resolved
   FK-ref owner in the same 2PC as the parent delete. Controller-seeded action
   jobs drain child-cursor pages, validate the FK metadata, verify each child
@@ -1730,15 +1913,17 @@ Implemented:
   fanout is not used for cascade because it is not a deterministic dependency
   graph.
 
-Remaining work:
+Ongoing hardening:
 
 - strengthen recovery/idempotence proofs for recursive durable cascade action
   pages across retry, topology transition, and process restart boundaries;
 - define cross-table allowed cyclic cases beyond local duplicate suppression;
-- produce richer operator diagnostics for depth-cap failures, repeated
-  dead-letter action jobs, and dependency chains that require policy changes;
-- make recovery resume or abort partially planned distributed cascade action
-  rounds cleanly when a participant fails after prepare.
+- keep expanding operator policy for depth-cap failures, repeated dead-letter
+  action jobs, and dependency chains that require policy changes. Metadata
+  status already exposes cumulative and last-failure action schedule/job
+  diagnostics, including cascade-depth-limit failures;
+- keep expanding failure-injection coverage for recovery after participant
+  prepare failures in distributed cascade action rounds.
 
 Cascades should not be implemented as background best-effort cleanup. The parent
 delete and every cascaded child delete must share one atomic commit boundary, or
@@ -1774,6 +1959,10 @@ Implemented:
   parent or unique-owner participants and carry exact deferred proof records to
   child participants, so the child side skips only the FK reference that the
   coordinator proved elsewhere;
+- exact parent-check proof records are the only distributed parent-check
+  externalization mechanism; relational participants require a matching record
+  for the child key, parent identity, constraint, and effective timing before
+  skipping local parent validation;
 - distributed/routed restrictive parent deletes over deferred FKs register the
   FK-ref owner participant and carry an exact timed parent-delete proof, so the
   owner validates its final reverse-reference state before prepare succeeds;
@@ -1782,22 +1971,41 @@ Implemented:
   full child table are the same single group; otherwise a claimed owner page is
   executed as a source-layer 2PC that deletes FK refs on the owner participant
   and mutates child rows on their resolved child participants;
-- deferred FK writes still fail closed if a participant receives only the legacy
-  broad externalization marker without a matching exact proof.
+- action-job page finish is fenced by the durable claim identity and the current
+  row status, so duplicate finish calls after a successful cursor advance are
+  rejected without double-counting applied children;
+- routed child-row update action pages (`set_null`, `update_set_null`, and
+  `update_cascade`) read and pin each affected child row before prepare,
+  compute the row's final FK value, and route any unique-owner mutations or
+  downstream FK parent-update participants introduced by that final row into the
+  same source-layer 2PC;
+- mixed immediate/deferred local transactions keep proof exactness per
+  constraint: an externalized proof for one deferred FK never suppresses local
+  final-state validation for another immediate FK on the same row;
+- deferred FK writes fail closed when the exact proof set is missing,
+  incomplete, or mismatched.
 
-Work:
+Ongoing hardening:
 
-- record pending unique changes, cascades, and set-null updates in the same
-  final-state proof model for distributed action jobs;
-- require all validation and action participants for recursively affected rows
-  to be locked or registered before prepare.
+- continue expanding recovery and failure-injection coverage for routed action
+  pages that combine child-row rewrites, unique-owner handoff, and downstream FK
+  parent checks across retries, topology transitions, and process restarts;
+- continue expanding negative tests for missing exact proofs, uncommon
+  cross-table / unique-parent mixed-timing variants, and SQL-style timing text
+  variants. The distributed transaction parser accepts ordinary
+  `SET CONSTRAINTS ... IMMEDIATE|DEFERRED` spellings, quoted identifiers,
+  target lists, whitespace separators, and a single trailing statement
+  terminator.
 
-Deferrable constraints should come last because they depend on the distributed
-participant model, unique indexes, and cascade/set-null planning.
+Deferrable constraints depend on the distributed participant model, unique
+indexes, and cascade/set-null planning. The current implementation enforces the
+final-state model locally and through exact routed proofs; continued hardening
+should expand recovery and negative-proof coverage for uncommon mixed-action
+transactions.
 
 ## Recommended Order
 
-Ship the remaining work in this order:
+The major implementation order was:
 
 1. Distributed/table-resolved primary-key `restrict`.
 2. Repair and validation tooling.
@@ -1806,19 +2014,21 @@ Ship the remaining work in this order:
 5. Cross-table/table-resolved FK targets for unique parent columns and composite
    unique tuples.
 6. Composite row identity, if Antfly adds composite primary keys.
-7. Distributed/large-operation hardening for `on_delete: set_null`, including
+7. Distributed/large-operation execution for `on_delete: set_null`, including
    hosted remote page execution through the same owner-cursor/source-2PC model,
-   autonomous controller ownership, and richer recovery diagnostics.
-8. Distributed recursive graph and large-operation hardening for
+   autonomous controller ownership, and recovery diagnostics.
+8. Distributed recursive graph and large-operation execution for
    `on_delete: cascade`.
 9. Mutating `on_update` actions backed by the same durable FK action-job
    executor.
 10. Distributed deferrable parent-delete/action constraint sets.
 
-This keeps the integrity substrate sound before adding features that multiply
-write-planning complexity. Distributed cascades and deferred parent-delete
-constraint sets should come late because they require full transaction planning
-across all affected rows, not just child parent-existence validation.
+Production work should continue to harden idempotence/recovery proof tests
+across topology changes and restart boundaries, dead-letter/requeue operator
+policy, and broader SQL-compatibility edge cases. Distributed cascades and
+deferred parent-delete constraint sets use full transaction planning across the
+affected owner and child rows, so they should keep receiving the widest
+failure-injection coverage.
 
 ## Testing Plan
 
@@ -1882,15 +2092,15 @@ Minimum coverage:
   requiring public HTTP polling. Bound/local maintenance also promotes a
   terminal valid adoption job to `enforced` by applying the rewritten schema
   through the ordinary local schema validator. Metadata-owned provisioned/hosted
-rounds invoke the same bounded pass automatically and promote terminal valid
-adoption jobs through the metadata table-update path; durable job-controller
-results are reported separately and do not mutate catalog validation state.
-Catalog-backed hosted/provisioned progress discovery tolerates not-yet-created
-group DBs by skipping the group for that round; validation, repair,
-parent-delete explain, set-null, and cascade execution continue to require the
-target group to exist.
-Service config controls whether the pass runs, worker id, lease duration,
-table/job/work-unit limits, and violation limit. Non-empty rounds log
+  rounds invoke the same bounded pass automatically and promote terminal valid
+  adoption jobs through the metadata table-update path; durable job-controller
+  results are reported separately and do not mutate catalog validation state.
+  Catalog-backed hosted/provisioned progress discovery tolerates
+  not-yet-created group DBs by skipping the group for that round; validation,
+  repair, parent-delete explain, set-null, and cascade execution continue to
+  require the target group to exist.
+  Service config controls whether the pass runs, worker id, lease duration,
+  table/job/work-unit limits, and violation limit. Non-empty rounds log
   aggregate scheduler counters and metadata status exposes cumulative and
   last-round scheduler counters plus cumulative and last-round FK integrity
   report counters. Terminal invalid adoption jobs remain durable FK job records,
@@ -1904,5 +2114,6 @@ table/job/work-unit limits, and violation limit. Non-empty rounds log
 - Planning surface: the DB and public/hosted operation can explain one parent
   delete using the same FK participant path as commit and return non-mutating
   set-null/cascade/reject counters.
-- Remaining operational docs: explicit large-operation execution/recovery
-  diagnostics for high-fanout set-null/cascade.
+- Large-operation surface: high-fanout `set_null`/`cascade` runs through durable
+  owner-routed action schedules and action jobs with explicit requeue,
+  dead-letter, depth-limit, lease, and metadata-status diagnostics.

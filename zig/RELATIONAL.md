@@ -133,14 +133,15 @@ top-level fields outside `attrs` are still rejected by the closed relational
 schema. Top-level dynamic templates in relational schemas stay invalid; flexible
 fields belong behind an explicit `json` column.
 
-Constraints in scope for v1: primary key is the existing document key;
-`NOT NULL` via `required_fields`; unique constraints over one or more ordered
-declared non-`json` relational columns; `on_delete: "restrict"` foreign keys;
-bounded local nullable-column `on_delete: "set_null"` foreign keys; and bounded
-local `on_delete: "cascade"` foreign keys from declared scalar child columns to
-either a parent table's `_id` or a same-table declared unique parent column
-tuple. Cross-table unique targets are rejected until the parent table's unique
-catalog and routed participants can be registered.
+Constraints in scope: primary identity is either the existing document key or a
+declared `primary_key.columns` tuple; `NOT NULL` via required schema fields;
+unique constraints over one or more ordered declared non-`json` relational
+columns; `on_delete: "restrict"` foreign keys; bounded local nullable-column
+`on_delete: "set_null"` foreign keys; and bounded local `on_delete: "cascade"`
+foreign keys from declared scalar child columns to either a parent table's `_id`,
+a declared primary-key tuple, or a declared unique parent column tuple.
+Cross-table primary-key and unique targets route through owner topology when
+configured and fail closed when the required owner range is missing.
 Existing Antfly transaction/2PC semantics still apply to relational writes.
 Hosted writes register the referenced parent table/range as a 2PC participant
 for enforced immediate single-column `_id` FKs and send an explicit
@@ -149,13 +150,75 @@ parent deletes register every range of child tables that declare a matching
 primary-key FK and send parent-delete validation checks to those child
 participants. Child reference creation and restrict parent-delete checks stage
 the same internal FK conflict intent, so concurrent prepares on the same parent
-reference conflict. Hosted writes that would create or update a complete unique
-tuple on a multi-range table fail before prepare until routed unique
-participants exist; single-range tables still use local unique enforcement.
-Composite row identity, constraint-driven large-operation
-cascade/set-null routing, and deferrable constraints remain out of scope for v1.
+reference conflict. Hosted writes that create or update complete primary/unique
+tuples on multi-range tables register the corresponding owner participant.
+Constraint-driven large-operation cascade/set-null routing and deferrable
+constraints use the action-job/participant model described in
+[FOREIGN_KEYS.md](FOREIGN_KEYS.md).
 Use graph indexes and the join planner for relationship queries rather than
 integrity enforcement.
+
+### Public Row Identity
+
+Document-mode clients can continue to use `/tables/{table}/batch` with physical
+document keys. Relational clients should use the row-identity endpoints:
+
+```http
+POST /tables/{table}/rows:batch
+POST /tables/{table}/rows:get
+```
+
+The public identity for a table with
+`primary_key.columns = ["tenant_id", "order_id"]` is the structured typed tuple,
+not the physical row key:
+
+```json
+{ "primary": { "tenant_id": "t1", "order_id": "o9" } }
+```
+
+`rows:batch` accepts row operations that compile to the existing batch and 2PC
+machinery:
+
+```json
+{
+  "operations": [
+    {
+      "op": "insert",
+      "row": {
+        "tenant_id": "t1",
+        "order_id": "o9",
+        "status": "open"
+      }
+    },
+    {
+      "op": "update",
+      "where": { "primary": { "tenant_id": "t1", "order_id": "o9" } },
+      "patch": { "status": "paid" }
+    },
+    {
+      "op": "delete",
+      "where": { "primary": { "tenant_id": "t1", "order_id": "o9" } }
+    }
+  ]
+}
+```
+
+`insert` adds an optimistic non-existence predicate for the derived row identity;
+`upsert` overwrites or creates; `update` is a non-upsert transform and cannot
+patch primary-key components. Primary-key changes are modeled as parent-key
+updates through the storage/constraint layer, not as silent mutation of the
+public row identity. `rows:get` accepts an array of primary selectors and returns
+the structured identity, row JSON, version, and optional `physical_key`.
+
+The physical key is an implementation detail derived from the canonical typed
+primary-key tuple. It exists for placement, WAL, row-version ownership, and
+debugging, but relational clients should not persist it as their row address.
+Unique-key selectors are reserved in the public contract; they must resolve
+through durable unique-owner rows rather than a query scan before they become
+write/read selectors. This shape is intentionally SQL-compatible: `INSERT`,
+`UPDATE ... WHERE` full primary-key equality, `DELETE ... WHERE` full
+primary-key equality, and `REFERENCES parent(col_a, col_b)` can compile directly
+to these structured API operations.
 
 Foreign-key metadata lives in `TableSchema.foreign_keys`; unique metadata lives
 in `TableSchema.unique_constraints`. Both compile into the runtime schema,

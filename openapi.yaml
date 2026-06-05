@@ -3471,6 +3471,96 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/rows:batch:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Perform structured relational row writes by primary identity
+      tags:
+        - data_operations
+      operationId: rowsBatchWrite
+      description: >
+        Relational row batch endpoint for tables with a declared `primary_key`.
+
+        Callers address rows by structured primary-key identity instead of
+
+        physical document keys. The server derives the storage-owned physical
+
+        row key from the canonical typed primary-key tuple and executes through
+
+        the normal batch/2PC path. Unique selectors are reserved until they can
+
+        resolve through durable unique-owner rows.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RowsBatchRequest'
+      responses:
+        '201':
+          description: Row batch operation successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/rows:get:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Lookup relational rows by structured primary identity
+      tags:
+        - data_operations
+      operationId: rowsGet
+      description: >
+        Point lookup endpoint for relational tables with a declared
+
+        `primary_key`. The request uses structured primary-key selectors and
+
+        returns row JSON, version, and optional diagnostic physical keys.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RowsGetRequest'
+      responses:
+        '200':
+          description: Row lookup response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowsGetResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/merge:
     parameters:
       - name: tableName
@@ -6969,6 +7059,125 @@ components:
         transformed:
           type: integer
           description: Number of documents successfully transformed
+    RowPrimarySelector:
+      type: object
+      additionalProperties: true
+      description: >
+        Structured primary-key identity. Keys are the declared
+
+        `primary_key.columns`; values are JSON scalar values coerced with the
+
+        table's relational column types.
+      example:
+        tenant_id: t1
+        order_id: o9
+    RowUniqueSelector:
+      type: object
+      description: >
+        Reserved structured unique-key selector. Public APIs reject this shape
+
+        until unique selectors resolve through durable unique-owner rows.
+      properties:
+        name:
+          type: string
+          description: Unique constraint name.
+        values:
+          type: object
+          additionalProperties: true
+          description: Values for the declared unique-constraint columns.
+      required:
+        - name
+        - values
+    RowSelector:
+      type: object
+      description: >
+        Structured row selector. `primary` is supported for declared
+
+        primary-key tables. `unique` is reserved until routed unique-owner
+
+        resolution is exposed publicly.
+      properties:
+        primary:
+          $ref: '#/components/schemas/RowPrimarySelector'
+        unique:
+          $ref: '#/components/schemas/RowUniqueSelector'
+    RowOperation:
+      type: object
+      description: >
+        Structured relational row mutation. `insert` fails if the primary
+
+        identity already exists, `upsert` overwrites or creates, `update`
+
+        applies a non-upsert patch by primary identity, and `delete` removes by
+
+        primary identity. `update.patch` cannot change primary-key components.
+      properties:
+        op:
+          type: string
+          enum:
+            - insert
+            - upsert
+            - update
+            - delete
+        row:
+          type: object
+          additionalProperties: true
+          description: Full row document for insert/upsert. Must include primary-key columns.
+        where:
+          $ref: '#/components/schemas/RowSelector'
+        patch:
+          type: object
+          additionalProperties: true
+          description: Top-level field patch for update operations.
+      required:
+        - op
+    RowsBatchRequest:
+      type: object
+      properties:
+        operations:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowOperation'
+        sync_level:
+          $ref: '#/components/schemas/SyncLevel'
+      required:
+        - operations
+    RowsGetRequest:
+      type: object
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowSelector'
+        include_physical_key:
+          type: boolean
+          default: false
+          description: Include the diagnostic storage-owned physical key in each result.
+      required:
+        - keys
+    RowsGetResult:
+      type: object
+      properties:
+        identity:
+          $ref: '#/components/schemas/RowSelector'
+        found:
+          type: boolean
+        row:
+          type: object
+          additionalProperties: true
+        version:
+          type: integer
+          format: uint64
+        physical_key:
+          type: string
+          description: Diagnostic storage-owned physical key. Do not persist as public row identity.
+    RowsGetResponse:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsGetResult'
     MultiBatchRequest:
       type: object
       description: >
@@ -12261,16 +12470,17 @@ components:
             where owner topology is configured.
         timing:
           type: string
-          enum:
-            - immediate
-            - deferred
-          description: Constraint timing. "deferred" is enforced for local relational transactions at
-            commit and routed child writes through exact parent-check proof records.
+          description: Constraint timing. Canonical values are "immediate" and "deferred"; SQL-shaped
+            aliases such as "INITIALLY DEFERRED" and combined deferrability clauses are accepted and normalized
+            by schema parsing.
         deferrable:
-          type: boolean
+          oneOf:
+            - type: boolean
+            - type: string
           description: Whether transaction-level timing overrides may change this constraint's effective
-            timing. Omitted defaults to false unless timing is "deferred" for compatibility; true with
-            timing "immediate" represents DEFERRABLE INITIALLY IMMEDIATE.
+            timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE",
+            and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred"
+            for compatibility.
         match:
           type: string
           enum:
@@ -12287,6 +12497,17 @@ components:
           description: Constraint validation state. Public schema validation accepts enforced constraints
             and local unvalidated adoption entries; online job-owned states are reserved for hosted migration
             jobs.
+    PrimaryKey:
+      type: object
+      additionalProperties: false
+      description: Relational primary-key constraint.
+      properties:
+        columns:
+          type: array
+          items:
+            type: string
+          description: Primary-key columns. One or more ordered required non-json relational columns are
+            supported.
     UniqueConstraint:
       type: object
       additionalProperties: false
@@ -12389,6 +12610,18 @@ components:
             Cross-table unique targets require routed parent-table unique participants.
 
             Unsupported shapes are rejected during schema validation.
+        primary_key:
+          $ref: '#/components/schemas/PrimaryKey'
+          description: >
+            Relational-mode primary key over one or more ordered declared
+
+            non-json relational columns. Every component must be required and
+
+            present on every row. When omitted, `_id` remains the document-key
+
+            primary identity. `_id` cannot be mixed into a declared composite
+
+            primary-key tuple.
         unique_constraints:
           type: array
           items:

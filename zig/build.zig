@@ -3002,6 +3002,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db exposes local transaction lifecycle",
             "storage.db.db.test.db relational foreign keys",
             "storage.db.db.test.db relational unique constraints enforce committed scalar values",
+            "storage.db.db.test.db relational composite primary keys enforce identity and back foreign keys",
             "storage.db.db.test.db foreign key integrity progress is durable per range",
             "storage.db.db.test.db unique constraint integrity repair rebuilds backing rows",
             "storage.db.db.test.db transaction unique constraint mutations enforce owner handoff",
@@ -3041,6 +3042,7 @@ pub fn build(b: *std.Build) void {
             "metadata raft apply store preserves projected tables and ranges across reopen",
             "metadata reconciler converges foreign key reference owner ranges",
             "metadata reconciler derives foreign key reference owner ranges from table schemas",
+            "metadata reconciler derives primary key and unique owner ranges from table schemas",
             "metadata reconciler preserves split foreign key reference owner ranges for active schema foreign keys",
             "metadata reconciler converges unique constraint owner ranges",
             "placement planner places foreign key reference owner ranges",
@@ -3151,6 +3153,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_metadata_vopr_chaos_default_filters = [_][]const u8{
         "metadata VOPR expanded generated workload campaign",
+        "metadata VOPR relational identity owner topology campaign",
     };
     const lib_metadata_vopr_chaos_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -3569,6 +3572,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, api_public_table_http_docid_test_mod, true, true);
+    const api_internal_group_write_routes_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_internal_group_write_routes_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_internal_group_write_routes_test_mod, true, true);
     const raft_transition_runtime_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_transition_runtime_test_root.zig"),
         .target = target,
@@ -3603,6 +3612,7 @@ pub fn build(b: *std.Build) void {
             "distributed txn coordinator routes unique foreign key parent updates through ref owners",
             "distributed txn coordinator schedules mutating unique foreign key parent updates through ref owners",
             "distributed txn coordinator routes cross-table composite foreign key checks through parent unique owner ranges",
+            "distributed txn coordinator routes cross-table composite foreign key checks through parent primary key owner ranges",
             "distributed txn coordinator routes unique foreign key parent deletes through ref owners",
             "distributed txn coordinator routes cross-table unique foreign key parent deletes through ref owners",
             "distributed txn coordinator routes unique foreign key set-null parent deletes through ref owners",
@@ -3611,7 +3621,7 @@ pub fn build(b: *std.Build) void {
             "distributed txn explain fails closed on incomplete routed ref owner scans",
             "distributed txn coordinator routes foreign key reference transforms with final-value planning",
             "distributed txn coordinator allows non-reference transforms on foreign key tables",
-            "distributed txn coordinator registers foreign key parent delete participants",
+            "distributed txn coordinator fails closed without foreign key ref owner parent delete ranges",
             "distributed txn coordinator routes foreign key parent deletes through ref owners when configured",
             "distributed txn coordinator routes deferred foreign key parent deletes through ref owners when configured",
             "distributed txn coordinator fails closed for transitional foreign key ref owner parent deletes",
@@ -3643,6 +3653,7 @@ pub fn build(b: *std.Build) void {
             "foreign key integrity plan clips requested span to table ranges",
             "foreign key integrity worker plan includes active owner ranges",
             "foreign key integrity job diagnostics merge samples across passes",
+            "foreign key integrity job records diagnostics across incomplete passes",
             "foreign key schema controller maintenance",
             "foreign key schema controller maintenance resumes durable action job",
             "provisioned foreign key action job drains owner range page",
@@ -3670,6 +3681,16 @@ pub fn build(b: *std.Build) void {
             "public table query handler maps doc identity unavailable errors",
             "public table query view handler maps doc identity unavailable errors",
             "public table backup handler rejects portable format",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const api_internal_group_write_routes_tests = b.addTest(.{
+        .root_module = api_internal_group_write_routes_test_mod,
+        .filters = &.{
+            "internal group write routes",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3704,6 +3725,7 @@ pub fn build(b: *std.Build) void {
     const run_api_table_writes_docid_tests = b.addRunArtifact(api_table_writes_docid_tests);
     const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
+    const run_api_internal_group_write_routes_tests = b.addRunArtifact(api_internal_group_write_routes_tests);
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
 
     const api_transactions_test_step = b.step("api-transactions-test", "Run focused API transaction coordinator tests");
@@ -3711,6 +3733,9 @@ pub fn build(b: *std.Build) void {
 
     const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write DOCID tests");
     api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
+
+    const api_internal_group_write_routes_test_step = b.step("api-internal-group-write-routes-test", "Run focused internal group write route tests");
+    api_internal_group_write_routes_test_step.dependOn(&run_api_internal_group_write_routes_tests.step);
 
     const lib_docid_lifecycle_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -3782,6 +3807,7 @@ pub fn build(b: *std.Build) void {
     lib_api_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
+    lib_api_docid_test_step.dependOn(&run_api_internal_group_write_routes_tests.step);
     lib_api_docid_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_data_storage_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_data_runtime_tests.step);
@@ -4148,6 +4174,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_metadata_logic_tests.step);
     unit_test_step.dependOn(&run_lib_metadata_service_tests.step);
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
+    unit_test_step.dependOn(&run_api_internal_group_write_routes_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_lib_api_logic_tests.step);
     unit_test_step.dependOn(&run_public_api_parity_tests.step);
@@ -4496,6 +4523,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "db transaction externalized foreign key parent checks still maintain refs",
             "db deferred foreign keys validate at local transaction commit and reject externalized checks",
+            "db mixed immediate and deferred foreign keys require per-constraint proofs",
             "db deferred no action foreign key update validates final transaction state",
             "db deferred restrict foreign key update remains immediate",
             "db relational foreign key on update set null rewrites local unique children",
