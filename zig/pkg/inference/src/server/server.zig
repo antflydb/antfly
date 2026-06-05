@@ -2206,7 +2206,7 @@ pub const Node = struct {
             }
 
             var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                return generationFailureResponse(ctx, err);
             defer result.deinit();
 
             var response_text = result.text;
@@ -2312,7 +2312,7 @@ pub const Node = struct {
                 }
 
                 var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    return generationFailureResponse(ctx, err);
                 defer result.deinit();
 
                 var response_text = result.text;
@@ -2593,7 +2593,7 @@ pub const Node = struct {
         }
 
         var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+            return generationFailureResponse(ctx, err);
         defer result.deinit();
 
         var response_text = result.text;
@@ -2673,6 +2673,19 @@ pub const Node = struct {
         }
 
         return result;
+    }
+
+    fn generationFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.AudioInputTooLong => ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = generation.userFacingErrorMessage(err),
+            }),
+            else => ctx.status(500).json(.{
+                .@"error" = "GENERATION_FAILED",
+                .message = generation.userFacingErrorMessage(err),
+            }),
+        };
     }
 
     /// Send a completed GenerationResult as a single SSE stream.
@@ -3002,7 +3015,7 @@ pub const Node = struct {
             StreamCtx.onToken,
         ) catch |err| {
             // Try to send an error event before closing
-            writer.writeEvent("error", @errorName(err)) catch {};
+            writer.writeEvent("error", generation.userFacingErrorMessage(err)) catch {};
             writer.close() catch {};
             return ctx.response.build();
         };
