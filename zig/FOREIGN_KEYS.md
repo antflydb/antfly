@@ -163,9 +163,12 @@ For v1:
   absent child component means no reference. `match: "full"` is also accepted:
   either every child component must be absent, producing no reference, or every
   child component must be present and validated as one composite reference.
-  A partially-null `MATCH FULL` reference is a FK violation. `match: "partial"`
-  remains rejected until its row-subset parent matching semantics are
-  implemented.
+  A partially-null `MATCH FULL` reference is a FK violation. DB transaction
+  prepare and distributed commit planning both validate this reference shape
+  before durable intents or participant prepare calls are emitted, so
+  partially-null composite references fail consistently in local and routed
+  writes. `match: "partial"` remains rejected until its row-subset parent
+  matching semantics are implemented.
 - referenced parent tables must be relational tables.
 - `on_update` defaults to `restrict`. `restrict` and `no_action` are enforced
   as parent-key update checks for supported unique parent targets: changing a
@@ -1282,6 +1285,11 @@ Implemented:
   current durable worker, claim timestamp, lease deadline, and attempt number, so
   stale workers cannot advance cursors after lease handoff. Failed page execution
   persists `last_error` and an invalid status for diagnostics/retry visibility.
+  Operators/controllers can explicitly requeue an incomplete failed job after
+  the underlying cause is corrected; requeue validates the durable action
+  identity, rejects completed jobs, clears claim/error/lease state, updates the
+  intended worker/page limit, and preserves the existing child cursor, attempt
+  count, and applied-child count so large operations resume rather than restart.
   FK progress rows, validation/repair claim leases, action schedules, and
   action-job claim leases are timestamped with realtime so autonomous hosted
   controllers can make consistent expiry decisions across owner DBs instead of
@@ -1325,8 +1333,8 @@ Remaining work:
   records across
   local/provisioned/hosted-local/hosted-remote owner groups. Remaining work is
   recursive/deep cascade planning, stronger idempotence and recovery proofs
-  across bounded distributed participant rounds, and broader operator retry
-  tooling for pathological large operations.
+  across bounded distributed participant rounds, and surfacing the new explicit
+  DB-local action-job requeue primitive through hosted/provisioned operator APIs.
 
 Repair may rebuild missing/corrupt secondary metadata, but it must not silently
 mutate user rows. Orphaned child rows should be reported for explicit operator

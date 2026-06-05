@@ -6911,6 +6911,95 @@ test "distributed txn coordinator rejects non-primary foreign key parent writes 
     try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
 }
 
+test "distributed txn coordinator rejects partial match full composite foreign key writes before prepare" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"customer_email":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"users_customer_tenant_email_fkey","columns":["tenant_id","customer_email"],"references":{"table":"row","columns":["tenant_id","email"]},"match":"full"}],"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"]}]}
+    ;
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const metadata_table_manager = @import("../metadata/table_manager.zig");
+            const raft_reconciler = @import("../raft/reconciler.zig");
+            const metadata_transition_state = @import("../metadata/transition_state.zig");
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 7, .name = "docs", .schema_json = schema_json, .placement_role = "data" },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+    };
+
+    const Recorder = struct {
+        begin_calls: usize = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .begin_group = begin,
+                    .prepare_group = prepare,
+                    .resolve_group = resolve,
+                    .status_group = status,
+                },
+            };
+        }
+
+        fn begin(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.begin_calls += 1;
+            return error.UnexpectedWorkerCall;
+        }
+
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+            return error.UnexpectedWorkerCall;
+        }
+
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {
+            return error.UnexpectedWorkerCall;
+        }
+
+        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            return error.UnexpectedWorkerCall;
+        }
+    };
+
+    var recorder = Recorder{};
+    const txn_id = try parseTxnIdHex("aaaabbbbccccddddeeeeffff00001112");
+    try std.testing.expectError(error.ForeignKeyViolation, executeMultiTableCommit(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        txn_id,
+        10_000,
+        10_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{.{ .key = "doc:partial", .value = "{\"tenant_id\":\"tenant:1\"}" }},
+        }},
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
+}
+
 test "distributed txn coordinator routes foreign key checks through unique owner ranges" {
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"},"ref_email":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_delete":"restrict"}],"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}

@@ -6279,6 +6279,7 @@ pub const DB = struct {
         if (req.foreign_key_parent_checks_externalized or req.foreign_key_externalized_parent_checks.len > 0) {
             try self.validateExternalizedForeignKeyParentChecks(req.foreign_key_externalized_parent_checks, req.foreign_key_constraint_timing_overrides, effective_ops.writes);
         }
+        try self.validateForeignKeyReferenceShapes(effective_ops.writes);
         try self.validateForeignKeyParentChecks(req.foreign_key_parent_checks, effective_ops.writes, effective_ops.deletes, req.unique_constraint_writes, req.unique_constraint_deletes);
         try self.validateForeignKeyRefMutations(req.foreign_key_ref_writes);
         try self.validateForeignKeyRefMutations(req.foreign_key_ref_deletes);
@@ -6861,6 +6862,23 @@ pub const DB = struct {
             const existing = try self.get(self.alloc, check.parent_key);
             defer if (existing) |body| self.alloc.free(body);
             if (existing == null) return error.ForeignKeyViolation;
+        }
+    }
+
+    fn validateForeignKeyReferenceShapes(
+        self: *DB,
+        writes: []const types.TransactionWrite,
+    ) !void {
+        if (writes.len == 0) return;
+        const runtime_schema = self.core.schema orelse return;
+        if (runtime_schema.storage_mode != .relational or runtime_schema.foreign_keys.len == 0) return;
+        for (writes) |write| {
+            if (isMetadataKey(write.key) or internal_keys.isInternalPhysicalTableDataKey(write.key)) continue;
+            for (runtime_schema.foreign_keys) |foreign_key| {
+                if (foreign_key.validation_state != .enforced) continue;
+                const parent_key = try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema.relational_columns, foreign_key, write.value);
+                defer if (parent_key) |value| self.alloc.free(value);
+            }
         }
     }
 
@@ -11686,6 +11704,135 @@ pub const DB = struct {
             .applied_children = 0,
             .next_child_table = null,
             .next_child_key = null,
+            .last_error = null,
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(payload);
+        try self.core.store.put(key, payload);
+        return try self.cloneForeignKeyActionJobRecordFromJson(payload);
+    }
+
+    pub fn requeueForeignKeyActionJob(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        page_limit: usize,
+    ) !ForeignKeyActionJobRecord {
+        return try self.requeueForeignKeyActionJobWithUpdatedParentKeyAt(
+            job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            null,
+            page_limit,
+            currentTimeNs(),
+        );
+    }
+
+    pub fn requeueForeignKeyActionJobWithUpdatedParentKey(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+    ) !ForeignKeyActionJobRecord {
+        return try self.requeueForeignKeyActionJobWithUpdatedParentKeyAt(
+            job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            updated_parent_key,
+            page_limit,
+            currentTimeNs(),
+        );
+    }
+
+    pub fn requeueForeignKeyActionJobAt(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        page_limit: usize,
+        now_ns: u64,
+    ) !ForeignKeyActionJobRecord {
+        return try self.requeueForeignKeyActionJobWithUpdatedParentKeyAt(
+            job_id,
+            action,
+            worker_id,
+            constraint_name,
+            parent_table,
+            parent_key,
+            null,
+            page_limit,
+            now_ns,
+        );
+    }
+
+    pub fn requeueForeignKeyActionJobWithUpdatedParentKeyAt(
+        self: *DB,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+        now_ns: u64,
+    ) !ForeignKeyActionJobRecord {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (page_limit == 0) return error.InvalidForeignKeyActionJob;
+        try validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyActionJobKeyAlloc(self.alloc, job_id);
+        defer self.alloc.free(key);
+        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return error.ForeignKeyActionJobNotFound,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+
+        const existing = try self.cloneForeignKeyActionJobRecordFromJson(raw);
+        defer self.freeForeignKeyActionJobRecord(existing);
+        try validateForeignKeyActionJobMatches(existing, action, constraint_name, parent_table, parent_key, updated_parent_key);
+        if (existing.completed) return error.InvalidForeignKeyActionJob;
+
+        const record = ForeignKeyActionJobRecord{
+            .job_id = existing.job_id,
+            .action = existing.action,
+            .worker_id = worker_id,
+            .constraint_name = existing.constraint_name,
+            .parent_table = existing.parent_table,
+            .parent_key = existing.parent_key,
+            .updated_parent_key = existing.updated_parent_key,
+            .page_limit = page_limit,
+            .status = "pending",
+            .created_at_ns = existing.created_at_ns,
+            .updated_at_ns = now_ns,
+            .claimed_at_ns = 0,
+            .lease_until_ns = 0,
+            .attempts = existing.attempts,
+            .completed = false,
+            .applied_children = existing.applied_children,
+            .next_child_table = existing.next_child_table,
+            .next_child_key = existing.next_child_key,
             .last_error = null,
         };
         const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
@@ -45326,6 +45473,147 @@ test "db foreign key action job rejects stale page finish after lease handoff" {
     try std.testing.expectEqualStrings("order:cursor", finished.next_child_key.?);
 }
 
+test "db foreign key action job requeue preserves durable cursor and clears failed claim" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const scheduled = try db.scheduleForeignKeyActionJobAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        8,
+        100_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(scheduled);
+
+    const claimed = try db.claimForeignKeyActionJobPageAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:failed",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        8,
+        60_000,
+        200_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(claimed);
+    try std.testing.expectEqualStrings("claimed", claimed.status);
+
+    const failed = try db.finishClaimedForeignKeyActionJobPageAt(
+        claimed,
+        3,
+        false,
+        "row",
+        "order:requeue:cursor",
+        "OperatorPaused",
+        210_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(failed);
+    try std.testing.expectEqualStrings("invalid", failed.status);
+    try std.testing.expect(!failed.completed);
+    try std.testing.expectEqual(@as(u64, 3), failed.applied_children);
+    try std.testing.expectEqual(@as(u32, 1), failed.attempts);
+    try std.testing.expectEqualStrings("worker:fk-action:failed", failed.worker_id);
+    try std.testing.expect(failed.lease_until_ns > 210_000);
+    try std.testing.expect(failed.next_child_table != null);
+    try std.testing.expectEqualStrings("row", failed.next_child_table.?);
+    try std.testing.expect(failed.next_child_key != null);
+    try std.testing.expectEqualStrings("order:requeue:cursor", failed.next_child_key.?);
+    try std.testing.expect(failed.last_error != null);
+    try std.testing.expectEqualStrings("OperatorPaused", failed.last_error.?);
+
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.requeueForeignKeyActionJobAt(
+        "fk-action:set-null:requeue",
+        "cascade",
+        "worker:fk-action:retry",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        4,
+        220_000,
+    ));
+
+    const requeued = try db.requeueForeignKeyActionJobAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:retry",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        4,
+        220_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(requeued);
+    try std.testing.expectEqualStrings("pending", requeued.status);
+    try std.testing.expect(!requeued.completed);
+    try std.testing.expectEqualStrings("worker:fk-action:retry", requeued.worker_id);
+    try std.testing.expectEqual(@as(usize, 4), requeued.page_limit);
+    try std.testing.expectEqual(@as(u64, 0), requeued.claimed_at_ns);
+    try std.testing.expectEqual(@as(u64, 0), requeued.lease_until_ns);
+    try std.testing.expectEqual(@as(u32, 1), requeued.attempts);
+    try std.testing.expectEqual(@as(u64, 3), requeued.applied_children);
+    try std.testing.expect(requeued.next_child_table != null);
+    try std.testing.expectEqualStrings("row", requeued.next_child_table.?);
+    try std.testing.expect(requeued.next_child_key != null);
+    try std.testing.expectEqualStrings("order:requeue:cursor", requeued.next_child_key.?);
+    try std.testing.expect(requeued.last_error == null);
+
+    const retry_claim = try db.claimForeignKeyActionJobPageAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:next",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        4,
+        60_000,
+        221_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(retry_claim);
+    try std.testing.expectEqualStrings("claimed", retry_claim.status);
+    try std.testing.expectEqualStrings("worker:fk-action:next", retry_claim.worker_id);
+    try std.testing.expectEqual(@as(u32, 2), retry_claim.attempts);
+    try std.testing.expectEqual(@as(u64, 3), retry_claim.applied_children);
+    try std.testing.expect(retry_claim.next_child_table != null);
+    try std.testing.expectEqualStrings("row", retry_claim.next_child_table.?);
+    try std.testing.expect(retry_claim.next_child_key != null);
+    try std.testing.expectEqualStrings("order:requeue:cursor", retry_claim.next_child_key.?);
+
+    const completed = try db.finishClaimedForeignKeyActionJobPageAt(
+        retry_claim,
+        0,
+        true,
+        null,
+        null,
+        null,
+        222_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(completed);
+    try std.testing.expectEqualStrings("complete", completed.status);
+    try std.testing.expect(completed.completed);
+
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.requeueForeignKeyActionJobAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:retry",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        4,
+        223_000,
+    ));
+}
+
 test "db transaction writes durable foreign key action schedules atomically" {
     const alloc = std.testing.allocator;
 
@@ -48010,6 +48298,39 @@ test "db deferred foreign keys preserve exact externalized unique parent proofs 
     const child = (try db.get(alloc, "user:exact-unique")) orelse return error.TestExpectedEqual;
     defer alloc.free(child);
     try std.testing.expectEqualStrings("{\"id\":\"user:exact-unique\",\"ref_email\":\"proof@example.test\"}", child);
+}
+
+test "db relational foreign keys reject partial match full composite references" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"customer_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"]}],"foreign_keys":[{"name":"users_customer_tenant_email_fkey","columns":["tenant_id","customer_email"],"references":{"table":"row","columns":["tenant_id","email"]},"match":"full"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const all_null_txn = try db.beginTransaction(14_942);
+    try db.writeTransaction(all_null_txn, .{
+        .writes = &.{.{ .key = "user:all-null", .value = "{\"id\":\"user:all-null\"}" }},
+    });
+    try db.commitTransaction(all_null_txn, 14_943);
+
+    const partial_txn = try db.beginTransaction(14_944);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(partial_txn, .{
+        .writes = &.{.{ .key = "user:partial", .value = "{\"id\":\"user:partial\",\"tenant_id\":\"tenant:1\"}" }},
+    }));
+    try db.abortTransaction(partial_txn, 14_945);
 }
 
 test "db deferred foreign keys require named cross-table unique parent proofs" {
