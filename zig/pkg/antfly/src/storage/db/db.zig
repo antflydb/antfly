@@ -5784,29 +5784,31 @@ pub const DB = struct {
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
         try self.retireResolverReplayBeforeCatalogRemoval();
 
-        var removed = false;
         const retirement_sequence = blk: {
             lockApply(self);
             defer self.core.unlockApply();
 
-            const cfg = (try self.resolverConfigByNameAlloc(name)) orelse break :blk null;
+            const cfg = (try self.resolverConfigByNameAlloc(name)) orelse return false;
             defer {
                 var owned = cfg;
                 owned.deinit(self.alloc);
             }
 
-            const sequence = try self.retireResolverArtifactsLocked(cfg);
-            if (!try self.core.removeResolver(name)) return false;
-            removed = true;
-            break :blk sequence;
+            break :blk try self.retireResolverArtifactsLocked(cfg);
         };
 
-        if (!removed) return false;
         if (retirement_sequence) |sequence| {
             self.executor.notifySequence(sequence);
             self.notifyResolverReplayRuntimesForced(sequence);
             try self.runUntilIdle();
         }
+
+        {
+            lockApply(self);
+            defer self.core.unlockApply();
+            if (!try self.core.removeResolver(name)) return false;
+        }
+
         self.stopResolverReplayRuntimesIfUnconfigured();
         return true;
     }
@@ -15972,6 +15974,7 @@ fn managedIndexBatchApplicability(
                         index_manager.alloc.free(parsed.artifact_name);
                     }
                     if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
                     return .missing_dependency;
                 }
                 if (internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
@@ -17031,7 +17034,6 @@ fn materializeMentionEdgesForResolutionKey(
     defer if (raw_resolution) |raw| alloc.free(raw);
 
     const cfg = resolverConfigForResolution(index_manager, source.artifact_name, parsed_key.artifact_name) orelse {
-        if (raw_resolution == null) return;
         if (options.require_resolution_contract) return error.MissingResolverArtifactContract;
         return;
     };
@@ -17126,6 +17128,16 @@ fn resolverConfigForResolution(
         {
             return cfg;
         }
+    }
+    return null;
+}
+
+fn resolverConfigForResolutionArtifact(
+    index_manager: *index_manager_mod.IndexManager,
+    resolution_artifact: []const u8,
+) ?*const index_manager_mod.ResolverConfig {
+    for (index_manager.resolvers.items) |*cfg| {
+        if (std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact)) return cfg;
     }
     return null;
 }
@@ -25107,6 +25119,19 @@ test "db graph replay blocks resolution artifact without resolver contract" {
         ),
     );
 
+    try db.core.store.delete(resolution_key);
+    try std.testing.expectError(
+        error.MissingResolverArtifactContract,
+        materializeGraphSourceArtifactsForIndex(
+            alloc,
+            db.core.store,
+            db.core.index_manager,
+            &.{resolution_key},
+            "prov_graph",
+            .{ .require_resolution_contract = true },
+        ),
+    );
+
     try db.addResolver(.{
         .name = "kg",
         .table = "entities",
@@ -25118,6 +25143,65 @@ test "db graph replay blocks resolution artifact without resolver contract" {
 
     try std.testing.expect(batchAffectsManagedIndex(db.core.index_manager, batch, index_ref));
     try std.testing.expect(try batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, index_ref));
+}
+
+test "db graph replay ignores resolution artifacts bound to another source contract" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_a",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_a","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_a","kind":"asset","field":"relations_a","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addIndex(.{
+        .name = "graph_b",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_b","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_b","kind":"asset","field":"relations_b","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg_b",
+        .table = "entities",
+        .source_artifact = "relations_b",
+        .resolution_artifact = "resolution_b",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_b");
+    defer alloc.free(resolution_key);
+    const batch = derived_types.DerivedBatch{
+        .sequence = 1,
+        .changed_artifact_keys = &.{resolution_key},
+    };
+
+    const graph_a = index_manager_mod.ManagedIndexRef{ .name = "graph_a", .kind = .graph };
+    try std.testing.expect(!batchAffectsManagedIndex(db.core.index_manager, batch, graph_a));
+    try std.testing.expect(!try batchAffectsManagedIndexForReplay(db.core.index_manager, batch, graph_a));
+    try std.testing.expect(!try batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, graph_a));
+
+    const graph_b = index_manager_mod.ManagedIndexRef{ .name = "graph_b", .kind = .graph };
+    try std.testing.expect(batchAffectsManagedIndex(db.core.index_manager, batch, graph_b));
+    try std.testing.expect(try batchAffectsManagedIndexForReplay(db.core.index_manager, batch, graph_b));
+    try std.testing.expect(try batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, graph_b));
 }
 
 test "db materializes doc->entity mention edges as provenance and clears them on delete" {
