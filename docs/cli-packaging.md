@@ -13,7 +13,7 @@ runtime archives produced by the main release workflow.
 ## Release Flow
 
 1. Publish the normal Antfly release tag, for example `v0.2.0`.
-2. The main release workflow runs GoReleaser and uploads native archives under
+2. The main release workflow uploads native archives under
    `https://releases.antfly.io/antfly/v0.2.0/`.
 3. The release workflow downloads those archives, repacks them, and publishes
    `antfly-cli` and `@antfly/cli`.
