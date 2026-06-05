@@ -64,10 +64,22 @@ const ForeignKeyIntegrityRequestWire = struct {
     lower_doc_key: ?[]const u8 = null,
     upper_doc_key: ?[]const u8 = null,
     violation_limit: ?usize = null,
+    job_id: ?[]const u8 = null,
+    claim_key: ?[]const u8 = null,
+    worker_id: ?[]const u8 = null,
+    lease_ms: ?u64 = null,
+    max_work_units: ?usize = null,
+};
+
+const UniqueIntegrityRequestWire = struct {
+    action: ?[]const u8 = null,
+    lower_doc_key: ?[]const u8 = null,
+    upper_doc_key: ?[]const u8 = null,
 };
 
 fn parseForeignKeyIntegrityAction(value: ?[]const u8) !table_writes.ForeignKeyIntegrityAction {
     const text = value orelse "validate";
+    if (std.mem.eql(u8, text, "plan")) return .plan;
     if (std.mem.eql(u8, text, "validate")) return .validate;
     if (std.mem.eql(u8, text, "dry_run")) return .dry_run;
     if (std.mem.eql(u8, text, "repair")) return .repair;
@@ -75,6 +87,15 @@ fn parseForeignKeyIntegrityAction(value: ?[]const u8) !table_writes.ForeignKeyIn
     if (std.mem.eql(u8, text, "explain_delete")) return .explain_delete;
     if (std.mem.eql(u8, text, "progress")) return .progress;
     return error.InvalidForeignKeyIntegrityRequest;
+}
+
+fn parseUniqueIntegrityAction(value: ?[]const u8) !table_writes.UniqueConstraintIntegrityAction {
+    const text = value orelse "validate";
+    if (std.mem.eql(u8, text, "validate")) return .validate;
+    if (std.mem.eql(u8, text, "dry_run")) return .dry_run;
+    if (std.mem.eql(u8, text, "repair")) return .repair;
+    if (std.mem.eql(u8, text, "progress")) return .progress;
+    return error.InvalidUniqueIntegrityRequest;
 }
 
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
@@ -206,6 +227,39 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         }
         const lower_doc_key = if (action == .explain_delete) parsed.value.doc_key.? else parsed.value.lower_doc_key orelse "";
         const upper_doc_key = if (action == .explain_delete) "" else parsed.value.upper_doc_key orelse "";
+        if (parsed.value.claim_key) |claim_key| {
+            const worker_id = parsed.value.worker_id orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "foreign key integrity claim requires worker_id");
+            if (claim_key.len == 0 or worker_id.len == 0) {
+                return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key integrity claim");
+            }
+            if (parsed.value.job_id) |job_id| {
+                if (job_id.len == 0) return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key integrity claim");
+            }
+            var result = (writes.foreignKeyIntegrityWorkUnitGroupLocal(
+                ctx.alloc,
+                fk_route.group_id,
+                fk_route.table_name,
+                action,
+                parsed.value.job_id,
+                claim_key,
+                worker_id,
+                parsed.value.lease_ms orelse 60_000,
+                @max(1, parsed.value.max_work_units orelse 1),
+                parsed.value.constraint_name,
+                lower_doc_key,
+                upper_doc_key,
+                violation_limit,
+            ) catch |err| switch (err) {
+                error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+                error.InvalidForeignKeyIntegrityRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key integrity request"),
+                error.ForeignKeyIntegrityClaimBusy => return try http_route_helpers.textResponse(ctx.alloc, 409, "foreign key integrity claim busy"),
+                error.ForeignKeyNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "foreign key not found"),
+                error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+            defer result.deinit(ctx.alloc);
+            return try http_route_helpers.jsonResponse(ctx.alloc, result);
+        }
         var result = (writes.foreignKeyIntegrityGroupLocal(
             ctx.alloc,
             fk_route.group_id,
@@ -218,6 +272,30 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         ) catch |err| switch (err) {
             error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             error.ForeignKeyNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "foreign key not found"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer result.deinit(ctx.alloc);
+        return try http_route_helpers.jsonResponse(ctx.alloc, result);
+    }
+    if (routes.Routes.matchGroupUniqueIntegrity(path)) |unique_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(UniqueIntegrityRequestWire, ctx.alloc, if (req.body.len == 0) "{}" else req.body, .{
+            .ignore_unknown_fields = true,
+        }) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid unique integrity request");
+        defer parsed.deinit();
+        const action = parseUniqueIntegrityAction(parsed.value.action) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid unique integrity request");
+        };
+        var result = (writes.uniqueConstraintIntegrityGroupLocal(
+            ctx.alloc,
+            unique_route.group_id,
+            unique_route.table_name,
+            action,
+            parsed.value.lower_doc_key orelse "",
+            parsed.value.upper_doc_key orelse "",
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
             else => return err,
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
@@ -589,6 +667,59 @@ test "internal group write routes expose foreign key integrity" {
     });
     defer dry_run_parsed.deinit();
     try std.testing.expectEqual(table_writes.ForeignKeyIntegrityAction.dry_run, dry_run_parsed.value.action);
+
+    var claim_resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/foreign-key-integrity",
+        .body = "{\"action\":\"validate\",\"job_id\":\"job:internal-fk\",\"claim_key\":\"fk:claim:7:docs:a:z\",\"worker_id\":\"worker:1\",\"lease_ms\":1000,\"max_work_units\":4,\"lower_doc_key\":\"a\",\"upper_doc_key\":\"z\"}",
+    }, "/internal/v1/groups/7/tables/docs/foreign-key-integrity")).?;
+    defer claim_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), claim_resp.status);
+    var claim_parsed = try std.json.parseFromSlice(table_writes.ForeignKeyIntegrityResult, alloc, claim_resp.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer claim_parsed.deinit();
+    try std.testing.expectEqual(table_writes.ForeignKeyIntegrityAction.validate, claim_parsed.value.action);
+    try std.testing.expect(claim_parsed.value.complete);
+    try std.testing.expectEqual(@as(usize, 1), claim_parsed.value.work_claims.len);
+    try std.testing.expectEqualStrings("fk:claim:7:docs:a:z", claim_parsed.value.work_claims[0].claim_key);
+    try std.testing.expectEqualStrings("worker:1", claim_parsed.value.work_claims[0].worker_id);
+    try std.testing.expectEqualStrings("a", claim_parsed.value.work_claims[0].lower_doc_key);
+    try std.testing.expectEqualStrings("z", claim_parsed.value.work_claims[0].upper_doc_key);
+    try std.testing.expectEqual(@as(u32, 4), claim_parsed.value.work_claims[0].attempts);
+}
+
+test "internal group write routes expose unique integrity" {
+    const alloc = std.testing.allocator;
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/unique-integrity",
+        .body = "{\"action\":\"repair\"}",
+    }, "/internal/v1/groups/7/tables/docs/unique-integrity")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    var parsed = try std.json.parseFromSlice(table_writes.UniqueConstraintIntegrityResult, alloc, resp.body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(table_writes.UniqueConstraintIntegrityAction.repair, parsed.value.action);
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.groups[0].group_id);
 }
 
 test "internal group write routes reject mismatched shard execute requests" {
@@ -753,6 +884,8 @@ const TestWriteSource = struct {
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
+                .foreign_key_integrity_work_unit_group_local = foreignKeyIntegrityWorkUnitGroupLocal,
+                .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
             },
         };
     }
@@ -821,6 +954,85 @@ const TestWriteSource = struct {
             .report = .{},
             .groups = groups,
             .violations = &.{},
+        };
+    }
+
+    fn foreignKeyIntegrityWorkUnitGroupLocal(
+        _: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        _: []const u8,
+        action: table_writes.ForeignKeyIntegrityAction,
+        job_id: ?[]const u8,
+        claim_key: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+        _: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        violation_limit: usize,
+    ) !?table_writes.ForeignKeyIntegrityResult {
+        const groups = try alloc.alloc(table_writes.ForeignKeyIntegrityGroupReport, 1);
+        errdefer alloc.free(groups);
+        groups[0] = .{ .group_id = group_id, .report = .{} };
+
+        const work_claims = try alloc.alloc(table_writes.ForeignKeyIntegrityWorkClaim, 1);
+        errdefer alloc.free(work_claims);
+        work_claims[0] = .{
+            .claim_key = try alloc.dupe(u8, claim_key),
+            .worker_id = &.{},
+            .group_id = group_id,
+            .phase = try alloc.dupe(u8, "child_range"),
+            .planned_action = try alloc.dupe(u8, @tagName(action)),
+            .constraint_name = null,
+            .lower_doc_key = try alloc.dupe(u8, lower_doc_key),
+            .upper_doc_key = try alloc.dupe(u8, upper_doc_key),
+            .claimed_at_ns = 1,
+            .lease_until_ns = 1 + lease_ms * std.time.ns_per_ms,
+            .attempts = @intCast(max_work_units),
+        };
+        errdefer {
+            if (work_claims[0].claim_key.len > 0) alloc.free(work_claims[0].claim_key);
+            if (work_claims[0].worker_id.len > 0) alloc.free(work_claims[0].worker_id);
+            if (work_claims[0].phase.len > 0) alloc.free(work_claims[0].phase);
+            if (work_claims[0].planned_action.len > 0) alloc.free(work_claims[0].planned_action);
+            if (work_claims[0].constraint_name) |value| alloc.free(value);
+            if (work_claims[0].lower_doc_key.len > 0) alloc.free(work_claims[0].lower_doc_key);
+            if (work_claims[0].upper_doc_key.len > 0) alloc.free(work_claims[0].upper_doc_key);
+        }
+        work_claims[0].worker_id = try alloc.dupe(u8, worker_id);
+
+        return .{
+            .action = action,
+            .valid = true,
+            .complete = job_id != null,
+            .violation_limit = violation_limit,
+            .violations_truncated = false,
+            .report = .{},
+            .groups = groups,
+            .work_claims = work_claims,
+            .violations = &.{},
+        };
+    }
+
+    fn uniqueConstraintIntegrityGroupLocal(
+        _: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        _: []const u8,
+        action: table_writes.UniqueConstraintIntegrityAction,
+        _: []const u8,
+        _: []const u8,
+    ) !?table_writes.UniqueConstraintIntegrityResult {
+        const groups = try alloc.alloc(table_writes.UniqueConstraintIntegrityGroupReport, 1);
+        groups[0] = .{ .group_id = group_id, .report = .{} };
+        return .{
+            .action = action,
+            .valid = true,
+            .complete = true,
+            .report = .{},
+            .groups = groups,
         };
     }
 };

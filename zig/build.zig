@@ -2996,7 +2996,9 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db ttl cleanup",
             "storage.db.db.test.db exposes local transaction lifecycle",
             "storage.db.db.test.db relational foreign keys",
+            "storage.db.db.test.db relational unique constraints enforce committed scalar values",
             "storage.db.db.test.db foreign key integrity progress is durable per range",
+            "storage.db.db.test.db unique constraint integrity repair rebuilds backing rows",
             "storage.db.db.test.db transaction unique constraint mutations enforce owner handoff",
             "storage.db.db.test.db transaction ",
             "storage.db.db.test.db foreign key ref children page by child cursor",
@@ -3238,6 +3240,8 @@ pub fn build(b: *std.Build) void {
         "metadata openapi module generates extractor surface for routed endpoints",
         "usermgr openapi module generates extractor surface for routed endpoints",
         "client openapi module resolves shared refs through owner modules",
+        "public api routes compile",
+        "internal group write routes expose unique integrity",
         "batch parser accepts Go transform op spelling",
         "public table contract exposes migration metadata",
         "api http client round-trips public table management routes",
@@ -3259,6 +3263,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves retrieval agent response envelope",
         "api http server serves table batch writes",
         "api http server exposes relational foreign key integrity repair",
+        "api http server exposes relational unique integrity repair",
         "auto bulk max-window session rolls without a following write",
         "auto bulk group writes release leases so idle finish can publish",
         "auto bulk max-window rolls publish all threshold aligned docs",
@@ -3289,6 +3294,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves table metadata routes against real metadata service",
         "api http server create table with replication sources returns encoded table detail",
         "api http server exposes relational foreign key integrity repair",
+        "api http server exposes relational unique integrity repair",
         "api http server lists cluster backups through public route",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
@@ -3577,9 +3583,9 @@ pub fn build(b: *std.Build) void {
             "distributed txn coordinator routes foreign key child writes through ref owners when configured",
             "distributed txn coordinator fails closed for transitional foreign key ref owner ranges",
             "distributed txn coordinator routes old and new foreign key refs with versioned child rows",
-            "distributed txn coordinator rejects unversioned multi-range unique writes without owner proof",
+            "distributed txn coordinator routes unique-touching transforms with row proofs",
             "distributed txn coordinator routes unique constraint writes through owner ranges",
-            "distributed txn coordinator routes versioned unique owner handoff",
+            "distributed txn coordinator routes unique owner handoff with row version proofs",
             "distributed txn coordinator allows non-unique transforms on multi-range unique tables",
             "distributed txn coordinator allows single-range unique writes to use local enforcement",
             "distributed txn coordinator rejects non-primary foreign key parent writes without unique owner topology",
@@ -3617,6 +3623,8 @@ pub fn build(b: *std.Build) void {
             "write cache reserves retirement slots when pruning multiple leased generations",
             "provisioned table write source coalesces same-group waiters",
             "provisioned table write coalescer isolates failed waiters",
+            "unique integrity owner topology inspection reports active and transitional ranges",
+            "foreign key integrity plan clips requested span to table ranges",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3678,6 +3686,9 @@ pub fn build(b: *std.Build) void {
 
     const api_transactions_test_step = b.step("api-transactions-test", "Run focused API transaction coordinator tests");
     api_transactions_test_step.dependOn(&run_api_transactions_docid_tests.step);
+
+    const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write DOCID tests");
+    api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
 
     const lib_docid_lifecycle_tests = b.addTest(.{
         .root_module = lib_test_mod,

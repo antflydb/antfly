@@ -80,6 +80,23 @@ pub const ForeignKeyIntegrityReport = struct {
     }
 };
 
+pub const UniqueConstraintIntegrityReport = struct {
+    scanned_rows: u64 = 0,
+    expected_unique_rows: u64 = 0,
+    scanned_unique_rows: u64 = 0,
+    missing_unique_rows: u64 = 0,
+    stale_unique_rows: u64 = 0,
+    duplicate_unique_rows: u64 = 0,
+    repaired_unique_rows: u64 = 0,
+    deleted_stale_unique_rows: u64 = 0,
+
+    pub fn valid(self: UniqueConstraintIntegrityReport) bool {
+        return self.missing_unique_rows == 0 and
+            self.stale_unique_rows == 0 and
+            self.duplicate_unique_rows == 0;
+    }
+};
+
 pub const ForeignKeyDeletePlanBlockReason = enum {
     none,
     restrict,
@@ -293,6 +310,7 @@ pub const WriteParticipant = struct {
         _ = txn_id;
         if (self.closed) return error.ParticipantClosed;
         if (try self.isRowDeletePlanned(doc_key)) return;
+        try appendDelete(self.alloc, self.store, self.deletes, self.owned_keys, doc_key);
         try self.prepareForeignKeyDelete(doc_key);
         try self.prepareUniqueConstraintDelete(doc_key);
         self.prepared = true;
@@ -454,7 +472,6 @@ pub const WriteParticipant = struct {
         if (self.foreign_keys.len == 0) return;
         const old_row = try getRawAlloc(self.alloc, self.store, doc_key) orelse return;
         defer self.alloc.free(old_row);
-        try appendDelete(self.alloc, self.store, self.deletes, self.owned_keys, doc_key);
         try self.applySetNullPrimaryKeyForeignKeyRefs(doc_key);
         for (self.unique_constraints) |constraint| {
             const value = (try uniqueConstraintTupleValueAlloc(self.alloc, old_row, constraint)) orelse continue;
@@ -1535,6 +1552,116 @@ pub fn rebuildUniqueConstraintRowsInRange(
     }
 
     if (writes.items.len > 0) try store.putBatch(writes.items, &.{});
+}
+
+pub fn reconcileUniqueConstraintRowsInRange(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    unique_constraints: []const schema_mod.UniqueConstraint,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+    mode: ForeignKeyIntegrityMode,
+) !UniqueConstraintIntegrityReport {
+    var report: UniqueConstraintIntegrityReport = .{};
+    if (unique_constraints.len == 0) return report;
+
+    const rows = try scanRowsAlloc(alloc, store, lower_doc_key, upper_doc_key);
+    defer freeRows(alloc, rows);
+
+    var expected = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer expected.deinit(alloc);
+    var duplicate_expected_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer duplicate_expected_keys.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    for (rows) |row| {
+        report.scanned_rows += 1;
+        for (unique_constraints) |constraint| {
+            const encoded_value = (try uniqueConstraintTupleValueAlloc(alloc, row.row_value, constraint)) orelse continue;
+            defer alloc.free(encoded_value);
+            const key = try internal_keys.relationalUniqueKeyAlloc(alloc, constraint.name, encoded_value);
+            var key_owned = true;
+            errdefer if (key_owned) alloc.free(key);
+            if (batchWriteValue(expected.items, key)) |existing_owner| {
+                if (!std.mem.eql(u8, existing_owner, row.doc_key)) {
+                    report.duplicate_unique_rows += 1;
+                    if (!containsKey(duplicate_expected_keys.items, key)) try duplicate_expected_keys.append(alloc, key);
+                }
+                alloc.free(key);
+                continue;
+            }
+            const owner = try alloc.dupe(u8, row.doc_key);
+            var owner_owned = true;
+            errdefer if (owner_owned) alloc.free(owner);
+            try owned_keys.append(alloc, key);
+            key_owned = false;
+            try owned_values.append(alloc, owner);
+            owner_owned = false;
+            try expected.append(alloc, .{ .key = key, .value = owner });
+            report.expected_unique_rows += 1;
+        }
+    }
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+
+    for (expected.items) |entry| {
+        const committed_owner = store.get(alloc, entry.key) catch |err| switch (err) {
+            error.NotFound => {
+                report.missing_unique_rows += 1;
+                if (mode == .repair or mode == .dry_run) {
+                    report.repaired_unique_rows += 1;
+                    if (mode == .repair) try writes.append(alloc, entry);
+                }
+                continue;
+            },
+            else => return err,
+        };
+        defer alloc.free(committed_owner);
+        if (std.mem.eql(u8, committed_owner, entry.value)) continue;
+        report.stale_unique_rows += 1;
+        if (!containsKey(duplicate_expected_keys.items, entry.key) and (mode == .repair or mode == .dry_run)) {
+            report.repaired_unique_rows += 1;
+            if (mode == .repair) try writes.append(alloc, entry);
+        }
+    }
+
+    const lower = [_]u8{internal_keys.relational_unique_namespace};
+    const upper = [_]u8{internal_keys.relational_unique_namespace + 1};
+    const scanned_unique = try store.scanRange(alloc, lower[0..], upper[0..]);
+    defer docstore_mod.DocStore.freeResults(alloc, scanned_unique);
+    for (scanned_unique) |entry| {
+        const constraint_name = (try decodeRelationalUniqueConstraintNameAlloc(alloc, entry.key)) orelse continue;
+        defer alloc.free(constraint_name);
+        if (!uniqueConstraintNameInCatalog(unique_constraints, constraint_name)) continue;
+        report.scanned_unique_rows += 1;
+        if (batchWriteValue(expected.items, entry.key)) |expected_owner| {
+            if (std.mem.eql(u8, expected_owner, entry.value)) continue;
+            if (containsKey(duplicate_expected_keys.items, entry.key)) continue;
+            continue;
+        }
+        report.stale_unique_rows += 1;
+        if (mode == .repair or mode == .dry_run) {
+            report.deleted_stale_unique_rows += 1;
+            if (mode == .repair) try deletes.append(alloc, entry.key);
+        }
+    }
+
+    if (mode == .repair and (writes.items.len > 0 or deletes.items.len > 0)) {
+        try store.putBatch(writes.items, deletes.items);
+    }
+    return report;
 }
 
 pub fn deleteUniqueConstraintRows(

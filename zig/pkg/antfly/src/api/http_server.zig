@@ -3104,6 +3104,11 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST) {
+            if (routes.Routes.matchTableUniqueIntegrity(uri_parts.path)) |unique_integrity| {
+                return try self.handlePublicTableUniqueIntegrity(unique_integrity.table_name, req.body);
+            }
+        }
+        if (req.method == .POST) {
             if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
                 return try self.handlePublicTableCreateIndex(table_index.table_name, table_index.index_name, req.body);
             }
@@ -5581,10 +5586,15 @@ pub const ApiHttpServer = struct {
         lower_doc_key: ?[]const u8 = null,
         upper_doc_key: ?[]const u8 = null,
         violation_limit: ?usize = null,
+        job_id: ?[]const u8 = null,
+        worker_id: ?[]const u8 = null,
+        lease_ms: ?u64 = null,
+        max_work_units: ?usize = null,
     };
 
     fn parseForeignKeyIntegrityAction(value: ?[]const u8) !table_writes.ForeignKeyIntegrityAction {
         const text = value orelse "validate";
+        if (std.mem.eql(u8, text, "plan")) return .plan;
         if (std.mem.eql(u8, text, "validate")) return .validate;
         if (std.mem.eql(u8, text, "dry_run")) return .dry_run;
         if (std.mem.eql(u8, text, "repair")) return .repair;
@@ -5592,6 +5602,21 @@ pub const ApiHttpServer = struct {
         if (std.mem.eql(u8, text, "explain_delete")) return .explain_delete;
         if (std.mem.eql(u8, text, "progress")) return .progress;
         return error.InvalidForeignKeyIntegrityRequest;
+    }
+
+    const UniqueIntegrityRequest = struct {
+        action: ?[]const u8 = null,
+        lower_doc_key: ?[]const u8 = null,
+        upper_doc_key: ?[]const u8 = null,
+    };
+
+    fn parseUniqueIntegrityAction(value: ?[]const u8) !table_writes.UniqueConstraintIntegrityAction {
+        const text = value orelse "validate";
+        if (std.mem.eql(u8, text, "validate")) return .validate;
+        if (std.mem.eql(u8, text, "dry_run")) return .dry_run;
+        if (std.mem.eql(u8, text, "repair")) return .repair;
+        if (std.mem.eql(u8, text, "progress")) return .progress;
+        return error.InvalidUniqueIntegrityRequest;
     }
 
     pub fn handlePublicTableForeignKeyIntegrity(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -5613,6 +5638,35 @@ pub const ApiHttpServer = struct {
         }
         const lower_doc_key = if (action == .explain_delete) parsed.value.doc_key.? else parsed.value.lower_doc_key orelse "";
         const upper_doc_key = if (action == .explain_delete) "" else parsed.value.upper_doc_key orelse "";
+        if (parsed.value.worker_id) |worker_id| {
+            if (worker_id.len == 0) return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            if (parsed.value.job_id) |job_id| {
+                if (job_id.len == 0) return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            }
+            var result = (source.foreignKeyIntegrityWorkerPass(
+                self.alloc,
+                table_name,
+                action,
+                parsed.value.job_id,
+                worker_id,
+                parsed.value.lease_ms orelse 60_000,
+                @max(1, parsed.value.max_work_units orelse 1),
+                parsed.value.constraint_name,
+                lower_doc_key,
+                upper_doc_key,
+                violation_limit,
+            ) catch |err| switch (err) {
+                error.InvalidForeignKeyIntegrityRequest => return try textResponse(self.alloc, 400, "invalid foreign key integrity request"),
+                error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+                error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.ForeignKeyNotFound => return try textResponse(self.alloc, 404, "foreign key not found"),
+                error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                error.ReadOnly => return try textResponse(self.alloc, 405, "method not allowed"),
+                else => return err,
+            }) orelse return try textResponse(self.alloc, 404, "not found");
+            defer result.deinit(self.alloc);
+            return try jsonResponse(self.alloc, result);
+        }
         var result = (source.foreignKeyIntegrity(
             self.alloc,
             table_name,
@@ -5625,6 +5679,36 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ForeignKeyNotFound => return try textResponse(self.alloc, 404, "foreign key not found"),
+            error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+            error.ReadOnly => return try textResponse(self.alloc, 405, "method not allowed"),
+            else => return err,
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        return try jsonResponse(self.alloc, result);
+    }
+
+    pub fn handlePublicTableUniqueIntegrity(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(
+            UniqueIntegrityRequest,
+            self.alloc,
+            if (body.len == 0) "{}" else body,
+            .{ .ignore_unknown_fields = true },
+        ) catch return try textResponse(self.alloc, 400, "invalid unique integrity request");
+        defer parsed.deinit();
+
+        const action = parseUniqueIntegrityAction(parsed.value.action) catch {
+            return try textResponse(self.alloc, 400, "invalid unique integrity request");
+        };
+        var result = (source.uniqueConstraintIntegrity(
+            self.alloc,
+            table_name,
+            action,
+            parsed.value.lower_doc_key orelse "",
+            parsed.value.upper_doc_key orelse "",
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
             error.ReadOnly => return try textResponse(self.alloc, 405, "method not allowed"),
             else => return err,
@@ -6014,6 +6098,11 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
     if (routes.Routes.matchTableForeignKeyIntegrity(path)) |fk_integrity| return .{
         .resource_type = .table,
         .resource = fk_integrity.table_name,
+        .permission_type = .admin,
+    };
+    if (routes.Routes.matchTableUniqueIntegrity(path)) |unique_integrity| return .{
+        .resource_type = .table,
+        .resource = unique_integrity.table_name,
         .permission_type = .admin,
     };
     if (tableNameForGraphPath(path)) |table_name| return .{
@@ -10291,6 +10380,7 @@ test "api http server exposes relational foreign key integrity repair" {
 
     const IntegrityResponse = struct {
         valid: bool,
+        complete: bool = true,
         report: struct {
             missing_ref_rows: u64,
             repaired_ref_rows: u64,
@@ -10308,6 +10398,39 @@ test "api http server exposes relational foreign key integrity repair" {
                 repaired_ref_rows: u64,
             },
         },
+        work_units: []const struct {
+            group_id: u64,
+            phase: []const u8,
+            planned_action: []const u8,
+            constraint_name: ?[]const u8 = null,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+        } = &.{},
+        work_statuses: []const struct {
+            group_id: u64,
+            phase: []const u8,
+            planned_action: []const u8,
+            constraint_name: ?[]const u8 = null,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+            claim_key: []const u8,
+            state: []const u8,
+            claim_worker_id: ?[]const u8 = null,
+            claim_lease_until_ns: ?u64 = null,
+            progress_updated_at_ns: ?u64 = null,
+        } = &.{},
+        work_claims: []const struct {
+            group_id: u64,
+            claim_key: []const u8,
+            worker_id: []const u8,
+            phase: []const u8,
+            planned_action: []const u8,
+            constraint_name: ?[]const u8 = null,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+            lease_until_ns: u64,
+            attempts: u32,
+        } = &.{},
         violations: []const struct {
             kind: []const u8,
             constraint_name: []const u8,
@@ -10328,6 +10451,97 @@ test "api http server exposes relational foreign key integrity repair" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, table_source.source());
+    var plan_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"plan\",\"constraint_name\":\"orders_customer_id_fkey\"}",
+    });
+    defer plan_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), plan_resp.status);
+    var plan_body = try std.json.parseFromSlice(IntegrityResponse, alloc, plan_resp.body, .{ .ignore_unknown_fields = true });
+    defer plan_body.deinit();
+    try std.testing.expect(plan_body.value.valid);
+    try std.testing.expectEqual(@as(u64, 0), plan_body.value.report.missing_ref_rows);
+    try std.testing.expectEqual(@as(usize, 0), plan_body.value.progress.len);
+    try std.testing.expectEqual(@as(usize, 1), plan_body.value.work_units.len);
+    try std.testing.expectEqual(@as(u64, 0), plan_body.value.work_units[0].group_id);
+    try std.testing.expectEqualStrings("child_range", plan_body.value.work_units[0].phase);
+    try std.testing.expectEqualStrings("validate", plan_body.value.work_units[0].planned_action);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", plan_body.value.work_units[0].constraint_name.?);
+    try std.testing.expectEqualStrings("", plan_body.value.work_units[0].lower_doc_key);
+    try std.testing.expectEqualStrings("", plan_body.value.work_units[0].upper_doc_key);
+    try std.testing.expectEqual(@as(usize, 1), plan_body.value.work_statuses.len);
+    try std.testing.expectEqual(@as(u64, 0), plan_body.value.work_statuses[0].group_id);
+    try std.testing.expectEqualStrings("validate", plan_body.value.work_statuses[0].planned_action);
+    try std.testing.expectEqualStrings("planned", plan_body.value.work_statuses[0].state);
+    try std.testing.expect(plan_body.value.work_statuses[0].claim_key.len > 0);
+    try std.testing.expect(plan_body.value.work_statuses[0].progress_updated_at_ns == null);
+
+    const claim = try db.claimForeignKeyIntegrityWorkUnitAt(
+        plan_body.value.work_statuses[0].claim_key,
+        "worker:http-test",
+        0,
+        "child_range",
+        "validate",
+        "orders_customer_id_fkey",
+        "",
+        "",
+        60_000,
+        100,
+    );
+    defer db.freeForeignKeyIntegrityClaimRecord(claim);
+
+    var claimed_plan_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"plan\",\"constraint_name\":\"orders_customer_id_fkey\"}",
+    });
+    defer claimed_plan_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), claimed_plan_resp.status);
+    var claimed_plan_body = try std.json.parseFromSlice(IntegrityResponse, alloc, claimed_plan_resp.body, .{ .ignore_unknown_fields = true });
+    defer claimed_plan_body.deinit();
+    try std.testing.expectEqual(@as(usize, 1), claimed_plan_body.value.work_claims.len);
+    try std.testing.expectEqualStrings("worker:http-test", claimed_plan_body.value.work_claims[0].worker_id);
+    try std.testing.expectEqual(@as(usize, 1), claimed_plan_body.value.work_statuses.len);
+    try std.testing.expectEqualStrings("claimed", claimed_plan_body.value.work_statuses[0].state);
+    try std.testing.expectEqualStrings("worker:http-test", claimed_plan_body.value.work_statuses[0].claim_worker_id.?);
+    try std.testing.expect(claimed_plan_body.value.work_statuses[0].claim_lease_until_ns != null);
+
+    var worker_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"validate\",\"constraint_name\":\"orders_account_id_fkey\",\"job_id\":\"job:http-fk-integrity\",\"worker_id\":\"worker:http-scheduler\",\"lease_ms\":60000,\"max_work_units\":1}",
+    });
+    defer worker_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), worker_resp.status);
+    var worker_body = try std.json.parseFromSlice(IntegrityResponse, alloc, worker_resp.body, .{ .ignore_unknown_fields = true });
+    defer worker_body.deinit();
+    try std.testing.expect(worker_body.value.valid);
+    try std.testing.expect(worker_body.value.complete);
+    try std.testing.expectEqual(@as(usize, 1), worker_body.value.work_units.len);
+    try std.testing.expectEqualStrings("orders_account_id_fkey", worker_body.value.work_units[0].constraint_name.?);
+    var saw_scheduler_claim = false;
+    for (worker_body.value.work_claims) |work_claim| {
+        if (std.mem.eql(u8, work_claim.worker_id, "worker:http-scheduler")) saw_scheduler_claim = true;
+    }
+    try std.testing.expect(saw_scheduler_claim);
+    try std.testing.expectEqual(@as(usize, 1), worker_body.value.work_statuses.len);
+    try std.testing.expectEqualStrings("complete", worker_body.value.work_statuses[0].state);
+    try std.testing.expectEqualStrings("worker:http-scheduler", worker_body.value.work_statuses[0].claim_worker_id.?);
+    const worker_job = (try db.loadForeignKeyIntegrityJobRecord("job:http-fk-integrity")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityJobRecord(worker_job);
+    try std.testing.expectEqualStrings("docs", worker_job.table_name);
+    try std.testing.expectEqualStrings("validate", worker_job.action);
+    try std.testing.expectEqualStrings("worker:http-scheduler", worker_job.worker_id);
+    try std.testing.expectEqualStrings("orders_account_id_fkey", worker_job.constraint_name.?);
+    try std.testing.expectEqualStrings("complete", worker_job.status);
+    try std.testing.expect(worker_job.completed);
+    try std.testing.expect(worker_job.valid.?);
+    try std.testing.expectEqual(@as(usize, 1), worker_job.max_work_units);
+
     var validate_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/docs/foreign-key-integrity",
@@ -10349,6 +10563,11 @@ test "api http server exposes relational foreign key integrity repair" {
     try std.testing.expect(validate_body.value.progress[0].completed);
     try std.testing.expect(!validate_body.value.progress[0].valid);
     try std.testing.expectEqual(@as(u64, 1), validate_body.value.progress[0].report.missing_ref_rows);
+    try std.testing.expectEqual(@as(usize, 1), validate_body.value.work_units.len);
+    try std.testing.expectEqualStrings("validate", validate_body.value.work_units[0].planned_action);
+    try std.testing.expectEqual(@as(usize, 1), validate_body.value.work_statuses.len);
+    try std.testing.expectEqualStrings("invalid", validate_body.value.work_statuses[0].state);
+    try std.testing.expect(validate_body.value.work_statuses[0].progress_updated_at_ns != null);
     try std.testing.expectEqual(@as(usize, 1), validate_body.value.violations.len);
     try std.testing.expectEqualStrings("missing_ref", validate_body.value.violations[0].kind);
     try std.testing.expectEqualStrings("orders_customer_id_fkey", validate_body.value.violations[0].constraint_name);
@@ -10423,6 +10642,10 @@ test "api http server exposes relational foreign key integrity repair" {
     try std.testing.expectEqualStrings("dry_run", dry_run_body.value.progress[0].mode);
     try std.testing.expectEqualStrings("orders_customer_id_fkey", dry_run_body.value.progress[0].constraint_name.?);
     try std.testing.expectEqual(@as(u64, 1), dry_run_body.value.progress[0].report.repaired_ref_rows);
+    try std.testing.expectEqual(@as(usize, 1), dry_run_body.value.work_units.len);
+    try std.testing.expectEqualStrings("dry_run", dry_run_body.value.work_units[0].planned_action);
+    try std.testing.expectEqual(@as(usize, 1), dry_run_body.value.work_statuses.len);
+    try std.testing.expectEqualStrings("invalid", dry_run_body.value.work_statuses[0].state);
     try std.testing.expectEqual(@as(usize, 1), dry_run_body.value.violations.len);
 
     var after_dry_run_resp = try server.handle(.{
@@ -10483,6 +10706,211 @@ test "api http server exposes relational foreign key integrity repair" {
     try std.testing.expect(saw_validate_account);
     try std.testing.expect(saw_dry_run_customer);
     try std.testing.expect(saw_repair_customer);
+}
+
+test "api http server exposes relational unique integrity repair" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-http-unique-integrity";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+    try db.applyTableSchemaJson(
+        alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+    ,
+        .{},
+    );
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:ada", .value = "{\"id\":\"user:ada\",\"email\":\"ada@example.test\"}" },
+            .{ .key = "user:grace", .value = "{\"id\":\"user:grace\",\"email\":\"grace@example.test\"}" },
+            .{ .key = "user:stale", .value = "{\"id\":\"user:stale\",\"email\":\"stale@example.test\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const runtime_schema = db.core.schema orelse return error.TestUnexpectedResult;
+    const unique_constraint = runtime_schema.unique_constraints[0];
+    const ada_row = (try db_mod.relational_store.getRawAlloc(alloc, db.core.store, "user:ada")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ada_row);
+    const grace_row = (try db_mod.relational_store.getRawAlloc(alloc, db.core.store, "user:grace")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(grace_row);
+    const stale_row = (try db_mod.relational_store.getRawAlloc(alloc, db.core.store, "user:stale")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(stale_row);
+    const ada_value = (try db_mod.relational_store.uniqueConstraintTupleValueAlloc(alloc, ada_row, unique_constraint)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ada_value);
+    const grace_value = (try db_mod.relational_store.uniqueConstraintTupleValueAlloc(alloc, grace_row, unique_constraint)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(grace_value);
+    const stale_value = (try db_mod.relational_store.uniqueConstraintTupleValueAlloc(alloc, stale_row, unique_constraint)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(stale_value);
+    const ada_key = try db_mod.internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", ada_value);
+    defer alloc.free(ada_key);
+    const grace_key = try db_mod.internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", grace_value);
+    defer alloc.free(grace_key);
+    const stale_key = try db_mod.internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", stale_value);
+    defer alloc.free(stale_key);
+    try db.batch(.{ .deletes = &.{"user:stale"}, .sync_level = .write });
+    try db.core.store.putBatch(&.{
+        .{ .key = grace_key, .value = "user:wrong" },
+        .{ .key = stale_key, .value = "user:ghost" },
+    }, &.{ada_key});
+
+    var table_source = table_writes.BoundTableWriteSource.init("docs", &db);
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const UniqueIntegrityResponse = struct {
+        valid: bool,
+        complete: bool,
+        report: struct {
+            scanned_rows: u64,
+            expected_unique_rows: u64,
+            scanned_unique_rows: u64,
+            missing_unique_rows: u64,
+            stale_unique_rows: u64,
+            repaired_unique_rows: u64,
+            deleted_stale_unique_rows: u64,
+        },
+        groups: []const struct {
+            group_id: u64,
+            report: struct {
+                repaired_unique_rows: u64,
+            },
+        },
+        progress: []const struct {
+            group_id: u64,
+            mode: []const u8,
+            valid: bool,
+            report: struct {
+                repaired_unique_rows: u64,
+                scanned_unique_rows: u64,
+            },
+        } = &.{},
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, table_source.source());
+    var validate_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/unique-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"validate\"}",
+    });
+    defer validate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), validate_resp.status);
+    var validate_body = try std.json.parseFromSlice(UniqueIntegrityResponse, alloc, validate_resp.body, .{ .ignore_unknown_fields = true });
+    defer validate_body.deinit();
+    try std.testing.expect(!validate_body.value.valid);
+    try std.testing.expect(validate_body.value.complete);
+    try std.testing.expectEqual(@as(u64, 2), validate_body.value.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 2), validate_body.value.report.expected_unique_rows);
+    try std.testing.expectEqual(@as(u64, 1), validate_body.value.report.missing_unique_rows);
+    try std.testing.expectEqual(@as(u64, 2), validate_body.value.report.stale_unique_rows);
+
+    var dry_run_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/unique-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"dry_run\"}",
+    });
+    defer dry_run_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), dry_run_resp.status);
+    var dry_run_body = try std.json.parseFromSlice(UniqueIntegrityResponse, alloc, dry_run_resp.body, .{ .ignore_unknown_fields = true });
+    defer dry_run_body.deinit();
+    try std.testing.expect(!dry_run_body.value.valid);
+    try std.testing.expectEqual(@as(u64, 2), dry_run_body.value.report.repaired_unique_rows);
+    try std.testing.expectEqual(@as(u64, 1), dry_run_body.value.report.deleted_stale_unique_rows);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, ada_key));
+
+    var repair_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/unique-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"repair\"}",
+    });
+    defer repair_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), repair_resp.status);
+    var repair_body = try std.json.parseFromSlice(UniqueIntegrityResponse, alloc, repair_resp.body, .{ .ignore_unknown_fields = true });
+    defer repair_body.deinit();
+    try std.testing.expect(!repair_body.value.valid);
+    try std.testing.expectEqual(@as(usize, 1), repair_body.value.groups.len);
+    try std.testing.expectEqual(@as(u64, 0), repair_body.value.groups[0].group_id);
+    try std.testing.expectEqual(@as(u64, 2), repair_body.value.groups[0].report.repaired_unique_rows);
+
+    var after_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/unique-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"validate\"}",
+    });
+    defer after_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), after_resp.status);
+    var after_body = try std.json.parseFromSlice(UniqueIntegrityResponse, alloc, after_resp.body, .{ .ignore_unknown_fields = true });
+    defer after_body.deinit();
+    try std.testing.expect(after_body.value.valid);
+    try std.testing.expectEqual(@as(u64, 2), after_body.value.report.scanned_unique_rows);
+    const ada_owner = try db.core.store.get(alloc, ada_key);
+    defer alloc.free(ada_owner);
+    try std.testing.expectEqualStrings("user:ada", ada_owner);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
+
+    var progress_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/unique-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"progress\"}",
+    });
+    defer progress_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), progress_resp.status);
+    var progress_body = try std.json.parseFromSlice(UniqueIntegrityResponse, alloc, progress_resp.body, .{ .ignore_unknown_fields = true });
+    defer progress_body.deinit();
+    try std.testing.expectEqual(@as(usize, 3), progress_body.value.progress.len);
+    var saw_validate = false;
+    var saw_dry_run = false;
+    var saw_repair = false;
+    for (progress_body.value.progress) |entry| {
+        try std.testing.expectEqual(@as(u64, 0), entry.group_id);
+        if (std.mem.eql(u8, entry.mode, "validate")) {
+            saw_validate = true;
+            try std.testing.expect(entry.valid);
+            try std.testing.expectEqual(@as(u64, 2), entry.report.scanned_unique_rows);
+        }
+        if (std.mem.eql(u8, entry.mode, "dry_run")) {
+            saw_dry_run = true;
+            try std.testing.expect(!entry.valid);
+            try std.testing.expectEqual(@as(u64, 2), entry.report.repaired_unique_rows);
+        }
+        if (std.mem.eql(u8, entry.mode, "repair")) {
+            saw_repair = true;
+            try std.testing.expect(entry.valid);
+            try std.testing.expectEqual(@as(u64, 2), entry.report.repaired_unique_rows);
+        }
+    }
+    try std.testing.expect(saw_validate);
+    try std.testing.expect(saw_dry_run);
+    try std.testing.expect(saw_repair);
+
+    var invalid_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/unique-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"bogus\"}",
+    });
+    defer invalid_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+    try std.testing.expectEqualStrings("invalid unique integrity request", invalid_resp.body);
 }
 
 test "api http server serves table batch transforms" {

@@ -200,8 +200,12 @@ pub const OpenMode = OpenOptions.OpenMode;
 pub const ForeignKeyIntegrityReport = relational_store_mod.ForeignKeyIntegrityReport;
 pub const ForeignKeyIntegrityViolation = relational_store_mod.ForeignKeyIntegrityViolation;
 pub const ForeignKeyDeletePlan = relational_store_mod.ForeignKeyDeletePlan;
+pub const UniqueConstraintIntegrityReport = relational_store_mod.UniqueConstraintIntegrityReport;
 pub const local_schema_json_key = "\x00\x00__metadata__:schema_json";
 const foreign_key_integrity_progress_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_progress";
+const foreign_key_integrity_claim_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_claim";
+const foreign_key_integrity_job_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_job";
+const unique_constraint_integrity_progress_key_prefix = "\x00\x00__metadata__:unique_constraint_integrity_progress";
 const foreign_key_parent_checks_externalized_intent_key_prefix = "\x00\x00__metadata__:txn_fk_parent_checks_externalized:";
 pub const ReplayProgress = struct {
     sequence: u64 = 0,
@@ -5719,6 +5723,37 @@ pub const DB = struct {
         return try self.reconcileForeignKeyRefsInRangeLocked(constraint_name, lower_doc_key, upper_doc_key, .dry_run);
     }
 
+    pub fn validateUniqueConstraintRowsInRange(
+        self: *DB,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !UniqueConstraintIntegrityReport {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.reconcileUniqueConstraintRowsInRangeLocked(lower_doc_key, upper_doc_key, .validate);
+    }
+
+    pub fn dryRunRepairUniqueConstraintRowsInRange(
+        self: *DB,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !UniqueConstraintIntegrityReport {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.reconcileUniqueConstraintRowsInRangeLocked(lower_doc_key, upper_doc_key, .dry_run);
+    }
+
+    pub fn repairUniqueConstraintRowsInRange(
+        self: *DB,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !UniqueConstraintIntegrityReport {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.reconcileUniqueConstraintRowsInRangeLocked(lower_doc_key, upper_doc_key, .repair);
+    }
+
     pub fn validateForeignKeyRefOwnerForParent(
         self: *DB,
         constraint_name: []const u8,
@@ -5958,6 +5993,26 @@ pub const DB = struct {
             mode,
         );
         try self.recordForeignKeyIntegrityProgressLocked(self.alloc, mode, constraint_name, lower_doc_key, upper_doc_key, report);
+        return report;
+    }
+
+    fn reconcileUniqueConstraintRowsInRangeLocked(
+        self: *DB,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+    ) !UniqueConstraintIntegrityReport {
+        const runtime_schema = self.core.schema orelse return .{};
+        if (runtime_schema.storage_mode != .relational or runtime_schema.unique_constraints.len == 0) return .{};
+        const report = try relational_store_mod.reconcileUniqueConstraintRowsInRange(
+            self.alloc,
+            self.core.store,
+            runtime_schema.unique_constraints,
+            lower_doc_key,
+            upper_doc_key,
+            mode,
+        );
+        try self.recordUniqueConstraintIntegrityProgressLocked(self.alloc, mode, lower_doc_key, upper_doc_key, report);
         return report;
     }
 
@@ -10067,6 +10122,94 @@ pub const DB = struct {
         if (records.len > 0) self.alloc.free(records);
     }
 
+    pub const ForeignKeyIntegrityClaimRecord = struct {
+        version: u32 = 1,
+        claim_key: []const u8,
+        worker_id: []const u8,
+        group_id: u64,
+        phase: []const u8,
+        planned_action: []const u8,
+        constraint_name: ?[]const u8 = null,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        claimed_at_ns: u64,
+        lease_until_ns: u64,
+        attempts: u32 = 1,
+    };
+
+    pub fn freeForeignKeyIntegrityClaimRecord(self: *DB, record: ForeignKeyIntegrityClaimRecord) void {
+        if (record.claim_key.len > 0) self.alloc.free(record.claim_key);
+        if (record.worker_id.len > 0) self.alloc.free(record.worker_id);
+        if (record.phase.len > 0) self.alloc.free(record.phase);
+        if (record.planned_action.len > 0) self.alloc.free(record.planned_action);
+        if (record.constraint_name) |value| self.alloc.free(value);
+        if (record.lower_doc_key.len > 0) self.alloc.free(record.lower_doc_key);
+        if (record.upper_doc_key.len > 0) self.alloc.free(record.upper_doc_key);
+    }
+
+    pub fn freeForeignKeyIntegrityClaimRecords(self: *DB, records: []ForeignKeyIntegrityClaimRecord) void {
+        for (records) |record| self.freeForeignKeyIntegrityClaimRecord(record);
+        if (records.len > 0) self.alloc.free(records);
+    }
+
+    pub const ForeignKeyIntegrityJobRecord = struct {
+        version: u32 = 1,
+        job_id: []const u8,
+        table_name: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: ?[]const u8 = null,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+        status: []const u8,
+        created_at_ns: u64,
+        updated_at_ns: u64,
+        attempts: u32 = 0,
+        completed: bool = false,
+        valid: ?bool = null,
+        last_report: relational_store_mod.ForeignKeyIntegrityReport = .{},
+    };
+
+    pub fn freeForeignKeyIntegrityJobRecord(self: *DB, record: ForeignKeyIntegrityJobRecord) void {
+        if (record.job_id.len > 0) self.alloc.free(record.job_id);
+        if (record.table_name.len > 0) self.alloc.free(record.table_name);
+        if (record.action.len > 0) self.alloc.free(record.action);
+        if (record.worker_id.len > 0) self.alloc.free(record.worker_id);
+        if (record.constraint_name) |value| self.alloc.free(value);
+        if (record.lower_doc_key.len > 0) self.alloc.free(record.lower_doc_key);
+        if (record.upper_doc_key.len > 0) self.alloc.free(record.upper_doc_key);
+        if (record.status.len > 0) self.alloc.free(record.status);
+    }
+
+    pub fn freeForeignKeyIntegrityJobRecords(self: *DB, records: []ForeignKeyIntegrityJobRecord) void {
+        for (records) |record| self.freeForeignKeyIntegrityJobRecord(record);
+        if (records.len > 0) self.alloc.free(records);
+    }
+
+    pub const UniqueConstraintIntegrityProgressRecord = struct {
+        version: u32 = 1,
+        mode: []const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        completed: bool = true,
+        valid: bool,
+        updated_at_ns: u64,
+        report: relational_store_mod.UniqueConstraintIntegrityReport,
+    };
+
+    pub fn freeUniqueConstraintIntegrityProgressRecord(self: *DB, record: UniqueConstraintIntegrityProgressRecord) void {
+        if (record.mode.len > 0) self.alloc.free(record.mode);
+        if (record.lower_doc_key.len > 0) self.alloc.free(record.lower_doc_key);
+        if (record.upper_doc_key.len > 0) self.alloc.free(record.upper_doc_key);
+    }
+
+    pub fn freeUniqueConstraintIntegrityProgressRecords(self: *DB, records: []UniqueConstraintIntegrityProgressRecord) void {
+        for (records) |record| self.freeUniqueConstraintIntegrityProgressRecord(record);
+        if (records.len > 0) self.alloc.free(records);
+    }
+
     pub fn listForeignKeyIntegrityProgressRecords(self: *DB) ![]ForeignKeyIntegrityProgressRecord {
         lockApply(self);
         defer self.core.unlockApply();
@@ -10102,6 +10245,90 @@ pub const DB = struct {
             errdefer self.freeForeignKeyIntegrityProgressRecord(cloned);
             cloned.mode = try self.alloc.dupe(u8, parsed.value.mode);
             if (parsed.value.constraint_name) |value| cloned.constraint_name = try self.alloc.dupe(u8, value);
+            cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
+            cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
+            try out.append(self.alloc, cloned);
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn listForeignKeyIntegrityClaimRecords(self: *DB) ![]ForeignKeyIntegrityClaimRecord {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const upper = try metadataPrefixUpperAlloc(self.alloc, foreign_key_integrity_claim_key_prefix);
+        defer if (upper) |buf| self.alloc.free(buf);
+        const scanned = try self.core.store.scanRange(self.alloc, foreign_key_integrity_claim_key_prefix, if (upper) |buf| buf else "");
+        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+        var out = std.ArrayListUnmanaged(ForeignKeyIntegrityClaimRecord).empty;
+        errdefer {
+            for (out.items) |record| self.freeForeignKeyIntegrityClaimRecord(record);
+            out.deinit(self.alloc);
+        }
+        for (scanned) |entry| {
+            const cloned = try self.cloneForeignKeyIntegrityClaimRecordFromJson(entry.value);
+            errdefer self.freeForeignKeyIntegrityClaimRecord(cloned);
+            try out.append(self.alloc, cloned);
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn listForeignKeyIntegrityJobRecords(self: *DB) ![]ForeignKeyIntegrityJobRecord {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const upper = try metadataPrefixUpperAlloc(self.alloc, foreign_key_integrity_job_key_prefix);
+        defer if (upper) |buf| self.alloc.free(buf);
+        const scanned = try self.core.store.scanRange(self.alloc, foreign_key_integrity_job_key_prefix, if (upper) |buf| buf else "");
+        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+        var out = std.ArrayListUnmanaged(ForeignKeyIntegrityJobRecord).empty;
+        errdefer {
+            for (out.items) |record| self.freeForeignKeyIntegrityJobRecord(record);
+            out.deinit(self.alloc);
+        }
+        for (scanned) |entry| {
+            const cloned = try self.cloneForeignKeyIntegrityJobRecordFromJson(entry.value);
+            errdefer self.freeForeignKeyIntegrityJobRecord(cloned);
+            try out.append(self.alloc, cloned);
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn listUniqueConstraintIntegrityProgressRecords(self: *DB) ![]UniqueConstraintIntegrityProgressRecord {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const upper = try metadataPrefixUpperAlloc(self.alloc, unique_constraint_integrity_progress_key_prefix);
+        defer if (upper) |buf| self.alloc.free(buf);
+        const scanned = try self.core.store.scanRange(self.alloc, unique_constraint_integrity_progress_key_prefix, if (upper) |buf| buf else "");
+        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+        var out = std.ArrayListUnmanaged(UniqueConstraintIntegrityProgressRecord).empty;
+        errdefer {
+            for (out.items) |record| self.freeUniqueConstraintIntegrityProgressRecord(record);
+            out.deinit(self.alloc);
+        }
+        for (scanned) |entry| {
+            var parsed = try std.json.parseFromSlice(UniqueConstraintIntegrityProgressRecord, self.alloc, entry.value, .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            });
+            defer parsed.deinit();
+
+            var cloned = UniqueConstraintIntegrityProgressRecord{
+                .version = parsed.value.version,
+                .mode = &.{},
+                .lower_doc_key = &.{},
+                .upper_doc_key = &.{},
+                .completed = parsed.value.completed,
+                .valid = parsed.value.valid,
+                .updated_at_ns = parsed.value.updated_at_ns,
+                .report = parsed.value.report,
+            };
+            errdefer self.freeUniqueConstraintIntegrityProgressRecord(cloned);
+            cloned.mode = try self.alloc.dupe(u8, parsed.value.mode);
             cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
             cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
             try out.append(self.alloc, cloned);
@@ -10152,6 +10379,80 @@ pub const DB = struct {
         return cloned;
     }
 
+    pub fn loadForeignKeyIntegrityClaimRecord(
+        self: *DB,
+        claim_key: []const u8,
+    ) !?ForeignKeyIntegrityClaimRecord {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyIntegrityClaimKeyAlloc(self.alloc, claim_key);
+        defer self.alloc.free(key);
+        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        return try self.cloneForeignKeyIntegrityClaimRecordFromJson(raw);
+    }
+
+    pub fn loadForeignKeyIntegrityJobRecord(
+        self: *DB,
+        job_id: []const u8,
+    ) !?ForeignKeyIntegrityJobRecord {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyIntegrityJobKeyAlloc(self.alloc, job_id);
+        defer self.alloc.free(key);
+        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        return try self.cloneForeignKeyIntegrityJobRecordFromJson(raw);
+    }
+
+    pub fn loadUniqueConstraintIntegrityProgressRecord(
+        self: *DB,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !?UniqueConstraintIntegrityProgressRecord {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try uniqueConstraintIntegrityProgressKeyAlloc(self.alloc, mode, lower_doc_key, upper_doc_key);
+        defer self.alloc.free(key);
+        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+
+        var parsed = try std.json.parseFromSlice(UniqueConstraintIntegrityProgressRecord, self.alloc, raw, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        var cloned = UniqueConstraintIntegrityProgressRecord{
+            .version = parsed.value.version,
+            .mode = &.{},
+            .lower_doc_key = &.{},
+            .upper_doc_key = &.{},
+            .completed = parsed.value.completed,
+            .valid = parsed.value.valid,
+            .updated_at_ns = parsed.value.updated_at_ns,
+            .report = parsed.value.report,
+        };
+        errdefer self.freeUniqueConstraintIntegrityProgressRecord(cloned);
+        cloned.mode = try self.alloc.dupe(u8, parsed.value.mode);
+        cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
+        cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
+        return cloned;
+    }
+
     fn recordForeignKeyIntegrityProgressLocked(
         self: *DB,
         alloc: Allocator,
@@ -10178,6 +10479,314 @@ pub const DB = struct {
         try self.core.store.put(key, payload);
     }
 
+    fn recordUniqueConstraintIntegrityProgressLocked(
+        self: *DB,
+        alloc: Allocator,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        report: relational_store_mod.UniqueConstraintIntegrityReport,
+    ) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
+        const key = try uniqueConstraintIntegrityProgressKeyAlloc(alloc, mode, lower_doc_key, upper_doc_key);
+        defer alloc.free(key);
+        const payload = try std.json.Stringify.valueAlloc(alloc, UniqueConstraintIntegrityProgressRecord{
+            .mode = foreignKeyIntegrityModeName(mode),
+            .lower_doc_key = lower_doc_key,
+            .upper_doc_key = upper_doc_key,
+            .valid = uniqueConstraintIntegrityProgressValid(mode, report),
+            .updated_at_ns = monotonicTimeNs(),
+            .report = report,
+        }, .{});
+        defer alloc.free(payload);
+        try self.core.store.put(key, payload);
+    }
+
+    pub fn claimForeignKeyIntegrityWorkUnit(
+        self: *DB,
+        claim_key: []const u8,
+        worker_id: []const u8,
+        group_id: u64,
+        phase: []const u8,
+        planned_action: []const u8,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        lease_ms: u64,
+    ) !ForeignKeyIntegrityClaimRecord {
+        return try self.claimForeignKeyIntegrityWorkUnitAt(
+            claim_key,
+            worker_id,
+            group_id,
+            phase,
+            planned_action,
+            constraint_name,
+            lower_doc_key,
+            upper_doc_key,
+            lease_ms,
+            monotonicTimeNs(),
+        );
+    }
+
+    pub fn claimForeignKeyIntegrityWorkUnitAt(
+        self: *DB,
+        claim_key: []const u8,
+        worker_id: []const u8,
+        group_id: u64,
+        phase: []const u8,
+        planned_action: []const u8,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        lease_ms: u64,
+        now_ns: u64,
+    ) !ForeignKeyIntegrityClaimRecord {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (claim_key.len == 0 or worker_id.len == 0 or phase.len == 0 or planned_action.len == 0) return error.InvalidForeignKeyIntegrityClaim;
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyIntegrityClaimKeyAlloc(self.alloc, claim_key);
+        defer self.alloc.free(key);
+
+        var attempts: u32 = 1;
+        if (self.core.store.get(self.alloc, key)) |raw| {
+            defer self.alloc.free(raw);
+            const existing = try self.cloneForeignKeyIntegrityClaimRecordFromJson(raw);
+            defer self.freeForeignKeyIntegrityClaimRecord(existing);
+            const held_by_other = !std.mem.eql(u8, existing.worker_id, worker_id);
+            if (held_by_other and existing.lease_until_ns > now_ns) return error.ForeignKeyIntegrityClaimBusy;
+            attempts = existing.attempts +| 1;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+
+        const lease_ns = std.math.mul(u64, lease_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+        const lease_until_ns = now_ns +| lease_ns;
+        const record = ForeignKeyIntegrityClaimRecord{
+            .claim_key = claim_key,
+            .worker_id = worker_id,
+            .group_id = group_id,
+            .phase = phase,
+            .planned_action = planned_action,
+            .constraint_name = constraint_name,
+            .lower_doc_key = lower_doc_key,
+            .upper_doc_key = upper_doc_key,
+            .claimed_at_ns = now_ns,
+            .lease_until_ns = lease_until_ns,
+            .attempts = attempts,
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(payload);
+        try self.core.store.put(key, payload);
+        return try self.cloneForeignKeyIntegrityClaimRecordFromJson(payload);
+    }
+
+    pub fn upsertForeignKeyIntegrityJobRecord(
+        self: *DB,
+        job_id: []const u8,
+        table_name: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+        status: []const u8,
+    ) !ForeignKeyIntegrityJobRecord {
+        return try self.upsertForeignKeyIntegrityJobRecordAt(
+            job_id,
+            table_name,
+            action,
+            worker_id,
+            constraint_name,
+            lower_doc_key,
+            upper_doc_key,
+            lease_ms,
+            max_work_units,
+            status,
+            monotonicTimeNs(),
+        );
+    }
+
+    pub fn upsertForeignKeyIntegrityJobRecordAt(
+        self: *DB,
+        job_id: []const u8,
+        table_name: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+        status: []const u8,
+        now_ns: u64,
+    ) !ForeignKeyIntegrityJobRecord {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (job_id.len == 0 or table_name.len == 0 or action.len == 0 or worker_id.len == 0 or status.len == 0) return error.InvalidForeignKeyIntegrityJob;
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyIntegrityJobKeyAlloc(self.alloc, job_id);
+        defer self.alloc.free(key);
+
+        var created_at_ns = now_ns;
+        var attempts: u32 = 1;
+        if (self.core.store.get(self.alloc, key)) |raw| {
+            defer self.alloc.free(raw);
+            const existing = try self.cloneForeignKeyIntegrityJobRecordFromJson(raw);
+            defer self.freeForeignKeyIntegrityJobRecord(existing);
+            created_at_ns = existing.created_at_ns;
+            attempts = existing.attempts +| 1;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+
+        const record = ForeignKeyIntegrityJobRecord{
+            .job_id = job_id,
+            .table_name = table_name,
+            .action = action,
+            .worker_id = worker_id,
+            .constraint_name = constraint_name,
+            .lower_doc_key = lower_doc_key,
+            .upper_doc_key = upper_doc_key,
+            .lease_ms = lease_ms,
+            .max_work_units = max_work_units,
+            .status = status,
+            .created_at_ns = created_at_ns,
+            .updated_at_ns = now_ns,
+            .attempts = attempts,
+            .completed = false,
+            .valid = null,
+            .last_report = .{},
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(payload);
+        try self.core.store.put(key, payload);
+        return try self.cloneForeignKeyIntegrityJobRecordFromJson(payload);
+    }
+
+    pub fn completeForeignKeyIntegrityJobRecord(
+        self: *DB,
+        job_id: []const u8,
+        status: []const u8,
+        valid: bool,
+        report: relational_store_mod.ForeignKeyIntegrityReport,
+    ) !ForeignKeyIntegrityJobRecord {
+        return try self.completeForeignKeyIntegrityJobRecordAt(job_id, status, valid, report, monotonicTimeNs());
+    }
+
+    pub fn completeForeignKeyIntegrityJobRecordAt(
+        self: *DB,
+        job_id: []const u8,
+        status: []const u8,
+        valid: bool,
+        report: relational_store_mod.ForeignKeyIntegrityReport,
+        now_ns: u64,
+    ) !ForeignKeyIntegrityJobRecord {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (job_id.len == 0 or status.len == 0) return error.InvalidForeignKeyIntegrityJob;
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyIntegrityJobKeyAlloc(self.alloc, job_id);
+        defer self.alloc.free(key);
+        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return error.ForeignKeyIntegrityJobNotFound,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        const existing = try self.cloneForeignKeyIntegrityJobRecordFromJson(raw);
+        defer self.freeForeignKeyIntegrityJobRecord(existing);
+
+        const record = ForeignKeyIntegrityJobRecord{
+            .job_id = existing.job_id,
+            .table_name = existing.table_name,
+            .action = existing.action,
+            .worker_id = existing.worker_id,
+            .constraint_name = existing.constraint_name,
+            .lower_doc_key = existing.lower_doc_key,
+            .upper_doc_key = existing.upper_doc_key,
+            .lease_ms = existing.lease_ms,
+            .max_work_units = existing.max_work_units,
+            .status = status,
+            .created_at_ns = existing.created_at_ns,
+            .updated_at_ns = now_ns,
+            .attempts = existing.attempts,
+            .completed = true,
+            .valid = valid,
+            .last_report = report,
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(payload);
+        try self.core.store.put(key, payload);
+        return try self.cloneForeignKeyIntegrityJobRecordFromJson(payload);
+    }
+
+    pub fn claimAndRunForeignKeyIntegrityWorkUnit(
+        self: *DB,
+        claim_key: []const u8,
+        worker_id: []const u8,
+        group_id: u64,
+        phase: []const u8,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        lease_ms: u64,
+    ) !ForeignKeyIntegrityReport {
+        return try self.claimAndRunForeignKeyIntegrityWorkUnitAt(
+            claim_key,
+            worker_id,
+            group_id,
+            phase,
+            mode,
+            constraint_name,
+            lower_doc_key,
+            upper_doc_key,
+            lease_ms,
+            monotonicTimeNs(),
+        );
+    }
+
+    pub fn claimAndRunForeignKeyIntegrityWorkUnitAt(
+        self: *DB,
+        claim_key: []const u8,
+        worker_id: []const u8,
+        group_id: u64,
+        phase: []const u8,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        lease_ms: u64,
+        now_ns: u64,
+    ) !ForeignKeyIntegrityReport {
+        const claim = try self.claimForeignKeyIntegrityWorkUnitAt(
+            claim_key,
+            worker_id,
+            group_id,
+            phase,
+            foreignKeyIntegrityModeName(mode),
+            constraint_name,
+            lower_doc_key,
+            upper_doc_key,
+            lease_ms,
+            now_ns,
+        );
+        defer self.freeForeignKeyIntegrityClaimRecord(claim);
+
+        return switch (mode) {
+            .validate => try self.validateForeignKeyRefsInRangeForConstraint(constraint_name, lower_doc_key, upper_doc_key),
+            .dry_run => try self.dryRunRepairForeignKeyRefsInRangeForConstraint(constraint_name, lower_doc_key, upper_doc_key),
+            .repair => try self.repairForeignKeyRefsInRangeForConstraint(constraint_name, lower_doc_key, upper_doc_key),
+        };
+    }
+
     fn foreignKeyIntegrityProgressKeyAlloc(
         alloc: Allocator,
         mode: relational_store_mod.ForeignKeyIntegrityMode,
@@ -10196,6 +10805,114 @@ pub const DB = struct {
             upper_doc_key.len,
             upper_doc_key,
         });
+    }
+
+    fn foreignKeyIntegrityClaimKeyAlloc(
+        alloc: Allocator,
+        claim_key: []const u8,
+    ) ![]u8 {
+        return try std.fmt.allocPrint(alloc, "{s}:{d}:{s}", .{
+            foreign_key_integrity_claim_key_prefix,
+            claim_key.len,
+            claim_key,
+        });
+    }
+
+    fn foreignKeyIntegrityJobKeyAlloc(
+        alloc: Allocator,
+        job_id: []const u8,
+    ) ![]u8 {
+        return try std.fmt.allocPrint(alloc, "{s}:{d}:{s}", .{
+            foreign_key_integrity_job_key_prefix,
+            job_id.len,
+            job_id,
+        });
+    }
+
+    fn uniqueConstraintIntegrityProgressKeyAlloc(
+        alloc: Allocator,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) ![]u8 {
+        return try std.fmt.allocPrint(alloc, "{s}:{s}:{d}:{s}:{d}:{s}", .{
+            unique_constraint_integrity_progress_key_prefix,
+            foreignKeyIntegrityModeName(mode),
+            lower_doc_key.len,
+            lower_doc_key,
+            upper_doc_key.len,
+            upper_doc_key,
+        });
+    }
+
+    fn cloneForeignKeyIntegrityClaimRecordFromJson(self: *DB, raw: []const u8) !ForeignKeyIntegrityClaimRecord {
+        var parsed = try std.json.parseFromSlice(ForeignKeyIntegrityClaimRecord, self.alloc, raw, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        var cloned = ForeignKeyIntegrityClaimRecord{
+            .version = parsed.value.version,
+            .claim_key = &.{},
+            .worker_id = &.{},
+            .group_id = parsed.value.group_id,
+            .phase = &.{},
+            .planned_action = &.{},
+            .constraint_name = null,
+            .lower_doc_key = &.{},
+            .upper_doc_key = &.{},
+            .claimed_at_ns = parsed.value.claimed_at_ns,
+            .lease_until_ns = parsed.value.lease_until_ns,
+            .attempts = parsed.value.attempts,
+        };
+        errdefer self.freeForeignKeyIntegrityClaimRecord(cloned);
+        cloned.claim_key = try self.alloc.dupe(u8, parsed.value.claim_key);
+        cloned.worker_id = try self.alloc.dupe(u8, parsed.value.worker_id);
+        cloned.phase = try self.alloc.dupe(u8, parsed.value.phase);
+        cloned.planned_action = try self.alloc.dupe(u8, parsed.value.planned_action);
+        if (parsed.value.constraint_name) |value| cloned.constraint_name = try self.alloc.dupe(u8, value);
+        cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
+        cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
+        return cloned;
+    }
+
+    fn cloneForeignKeyIntegrityJobRecordFromJson(self: *DB, raw: []const u8) !ForeignKeyIntegrityJobRecord {
+        var parsed = try std.json.parseFromSlice(ForeignKeyIntegrityJobRecord, self.alloc, raw, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        var cloned = ForeignKeyIntegrityJobRecord{
+            .version = parsed.value.version,
+            .job_id = &.{},
+            .table_name = &.{},
+            .action = &.{},
+            .worker_id = &.{},
+            .constraint_name = null,
+            .lower_doc_key = &.{},
+            .upper_doc_key = &.{},
+            .lease_ms = parsed.value.lease_ms,
+            .max_work_units = parsed.value.max_work_units,
+            .status = &.{},
+            .created_at_ns = parsed.value.created_at_ns,
+            .updated_at_ns = parsed.value.updated_at_ns,
+            .attempts = parsed.value.attempts,
+            .completed = parsed.value.completed,
+            .valid = parsed.value.valid,
+            .last_report = parsed.value.last_report,
+        };
+        errdefer self.freeForeignKeyIntegrityJobRecord(cloned);
+        cloned.job_id = try self.alloc.dupe(u8, parsed.value.job_id);
+        cloned.table_name = try self.alloc.dupe(u8, parsed.value.table_name);
+        cloned.action = try self.alloc.dupe(u8, parsed.value.action);
+        cloned.worker_id = try self.alloc.dupe(u8, parsed.value.worker_id);
+        if (parsed.value.constraint_name) |value| cloned.constraint_name = try self.alloc.dupe(u8, value);
+        cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
+        cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
+        cloned.status = try self.alloc.dupe(u8, parsed.value.status);
+        return cloned;
     }
 
     fn metadataPrefixUpperAlloc(alloc: Allocator, prefix: []const u8) !?[]u8 {
@@ -10228,6 +10945,16 @@ pub const DB = struct {
         return switch (mode) {
             .validate, .dry_run => report.valid(),
             .repair => report.missing_parent_rows == 0,
+        };
+    }
+
+    fn uniqueConstraintIntegrityProgressValid(
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+        report: relational_store_mod.UniqueConstraintIntegrityReport,
+    ) bool {
+        return switch (mode) {
+            .validate, .dry_run => report.valid(),
+            .repair => report.duplicate_unique_rows == 0,
         };
     }
 
@@ -29270,7 +29997,7 @@ test "db async asset producer mention edges come from resolution artifacts" {
 
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
     defer alloc.free(asset_key);
-    const changed = try materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph");
+    const changed = try materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph", false);
     defer freeOwnedKeySlice(alloc, changed);
 
     const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
@@ -41872,6 +42599,225 @@ test "db foreign key integrity progress is durable per range" {
     }
     try std.testing.expect(saw_low);
     try std.testing.expect(saw_high);
+
+    const worker_report = try db.claimAndRunForeignKeyIntegrityWorkUnitAt(
+        "claim:validate-all",
+        "worker:validate",
+        19,
+        "child_range",
+        .validate,
+        null,
+        "",
+        "",
+        60_000,
+        100_000,
+    );
+    try std.testing.expect(worker_report.valid());
+    try std.testing.expectEqual(@as(u64, 2), worker_report.referenced_child_rows);
+
+    const worker_claim = (try db.loadForeignKeyIntegrityClaimRecord("claim:validate-all")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityClaimRecord(worker_claim);
+    try std.testing.expectEqualStrings("worker:validate", worker_claim.worker_id);
+    try std.testing.expectEqualStrings("validate", worker_claim.planned_action);
+    try std.testing.expectEqualStrings("", worker_claim.lower_doc_key);
+    try std.testing.expectEqualStrings("", worker_claim.upper_doc_key);
+
+    const worker_progress = (try db.loadForeignKeyIntegrityProgressRecord(.validate, null, "", "")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityProgressRecord(worker_progress);
+    try std.testing.expect(worker_progress.valid);
+    try std.testing.expectEqual(@as(u64, 2), worker_progress.report.referenced_child_rows);
+}
+
+test "db foreign key integrity work claims are leased and durable" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const first = try db.claimForeignKeyIntegrityWorkUnitAt(
+            "claim:a",
+            "worker:a",
+            17,
+            "child_range",
+            "validate",
+            "orders_customer_id_fkey",
+            "a:",
+            "m:",
+            1_000,
+            10_000,
+        );
+        defer db.freeForeignKeyIntegrityClaimRecord(first);
+        try std.testing.expectEqualStrings("claim:a", first.claim_key);
+        try std.testing.expectEqualStrings("worker:a", first.worker_id);
+        try std.testing.expectEqual(@as(u64, 17), first.group_id);
+        try std.testing.expectEqualStrings("validate", first.planned_action);
+        try std.testing.expectEqualStrings("orders_customer_id_fkey", first.constraint_name.?);
+        try std.testing.expectEqual(@as(u32, 1), first.attempts);
+        try std.testing.expect(first.lease_until_ns > first.claimed_at_ns);
+
+        try std.testing.expectError(error.ForeignKeyIntegrityClaimBusy, db.claimForeignKeyIntegrityWorkUnitAt(
+            "claim:a",
+            "worker:b",
+            17,
+            "child_range",
+            "validate",
+            "orders_customer_id_fkey",
+            "a:",
+            "m:",
+            1_000,
+            20_000,
+        ));
+
+        const renewed = try db.claimForeignKeyIntegrityWorkUnitAt(
+            "claim:a",
+            "worker:a",
+            17,
+            "child_range",
+            "validate",
+            "orders_customer_id_fkey",
+            "a:",
+            "m:",
+            1_000,
+            30_000,
+        );
+        defer db.freeForeignKeyIntegrityClaimRecord(renewed);
+        try std.testing.expectEqualStrings("worker:a", renewed.worker_id);
+        try std.testing.expectEqual(@as(u32, 2), renewed.attempts);
+        try std.testing.expect(renewed.claimed_at_ns > first.claimed_at_ns);
+
+        const taken = try db.claimForeignKeyIntegrityWorkUnitAt(
+            "claim:a",
+            "worker:b",
+            17,
+            "child_range",
+            "repair",
+            null,
+            "a:",
+            "m:",
+            1_000,
+            renewed.lease_until_ns + 1,
+        );
+        defer db.freeForeignKeyIntegrityClaimRecord(taken);
+        try std.testing.expectEqualStrings("worker:b", taken.worker_id);
+        try std.testing.expectEqualStrings("repair", taken.planned_action);
+        try std.testing.expect(taken.constraint_name == null);
+        try std.testing.expectEqual(@as(u32, 3), taken.attempts);
+
+        const loaded = (try db.loadForeignKeyIntegrityClaimRecord("claim:a")) orelse return error.TestUnexpectedResult;
+        defer db.freeForeignKeyIntegrityClaimRecord(loaded);
+        try std.testing.expectEqualStrings("worker:b", loaded.worker_id);
+        try std.testing.expectEqualStrings("repair", loaded.planned_action);
+
+        const all = try db.listForeignKeyIntegrityClaimRecords();
+        defer db.freeForeignKeyIntegrityClaimRecords(all);
+        try std.testing.expectEqual(@as(usize, 1), all.len);
+        try std.testing.expectEqualStrings("claim:a", all[0].claim_key);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const persisted = (try reopened.loadForeignKeyIntegrityClaimRecord("claim:a")) orelse return error.TestUnexpectedResult;
+    defer reopened.freeForeignKeyIntegrityClaimRecord(persisted);
+    try std.testing.expectEqualStrings("worker:b", persisted.worker_id);
+    try std.testing.expectEqualStrings("repair", persisted.planned_action);
+    try std.testing.expectEqual(@as(u32, 3), persisted.attempts);
+}
+
+test "db foreign key integrity job records persist intent and completion" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const created = try db.upsertForeignKeyIntegrityJobRecordAt(
+            "job:fk:orders:validate",
+            "orders",
+            "validate",
+            "worker:fk-job",
+            "orders_customer_id_fkey",
+            "a:",
+            "z:",
+            60_000,
+            4,
+            "running",
+            10_000,
+        );
+        defer db.freeForeignKeyIntegrityJobRecord(created);
+        try std.testing.expectEqualStrings("job:fk:orders:validate", created.job_id);
+        try std.testing.expectEqualStrings("orders", created.table_name);
+        try std.testing.expectEqualStrings("validate", created.action);
+        try std.testing.expectEqualStrings("worker:fk-job", created.worker_id);
+        try std.testing.expectEqualStrings("orders_customer_id_fkey", created.constraint_name.?);
+        try std.testing.expectEqualStrings("a:", created.lower_doc_key);
+        try std.testing.expectEqualStrings("z:", created.upper_doc_key);
+        try std.testing.expectEqual(@as(u64, 60_000), created.lease_ms);
+        try std.testing.expectEqual(@as(usize, 4), created.max_work_units);
+        try std.testing.expectEqualStrings("running", created.status);
+        try std.testing.expectEqual(@as(u64, 10_000), created.created_at_ns);
+        try std.testing.expectEqual(@as(u64, 10_000), created.updated_at_ns);
+        try std.testing.expectEqual(@as(u32, 1), created.attempts);
+        try std.testing.expect(!created.completed);
+        try std.testing.expect(created.valid == null);
+
+        const resumed = try db.upsertForeignKeyIntegrityJobRecordAt(
+            "job:fk:orders:validate",
+            "orders",
+            "validate",
+            "worker:fk-job-2",
+            "orders_customer_id_fkey",
+            "a:",
+            "z:",
+            120_000,
+            8,
+            "running",
+            20_000,
+        );
+        defer db.freeForeignKeyIntegrityJobRecord(resumed);
+        try std.testing.expectEqual(@as(u64, 10_000), resumed.created_at_ns);
+        try std.testing.expectEqual(@as(u64, 20_000), resumed.updated_at_ns);
+        try std.testing.expectEqual(@as(u32, 2), resumed.attempts);
+        try std.testing.expectEqualStrings("worker:fk-job-2", resumed.worker_id);
+        try std.testing.expectEqual(@as(u64, 120_000), resumed.lease_ms);
+        try std.testing.expectEqual(@as(usize, 8), resumed.max_work_units);
+
+        const completed = try db.completeForeignKeyIntegrityJobRecordAt(
+            "job:fk:orders:validate",
+            "complete",
+            true,
+            .{ .referenced_child_rows = 12 },
+            30_000,
+        );
+        defer db.freeForeignKeyIntegrityJobRecord(completed);
+        try std.testing.expect(completed.completed);
+        try std.testing.expect(completed.valid.?);
+        try std.testing.expectEqualStrings("complete", completed.status);
+        try std.testing.expectEqual(@as(u64, 12), completed.last_report.referenced_child_rows);
+
+        const all = try db.listForeignKeyIntegrityJobRecords();
+        defer db.freeForeignKeyIntegrityJobRecords(all);
+        try std.testing.expectEqual(@as(usize, 1), all.len);
+        try std.testing.expectEqualStrings("job:fk:orders:validate", all[0].job_id);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const persisted = (try reopened.loadForeignKeyIntegrityJobRecord("job:fk:orders:validate")) orelse return error.TestUnexpectedResult;
+    defer reopened.freeForeignKeyIntegrityJobRecord(persisted);
+    try std.testing.expect(persisted.completed);
+    try std.testing.expect(persisted.valid.?);
+    try std.testing.expectEqualStrings("complete", persisted.status);
+    try std.testing.expectEqual(@as(u32, 2), persisted.attempts);
+    try std.testing.expectEqual(@as(u64, 12), persisted.last_report.referenced_child_rows);
 }
 
 test "db relational foreign keys setSchema rejects reserved runtime states" {
@@ -42234,6 +43180,14 @@ test "db relational unique constraints enforce committed scalar values" {
     try db.batch(.{
         .deletes = &.{"user:2"},
     });
+    const deleted_user_2_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:2");
+    defer if (deleted_user_2_row) |row| alloc.free(row);
+    try std.testing.expect(deleted_user_2_row == null);
+    const reusable_email_value = try testUniqueTupleValueAlloc(alloc, &.{"a@example.com"});
+    defer alloc.free(reusable_email_value);
+    const reusable_email_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", reusable_email_value);
+    defer alloc.free(reusable_email_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, reusable_email_key));
     try db.batch(.{
         .writes = &.{.{ .key = "user:3", .value = "{\"id\":\"user:3\",\"email\":\"a@example.com\",\"age\":30}" }},
     });
@@ -42256,6 +43210,102 @@ test "db relational unique constraints enforce committed scalar values" {
     }, &.{});
     try std.testing.expectError(error.UniqueConstraintViolation, db.commitTransaction(txn_id, 20_001));
     try db.abortTransaction(txn_id, 20_002);
+}
+
+test "db unique constraint integrity repair rebuilds backing rows" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "user:ada", .value = "{\"id\":\"user:ada\",\"email\":\"ada@example.test\"}" },
+        .{ .key = "user:grace", .value = "{\"id\":\"user:grace\",\"email\":\"grace@example.test\"}" },
+    } });
+
+    const ada_value = try testUniqueTupleValueAlloc(alloc, &.{"ada@example.test"});
+    defer alloc.free(ada_value);
+    const grace_value = try testUniqueTupleValueAlloc(alloc, &.{"grace@example.test"});
+    defer alloc.free(grace_value);
+    const stale_value = try testUniqueTupleValueAlloc(alloc, &.{"stale@example.test"});
+    defer alloc.free(stale_value);
+    const ada_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", ada_value);
+    defer alloc.free(ada_key);
+    const grace_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", grace_value);
+    defer alloc.free(grace_key);
+    const stale_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", stale_value);
+    defer alloc.free(stale_key);
+
+    try db.core.store.putBatch(&.{
+        .{ .key = grace_key, .value = "user:wrong" },
+        .{ .key = stale_key, .value = "user:ghost" },
+    }, &.{ada_key});
+
+    const validate = try db.validateUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(!validate.valid());
+    try std.testing.expectEqual(@as(u64, 2), validate.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 2), validate.expected_unique_rows);
+    try std.testing.expectEqual(@as(u64, 1), validate.missing_unique_rows);
+    try std.testing.expectEqual(@as(u64, 2), validate.stale_unique_rows);
+
+    const dry_run = try db.dryRunRepairUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(!dry_run.valid());
+    try std.testing.expectEqual(@as(u64, 2), dry_run.repaired_unique_rows);
+    try std.testing.expectEqual(@as(u64, 1), dry_run.deleted_stale_unique_rows);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, ada_key));
+
+    const repair = try db.repairUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(!repair.valid());
+    try std.testing.expectEqual(@as(u64, 2), repair.repaired_unique_rows);
+    try std.testing.expectEqual(@as(u64, 1), repair.deleted_stale_unique_rows);
+    const repair_progress = (try db.loadUniqueConstraintIntegrityProgressRecord(.repair, "", "")) orelse return error.TestUnexpectedResult;
+    defer db.freeUniqueConstraintIntegrityProgressRecord(repair_progress);
+    try std.testing.expectEqualStrings("repair", repair_progress.mode);
+    try std.testing.expect(repair_progress.completed);
+    try std.testing.expect(repair_progress.valid);
+    try std.testing.expectEqual(@as(u64, 2), repair_progress.report.repaired_unique_rows);
+    try std.testing.expectEqual(@as(u64, 1), repair_progress.report.deleted_stale_unique_rows);
+
+    const after = try db.validateUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(after.valid());
+    try std.testing.expectEqual(@as(u64, 2), after.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 2), after.scanned_unique_rows);
+    const validate_progress = (try db.loadUniqueConstraintIntegrityProgressRecord(.validate, "", "")) orelse return error.TestUnexpectedResult;
+    defer db.freeUniqueConstraintIntegrityProgressRecord(validate_progress);
+    try std.testing.expectEqualStrings("validate", validate_progress.mode);
+    try std.testing.expect(validate_progress.completed);
+    try std.testing.expect(validate_progress.valid);
+    try std.testing.expectEqual(@as(u64, 2), validate_progress.report.scanned_unique_rows);
+    const dry_run_progress = (try db.loadUniqueConstraintIntegrityProgressRecord(.dry_run, "", "")) orelse return error.TestUnexpectedResult;
+    defer db.freeUniqueConstraintIntegrityProgressRecord(dry_run_progress);
+    try std.testing.expectEqualStrings("dry_run", dry_run_progress.mode);
+    try std.testing.expect(!dry_run_progress.valid);
+    try std.testing.expectEqual(@as(u64, 2), dry_run_progress.report.repaired_unique_rows);
+    const all_progress = try db.listUniqueConstraintIntegrityProgressRecords();
+    defer db.freeUniqueConstraintIntegrityProgressRecords(all_progress);
+    try std.testing.expectEqual(@as(usize, 3), all_progress.len);
+    const ada_owner = try db.core.store.get(alloc, ada_key);
+    defer alloc.free(ada_owner);
+    try std.testing.expectEqualStrings("user:ada", ada_owner);
+    const grace_owner = try db.core.store.get(alloc, grace_key);
+    defer alloc.free(grace_owner);
+    try std.testing.expectEqualStrings("user:grace", grace_owner);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
 }
 
 test "db transaction unique constraint mutations enforce owner handoff" {

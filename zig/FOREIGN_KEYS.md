@@ -19,9 +19,11 @@ exist, hosted insert-only child writes proven by `expected_version: 0` also
 register the exact owner range and send an explicit FK-ref write mutation in the
 same 2PC. Version-predicated child updates/deletes read the old child row at
 planning time, require the row version to match the predicate, and route FK-ref
-deletes for old parent keys plus FK-ref writes for new parent keys. Unbound
-writes that may move or remove an existing FK remain fail-closed because the
-coordinator cannot prove the old reverse-reference row is still current.
+deletes for old parent keys plus FK-ref writes for new parent keys. Unversioned
+full-row child writes read the current child row before prepare, inject either
+the observed row version or `expected_version: 0` for a missing row as a
+row-participant predicate, and use that proof to route FK-ref deletes for old
+parent keys plus FK-ref writes for new parent keys.
 Hosted restrict parent deletes use routed FK-ref owner ranges for exact
 parent-key checks when that topology is configured; otherwise they
 conservatively register all ranges of child tables that declare a matching
@@ -406,8 +408,9 @@ layer accepts explicit FK-ref write/delete mutations in the prepare request.
 Those mutations are validated against the runtime FK catalog, materialize as
 exact internal reverse-reference keys on commit, delete those keys on commit
 when requested, and are considered by parent-delete validation. Remaining hosted
-coordinator work is broader unbound write planning, resumable large-operation
-execution for wide set-null/cascade fanout, and online validation/rebuild jobs.
+coordinator work is resumable large-operation execution for wide
+set-null/cascade fanout, online validation/rebuild jobs, and deferrable
+constraint planning.
 
 ## Transaction And 2PC Semantics
 
@@ -437,11 +440,15 @@ For cross-shard or cross-table writes:
 - when FK-ref owner ranges are configured, insert-only child writes with a
   matching `expected_version: 0` predicate also register the exact owner range
   for the new parent key and send a FK-ref write mutation to that participant;
+- unversioned full-row child writes read the current row before prepare, inject
+  either the observed row version or `expected_version: 0` for a missing row as
+  a row-participant predicate, and use that durable proof to route old/new
+  FK-ref owner mutations;
 - owner-ranged child writes/deletes with positive version predicates read the
   old child row, verify the read version against the predicate, and route
   FK-ref deletes for old parent keys plus FK-ref writes for new parent keys;
-- owner-ranged child writes/deletes that are neither provable inserts nor bound
-  to a verified old row fail before prepare;
+- owner-ranged deletes and transforms that are neither provable inserts nor
+  bound to a verified old row fail before prepare;
 - parent-existence validation is fail-closed at the participant boundary: the
   receiving participant must be a relational table whose runtime
   `default_type` matches the requested `parent_table`, and malformed or
@@ -489,9 +496,11 @@ For cross-shard or cross-table writes:
   coalesces same-key writes, deletes, and transforms using the same ordering as
   the storage participant, resolves the final row value, registers the
   parent-existence participant for the new FK value, and registers routed FK-ref
-  owner write/delete mutations for old/new parent keys. FK-reference transforms
-  still fail before prepare when they lack a version/insert proof or target
-  unsupported non-primary FK shapes;
+  owner write/delete mutations for old/new parent keys. Unversioned
+  FK-reference transforms read the current row before prepare and inject the
+  observed row version or `expected_version: 0` for a missing row before
+  routing owner mutations. FK-reference transforms still fail before prepare
+  when they target unsupported non-primary FK shapes;
 - transaction prepare requests can carry explicit FK-ref writes/deletes for the
   FK-ref owner participant. The storage participant applies those internal rows
   exactly and parent-delete validation treats staged FK-ref writes as blockers
@@ -500,9 +509,9 @@ For cross-shard or cross-table writes:
   resolved by `(child_table, constraint, parent_table, parent_key)` whenever the
   owner topology exists;
 - routed child reference creation and parent-delete validation prepare through
-  the same FK-ref owner range for the relevant parent key. Reference removal and
-  moved-reference updates still need old/new FK planning before they can use the
-  same path;
+  the same FK-ref owner range for the relevant parent key. Reference removal,
+  moved-reference updates, and FK-reference transforms use read-pinned old/new
+  FK planning before registering owner mutations;
 - prepare must fail if the parent is absent or if a parent delete conflicts with
   a child reference that would survive the transaction;
 - recovery must either commit both the relational row and reverse FK rows, or
@@ -558,7 +567,7 @@ DB layer exposes the same local primitive for validation, repair, and violation
 listing. The public admin endpoint
 `POST /tables/{table}/foreign-key-integrity` exposes the same operation for
 local/bound, provisioned, and hosted tables with `validate`, `dry_run`,
-`repair`, `list`, and `progress` actions plus optional `constraint_name`,
+`repair`, `list`, `plan`, and `progress` actions plus optional `constraint_name`,
 document-key range bounds, and a violation-detail limit. When `constraint_name`
 is present, every local, provisioned, hosted, and internal group execution path
 validates the name against the runtime FK catalog and scans only that
@@ -571,6 +580,67 @@ same constraint scope to remote groups, aggregates every resolved table range,
 and fails the request rather than returning a partial result when a group cannot
 be routed. Online schema adoption can later use the same scanner to validate a
 newly added FK before making it enforced.
+`{"action":"plan"}` is catalog-only for provisioned and hosted sources: it
+resolves the requested table/span into deterministic per-group child-range work
+units without opening shard DBs. Each work unit records the target group, phase,
+planned action, optional constraint scope, and clipped document-key lower/upper
+bounds. The planned action matches the operation that will run (`validate`,
+`dry_run`, `repair`, or `list`) so a background worker can execute a returned
+unit directly without translating it through request context. Provisioned and
+hosted `validate`, `dry_run`, `repair`, and `list` execute those same clipped
+work units instead of one broad per-group scan, so the stored progress rows are
+real range checkpoints. Bound/local sources expose the same shape as a single
+child-range work unit for validation-style actions. `progress` is a status
+listing action and still queries each resolved group once, returning all stored
+FK integrity progress rows for that group. `validate`, `dry_run`, `repair`,
+`list`, and `progress` responses also include the same `work_units` array so
+operators and future background workers can correlate execution/progress with
+the exact resumable range boundaries.
+The response also includes `work_statuses`, a worker-facing manifest keyed by
+the same unit boundary. Each status carries a deterministic `claim_key` plus
+`planned`, `pending`, `claimed`, `incomplete`, `complete`, or `invalid` state.
+The state is derived by joining the planned unit to durable per-group progress
+rows and durable per-group claim rows by group, mode, constraint name, clipped
+document-key range, and claim key. `plan` reports `planned` without opening
+shard DBs unless a matching claim row already exists; execution responses report
+`complete` or `invalid` after the unit records progress, and `progress` reports
+`pending` when a planned unit has no matching progress or claim row yet.
+`work_claims` exposes the persisted lease owner, lease deadline, attempt count,
+and unit boundary for claimed units. Claim rows live in the target group DB
+under internal metadata and support same-worker renewal plus expired-lease
+takeover while rejecting active leases held by another worker. The group DB also
+exposes a claim-and-run primitive that acquires the lease, executes the selected
+`validate`, `dry_run`, or `repair` mode for that exact unit range, and records
+the normal durable progress row before returning the report. Bound, provisioned,
+hosted, and internal group write sources expose the same claimed work-unit
+operation, so a coordinator can dispatch a planned unit to the owning group
+through the normal internal group write route instead of opening group storage
+directly.
+The public `foreign-key-integrity` operation also accepts `worker_id`,
+`lease_ms`, `max_work_units`, and optional `job_id` for `validate`, `dry_run`,
+and `repair`. When `worker_id` is present, the table-write source runs a
+bounded scheduler pass: it plans child-range units, reads durable progress and
+claim state without mutating every unit, selects pending/incomplete or
+expired-lease units, claims and runs up to `max_work_units`, then returns
+refreshed progress, claims, and statuses. If `job_id` is supplied, the pass
+records durable job intent before claiming work and marks the job `complete` or
+`invalid` when the refreshed work statuses are terminal. Local/bound execution
+stores that record in the table DB. Provisioned execution stores the same
+record in every group DB that owns planned work for the pass, alongside the
+group-local claim and progress rows. Hosted execution routes selected units to
+the owning group leader through the same internal group claimed work-unit route.
+When the coordinator supplies `job_id`, that routed request carries the job
+identity and per-pass work-unit limit to the owning leader, which records the
+group-local job shard next to the claim/progress rows before and after the
+claimed unit runs. The bounded pass is therefore safe to call repeatedly by an
+external coordinator or future in-process background job.
+
+Group DB FK integrity job records are keyed by `job_id`. A record stores table,
+action, worker identity, optional constraint scope, document-key range, lease
+duration, per-pass work-unit limit, status, attempt count, created/updated
+timestamps, completion/validity, and the latest aggregate report. These records
+are the durable intent/resume substrate for hosted job controllers; they survive
+DB reopen independently from the in-memory background job lane.
 
 When hosted FK refs move to routed ownership, repair becomes a two-phase
 constraint-index job:
@@ -622,6 +692,20 @@ parent rows; the report still preserves the repaired/deleted reference counters.
 resolved group without running validation, dry-run, or repair, so operators can
 list outstanding or recent integrity work without knowing its exact mode, range,
 or constraint.
+
+Remaining hosted online-validation work is no longer range discovery, status
+correlation, group-local claim persistence, group-local claim-and-run
+execution/routing, or a bounded claimable-unit scheduler pass; those are exposed
+by `plan`, `work_units`, `work_statuses`, `work_claims`, durable claim rows,
+durable per-range progress rows, the DB claim-and-run primitive, the internal
+group claimed work-unit route, the public worker-pass request fields, and
+bounded `job_id` job-record writes for local, provisioned, local-hosted, and
+remote-hosted claimed work. The missing production piece is a hosted job
+controller that creates jobs from schema adoption or admin requests,
+periodically invokes bounded worker passes with stable worker identity,
+aggregates violation details across passes, and resumes incomplete units after
+coordinator or worker restart without requiring an operator to poll the public
+endpoint manually.
 
 Diagnostics should report:
 
@@ -759,13 +843,13 @@ Work:
 - move hosted distributed reverse-reference maintenance onto the FK-ref owner
   participant instead of the local child row participant. Insert-only child
   writes with `expected_version: 0` now register the exact owner participant and
-  send a FK-ref write mutation. Version-predicated updates/deletes now read the
-  old child row, verify the version, and route old/new FK-ref owner mutations.
-  Version-bound and insert-only FK-reference transforms also coalesce same-key
-  writes, deletes, and transforms before prepare, then register old/new FK-ref
-  owner participants plus parent-existence participants. Unbound
-  writes/transforms that can move or remove an existing reference remain
-  fail-closed until they are bound by version or insert proof;
+  send a FK-ref write mutation. Unversioned full-row writes and
+  version-predicated updates/deletes read the old child row when needed, verify
+  or inject the row version proof, and route old/new FK-ref owner mutations.
+  FK-reference transforms also coalesce same-key writes, deletes, and transforms
+  before prepare, read-pin or validate the affected row when needed, then
+  register old/new FK-ref owner participants plus parent-existence participants.
+  Transforms that target unsupported non-primary FK shapes remain fail-closed;
 - make parent deletes register only the FK-ref owner ranges for each deleted
   parent key and referencing constraint. This exact routed path is implemented
   for primary-key `restrict` FKs when owner ranges are configured, with broad
@@ -828,6 +912,26 @@ Implemented:
   checkpoints do not overwrite each other;
 - public/hosted integrity responses that return the latest per-group progress
   rows alongside aggregate report counters and violations;
+- worker-facing `work_statuses` that join planned units to durable progress rows
+  and expose deterministic per-unit `claim_key`s for future hosted background
+  workers;
+- durable group-local claim rows keyed by `claim_key`, with lease owner,
+  deadline, attempt count, same-worker renewal, and expired-lease takeover;
+- group-local claim-and-run execution for FK integrity units, which claims a
+  lease and records the same durable progress row as interactive validation,
+  dry-run, or repair;
+- bound, provisioned, hosted, and internal group table-write routing for claimed
+  FK integrity work units, so hosted workers can execute a planned unit on its
+  owning group through the same routed internal write surface used by normal
+  group-local operations;
+- public bounded worker-pass execution for FK integrity `validate`, `dry_run`,
+  and `repair`, using `worker_id`, `lease_ms`, and `max_work_units` to select
+  unclaimed, incomplete, or expired-lease units, route them to their owning
+  groups, and return refreshed progress/claim/status state;
+- bounded `job_id` worker-pass persistence for local, provisioned, and hosted
+  claimed-unit execution, preserving job intent, worker identity, lease/pass
+  limits, status, attempts, completion, validity, and latest report across
+  reopen in the DBs that own the planned work;
 - DB owner-prefix validation/dry-run/repair for a single routed FK-ref owner
   range. The primitive scans exactly one parent-key prefix, detects owner rows
   whose child row is missing or now references a different parent, and repairs
@@ -835,10 +939,11 @@ Implemented:
 
 Remaining work:
 
-- hosted resumable validation/repair jobs that advance durable checkpoints
-  incrementally instead of running one interactive scan per group. Those jobs
-  should compose the child-range pass that recreates missing owner rows with the
-  owner-prefix pass that prunes stale owner rows.
+- hosted resumable validation/repair controller that creates jobs from
+  schema/admin intent, invokes bounded worker passes outside the interactive
+  request path, retries idempotently, aggregates violation details across
+  passes, and composes the child-range pass that recreates missing owner rows
+  with the owner-prefix pass that prunes stale owner rows.
 
 Repair may rebuild missing/corrupt secondary metadata, but it must not silently
 mutate user rows. Orphaned child rows should be reported for explicit operator
@@ -939,29 +1044,56 @@ Implemented:
 - table workflow exposes unique-owner range upsert/remove and two-phase
   split/merge/rebuild lifecycle methods, matching the FK-ref owner range API;
 - hosted distributed single-table and multi-table insert-only writes
-  (`expected_version: 0`), version-bound updates, and version-bound deletes on
-  multi-range tables route complete unique tuple changes through the configured
-  unique-owner range. Updates compare the old versioned row with the new row and
-  register the exact unique delete/write handoff before prepare. Deletes remove
-  the old tuple from the same owner range. Unversioned deletes first read the
-  current row from its table group, inject that observed row version as a
-  prepare predicate on the row participant, and use the same durable old-tuple
-  proof for unique-owner cleanup. Missing owner topology, transitional owner
-  topology, and unversioned unique writes still fail closed before prepare;
+  (`expected_version: 0`), version-bound updates, version-bound deletes, and
+  unversioned full-row writes/deletes on multi-range tables route complete
+  unique tuple changes through the configured unique-owner range. Updates
+  compare the old row with the new row and register the exact unique
+  delete/write handoff before prepare. Unversioned full-row writes first read
+  the current row from its table group, inject either the observed row version or
+  `expected_version: 0` for a missing row as a prepare predicate on the row
+  participant, and use that durable proof for unique-owner mutation planning.
+  Deletes remove the old tuple from the same owner range. Unversioned deletes
+  use the same observed-version proof for unique-owner cleanup. Missing owner
+  topology and transitional owner topology still fail closed before prepare;
 - transforms that can change a unique column or upsert a row on a multi-range
-  unique table still fail before prepare because final-value planning for those
-  transforms is not yet wired into the unique-owner participant path. Transforms
-  that cannot touch unique columns still route to the row's owning group.
-  Single-range tables continue to use local participant enforcement.
+  unique table use the same final-row planning model as FK-reference
+  transforms. The coordinator coalesces same-key writes, deletes, and
+  transforms in storage order, read-pins or validates the affected row when
+  needed, then routes old/new tuple mutations through the unique-owner range.
+  Transforms that cannot touch unique columns still route only to the row's
+  owning group. Single-range tables continue to use local participant
+  enforcement;
+- the storage layer exposes a unique-constraint integrity reconciliation
+  primitive over a document-key range. It scans committed relational rows,
+  derives expected unique integrity rows, reports missing, stale, and duplicate
+  unique rows, supports non-mutating dry-run repair, and can rebuild missing or
+  mismatched unique rows plus prune stale unique rows without mutating user
+  rows. Duplicate user rows are reported and left for explicit operator action;
+- the public table operation
+  `POST /tables/{table}/unique-integrity` exposes the same primitive with
+  `validate`, `dry_run`, and `repair` actions plus optional document-key range
+  bounds. Local/bound sources execute directly, provisioned sources fan out
+  across every resolved local table range, and hosted sources route each group
+  to its leader through the internal group `unique-integrity` operation.
+  Responses include aggregate counters, per-group counters, and stored progress
+  rows. `validate`, `dry_run`, and `repair` persist durable progress records
+  keyed by `(mode, lower_doc_key, upper_doc_key)`; `progress` lists those rows
+  without rescanning table data. Dry-run reports the rows it would repair or
+  delete without mutating integrity rows; repair rebuilds missing/mismatched
+  unique rows and deletes stale unique rows, while preserving duplicate user
+  rows for explicit operator resolution;
+- provisioned and hosted unique-integrity responses include
+  `owner_topology`, a catalog inspection of unique-owner ranges for the table.
+  It reports declared/configured constraint counts, active/transitional range
+  counts, a topology epoch, and the observed owner ranges. `complete` is true
+  only when every declared unique constraint has active contiguous coverage from
+  the empty encoded tuple through the open-ended upper bound, with no
+  transitional or stale configured constraints.
 
 Remaining work:
 
-- admin routes for manually inspecting and repairing unique-owner ranges;
-- distributed/online unique validation/build using the same validation-state
-  model;
-- final-value planning for unique-touching transforms and unversioned changes;
-- routed parent-delete and action planning for cross-table/non-local unique
-  parent targets.
+- hosted/distributed unique validation/build jobs using the same durable
+  validation-state model and unique-owner topology.
 
 The unique index is an integrity index. It cannot be eventually consistent and
 cannot be replaced by a search, algebraic, or graph index.
@@ -1005,9 +1137,7 @@ Implemented:
 Remaining work:
 
 - make parent-update and child-reference races use distributed range/participant
-  conflict protection instead of the current local-store reverse-reference scan;
-- extend the same final-state planning model to unversioned unique writes and
-  unique-touching transforms.
+  conflict protection instead of the current local-store reverse-reference scan.
 
 ### 6. Composite FKs
 
@@ -1171,9 +1301,7 @@ Ship the remaining work in this order:
    paginated owner scans and resumable child-action execution.
 8. Distributed recursive graph and large-operation hardening for
    `on_delete: cascade`.
-9. Broader final-state planning for unversioned unique writes, unique-touching
-   transforms, and unbound FK-reference writes/transforms.
-10. Deferrable constraints.
+9. Deferrable constraints.
 
 This keeps the integrity substrate sound before adding features that multiply
 write-planning complexity. Cascades and deferrable constraints should come late
@@ -1206,6 +1334,17 @@ Minimum coverage:
 - FK-ref range split/merge preserves ownership and rejects stale topology epochs;
 - routed repair recreates missing FK-ref rows in the owner range and the
   owner-prefix primitive prunes stale rows without mutating child rows.
+- FK integrity `plan` returns deterministic per-group child-range work units
+  clipped to the requested span, and hosted/provisioned validate, dry-run,
+  repair, and list execute by those planned units.
+- FK integrity `work_statuses` expose deterministic claim keys and progress
+  state for planned units so hosted validation workers can resume by durable
+  unit identity.
+- FK integrity group DBs persist claim leases by `claim_key`, reject active
+  leases held by another worker, allow same-worker renewal, and allow expired
+  takeover after reopen.
+- FK integrity group DBs can claim and run one validation, dry-run, or repair
+  unit and persist progress for that exact unit boundary.
 
 ## Documentation Status
 
@@ -1215,10 +1354,16 @@ Minimum coverage:
   limits.
 - API/OpenAPI schema: exposes `foreign_keys` on `TableSchema`.
 - Operational surface: `POST /tables/{table}/foreign-key-integrity` validates,
-  dry-runs repairs, repairs, lists FK reverse-reference violations, and explains
-  parent deletes for local and hosted table storage.
+  dry-runs repairs, repairs, lists FK reverse-reference violations, plans
+  per-range validation work, reports stored progress, exposes per-unit
+  worker-status claim keys, advances bounded worker passes with optional
+  durable `job_id` records, and explains parent deletes for local and hosted
+  table storage.
+- Unique operational surface: `POST /tables/{table}/unique-integrity`
+  validates, dry-runs repair, repairs, and reports stored progress for unique
+  integrity rows on local, provisioned, and hosted relational tables.
 - Planning surface: the DB and public/hosted operation can explain one parent
   delete using the same FK participant path as commit and return non-mutating
   set-null/cascade/reject counters.
-- Remaining operational docs: background jobs and explicit large-operation
-  execution/recovery diagnostics.
+- Remaining operational docs: hosted background job-controller configuration and
+  explicit large-operation execution/recovery diagnostics.

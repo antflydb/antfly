@@ -60,6 +60,7 @@ pub const Routes = struct {
     pub const backup_suffix = "/backup";
     pub const restore_suffix = "/restore";
     pub const foreign_key_integrity_suffix = "/foreign-key-integrity";
+    pub const unique_integrity_suffix = "/unique-integrity";
     pub const foreign_key_ref_children_suffix = "/foreign-key-ref-children";
     pub const query_suffix = "/query";
     pub const query_preflight_suffix = "/query-preflight";
@@ -127,6 +128,10 @@ pub const Routes = struct {
     };
 
     pub const TableForeignKeyIntegrity = struct {
+        table_name: []const u8,
+    };
+
+    pub const TableUniqueIntegrity = struct {
         table_name: []const u8,
     };
 
@@ -248,6 +253,11 @@ pub const Routes = struct {
     };
 
     pub const GroupForeignKeyIntegrity = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupUniqueIntegrity = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -395,6 +405,14 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, foreign_key_integrity_suffix)) return null;
         const table_name = path[tables_prefix.len .. path.len - foreign_key_integrity_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableUniqueIntegrity(path: []const u8) ?TableUniqueIntegrity {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, unique_integrity_suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - unique_integrity_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
     }
@@ -658,6 +676,16 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupUniqueIntegrity(path: []const u8) ?GroupUniqueIntegrity {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, unique_integrity_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - unique_integrity_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchGroupForeignKeyRefChildren(path: []const u8) ?GroupForeignKeyRefChildren {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -881,7 +909,10 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", restore.table_name);
     const fk_integrity = Routes.matchTableForeignKeyIntegrity("/tables/docs/foreign-key-integrity").?;
     try std.testing.expectEqualStrings("docs", fk_integrity.table_name);
+    const unique_integrity = Routes.matchTableUniqueIntegrity("/tables/docs/unique-integrity").?;
+    try std.testing.expectEqualStrings("docs", unique_integrity.table_name);
     try std.testing.expect(Routes.matchTablePath("/tables/docs/foreign-key-integrity") == null);
+    try std.testing.expect(Routes.matchTablePath("/tables/docs/unique-integrity") == null);
     const indexes = Routes.matchTableIndexes("/tables/docs/indexes").?;
     try std.testing.expectEqualStrings("docs", indexes.table_name);
     const index = Routes.matchTableIndex("/tables/docs/indexes/search_idx").?;
@@ -928,6 +959,9 @@ test "public api routes compile" {
     const group_fk_integrity = Routes.matchGroupForeignKeyIntegrity("/internal/v1/groups/7/tables/docs/foreign-key-integrity").?;
     try std.testing.expectEqual(@as(u64, 7), group_fk_integrity.group_id);
     try std.testing.expectEqualStrings("docs", group_fk_integrity.table_name);
+    const group_unique_integrity = Routes.matchGroupUniqueIntegrity("/internal/v1/groups/7/tables/docs/unique-integrity").?;
+    try std.testing.expectEqual(@as(u64, 7), group_unique_integrity.group_id);
+    try std.testing.expectEqualStrings("docs", group_unique_integrity.table_name);
     const group_fk_ref_children = Routes.matchGroupForeignKeyRefChildren("/internal/v1/groups/7/tables/docs/foreign-key-ref-children").?;
     try std.testing.expectEqual(@as(u64, 7), group_fk_ref_children.group_id);
     try std.testing.expectEqualStrings("docs", group_fk_ref_children.table_name);

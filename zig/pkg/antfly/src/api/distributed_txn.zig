@@ -1165,10 +1165,9 @@ fn addForeignKeyParentParticipants(
                 continue;
             }
 
-            var old_row = try lookupVersionedChildRowForForeignKeyPlanning(alloc, catalog, worker, table_name, write.key, predicates);
+            var old_row = try lookupWriteRowForConstraintProof(alloc, catalog, worker, participants, table_name, write.key, predicates);
             defer if (old_row) |*row| row.deinit(alloc);
-            const old = old_row orelse return error.UnsupportedOperation;
-            const maybe_old_parent_key = try foreignKeyParentReferenceFromJsonAlloc(alloc, runtime_schema.relational_columns, foreign_key, old.json);
+            const maybe_old_parent_key = if (old_row) |old| try foreignKeyParentReferenceFromJsonAlloc(alloc, runtime_schema.relational_columns, foreign_key, old.json) else null;
             defer if (maybe_old_parent_key) |old_parent_key| alloc.free(old_parent_key);
 
             if (maybe_old_parent_key) |old_parent_key| {
@@ -1292,6 +1291,31 @@ fn lookupDeleteRowForConstraintProof(
     return row;
 }
 
+fn lookupWriteRowForConstraintProof(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    worker: ParticipantWorker,
+    participants: *std.ArrayListUnmanaged(ParticipantTxn),
+    table_name: []const u8,
+    key: []const u8,
+    predicates: []const db_mod.types.TransactionVersionPredicate,
+) !?table_reads.LookupResponse {
+    if (findVersionPredicate(predicates, key) != null) {
+        return try lookupVersionedChildRowForForeignKeyPlanning(alloc, catalog, worker, table_name, key, predicates);
+    }
+    const topology_epoch = try table_catalog.topologyEpoch(alloc, catalog, table_name);
+    if (topology_epoch == 0) return error.TableNotFound;
+    const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table_name, key, topology_epoch)) orelse return error.UnknownGroup;
+    const participant = try ensureParticipantTxn(alloc, participants, table_name, group_id, topology_epoch);
+    var row = (try worker.lookupGroup(alloc, group_id, table_name, key)) orelse {
+        try appendInjectedVersionPredicate(alloc, participant, key, 0);
+        return null;
+    };
+    errdefer row.deinit(alloc);
+    try appendInjectedVersionPredicate(alloc, participant, key, row.version);
+    return row;
+}
+
 fn foreignKeyRefOwnersConfiguredForConstraint(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -1337,13 +1361,8 @@ fn addForeignKeyTransformParticipants(
         if (transformKeySeenBefore(transforms, transform_index)) continue;
         if (!try keyHasForeignKeyReferenceTransform(alloc, runtime_schema.foreign_keys, transform.key, transforms)) continue;
 
-        const expected_version = findVersionPredicate(predicates, transform.key) orelse return error.UnsupportedOperation;
-        var old_row: ?table_reads.LookupResponse = null;
+        var old_row = try lookupWriteRowForConstraintProof(alloc, catalog, worker, participants, table_name, transform.key, predicates);
         defer if (old_row) |*row| row.deinit(alloc);
-        if (expected_version != 0) {
-            old_row = try lookupVersionedChildRowForForeignKeyPlanning(alloc, catalog, worker, table_name, transform.key, predicates);
-            if (old_row == null) return error.VersionConflict;
-        }
 
         var final_owned: ?[]u8 = null;
         defer if (final_owned) |body| alloc.free(body);
@@ -1853,18 +1872,10 @@ fn addUniqueConstraintOwnerParticipants(
     if (groups.len == 0) return error.UnknownGroup;
     if (groups.len == 1) return;
 
-    for (transforms) |transform| {
-        if (transform.upsert) return error.UnsupportedOperation;
-        if (try transformTouchesUniqueConstraint(alloc, runtime_schema.unique_constraints, transform)) return error.UnsupportedOperation;
-    }
     for (writes) |write| {
-        const expected_version = findVersionPredicate(predicates, write.key) orelse return error.UnsupportedOperation;
-        var old_row: ?table_reads.LookupResponse = null;
+        if (try keyHasUniqueConstraintTransform(alloc, runtime_schema.unique_constraints, write.key, transforms)) continue;
+        var old_row = try lookupWriteRowForConstraintProof(alloc, catalog, worker, participants, table_name, write.key, predicates);
         defer if (old_row) |*row| row.deinit(alloc);
-        if (expected_version != 0) {
-            old_row = try lookupVersionedChildRowForForeignKeyPlanning(alloc, catalog, worker, table_name, write.key, predicates);
-            if (old_row == null) return error.VersionConflict;
-        }
         try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema.relational_columns, runtime_schema.unique_constraints, write.key, if (old_row) |row| row.json else null, write.value);
     }
     for (deletes) |key| {
@@ -1874,6 +1885,32 @@ fn addUniqueConstraintOwnerParticipants(
         defer if (old_row) |*row| row.deinit(alloc);
         const old = old_row orelse continue;
         try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema.relational_columns, runtime_schema.unique_constraints, key, old.json, null);
+    }
+    for (transforms, 0..) |transform, transform_index| {
+        if (transformKeySeenBefore(transforms, transform_index)) continue;
+        if (!try keyHasUniqueConstraintTransform(alloc, runtime_schema.unique_constraints, transform.key, transforms)) continue;
+
+        var old_row = try lookupWriteRowForConstraintProof(alloc, catalog, worker, participants, table_name, transform.key, predicates);
+        defer if (old_row) |*row| row.deinit(alloc);
+
+        var final_owned: ?[]u8 = null;
+        defer if (final_owned) |body| alloc.free(body);
+        var final_json: ?[]const u8 = blk: {
+            if (deleteContainsKey(deletes, transform.key)) break :blk null;
+            if (findWriteValueForKey(writes, transform.key)) |write_value| break :blk write_value;
+            if (old_row) |row| break :blk row.json;
+            break :blk null;
+        };
+        for (transforms) |candidate| {
+            if (!std.mem.eql(u8, candidate.key, transform.key)) continue;
+            const resolved = try db_mod.transform.resolveDocumentTransform(alloc, final_json, candidate) orelse continue;
+            if (final_owned) |previous| alloc.free(previous);
+            final_owned = resolved;
+            final_json = resolved;
+        }
+        if (final_json == null and old_row == null) continue;
+
+        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema.relational_columns, runtime_schema.unique_constraints, transform.key, if (old_row) |row| row.json else null, final_json);
     }
 }
 
@@ -4122,6 +4159,7 @@ test "distributed txn coordinator routes foreign key child writes through ref ow
         prepared_child: bool = false,
         prepared_parent: bool = false,
         prepared_owner: bool = false,
+        lookup_calls: usize = 0,
 
         fn worker(self: *@This()) ParticipantWorker {
             return .{
@@ -4131,6 +4169,19 @@ test "distributed txn coordinator routes foreign key child writes through ref ow
                     .prepare_group = prepare,
                     .resolve_group = resolve,
                     .status_group = status,
+                },
+            };
+        }
+
+        fn workerWithLookup(self: *@This()) ParticipantWorker {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .begin_group = begin,
+                    .prepare_group = prepare,
+                    .resolve_group = resolve,
+                    .status_group = status,
+                    .lookup_group = lookupMissing,
                 },
             };
         }
@@ -4177,13 +4228,22 @@ test "distributed txn coordinator routes foreign key child writes through ref ow
         fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
             return .pending;
         }
+
+        fn lookupMissing(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lookup_calls += 1;
+            try std.testing.expectEqual(@as(u64, 7001), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:a-order", key);
+            return null;
+        }
     };
 
-    var rejected_recorder = Recorder{};
-    try std.testing.expectError(error.UnsupportedOperation, executeMultiTableCommit(
+    var unversioned_recorder = Recorder{};
+    const unversioned_result = try executeMultiTableCommit(
         std.testing.allocator,
         FakeCatalog.iface(),
-        rejected_recorder.worker(),
+        unversioned_recorder.workerWithLookup(),
         try parseTxnIdHex("22223333444455556666777788889998"),
         10_000,
         10_001,
@@ -4192,10 +4252,12 @@ test "distributed txn coordinator routes foreign key child writes through ref ow
             .writes = &.{.{ .key = "doc:a-order", .value = "{\"customer_id\":\"cust:z-customer\"}" }},
         }},
         null,
-    ));
-    try std.testing.expect(!rejected_recorder.prepared_child);
-    try std.testing.expect(!rejected_recorder.prepared_parent);
-    try std.testing.expect(!rejected_recorder.prepared_owner);
+    );
+    try std.testing.expectEqual(@as(usize, 3), unversioned_result.committed.participant_count);
+    try std.testing.expectEqual(@as(usize, 1), unversioned_recorder.lookup_calls);
+    try std.testing.expect(unversioned_recorder.prepared_child);
+    try std.testing.expect(unversioned_recorder.prepared_parent);
+    try std.testing.expect(unversioned_recorder.prepared_owner);
 
     var delete_recorder = Recorder{};
     try std.testing.expectError(error.UnsupportedOperation, executeMultiTableCommit(
@@ -4510,10 +4572,35 @@ test "distributed txn coordinator routes old and new foreign key refs with versi
     try std.testing.expect(delete_recorder.prepared_owner);
 }
 
-test "distributed txn coordinator rejects unversioned multi-range unique writes without owner proof" {
+test "distributed txn coordinator routes unique-touching transforms with row proofs" {
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
     ;
+    var parsed_schema = try schema_mod.parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed_schema.deinit(std.testing.allocator);
+    const runtime_schema = try schema_mod.deriveRuntimeTableSchema(std.testing.allocator, parsed_schema);
+    defer storage_schema.freeSchema(std.testing.allocator, runtime_schema);
+    const old_row = try document_mapper.buildRelationalRowValueAlloc(std.testing.allocator, "{\"email\":\"ada@example.test\"}", runtime_schema.relational_columns);
+    defer std.testing.allocator.free(old_row);
+    const old_value = try relational_store.uniqueConstraintTupleValueAlloc(std.testing.allocator, old_row, runtime_schema.unique_constraints[0]);
+    defer if (old_value) |value| std.testing.allocator.free(value);
+    const old_encoded_value = old_value orelse unreachable;
+    const grace_row = try document_mapper.buildRelationalRowValueAlloc(std.testing.allocator, "{\"email\":\"grace@example.test\"}", runtime_schema.relational_columns);
+    defer std.testing.allocator.free(grace_row);
+    const grace_value = try relational_store.uniqueConstraintTupleValueAlloc(std.testing.allocator, grace_row, runtime_schema.unique_constraints[0]);
+    defer if (grace_value) |value| std.testing.allocator.free(value);
+    const grace_encoded_value = grace_value orelse unreachable;
+    const katherine_row = try document_mapper.buildRelationalRowValueAlloc(std.testing.allocator, "{\"email\":\"katherine@example.test\"}", runtime_schema.relational_columns);
+    defer std.testing.allocator.free(katherine_row);
+    const katherine_value = try relational_store.uniqueConstraintTupleValueAlloc(std.testing.allocator, katherine_row, runtime_schema.unique_constraints[0]);
+    defer if (katherine_value) |value| std.testing.allocator.free(value);
+    const katherine_encoded_value = katherine_value orelse unreachable;
+    const final_row = try document_mapper.buildRelationalRowValueAlloc(std.testing.allocator, "{\"email\":\"final@example.test\"}", runtime_schema.relational_columns);
+    defer std.testing.allocator.free(final_row);
+    const final_value = try relational_store.uniqueConstraintTupleValueAlloc(std.testing.allocator, final_row, runtime_schema.unique_constraints[0]);
+    defer if (final_value) |value| std.testing.allocator.free(value);
+    const final_encoded_value = final_value orelse unreachable;
+
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -4538,6 +4625,15 @@ test "distributed txn coordinator rejects unversioned multi-range unique writes 
                     .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "user:m" },
                     .{ .group_id = 7002, .table_id = 7, .start_key = "user:m", .end_key = null },
                 })[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{.{
+                    .table_id = 7,
+                    .constraint_name = "users_email_key",
+                    .start_encoded_value = "",
+                    .end_encoded_value = null,
+                    .group_id = 9001,
+                    .topology_epoch = 1,
+                    .state = metadata_table_manager.unique_constraint_range_active,
+                }})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -4548,8 +4644,15 @@ test "distributed txn coordinator rejects unversioned multi-range unique writes 
         fn freeAdminSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
     };
 
+    const Mode = enum { existing, upsert, write_transform };
     const Recorder = struct {
-        begin_calls: usize = 0,
+        mode: Mode,
+        expected_old_encoded_value: ?[]const u8 = null,
+        expected_new_encoded_value: []const u8,
+        expected_version: u64,
+        lookup_calls: usize = 0,
+        prepared_row: bool = false,
+        prepared_owner: bool = false,
 
         fn worker(self: *@This()) ParticipantWorker {
             return .{
@@ -4559,79 +4662,169 @@ test "distributed txn coordinator rejects unversioned multi-range unique writes 
                     .prepare_group = prepare,
                     .resolve_group = resolve,
                     .status_group = status,
+                    .lookup_group = lookup,
                 },
             };
         }
 
-        fn begin(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.begin_calls += 1;
-            return error.UnexpectedWorkerCall;
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnBeginRequest) !void {
+            try std.testing.expectEqual(@as(usize, 2), req.participants.len);
         }
 
-        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
-            return error.UnexpectedWorkerCall;
+        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("users", table_name);
+            if (group_id == 7002) {
+                try std.testing.expectEqual(@as(usize, 1), req.req.transforms.len);
+                try std.testing.expectEqual(@as(usize, 1), req.req.predicates.len);
+                try std.testing.expectEqual(self.expected_version, req.req.predicates[0].expected_version);
+                if (self.mode == .write_transform) {
+                    try std.testing.expectEqual(@as(usize, 1), req.req.writes.len);
+                    try std.testing.expectEqualStrings("user:x", req.req.writes[0].key);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
+                }
+                self.prepared_row = true;
+            } else if (group_id == 9001) {
+                if (self.expected_old_encoded_value) |old_encoded| {
+                    try std.testing.expectEqual(@as(usize, 1), req.req.unique_constraint_deletes.len);
+                    try std.testing.expectEqualStrings(old_encoded, req.req.unique_constraint_deletes[0].encoded_value);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), req.req.unique_constraint_deletes.len);
+                }
+                try std.testing.expectEqual(@as(usize, 1), req.req.unique_constraint_writes.len);
+                try std.testing.expectEqualStrings(self.expected_new_encoded_value, req.req.unique_constraint_writes[0].encoded_value);
+                self.prepared_owner = true;
+            } else return error.UnexpectedGroup;
         }
 
         fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {
-            return error.UnexpectedWorkerCall;
+            return;
         }
 
         fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
-            return error.UnexpectedWorkerCall;
+            return .pending;
+        }
+
+        fn lookup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lookup_calls += 1;
+            try std.testing.expectEqual(@as(u64, 7002), group_id);
+            try std.testing.expectEqualStrings("users", table_name);
+            switch (self.mode) {
+                .existing => {
+                    try std.testing.expectEqualStrings("user:z", key);
+                    return .{
+                        .json = try alloc.dupe(u8, "{\"email\":\"ada@example.test\"}"),
+                        .version = 7,
+                    };
+                },
+                .upsert => {
+                    try std.testing.expectEqualStrings("user:y", key);
+                    return null;
+                },
+                .write_transform => {
+                    try std.testing.expectEqualStrings("user:x", key);
+                    return null;
+                },
+            }
         }
     };
 
-    var recorder = Recorder{};
     const txn_id = try parseTxnIdHex("1234567890abcdef1234567890abcdef");
-    try std.testing.expectError(error.UnsupportedOperation, executeMultiTableCommit(
-        std.testing.allocator,
-        FakeCatalog.iface(),
-        recorder.worker(),
-        txn_id,
-        10_000,
-        10_001,
-        &.{.{
-            .table_name = "users",
-            .writes = &.{.{ .key = "user:z", .value = "{\"email\":\"ada@example.test\"}" }},
-        }},
-        null,
-    ));
-    try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
-
-    try std.testing.expectError(error.UnsupportedOperation, executeCrossGroup(
-        std.testing.allocator,
-        FakeCatalog.iface(),
-        recorder.worker(),
-        "users",
-        txn_id,
-        10_100,
-        10_101,
-        .{ .writes = &.{.{ .key = "user:a", .value = "{\"email\":\"grace@example.test\"}" }} },
-        null,
-    ));
-    try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
-
-    const update_email = [_]db_mod.types.TransformOp{.{
+    const set_grace = [_]db_mod.types.TransformOp{.{
         .op = .set,
         .path = "email",
-        .value_json = "\"katherine@example.test\"",
+        .value_json = "\"grace@example.test\"",
     }};
-    try std.testing.expectError(error.UnsupportedOperation, executeCrossGroup(
+    var existing_recorder = Recorder{
+        .mode = .existing,
+        .expected_old_encoded_value = old_encoded_value,
+        .expected_new_encoded_value = grace_encoded_value,
+        .expected_version = 7,
+    };
+    const existing_result = try executeCrossGroup(
         std.testing.allocator,
         FakeCatalog.iface(),
-        recorder.worker(),
+        existing_recorder.worker(),
         "users",
         txn_id,
         10_200,
         10_201,
         .{ .transforms = &.{.{
-            .key = "user:a",
-            .operations = update_email[0..],
+            .key = "user:z",
+            .operations = set_grace[0..],
         }} },
         null,
-    ));
-    try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
+    );
+    try std.testing.expectEqual(@as(usize, 2), existing_result.participant_count);
+    try std.testing.expectEqual(@as(usize, 1), existing_recorder.lookup_calls);
+    try std.testing.expect(existing_recorder.prepared_row);
+    try std.testing.expect(existing_recorder.prepared_owner);
+
+    const set_katherine = [_]db_mod.types.TransformOp{.{
+        .op = .set,
+        .path = "email",
+        .value_json = "\"katherine@example.test\"",
+    }};
+    var upsert_recorder = Recorder{
+        .mode = .upsert,
+        .expected_new_encoded_value = katherine_encoded_value,
+        .expected_version = 0,
+    };
+    const upsert_result = try executeMultiTableCommit(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        upsert_recorder.worker(),
+        try parseTxnIdHex("1234567890abcdef1234567890abcdee"),
+        10_300,
+        10_301,
+        &.{.{
+            .table_name = "users",
+            .transforms = &.{.{
+                .key = "user:y",
+                .operations = set_katherine[0..],
+                .upsert = true,
+            }},
+        }},
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 2), upsert_result.committed.participant_count);
+    try std.testing.expectEqual(@as(usize, 1), upsert_recorder.lookup_calls);
+    try std.testing.expect(upsert_recorder.prepared_row);
+    try std.testing.expect(upsert_recorder.prepared_owner);
+
+    const set_final = [_]db_mod.types.TransformOp{.{
+        .op = .set,
+        .path = "email",
+        .value_json = "\"final@example.test\"",
+    }};
+    var write_transform_recorder = Recorder{
+        .mode = .write_transform,
+        .expected_new_encoded_value = final_encoded_value,
+        .expected_version = 0,
+    };
+    const write_transform_result = try executeCrossGroup(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        write_transform_recorder.worker(),
+        "users",
+        try parseTxnIdHex("1234567890abcdef1234567890abcded"),
+        10_400,
+        10_401,
+        .{
+            .writes = &.{.{ .key = "user:x", .value = "{\"email\":\"initial@example.test\"}" }},
+            .transforms = &.{.{
+                .key = "user:x",
+                .operations = set_final[0..],
+            }},
+        },
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 2), write_transform_result.participant_count);
+    try std.testing.expectEqual(@as(usize, 1), write_transform_recorder.lookup_calls);
+    try std.testing.expect(write_transform_recorder.prepared_row);
+    try std.testing.expect(write_transform_recorder.prepared_owner);
 }
 
 test "distributed txn coordinator routes unique constraint writes through owner ranges" {
@@ -4766,6 +4959,7 @@ test "distributed txn coordinator routes unique constraint writes through owner 
             try std.testing.expectEqual(@as(u64, 7002), group_id);
             try std.testing.expectEqualStrings("users", table_name);
             try std.testing.expectEqualStrings("user:z", key);
+            if (self.mode == .write) return null;
             return .{
                 .json = try alloc.dupe(u8, "{\"email\":\"ada@example.test\"}"),
                 .version = 5,
@@ -4785,14 +4979,13 @@ test "distributed txn coordinator routes unique constraint writes through owner 
         30_001,
         .{
             .writes = &.{.{ .key = "user:z", .value = "{\"email\":\"ada@example.test\"}" }},
-            .predicates = &.{.{ .key = "user:z", .expected_version = 0 }},
         },
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), result.participant_count);
     try std.testing.expect(recorder.prepared_row);
     try std.testing.expect(recorder.prepared_owner);
-    try std.testing.expectEqual(@as(usize, 0), recorder.lookup_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.lookup_calls);
 
     var delete_recorder = Recorder{ .mode = .delete, .expected_encoded_value = expected_encoded_value };
     const delete_result = try executeCrossGroup(
@@ -4812,7 +5005,7 @@ test "distributed txn coordinator routes unique constraint writes through owner 
     try std.testing.expectEqual(@as(usize, 1), delete_recorder.lookup_calls);
 }
 
-test "distributed txn coordinator routes versioned unique owner handoff" {
+test "distributed txn coordinator routes unique owner handoff with row version proofs" {
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
     ;
@@ -4902,6 +5095,9 @@ test "distributed txn coordinator routes versioned unique owner handoff" {
             try std.testing.expectEqualStrings("users", table_name);
             if (group_id == 7002) {
                 try std.testing.expectEqual(@as(usize, 1), req.req.writes.len);
+                try std.testing.expectEqual(@as(usize, 1), req.req.predicates.len);
+                try std.testing.expectEqualStrings("user:z", req.req.predicates[0].key);
+                try std.testing.expectEqual(@as(u64, 7), req.req.predicates[0].expected_version);
             } else if (group_id == 9001) {
                 try std.testing.expectEqual(@as(usize, 1), req.req.unique_constraint_deletes.len);
                 try std.testing.expectEqualStrings(self.old_encoded_value, req.req.unique_constraint_deletes[0].encoded_value);
@@ -4951,6 +5147,22 @@ test "distributed txn coordinator routes versioned unique owner handoff" {
     try std.testing.expectEqual(@as(usize, 2), result.participant_count);
     try std.testing.expectEqual(@as(usize, 1), recorder.lookup_calls);
     try std.testing.expect(recorder.prepared_owner);
+
+    var unversioned_recorder = Recorder{ .old_encoded_value = old_encoded_value, .new_encoded_value = new_encoded_value };
+    const unversioned_result = try executeCrossGroup(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        unversioned_recorder.worker(),
+        "users",
+        try parseTxnIdHex("42424242424242424242424242424243"),
+        31_100,
+        31_101,
+        .{ .writes = &.{.{ .key = "user:z", .value = "{\"email\":\"grace@example.test\"}" }} },
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 2), unversioned_result.participant_count);
+    try std.testing.expectEqual(@as(usize, 1), unversioned_recorder.lookup_calls);
+    try std.testing.expect(unversioned_recorder.prepared_owner);
 }
 
 test "distributed txn coordinator allows non-unique transforms on multi-range unique tables" {
@@ -6494,6 +6706,15 @@ test "distributed txn coordinator routes foreign key reference transforms with f
                         std.mem.eql(u8, "doc:c-order", key) or
                         std.mem.eql(u8, "doc:d-order", key),
                 );
+                try std.testing.expectEqual(@as(usize, 1), req.req.predicates.len);
+                try std.testing.expectEqualStrings(key, req.req.predicates[0].key);
+                const expected_version: u64 = if (std.mem.eql(u8, "doc:a-order", key))
+                    7
+                else if (std.mem.eql(u8, "doc:d-order", key))
+                    8
+                else
+                    0;
+                try std.testing.expectEqual(expected_version, req.req.predicates[0].expected_version);
                 if (std.mem.eql(u8, "doc:c-order", key)) {
                     try std.testing.expectEqual(@as(usize, 1), req.req.writes.len);
                     try std.testing.expectEqualStrings("doc:c-order", req.req.writes[0].key);
@@ -6610,12 +6831,12 @@ test "distributed txn coordinator routes foreign key reference transforms with f
         .path = "customer_id",
         .value_json = "\"cust:d-final\"",
     }};
-    var recorder = Recorder{};
     const txn_id = try parseTxnIdHex("abcdefabcdefabcdefabcdefabcdefab");
-    try std.testing.expectError(error.UnsupportedOperation, executeMultiTableCommit(
+    var unversioned_recorder = Recorder{};
+    const unversioned_outcome = try executeMultiTableCommit(
         std.testing.allocator,
         FakeCatalog.iface(),
-        recorder.worker(),
+        unversioned_recorder.worker(),
         txn_id,
         10_000,
         10_001,
@@ -6627,9 +6848,14 @@ test "distributed txn coordinator routes foreign key reference transforms with f
             }},
         }},
         null,
-    ));
-    try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
+    );
+    try std.testing.expectEqual(@as(usize, 3), unversioned_outcome.committed.participant_count);
+    try std.testing.expectEqual(@as(usize, 3), unversioned_recorder.begin_calls);
+    try std.testing.expectEqual(@as(usize, 3), unversioned_recorder.prepare_calls);
+    try std.testing.expectEqual(@as(usize, 3), unversioned_recorder.resolve_calls);
+    try std.testing.expectEqual(@as(usize, 1), unversioned_recorder.lookup_calls);
 
+    var recorder = Recorder{};
     const outcome = try executeCrossGroup(
         std.testing.allocator,
         FakeCatalog.iface(),
