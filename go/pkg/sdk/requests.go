@@ -19,6 +19,7 @@ package sdk
 import (
 	"bytes"
 	"fmt"
+	"reflect"
 
 	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
@@ -187,8 +188,10 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		SemanticSearch:   q.SemanticSearch,
 		DocumentRenderer: q.DocumentRenderer,
 		GraphSearches:    q.GraphSearches,
-		Join:             q.Join,
 		ForeignSources:   q.ForeignSources,
+	}
+	if !reflect.ValueOf(q.Join).IsZero() {
+		oapiReq.Join = q.Join
 	}
 
 	// Marshal query fields to json.RawMessage
@@ -212,7 +215,19 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		}
 	}
 
-	return json.Marshal(oapiReq)
+	data, err := json.Marshal(oapiReq)
+	if err != nil {
+		return nil, err
+	}
+	if reflect.ValueOf(q.Join).IsZero() {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return nil, err
+		}
+		delete(fields, "join")
+		return json.Marshal(fields)
+	}
+	return data, nil
 }
 
 // UnmarshalJSON implements custom JSON unmarshalling for QueryRequest.
