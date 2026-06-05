@@ -372,7 +372,9 @@ def default_generator_model_name(available_generators: set[str] | None = None) -
     if override:
         return override
 
-    if available_generators:
+    if available_generators is not None:
+        if not available_generators:
+            return None
         for candidate in (DEFAULT_GENERATOR_MODEL, DEFAULT_TOOL_GENERATOR_MODEL):
             if candidate in available_generators:
                 return candidate
@@ -431,9 +433,10 @@ def find_tool_model_name(available_generators: set[str] | None = None) -> str | 
                 if available_generators is None or model_name in available_generators:
                     return model_name
 
-    if available_generators:
+    if available_generators is not None:
         if DEFAULT_TOOL_GENERATOR_MODEL in available_generators:
             return DEFAULT_TOOL_GENERATOR_MODEL
+        return None
 
     return DEFAULT_TOOL_GENERATOR_MODEL
 
@@ -498,9 +501,10 @@ def find_multimodal_generator_model_name(available_generators: set[str] | None =
             if available_generators is None or model_name in available_generators:
                 return model_name
 
-    if available_generators:
+    if available_generators is not None:
         if DEFAULT_MULTIMODAL_GENERATOR_MODEL in available_generators:
             return DEFAULT_MULTIMODAL_GENERATOR_MODEL
+        return None
 
     return DEFAULT_MULTIMODAL_GENERATOR_MODEL
 
