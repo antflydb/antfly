@@ -254,6 +254,7 @@ fn deriveRuntimeForeignKeys(alloc: std.mem.Allocator, schema: ParsedTableSchema)
                 .immediate => .immediate,
                 .deferred => .deferred,
             },
+            .deferrable = foreign_key.deferrable,
             .match = switch (foreign_key.match) {
                 .simple => .simple,
                 .full => .full,

@@ -6418,7 +6418,8 @@ pub const DB = struct {
     ) !void {
         for (schedules) |schedule| {
             if (schedule.schedule_id.len == 0 or schedule.action_job_id.len == 0 or schedule.page_limit == 0) return error.InvalidForeignKeyActionJob;
-            try validateForeignKeyActionJobIdentity(schedule.action_job_id, schedule.action, schedule.worker_id, schedule.constraint_name, schedule.parent_table, schedule.parent_key, schedule.updated_parent_key);
+            const canonical_action = foreignKeyActionJobCanonicalAction(schedule.action) orelse return error.InvalidForeignKeyActionJob;
+            try validateForeignKeyActionJobIdentity(schedule.action_job_id, canonical_action, schedule.worker_id, schedule.constraint_name, schedule.parent_table, schedule.parent_key, schedule.updated_parent_key);
 
             const key = try foreignKeyActionScheduleKeyAlloc(self.alloc, schedule.schedule_id);
             errdefer self.alloc.free(key);
@@ -6426,7 +6427,7 @@ pub const DB = struct {
                 defer self.alloc.free(raw);
                 const existing = try self.cloneForeignKeyActionScheduleRecordFromJson(raw);
                 defer self.freeForeignKeyActionScheduleRecord(existing);
-                try validateForeignKeyActionScheduleMatches(existing, schedule.action_job_id, schedule.action, schedule.constraint_name, schedule.parent_table, schedule.parent_key, schedule.updated_parent_key);
+                try validateForeignKeyActionScheduleMatches(existing, schedule.action_job_id, canonical_action, schedule.constraint_name, schedule.parent_table, schedule.parent_key, schedule.updated_parent_key);
                 self.alloc.free(key);
                 continue;
             } else |err| switch (err) {
@@ -6437,7 +6438,7 @@ pub const DB = struct {
             const record = ForeignKeyActionScheduleRecord{
                 .schedule_id = schedule.schedule_id,
                 .action_job_id = schedule.action_job_id,
-                .action = schedule.action,
+                .action = canonical_action,
                 .worker_id = schedule.worker_id,
                 .constraint_name = schedule.constraint_name,
                 .parent_table = schedule.parent_table,
@@ -6449,6 +6450,8 @@ pub const DB = struct {
                 .updated_at_ns = now_ns,
                 .completed = false,
                 .scheduled_groups = 0,
+                .cascade_depth = schedule.cascade_depth,
+                .cascade_max_depth = schedule.cascade_max_depth,
                 .last_error = null,
             };
             const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
@@ -6956,13 +6959,13 @@ pub const DB = struct {
         if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
         for (overrides, 0..) |override, i| {
             if (override.constraint_name.len == 0) return error.ForeignKeyViolation;
-            if (override.timing != .immediate) return error.ForeignKeyViolation;
+            if (override.timing != .immediate and override.timing != .deferred) return error.ForeignKeyViolation;
             for (overrides[0..i]) |previous| {
                 if (std.mem.eql(u8, previous.constraint_name, override.constraint_name)) return error.ForeignKeyViolation;
             }
             const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, override.constraint_name) orelse return error.ForeignKeyViolation;
             if (foreign_key.validation_state != .enforced) return error.ForeignKeyViolation;
-            if (foreign_key.timing != .deferred) return error.ForeignKeyViolation;
+            if (!foreign_key.deferrable) return error.ForeignKeyViolation;
         }
     }
 
@@ -10632,6 +10635,13 @@ pub const DB = struct {
         attempts: u32 = 0,
         completed: bool = false,
         applied_children: u64 = 0,
+        failure_count: u64 = 0,
+        first_failed_at_ns: ?u64 = null,
+        last_failed_at_ns: ?u64 = null,
+        requeue_count: u64 = 0,
+        last_requeued_at_ns: ?u64 = null,
+        cascade_depth: u32 = 0,
+        cascade_max_depth: u32 = 64,
         next_child_table: ?[]const u8 = null,
         next_child_key: ?[]const u8 = null,
         last_error: ?[]const u8 = null,
@@ -10672,6 +10682,8 @@ pub const DB = struct {
         updated_at_ns: u64,
         completed: bool = false,
         scheduled_groups: u64 = 0,
+        cascade_depth: u32 = 0,
+        cascade_max_depth: u32 = 64,
         last_error: ?[]const u8 = null,
     };
 
@@ -11667,7 +11679,8 @@ pub const DB = struct {
     ) !ForeignKeyActionJobRecord {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (page_limit == 0) return error.InvalidForeignKeyActionJob;
-        try validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
+        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
+        try validateForeignKeyActionJobIdentity(job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
         lockApply(self);
         defer self.core.unlockApply();
 
@@ -11678,16 +11691,17 @@ pub const DB = struct {
             defer self.alloc.free(raw);
             const existing = try self.cloneForeignKeyActionJobRecordFromJson(raw);
             errdefer self.freeForeignKeyActionJobRecord(existing);
-            try validateForeignKeyActionJobMatches(existing, action, constraint_name, parent_table, parent_key, updated_parent_key);
+            try validateForeignKeyActionJobMatches(existing, canonical_action, constraint_name, parent_table, parent_key, updated_parent_key);
             return existing;
         } else |err| switch (err) {
             error.NotFound => {},
             else => return err,
         }
 
+        const lineage = foreignKeyActionLineageFromId(job_id);
         const record = ForeignKeyActionJobRecord{
             .job_id = job_id,
-            .action = action,
+            .action = canonical_action,
             .worker_id = worker_id,
             .constraint_name = constraint_name,
             .parent_table = parent_table,
@@ -11702,6 +11716,13 @@ pub const DB = struct {
             .attempts = 0,
             .completed = false,
             .applied_children = 0,
+            .failure_count = 0,
+            .first_failed_at_ns = null,
+            .last_failed_at_ns = null,
+            .requeue_count = 0,
+            .last_requeued_at_ns = null,
+            .cascade_depth = lineage.cascade_depth,
+            .cascade_max_depth = lineage.cascade_max_depth,
             .next_child_table = null,
             .next_child_key = null,
             .last_error = null,
@@ -11797,7 +11818,8 @@ pub const DB = struct {
     ) !ForeignKeyActionJobRecord {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (page_limit == 0) return error.InvalidForeignKeyActionJob;
-        try validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
+        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
+        try validateForeignKeyActionJobIdentity(job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
         lockApply(self);
         defer self.core.unlockApply();
 
@@ -11811,7 +11833,7 @@ pub const DB = struct {
 
         const existing = try self.cloneForeignKeyActionJobRecordFromJson(raw);
         defer self.freeForeignKeyActionJobRecord(existing);
-        try validateForeignKeyActionJobMatches(existing, action, constraint_name, parent_table, parent_key, updated_parent_key);
+        try validateForeignKeyActionJobMatches(existing, canonical_action, constraint_name, parent_table, parent_key, updated_parent_key);
         if (existing.completed) return error.InvalidForeignKeyActionJob;
 
         const record = ForeignKeyActionJobRecord{
@@ -11831,6 +11853,13 @@ pub const DB = struct {
             .attempts = existing.attempts,
             .completed = false,
             .applied_children = existing.applied_children,
+            .failure_count = existing.failure_count,
+            .first_failed_at_ns = existing.first_failed_at_ns,
+            .last_failed_at_ns = existing.last_failed_at_ns,
+            .requeue_count = existing.requeue_count +| 1,
+            .last_requeued_at_ns = now_ns,
+            .cascade_depth = existing.cascade_depth,
+            .cascade_max_depth = existing.cascade_max_depth,
             .next_child_table = existing.next_child_table,
             .next_child_key = existing.next_child_key,
             .last_error = null,
@@ -11933,7 +11962,8 @@ pub const DB = struct {
     ) !ForeignKeyActionScheduleRecord {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (schedule_id.len == 0 or action_job_id.len == 0 or page_limit == 0) return error.InvalidForeignKeyActionJob;
-        try validateForeignKeyActionJobIdentity(action_job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
+        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
+        try validateForeignKeyActionJobIdentity(action_job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
         lockApply(self);
         defer self.core.unlockApply();
 
@@ -11943,17 +11973,18 @@ pub const DB = struct {
             defer self.alloc.free(raw);
             const existing = try self.cloneForeignKeyActionScheduleRecordFromJson(raw);
             errdefer self.freeForeignKeyActionScheduleRecord(existing);
-            try validateForeignKeyActionScheduleMatches(existing, action_job_id, action, constraint_name, parent_table, parent_key, updated_parent_key);
+            try validateForeignKeyActionScheduleMatches(existing, action_job_id, canonical_action, constraint_name, parent_table, parent_key, updated_parent_key);
             return existing;
         } else |err| switch (err) {
             error.NotFound => {},
             else => return err,
         }
 
+        const lineage = foreignKeyActionLineageFromId(action_job_id);
         const record = ForeignKeyActionScheduleRecord{
             .schedule_id = schedule_id,
             .action_job_id = action_job_id,
-            .action = action,
+            .action = canonical_action,
             .worker_id = worker_id,
             .constraint_name = constraint_name,
             .parent_table = parent_table,
@@ -11965,6 +11996,8 @@ pub const DB = struct {
             .updated_at_ns = now_ns,
             .completed = false,
             .scheduled_groups = 0,
+            .cascade_depth = lineage.cascade_depth,
+            .cascade_max_depth = lineage.cascade_max_depth,
             .last_error = null,
         };
         const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
@@ -12018,6 +12051,8 @@ pub const DB = struct {
             .updated_at_ns = now_ns,
             .completed = scheduled_groups != 0,
             .scheduled_groups = scheduled_groups,
+            .cascade_depth = existing.cascade_depth,
+            .cascade_max_depth = existing.cascade_max_depth,
             .last_error = if (scheduled_groups == 0) "NoForeignKeyActionOwnerGroups" else null,
         };
         const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
@@ -12066,11 +12101,12 @@ pub const DB = struct {
         now_ns: u64,
     ) !ForeignKeyActionJobRecord {
         if (page_limit == 0 or lease_ms == 0) return error.InvalidForeignKeyActionJob;
-        try validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
+        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
+        try validateForeignKeyActionJobIdentity(job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
 
         const claimed = try self.claimForeignKeyActionJobRecordAt(
             job_id,
-            action,
+            canonical_action,
             worker_id,
             constraint_name,
             parent_table,
@@ -12083,7 +12119,7 @@ pub const DB = struct {
         defer self.freeForeignKeyActionJobRecord(claimed);
         if (claimed.completed) return try self.cloneForeignKeyActionJobRecordOwned(claimed);
 
-        return self.runClaimedForeignKeyActionJobPageAt(claimed, action, constraint_name, parent_table, parent_key, page_limit, now_ns) catch |err| {
+        return self.runClaimedForeignKeyActionJobPageAt(claimed, canonical_action, constraint_name, parent_table, parent_key, page_limit, now_ns) catch |err| {
             const failed = self.updateForeignKeyActionJobRecordAfterPageAt(
                 claimed,
                 0,
@@ -12327,7 +12363,8 @@ pub const DB = struct {
     ) !ForeignKeyActionJobRecord {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (page_limit == 0 or lease_ms == 0) return error.InvalidForeignKeyActionJob;
-        try validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
+        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
+        try validateForeignKeyActionJobIdentity(job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
         lockApply(self);
         defer self.core.unlockApply();
 
@@ -12338,6 +12375,13 @@ pub const DB = struct {
         var attempts: u32 = 1;
         var completed = false;
         var applied_children: u64 = 0;
+        var failure_count: u64 = 0;
+        var first_failed_at_ns: ?u64 = null;
+        var last_failed_at_ns: ?u64 = null;
+        var requeue_count: u64 = 0;
+        var last_requeued_at_ns: ?u64 = null;
+        var cascade_depth = foreignKeyActionLineageFromId(job_id).cascade_depth;
+        var cascade_max_depth = foreignKeyActionLineageFromId(job_id).cascade_max_depth;
         var next_child_table: ?[]const u8 = null;
         var next_child_key: ?[]const u8 = null;
         var existing_next_child_table: ?[]u8 = null;
@@ -12350,7 +12394,10 @@ pub const DB = struct {
             defer self.alloc.free(raw);
             const existing = try self.cloneForeignKeyActionJobRecordFromJson(raw);
             defer self.freeForeignKeyActionJobRecord(existing);
-            try validateForeignKeyActionJobMatches(existing, action, constraint_name, parent_table, parent_key, updated_parent_key);
+            try validateForeignKeyActionJobMatches(existing, canonical_action, constraint_name, parent_table, parent_key, updated_parent_key);
+            if (!existing.completed and (std.mem.eql(u8, existing.status, "invalid") or existing.last_error != null)) {
+                return error.InvalidForeignKeyActionJob;
+            }
             if (!existing.completed and !std.mem.eql(u8, existing.worker_id, worker_id) and existing.lease_until_ns > now_ns) {
                 return error.ForeignKeyIntegrityClaimBusy;
             }
@@ -12358,6 +12405,13 @@ pub const DB = struct {
             attempts = existing.attempts +| 1;
             completed = existing.completed;
             applied_children = existing.applied_children;
+            failure_count = existing.failure_count;
+            first_failed_at_ns = existing.first_failed_at_ns;
+            last_failed_at_ns = existing.last_failed_at_ns;
+            requeue_count = existing.requeue_count;
+            last_requeued_at_ns = existing.last_requeued_at_ns;
+            cascade_depth = existing.cascade_depth;
+            cascade_max_depth = existing.cascade_max_depth;
             if (existing.next_child_table) |value| {
                 existing_next_child_table = try self.alloc.dupe(u8, value);
                 next_child_table = existing_next_child_table.?;
@@ -12375,7 +12429,7 @@ pub const DB = struct {
         const lease_until_ns = now_ns +| lease_ns;
         const record = ForeignKeyActionJobRecord{
             .job_id = job_id,
-            .action = action,
+            .action = canonical_action,
             .worker_id = worker_id,
             .constraint_name = constraint_name,
             .parent_table = parent_table,
@@ -12390,6 +12444,13 @@ pub const DB = struct {
             .attempts = attempts,
             .completed = completed,
             .applied_children = applied_children,
+            .failure_count = failure_count,
+            .first_failed_at_ns = first_failed_at_ns,
+            .last_failed_at_ns = last_failed_at_ns,
+            .requeue_count = requeue_count,
+            .last_requeued_at_ns = last_requeued_at_ns,
+            .cascade_depth = cascade_depth,
+            .cascade_max_depth = cascade_max_depth,
             .next_child_table = next_child_table,
             .next_child_key = next_child_key,
             .last_error = null,
@@ -12425,6 +12486,7 @@ pub const DB = struct {
         defer self.freeForeignKeyActionJobRecord(current);
         try validateForeignKeyActionJobMatches(current, existing.action, existing.constraint_name, existing.parent_table, existing.parent_key, existing.updated_parent_key);
         if (!foreignKeyActionJobClaimsMatch(current, existing)) return error.ForeignKeyIntegrityClaimBusy;
+        const failed = last_error != null;
 
         const record = ForeignKeyActionJobRecord{
             .job_id = current.job_id,
@@ -12441,8 +12503,15 @@ pub const DB = struct {
             .claimed_at_ns = current.claimed_at_ns,
             .lease_until_ns = current.lease_until_ns,
             .attempts = current.attempts,
-            .completed = complete and last_error == null,
+            .completed = complete and !failed,
             .applied_children = current.applied_children +| @as(u64, @intCast(applied_count)),
+            .failure_count = current.failure_count +| @as(u64, if (failed) 1 else 0),
+            .first_failed_at_ns = if (failed and current.first_failed_at_ns == null) now_ns else current.first_failed_at_ns,
+            .last_failed_at_ns = if (failed) now_ns else current.last_failed_at_ns,
+            .requeue_count = current.requeue_count,
+            .last_requeued_at_ns = current.last_requeued_at_ns,
+            .cascade_depth = current.cascade_depth,
+            .cascade_max_depth = current.cascade_max_depth,
             .next_child_table = if (complete) null else next_child_table,
             .next_child_key = if (complete) null else next_child_key,
             .last_error = last_error,
@@ -12727,6 +12796,13 @@ pub const DB = struct {
             .attempts = parsed.value.attempts,
             .completed = parsed.value.completed,
             .applied_children = parsed.value.applied_children,
+            .failure_count = parsed.value.failure_count,
+            .first_failed_at_ns = parsed.value.first_failed_at_ns,
+            .last_failed_at_ns = parsed.value.last_failed_at_ns,
+            .requeue_count = parsed.value.requeue_count,
+            .last_requeued_at_ns = parsed.value.last_requeued_at_ns,
+            .cascade_depth = parsed.value.cascade_depth,
+            .cascade_max_depth = parsed.value.cascade_max_depth,
             .next_child_table = null,
             .next_child_key = null,
             .last_error = null,
@@ -12781,6 +12857,8 @@ pub const DB = struct {
             .updated_at_ns = parsed.value.updated_at_ns,
             .completed = parsed.value.completed,
             .scheduled_groups = parsed.value.scheduled_groups,
+            .cascade_depth = parsed.value.cascade_depth,
+            .cascade_max_depth = parsed.value.cascade_max_depth,
             .last_error = null,
         };
         errdefer self.freeForeignKeyActionScheduleRecord(cloned);
@@ -12820,15 +12898,41 @@ pub const DB = struct {
         };
     }
 
+    fn foreignKeyActionJobCanonicalAction(action: []const u8) ?[]const u8 {
+        if (enumTokenEql(action, "set_null")) return "set_null";
+        if (enumTokenEql(action, "cascade")) return "cascade";
+        if (enumTokenEql(action, "update_set_null") or enumTokenEql(action, "on_update_set_null")) return "update_set_null";
+        if (enumTokenEql(action, "update_cascade") or enumTokenEql(action, "on_update_cascade")) return "update_cascade";
+        return null;
+    }
+
     fn foreignKeyActionJobActionSupported(action: []const u8) bool {
-        return std.mem.eql(u8, action, "set_null") or
-            std.mem.eql(u8, action, "cascade") or
-            std.mem.eql(u8, action, "update_set_null") or
-            std.mem.eql(u8, action, "update_cascade");
+        return foreignKeyActionJobCanonicalAction(action) != null;
     }
 
     fn foreignKeyActionJobIsUpdate(action: []const u8) bool {
-        return std.mem.eql(u8, action, "update_set_null") or std.mem.eql(u8, action, "update_cascade");
+        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return false;
+        return std.mem.eql(u8, canonical_action, "update_set_null") or std.mem.eql(u8, canonical_action, "update_cascade");
+    }
+
+    fn enumTokenEql(actual: []const u8, expected: []const u8) bool {
+        var actual_index: usize = 0;
+        var expected_index: usize = 0;
+        while (true) {
+            while (actual_index < actual.len and enumTokenSeparator(actual[actual_index])) actual_index += 1;
+            while (expected_index < expected.len and enumTokenSeparator(expected[expected_index])) expected_index += 1;
+            if (actual_index == actual.len or expected_index == expected.len) break;
+            if (std.ascii.toLower(actual[actual_index]) != std.ascii.toLower(expected[expected_index])) return false;
+            actual_index += 1;
+            expected_index += 1;
+        }
+        while (actual_index < actual.len and enumTokenSeparator(actual[actual_index])) actual_index += 1;
+        while (expected_index < expected.len and enumTokenSeparator(expected[expected_index])) expected_index += 1;
+        return actual_index == actual.len and expected_index == expected.len;
+    }
+
+    fn enumTokenSeparator(ch: u8) bool {
+        return ch == ' ' or ch == '_' or ch == '-';
     }
 
     fn foreignKeyActionUpdatedParentKeyMatches(existing: ?[]const u8, expected: ?[]const u8) bool {
@@ -12837,6 +12941,30 @@ pub const DB = struct {
             return std.mem.eql(u8, existing_value, expected_value);
         }
         return expected == null;
+    }
+
+    const ForeignKeyActionLineage = struct {
+        cascade_depth: u32 = 0,
+        cascade_max_depth: u32 = 64,
+    };
+
+    fn foreignKeyActionLineageFromId(id: []const u8) ForeignKeyActionLineage {
+        const action_prefix = "fk-action:v4:";
+        const schedule_prefix = "fk-action-schedule:v4:";
+        const rest = if (std.mem.startsWith(u8, id, action_prefix))
+            id[action_prefix.len..]
+        else if (std.mem.startsWith(u8, id, schedule_prefix))
+            id[schedule_prefix.len..]
+        else
+            return .{};
+
+        const depth_end = std.mem.indexOfScalar(u8, rest, ':') orelse return .{};
+        const depth = std.fmt.parseUnsigned(u32, rest[0..depth_end], 10) catch return .{};
+        const max_rest = rest[depth_end + 1 ..];
+        const max_end = std.mem.indexOfScalar(u8, max_rest, ':') orelse return .{};
+        const max_depth = std.fmt.parseUnsigned(u32, max_rest[0..max_end], 10) catch return .{};
+        if (max_depth == 0 or depth > max_depth) return .{};
+        return .{ .cascade_depth = depth, .cascade_max_depth = max_depth };
     }
 
     fn validateForeignKeyActionJobIdentity(
@@ -12851,10 +12979,10 @@ pub const DB = struct {
         if (job_id.len == 0 or action.len == 0 or worker_id.len == 0 or constraint_name.len == 0 or parent_table.len == 0 or parent_key.len == 0) {
             return error.InvalidForeignKeyActionJob;
         }
-        if (!foreignKeyActionJobActionSupported(action)) return error.InvalidForeignKeyActionJob;
-        if (std.mem.eql(u8, action, "update_cascade")) {
+        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
+        if (std.mem.eql(u8, canonical_action, "update_cascade")) {
             if (updated_parent_key == null or updated_parent_key.?.len == 0) return error.InvalidForeignKeyActionJob;
-        } else if (!foreignKeyActionJobIsUpdate(action) and updated_parent_key != null) {
+        } else if (!foreignKeyActionJobIsUpdate(canonical_action) and updated_parent_key != null) {
             return error.InvalidForeignKeyActionJob;
         }
     }
@@ -12867,7 +12995,8 @@ pub const DB = struct {
         parent_key: []const u8,
         updated_parent_key: ?[]const u8,
     ) !void {
-        if (!std.mem.eql(u8, existing.action, action) or
+        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
+        if (!std.mem.eql(u8, existing.action, canonical_action) or
             !std.mem.eql(u8, existing.constraint_name, constraint_name) or
             !std.mem.eql(u8, existing.parent_table, parent_table) or
             !std.mem.eql(u8, existing.parent_key, parent_key) or
@@ -12895,8 +13024,9 @@ pub const DB = struct {
         parent_key: []const u8,
         updated_parent_key: ?[]const u8,
     ) !void {
+        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
         if (!std.mem.eql(u8, existing.action_job_id, action_job_id) or
-            !std.mem.eql(u8, existing.action, action) or
+            !std.mem.eql(u8, existing.action, canonical_action) or
             !std.mem.eql(u8, existing.constraint_name, constraint_name) or
             !std.mem.eql(u8, existing.parent_table, parent_table) or
             !std.mem.eql(u8, existing.parent_key, parent_key) or
@@ -45243,7 +45373,7 @@ test "db foreign key maintenance leases use durable realtime clock" {
     try std.testing.expectEqual(@as(u64, 0), action.lease_until_ns);
 
     const before_action_claim_ns = currentTimeNs();
-    const claimed_action = try db.claimAndRunForeignKeyActionJobPage(
+    const claimed_action = try db.claimForeignKeyActionJobPage(
         "fk-action:realtime:claim",
         "set_null",
         "worker:realtime",
@@ -45256,6 +45386,103 @@ test "db foreign key maintenance leases use durable realtime clock" {
     defer db.freeForeignKeyActionJobRecord(claimed_action);
     try std.testing.expect(claimed_action.claimed_at_ns >= before_action_claim_ns);
     try std.testing.expect(claimed_action.lease_until_ns > currentTimeNs());
+}
+
+test "db foreign key action jobs canonicalize SQL action aliases" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const scheduled = try db.scheduleForeignKeyActionJobAt(
+        "fk-action:sql-set-null",
+        "SET NULL",
+        "worker:fk-action:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:sql",
+        16,
+        100_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(scheduled);
+    try std.testing.expectEqualStrings("set_null", scheduled.action);
+
+    const scheduled_again = try db.scheduleForeignKeyActionJobAt(
+        "fk-action:sql-set-null",
+        "set-null",
+        "worker:fk-action:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:sql",
+        16,
+        100_001,
+    );
+    defer db.freeForeignKeyActionJobRecord(scheduled_again);
+    try std.testing.expectEqualStrings("set_null", scheduled_again.action);
+    try std.testing.expectEqual(@as(u64, scheduled.created_at_ns), scheduled_again.created_at_ns);
+
+    const claimed = try db.claimForeignKeyActionJobPageAt(
+        "fk-action:sql-set-null",
+        "SET NULL",
+        "worker:fk-action:claimer",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:sql",
+        16,
+        60_000,
+        100_010,
+    );
+    defer db.freeForeignKeyActionJobRecord(claimed);
+    try std.testing.expectEqualStrings("set_null", claimed.action);
+    try std.testing.expectEqualStrings("claimed", claimed.status);
+
+    const update_scheduled = try db.scheduleForeignKeyActionJobWithUpdatedParentKeyAt(
+        "fk-action:sql-update-cascade",
+        "UPDATE CASCADE",
+        "worker:fk-action:scheduler",
+        "users_ref_email_fkey",
+        "users",
+        "email:old",
+        "email:new",
+        8,
+        100_020,
+    );
+    defer db.freeForeignKeyActionJobRecord(update_scheduled);
+    try std.testing.expectEqualStrings("update_cascade", update_scheduled.action);
+    try std.testing.expectEqualStrings("email:new", update_scheduled.updated_parent_key.?);
+
+    const schedule = try db.scheduleForeignKeyActionScheduleAt(
+        "fk-action-schedule:sql-set-null",
+        "fk-action:sql-set-null-scheduled",
+        "SET NULL",
+        "worker:fk-action:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:scheduled",
+        32,
+        100_030,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(schedule);
+    try std.testing.expectEqualStrings("set_null", schedule.action);
+
+    const schedule_again = try db.scheduleForeignKeyActionScheduleAt(
+        "fk-action-schedule:sql-set-null",
+        "fk-action:sql-set-null-scheduled",
+        "set-null",
+        "worker:fk-action:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:scheduled",
+        32,
+        100_031,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(schedule_again);
+    try std.testing.expectEqualStrings("set_null", schedule_again.action);
+    try std.testing.expectEqual(@as(u64, schedule.created_at_ns), schedule_again.created_at_ns);
 }
 
 test "db foreign key action job applies set-null children in durable pages" {
@@ -45531,6 +45758,25 @@ test "db foreign key action job requeue preserves durable cursor and clears fail
     try std.testing.expectEqualStrings("order:requeue:cursor", failed.next_child_key.?);
     try std.testing.expect(failed.last_error != null);
     try std.testing.expectEqualStrings("OperatorPaused", failed.last_error.?);
+    try std.testing.expectEqual(@as(u64, 1), failed.failure_count);
+    try std.testing.expect(failed.first_failed_at_ns != null);
+    try std.testing.expectEqual(@as(u64, 210_000), failed.first_failed_at_ns.?);
+    try std.testing.expect(failed.last_failed_at_ns != null);
+    try std.testing.expectEqual(@as(u64, 210_000), failed.last_failed_at_ns.?);
+    try std.testing.expectEqual(@as(u64, 0), failed.requeue_count);
+    try std.testing.expect(failed.last_requeued_at_ns == null);
+
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.claimForeignKeyActionJobPageAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:auto-retry",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        4,
+        60_000,
+        failed.lease_until_ns +| 1,
+    ));
 
     try std.testing.expectError(error.InvalidForeignKeyActionJob, db.requeueForeignKeyActionJobAt(
         "fk-action:set-null:requeue",
@@ -45567,6 +45813,14 @@ test "db foreign key action job requeue preserves durable cursor and clears fail
     try std.testing.expect(requeued.next_child_key != null);
     try std.testing.expectEqualStrings("order:requeue:cursor", requeued.next_child_key.?);
     try std.testing.expect(requeued.last_error == null);
+    try std.testing.expectEqual(@as(u64, 1), requeued.failure_count);
+    try std.testing.expect(requeued.first_failed_at_ns != null);
+    try std.testing.expectEqual(@as(u64, 210_000), requeued.first_failed_at_ns.?);
+    try std.testing.expect(requeued.last_failed_at_ns != null);
+    try std.testing.expectEqual(@as(u64, 210_000), requeued.last_failed_at_ns.?);
+    try std.testing.expectEqual(@as(u64, 1), requeued.requeue_count);
+    try std.testing.expect(requeued.last_requeued_at_ns != null);
+    try std.testing.expectEqual(@as(u64, 220_000), requeued.last_requeued_at_ns.?);
 
     const retry_claim = try db.claimForeignKeyActionJobPageAt(
         "fk-action:set-null:requeue",
@@ -45588,6 +45842,8 @@ test "db foreign key action job requeue preserves durable cursor and clears fail
     try std.testing.expectEqualStrings("row", retry_claim.next_child_table.?);
     try std.testing.expect(retry_claim.next_child_key != null);
     try std.testing.expectEqualStrings("order:requeue:cursor", retry_claim.next_child_key.?);
+    try std.testing.expectEqual(@as(u64, 1), retry_claim.failure_count);
+    try std.testing.expectEqual(@as(u64, 1), retry_claim.requeue_count);
 
     const completed = try db.finishClaimedForeignKeyActionJobPageAt(
         retry_claim,
@@ -45601,6 +45857,8 @@ test "db foreign key action job requeue preserves durable cursor and clears fail
     defer db.freeForeignKeyActionJobRecord(completed);
     try std.testing.expectEqualStrings("complete", completed.status);
     try std.testing.expect(completed.completed);
+    try std.testing.expectEqual(@as(u64, 1), completed.failure_count);
+    try std.testing.expectEqual(@as(u64, 1), completed.requeue_count);
 
     try std.testing.expectError(error.InvalidForeignKeyActionJob, db.requeueForeignKeyActionJobAt(
         "fk-action:set-null:requeue",
@@ -45629,12 +45887,14 @@ test "db transaction writes durable foreign key action schedules atomically" {
         .foreign_key_action_schedules = &.{.{
             .schedule_id = "fk-action-schedule:orders:customers:customer:txn",
             .action_job_id = "fk-action:orders:customers:customer:txn",
-            .action = "set_null",
+            .action = "SET NULL",
             .worker_id = "worker:txn",
             .constraint_name = "orders_customer_id_fkey",
             .parent_table = "customers",
             .parent_key = "customer:txn",
             .page_limit = 128,
+            .cascade_depth = 2,
+            .cascade_max_depth = 8,
         }},
     });
 
@@ -45650,6 +45910,8 @@ test "db transaction writes durable foreign key action schedules atomically" {
     try std.testing.expectEqualStrings("customers", loaded.parent_table);
     try std.testing.expectEqualStrings("customer:txn", loaded.parent_key);
     try std.testing.expectEqual(@as(usize, 128), loaded.page_limit);
+    try std.testing.expectEqual(@as(u32, 2), loaded.cascade_depth);
+    try std.testing.expectEqual(@as(u32, 8), loaded.cascade_max_depth);
     try std.testing.expectEqualStrings("pending", loaded.status);
     try std.testing.expect(!loaded.completed);
 
@@ -45658,12 +45920,14 @@ test "db transaction writes durable foreign key action schedules atomically" {
         .foreign_key_action_schedules = &.{.{
             .schedule_id = "fk-action-schedule:orders:customers:customer:txn",
             .action_job_id = "fk-action:orders:customers:customer:txn",
-            .action = "set_null",
+            .action = "set-null",
             .worker_id = "worker:txn",
             .constraint_name = "orders_customer_id_fkey",
             .parent_table = "customers",
             .parent_key = "customer:txn",
             .page_limit = 128,
+            .cascade_depth = 2,
+            .cascade_max_depth = 8,
         }},
     });
     try db.commitTransaction(retry_txn, 31_011);
@@ -45679,8 +45943,39 @@ test "db transaction writes durable foreign key action schedules atomically" {
             .parent_table = "customers",
             .parent_key = "customer:txn",
             .page_limit = 128,
+            .cascade_depth = 2,
+            .cascade_max_depth = 8,
         }},
     }));
+
+    const generated_job = try db.scheduleForeignKeyActionJobAt(
+        "fk-action:v4:3:9:generated-lineage",
+        "cascade",
+        "worker:txn",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:lineage",
+        128,
+        31_030,
+    );
+    defer db.freeForeignKeyActionJobRecord(generated_job);
+    try std.testing.expectEqual(@as(u32, 3), generated_job.cascade_depth);
+    try std.testing.expectEqual(@as(u32, 9), generated_job.cascade_max_depth);
+
+    const generated_schedule = try db.scheduleForeignKeyActionScheduleAt(
+        "fk-action-schedule:v4:4:10:generated-lineage",
+        "fk-action:v4:4:10:generated-lineage",
+        "cascade",
+        "worker:txn",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:lineage",
+        128,
+        31_031,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(generated_schedule);
+    try std.testing.expectEqual(@as(u32, 4), generated_schedule.cascade_depth);
+    try std.testing.expectEqual(@as(u32, 10), generated_schedule.cascade_max_depth);
 }
 
 test "db foreign key action schedule records zero-owner seed failures durably" {
@@ -48221,6 +48516,74 @@ test "db transaction foreign key timing override survives intent resolution" {
     const forced_parent = (try db.get(alloc, "aa-parent:forced")) orelse return error.TestExpectedEqual;
     defer alloc.free(forced_parent);
     try std.testing.expectEqualStrings("{\"id\":\"aa-parent:forced\",\"email\":\"old-b\"}", forced_parent);
+}
+
+test "db deferrable initially immediate foreign key can be deferred by transaction override" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"manager_email":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"row_email_key","columns":["email"]}],"foreign_keys":[{"name":"row_manager_email_fkey","columns":["manager_email"],"references":{"table":"row","columns":["email"]},"on_update":"no_action","timing":"immediate","deferrable":true}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "aa-parent:initially-immediate", .value = "{\"id\":\"aa-parent:initially-immediate\",\"email\":\"old-a\"}" },
+            .{ .key = "zz-child:initially-immediate", .value = "{\"id\":\"zz-child:initially-immediate\",\"manager_email\":\"old-a\"}" },
+        },
+        .timestamp_ns = 15_300,
+    });
+
+    const deferred_txn = try db.beginTransaction(15_310);
+    try db.writeTransaction(deferred_txn, .{
+        .writes = &.{
+            .{ .key = "aa-parent:initially-immediate", .value = "{\"id\":\"aa-parent:initially-immediate\",\"email\":\"new-a\"}" },
+            .{ .key = "zz-child:initially-immediate", .value = "{\"id\":\"zz-child:initially-immediate\",\"manager_email\":\"new-a\"}" },
+        },
+        .foreign_key_constraint_timing_overrides = &.{.{
+            .constraint_name = "row_manager_email_fkey",
+            .timing = .deferred,
+        }},
+    });
+    try db.resolveTransactionIntents(deferred_txn, .committed, 15_311);
+
+    const child = (try db.get(alloc, "zz-child:initially-immediate")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"zz-child:initially-immediate\",\"manager_email\":\"new-a\"}", child);
+
+    const non_deferrable_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"manager_email":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"row_email_key","columns":["email"]}],"foreign_keys":[{"name":"row_manager_email_fkey","columns":["manager_email"],"references":{"table":"row","columns":["email"]},"on_update":"no_action","timing":"immediate"}]}
+    ;
+    var path_buf_2: [256]u8 = undefined;
+    const path_2 = tempPath(&path_buf_2);
+    defer cleanupTempDir(path_2);
+    var non_deferrable_db = try DB.open(alloc, std.mem.span(path_2), .{});
+    defer non_deferrable_db.close();
+    var non_deferrable_parsed = try table_schema_api.parseValidatedTableSchema(alloc, non_deferrable_schema_json);
+    defer non_deferrable_parsed.deinit(alloc);
+    const non_deferrable_runtime = try table_schema_api.deriveRuntimeTableSchema(alloc, non_deferrable_parsed);
+    defer schema_mod.freeSchema(alloc, non_deferrable_runtime);
+    try non_deferrable_db.setSchema(non_deferrable_runtime);
+    const rejected_txn = try non_deferrable_db.beginTransaction(15_320);
+    try std.testing.expectError(error.ForeignKeyViolation, non_deferrable_db.writeTransaction(rejected_txn, .{
+        .foreign_key_constraint_timing_overrides = &.{.{
+            .constraint_name = "row_manager_email_fkey",
+            .timing = .deferred,
+        }},
+    }));
+    try non_deferrable_db.abortTransaction(rejected_txn, 15_321);
 }
 
 test "db deferred foreign keys preserve exact externalized unique parent proofs through commit" {

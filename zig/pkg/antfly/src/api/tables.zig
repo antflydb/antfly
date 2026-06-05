@@ -976,6 +976,7 @@ fn foreignKeysSameDefinition(a: runtime_schema_mod.ForeignKey, b: runtime_schema
         a.on_delete == b.on_delete and
         a.on_update == b.on_update and
         a.timing == b.timing and
+        a.deferrable == b.deferrable and
         a.match == b.match;
 }
 
@@ -998,6 +999,10 @@ test "foreign key definition equality includes SQL compatibility fields" {
     var changed_match = base;
     changed_match.match = .full;
     try std.testing.expect(!foreignKeysSameDefinition(base, changed_match));
+
+    var changed_deferrable = base;
+    changed_deferrable.deferrable = true;
+    try std.testing.expect(!foreignKeysSameDefinition(base, changed_deferrable));
 }
 
 fn foreignKeyValidationStateString(state: runtime_schema_mod.ForeignKeyValidationState) ![]const u8 {

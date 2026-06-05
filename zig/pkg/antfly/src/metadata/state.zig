@@ -231,7 +231,19 @@ pub const MetadataState = struct {
         self.projected_store_topology_present = projected_stores.len > 0;
     }
 
+    pub const CaptureCurrentOptions = struct {
+        observe_transitions: bool = true,
+    };
+
     pub fn captureCurrent(self: *MetadataState, service: anytype) !CapturedCurrentState {
+        return try self.captureCurrentWithOptions(service, .{});
+    }
+
+    pub fn captureCurrentWithOptions(
+        self: *MetadataState,
+        service: anytype,
+        options: CaptureCurrentOptions,
+    ) !CapturedCurrentState {
         const placement_intents = try service.listProjectedPlacementIntents(self.alloc);
         errdefer service.freeProjectedPlacementIntents(self.alloc, placement_intents);
         const tables = try self.projected.listTables(self.alloc);
@@ -255,19 +267,25 @@ pub const MetadataState = struct {
         for (self.committed_splits.items, 0..) |record, i| {
             split_observations[i] = .{
                 .transition_id = record.transition_id,
-                .observation = (service.observeSplitTransition(record.transition_id) catch |err| blk: {
-                    std.log.warn("split transition observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
-                    break :blk null;
-                }) orelse defaultSplitObservation(),
+                .observation = if (options.observe_transitions)
+                    (service.observeSplitTransition(record.transition_id) catch |err| blk: {
+                        std.log.warn("split transition observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
+                        break :blk null;
+                    }) orelse defaultSplitObservation()
+                else
+                    defaultSplitObservation(),
             };
         }
         for (self.committed_merges.items, 0..) |record, i| {
             merge_observations[i] = .{
                 .transition_id = record.transition_id,
-                .observation = (service.observeMergeTransition(record.transition_id) catch |err| blk: {
-                    std.log.warn("merge transition observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
-                    break :blk null;
-                }) orelse defaultMergeObservation(record),
+                .observation = if (options.observe_transitions)
+                    (service.observeMergeTransition(record.transition_id) catch |err| blk: {
+                        std.log.warn("merge transition observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
+                        break :blk null;
+                    }) orelse defaultMergeObservation(record)
+                else
+                    defaultMergeObservation(record),
             };
         }
         const merged_group_statuses = try mergeHealthyGroupStatuses(

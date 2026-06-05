@@ -938,6 +938,8 @@ pub const ForeignKeyActionScheduleMutation = struct {
     parent_key: []const u8,
     updated_parent_key: ?[]const u8 = null,
     page_limit: usize,
+    cascade_depth: u32 = 0,
+    cascade_max_depth: u32 = 64,
 };
 
 pub const UniqueConstraintMutation = struct {

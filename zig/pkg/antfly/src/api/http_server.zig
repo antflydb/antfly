@@ -5585,6 +5585,11 @@ pub const ApiHttpServer = struct {
         lease_ms: ?u64 = null,
         max_work_units: ?usize = null,
         controller: ?[]const u8 = null,
+        action_job_action: ?[]const u8 = null,
+        parent_table: ?[]const u8 = null,
+        parent_key: ?[]const u8 = null,
+        updated_parent_key: ?[]const u8 = null,
+        page_limit: ?usize = null,
     };
 
     fn parseForeignKeyIntegrityAction(value: ?[]const u8) !table_writes.ForeignKeyIntegrityAction {
@@ -5623,6 +5628,46 @@ pub const ApiHttpServer = struct {
             .{ .ignore_unknown_fields = true },
         ) catch return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
         defer parsed.deinit();
+
+        const action_text = parsed.value.action orelse "validate";
+        if (std.mem.eql(u8, action_text, "requeue_action_job")) {
+            const job_id = parsed.value.job_id orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const action_job_action = parsed.value.action_job_action orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const worker_id = parsed.value.worker_id orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const constraint_name = parsed.value.constraint_name orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const parent_table = parsed.value.parent_table orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const parent_key = parsed.value.parent_key orelse return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            const page_limit = @min(parsed.value.page_limit orelse 1024, 10_000);
+            if (job_id.len == 0 or action_job_action.len == 0 or worker_id.len == 0 or constraint_name.len == 0 or parent_table.len == 0 or parent_key.len == 0 or page_limit == 0) {
+                return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            }
+            if (parsed.value.controller != null or parsed.value.phase != null or parsed.value.doc_key != null) {
+                return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
+            }
+            var result = (source.foreignKeyActionJobRequeue(
+                self.alloc,
+                table_name,
+                job_id,
+                action_job_action,
+                worker_id,
+                constraint_name,
+                parent_table,
+                parent_key,
+                parsed.value.updated_parent_key,
+                page_limit,
+            ) catch |err| switch (err) {
+                error.InvalidForeignKeyActionJob, error.InvalidForeignKeyIntegrityRequest => return try textResponse(self.alloc, 400, "invalid foreign key integrity request"),
+                error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+                error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.ForeignKeyNotFound => return try textResponse(self.alloc, 404, "foreign key not found"),
+                error.ForeignKeyActionJobNotFound => return try textResponse(self.alloc, 404, "foreign key action job not found"),
+                error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                error.ReadOnly => return try textResponse(self.alloc, 405, "method not allowed"),
+                else => return err,
+            }) orelse return try textResponse(self.alloc, 404, "not found");
+            defer result.deinit(self.alloc);
+            return try jsonResponse(self.alloc, result);
+        }
 
         const action = parseForeignKeyIntegrityAction(parsed.value.action) catch {
             return try textResponse(self.alloc, 400, "invalid foreign key integrity request");
@@ -10477,9 +10522,120 @@ test "api http server exposes relational foreign key integrity repair" {
             planned_cascade_deletes: u64,
         },
     };
+    const ActionJobResponse = struct {
+        complete: bool,
+        groups: []const struct {
+            group_id: u64,
+            job_id: []const u8,
+            action: []const u8,
+            worker_id: []const u8,
+            constraint_name: []const u8,
+            parent_table: []const u8,
+            parent_key: []const u8,
+            page_limit: usize,
+            status: []const u8,
+            claimed_at_ns: u64,
+            lease_until_ns: u64,
+            attempts: u32,
+            completed: bool,
+            applied_children: u64,
+            failure_count: u64 = 0,
+            first_failed_at_ns: ?u64 = null,
+            last_failed_at_ns: ?u64 = null,
+            requeue_count: u64 = 0,
+            last_requeued_at_ns: ?u64 = null,
+            cascade_depth: u32 = 0,
+            cascade_max_depth: u32 = 64,
+            next_child_table: ?[]const u8 = null,
+            next_child_key: ?[]const u8 = null,
+            last_error: ?[]const u8 = null,
+        },
+    };
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, table_source.source());
+
+    const scheduled_action = try db.scheduleForeignKeyActionJobAt(
+        "fk-action:http-requeue",
+        "set_null",
+        "worker:http-action-scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:a",
+        8,
+        14_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(scheduled_action);
+    const claimed_action = try db.claimForeignKeyActionJobPageAt(
+        "fk-action:http-requeue",
+        "set_null",
+        "worker:http-action-failed",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:a",
+        8,
+        60_000,
+        14_100,
+    );
+    defer db.freeForeignKeyActionJobRecord(claimed_action);
+    const failed_action = try db.finishClaimedForeignKeyActionJobPageAt(
+        claimed_action,
+        2,
+        false,
+        "row",
+        "order:action:cursor",
+        "OperatorPaused",
+        14_200,
+    );
+    defer db.freeForeignKeyActionJobRecord(failed_action);
+    try std.testing.expectEqualStrings("invalid", failed_action.status);
+
+    var requeue_action_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"requeue_action_job\",\"job_id\":\"fk-action:http-requeue\",\"action_job_action\":\"set_null\",\"worker_id\":\"worker:http-action-retry\",\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"parent_key\":\"customer:a\",\"page_limit\":4}",
+    });
+    defer requeue_action_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), requeue_action_resp.status);
+    var requeue_action_body = try std.json.parseFromSlice(ActionJobResponse, alloc, requeue_action_resp.body, .{ .ignore_unknown_fields = true });
+    defer requeue_action_body.deinit();
+    try std.testing.expect(!requeue_action_body.value.complete);
+    try std.testing.expectEqual(@as(usize, 1), requeue_action_body.value.groups.len);
+    try std.testing.expectEqualStrings("fk-action:http-requeue", requeue_action_body.value.groups[0].job_id);
+    try std.testing.expectEqualStrings("set_null", requeue_action_body.value.groups[0].action);
+    try std.testing.expectEqualStrings("worker:http-action-retry", requeue_action_body.value.groups[0].worker_id);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", requeue_action_body.value.groups[0].constraint_name);
+    try std.testing.expectEqualStrings("customers", requeue_action_body.value.groups[0].parent_table);
+    try std.testing.expectEqualStrings("customer:a", requeue_action_body.value.groups[0].parent_key);
+    try std.testing.expectEqual(@as(usize, 4), requeue_action_body.value.groups[0].page_limit);
+    try std.testing.expectEqualStrings("pending", requeue_action_body.value.groups[0].status);
+    try std.testing.expectEqual(@as(u64, 0), requeue_action_body.value.groups[0].claimed_at_ns);
+    try std.testing.expectEqual(@as(u64, 0), requeue_action_body.value.groups[0].lease_until_ns);
+    try std.testing.expectEqual(@as(u32, 1), requeue_action_body.value.groups[0].attempts);
+    try std.testing.expect(!requeue_action_body.value.groups[0].completed);
+    try std.testing.expectEqual(@as(u64, 2), requeue_action_body.value.groups[0].applied_children);
+    try std.testing.expectEqual(@as(u64, 1), requeue_action_body.value.groups[0].failure_count);
+    try std.testing.expectEqual(@as(u64, 14_200), requeue_action_body.value.groups[0].first_failed_at_ns.?);
+    try std.testing.expectEqual(@as(u64, 14_200), requeue_action_body.value.groups[0].last_failed_at_ns.?);
+    try std.testing.expectEqual(@as(u64, 1), requeue_action_body.value.groups[0].requeue_count);
+    try std.testing.expect(requeue_action_body.value.groups[0].last_requeued_at_ns != null);
+    try std.testing.expectEqual(@as(u32, 0), requeue_action_body.value.groups[0].cascade_depth);
+    try std.testing.expectEqual(@as(u32, 64), requeue_action_body.value.groups[0].cascade_max_depth);
+    try std.testing.expectEqualStrings("row", requeue_action_body.value.groups[0].next_child_table.?);
+    try std.testing.expectEqualStrings("order:action:cursor", requeue_action_body.value.groups[0].next_child_key.?);
+    try std.testing.expect(requeue_action_body.value.groups[0].last_error == null);
+
+    var missing_action_job_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/foreign-key-integrity",
+        .content_type = "application/json",
+        .body = "{\"action\":\"requeue_action_job\",\"job_id\":\"fk-action:missing\",\"action_job_action\":\"set_null\",\"worker_id\":\"worker:http-action-retry\",\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"parent_key\":\"customer:a\"}",
+    });
+    defer missing_action_job_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), missing_action_job_resp.status);
+    try std.testing.expectEqualStrings("foreign key action job not found", missing_action_job_resp.body);
+
     var plan_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/docs/foreign-key-integrity",

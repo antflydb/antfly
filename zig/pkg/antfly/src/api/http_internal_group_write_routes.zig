@@ -89,6 +89,7 @@ const ForeignKeyActionJobRequestWire = struct {
     page_limit: ?usize = null,
     lease_ms: ?u64 = null,
     schedule_only: bool = false,
+    requeue_only: bool = false,
 };
 
 const ForeignKeyActionScheduleRequestWire = struct {
@@ -376,8 +377,25 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         if (job_id.len == 0 or action.len == 0 or worker_id.len == 0 or constraint_name.len == 0 or parent_table.len == 0 or parent_key.len == 0) {
             return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
         }
+        if (parsed.value.schedule_only and parsed.value.requeue_only) {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid foreign key action job request");
+        }
         const maybe_status = if (parsed.value.schedule_only)
             writes.foreignKeyActionJobGroupLocalSchedule(
+                ctx.alloc,
+                fk_route.group_id,
+                fk_route.table_name,
+                job_id,
+                action,
+                worker_id,
+                constraint_name,
+                parent_table,
+                parent_key,
+                parsed.value.updated_parent_key,
+                @min(parsed.value.page_limit orelse 1024, 10_000),
+            )
+        else if (parsed.value.requeue_only)
+            writes.foreignKeyActionJobGroupLocalRequeue(
                 ctx.alloc,
                 fk_route.group_id,
                 fk_route.table_name,
@@ -823,6 +841,65 @@ test "internal group write routes expose foreign key integrity" {
     try std.testing.expectEqual(@as(u32, 4), claim_parsed.value.work_claims[0].attempts);
 }
 
+test "internal group write routes expose foreign key action job requeue" {
+    const alloc = std.testing.allocator;
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/foreign-key-action-job",
+        .body = "{\"job_id\":\"fk-action:set-null:7\",\"action\":\"set_null\",\"worker_id\":\"worker:retry\",\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"parent_key\":\"customer:7\",\"page_limit\":12,\"requeue_only\":true}",
+    }, "/internal/v1/groups/7/tables/docs/foreign-key-action-job")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    var parsed = try std.json.parseFromSlice(table_writes.ForeignKeyActionJobStatus, alloc, resp.body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.group_id);
+    try std.testing.expectEqualStrings("fk-action:set-null:7", parsed.value.job_id);
+    try std.testing.expectEqualStrings("set_null", parsed.value.action);
+    try std.testing.expectEqualStrings("worker:retry", parsed.value.worker_id);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", parsed.value.constraint_name);
+    try std.testing.expectEqualStrings("customers", parsed.value.parent_table);
+    try std.testing.expectEqualStrings("customer:7", parsed.value.parent_key);
+    try std.testing.expectEqual(@as(usize, 12), parsed.value.page_limit);
+    try std.testing.expectEqualStrings("pending", parsed.value.status);
+    try std.testing.expectEqual(@as(u64, 5), parsed.value.applied_children);
+    try std.testing.expectEqual(@as(u64, 3), parsed.value.failure_count);
+    try std.testing.expectEqual(@as(u64, 101), parsed.value.first_failed_at_ns.?);
+    try std.testing.expectEqual(@as(u64, 202), parsed.value.last_failed_at_ns.?);
+    try std.testing.expectEqual(@as(u64, 2), parsed.value.requeue_count);
+    try std.testing.expectEqual(@as(u64, 303), parsed.value.last_requeued_at_ns.?);
+    try std.testing.expectEqual(@as(u32, 4), parsed.value.cascade_depth);
+    try std.testing.expectEqual(@as(u32, 9), parsed.value.cascade_max_depth);
+    try std.testing.expectEqualStrings("row", parsed.value.next_child_table.?);
+    try std.testing.expectEqualStrings("order:cursor", parsed.value.next_child_key.?);
+
+    var invalid_resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/foreign-key-action-job",
+        .body = "{\"job_id\":\"fk-action:set-null:7\",\"action\":\"set_null\",\"worker_id\":\"worker:retry\",\"constraint_name\":\"orders_customer_id_fkey\",\"parent_table\":\"customers\",\"parent_key\":\"customer:7\",\"schedule_only\":true,\"requeue_only\":true}",
+    }, "/internal/v1/groups/7/tables/docs/foreign-key-action-job")).?;
+    defer invalid_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+    try std.testing.expectEqualStrings("invalid foreign key action job request", invalid_resp.body);
+}
+
 test "internal group write routes expose unique integrity" {
     const alloc = std.testing.allocator;
 
@@ -1011,6 +1088,9 @@ const TestWriteSource = struct {
                 .txn_status_group_local = txnStatusGroupLocal,
                 .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
                 .foreign_key_integrity_work_unit_group_local = foreignKeyIntegrityWorkUnitGroupLocal,
+                .foreign_key_action_job_group_local = foreignKeyActionJobGroupLocal,
+                .foreign_key_action_job_group_local_schedule = foreignKeyActionJobGroupLocalSchedule,
+                .foreign_key_action_job_group_local_requeue = foreignKeyActionJobGroupLocalRequeue,
                 .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
             },
         };
@@ -1141,6 +1221,102 @@ const TestWriteSource = struct {
             .work_claims = work_claims,
             .violations = &.{},
         };
+    }
+
+    fn testForeignKeyActionJobStatus(
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+        status: []const u8,
+    ) !table_writes.ForeignKeyActionJobStatus {
+        return .{
+            .group_id = group_id,
+            .job_id = try alloc.dupe(u8, job_id),
+            .action = try alloc.dupe(u8, action),
+            .worker_id = try alloc.dupe(u8, worker_id),
+            .constraint_name = try alloc.dupe(u8, constraint_name),
+            .parent_table = try alloc.dupe(u8, parent_table),
+            .parent_key = try alloc.dupe(u8, parent_key),
+            .updated_parent_key = if (updated_parent_key) |value| try alloc.dupe(u8, value) else null,
+            .page_limit = page_limit,
+            .status = try alloc.dupe(u8, status),
+            .created_at_ns = 1,
+            .updated_at_ns = 2,
+            .claimed_at_ns = if (std.mem.eql(u8, status, "claimed")) 2 else 0,
+            .lease_until_ns = if (std.mem.eql(u8, status, "claimed")) 3 else 0,
+            .attempts = if (std.mem.eql(u8, status, "claimed")) 2 else 1,
+            .completed = false,
+            .applied_children = if (std.mem.eql(u8, status, "pending")) 5 else 0,
+            .failure_count = if (std.mem.eql(u8, status, "pending")) 3 else 0,
+            .first_failed_at_ns = if (std.mem.eql(u8, status, "pending")) 101 else null,
+            .last_failed_at_ns = if (std.mem.eql(u8, status, "pending")) 202 else null,
+            .requeue_count = if (std.mem.eql(u8, status, "pending")) 2 else 0,
+            .last_requeued_at_ns = if (std.mem.eql(u8, status, "pending")) 303 else null,
+            .cascade_depth = if (std.mem.eql(u8, status, "pending")) 4 else 0,
+            .cascade_max_depth = if (std.mem.eql(u8, status, "pending")) 9 else 64,
+            .next_child_table = if (std.mem.eql(u8, status, "pending")) try alloc.dupe(u8, "row") else null,
+            .next_child_key = if (std.mem.eql(u8, status, "pending")) try alloc.dupe(u8, "order:cursor") else null,
+            .last_error = null,
+        };
+    }
+
+    fn foreignKeyActionJobGroupLocal(
+        _: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        _: []const u8,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+        _: u64,
+    ) !?table_writes.ForeignKeyActionJobStatus {
+        return try testForeignKeyActionJobStatus(alloc, group_id, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, "claimed");
+    }
+
+    fn foreignKeyActionJobGroupLocalSchedule(
+        _: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        _: []const u8,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+    ) !?table_writes.ForeignKeyActionJobStatus {
+        return try testForeignKeyActionJobStatus(alloc, group_id, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, "scheduled");
+    }
+
+    fn foreignKeyActionJobGroupLocalRequeue(
+        _: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        _: []const u8,
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+        page_limit: usize,
+    ) !?table_writes.ForeignKeyActionJobStatus {
+        return try testForeignKeyActionJobStatus(alloc, group_id, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, "pending");
     }
 
     fn uniqueConstraintIntegrityGroupLocal(

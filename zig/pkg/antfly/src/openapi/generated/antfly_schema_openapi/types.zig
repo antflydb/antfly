@@ -110,11 +110,13 @@ pub const ForeignKey = struct {
     references: ?ForeignKeyReference = null,
     /// Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
     on_delete: ?[]const u8 = null,
-    /// Update action. "restrict" and "no_action" are accepted and enforced as restrictive parent-key update checks; mutating update actions are reserved until distributed FK mutation jobs are available.
+    /// Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
     on_update: ?[]const u8 = null,
     /// Constraint timing. "deferred" is enforced for local relational transactions at commit and routed child writes through exact parent-check proof records.
     timing: ?[]const u8 = null,
-    /// Match mode. "simple" is the default and means any null or absent child component creates no reference. MATCH FULL and MATCH PARTIAL are reserved until their composite-null semantics are implemented.
+    /// Whether transaction-level timing overrides may change this constraint's effective timing. Omitted defaults to false unless timing is "deferred" for compatibility; true with timing "immediate" represents DEFERRABLE INITIALLY IMMEDIATE.
+    deferrable: ?bool = null,
+    /// Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
     match: ?[]const u8 = null,
     /// Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
     validation_state: ?[]const u8 = null,
@@ -155,7 +157,7 @@ pub const TableSchema = struct {
     ttl_duration: ?[]const u8 = null,
     /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
     dynamic_templates: ?[]const DynamicTemplate = null,
-    /// Relational-mode referential constraints. Supported targets are a parent table's `_id` document key or a same-table declared unique parent column tuple with `on_delete: "restrict"` / `on_delete: "no_action"` or bounded local nullable-column `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`. `on_update: "restrict"` and `on_update: "no_action"` are accepted as restrictive parent-key update checks. `match: "simple"` is the default and only accepted match mode today; `full` and `partial` are rejected until their composite-null semantics are implemented. Cross-table unique targets require routed parent-table unique participants. Unsupported shapes are rejected during schema validation.
+    /// Relational-mode referential constraints. Supported targets are a parent table's `_id` document key or a same-table declared unique parent column tuple with `on_delete: "restrict"` / `on_delete: "no_action"` or bounded local nullable-column `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`. `on_update: "restrict"` and `on_update: "no_action"` are accepted as parent-key update checks, and mutating `set_null`/`cascade` update actions are supported where owner topology is configured. `match: "simple"` is the default; `full` is accepted for composite nullable references, and `partial` is rejected until row-subset parent matching is implemented. Cross-table unique targets require routed parent-table unique participants. Unsupported shapes are rejected during schema validation.
     foreign_keys: ?[]const ForeignKey = null,
     /// Relational-mode unique constraints over one or more ordered declared non-json relational columns. Present scalar tuples are enforced by committed integrity rows; rows with any absent nullable component do not create unique rows.
     unique_constraints: ?[]const UniqueConstraint = null,

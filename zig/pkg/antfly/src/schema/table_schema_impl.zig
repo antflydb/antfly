@@ -60,10 +60,10 @@ pub const ForeignKeyAction = enum {
     cascade,
 
     pub fn fromString(text: []const u8) ?ForeignKeyAction {
-        if (std.mem.eql(u8, text, "restrict")) return .restrict;
-        if (std.mem.eql(u8, text, "no_action")) return .no_action;
-        if (std.mem.eql(u8, text, "set_null")) return .set_null;
-        if (std.mem.eql(u8, text, "cascade")) return .cascade;
+        if (enumTokenEql(text, "restrict")) return .restrict;
+        if (enumTokenEql(text, "no_action")) return .no_action;
+        if (enumTokenEql(text, "set_null")) return .set_null;
+        if (enumTokenEql(text, "cascade")) return .cascade;
         return null;
     }
 };
@@ -73,8 +73,8 @@ pub const ForeignKeyTiming = enum {
     deferred,
 
     pub fn fromString(text: []const u8) ?ForeignKeyTiming {
-        if (std.mem.eql(u8, text, "immediate")) return .immediate;
-        if (std.mem.eql(u8, text, "deferred")) return .deferred;
+        if (enumTokenEql(text, "immediate") or enumTokenEql(text, "initially_immediate")) return .immediate;
+        if (enumTokenEql(text, "deferred") or enumTokenEql(text, "initially_deferred")) return .deferred;
         return null;
     }
 };
@@ -85,9 +85,9 @@ pub const ForeignKeyMatch = enum {
     partial,
 
     pub fn fromString(text: []const u8) ?ForeignKeyMatch {
-        if (std.mem.eql(u8, text, "simple")) return .simple;
-        if (std.mem.eql(u8, text, "full")) return .full;
-        if (std.mem.eql(u8, text, "partial")) return .partial;
+        if (enumTokenEql(text, "simple") or enumTokenEql(text, "match_simple")) return .simple;
+        if (enumTokenEql(text, "full") or enumTokenEql(text, "match_full")) return .full;
+        if (enumTokenEql(text, "partial") or enumTokenEql(text, "match_partial")) return .partial;
         return null;
     }
 };
@@ -99,13 +99,47 @@ pub const ForeignKeyValidationState = enum {
     invalid,
 
     pub fn fromString(text: []const u8) ?ForeignKeyValidationState {
-        if (std.mem.eql(u8, text, "enforced")) return .enforced;
-        if (std.mem.eql(u8, text, "unvalidated")) return .unvalidated;
-        if (std.mem.eql(u8, text, "validating")) return .validating;
-        if (std.mem.eql(u8, text, "invalid")) return .invalid;
+        if (enumTokenEql(text, "enforced")) return .enforced;
+        if (enumTokenEql(text, "unvalidated") or enumTokenEql(text, "not_valid")) return .unvalidated;
+        if (enumTokenEql(text, "validating")) return .validating;
+        if (enumTokenEql(text, "invalid")) return .invalid;
         return null;
     }
 };
+
+fn foreignKeyDeferrableFromValue(value: std.json.Value) ?bool {
+    return switch (value) {
+        .bool => |enabled| enabled,
+        .string => |text| foreignKeyDeferrableFromString(text),
+        else => null,
+    };
+}
+
+fn foreignKeyDeferrableFromString(text: []const u8) ?bool {
+    if (enumTokenEql(text, "deferrable")) return true;
+    if (enumTokenEql(text, "not_deferrable")) return false;
+    return null;
+}
+
+fn enumTokenEql(actual: []const u8, expected: []const u8) bool {
+    var actual_index: usize = 0;
+    var expected_index: usize = 0;
+    while (true) {
+        while (actual_index < actual.len and enumTokenSeparator(actual[actual_index])) actual_index += 1;
+        while (expected_index < expected.len and enumTokenSeparator(expected[expected_index])) expected_index += 1;
+        if (actual_index == actual.len or expected_index == expected.len) break;
+        if (std.ascii.toLower(actual[actual_index]) != std.ascii.toLower(expected[expected_index])) return false;
+        actual_index += 1;
+        expected_index += 1;
+    }
+    while (actual_index < actual.len and enumTokenSeparator(actual[actual_index])) actual_index += 1;
+    while (expected_index < expected.len and enumTokenSeparator(expected[expected_index])) expected_index += 1;
+    return actual_index == actual.len and expected_index == expected.len;
+}
+
+fn enumTokenSeparator(ch: u8) bool {
+    return ch == ' ' or ch == '_' or ch == '-';
+}
 
 pub const ForeignKeyReference = struct {
     table: []const u8,
@@ -126,6 +160,7 @@ pub const ForeignKey = struct {
     on_delete: ForeignKeyAction = .restrict,
     on_update: ForeignKeyAction = .restrict,
     timing: ForeignKeyTiming = .immediate,
+    deferrable: bool = false,
     match: ForeignKeyMatch = .simple,
     validation_state: ForeignKeyValidationState = .enforced,
 
@@ -792,6 +827,9 @@ fn validateForeignKeys(value: std.json.Value) !void {
         if (object.get("timing")) |timing| {
             if (timing != .string or ForeignKeyTiming.fromString(timing.string) == null) return error.InvalidSchemaUpdateRequest;
         }
+        if (object.get("deferrable")) |deferrable| {
+            if (foreignKeyDeferrableFromValue(deferrable) == null) return error.InvalidSchemaUpdateRequest;
+        }
         if (object.get("match")) |match| {
             if (match != .string or ForeignKeyMatch.fromString(match.string) == null) return error.InvalidSchemaUpdateRequest;
         }
@@ -808,6 +846,7 @@ fn isAllowedForeignKeyField(field: []const u8) bool {
         std.mem.eql(u8, field, "on_delete") or
         std.mem.eql(u8, field, "on_update") or
         std.mem.eql(u8, field, "timing") or
+        std.mem.eql(u8, field, "deferrable") or
         std.mem.eql(u8, field, "match") or
         std.mem.eql(u8, field, "validation_state");
 }
@@ -1700,6 +1739,7 @@ fn validateRelationalForeignKeys(schema: TableSchema) !void {
         if (foreign_key.references.columns.len == 0) return error.InvalidSchemaUpdateRequest;
         if (foreign_key.validation_state == .validating or foreign_key.validation_state == .invalid) return error.InvalidSchemaUpdateRequest;
         if (foreign_key.on_update != .restrict and foreign_key.on_update != .no_action and foreign_key.on_update != .set_null and foreign_key.on_update != .cascade) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.timing == .deferred and !foreign_key.deferrable) return error.InvalidSchemaUpdateRequest;
         if (foreign_key.match == .partial) return error.InvalidSchemaUpdateRequest;
         if (foreignKeyReferencesPrimaryKey(foreign_key)) {
             if (foreign_key.columns.len != 1) return error.InvalidSchemaUpdateRequest;
@@ -2832,6 +2872,14 @@ fn parseForeignKeys(alloc: std.mem.Allocator, value: std.json.Value) ![]ForeignK
     for (array.items) |item| {
         const object = item.object;
         const references = object.get("references").?.object;
+        const timing = if (object.get("timing")) |timing_value|
+            ForeignKeyTiming.fromString(timing_value.string).?
+        else
+            ForeignKeyTiming.immediate;
+        const deferrable = if (object.get("deferrable")) |deferrable_value|
+            foreignKeyDeferrableFromValue(deferrable_value).?
+        else
+            timing == .deferred;
         foreign_keys[initialized] = .{
             .name = try alloc.dupe(u8, object.get("name").?.string),
             .columns = try parseStringArrayAlloc(alloc, object.get("columns").?),
@@ -2847,10 +2895,8 @@ fn parseForeignKeys(alloc: std.mem.Allocator, value: std.json.Value) ![]ForeignK
                 ForeignKeyAction.fromString(on_update.string).?
             else
                 .restrict,
-            .timing = if (object.get("timing")) |timing|
-                ForeignKeyTiming.fromString(timing.string).?
-            else
-                .immediate,
+            .timing = timing,
+            .deferrable = deferrable,
             .match = if (object.get("match")) |match|
                 ForeignKeyMatch.fromString(match.string).?
             else
@@ -4036,6 +4082,77 @@ test "relational schema parses primary-key foreign keys and unique constraints" 
     try std.testing.expectEqual(ForeignKeyAction.cascade, parsed_update_cascade.foreign_keys[0].on_update);
 }
 
+test "relational schema accepts SQL foreign key enum spellings" {
+    var parsed = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"SET NULL\",\"on_update\":\"NO ACTION\",\"timing\":\"INITIALLY DEFERRED\",\"match\":\"MATCH SIMPLE\",\"validation_state\":\"UNVALIDATED\"}]}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.set_null, parsed.foreign_keys[0].on_delete);
+    try std.testing.expectEqual(ForeignKeyAction.no_action, parsed.foreign_keys[0].on_update);
+    try std.testing.expectEqual(ForeignKeyTiming.deferred, parsed.foreign_keys[0].timing);
+    try std.testing.expect(parsed.foreign_keys[0].deferrable);
+    try std.testing.expectEqual(ForeignKeyMatch.simple, parsed.foreign_keys[0].match);
+    try std.testing.expectEqual(ForeignKeyValidationState.unvalidated, parsed.foreign_keys[0].validation_state);
+
+    var parsed_sql_not_valid = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"validation_state\":\"NOT VALID\"}]}",
+    );
+    defer parsed_sql_not_valid.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyValidationState.unvalidated, parsed_sql_not_valid.foreign_keys[0].validation_state);
+
+    var parsed_hyphenated = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"no-action\",\"on_update\":\"RESTRICT\",\"timing\":\"initially-immediate\",\"deferrable\":true,\"match\":\"match-full\",\"validation_state\":\"not-valid\"}]}",
+    );
+    defer parsed_hyphenated.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.no_action, parsed_hyphenated.foreign_keys[0].on_delete);
+    try std.testing.expectEqual(ForeignKeyAction.restrict, parsed_hyphenated.foreign_keys[0].on_update);
+    try std.testing.expectEqual(ForeignKeyTiming.immediate, parsed_hyphenated.foreign_keys[0].timing);
+    try std.testing.expect(parsed_hyphenated.foreign_keys[0].deferrable);
+    try std.testing.expectEqual(ForeignKeyMatch.full, parsed_hyphenated.foreign_keys[0].match);
+    try std.testing.expectEqual(ForeignKeyValidationState.unvalidated, parsed_hyphenated.foreign_keys[0].validation_state);
+
+    var parsed_sql_deferrable = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"INITIALLY IMMEDIATE\",\"deferrable\":\"DEFERRABLE\"}]}",
+    );
+    defer parsed_sql_deferrable.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyTiming.immediate, parsed_sql_deferrable.foreign_keys[0].timing);
+    try std.testing.expect(parsed_sql_deferrable.foreign_keys[0].deferrable);
+
+    var parsed_sql_not_deferrable = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"INITIALLY IMMEDIATE\",\"deferrable\":\"NOT DEFERRABLE\"}]}",
+    );
+    defer parsed_sql_not_deferrable.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyTiming.immediate, parsed_sql_not_deferrable.foreign_keys[0].timing);
+    try std.testing.expect(!parsed_sql_not_deferrable.foreign_keys[0].deferrable);
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"SET DEFAULT\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"deferred\",\"deferrable\":false}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"INITIALLY DEFERRED\",\"deferrable\":\"NOT DEFERRABLE\"}]}",
+        ),
+    );
+}
+
 test "relational schema rejects unsupported foreign key shapes" {
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
@@ -4078,6 +4195,7 @@ test "relational schema rejects unsupported foreign key shapes" {
     );
     defer parsed_deferred.deinit(std.testing.allocator);
     try std.testing.expectEqual(ForeignKeyTiming.deferred, parsed_deferred.foreign_keys[0].timing);
+    try std.testing.expect(parsed_deferred.foreign_keys[0].deferrable);
     var parsed_match_simple = try parseSchema(
         std.testing.allocator,
         "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"match\":\"simple\"}]}",

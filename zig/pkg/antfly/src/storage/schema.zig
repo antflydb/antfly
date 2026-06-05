@@ -167,6 +167,7 @@ pub const ForeignKey = struct {
     on_delete: ForeignKeyAction = .restrict,
     on_update: ForeignKeyAction = .restrict,
     timing: ForeignKeyTiming = .immediate,
+    deferrable: bool = false,
     match: ForeignKeyMatch = .simple,
     validation_state: ForeignKeyValidationState = .enforced,
 };
@@ -198,6 +199,7 @@ pub fn foreignKeyCatalogsEqual(current: []const ForeignKey, next: []const Foreig
         if (a.on_delete != b.on_delete) return false;
         if (a.on_update != b.on_update) return false;
         if (a.timing != b.timing) return false;
+        if (a.deferrable != b.deferrable) return false;
         if (a.match != b.match) return false;
         if (a.validation_state != b.validation_state) return false;
     }
@@ -253,7 +255,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 15); // format version
+    try appendU32(&buf, alloc, 16); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -328,6 +330,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, @intFromEnum(foreign_key.on_delete));
         try buf.append(alloc, @intFromEnum(foreign_key.on_update));
         try buf.append(alloc, @intFromEnum(foreign_key.timing));
+        try buf.append(alloc, if (foreign_key.deferrable) 1 else 0);
         try buf.append(alloc, @intFromEnum(foreign_key.match));
         try buf.append(alloc, @intFromEnum(foreign_key.validation_state));
     }
@@ -353,7 +356,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 15) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 16) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -667,6 +670,11 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 pos += 1;
                 break :timing_blk value;
             } else .immediate;
+            const deferrable: bool = if (fmt_version >= 16) deferrable_blk: {
+                const value = data[pos] == 1;
+                pos += 1;
+                break :deferrable_blk value;
+            } else timing == .deferred;
             const match: ForeignKeyMatch = if (fmt_version >= 15) match_blk: {
                 const value: ForeignKeyMatch = @enumFromInt(data[pos]);
                 pos += 1;
@@ -685,6 +693,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 .on_delete = on_delete,
                 .on_update = on_update,
                 .timing = timing,
+                .deferrable = deferrable,
                 .match = match,
                 .validation_state = validation_state,
             };
@@ -1355,6 +1364,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                 .on_delete = .cascade,
                 .on_update = .no_action,
                 .timing = .immediate,
+                .deferrable = true,
                 .match = .simple,
                 .validation_state = .enforced,
             },
@@ -1396,6 +1406,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(ForeignKeyAction.cascade, loaded.foreign_keys[2].on_delete);
     try std.testing.expectEqual(ForeignKeyAction.no_action, loaded.foreign_keys[2].on_update);
     try std.testing.expectEqual(ForeignKeyTiming.immediate, loaded.foreign_keys[2].timing);
+    try std.testing.expect(loaded.foreign_keys[2].deferrable);
     try std.testing.expectEqual(ForeignKeyMatch.simple, loaded.foreign_keys[2].match);
     try std.testing.expectEqual(ForeignKeyValidationState.enforced, loaded.foreign_keys[2].validation_state);
     try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints.len);
