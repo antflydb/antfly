@@ -1806,12 +1806,14 @@ pub const ForeignKeyIntegritySchemaControllerOptions = struct {
     worker_id: []const u8 = "fk-schema-controller",
     lease_ms: u64 = 60_000,
     max_tables: usize = 16,
+    max_jobs: usize = 16,
     max_work_units_per_table: usize = 1,
     violation_limit: usize = 100,
 };
 
 pub const ForeignKeyIntegritySchemaControllerTableResult = struct {
     table_name: []u8,
+    schema_adoption: bool = false,
     result: ForeignKeyIntegrityResult,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -1825,6 +1827,8 @@ pub const ForeignKeyIntegritySchemaControllerResult = struct {
     tables_scanned: usize = 0,
     tables_with_pending_constraints: usize = 0,
     tables_executed: usize = 0,
+    jobs_scanned: usize = 0,
+    jobs_executed: usize = 0,
     claim_attempts: usize = 0,
     terminal_valid_results: usize = 0,
     terminal_invalid_results: usize = 0,
@@ -1968,6 +1972,41 @@ fn freeForeignKeyIntegrityTupleValues(alloc: std.mem.Allocator, values: []Foreig
     if (values.len > 0) alloc.free(values);
 }
 
+pub const ForeignKeyIntegrityJobStatus = struct {
+    group_id: u64,
+    version: u32 = 1,
+    job_id: []u8,
+    table_name: []u8,
+    action: []u8,
+    worker_id: []u8,
+    constraint_name: ?[]u8 = null,
+    lower_doc_key: []u8,
+    upper_doc_key: []u8,
+    lease_ms: u64,
+    max_work_units: usize,
+    status: []u8,
+    created_at_ns: u64,
+    updated_at_ns: u64,
+    attempts: u32 = 0,
+    completed: bool = false,
+    valid: ?bool = null,
+    last_report: db_mod.relational_store.ForeignKeyIntegrityReport = .{},
+    violation_sample_count: usize = 0,
+    violations_truncated: bool = false,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.job_id.len > 0) alloc.free(self.job_id);
+        if (self.table_name.len > 0) alloc.free(self.table_name);
+        if (self.action.len > 0) alloc.free(self.action);
+        if (self.worker_id.len > 0) alloc.free(self.worker_id);
+        if (self.constraint_name) |value| alloc.free(value);
+        if (self.lower_doc_key.len > 0) alloc.free(self.lower_doc_key);
+        if (self.upper_doc_key.len > 0) alloc.free(self.upper_doc_key);
+        if (self.status.len > 0) alloc.free(self.status);
+        self.* = undefined;
+    }
+};
+
 pub const ForeignKeyIntegrityResult = struct {
     job_id: ?[]u8 = null,
     action: ForeignKeyIntegrityAction,
@@ -1982,6 +2021,7 @@ pub const ForeignKeyIntegrityResult = struct {
     work_units: []ForeignKeyIntegrityWorkUnit = &.{},
     work_claims: []ForeignKeyIntegrityWorkClaim = &.{},
     work_statuses: []ForeignKeyIntegrityWorkStatus = &.{},
+    jobs: []ForeignKeyIntegrityJobStatus = &.{},
     violations: []ForeignKeyIntegrityViolation,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -1995,6 +2035,8 @@ pub const ForeignKeyIntegrityResult = struct {
         if (self.work_claims.len > 0) alloc.free(self.work_claims);
         for (self.work_statuses) |*status| status.deinit(alloc);
         if (self.work_statuses.len > 0) alloc.free(self.work_statuses);
+        for (self.jobs) |*job| job.deinit(alloc);
+        if (self.jobs.len > 0) alloc.free(self.jobs);
         for (self.violations) |*violation| violation.deinit(alloc);
         alloc.free(self.violations);
         self.* = undefined;
@@ -2947,16 +2989,122 @@ fn startForeignKeyIntegrityJobOnDb(
     defer db.freeForeignKeyIntegrityJobRecord(record);
 }
 
+const foreign_key_integrity_job_violation_sample_limit: usize = 100;
+
+const ForeignKeyIntegrityJobDiagnostics = struct {
+    samples_json: []u8,
+    sample_count: usize,
+    truncated: bool,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.samples_json);
+        self.* = undefined;
+    }
+};
+
+fn foreignKeyIntegrityJobDiagnosticsAlloc(
+    alloc: std.mem.Allocator,
+    existing: ?db_mod.DB.ForeignKeyIntegrityJobRecord,
+    result: ForeignKeyIntegrityResult,
+) !ForeignKeyIntegrityJobDiagnostics {
+    var samples = std.ArrayListUnmanaged(ForeignKeyIntegrityViolation).empty;
+    errdefer {
+        for (samples.items) |*violation| violation.deinit(alloc);
+        samples.deinit(alloc);
+    }
+    var truncated = result.violations_truncated;
+
+    if (existing) |record| {
+        truncated = truncated or record.violations_truncated;
+        if (record.violation_samples_json.len > 0 and !std.mem.eql(u8, record.violation_samples_json, "[]")) {
+            var parsed = try std.json.parseFromSlice([]ForeignKeyIntegrityViolation, alloc, record.violation_samples_json, .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            });
+            defer parsed.deinit();
+            for (parsed.value) |violation| {
+                if (samples.items.len >= foreign_key_integrity_job_violation_sample_limit) {
+                    truncated = true;
+                    break;
+                }
+                if (foreignKeyIntegrityViolationSamplesContain(samples.items, violation)) continue;
+                try samples.append(alloc, try cloneForeignKeyIntegrityResultViolation(alloc, violation));
+            }
+        }
+    }
+
+    for (result.violations) |violation| {
+        if (foreignKeyIntegrityViolationSamplesContain(samples.items, violation)) continue;
+        if (samples.items.len >= foreign_key_integrity_job_violation_sample_limit) {
+            truncated = true;
+            break;
+        }
+        try samples.append(alloc, try cloneForeignKeyIntegrityResultViolation(alloc, violation));
+    }
+
+    const samples_json = try std.json.Stringify.valueAlloc(
+        alloc,
+        samples.items,
+        .{ .emit_null_optional_fields = false },
+    );
+    const sample_count = samples.items.len;
+    for (samples.items) |*violation| violation.deinit(alloc);
+    samples.deinit(alloc);
+    return .{
+        .samples_json = samples_json,
+        .sample_count = sample_count,
+        .truncated = truncated,
+    };
+}
+
+fn foreignKeyIntegrityViolationSamplesContain(
+    samples: []const ForeignKeyIntegrityViolation,
+    needle: ForeignKeyIntegrityViolation,
+) bool {
+    for (samples) |sample| {
+        if (sample.kind != needle.kind) continue;
+        if (!std.mem.eql(u8, sample.constraint_name, needle.constraint_name)) continue;
+        if (!std.mem.eql(u8, sample.child_table, needle.child_table)) continue;
+        if (!std.mem.eql(u8, sample.child_key, needle.child_key)) continue;
+        if (!std.mem.eql(u8, sample.parent_table, needle.parent_table)) continue;
+        if (!std.mem.eql(u8, sample.parent_key, needle.parent_key)) continue;
+        if (!optionalStringsEqual(sample.observed_parent_key, needle.observed_parent_key)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
 fn finishForeignKeyIntegrityJobOnDb(
+    alloc: std.mem.Allocator,
     db: *db_mod.DB,
     job_id: ?[]const u8,
     result: ForeignKeyIntegrityResult,
 ) !void {
     const id = job_id orelse return;
     if (!result.complete) return;
-    const record = try db.completeForeignKeyIntegrityJobRecord(
+    const status = if (result.valid) "complete" else "invalid";
+    const record = if (result.violations.len > 0 or result.violations_truncated) blk: {
+        const existing = try db.loadForeignKeyIntegrityJobRecord(id);
+        defer if (existing) |record| db.freeForeignKeyIntegrityJobRecord(record);
+        var diagnostics = try foreignKeyIntegrityJobDiagnosticsAlloc(alloc, existing, result);
+        defer diagnostics.deinit(alloc);
+        break :blk try db.completeForeignKeyIntegrityJobRecordWithDiagnostics(
+            id,
+            status,
+            result.valid,
+            result.report,
+            diagnostics.samples_json,
+            diagnostics.sample_count,
+            diagnostics.truncated,
+        );
+    } else try db.completeForeignKeyIntegrityJobRecord(
         id,
-        if (result.valid) "complete" else "invalid",
+        status,
         result.valid,
         result.report,
     );
@@ -3066,17 +3214,19 @@ fn foreignKeyIntegritySchemaControllerPassWithSchemaJson(
 fn validateForeignKeyIntegritySchemaControllerOptions(options: ForeignKeyIntegritySchemaControllerOptions) !void {
     if (!foreignKeyIntegrityWorkerActionSupported(options.action)) return error.InvalidForeignKeyIntegrityRequest;
     if (options.worker_id.len == 0 or options.lease_ms == 0) return error.InvalidForeignKeyIntegrityRequest;
-    if (options.max_tables == 0 or options.max_work_units_per_table == 0) return error.InvalidForeignKeyIntegrityRequest;
+    if (options.max_tables == 0 or options.max_jobs == 0 or options.max_work_units_per_table == 0) return error.InvalidForeignKeyIntegrityRequest;
 }
 
 fn appendForeignKeyIntegritySchemaControllerTableResult(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(ForeignKeyIntegritySchemaControllerTableResult),
     table_name: []const u8,
+    schema_adoption: bool,
     result: ForeignKeyIntegrityResult,
 ) !void {
     var entry = ForeignKeyIntegritySchemaControllerTableResult{
         .table_name = try alloc.dupe(u8, table_name),
+        .schema_adoption = schema_adoption,
         .result = result,
     };
     errdefer entry.deinit(alloc);
@@ -3117,7 +3267,77 @@ fn runForeignKeyIntegritySchemaControllerMaintenanceForTable(
     summary.valid = summary.valid and result.valid;
     if (result.complete and result.valid) summary.terminal_valid_results += 1;
     if (result.complete and !result.valid) summary.terminal_invalid_results += 1;
-    try appendForeignKeyIntegritySchemaControllerTableResult(alloc, results, table_name, result);
+    try appendForeignKeyIntegritySchemaControllerTableResult(alloc, results, table_name, true, result);
+}
+
+fn foreignKeyIntegrityActionFromJobStatus(job: ForeignKeyIntegrityJobStatus) ?ForeignKeyIntegrityAction {
+    return std.meta.stringToEnum(ForeignKeyIntegrityAction, job.action);
+}
+
+fn foreignKeyIntegritySchemaControllerResultsContainJobId(
+    results: []const ForeignKeyIntegritySchemaControllerTableResult,
+    job_id: []const u8,
+) bool {
+    for (results) |entry| {
+        if (entry.result.job_id) |existing| {
+            if (std.mem.eql(u8, existing, job_id)) return true;
+        }
+    }
+    return false;
+}
+
+fn runForeignKeyIntegrityJobControllerMaintenanceForTable(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    table_name: []const u8,
+    options: ForeignKeyIntegritySchemaControllerOptions,
+    summary: *ForeignKeyIntegritySchemaControllerResult,
+    results: *std.ArrayListUnmanaged(ForeignKeyIntegritySchemaControllerTableResult),
+) !void {
+    if (summary.jobs_executed >= options.max_jobs) return;
+    var progress = (try source.foreignKeyIntegrity(
+        alloc,
+        table_name,
+        .progress,
+        null,
+        "",
+        "",
+        0,
+    )) orelse return;
+    defer progress.deinit(alloc);
+
+    summary.jobs_scanned += progress.jobs.len;
+    for (progress.jobs) |job| {
+        if (summary.jobs_executed >= options.max_jobs) break;
+        if (job.completed) continue;
+        if (!std.mem.eql(u8, job.table_name, table_name)) continue;
+        if (foreignKeyIntegritySchemaControllerResultsContainJobId(results.items, job.job_id)) continue;
+        const action = foreignKeyIntegrityActionFromJobStatus(job) orelse continue;
+        if (!foreignKeyIntegrityWorkerActionSupported(action)) continue;
+
+        var result = (try source.foreignKeyIntegrityWorkerPass(
+            alloc,
+            table_name,
+            action,
+            job.job_id,
+            options.worker_id,
+            options.lease_ms,
+            options.max_work_units_per_table,
+            job.constraint_name,
+            job.lower_doc_key,
+            job.upper_doc_key,
+            options.violation_limit,
+        )) orelse continue;
+        errdefer result.deinit(alloc);
+
+        summary.jobs_executed += 1;
+        summary.claim_attempts += result.work_claims.len;
+        summary.complete = summary.complete and result.complete;
+        summary.valid = summary.valid and result.valid;
+        if (result.complete and result.valid) summary.terminal_valid_results += 1;
+        if (result.complete and !result.valid) summary.terminal_invalid_results += 1;
+        try appendForeignKeyIntegritySchemaControllerTableResult(alloc, results, table_name, false, result);
+    }
 }
 
 fn finalizeForeignKeyIntegritySchemaControllerMaintenanceResult(
@@ -3195,7 +3415,15 @@ fn runCatalogForeignKeyIntegritySchemaControllerMaintenancePass(
             &summary,
             &results,
         );
-        if (summary.tables_executed >= options.max_tables) break;
+        try runForeignKeyIntegrityJobControllerMaintenanceForTable(
+            alloc,
+            source,
+            table.name,
+            options,
+            &summary,
+            &results,
+        );
+        if (summary.tables_executed >= options.max_tables and summary.jobs_executed >= options.max_jobs) break;
     }
 
     return try finalizeForeignKeyIntegritySchemaControllerMaintenanceResult(alloc, summary, &results);
@@ -3255,6 +3483,81 @@ fn cloneForeignKeyIntegrityWorkClaim(
     return cloned;
 }
 
+fn cloneForeignKeyIntegrityJobStatus(
+    alloc: std.mem.Allocator,
+    job: ForeignKeyIntegrityJobStatus,
+) !ForeignKeyIntegrityJobStatus {
+    var cloned = ForeignKeyIntegrityJobStatus{
+        .group_id = job.group_id,
+        .version = job.version,
+        .job_id = try alloc.dupe(u8, job.job_id),
+        .table_name = &.{},
+        .action = &.{},
+        .worker_id = &.{},
+        .constraint_name = null,
+        .lower_doc_key = &.{},
+        .upper_doc_key = &.{},
+        .lease_ms = job.lease_ms,
+        .max_work_units = job.max_work_units,
+        .status = &.{},
+        .created_at_ns = job.created_at_ns,
+        .updated_at_ns = job.updated_at_ns,
+        .attempts = job.attempts,
+        .completed = job.completed,
+        .valid = job.valid,
+        .last_report = job.last_report,
+        .violation_sample_count = job.violation_sample_count,
+        .violations_truncated = job.violations_truncated,
+    };
+    errdefer cloned.deinit(alloc);
+    cloned.table_name = try alloc.dupe(u8, job.table_name);
+    cloned.action = try alloc.dupe(u8, job.action);
+    cloned.worker_id = try alloc.dupe(u8, job.worker_id);
+    if (job.constraint_name) |value| cloned.constraint_name = try alloc.dupe(u8, value);
+    cloned.lower_doc_key = try alloc.dupe(u8, job.lower_doc_key);
+    cloned.upper_doc_key = try alloc.dupe(u8, job.upper_doc_key);
+    cloned.status = try alloc.dupe(u8, job.status);
+    return cloned;
+}
+
+fn cloneForeignKeyIntegrityJobRecord(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    job: db_mod.DB.ForeignKeyIntegrityJobRecord,
+) !ForeignKeyIntegrityJobStatus {
+    var cloned = ForeignKeyIntegrityJobStatus{
+        .group_id = group_id,
+        .version = job.version,
+        .job_id = try alloc.dupe(u8, job.job_id),
+        .table_name = &.{},
+        .action = &.{},
+        .worker_id = &.{},
+        .constraint_name = null,
+        .lower_doc_key = &.{},
+        .upper_doc_key = &.{},
+        .lease_ms = job.lease_ms,
+        .max_work_units = job.max_work_units,
+        .status = &.{},
+        .created_at_ns = job.created_at_ns,
+        .updated_at_ns = job.updated_at_ns,
+        .attempts = job.attempts,
+        .completed = job.completed,
+        .valid = job.valid,
+        .last_report = job.last_report,
+        .violation_sample_count = job.violation_sample_count,
+        .violations_truncated = job.violations_truncated,
+    };
+    errdefer cloned.deinit(alloc);
+    cloned.table_name = try alloc.dupe(u8, job.table_name);
+    cloned.action = try alloc.dupe(u8, job.action);
+    cloned.worker_id = try alloc.dupe(u8, job.worker_id);
+    if (job.constraint_name) |value| cloned.constraint_name = try alloc.dupe(u8, value);
+    cloned.lower_doc_key = try alloc.dupe(u8, job.lower_doc_key);
+    cloned.upper_doc_key = try alloc.dupe(u8, job.upper_doc_key);
+    cloned.status = try alloc.dupe(u8, job.status);
+    return cloned;
+}
+
 fn cloneForeignKeyIntegrityWorkClaimSlice(
     alloc: std.mem.Allocator,
     entries: []const ForeignKeyIntegrityWorkClaim,
@@ -3288,6 +3591,16 @@ fn cloneForeignKeyIntegrityResultForWorkerSnapshot(
         for (work_claims) |*claim| claim.deinit(alloc);
         if (work_claims.len > 0) alloc.free(work_claims);
     }
+    var jobs = try alloc.alloc(ForeignKeyIntegrityJobStatus, result.jobs.len);
+    var jobs_initialized: usize = 0;
+    errdefer {
+        for (jobs[0..jobs_initialized]) |*job| job.deinit(alloc);
+        if (jobs.len > 0) alloc.free(jobs);
+    }
+    for (result.jobs, 0..) |job, i| {
+        jobs[i] = try cloneForeignKeyIntegrityJobStatus(alloc, job);
+        jobs_initialized += 1;
+    }
     const violations = try alloc.alloc(ForeignKeyIntegrityViolation, 0);
     errdefer alloc.free(violations);
     var cloned: ForeignKeyIntegrityResult = .{
@@ -3302,6 +3615,7 @@ fn cloneForeignKeyIntegrityResultForWorkerSnapshot(
         .work_units = &.{},
         .work_claims = work_claims,
         .work_statuses = &.{},
+        .jobs = jobs,
         .violations = violations,
     };
     errdefer cloned.deinit(alloc);
@@ -3350,6 +3664,16 @@ fn cloneForeignKeyIntegrityResultForWorkerExecution(
         violations[i] = try cloneForeignKeyIntegrityResultViolation(alloc, violation);
         violations_initialized += 1;
     }
+    var jobs = try alloc.alloc(ForeignKeyIntegrityJobStatus, result.jobs.len);
+    var jobs_initialized: usize = 0;
+    errdefer {
+        for (jobs[0..jobs_initialized]) |*job| job.deinit(alloc);
+        if (jobs.len > 0) alloc.free(jobs);
+    }
+    for (result.jobs, 0..) |job, i| {
+        jobs[i] = try cloneForeignKeyIntegrityJobStatus(alloc, job);
+        jobs_initialized += 1;
+    }
     var cloned: ForeignKeyIntegrityResult = .{
         .action = result.action,
         .valid = result.valid,
@@ -3363,6 +3687,7 @@ fn cloneForeignKeyIntegrityResultForWorkerExecution(
         .work_units = work_units,
         .work_claims = work_claims,
         .work_statuses = work_statuses,
+        .jobs = jobs,
         .violations = violations,
     };
     errdefer cloned.deinit(alloc);
@@ -4038,6 +4363,7 @@ fn appendForeignKeyIntegrityResult(
     progress_entries: *std.ArrayListUnmanaged(ForeignKeyIntegrityProgress),
     work_units: *std.ArrayListUnmanaged(ForeignKeyIntegrityWorkUnit),
     work_claims: *std.ArrayListUnmanaged(ForeignKeyIntegrityWorkClaim),
+    jobs: *std.ArrayListUnmanaged(ForeignKeyIntegrityJobStatus),
     violations: *std.ArrayListUnmanaged(ForeignKeyIntegrityViolation),
     delete_plan: *?db_mod.relational_store.ForeignKeyDeletePlan,
     truncated: *bool,
@@ -4063,6 +4389,11 @@ fn appendForeignKeyIntegrityResult(
         work_claims.appendAssumeCapacity(try cloneForeignKeyIntegrityWorkClaim(alloc, claim));
     }
 
+    try jobs.ensureUnusedCapacity(alloc, result.jobs.len);
+    for (result.jobs) |job| {
+        jobs.appendAssumeCapacity(try cloneForeignKeyIntegrityJobStatus(alloc, job));
+    }
+
     const remaining = violation_limit -| violations.items.len;
     const copy_count = @min(remaining, result.violations.len);
     try violations.ensureUnusedCapacity(alloc, copy_count);
@@ -4083,6 +4414,7 @@ fn appendForeignKeyIntegrityProgressAndClaims(
     result: ForeignKeyIntegrityResult,
     progress_entries: *std.ArrayListUnmanaged(ForeignKeyIntegrityProgress),
     work_claims: *std.ArrayListUnmanaged(ForeignKeyIntegrityWorkClaim),
+    jobs: *std.ArrayListUnmanaged(ForeignKeyIntegrityJobStatus),
 ) !void {
     try progress_entries.ensureUnusedCapacity(alloc, result.progress.len);
     for (result.progress) |progress| {
@@ -4091,6 +4423,10 @@ fn appendForeignKeyIntegrityProgressAndClaims(
     try work_claims.ensureUnusedCapacity(alloc, result.work_claims.len);
     for (result.work_claims) |claim| {
         work_claims.appendAssumeCapacity(try cloneForeignKeyIntegrityWorkClaim(alloc, claim));
+    }
+    try jobs.ensureUnusedCapacity(alloc, result.jobs.len);
+    for (result.jobs) |job| {
+        jobs.appendAssumeCapacity(try cloneForeignKeyIntegrityJobStatus(alloc, job));
     }
 }
 
@@ -4380,6 +4716,20 @@ fn runForeignKeyIntegrityOnDb(
         work_claims.appendAssumeCapacity(try cloneForeignKeyIntegrityWorkClaimRecord(alloc, claim));
     }
 
+    var jobs = std.ArrayListUnmanaged(ForeignKeyIntegrityJobStatus).empty;
+    errdefer {
+        for (jobs.items) |*job| job.deinit(alloc);
+        jobs.deinit(alloc);
+    }
+    if (action == .progress) {
+        const job_records = try db.listForeignKeyIntegrityJobRecords();
+        defer db.freeForeignKeyIntegrityJobRecords(job_records);
+        try jobs.ensureUnusedCapacity(alloc, job_records.len);
+        for (job_records) |job| {
+            jobs.appendAssumeCapacity(try cloneForeignKeyIntegrityJobRecord(alloc, group_id, job));
+        }
+    }
+
     const include_work_unit = switch (action) {
         .plan, .validate, .dry_run, .repair, .list => true,
         .explain_delete, .progress => false,
@@ -4417,6 +4767,7 @@ fn runForeignKeyIntegrityOnDb(
         .work_units = work_units,
         .work_claims = try work_claims.toOwnedSlice(alloc),
         .work_statuses = work_statuses,
+        .jobs = try jobs.toOwnedSlice(alloc),
         .violations = try violations.toOwnedSlice(alloc),
     };
 }
@@ -4802,7 +5153,7 @@ pub const BoundTableWriteSource = struct {
             var cleanup = result;
             cleanup.deinit(alloc);
         }
-        try finishForeignKeyIntegrityJobOnDb(self.db, job_id, result);
+        try finishForeignKeyIntegrityJobOnDb(alloc, self.db, job_id, result);
         try attachForeignKeyIntegrityJobId(alloc, &result, job_id);
         return result;
     }
@@ -4870,11 +5221,20 @@ pub const BoundTableWriteSource = struct {
                 &summary,
                 &results,
             );
-            if (results.items.len > 0) {
+            try runForeignKeyIntegrityJobControllerMaintenanceForTable(
+                alloc,
+                self.source(),
+                self.table_name,
+                options,
+                &summary,
+                &results,
+            );
+            for (results.items) |entry| {
+                if (!entry.schema_adoption) continue;
                 try promoteLocalForeignKeyAfterSchemaControllerResult(
                     alloc,
                     self.db,
-                    results.items[results.items.len - 1].result,
+                    entry.result,
                 );
             }
         }
@@ -4932,7 +5292,7 @@ pub const BoundTableWriteSource = struct {
         try startForeignKeyIntegrityJobOnDb(self.db, job_id, table_name, action, worker_id, constraint_name, lower_doc_key, upper_doc_key, lease_ms, max_work_units);
         var result = try runForeignKeyIntegrityClaimedWorkUnitOnDb(alloc, self.db, group_id, action, phase, claim_key, worker_id, lease_ms, constraint_name, lower_doc_key, upper_doc_key, violation_limit);
         errdefer result.deinit(alloc);
-        try finishForeignKeyIntegrityJobOnDb(self.db, job_id, result);
+        try finishForeignKeyIntegrityJobOnDb(alloc, self.db, job_id, result);
         try attachForeignKeyIntegrityJobId(alloc, &result, job_id);
         return result;
     }
@@ -8998,6 +9358,7 @@ pub const ProvisionedTableWriteSource = struct {
         var progress_entries = std.ArrayListUnmanaged(ForeignKeyIntegrityProgress).empty;
         var work_units = std.ArrayListUnmanaged(ForeignKeyIntegrityWorkUnit).empty;
         var work_claims = std.ArrayListUnmanaged(ForeignKeyIntegrityWorkClaim).empty;
+        var jobs = std.ArrayListUnmanaged(ForeignKeyIntegrityJobStatus).empty;
         var violations = std.ArrayListUnmanaged(ForeignKeyIntegrityViolation).empty;
         errdefer {
             group_reports.deinit(alloc);
@@ -9007,6 +9368,8 @@ pub const ProvisionedTableWriteSource = struct {
             work_units.deinit(alloc);
             for (work_claims.items) |*claim| claim.deinit(alloc);
             work_claims.deinit(alloc);
+            for (jobs.items) |*job| job.deinit(alloc);
+            jobs.deinit(alloc);
             for (violations.items) |*violation| violation.deinit(alloc);
             violations.deinit(alloc);
         }
@@ -9043,6 +9406,7 @@ pub const ProvisionedTableWriteSource = struct {
                     &progress_entries,
                     &work_units,
                     &work_claims,
+                    &jobs,
                     &violations,
                     &delete_plan,
                     &truncated,
@@ -9073,6 +9437,7 @@ pub const ProvisionedTableWriteSource = struct {
                     &progress_entries,
                     &work_units,
                     &work_claims,
+                    &jobs,
                     &violations,
                     &delete_plan,
                     &truncated,
@@ -9101,6 +9466,7 @@ pub const ProvisionedTableWriteSource = struct {
             .work_units = try work_units.toOwnedSlice(alloc),
             .work_claims = try work_claims.toOwnedSlice(alloc),
             .work_statuses = work_statuses,
+            .jobs = try jobs.toOwnedSlice(alloc),
             .violations = try violations.toOwnedSlice(alloc),
         };
     }
@@ -9379,7 +9745,12 @@ pub const ProvisionedTableWriteSource = struct {
                 0,
             )) orelse return error.UnknownGroup;
             defer one.deinit(alloc);
-            try appendForeignKeyIntegrityProgressAndClaims(alloc, one, progress_entries, work_claims);
+            var jobs = std.ArrayListUnmanaged(ForeignKeyIntegrityJobStatus).empty;
+            defer {
+                for (jobs.items) |*job| job.deinit(alloc);
+                jobs.deinit(alloc);
+            }
+            try appendForeignKeyIntegrityProgressAndClaims(alloc, one, progress_entries, work_claims, &jobs);
         }
     }
 
@@ -9604,7 +9975,7 @@ pub const ProvisionedTableWriteSource = struct {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
             defer cached.deinit(alloc);
             if (complete_result) |result| {
-                try finishForeignKeyIntegrityJobOnDb(cached.db, job_id, result);
+                try finishForeignKeyIntegrityJobOnDb(alloc, cached.db, job_id, result);
             } else {
                 try startForeignKeyIntegrityJobOnDb(cached.db, job_id, table_name, action, worker_id, constraint_name, lower_doc_key, upper_doc_key, lease_ms, max_work_units);
             }
@@ -9621,7 +9992,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer db.close();
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
         if (complete_result) |result| {
-            try finishForeignKeyIntegrityJobOnDb(&db, job_id, result);
+            try finishForeignKeyIntegrityJobOnDb(alloc, &db, job_id, result);
         } else {
             try startForeignKeyIntegrityJobOnDb(&db, job_id, table_name, action, worker_id, constraint_name, lower_doc_key, upper_doc_key, lease_ms, max_work_units);
         }
@@ -9670,7 +10041,7 @@ pub const ProvisionedTableWriteSource = struct {
                 violation_limit,
             );
             errdefer result.deinit(alloc);
-            try finishForeignKeyIntegrityJobOnDb(cached.db, job_id, result);
+            try finishForeignKeyIntegrityJobOnDb(alloc, cached.db, job_id, result);
             try attachForeignKeyIntegrityJobId(alloc, &result, job_id);
             try drainManagedDbBeforeClose(cached.db);
             lockAtomic(&self.local_db_mutex);
@@ -9701,7 +10072,7 @@ pub const ProvisionedTableWriteSource = struct {
             violation_limit,
         );
         errdefer result.deinit(alloc);
-        try finishForeignKeyIntegrityJobOnDb(&db, job_id, result);
+        try finishForeignKeyIntegrityJobOnDb(alloc, &db, job_id, result);
         try attachForeignKeyIntegrityJobId(alloc, &result, job_id);
         self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         if (action == .repair) self.notifyLocalChange(table_name, .data);
@@ -10729,6 +11100,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         var progress_entries = std.ArrayListUnmanaged(ForeignKeyIntegrityProgress).empty;
         var work_units = std.ArrayListUnmanaged(ForeignKeyIntegrityWorkUnit).empty;
         var work_claims = std.ArrayListUnmanaged(ForeignKeyIntegrityWorkClaim).empty;
+        var jobs = std.ArrayListUnmanaged(ForeignKeyIntegrityJobStatus).empty;
         var violations = std.ArrayListUnmanaged(ForeignKeyIntegrityViolation).empty;
         errdefer {
             group_reports.deinit(alloc);
@@ -10738,6 +11110,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             work_units.deinit(alloc);
             for (work_claims.items) |*claim| claim.deinit(alloc);
             work_claims.deinit(alloc);
+            for (jobs.items) |*job| job.deinit(alloc);
+            jobs.deinit(alloc);
             for (violations.items) |*violation| violation.deinit(alloc);
             violations.deinit(alloc);
         }
@@ -10770,7 +11144,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                                 violation_limit -| violations.items.len,
                             )) orelse return error.UnknownGroup;
                             defer one.deinit(alloc);
-                            try appendForeignKeyIntegrityResult(alloc, one, violation_limit, &aggregate, &group_reports, &progress_entries, &work_units, &work_claims, &violations, &delete_plan, &truncated, &valid, &complete);
+                            try appendForeignKeyIntegrityResult(alloc, one, violation_limit, &aggregate, &group_reports, &progress_entries, &work_units, &work_claims, &jobs, &violations, &delete_plan, &truncated, &valid, &complete);
                         },
                         .remote => |remote| {
                             var client = http_client.ApiHttpClient.init(alloc, self.executor);
@@ -10790,7 +11164,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                                 .ignore_unknown_fields = true,
                             });
                             defer parsed.deinit();
-                            try appendForeignKeyIntegrityResult(alloc, parsed.value, violation_limit, &aggregate, &group_reports, &progress_entries, &work_units, &work_claims, &violations, &delete_plan, &truncated, &valid, &complete);
+                            try appendForeignKeyIntegrityResult(alloc, parsed.value, violation_limit, &aggregate, &group_reports, &progress_entries, &work_units, &work_claims, &jobs, &violations, &delete_plan, &truncated, &valid, &complete);
                         },
                     }
                 } else {
@@ -10814,7 +11188,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         violation_limit -| violations.items.len,
                     )) orelse return error.UnknownGroup;
                     defer one.deinit(alloc);
-                    try appendForeignKeyIntegrityResult(alloc, one, violation_limit, &aggregate, &group_reports, &progress_entries, &work_units, &work_claims, &violations, &delete_plan, &truncated, &valid, &complete);
+                    try appendForeignKeyIntegrityResult(alloc, one, violation_limit, &aggregate, &group_reports, &progress_entries, &work_units, &work_claims, &jobs, &violations, &delete_plan, &truncated, &valid, &complete);
                 }
             }
         } else {
@@ -10836,7 +11210,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                                 violation_limit -| violations.items.len,
                             )) orelse return error.UnknownGroup;
                             defer one.deinit(alloc);
-                            try appendForeignKeyIntegrityResult(alloc, one, violation_limit, &aggregate, &group_reports, &progress_entries, &work_units, &work_claims, &violations, &delete_plan, &truncated, &valid, &complete);
+                            try appendForeignKeyIntegrityResult(alloc, one, violation_limit, &aggregate, &group_reports, &progress_entries, &work_units, &work_claims, &jobs, &violations, &delete_plan, &truncated, &valid, &complete);
                         },
                         .remote => |remote| {
                             var client = http_client.ApiHttpClient.init(alloc, self.executor);
@@ -10856,7 +11230,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                                 .ignore_unknown_fields = true,
                             });
                             defer parsed.deinit();
-                            try appendForeignKeyIntegrityResult(alloc, parsed.value, violation_limit, &aggregate, &group_reports, &progress_entries, &work_units, &work_claims, &violations, &delete_plan, &truncated, &valid, &complete);
+                            try appendForeignKeyIntegrityResult(alloc, parsed.value, violation_limit, &aggregate, &group_reports, &progress_entries, &work_units, &work_claims, &jobs, &violations, &delete_plan, &truncated, &valid, &complete);
                         },
                     }
                 } else {
@@ -10880,7 +11254,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         violation_limit -| violations.items.len,
                     )) orelse return error.UnknownGroup;
                     defer one.deinit(alloc);
-                    try appendForeignKeyIntegrityResult(alloc, one, violation_limit, &aggregate, &group_reports, &progress_entries, &work_units, &work_claims, &violations, &delete_plan, &truncated, &valid, &complete);
+                    try appendForeignKeyIntegrityResult(alloc, one, violation_limit, &aggregate, &group_reports, &progress_entries, &work_units, &work_claims, &jobs, &violations, &delete_plan, &truncated, &valid, &complete);
                 }
             }
         }
@@ -10904,6 +11278,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             .work_units = try work_units.toOwnedSlice(alloc),
             .work_claims = try work_claims.toOwnedSlice(alloc),
             .work_statuses = work_statuses,
+            .jobs = try jobs.toOwnedSlice(alloc),
             .violations = try violations.toOwnedSlice(alloc),
         };
     }
@@ -11199,7 +11574,12 @@ pub const HostedProvisionedTableWriteSource = struct {
                 )) orelse return error.UnknownGroup;
             };
             defer one.deinit(alloc);
-            try appendForeignKeyIntegrityProgressAndClaims(alloc, one, progress_entries, work_claims);
+            var jobs = std.ArrayListUnmanaged(ForeignKeyIntegrityJobStatus).empty;
+            defer {
+                for (jobs.items) |*job| job.deinit(alloc);
+                jobs.deinit(alloc);
+            }
+            try appendForeignKeyIntegrityProgressAndClaims(alloc, one, progress_entries, work_claims, &jobs);
         }
     }
 
@@ -11472,7 +11852,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             violation_limit,
         );
         errdefer result.deinit(alloc);
-        try finishForeignKeyIntegrityJobOnDb(cached.db, job_id, result);
+        try finishForeignKeyIntegrityJobOnDb(alloc, cached.db, job_id, result);
         try attachForeignKeyIntegrityJobId(alloc, &result, job_id);
         try drainManagedDbBeforeClose(cached.db);
         return result;
@@ -22566,6 +22946,70 @@ test "foreign key integrity worker plan includes active owner ranges" {
     }
 }
 
+test "foreign key integrity job diagnostics merge samples across passes" {
+    const alloc = std.testing.allocator;
+    const old_samples =
+        \\[{"group_id":7,"kind":"missing_parent","constraint_name":"orders_customer_id_fkey","child_table":"row","child_key":"order:old","parent_table":"customers","parent_key":"customer:old","parent_values":[],"observed_parent_values":[]}]
+    ;
+    const existing: db_mod.DB.ForeignKeyIntegrityJobRecord = .{
+        .job_id = "job:fk",
+        .table_name = "orders",
+        .action = "validate",
+        .worker_id = "worker",
+        .constraint_name = "orders_customer_id_fkey",
+        .lower_doc_key = "",
+        .upper_doc_key = "",
+        .lease_ms = 60_000,
+        .max_work_units = 1,
+        .status = "running",
+        .created_at_ns = 1,
+        .updated_at_ns = 2,
+        .violation_samples_json = old_samples,
+        .violation_sample_count = 1,
+    };
+
+    var new_violations = [_]ForeignKeyIntegrityViolation{
+        .{
+            .group_id = 7,
+            .kind = .missing_parent,
+            .constraint_name = try alloc.dupe(u8, "orders_customer_id_fkey"),
+            .child_table = try alloc.dupe(u8, "row"),
+            .child_key = try alloc.dupe(u8, "order:old"),
+            .parent_table = try alloc.dupe(u8, "customers"),
+            .parent_key = try alloc.dupe(u8, "customer:old"),
+        },
+        .{
+            .group_id = 8,
+            .kind = .missing_parent,
+            .constraint_name = try alloc.dupe(u8, "orders_customer_id_fkey"),
+            .child_table = try alloc.dupe(u8, "row"),
+            .child_key = try alloc.dupe(u8, "order:new"),
+            .parent_table = try alloc.dupe(u8, "customers"),
+            .parent_key = try alloc.dupe(u8, "customer:new"),
+        },
+    };
+    defer {
+        for (&new_violations) |*violation| violation.deinit(alloc);
+    }
+    const result: ForeignKeyIntegrityResult = .{
+        .action = .validate,
+        .valid = false,
+        .complete = true,
+        .violation_limit = 100,
+        .violations_truncated = false,
+        .report = .{ .missing_parent_rows = 2 },
+        .groups = &.{},
+        .violations = new_violations[0..],
+    };
+
+    var diagnostics = try foreignKeyIntegrityJobDiagnosticsAlloc(alloc, existing, result);
+    defer diagnostics.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.sample_count);
+    try std.testing.expect(!diagnostics.truncated);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.samples_json, "\"child_key\":\"order:old\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.samples_json, "\"child_key\":\"order:new\"") != null);
+}
+
 test "foreign key schema controller maintenance repairs unvalidated local constraint" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-fk-schema-controller-maintenance";
@@ -22652,6 +23096,83 @@ test "foreign key schema controller maintenance repairs unvalidated local constr
     try std.testing.expect(job.valid.?);
 }
 
+test "foreign key schema controller maintenance resumes incomplete durable local job" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-fk-job-controller-maintenance";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(
+        alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","validation_state":"enforced"}]}
+    ,
+        .{},
+    );
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:present", .value = "{\"_type\":\"customers\"}" },
+            .{ .key = "order:pending-job", .value = "{\"customer_id\":\"customer:present\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    var bound = BoundTableWriteSource.init("orders", &db);
+    var started = (try bound.source().foreignKeyIntegrityWorkerPass(
+        alloc,
+        "orders",
+        .validate,
+        "job:fk:orders:resume",
+        "worker:manual",
+        60_000,
+        0,
+        "orders_customer_id_fkey",
+        "",
+        "",
+        100,
+    )).?;
+    defer started.deinit(alloc);
+    try std.testing.expect(!started.complete);
+
+    var progress = (try bound.source().foreignKeyIntegrity(alloc, "orders", .progress, null, "", "", 0)).?;
+    defer progress.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), progress.jobs.len);
+    try std.testing.expectEqualStrings("job:fk:orders:resume", progress.jobs[0].job_id);
+    try std.testing.expect(!progress.jobs[0].completed);
+
+    var summary = (try bound.source().foreignKeyIntegritySchemaControllerMaintenancePass(alloc, .{
+        .action = .repair,
+        .worker_id = "worker:fk-job-controller",
+        .max_tables = 4,
+        .max_jobs = 4,
+        .max_work_units_per_table = 1,
+    })).?;
+    defer summary.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_scanned);
+    try std.testing.expectEqual(@as(usize, 0), summary.tables_with_pending_constraints);
+    try std.testing.expectEqual(@as(usize, 0), summary.tables_executed);
+    try std.testing.expectEqual(@as(usize, 1), summary.jobs_scanned);
+    try std.testing.expectEqual(@as(usize, 1), summary.jobs_executed);
+    try std.testing.expectEqual(@as(usize, 1), summary.results.len);
+    try std.testing.expect(!summary.results[0].schema_adoption);
+    try std.testing.expectEqualStrings("job:fk:orders:resume", summary.results[0].result.job_id.?);
+    try std.testing.expect(summary.results[0].result.complete);
+    try std.testing.expect(summary.results[0].result.valid);
+    try std.testing.expectEqual(@as(u64, 0), summary.results[0].result.report.missing_parent_rows);
+
+    const job = (try db.loadForeignKeyIntegrityJobRecord("job:fk:orders:resume")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityJobRecord(job);
+    try std.testing.expectEqualStrings("complete", job.status);
+    try std.testing.expect(job.completed);
+    try std.testing.expect(job.valid.?);
+    try std.testing.expectEqualStrings("worker:fk-job-controller", job.worker_id);
+    try std.testing.expectEqual(@as(usize, 0), job.violation_sample_count);
+}
+
 test "foreign key schema controller maintenance records invalid unvalidated local constraint" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-fk-schema-controller-maintenance-invalid";
@@ -22708,6 +23229,10 @@ test "foreign key schema controller maintenance records invalid unvalidated loca
     try std.testing.expectEqualStrings("invalid", job.status);
     try std.testing.expect(job.completed);
     try std.testing.expect(!job.valid.?);
+    try std.testing.expectEqual(@as(usize, 2), job.violation_sample_count);
+    try std.testing.expect(!job.violations_truncated);
+    try std.testing.expect(std.mem.indexOf(u8, job.violation_samples_json, "\"child_key\":\"order:1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, job.violation_samples_json, "\"kind\":\"missing_parent\"") != null);
 }
 
 test "managed startup catch-up open disables optional runtimes and workers" {

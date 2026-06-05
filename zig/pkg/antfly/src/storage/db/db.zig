@@ -10269,6 +10269,9 @@ pub const DB = struct {
         completed: bool = false,
         valid: ?bool = null,
         last_report: relational_store_mod.ForeignKeyIntegrityReport = .{},
+        violation_samples_json: []const u8 = "[]",
+        violation_sample_count: usize = 0,
+        violations_truncated: bool = false,
     };
 
     pub fn freeForeignKeyIntegrityJobRecord(self: *DB, record: ForeignKeyIntegrityJobRecord) void {
@@ -10280,6 +10283,7 @@ pub const DB = struct {
         if (record.lower_doc_key.len > 0) self.alloc.free(record.lower_doc_key);
         if (record.upper_doc_key.len > 0) self.alloc.free(record.upper_doc_key);
         if (record.status.len > 0) self.alloc.free(record.status);
+        if (record.violation_samples_json.len > 0) self.alloc.free(record.violation_samples_json);
     }
 
     pub fn freeForeignKeyIntegrityJobRecords(self: *DB, records: []ForeignKeyIntegrityJobRecord) void {
@@ -10771,12 +10775,21 @@ pub const DB = struct {
 
         var created_at_ns = now_ns;
         var attempts: u32 = 1;
+        var violation_samples_json: []const u8 = "[]";
+        var preserved_violation_samples_json: ?[]u8 = null;
+        defer if (preserved_violation_samples_json) |value| self.alloc.free(value);
+        var violation_sample_count: usize = 0;
+        var violations_truncated = false;
         if (self.core.store.get(self.alloc, key)) |raw| {
             defer self.alloc.free(raw);
             const existing = try self.cloneForeignKeyIntegrityJobRecordFromJson(raw);
             defer self.freeForeignKeyIntegrityJobRecord(existing);
             created_at_ns = existing.created_at_ns;
             attempts = existing.attempts +| 1;
+            preserved_violation_samples_json = try self.alloc.dupe(u8, existing.violation_samples_json);
+            violation_samples_json = preserved_violation_samples_json.?;
+            violation_sample_count = existing.violation_sample_count;
+            violations_truncated = existing.violations_truncated;
         } else |err| switch (err) {
             error.NotFound => {},
             else => return err,
@@ -10799,6 +10812,9 @@ pub const DB = struct {
             .completed = false,
             .valid = null,
             .last_report = .{},
+            .violation_samples_json = violation_samples_json,
+            .violation_sample_count = violation_sample_count,
+            .violations_truncated = violations_truncated,
         };
         const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(payload);
@@ -10816,12 +10832,57 @@ pub const DB = struct {
         return try self.completeForeignKeyIntegrityJobRecordAt(job_id, status, valid, report, monotonicTimeNs());
     }
 
+    pub fn completeForeignKeyIntegrityJobRecordWithDiagnostics(
+        self: *DB,
+        job_id: []const u8,
+        status: []const u8,
+        valid: bool,
+        report: relational_store_mod.ForeignKeyIntegrityReport,
+        violation_samples_json: []const u8,
+        violation_sample_count: usize,
+        violations_truncated: bool,
+    ) !ForeignKeyIntegrityJobRecord {
+        return try self.completeForeignKeyIntegrityJobRecordWithDiagnosticsAt(
+            job_id,
+            status,
+            valid,
+            report,
+            violation_samples_json,
+            violation_sample_count,
+            violations_truncated,
+            monotonicTimeNs(),
+        );
+    }
+
     pub fn completeForeignKeyIntegrityJobRecordAt(
         self: *DB,
         job_id: []const u8,
         status: []const u8,
         valid: bool,
         report: relational_store_mod.ForeignKeyIntegrityReport,
+        now_ns: u64,
+    ) !ForeignKeyIntegrityJobRecord {
+        return try self.completeForeignKeyIntegrityJobRecordWithDiagnosticsAt(
+            job_id,
+            status,
+            valid,
+            report,
+            null,
+            null,
+            null,
+            now_ns,
+        );
+    }
+
+    pub fn completeForeignKeyIntegrityJobRecordWithDiagnosticsAt(
+        self: *DB,
+        job_id: []const u8,
+        status: []const u8,
+        valid: bool,
+        report: relational_store_mod.ForeignKeyIntegrityReport,
+        violation_samples_json: ?[]const u8,
+        violation_sample_count: ?usize,
+        violations_truncated: ?bool,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -10856,6 +10917,75 @@ pub const DB = struct {
             .completed = true,
             .valid = valid,
             .last_report = report,
+            .violation_samples_json = violation_samples_json orelse existing.violation_samples_json,
+            .violation_sample_count = violation_sample_count orelse existing.violation_sample_count,
+            .violations_truncated = violations_truncated orelse existing.violations_truncated,
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(payload);
+        try self.core.store.put(key, payload);
+        return try self.cloneForeignKeyIntegrityJobRecordFromJson(payload);
+    }
+
+    pub fn updateForeignKeyIntegrityJobDiagnostics(
+        self: *DB,
+        job_id: []const u8,
+        violation_samples_json: []const u8,
+        violation_sample_count: usize,
+        violations_truncated: bool,
+    ) !ForeignKeyIntegrityJobRecord {
+        return try self.updateForeignKeyIntegrityJobDiagnosticsAt(
+            job_id,
+            violation_samples_json,
+            violation_sample_count,
+            violations_truncated,
+            monotonicTimeNs(),
+        );
+    }
+
+    pub fn updateForeignKeyIntegrityJobDiagnosticsAt(
+        self: *DB,
+        job_id: []const u8,
+        violation_samples_json: []const u8,
+        violation_sample_count: usize,
+        violations_truncated: bool,
+        now_ns: u64,
+    ) !ForeignKeyIntegrityJobRecord {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (job_id.len == 0) return error.InvalidForeignKeyIntegrityJob;
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        const key = try foreignKeyIntegrityJobKeyAlloc(self.alloc, job_id);
+        defer self.alloc.free(key);
+        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return error.ForeignKeyIntegrityJobNotFound,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        const existing = try self.cloneForeignKeyIntegrityJobRecordFromJson(raw);
+        defer self.freeForeignKeyIntegrityJobRecord(existing);
+
+        const record = ForeignKeyIntegrityJobRecord{
+            .job_id = existing.job_id,
+            .table_name = existing.table_name,
+            .action = existing.action,
+            .worker_id = existing.worker_id,
+            .constraint_name = existing.constraint_name,
+            .lower_doc_key = existing.lower_doc_key,
+            .upper_doc_key = existing.upper_doc_key,
+            .lease_ms = existing.lease_ms,
+            .max_work_units = existing.max_work_units,
+            .status = existing.status,
+            .created_at_ns = existing.created_at_ns,
+            .updated_at_ns = now_ns,
+            .attempts = existing.attempts,
+            .completed = existing.completed,
+            .valid = existing.valid,
+            .last_report = existing.last_report,
+            .violation_samples_json = violation_samples_json,
+            .violation_sample_count = violation_sample_count,
+            .violations_truncated = violations_truncated,
         };
         const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(payload);
@@ -11068,6 +11198,9 @@ pub const DB = struct {
             .completed = parsed.value.completed,
             .valid = parsed.value.valid,
             .last_report = parsed.value.last_report,
+            .violation_samples_json = &.{},
+            .violation_sample_count = parsed.value.violation_sample_count,
+            .violations_truncated = parsed.value.violations_truncated,
         };
         errdefer self.freeForeignKeyIntegrityJobRecord(cloned);
         cloned.job_id = try self.alloc.dupe(u8, parsed.value.job_id);
@@ -11078,6 +11211,7 @@ pub const DB = struct {
         cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
         cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
         cloned.status = try self.alloc.dupe(u8, parsed.value.status);
+        cloned.violation_samples_json = try self.alloc.dupe(u8, parsed.value.violation_samples_json);
         return cloned;
     }
 
@@ -42934,6 +43068,9 @@ test "db foreign key integrity job records persist intent and completion" {
         try std.testing.expectEqual(@as(u32, 1), created.attempts);
         try std.testing.expect(!created.completed);
         try std.testing.expect(created.valid == null);
+        try std.testing.expectEqualStrings("[]", created.violation_samples_json);
+        try std.testing.expectEqual(@as(usize, 0), created.violation_sample_count);
+        try std.testing.expect(!created.violations_truncated);
 
         const resumed = try db.upsertForeignKeyIntegrityJobRecordAt(
             "job:fk:orders:validate",
@@ -42956,6 +43093,18 @@ test "db foreign key integrity job records persist intent and completion" {
         try std.testing.expectEqual(@as(u64, 120_000), resumed.lease_ms);
         try std.testing.expectEqual(@as(usize, 8), resumed.max_work_units);
 
+        const diagnosed = try db.updateForeignKeyIntegrityJobDiagnosticsAt(
+            "job:fk:orders:validate",
+            "[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]",
+            1,
+            true,
+            25_000,
+        );
+        defer db.freeForeignKeyIntegrityJobRecord(diagnosed);
+        try std.testing.expectEqualStrings("[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]", diagnosed.violation_samples_json);
+        try std.testing.expectEqual(@as(usize, 1), diagnosed.violation_sample_count);
+        try std.testing.expect(diagnosed.violations_truncated);
+
         const completed = try db.completeForeignKeyIntegrityJobRecordAt(
             "job:fk:orders:validate",
             "complete",
@@ -42968,6 +43117,9 @@ test "db foreign key integrity job records persist intent and completion" {
         try std.testing.expect(completed.valid.?);
         try std.testing.expectEqualStrings("complete", completed.status);
         try std.testing.expectEqual(@as(u64, 12), completed.last_report.referenced_child_rows);
+        try std.testing.expectEqualStrings("[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]", completed.violation_samples_json);
+        try std.testing.expectEqual(@as(usize, 1), completed.violation_sample_count);
+        try std.testing.expect(completed.violations_truncated);
 
         const all = try db.listForeignKeyIntegrityJobRecords();
         defer db.freeForeignKeyIntegrityJobRecords(all);
@@ -42984,6 +43136,9 @@ test "db foreign key integrity job records persist intent and completion" {
     try std.testing.expectEqualStrings("complete", persisted.status);
     try std.testing.expectEqual(@as(u32, 2), persisted.attempts);
     try std.testing.expectEqual(@as(u64, 12), persisted.last_report.referenced_child_rows);
+    try std.testing.expectEqualStrings("[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]", persisted.violation_samples_json);
+    try std.testing.expectEqual(@as(usize, 1), persisted.violation_sample_count);
+    try std.testing.expect(persisted.violations_truncated);
 }
 
 test "db relational foreign keys setSchema rejects reserved runtime states" {

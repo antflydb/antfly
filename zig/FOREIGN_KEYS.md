@@ -669,13 +669,25 @@ FK declarations, and run at most `max_tables` schema-controller worker passes
 per invocation. This gives hosted runtimes an in-process primitive that can be
 scheduled from an existing background loop without external HTTP polling while
 preserving the same stable job ids and durable per-group progress rows.
+The same maintenance pass also scans durable group-local FK integrity job
+records exposed by `.progress`, finds incomplete validate/dry-run/repair jobs,
+deduplicates them by `job_id`, and advances up to `max_jobs` bounded worker
+passes using the controller worker identity. These job-controller results are
+kept distinct from schema-adoption results, so a partial or user-created job can
+finish without mutating catalog validation state; only schema-adoption results
+are eligible for the `validation_state: "enforced"` promotion path.
 
 Group DB FK integrity job records are keyed by `job_id`. A record stores table,
 action, worker identity, optional constraint scope, document-key range, lease
 duration, per-pass work-unit limit, status, attempt count, created/updated
-timestamps, completion/validity, and the latest aggregate report. These records
-are the durable intent/resume substrate for hosted job controllers; they survive
-DB reopen independently from the in-memory background job lane.
+timestamps, completion/validity, the latest aggregate report, and a bounded JSON
+sample of violation diagnostics with sample count and truncation metadata. Each
+completed pass merges distinct new samples into the existing job sample up to
+the bounded limit; completion without fresh samples preserves any previously
+recorded diagnostic sample, so a later terminal pass does not erase the useful
+failure context gathered by an earlier bounded pass. These records are the
+durable intent/resume substrate for hosted job controllers; they survive DB
+reopen independently from the in-memory background job lane.
 
 When hosted FK refs move to routed ownership, repair becomes a two-phase
 constraint-index job:
@@ -741,11 +753,13 @@ local, provisioned, local-hosted, and remote-hosted claimed work. Metadata-owned
 background rounds now provide the first automatic hosted/provisioned scheduling
 shape: the metadata leader runs one bounded schema-controller maintenance pass
 per round, with explicit service config for enablement, worker id, lease
-duration, maximum tables per round, maximum work units per table, and violation
-limit. The default worker id is `metadata-fk-schema-controller`; the default
-round advances at most four tables and one work unit per table. Each non-empty
-round logs scanned, pending, executed, claim, terminal-valid, terminal-invalid,
-completion, and validity counters, exposes cumulative and last-round counters
+duration, maximum tables per round, maximum durable jobs per round, maximum
+work units per pass, and violation limit. The default worker id is
+`metadata-fk-schema-controller`; the default round advances at most four tables,
+sixteen durable jobs, and one work unit per pass. Each non-empty round logs
+scanned, pending, executed, job-scanned, job-executed, claim, terminal-valid,
+terminal-invalid, completion, and validity counters, exposes cumulative and
+last-round counters
 in metadata status, accumulates cumulative and last-round FK integrity report
 counters for the work it actually ran, and promotes terminal valid adoption jobs
 through the metadata table-update path.
@@ -761,15 +775,14 @@ rewrite the selected FK to `enforced`, and enqueue the resulting table record
 through the same schema-update/table-upsert path used by admin schema changes.
 `AdminSource.updateForeignKeyValidationState` exposes the same catalog flip for
 external coordinators. Terminal invalid adoption results are surfaced through
-the durable FK job record (`status: "invalid"`, `valid: false`), metadata
-scheduler warnings, and `foreign_key_validation_json` in the internal table
-record. That metadata records the constraint name, action, optional job id,
-terminal validity, report counters, and truncation flag without writing
-reserved states into runtime schema JSON. A later terminal valid promotion
-clears the stale invalid entry for that constraint. The remaining production
-work is richer hosted job orchestration: aggregate sampled violation details
-across passes and compose child-range repair with owner-prefix cleanup across
-coordinator or worker restarts.
+the durable FK job record (`status: "invalid"`, `valid: false`, aggregate
+report, and bounded violation sample diagnostics), metadata scheduler warnings,
+and `foreign_key_validation_json` in the internal table record. That metadata
+records the constraint name, action, optional job id, terminal validity, report
+counters, and truncation flag without writing reserved states into runtime
+schema JSON. A later terminal valid promotion clears the stale invalid entry for
+that constraint. Durable validate/dry-run/repair jobs are also resumed by the
+same metadata-owned background pass without relying on request polling.
 
 Diagnostics should report:
 
@@ -999,6 +1012,10 @@ Implemented:
   provisioned, and hosted claimed-unit execution, preserving job intent, worker
   identity, lease/pass limits, status, attempts, completion, validity, and
   latest report across reopen in the DBs that own the planned work;
+- bounded FK job violation diagnostics: completed job records merge distinct
+  reported violations into a bounded JSON sample, sample count, and truncation
+  flag, while completion without fresh samples preserves any prior diagnostic
+  sample for the same durable job;
 - DB owner validation/dry-run/repair for a single parent-key prefix and for a
   routed FK-ref owner range parent-key span. The primitive scans owner rows,
   detects rows whose child row is missing or now references a different parent,
@@ -1012,11 +1029,12 @@ Implemented:
 
 Remaining work:
 
-- in-process hosted resumable validation/repair controller that discovers
-  schema/admin jobs without an external poller, invokes bounded worker passes
-  outside the interactive request path, retries idempotently, aggregates
-  violation details across passes, and drives large owner-range repair jobs
-  without relying on an operator or public HTTP request loop.
+- distributed large-operation execution and recovery for high-fanout
+  `set_null` / `cascade` parent deletes. The validation/repair controller can
+  already discover and advance durable integrity jobs without a public request
+  loop; high-fanout data-changing operations still need a durable operation
+  plan, resume cursor, idempotent participant execution, and operator-visible
+  recovery diagnostics.
 
 Repair may rebuild missing/corrupt secondary metadata, but it must not silently
 mutate user rows. Orphaned child rows should be reported for explicit operator
@@ -1438,20 +1456,23 @@ Minimum coverage:
   hosted table storage.
 - In-process FK maintenance surface: table-write sources expose a bounded
   schema-controller maintenance pass that scans bound/local or catalog-backed
-  tables for non-enforced FK declarations and advances durable repair/validation
-  jobs without requiring public HTTP polling. Bound/local maintenance also
-  promotes a terminal valid adoption job to `enforced` by applying the rewritten
-  schema through the ordinary local schema validator. Metadata-owned
-  provisioned/hosted rounds invoke the same bounded pass automatically and
-  promote terminal valid adoption jobs through the metadata table-update path;
-  service config controls whether the pass runs, worker id, lease duration,
-  table/work-unit limits, and violation limit. Non-empty rounds log aggregate
-  scheduler counters and metadata status exposes cumulative and last-round
-  scheduler counters plus cumulative and last-round FK integrity report
-  counters. Terminal invalid adoption jobs remain durable FK job records,
-  scheduler diagnostics, and internal table validation metadata instead of
-  runtime schema states. `AdminSource.updateForeignKeyValidationState` provides
-  the same explicit catalog transition primitive for external coordinators.
+  tables for non-enforced FK declarations and scans durable group-local
+  validate/dry-run/repair job records to advance incomplete jobs without
+  requiring public HTTP polling. Bound/local maintenance also promotes a
+  terminal valid adoption job to `enforced` by applying the rewritten schema
+  through the ordinary local schema validator. Metadata-owned provisioned/hosted
+  rounds invoke the same bounded pass automatically and promote terminal valid
+  adoption jobs through the metadata table-update path; durable job-controller
+  results are reported separately and do not mutate catalog validation state.
+  Service config controls whether the pass runs, worker id, lease duration,
+  table/job/work-unit limits, and violation limit. Non-empty rounds log
+  aggregate scheduler counters and metadata status exposes cumulative and
+  last-round scheduler counters plus cumulative and last-round FK integrity
+  report counters. Terminal invalid adoption jobs remain durable FK job records,
+  bounded job violation samples, scheduler diagnostics, and internal table
+  validation metadata instead of runtime schema states.
+  `AdminSource.updateForeignKeyValidationState` provides the same explicit
+  catalog transition primitive for external coordinators.
 - Unique operational surface: `POST /tables/{table}/unique-integrity`
   validates, dry-runs repair, repairs, and reports stored progress for unique
   integrity rows on local, provisioned, and hosted relational tables.
@@ -1459,4 +1480,4 @@ Minimum coverage:
   delete using the same FK participant path as commit and return non-mutating
   set-null/cascade/reject counters.
 - Remaining operational docs: explicit large-operation execution/recovery
-  diagnostics and richer cross-pass hosted violation-detail summaries.
+  diagnostics for high-fanout set-null/cascade.

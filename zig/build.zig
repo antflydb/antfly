@@ -3626,6 +3626,7 @@ pub fn build(b: *std.Build) void {
             "unique integrity owner topology inspection reports active and transitional ranges",
             "foreign key integrity plan clips requested span to table ranges",
             "foreign key integrity worker plan includes active owner ranges",
+            "foreign key integrity job diagnostics merge samples across passes",
             "foreign key schema controller maintenance",
         },
         .test_runner = .{

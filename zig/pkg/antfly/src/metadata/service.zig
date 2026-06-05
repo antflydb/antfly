@@ -225,6 +225,7 @@ pub const ForeignKeySchemaControllerConfig = struct {
     worker_id: []const u8 = default_fk_schema_controller_worker_id,
     lease_ms: u64 = 60_000,
     max_tables: usize = 4,
+    max_jobs: usize = 16,
     max_work_units_per_table: usize = 1,
     violation_limit: usize = 100,
 
@@ -234,6 +235,7 @@ pub const ForeignKeySchemaControllerConfig = struct {
             .worker_id = self.worker_id,
             .lease_ms = self.lease_ms,
             .max_tables = self.max_tables,
+            .max_jobs = self.max_jobs,
             .max_work_units_per_table = self.max_work_units_per_table,
             .violation_limit = self.violation_limit,
         };
@@ -266,6 +268,8 @@ const ForeignKeySchemaControllerRuntimeStatus = struct {
         self.counters.tables_scanned_total +%= summary.tables_scanned;
         self.counters.tables_with_pending_constraints_total +%= summary.tables_with_pending_constraints;
         self.counters.tables_executed_total +%= summary.tables_executed;
+        self.counters.jobs_scanned_total +%= summary.jobs_scanned;
+        self.counters.jobs_executed_total +%= summary.jobs_executed;
         self.counters.claim_attempts_total +%= summary.claim_attempts;
         self.counters.terminal_valid_results_total +%= summary.terminal_valid_results;
         self.counters.terminal_invalid_results_total +%= summary.terminal_invalid_results;
@@ -273,6 +277,8 @@ const ForeignKeySchemaControllerRuntimeStatus = struct {
         self.counters.last_tables_scanned = summary.tables_scanned;
         self.counters.last_tables_with_pending_constraints = summary.tables_with_pending_constraints;
         self.counters.last_tables_executed = summary.tables_executed;
+        self.counters.last_jobs_scanned = summary.jobs_scanned;
+        self.counters.last_jobs_executed = summary.jobs_executed;
         self.counters.last_claim_attempts = summary.claim_attempts;
         self.counters.last_terminal_valid_results = summary.terminal_valid_results;
         self.counters.last_terminal_invalid_results = summary.terminal_invalid_results;
@@ -3862,14 +3868,16 @@ fn runForeignKeySchemaControllerMaintenanceForService(
         service.recordForeignKeySchemaControllerMaintenanceSummary(summary);
     }
 
-    if (summary.tables_with_pending_constraints > 0 or summary.tables_executed > 0 or summary.terminal_valid_results > 0 or summary.terminal_invalid_results > 0) {
+    if (summary.tables_with_pending_constraints > 0 or summary.tables_executed > 0 or summary.jobs_executed > 0 or summary.terminal_valid_results > 0 or summary.terminal_invalid_results > 0) {
         std.log.info(
-            "metadata fk schema-controller round worker_id={s} scanned={d} pending={d} executed={d} claims={d} terminal_valid={d} terminal_invalid={d} complete={any} valid={any}",
+            "metadata fk schema-controller round worker_id={s} scanned={d} pending={d} executed={d} jobs_scanned={d} jobs_executed={d} claims={d} terminal_valid={d} terminal_invalid={d} complete={any} valid={any}",
             .{
                 config.worker_id,
                 summary.tables_scanned,
                 summary.tables_with_pending_constraints,
                 summary.tables_executed,
+                summary.jobs_scanned,
+                summary.jobs_executed,
                 summary.claim_attempts,
                 summary.terminal_valid_results,
                 summary.terminal_invalid_results,
@@ -3880,6 +3888,7 @@ fn runForeignKeySchemaControllerMaintenanceForService(
     }
 
     for (summary.results) |entry| {
+        if (!entry.schema_adoption) continue;
         if (isTerminalInvalidForeignKeySchemaControllerResult(entry.result)) {
             std.log.warn(
                 "metadata fk schema-controller terminal invalid table={s} constraint={s} job_id={s} missing_parent_rows={d} missing_ref_rows={d}",
@@ -3904,6 +3913,7 @@ test "metadata fk schema controller config builds bounded maintenance options" {
         .worker_id = "metadata-fk-test-worker",
         .lease_ms = 1234,
         .max_tables = 7,
+        .max_jobs = 11,
         .max_work_units_per_table = 3,
         .violation_limit = 42,
     };
@@ -3912,6 +3922,7 @@ test "metadata fk schema controller config builds bounded maintenance options" {
     try std.testing.expectEqualStrings("metadata-fk-test-worker", options.worker_id);
     try std.testing.expectEqual(@as(u64, 1234), options.lease_ms);
     try std.testing.expectEqual(@as(usize, 7), options.max_tables);
+    try std.testing.expectEqual(@as(usize, 11), options.max_jobs);
     try std.testing.expectEqual(@as(usize, 3), options.max_work_units_per_table);
     try std.testing.expectEqual(@as(usize, 42), options.violation_limit);
 
@@ -3919,6 +3930,7 @@ test "metadata fk schema controller config builds bounded maintenance options" {
     try std.testing.expectEqualStrings(default_fk_schema_controller_worker_id, defaults.worker_id);
     try std.testing.expectEqual(@as(u64, 60_000), defaults.lease_ms);
     try std.testing.expectEqual(@as(usize, 4), defaults.max_tables);
+    try std.testing.expectEqual(@as(usize, 16), defaults.max_jobs);
     try std.testing.expectEqual(@as(usize, 1), defaults.max_work_units_per_table);
     try std.testing.expectEqual(@as(usize, 100), defaults.violation_limit);
 
