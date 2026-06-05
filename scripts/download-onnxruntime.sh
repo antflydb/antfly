@@ -355,8 +355,8 @@ main() {
     info "To build with ONNX support, set:"
     info "  export ONNXRUNTIME_ROOT=${OUTPUT_DIR}"
     echo ""
-    info "Then run goreleaser:"
-    info "  ONNXRUNTIME_ROOT=${OUTPUT_DIR} SDK_PATH=\$(xcrun --show-sdk-path) goreleaser release --snapshot --clean"
+    info "Then run the Antfly release workflow or packaging scripts with:"
+    info "  ONNXRUNTIME_ROOT=${OUTPUT_DIR} SDK_PATH=\$(xcrun --show-sdk-path)"
     echo ""
 
     # List what was downloaded

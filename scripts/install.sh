@@ -75,8 +75,8 @@ EOF
         fi
     fi
 
-    # Normalize version: TAG has v prefix, VERSION_NUM does not
-    # GoReleaser uses .Tag (with v) for paths and .Version (without v) for filenames
+    # Normalize version: TAG has v prefix, VERSION_NUM does not.
+    # Release paths use TAG, while archive filenames use VERSION_NUM.
     case "$VERSION" in
         v*) TAG="$VERSION"; VERSION_NUM="${VERSION#v}" ;;
         *)  TAG="v$VERSION"; VERSION_NUM="$VERSION" ;;

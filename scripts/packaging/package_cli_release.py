@@ -168,6 +168,7 @@ def package_python_wheel(
 
     def write_bytes(zf: zipfile.ZipFile, arcname: str, data: bytes, mode: int | None = None) -> None:
         info = zipfile.ZipInfo(arcname)
+        info.compress_type = zipfile.ZIP_DEFLATED
         info.external_attr = ((mode or 0o644) & 0xFFFF) << 16
         zf.writestr(info, data)
         digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
@@ -226,7 +227,7 @@ def package_python_wheel(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", required=True, help="Antfly version, with or without v prefix")
-    parser.add_argument("--archive-dir", type=Path, default=Path("dist"), help="Directory containing GoReleaser archives")
+    parser.add_argument("--archive-dir", type=Path, default=Path("dist"), help="Directory containing release archives")
     parser.add_argument("--out-dir", type=Path, default=Path("dist/cli-packages"), help="Output directory")
     args = parser.parse_args()
 
