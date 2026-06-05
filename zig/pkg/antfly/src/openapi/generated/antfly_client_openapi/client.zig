@@ -465,7 +465,7 @@ pub const Client = struct {
         return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Perform structured relational row writes by primary identity
+    /// Perform structured relational row writes by row identity
     /// POST /db/v1/tables/{tableName}/rows:batch
     pub fn rowsBatchWrite(self: *@This(), table_name: []const u8, body: types.RowsBatchRequest) !ApiResponse(types.BatchResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:batch", .{ self.base_url, table_name });
@@ -476,15 +476,15 @@ pub const Client = struct {
         return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Lookup relational rows by structured primary identity
+    /// Lookup relational rows by structured row identity
     /// POST /db/v1/tables/{tableName}/rows:get
-    pub fn rowsGet(self: *@This(), table_name: []const u8, body: types.RowsGetRequest) !ApiResponse(types.RowsGetResponse) {
+    pub fn rowsGet(self: *@This(), table_name: []const u8, body: types.RowsGetRequest) !ApiResponse(types.RowsGetResultSet) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:get", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.RowsGetResponse).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.RowsGetResultSet).fromResponse(self.allocator, &resp);
     }
 
     /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge

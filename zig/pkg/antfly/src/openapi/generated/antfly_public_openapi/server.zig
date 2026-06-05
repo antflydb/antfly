@@ -202,7 +202,7 @@ pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Perform structured relational row writes by primary identity
+/// Perform structured relational row writes by row identity
 pub const RowsBatchWritePathParams = struct {
     /// Name of the relational table
     table_name: []const u8,
@@ -213,7 +213,7 @@ pub fn parseRowsBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !
     return std.json.parseFromSlice(types.RowsBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Lookup relational rows by structured primary identity
+/// Lookup relational rows by structured row identity
 pub const RowsGetPathParams = struct {
     /// Name of the relational table
     table_name: []const u8,

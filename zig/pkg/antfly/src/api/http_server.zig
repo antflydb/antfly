@@ -239,6 +239,30 @@ pub const ApiHttpServerConfig = struct {
     session_savepoint_limit: ?usize = null,
 };
 
+const RowsUniqueSelectorResolverContext = struct {
+    source: ?table_reads.TableReadSource,
+
+    fn resolver(self: *@This()) ?relational_rows_api.UniqueSelectorResolver {
+        if (self.source == null) return null;
+        return .{
+            .ptr = self,
+            .resolve = resolve,
+        };
+    }
+
+    fn resolve(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+    ) !?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const source = self.source orelse return error.UnsupportedOperation;
+        return try source.relationalUniqueOwnerLookup(alloc, table_name, constraint_name, encoded_value, .read_index);
+    }
+};
+
 pub const trusted_principal_header = "X-Antfly-Trusted-Principal";
 
 pub const AuthenticatedRequest = struct {
@@ -5484,8 +5508,12 @@ pub const ApiHttpServer = struct {
         };
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
-        var rows_req = relational_rows_api.parseRowsBatchRequest(self.alloc, body, schema) catch |err| switch (err) {
+        var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
+        const unique_resolver = unique_resolver_ctx.resolver();
+        var rows_req = relational_rows_api.parseRowsBatchRequestWithResolver(self.alloc, table_name, body, schema, unique_resolver) catch |err| switch (err) {
             error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
+            error.RowSelectorNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),
             else => return try textResponse(self.alloc, 400, "invalid rows request"),
         };
         defer rows_req.deinit(self.alloc);
@@ -5520,8 +5548,11 @@ pub const ApiHttpServer = struct {
         };
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
-        var rows_req = relational_rows_api.parseRowsGetRequest(self.alloc, body, schema) catch |err| switch (err) {
+        var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
+        const unique_resolver = unique_resolver_ctx.resolver();
+        var rows_req = relational_rows_api.parseRowsGetRequestWithResolver(self.alloc, table_name, body, schema, unique_resolver) catch |err| switch (err) {
             error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
+            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),
             else => return try textResponse(self.alloc, 400, "invalid rows request"),
         };
         defer rows_req.deinit(self.alloc);
@@ -5538,13 +5569,14 @@ pub const ApiHttpServer = struct {
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
 
-        for (rows_req.keys, 0..) |key, i| {
+        for (rows_req.keys, 0..) |maybe_key, i| {
             results[i] = .{
                 .identity_json = rows_req.identities_json[i],
-                .physical_key = key,
+                .physical_key = maybe_key,
                 .found = false,
             };
             initialized += 1;
+            const key = maybe_key orelse continue;
             var lookup = (try source.lookup(self.alloc, table_name, key, .{}, .read_index)) orelse continue;
             defer lookup.deinit(self.alloc);
             if (row_filter_json) |value| {
@@ -11557,6 +11589,137 @@ test "api http server updates local table schema through bound write source" {
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), batch_resp.status);
+}
+
+test "api http server resolves relational rows by unique selector" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rows-unique-selector", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    var read_source = table_reads.BoundTableReadSource.init("users", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var write_source = table_writes.BoundTableWriteSource.init("users", &db);
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "users",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+
+    var insert_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/users/rows:batch",
+        .content_type = "application/json",
+        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"user:ada\",\"email\":\"ada@example.test\",\"status\":\"new\"}},{\"op\":\"insert\",\"row\":{\"id\":\"user:grace\",\"email\":\"grace@example.test\",\"status\":\"new\"}}]}",
+    });
+    defer insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), insert_resp.status);
+
+    var get_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/users/rows:get",
+        .content_type = "application/json",
+        .body = "{\"keys\":[{\"unique\":{\"name\":\"users_email_key\",\"values\":{\"email\":\"ada@example.test\"}}}],\"include_physical_key\":true}",
+    });
+    defer get_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), get_resp.status);
+    var parsed_get = try std.json.parseFromSlice(std.json.Value, alloc, get_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_get.deinit();
+    const first_get = parsed_get.value.object.get("rows").?.array.items[0].object;
+    try std.testing.expect(first_get.get("found").?.bool);
+    try std.testing.expectEqualStrings("ada@example.test", first_get.get("row").?.object.get("email").?.string);
+    try std.testing.expect(first_get.get("physical_key").? == .string);
+
+    var update_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/users/rows:batch",
+        .content_type = "application/json",
+        .body = "{\"operations\":[{\"op\":\"update\",\"where\":{\"unique\":{\"name\":\"users_email_key\",\"values\":{\"email\":\"ada@example.test\"}}},\"patch\":{\"status\":\"active\"}}]}",
+    });
+    defer update_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), update_resp.status);
+
+    var updated_get_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/users/rows:get",
+        .content_type = "application/json",
+        .body = "{\"keys\":[{\"primary\":{\"id\":\"user:ada\"}}]}",
+    });
+    defer updated_get_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), updated_get_resp.status);
+    var parsed_updated = try std.json.parseFromSlice(std.json.Value, alloc, updated_get_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_updated.deinit();
+    const updated = parsed_updated.value.object.get("rows").?.array.items[0].object;
+    try std.testing.expect(updated.get("found").?.bool);
+    try std.testing.expectEqualStrings("active", updated.get("row").?.object.get("status").?.string);
+
+    var delete_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/users/rows:batch",
+        .content_type = "application/json",
+        .body = "{\"operations\":[{\"op\":\"delete\",\"where\":{\"unique\":{\"name\":\"users_email_key\",\"values\":{\"email\":\"ada@example.test\"}}}}]}",
+    });
+    defer delete_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), delete_resp.status);
+
+    var missing_get_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/users/rows:get",
+        .content_type = "application/json",
+        .body = "{\"keys\":[{\"unique\":{\"name\":\"users_email_key\",\"values\":{\"email\":\"ada@example.test\"}}}],\"include_physical_key\":true}",
+    });
+    defer missing_get_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), missing_get_resp.status);
+    var parsed_missing = try std.json.parseFromSlice(std.json.Value, alloc, missing_get_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_missing.deinit();
+    const missing = parsed_missing.value.object.get("rows").?.array.items[0].object;
+    try std.testing.expect(!missing.get("found").?.bool);
+    try std.testing.expect(missing.get("physical_key").? == .null);
 }
 
 test "api http server serves public transaction commit route" {

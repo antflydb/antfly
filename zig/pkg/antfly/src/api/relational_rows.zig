@@ -53,12 +53,12 @@ pub const OwnedRowsBatchRequest = struct {
 };
 
 pub const OwnedRowsGetRequest = struct {
-    keys: [][]const u8 = &.{},
+    keys: []?[]const u8 = &.{},
     identities_json: [][]const u8 = &.{},
     include_physical_key: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        for (self.keys) |key| alloc.free(key);
+        for (self.keys) |key| if (key) |value| alloc.free(value);
         if (self.keys.len > 0) alloc.free(self.keys);
         for (self.identities_json) |identity| alloc.free(identity);
         if (self.identities_json.len > 0) alloc.free(self.identities_json);
@@ -66,10 +66,41 @@ pub const OwnedRowsGetRequest = struct {
     }
 };
 
+pub const UniqueSelectorResolver = struct {
+    ptr: *anyopaque,
+    resolve: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+    ) anyerror!?[]u8,
+
+    pub fn resolveUnique(
+        self: UniqueSelectorResolver,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+    ) !?[]u8 {
+        return try self.resolve(self.ptr, alloc, table_name, constraint_name, encoded_value);
+    }
+};
+
 pub fn parseRowsBatchRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
     schema: runtime_schema.TableSchema,
+) !OwnedRowsBatchRequest {
+    return try parseRowsBatchRequestWithResolver(alloc, "", body, schema, null);
+}
+
+pub fn parseRowsBatchRequestWithResolver(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    body: []const u8,
+    schema: runtime_schema.TableSchema,
+    unique_resolver: ?UniqueSelectorResolver,
 ) !OwnedRowsBatchRequest {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidRowsRequest;
     if (body.len == 0) return error.InvalidRowsRequest;
@@ -141,7 +172,7 @@ pub fn parseRowsBatchRequest(
         }
 
         if (std.mem.eql(u8, op_text, "delete")) {
-            const key = try physicalPrimaryKeyFromWhereAlloc(alloc, schema, op_value.object.get("where") orelse return error.InvalidRowsRequest);
+            const key = (try physicalPrimaryKeyFromWhereAlloc(alloc, table_name, schema, op_value.object.get("where") orelse return error.InvalidRowsRequest, unique_resolver, false)) orelse return error.RowSelectorNotFound;
             var key_transferred = false;
             errdefer if (!key_transferred) alloc.free(key);
             try deletes.append(alloc, key);
@@ -151,7 +182,7 @@ pub fn parseRowsBatchRequest(
         }
 
         if (std.mem.eql(u8, op_text, "update")) {
-            const key = try physicalPrimaryKeyFromWhereAlloc(alloc, schema, op_value.object.get("where") orelse return error.InvalidRowsRequest);
+            const key = (try physicalPrimaryKeyFromWhereAlloc(alloc, table_name, schema, op_value.object.get("where") orelse return error.InvalidRowsRequest, unique_resolver, false)) orelse return error.RowSelectorNotFound;
             var key_transferred = false;
             errdefer if (!key_transferred) alloc.free(key);
             const patch = op_value.object.get("patch") orelse return error.InvalidRowsRequest;
@@ -213,6 +244,16 @@ pub fn parseRowsGetRequest(
     body: []const u8,
     schema: runtime_schema.TableSchema,
 ) !OwnedRowsGetRequest {
+    return try parseRowsGetRequestWithResolver(alloc, "", body, schema, null);
+}
+
+pub fn parseRowsGetRequestWithResolver(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    body: []const u8,
+    schema: runtime_schema.TableSchema,
+    unique_resolver: ?UniqueSelectorResolver,
+) !OwnedRowsGetRequest {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidRowsRequest;
     if (body.len == 0) return error.InvalidRowsRequest;
 
@@ -230,9 +271,9 @@ pub fn parseRowsGetRequest(
     const keys_value = parsed.value.object.get("keys") orelse return error.InvalidRowsRequest;
     if (keys_value != .array) return error.InvalidRowsRequest;
 
-    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    var keys = std.ArrayListUnmanaged(?[]const u8).empty;
     errdefer {
-        freeDeletes(alloc, keys.items);
+        freeOptionalKeys(alloc, keys.items);
         keys.deinit(alloc);
     }
     var identities = std.ArrayListUnmanaged([]const u8).empty;
@@ -242,9 +283,9 @@ pub fn parseRowsGetRequest(
     }
 
     for (keys_value.array.items) |selector| {
-        const key = try physicalPrimaryKeyFromWhereAlloc(alloc, schema, selector);
+        const key = try physicalPrimaryKeyFromWhereAlloc(alloc, table_name, schema, selector, unique_resolver, true);
         var key_transferred = false;
-        errdefer if (!key_transferred) alloc.free(key);
+        errdefer if (!key_transferred) if (key) |value| alloc.free(value);
         const identity_json = try identityResponseJsonAlloc(alloc, selector);
         var identity_transferred = false;
         errdefer if (!identity_transferred) alloc.free(identity_json);
@@ -256,7 +297,7 @@ pub fn parseRowsGetRequest(
 
     const keys_owned = try keys.toOwnedSlice(alloc);
     errdefer {
-        freeDeletes(alloc, keys_owned);
+        freeOptionalKeys(alloc, keys_owned);
         alloc.free(keys_owned);
     }
     const identities_owned = try identities.toOwnedSlice(alloc);
@@ -300,7 +341,11 @@ pub fn encodeRowsGetResponseAlloc(
             try writer.writeAll(",\"found\":false");
         }
         if (include_physical_key) {
-            try writer.print(",\"physical_key\":{f}", .{std.json.fmt(row.physical_key, .{})});
+            if (row.physical_key) |physical_key| {
+                try writer.print(",\"physical_key\":{f}", .{std.json.fmt(physical_key, .{})});
+            } else {
+                try writer.writeAll(",\"physical_key\":null");
+            }
         }
         try writer.writeByte('}');
     }
@@ -310,7 +355,7 @@ pub fn encodeRowsGetResponseAlloc(
 
 pub const RowLookupResult = struct {
     identity_json: []const u8,
-    physical_key: []const u8,
+    physical_key: ?[]const u8 = null,
     found: bool,
     row_json: ?[]const u8 = null,
     version: ?u64 = null,
@@ -318,12 +363,29 @@ pub const RowLookupResult = struct {
 
 pub fn physicalPrimaryKeyFromWhereAlloc(
     alloc: std.mem.Allocator,
+    table_name: []const u8,
     schema: runtime_schema.TableSchema,
     where_value: std.json.Value,
-) ![]u8 {
+    unique_resolver: ?UniqueSelectorResolver,
+    missing_unique_ok: bool,
+) !?[]u8 {
     if (where_value != .object) return error.InvalidRowsRequest;
     const primary_value = where_value.object.get("primary") orelse {
-        if (where_value.object.get("unique") != null) return error.UnsupportedRowsSelector;
+        if (where_value.object.get("unique")) |unique_value| {
+            const resolver = unique_resolver orelse return error.UnsupportedRowsSelector;
+            if (unique_value != .object) return error.InvalidRowsRequest;
+            const name_value = unique_value.object.get("name") orelse return error.InvalidRowsRequest;
+            if (name_value != .string) return error.InvalidRowsRequest;
+            const values_value = unique_value.object.get("values") orelse return error.InvalidRowsRequest;
+            if (values_value != .object) return error.InvalidRowsRequest;
+            const constraint = findUniqueConstraint(schema.unique_constraints, name_value.string) orelse return error.InvalidRowsRequest;
+            const encoded_value = try uniqueConstraintValueFromValuesAlloc(alloc, schema, constraint, values_value);
+            defer alloc.free(encoded_value);
+            return (try resolver.resolveUnique(alloc, table_name, constraint.name, encoded_value)) orelse {
+                if (missing_unique_ok) return null;
+                return error.RowSelectorNotFound;
+            };
+        }
         return error.InvalidRowsRequest;
     };
     if (primary_value != .object) return error.InvalidRowsRequest;
@@ -376,11 +438,47 @@ fn primaryKeyColumnsAlloc(
     return selected;
 }
 
+fn uniqueConstraintColumnsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    constraint: runtime_schema.UniqueConstraint,
+) ![]runtime_schema.RelationalColumn {
+    var selected = try alloc.alloc(runtime_schema.RelationalColumn, constraint.columns.len);
+    errdefer alloc.free(selected);
+    for (constraint.columns, 0..) |column_name, i| {
+        selected[i] = findRelationalColumn(schema.relational_columns, column_name) orelse return error.InvalidRowsRequest;
+    }
+    return selected;
+}
+
+fn findUniqueConstraint(constraints: []const runtime_schema.UniqueConstraint, name: []const u8) ?runtime_schema.UniqueConstraint {
+    for (constraints) |constraint| {
+        if (std.mem.eql(u8, constraint.name, name)) return constraint;
+    }
+    return null;
+}
+
 fn findRelationalColumn(columns: []const runtime_schema.RelationalColumn, name: []const u8) ?runtime_schema.RelationalColumn {
     for (columns) |column| {
         if (std.mem.eql(u8, column.path, name) or std.mem.eql(u8, column.name, name)) return column;
     }
     return null;
+}
+
+fn uniqueConstraintValueFromValuesAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    constraint: runtime_schema.UniqueConstraint,
+    values: std.json.Value,
+) ![]u8 {
+    const selected_columns = try uniqueConstraintColumnsAlloc(alloc, schema, constraint);
+    defer alloc.free(selected_columns);
+    const values_json = try jsonValueStringifyAlloc(alloc, values);
+    defer alloc.free(values_json);
+    const row_value = db_mod.document_mapper.buildRelationalRowValueAlloc(alloc, values_json, selected_columns) catch return error.InvalidRowsRequest;
+    defer alloc.free(row_value);
+    const tuple = (db_mod.relational_store.uniqueConstraintTupleValueAlloc(alloc, row_value, constraint) catch return error.InvalidRowsRequest) orelse return error.InvalidRowsRequest;
+    return tuple;
 }
 
 fn patchToTransformOperationsAlloc(
@@ -394,14 +492,18 @@ fn patchToTransformOperationsAlloc(
     while (it.next()) |entry| {
         if (primaryKeyContains(primary_key, entry.key_ptr.*)) return error.InvalidRowsRequest;
         const value_json = try jsonValueStringifyAlloc(alloc, entry.value_ptr.*);
-        errdefer alloc.free(value_json);
+        var value_json_transferred = false;
+        errdefer if (!value_json_transferred) alloc.free(value_json);
         const path = try alloc.dupe(u8, entry.key_ptr.*);
-        errdefer alloc.free(path);
+        var path_transferred = false;
+        errdefer if (!path_transferred) alloc.free(path);
         try operations.append(alloc, .{
             .op = .set,
             .path = path,
             .value_json = value_json,
         });
+        path_transferred = true;
+        value_json_transferred = true;
     }
     return try operations.toOwnedSlice(alloc);
 }
@@ -415,23 +517,18 @@ fn primaryKeyContains(primary_key: runtime_schema.PrimaryKey, column: []const u8
 
 fn identityResponseJsonAlloc(alloc: std.mem.Allocator, selector: std.json.Value) ![]u8 {
     if (selector != .object) return error.InvalidRowsRequest;
-    const primary_value = selector.object.get("primary") orelse return error.InvalidRowsRequest;
-    return try std.fmt.allocPrint(alloc, "{{\"primary\":{}}}", .{try jsonValueStringifyOwnedArg(alloc, primary_value)});
-}
-
-fn jsonValueStringifyOwnedArg(alloc: std.mem.Allocator, value: std.json.Value) !OwnedFmtArg {
-    return .{ .alloc = alloc, .json = try jsonValueStringifyAlloc(alloc, value) };
-}
-
-const OwnedFmtArg = struct {
-    alloc: std.mem.Allocator,
-    json: []u8,
-
-    pub fn format(self: @This(), writer: *std.Io.Writer) !void {
-        defer self.alloc.free(self.json);
-        try writer.writeAll(self.json);
+    if (selector.object.get("primary")) |primary_value| {
+        const primary_json = try jsonValueStringifyAlloc(alloc, primary_value);
+        defer alloc.free(primary_json);
+        return try std.fmt.allocPrint(alloc, "{{\"primary\":{s}}}", .{primary_json});
     }
-};
+    if (selector.object.get("unique")) |unique_value| {
+        const unique_json = try jsonValueStringifyAlloc(alloc, unique_value);
+        defer alloc.free(unique_json);
+        return try std.fmt.allocPrint(alloc, "{{\"unique\":{s}}}", .{unique_json});
+    }
+    return error.InvalidRowsRequest;
+}
 
 fn jsonValueStringifyAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -449,6 +546,10 @@ fn freeWrites(alloc: std.mem.Allocator, writes: []const db_mod.types.BatchWrite)
 
 fn freeDeletes(alloc: std.mem.Allocator, deletes: []const []const u8) void {
     for (deletes) |key| alloc.free(@constCast(key));
+}
+
+fn freeOptionalKeys(alloc: std.mem.Allocator, keys: []const ?[]const u8) void {
+    for (keys) |key| if (key) |value| alloc.free(@constCast(value));
 }
 
 fn freeTransformOps(alloc: std.mem.Allocator, operations: []const db_mod.types.TransformOp) void {
@@ -494,4 +595,62 @@ test "relational rows batch derives deterministic physical primary keys" {
     try std.testing.expectEqual(@as(usize, 1), batch.predicates.len);
     try std.testing.expectEqualStrings(batch.writes[0].key, batch.deletes[0]);
     try std.testing.expect(std.mem.startsWith(u8, batch.writes[0].key, physical_primary_key_prefix));
+}
+
+test "relational rows unique selector resolves through owner lookup" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    const Resolver = struct {
+        calls: usize = 0,
+        last_encoded: []u8 = &.{},
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.last_encoded.len > 0) alloc.free(self.last_encoded);
+            self.* = undefined;
+        }
+
+        fn iface(self: *@This()) UniqueSelectorResolver {
+            return .{ .ptr = self, .resolve = resolve };
+        }
+
+        fn resolve(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            encoded_value: []const u8,
+        ) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("users", table_name);
+            try std.testing.expectEqualStrings("users_email_key", constraint_name);
+            try std.testing.expect(encoded_value.len > 0);
+            if (self.last_encoded.len > 0) alloc.free(self.last_encoded);
+            self.last_encoded = try alloc.dupe(u8, encoded_value);
+            self.calls += 1;
+            return try alloc.dupe(u8, "\x00antfly-rel-pk:test");
+        }
+    };
+
+    var resolver = Resolver{};
+    defer resolver.deinit(std.testing.allocator);
+    var get_req = try parseRowsGetRequestWithResolver(
+        std.testing.allocator,
+        "users",
+        "{\"keys\":[{\"unique\":{\"name\":\"users_email_key\",\"values\":{\"email\":\"ada@example.test\"}}}],\"include_physical_key\":true}",
+        schema,
+        resolver.iface(),
+    );
+    defer get_req.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 1), get_req.keys.len);
+    try std.testing.expect(get_req.keys[0] != null);
+    try std.testing.expectEqualStrings("\x00antfly-rel-pk:test", get_req.keys[0].?);
+    try std.testing.expectEqualStrings("{\"unique\":{\"name\":\"users_email_key\",\"values\":{\"email\":\"ada@example.test\"}}}", get_req.identities_json[0]);
+    try std.testing.expect(get_req.include_physical_key);
 }

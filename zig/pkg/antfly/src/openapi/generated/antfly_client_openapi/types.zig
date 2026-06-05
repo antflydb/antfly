@@ -576,7 +576,7 @@ pub const BatchResponse = struct {
 /// Structured primary-key identity. Keys are the declared `primary_key.columns`; values are JSON scalar values coerced with the table's relational column types.
 pub const RowPrimarySelector = struct {};
 
-/// Reserved structured unique-key selector. Public APIs reject this shape until unique selectors resolve through durable unique-owner rows.
+/// Structured unique-key selector. The server encodes `values` with the same relational tuple encoder used by storage, routes to the durable unique-owner range, and reads the owner row to resolve the physical row identity. This is a point lookup, not a query scan.
 pub const RowUniqueSelector = struct {
     /// Unique constraint name.
     name: []const u8,
@@ -3295,7 +3295,7 @@ pub const TransactionCommitResponse = struct {
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
 };
 
-/// Structured row selector. `primary` is supported for declared primary-key tables. `unique` is reserved until routed unique-owner resolution is exposed publicly.
+/// Structured row selector. `primary` addresses declared primary-key tables directly. `unique` addresses a declared unique constraint through durable unique-owner rows.
 pub const RowSelector = struct {
     primary: ?RowPrimarySelector = null,
     unique: ?RowUniqueSelector = null,
@@ -4298,7 +4298,7 @@ pub const TransactionSessionCommitResponse = struct {
     transaction_id: []const u8,
 };
 
-/// Structured relational row mutation. `insert` fails if the primary identity already exists, `upsert` overwrites or creates, `update` applies a non-upsert patch by primary identity, and `delete` removes by primary identity. `update.patch` cannot change primary-key components.
+/// Structured relational row mutation. `insert` fails if the primary identity already exists, `upsert` overwrites or creates, `update` applies a non-upsert patch by primary or unique identity, and `delete` removes by primary or unique identity. `update.patch` cannot change primary-key components. Missing unique selectors fail the write request rather than falling back to scans.
 pub const RowOperation = struct {
     op: []const u8,
     /// Full row document for insert/upsert. Must include primary-key columns.
@@ -4319,7 +4319,7 @@ pub const RowsGetResult = struct {
     found: ?bool = null,
     row: ?std.json.Value = null,
     version: ?i64 = null,
-    /// Diagnostic storage-owned physical key. Do not persist as public row identity.
+    /// Diagnostic storage-owned physical key. Null when a unique selector did not resolve. Do not persist as public row identity.
     physical_key: ?[]const u8 = null,
 };
 
@@ -4905,7 +4905,7 @@ pub const RowsBatchRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
-pub const RowsGetResponse = struct {
+pub const RowsGetResultSet = struct {
     rows: ?[]const RowsGetResult = null,
 };
 

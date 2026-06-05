@@ -1200,6 +1200,14 @@ pub const TableReadSource = struct {
             opts: db_mod.types.LookupOptions,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?LookupResponse = null,
+        relational_unique_owner_lookup: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            encoded_value: []const u8,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?[]u8 = null,
         scan_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1379,6 +1387,18 @@ pub const TableReadSource = struct {
     ) !?LookupResponse {
         const fn_ptr = self.vtable.lookup_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, key, opts, consistency);
+    }
+
+    pub fn relationalUniqueOwnerLookup(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.relational_unique_owner_lookup orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, constraint_name, encoded_value, consistency);
     }
 
     pub fn scanGroupLocal(
@@ -1782,6 +1802,7 @@ pub const BoundTableReadSource = struct {
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
+                .relational_unique_owner_lookup = relationalUniqueOwnerLookup,
                 .scan_group_local = scanGroupLocal,
                 .query_group_local = queryGroupLocal,
                 .search_result_group_local = searchResultGroupLocal,
@@ -1986,6 +2007,19 @@ pub const BoundTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         return try lookup(ptr, alloc, table_name, key, opts, consistency);
+    }
+
+    fn relationalUniqueOwnerLookup(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try lookupRelationalUniqueOwnerInDb(alloc, self.db, self.reads.group_id, self.reads.reads, constraint_name, encoded_value, consistency);
     }
 
     fn scanGroupLocal(
@@ -2214,6 +2248,7 @@ pub const ProvisionedTableReadSource = struct {
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
+                .relational_unique_owner_lookup = relationalUniqueOwnerLookup,
                 .scan_group_local = scanGroupLocal,
                 .query_group_local = queryGroupLocal,
                 .search_result_group_local = searchResultGroupLocal,
@@ -2407,6 +2442,34 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
+    }
+
+    fn relationalUniqueOwnerLookup(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const group_id = try resolveSingleUniqueOwnerGroup(alloc, self.catalog, table_name, constraint_name, encoded_value);
+        return try lookupRelationalUniqueOwnerProvisionedHostedLocal(
+            self.primary_lookup_db,
+            self.cache,
+            self.replica_root_dir,
+            self.catalog,
+            self.requester,
+            alloc,
+            group_id,
+            self.visibleRootGeneration(group_id),
+            self.backend_runtime,
+            table_name,
+            constraint_name,
+            encoded_value,
+            consistency,
+        );
     }
 
     fn preflightQueryGroupLocal(
@@ -2645,6 +2708,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
+                .relational_unique_owner_lookup = relationalUniqueOwnerLookup,
                 .scan_group_local = scanGroupLocal,
                 .query_group_local = queryGroupLocal,
                 .search_result_group_local = searchResultGroupLocal,
@@ -2746,6 +2810,44 @@ pub const HostedProvisionedTableReadSource = struct {
             }
         }
         return null;
+    }
+
+    fn relationalUniqueOwnerLookup(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const group_id = try resolveSingleUniqueOwnerGroup(alloc, self.catalog, table_name, constraint_name, encoded_value);
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse {
+            return error.UniqueOwnerTopologyUnavailable;
+        };
+        defer route.deinit(alloc);
+
+        return switch (route) {
+            .local => try lookupRelationalUniqueOwnerProvisionedHostedLocal(
+                null,
+                null,
+                self.replica_root_dir,
+                self.catalog,
+                self.requester,
+                alloc,
+                group_id,
+                self.visibleRootGeneration(group_id),
+                self.backend_runtime,
+                table_name,
+                constraint_name,
+                encoded_value,
+                consistency,
+            ),
+            .remote => |remote| lookupRelationalUniqueOwnerRemote(self.executor, alloc, remote.base_uri, group_id, table_name, constraint_name, encoded_value) catch |err| switch (err) {
+                error.UnexpectedHttpStatus => null,
+                else => err,
+            },
+        };
     }
 
     fn scan(
@@ -4357,6 +4459,127 @@ fn lookupLocal(
         .json = try alloc.dupe(u8, result.json),
         .version = try db.getTimestamp(alloc, key),
     };
+}
+
+fn resolveSingleUniqueOwnerGroup(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) !u64 {
+    var owner = try table_catalog.resolveUniqueConstraintOwnerGroups(alloc, catalog, table_name, constraint_name, encoded_value);
+    defer owner.deinit(alloc);
+    if (!owner.configured or owner.groups.len != 1) return error.UniqueOwnerTopologyUnavailable;
+    return owner.groups[0];
+}
+
+fn relationalUniqueOwnerKeyAlloc(
+    alloc: std.mem.Allocator,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) ![]u8 {
+    return try db_mod.internal_keys.relationalUniqueKeyAlloc(alloc, constraint_name, encoded_value);
+}
+
+fn lookupRelationalUniqueOwnerInDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    group_id: u64,
+    reads: raft_mod.FeatureReads,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?[]u8 {
+    const key = try relationalUniqueOwnerKeyAlloc(alloc, constraint_name, encoded_value);
+    defer alloc.free(key);
+    try reads.prepareLookupWithConsistency(group_id, key, .{}, consistency);
+    return try db.get(alloc, key);
+}
+
+fn lookupRelationalUniqueOwnerProvisionedLocal(
+    primary_lookup_db: ?PrimaryLookupDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?[]u8 {
+    if (primary_lookup_db) |source| {
+        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease_value| {
+            var lease = lease_value;
+            defer lease.release(alloc);
+            try validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db);
+            return try lookupRelationalUniqueOwnerInDb(alloc, lease.db, group_id, raft_mod.FeatureReads.init(requester), constraint_name, encoded_value, consistency);
+        }
+    }
+
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(path);
+    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
+    if (cache) |cached| {
+        if (cached.getIfPresent(group_id, lsm_root_generation, identity_namespace, table_name)) |db_lease_value| {
+            var db_lease = db_lease_value;
+            defer db_lease.release();
+            return try lookupRelationalUniqueOwnerInDb(alloc, db_lease.db, group_id, raft_mod.FeatureReads.init(requester), constraint_name, encoded_value, consistency);
+        }
+    }
+
+    var db = try openProvisionedLookupDbForTable(
+        alloc,
+        path,
+        if (cache) |cached| cached.lsm_cache else null,
+        lsm_root_generation,
+        if (cache) |cached| cached.resource_manager else null,
+        backend_runtime,
+        identity_namespace,
+    );
+    defer db.close();
+    return try lookupRelationalUniqueOwnerInDb(alloc, &db, group_id, raft_mod.FeatureReads.init(requester), constraint_name, encoded_value, consistency);
+}
+
+fn lookupRelationalUniqueOwnerProvisionedHostedLocal(
+    primary_lookup_db: ?PrimaryLookupDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?[]u8 {
+    return lookupRelationalUniqueOwnerProvisionedLocal(primary_lookup_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, constraint_name, encoded_value, consistency) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try lookupRelationalUniqueOwnerProvisionedLocal(primary_lookup_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, constraint_name, encoded_value, .stale),
+        else => err,
+    };
+}
+
+fn lookupRelationalUniqueOwnerRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) !?[]u8 {
+    const key = try relationalUniqueOwnerKeyAlloc(alloc, constraint_name, encoded_value);
+    defer alloc.free(key);
+    var lookup = (try lookupRemote(executor, alloc, base_uri, group_id, table_name, key, .{})) orelse return null;
+    defer lookup.deinit(alloc);
+    return try alloc.dupe(u8, lookup.json);
 }
 
 fn lookupProvisionedLocal(
@@ -18966,4 +19189,65 @@ test "provisioned read cache keeps leased entry cleanup reachable when retiremen
     lease.release();
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+}
+
+test "relational unique owner lookup requires one active owner range" {
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "users",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_email_key",
+                        .start_encoded_value = "",
+                        .end_encoded_value = "m",
+                        .group_id = 7101,
+                    },
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_email_key",
+                        .start_encoded_value = "m",
+                        .end_encoded_value = null,
+                        .group_id = 7102,
+                    },
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_phone_key",
+                        .start_encoded_value = "",
+                        .end_encoded_value = null,
+                        .group_id = 7201,
+                        .state = metadata_table_manager.unique_constraint_range_rebuilding,
+                    },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    try std.testing.expectEqual(@as(u64, 7101), try resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_email_key", "a"));
+    try std.testing.expectEqual(@as(u64, 7102), try resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_email_key", "z"));
+    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_phone_key", "p"));
+    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "missing_key", "a"));
 }

@@ -176,6 +176,26 @@ not the physical row key:
 { "primary": { "tenant_id": "t1", "order_id": "o9" } }
 ```
 
+Rows can also be addressed by a declared unique constraint:
+
+```json
+{
+  "unique": {
+    "name": "orders_external_id_key",
+    "values": {
+      "tenant_id": "t1",
+      "external_id": "ext-9"
+    }
+  }
+}
+```
+
+Unique selectors use the same tuple encoder as relational unique constraints and
+route to the durable unique-owner range before reading the owner row. They are
+point lookups, not query scans. Missing unique selectors return `found: false`
+from `rows:get`; `update` and `delete` fail rather than silently becoming
+no-ops.
+
 `rows:batch` accepts row operations that compile to the existing batch and 2PC
 machinery:
 
@@ -207,17 +227,19 @@ machinery:
 `upsert` overwrites or creates; `update` is a non-upsert transform and cannot
 patch primary-key components. Primary-key changes are modeled as parent-key
 updates through the storage/constraint layer, not as silent mutation of the
-public row identity. `rows:get` accepts an array of primary selectors and returns
-the structured identity, row JSON, version, and optional `physical_key`.
+public row identity. `insert` and `upsert` remain primary-key based unless a
+future explicit conflict target is added; a later SQL DSL can compile
+`ON CONFLICT (unique_col...) DO UPDATE` into that explicit path without changing
+current `upsert` semantics. `rows:get` accepts an array of primary or unique
+selectors and returns the structured identity, row JSON, version, and optional
+`physical_key`.
 
 The physical key is an implementation detail derived from the canonical typed
 primary-key tuple. It exists for placement, WAL, row-version ownership, and
 debugging, but relational clients should not persist it as their row address.
-Unique-key selectors are reserved in the public contract; they must resolve
-through durable unique-owner rows rather than a query scan before they become
-write/read selectors. This shape is intentionally SQL-compatible: `INSERT`,
-`UPDATE ... WHERE` full primary-key equality, `DELETE ... WHERE` full
-primary-key equality, and `REFERENCES parent(col_a, col_b)` can compile directly
+This shape is intentionally SQL-compatible: `INSERT`, `UPDATE ... WHERE` full
+primary-key or unique-key equality, `DELETE ... WHERE` full primary-key or
+unique-key equality, and `REFERENCES parent(col_a, col_b)` can compile directly
 to these structured API operations.
 
 Foreign-key metadata lives in `TableSchema.foreign_keys`; unique metadata lives

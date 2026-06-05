@@ -3572,6 +3572,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, api_public_table_http_docid_test_mod, true, true);
+    const api_rows_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_rows_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_rows_test_mod, true, true);
     const api_internal_group_write_routes_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_internal_group_write_routes_test_root.zig"),
         .target = target,
@@ -3687,6 +3693,18 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
+    const api_rows_tests = b.addTest(.{
+        .root_module = api_rows_test_mod,
+        .filters = &.{
+            "relational rows unique selector",
+            "api http server resolves relational rows by unique selector",
+            "relational unique owner lookup requires one active owner range",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
     const api_internal_group_write_routes_tests = b.addTest(.{
         .root_module = api_internal_group_write_routes_test_mod,
         .filters = &.{
@@ -3725,6 +3743,7 @@ pub fn build(b: *std.Build) void {
     const run_api_table_writes_docid_tests = b.addRunArtifact(api_table_writes_docid_tests);
     const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
+    const run_api_rows_tests = b.addRunArtifact(api_rows_tests);
     const run_api_internal_group_write_routes_tests = b.addRunArtifact(api_internal_group_write_routes_tests);
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
 
@@ -3736,6 +3755,9 @@ pub fn build(b: *std.Build) void {
 
     const api_internal_group_write_routes_test_step = b.step("api-internal-group-write-routes-test", "Run focused internal group write route tests");
     api_internal_group_write_routes_test_step.dependOn(&run_api_internal_group_write_routes_tests.step);
+
+    const api_rows_test_step = b.step("api-rows-test", "Run focused relational row API tests");
+    api_rows_test_step.dependOn(&run_api_rows_tests.step);
 
     const lib_docid_lifecycle_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -3807,6 +3829,7 @@ pub fn build(b: *std.Build) void {
     lib_api_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
+    lib_api_docid_test_step.dependOn(&run_api_rows_tests.step);
     lib_api_docid_test_step.dependOn(&run_api_internal_group_write_routes_tests.step);
     lib_api_docid_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_data_storage_tests.step);
@@ -4174,6 +4197,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_metadata_logic_tests.step);
     unit_test_step.dependOn(&run_lib_metadata_service_tests.step);
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
+    unit_test_step.dependOn(&run_api_rows_tests.step);
     unit_test_step.dependOn(&run_api_internal_group_write_routes_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_lib_api_logic_tests.step);

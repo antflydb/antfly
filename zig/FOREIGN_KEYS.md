@@ -137,26 +137,28 @@ Current production shape:
 
 Public API shape:
 
-- Relational clients address rows through structured primary-key selectors,
-  for example
-  `{ "primary": { "tenant_id": "t1", "order_id": "o9" } }`, not by the hidden
-  physical row key.
+- Relational clients address rows through structured primary-key selectors, for
+  example `{ "primary": { "tenant_id": "t1", "order_id": "o9" } }`, or through
+  declared unique-key selectors, for example
+  `{ "unique": { "name": "customers_email_key", "values": { "tenant_id": "t1", "email": "a@example.test" } } }`.
+  They do not address rows by the hidden physical row key.
 - `POST /tables/{table}/rows:batch` accepts `insert`, `upsert`, `update`, and
   `delete` operations. `insert` compiles to the existing batch write path with a
   non-existence version predicate on the derived row identity; `upsert` uses the
   existing overwrite-or-create batch semantics; `update` compiles to a
-  non-upsert transform and rejects primary-key component patches; `delete`
-  compiles to a normal batch delete.
-- `POST /tables/{table}/rows:get` accepts primary-key selectors and returns the
-  structured identity, row JSON, version, and optional physical key for
-  diagnostics.
+  non-upsert transform after resolving a primary or unique selector and rejects
+  primary-key component patches; `delete` compiles to a normal batch delete
+  after resolving a primary or unique selector. Missing unique selectors fail
+  write requests rather than becoming scans or silent no-ops.
+- `POST /tables/{table}/rows:get` accepts primary-key and unique-key selectors
+  and returns the structured identity, row JSON, version, and optional physical
+  key for diagnostics. Missing unique selectors return `found: false`.
 - The public physical key, when requested, is diagnostic only. It is derived
   from the canonical typed primary-key tuple and remains storage-owned for
   placement, WAL, row-version ownership, and hidden base-row addressing.
-- Unique-key selectors are reserved until the public API can resolve them
-  through durable unique-owner rows. They must not be implemented as query scans
-  because FK, uniqueness, and SQL `ON CONFLICT` semantics require the same
-  exact owner-routing contract as storage.
+- Unique-key selectors resolve through durable unique-owner rows using the same
+  tuple encoder and owner-routing contract as FK and uniqueness enforcement.
+  They are not query scans.
 - A future SQL DSL should compile `PRIMARY KEY (tenant_id, order_id)`,
   `REFERENCES customers(tenant_id, customer_id)`, `INSERT`, `ON CONFLICT`,
   point `UPDATE`, and point `DELETE` into this structured API rather than making
