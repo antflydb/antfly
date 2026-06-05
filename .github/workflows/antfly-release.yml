@@ -331,8 +331,6 @@ jobs:
     needs:
       - build-zig-runtime-archives
       - publish-release-assets
-      - publish-cli-pypi
-      - publish-cli-npm
     uses: ./.github/workflows/antfly-container.yml
     with:
       tag_name: ${{ github.ref_name }}

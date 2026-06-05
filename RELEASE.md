@@ -48,6 +48,10 @@ failed under CI memory pressure, especially Linux arm64 from amd64.
    `artifact_source: github`, so the container image uses the Linux archives
    already built by the release.
 
+After the native archives and release payload are published, package registry
+publishes, Homebrew, and container publishing fan out independently. A PyPI or
+npm publish failure must not block the container image for the same tag.
+
 `.github/workflows/antfly-container.yml` still supports standalone container
 publishes. In standalone mode it builds the Linux archives on native Linux
 runners, uploads them to the container artifact bucket, and packages images from
