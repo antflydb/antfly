@@ -831,31 +831,224 @@ pub const RelationalRowsQueryOrder = struct {
     direction: RelationalRowsQueryOrderDirection = .asc,
 };
 
+pub const RelationalRowsArrayAnyPredicate = struct {
+    field: []const u8,
+    value_json: []const u8,
+};
+
+pub const RelationalRowsArrayContainsPredicate = struct {
+    field: []const u8,
+    value_json: []const u8,
+};
+
+pub const RelationalRowsArrayEqPredicate = struct {
+    field: []const u8,
+    value_json: []const u8,
+};
+
+pub const RelationalRowsJsonContainsPredicate = struct {
+    field: []const u8,
+    value_json: []const u8,
+};
+
+pub const RelationalRowsJsonPathEqPredicate = struct {
+    field: []const u8,
+    path: []const u8,
+    value_json: []const u8,
+};
+
+pub const RelationalRowsJsonPathExistsPredicate = struct {
+    field: []const u8,
+    path: []const u8,
+};
+
+pub const RelationalRowsJsonExtractProjection = struct {
+    output: []const u8,
+    field: []const u8,
+    path: []const u8,
+    as_text: bool = false,
+};
+
+pub const RelationalRowsDocKeyRange = struct {
+    start: []const u8 = "",
+    end: []const u8 = "",
+};
+
 pub const RelationalRowsQueryRequest = struct {
-    predicates: []schema_mod.RelationalCheck = &.{},
+    source_cte: []const u8 = "",
+    predicates: []const schema_mod.RelationalCheck = &.{},
+    array_any: []const RelationalRowsArrayAnyPredicate = &.{},
+    array_contains: []const RelationalRowsArrayContainsPredicate = &.{},
+    array_eq: []const RelationalRowsArrayEqPredicate = &.{},
+    json_contains: []const RelationalRowsJsonContainsPredicate = &.{},
+    json_path_eq: []const RelationalRowsJsonPathEqPredicate = &.{},
+    json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
     select: []const []const u8 = &.{},
+    json_extract: []const RelationalRowsJsonExtractProjection = &.{},
     select_all: bool = true,
-    order_by: []RelationalRowsQueryOrder = &.{},
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    row_claim: ?RowClaimRequest = null,
+    doc_key_range: ?RelationalRowsDocKeyRange = null,
     limit: ?u32 = null,
     offset: u32 = 0,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.source_cte.len > 0) alloc.free(self.source_cte);
         for (self.predicates) |predicate| {
             alloc.free(predicate.field);
             if (predicate.value_json) |value_json| alloc.free(value_json);
         }
         if (self.predicates.len > 0) alloc.free(self.predicates);
+        for (self.array_any) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+        if (self.array_any.len > 0) alloc.free(self.array_any);
+        for (self.array_contains) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+        if (self.array_contains.len > 0) alloc.free(self.array_contains);
+        for (self.array_eq) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+        if (self.array_eq.len > 0) alloc.free(self.array_eq);
+        for (self.json_contains) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+        if (self.json_contains.len > 0) alloc.free(self.json_contains);
+        for (self.json_path_eq) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.path);
+            alloc.free(predicate.value_json);
+        }
+        if (self.json_path_eq.len > 0) alloc.free(self.json_path_eq);
+        for (self.json_path_exists) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.path);
+        }
+        if (self.json_path_exists.len > 0) alloc.free(self.json_path_exists);
         for (self.select) |field| alloc.free(field);
         if (self.select.len > 0) alloc.free(self.select);
+        for (self.json_extract) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+            alloc.free(projection.path);
+        }
+        if (self.json_extract.len > 0) alloc.free(self.json_extract);
         for (self.order_by) |order| alloc.free(order.field);
         if (self.order_by.len > 0) alloc.free(self.order_by);
+        if (self.row_claim) |claim| if (claim.owner_id.len > 0) alloc.free(claim.owner_id);
+        if (self.doc_key_range) |range| {
+            if (range.start.len > 0) alloc.free(range.start);
+            if (range.end.len > 0) alloc.free(range.end);
+        }
         self.* = undefined;
     }
+};
+
+pub const RelationalRowsCte = struct {
+    name: []const u8,
+    query: RelationalRowsQueryRequest = .{},
+};
+
+pub const RelationalRowsQueryPlan = struct {
+    ctes: []const RelationalRowsCte = &.{},
+    query: RelationalRowsQueryRequest = .{},
 };
 
 pub const RelationalRowsQueryResult = struct {
     rows: [][]const u8 = &.{},
     total: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.rows) |row| alloc.free(@constCast(row));
+        if (self.rows.len > 0) alloc.free(self.rows);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsAggregateOp = enum {
+    count,
+    sum,
+    min,
+    max,
+    avg,
+};
+
+pub const RelationalRowsAggregateSpec = struct {
+    name: []const u8,
+    op: RelationalRowsAggregateOp,
+    field: ?[]const u8 = null,
+};
+
+pub const RelationalRowsAggregateRequest = struct {
+    source: RelationalRowsQueryRequest = .{},
+    group_by: []const []const u8 = &.{},
+    aggregations: []const RelationalRowsAggregateSpec = &.{},
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
+};
+
+pub const RelationalRowsAggregatePlan = struct {
+    ctes: []const RelationalRowsCte = &.{},
+    aggregate: RelationalRowsAggregateRequest = .{},
+};
+
+pub const RelationalRowsAggregateResult = struct {
+    rows: [][]const u8 = &.{},
+    total_groups: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.rows) |row| alloc.free(@constCast(row));
+        if (self.rows.len > 0) alloc.free(self.rows);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsJoinType = enum {
+    inner,
+    left,
+};
+
+pub const RelationalRowsJoinOn = struct {
+    left_field: []const u8,
+    right_field: []const u8,
+};
+
+pub const RelationalRowsJoinProjectionSide = enum {
+    left,
+    right,
+};
+
+pub const RelationalRowsJoinProjection = struct {
+    output: []const u8,
+    side: RelationalRowsJoinProjectionSide,
+    field: []const u8,
+};
+
+pub const RelationalRowsJoinRequest = struct {
+    left: RelationalRowsQueryRequest = .{},
+    right: RelationalRowsQueryRequest = .{},
+    on: []const RelationalRowsJoinOn = &.{},
+    join_type: RelationalRowsJoinType = .inner,
+    select: []const RelationalRowsJoinProjection = &.{},
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
+};
+
+pub const RelationalRowsJoinPlan = struct {
+    ctes: []const RelationalRowsCte = &.{},
+    join: RelationalRowsJoinRequest = .{},
+};
+
+pub const RelationalRowsJoinResult = struct {
+    rows: [][]const u8 = &.{},
+    total_rows: u32 = 0,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.rows) |row| alloc.free(@constCast(row));

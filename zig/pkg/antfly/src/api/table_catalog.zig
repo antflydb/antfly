@@ -128,6 +128,19 @@ pub const UniqueConstraintOwnerResolution = struct {
     }
 };
 
+pub const TableDocKeyRangePlan = struct {
+    group_id: u64,
+    start_key: []u8,
+    end_key: []u8,
+    topology_epoch: u64 = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.start_key.len > 0) alloc.free(self.start_key);
+        if (self.end_key.len > 0) alloc.free(self.end_key);
+        self.* = undefined;
+    }
+};
+
 pub fn resolveSingleRangeGroup(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,
@@ -231,6 +244,44 @@ pub fn resolveGroupForKey(
     defer metadata_admin.freeRangeRefs(alloc, ranges);
     if (ranges.len == 0) return null;
     return resolveGroupForKeyFromRanges(ranges, key);
+}
+
+pub fn resolveTableDocKeyRanges(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+) ![]TableDocKeyRangePlan {
+    if (from_key.len > 0 and to_key.len > 0 and std.mem.order(u8, from_key, to_key) != .lt) return error.InvalidRangeBounds;
+
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return try alloc.alloc(TableDocKeyRangePlan, 0);
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+    sortRangeRefs(ranges);
+
+    const epoch = tableTopologyEpochFromRanges(table.*, ranges);
+    var plans = std.ArrayListUnmanaged(TableDocKeyRangePlan).empty;
+    errdefer {
+        for (plans.items) |*plan| plan.deinit(alloc);
+        plans.deinit(alloc);
+    }
+
+    for (ranges) |range| {
+        if (!rangeOverlapsSpan(range.*, from_key, to_key)) continue;
+        const clipped_start = clippedRangeStart(range.start_key, from_key);
+        const clipped_end = clippedRangeEnd(range.end_key, to_key);
+        if (clipped_start.len > 0 and clipped_end.len > 0 and std.mem.order(u8, clipped_start, clipped_end) != .lt) continue;
+        try plans.append(alloc, .{
+            .group_id = range.group_id,
+            .start_key = try alloc.dupe(u8, clipped_start),
+            .end_key = try alloc.dupe(u8, clipped_end),
+            .topology_epoch = epoch,
+        });
+    }
+    return try plans.toOwnedSlice(alloc);
 }
 
 pub fn resolveGroupForKeyFromRanges(
@@ -505,6 +556,19 @@ fn rangeOverlapsSpan(range: metadata_table_manager.RangeRecord, from_key: []cons
     return true;
 }
 
+fn clippedRangeStart(range_start: []const u8, from_key: []const u8) []const u8 {
+    if (from_key.len == 0) return range_start;
+    if (range_start.len == 0) return from_key;
+    return if (std.mem.order(u8, from_key, range_start) == .gt) from_key else range_start;
+}
+
+fn clippedRangeEnd(range_end: ?[]const u8, to_key: []const u8) []const u8 {
+    const end = range_end orelse "";
+    if (to_key.len == 0) return end;
+    if (end.len == 0) return to_key;
+    return if (std.mem.order(u8, end, to_key) == .lt) end else to_key;
+}
+
 fn rangeRefsContainGroup(ranges: []const *const metadata_table_manager.RangeRecord, group_id: u64) bool {
     for (ranges) |range| {
         if (range.group_id == group_id) return true;
@@ -750,6 +814,33 @@ test "catalog source resolves groups by key and span" {
     try std.testing.expectEqual(@as(usize, 2), groups.len);
     try std.testing.expectEqual(@as(u64, 7001), groups[0]);
     try std.testing.expectEqual(@as(u64, 7002), groups[1]);
+
+    const spans = try resolveTableDocKeyRanges(std.testing.allocator, FakeCatalog.iface(), "docs", "doc:b", "doc:z");
+    defer {
+        for (spans) |*span| span.deinit(std.testing.allocator);
+        std.testing.allocator.free(spans);
+    }
+    try std.testing.expectEqual(@as(usize, 2), spans.len);
+    try std.testing.expectEqual(@as(u64, 7001), spans[0].group_id);
+    try std.testing.expectEqualStrings("doc:b", spans[0].start_key);
+    try std.testing.expectEqualStrings("doc:m", spans[0].end_key);
+    try std.testing.expectEqual(epoch, spans[0].topology_epoch);
+    try std.testing.expectEqual(@as(u64, 7002), spans[1].group_id);
+    try std.testing.expectEqualStrings("doc:m", spans[1].start_key);
+    try std.testing.expectEqualStrings("doc:z", spans[1].end_key);
+    try std.testing.expectEqual(epoch, spans[1].topology_epoch);
+
+    const tail = try resolveTableDocKeyRanges(std.testing.allocator, FakeCatalog.iface(), "docs", "doc:x", "");
+    defer {
+        for (tail) |*span| span.deinit(std.testing.allocator);
+        std.testing.allocator.free(tail);
+    }
+    try std.testing.expectEqual(@as(usize, 1), tail.len);
+    try std.testing.expectEqual(@as(u64, 7002), tail[0].group_id);
+    try std.testing.expectEqualStrings("doc:x", tail[0].start_key);
+    try std.testing.expectEqualStrings("", tail[0].end_key);
+
+    try std.testing.expectError(error.InvalidRangeBounds, resolveTableDocKeyRanges(std.testing.allocator, FakeCatalog.iface(), "docs", "doc:z", "doc:b"));
 }
 
 test "catalog source resolves foreign key ref owner groups" {

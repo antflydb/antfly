@@ -212,6 +212,17 @@ pub const ColumnIndexPolicy = struct {
         }
         return false;
     }
+
+    pub fn shouldIndexRow(self: ColumnIndexPolicy, alloc: Allocator, path: []const u8, row_value: []const u8) !bool {
+        if (!self.restrict_to_catalog) return true;
+        for (self.columns) |column| {
+            if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
+            if (!column.indexed) return false;
+            if (column.index_where.len == 0) return true;
+            return try rowMatchesUniqueConstraintPredicates(alloc, row_value, column.index_where);
+        }
+        return false;
+    }
 };
 
 pub fn primaryKeyAsUniqueConstraint(primary_key: schema_mod.PrimaryKey) schema_mod.UniqueConstraint {
@@ -1953,7 +1964,7 @@ pub fn appendColumnIndexWritesForRowWithColumnIndexPolicy(
     var row = try relational_row_codec.deserialize(alloc, row_value);
     defer row.deinit(alloc);
     for (row.cells) |cell| {
-        if (!column_index_policy.shouldIndex(cell.path)) continue;
+        if (!(try column_index_policy.shouldIndexRow(alloc, cell.path, row_value))) continue;
         try appendColumnIndexWriteForCell(alloc, writes, owned_keys, owned_values, doc_key, cell);
     }
 }
@@ -2006,6 +2017,41 @@ pub fn scanRowsAlloc(
     const lower = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
     defer alloc.free(lower);
     const upper = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
+    defer if (upper) |buf| alloc.free(buf);
+
+    const scanned = try store.scanRange(alloc, lower, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var out = std.ArrayListUnmanaged(OwnedRow).empty;
+    errdefer {
+        for (out.items) |*row| row.deinit(alloc);
+        out.deinit(alloc);
+    }
+
+    for (scanned) |entry| {
+        if (!internal_keys.isRelationalRowKey(entry.key)) continue;
+        const doc_key = (try internal_keys.decodeRelationalRowKeyAlloc(alloc, entry.key)) orelse continue;
+        errdefer alloc.free(doc_key);
+        const row_value = try alloc.dupe(u8, entry.value);
+        errdefer alloc.free(row_value);
+        try out.append(alloc, .{
+            .doc_key = doc_key,
+            .row_value = row_value,
+        });
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn scanRowsSpanAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    start_doc_key: []const u8,
+    end_doc_key: []const u8,
+) ![]OwnedRow {
+    const lower = try internal_keys.documentRangeLowerAlloc(alloc, start_doc_key);
+    defer alloc.free(lower);
+    const upper = if (end_doc_key.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, end_doc_key) else null;
     defer if (upper) |buf| alloc.free(buf);
 
     const scanned = try store.scanRange(alloc, lower, if (upper) |buf| buf else "");
@@ -2089,6 +2135,10 @@ pub fn arrayElementIndexKeyForValueAlloc(alloc: Allocator, value: std.json.Value
     return try std.json.Stringify.valueAlloc(alloc, value, .{});
 }
 
+pub fn arrayValueIndexKeyForValueAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, value, .{});
+}
+
 pub fn jsonValueIndexKeyForValueAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, value, .{});
 }
@@ -2138,6 +2188,46 @@ pub fn scanArrayElementDocKeysAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+pub fn scanArrayValueDocKeysAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    column_path: []const u8,
+    array_key: []const u8,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) ![][]u8 {
+    const lower_doc_bound = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
+    defer alloc.free(lower_doc_bound);
+    const upper_doc_bound = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
+    defer if (upper_doc_bound) |buf| alloc.free(buf);
+
+    const lower = try internal_keys.relationalArrayValueIndexPrefixAlloc(alloc, column_path, array_key);
+    defer alloc.free(lower);
+    const upper = try nextPrefixAlloc(alloc, lower);
+    defer if (upper) |buf| alloc.free(buf);
+
+    const scanned = try store.scanRange(alloc, lower, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var out = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (out.items) |doc_key| alloc.free(doc_key);
+        out.deinit(alloc);
+    }
+
+    for (scanned) |entry| {
+        var decoded = (try internal_keys.decodeRelationalArrayValueIndexKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!std.mem.eql(u8, decoded.column_path, column_path)) continue;
+        if (!std.mem.eql(u8, decoded.array_key, array_key)) continue;
+        if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
+        if (!try currentRowArrayValueEquals(alloc, store, decoded.doc_key, column_path, array_key)) continue;
+        try out.append(alloc, try alloc.dupe(u8, decoded.doc_key));
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
 fn currentRowHasArrayElementKey(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -2158,6 +2248,25 @@ fn currentRowHasArrayElementKey(
         if (std.mem.eql(u8, item_key, element_key)) return true;
     }
     return false;
+}
+
+fn currentRowArrayValueEquals(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    column_path: []const u8,
+    array_key: []const u8,
+) !bool {
+    const raw_row = try getRawAlloc(alloc, store, doc_key) orelse return false;
+    defer alloc.free(raw_row);
+    const cell = (try relational_row_codec.findCellByPath(raw_row, column_path)) orelse return false;
+    if (cell.value_type != .bytes_val or !cell.is_json) return false;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return false;
+    const current_key = try arrayValueIndexKeyForValueAlloc(alloc, parsed.value);
+    defer alloc.free(current_key);
+    return std.mem.eql(u8, current_key, array_key);
 }
 
 pub fn jsonContainsHasIndexableLeaf(value: std.json.Value) bool {
@@ -2228,6 +2337,91 @@ pub fn scanJsonContainmentDocKeysAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+pub fn scanJsonPathValueDocKeysAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    column_path: []const u8,
+    json_path: []const u8,
+    wanted: std.json.Value,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) ![][]u8 {
+    const value_key = try jsonValueIndexKeyForValueAlloc(alloc, wanted);
+    defer alloc.free(value_key);
+
+    const lower_doc_bound = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
+    defer alloc.free(lower_doc_bound);
+    const upper_doc_bound = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
+    defer if (upper_doc_bound) |buf| alloc.free(buf);
+
+    const lower = try internal_keys.relationalJsonValueIndexPrefixAlloc(alloc, column_path, json_path, value_key);
+    defer alloc.free(lower);
+    const upper = try nextPrefixAlloc(alloc, lower);
+    defer if (upper) |buf| alloc.free(buf);
+
+    const scanned = try store.scanRange(alloc, lower, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var out = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (out.items) |doc_key| alloc.free(doc_key);
+        out.deinit(alloc);
+    }
+
+    for (scanned) |entry| {
+        var decoded = (try internal_keys.decodeRelationalJsonValueIndexKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!std.mem.eql(u8, decoded.column_path, column_path)) continue;
+        if (!std.mem.eql(u8, decoded.json_path, json_path)) continue;
+        if (!std.mem.eql(u8, decoded.value_key, value_key)) continue;
+        if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
+        if (!try currentRowJsonPathEquals(alloc, store, decoded.doc_key, column_path, json_path, wanted)) continue;
+        try out.append(alloc, try alloc.dupe(u8, decoded.doc_key));
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn scanJsonPathDocKeysAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    column_path: []const u8,
+    json_path: []const u8,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) ![][]u8 {
+    const lower_doc_bound = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
+    defer alloc.free(lower_doc_bound);
+    const upper_doc_bound = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
+    defer if (upper_doc_bound) |buf| alloc.free(buf);
+
+    const lower = try internal_keys.relationalJsonPathIndexPrefixAlloc(alloc, column_path, json_path);
+    defer alloc.free(lower);
+    const upper = try nextPrefixAlloc(alloc, lower);
+    defer if (upper) |buf| alloc.free(buf);
+
+    const scanned = try store.scanRange(alloc, lower, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var out = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (out.items) |doc_key| alloc.free(doc_key);
+        out.deinit(alloc);
+    }
+
+    for (scanned) |entry| {
+        var decoded = (try internal_keys.decodeRelationalJsonPathIndexKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!std.mem.eql(u8, decoded.column_path, column_path)) continue;
+        if (!std.mem.eql(u8, decoded.json_path, json_path)) continue;
+        if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
+        if (!try currentRowJsonPathExists(alloc, store, decoded.doc_key, column_path, json_path)) continue;
+        try out.append(alloc, try alloc.dupe(u8, decoded.doc_key));
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
 fn currentRowJsonContains(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -2241,11 +2435,53 @@ fn currentRowJsonContains(
     return try jsonCellContains(alloc, cell, wanted);
 }
 
+fn currentRowJsonPathEquals(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    column_path: []const u8,
+    json_path: []const u8,
+    wanted: std.json.Value,
+) !bool {
+    const raw_row = try getRawAlloc(alloc, store, doc_key) orelse return false;
+    defer alloc.free(raw_row);
+    const cell = (try relational_row_codec.findCellByPath(raw_row, column_path)) orelse return false;
+    return try jsonCellPathEquals(alloc, cell, json_path, wanted);
+}
+
+fn currentRowJsonPathExists(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    column_path: []const u8,
+    json_path: []const u8,
+) !bool {
+    const raw_row = try getRawAlloc(alloc, store, doc_key) orelse return false;
+    defer alloc.free(raw_row);
+    const cell = (try relational_row_codec.findCellByPath(raw_row, column_path)) orelse return false;
+    return try jsonCellPathExists(alloc, cell, json_path);
+}
+
 pub fn jsonCellContains(alloc: Allocator, cell: relational_row_codec.Cell, wanted: std.json.Value) !bool {
     if (cell.value_type != .bytes_val or !cell.is_json) return false;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{}) catch return false;
     defer parsed.deinit();
     return jsonValueContains(parsed.value, wanted);
+}
+
+pub fn jsonCellPathEquals(alloc: Allocator, cell: relational_row_codec.Cell, json_path: []const u8, wanted: std.json.Value) !bool {
+    if (cell.value_type != .bytes_val or !cell.is_json) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{}) catch return false;
+    defer parsed.deinit();
+    const actual = jsonValueAtDotPath(parsed.value, json_path) orelse return false;
+    return jsonValuesEqualExact(actual.*, wanted);
+}
+
+pub fn jsonCellPathExists(alloc: Allocator, cell: relational_row_codec.Cell, json_path: []const u8) !bool {
+    if (cell.value_type != .bytes_val or !cell.is_json) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{}) catch return false;
+    defer parsed.deinit();
+    return jsonValueAtDotPath(parsed.value, json_path) != null;
 }
 
 pub fn jsonValueContains(candidate: std.json.Value, wanted: std.json.Value) bool {
@@ -2274,6 +2510,59 @@ pub fn jsonValueContains(candidate: std.json.Value, wanted: std.json.Value) bool
         },
         else => jsonValuesEqualForContainment(candidate, wanted),
     };
+}
+
+pub fn jsonValuesEqualExact(lhs: std.json.Value, rhs: std.json.Value) bool {
+    return switch (lhs) {
+        .null => rhs == .null,
+        .bool => |value| rhs == .bool and rhs.bool == value,
+        .integer => |value| switch (rhs) {
+            .integer => |other| other == value,
+            .float => |other| @as(f64, @floatFromInt(value)) == other,
+            else => false,
+        },
+        .float => |value| switch (rhs) {
+            .integer => |other| value == @as(f64, @floatFromInt(other)),
+            .float => |other| other == value,
+            else => false,
+        },
+        .number_string => |value| switch (rhs) {
+            .number_string => |other| std.mem.eql(u8, value, other),
+            .string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .string => |value| switch (rhs) {
+            .string => |other| std.mem.eql(u8, value, other),
+            .number_string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .array => |array| blk: {
+            if (rhs != .array or array.items.len != rhs.array.items.len) break :blk false;
+            for (array.items, rhs.array.items) |lhs_item, rhs_item| {
+                if (!jsonValuesEqualExact(lhs_item, rhs_item)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => |object| blk: {
+            if (rhs != .object or object.count() != rhs.object.count()) break :blk false;
+            for (object.keys(), object.values()) |key, lhs_value| {
+                const rhs_value = rhs.object.get(key) orelse break :blk false;
+                if (!jsonValuesEqualExact(lhs_value, rhs_value)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+pub fn jsonValueAtDotPath(root: std.json.Value, path: []const u8) ?*const std.json.Value {
+    if (root != .object) return null;
+    var current: *const std.json.Value = &root;
+    var parts = std.mem.splitScalar(u8, path, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0 or current.* != .object) return null;
+        current = current.object.getPtr(part) orelse return null;
+    }
+    return current;
 }
 
 fn jsonValuesEqualForContainment(lhs: std.json.Value, rhs: std.json.Value) bool {
@@ -2397,7 +2686,25 @@ pub fn pruneColumnIndexesForMissingRowsInRange(
         store,
         &deletes,
         &owned_keys,
+        internal_keys.relational_array_value_index_namespace,
+        lower_doc_bound,
+        upper_doc_bound,
+    );
+    try appendMissingRowColumnIndexDeletesForNamespace(
+        alloc,
+        store,
+        &deletes,
+        &owned_keys,
         internal_keys.relational_json_value_index_namespace,
+        lower_doc_bound,
+        upper_doc_bound,
+    );
+    try appendMissingRowColumnIndexDeletesForNamespace(
+        alloc,
+        store,
+        &deletes,
+        &owned_keys,
+        internal_keys.relational_json_path_index_namespace,
         lower_doc_bound,
         upper_doc_bound,
     );
@@ -2448,8 +2755,18 @@ fn decodedColumnIndexDocKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
         defer decoded.deinit(alloc);
         return try alloc.dupe(u8, decoded.doc_key);
     }
+    if (key[0] == internal_keys.relational_array_value_index_namespace) {
+        var decoded = (try internal_keys.decodeRelationalArrayValueIndexKeyAlloc(alloc, key)) orelse return null;
+        defer decoded.deinit(alloc);
+        return try alloc.dupe(u8, decoded.doc_key);
+    }
     if (key[0] == internal_keys.relational_json_value_index_namespace) {
         var decoded = (try internal_keys.decodeRelationalJsonValueIndexKeyAlloc(alloc, key)) orelse return null;
+        defer decoded.deinit(alloc);
+        return try alloc.dupe(u8, decoded.doc_key);
+    }
+    if (key[0] == internal_keys.relational_json_path_index_namespace) {
+        var decoded = (try internal_keys.decodeRelationalJsonPathIndexKeyAlloc(alloc, key)) orelse return null;
         defer decoded.deinit(alloc);
         return try alloc.dupe(u8, decoded.doc_key);
     }
@@ -2491,7 +2808,9 @@ pub fn deleteColumnIndexesByDocRange(
         try deletes.append(alloc, column_major);
     }
     try appendArrayElementIndexDeletesForDocRange(alloc, store, &deletes, &owned_keys, lower_doc_key, upper_doc_key);
+    try appendArrayValueIndexDeletesForDocRange(alloc, store, &deletes, &owned_keys, lower_doc_key, upper_doc_key);
     try appendJsonValueIndexDeletesForDocRange(alloc, store, &deletes, &owned_keys, lower_doc_key, upper_doc_key);
+    try appendJsonPathIndexDeletesForDocRange(alloc, store, &deletes, &owned_keys, lower_doc_key, upper_doc_key);
     if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
 }
 
@@ -2526,6 +2845,37 @@ fn appendArrayElementIndexDeletesForDocRange(
     }
 }
 
+fn appendArrayValueIndexDeletesForDocRange(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) !void {
+    const lower_doc_bound = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
+    defer alloc.free(lower_doc_bound);
+    const upper_doc_bound = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
+    defer if (upper_doc_bound) |buf| alloc.free(buf);
+
+    const lower = [_]u8{internal_keys.relational_array_value_index_namespace};
+    const upper = [_]u8{internal_keys.relational_array_value_index_namespace + 1};
+    const scanned = try store.scanRange(alloc, lower[0..], upper[0..]);
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    for (scanned) |entry| {
+        var decoded = (try internal_keys.decodeRelationalArrayValueIndexKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
+        const key = try alloc.dupe(u8, entry.key);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        try owned_keys.append(alloc, key);
+        key_owned = false;
+        try deletes.append(alloc, key);
+    }
+}
+
 fn appendJsonValueIndexDeletesForDocRange(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -2546,6 +2896,37 @@ fn appendJsonValueIndexDeletesForDocRange(
 
     for (scanned) |entry| {
         var decoded = (try internal_keys.decodeRelationalJsonValueIndexKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
+        const key = try alloc.dupe(u8, entry.key);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        try owned_keys.append(alloc, key);
+        key_owned = false;
+        try deletes.append(alloc, key);
+    }
+}
+
+fn appendJsonPathIndexDeletesForDocRange(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) !void {
+    const lower_doc_bound = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
+    defer alloc.free(lower_doc_bound);
+    const upper_doc_bound = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
+    defer if (upper_doc_bound) |buf| alloc.free(buf);
+
+    const lower = [_]u8{internal_keys.relational_json_path_index_namespace};
+    const upper = [_]u8{internal_keys.relational_json_path_index_namespace + 1};
+    const scanned = try store.scanRange(alloc, lower[0..], upper[0..]);
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    for (scanned) |entry| {
+        var decoded = (try internal_keys.decodeRelationalJsonPathIndexKeyAlloc(alloc, entry.key)) orelse continue;
         defer decoded.deinit(alloc);
         if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
         const key = try alloc.dupe(u8, entry.key);
@@ -3379,7 +3760,9 @@ fn foreignKeyNameInCatalog(foreign_keys: []const schema_mod.ForeignKey, name: []
 fn clearColumnIndexNamespace(alloc: Allocator, store: *docstore_mod.DocStore) !void {
     try clearColumnIndexNamespacePrefix(alloc, store, internal_keys.relational_column_index_namespace);
     try clearColumnIndexNamespacePrefix(alloc, store, internal_keys.relational_array_element_index_namespace);
+    try clearColumnIndexNamespacePrefix(alloc, store, internal_keys.relational_array_value_index_namespace);
     try clearColumnIndexNamespacePrefix(alloc, store, internal_keys.relational_json_value_index_namespace);
+    try clearColumnIndexNamespacePrefix(alloc, store, internal_keys.relational_json_path_index_namespace);
     try clearColumnIndexNamespacePrefix(alloc, store, internal_keys.relational_column_index_by_doc_namespace);
 }
 
@@ -3396,7 +3779,9 @@ fn clearColumnIndexNamespacePrefix(alloc: Allocator, store: *docstore_mod.DocSto
     for (scanned) |entry| {
         if (!internal_keys.isRelationalColumnIndexKey(entry.key) and
             !internal_keys.isRelationalArrayElementIndexKey(entry.key) and
+            !internal_keys.isRelationalArrayValueIndexKey(entry.key) and
             !internal_keys.isRelationalJsonValueIndexKey(entry.key) and
+            !internal_keys.isRelationalJsonPathIndexKey(entry.key) and
             !internal_keys.isRelationalColumnIndexByDocKey(entry.key)) continue;
         deletes.appendAssumeCapacity(entry.key);
     }
@@ -3480,7 +3865,7 @@ fn appendUpsertInternal(
         key_owned = false;
         value_owned = false;
 
-        if (column_index_policy.shouldIndex(cell.path)) {
+        if (try column_index_policy.shouldIndexRow(alloc, cell.path, row_value)) {
             try appendColumnIndexWriteForCell(alloc, writes, owned_keys, owned_values, doc_key, cell);
         }
     }
@@ -3532,7 +3917,9 @@ fn appendColumnIndexWriteForCell(
     by_doc_key_owned = false;
 
     try appendArrayElementIndexWritesForCell(alloc, writes, owned_keys, doc_key, cell);
+    try appendArrayValueIndexWriteForCell(alloc, writes, owned_keys, doc_key, cell);
     try appendJsonValueIndexWritesForCell(alloc, writes, owned_keys, doc_key, cell);
+    try appendJsonPathIndexWritesForCell(alloc, writes, owned_keys, doc_key, cell);
 }
 
 fn appendColumnIndexDeleteForCell(
@@ -3563,7 +3950,9 @@ fn appendColumnIndexDeleteForCell(
     by_doc_key_owned = false;
 
     try appendArrayElementIndexDeletesForCell(alloc, deletes, owned_keys, doc_key, cell);
+    try appendArrayValueIndexDeleteForCell(alloc, deletes, owned_keys, doc_key, cell);
     try appendJsonValueIndexDeletesForCell(alloc, deletes, owned_keys, doc_key, cell);
+    try appendJsonPathIndexDeletesForCell(alloc, deletes, owned_keys, doc_key, cell);
 }
 
 fn appendArrayElementIndexWritesForCell(
@@ -3608,6 +3997,30 @@ fn appendArrayElementIndexWritesForCell(
     while (it.next()) |key| alloc.free(key.*);
 }
 
+fn appendArrayValueIndexWriteForCell(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    cell: relational_row_codec.Cell,
+) !void {
+    if (cell.value_type != .bytes_val or !cell.is_json) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .array) return;
+    const array_key = try arrayValueIndexKeyForValueAlloc(alloc, parsed.value);
+    defer alloc.free(array_key);
+    const key = try internal_keys.relationalArrayValueIndexKeyAlloc(alloc, cell.path, array_key, doc_key);
+    var key_owned = true;
+    errdefer if (key_owned) alloc.free(key);
+    if (owned_keys) |keys| {
+        try keys.append(alloc, key);
+        key_owned = false;
+    }
+    try writes.append(alloc, .{ .key = key, .value = "" });
+    key_owned = false;
+}
+
 fn appendArrayElementIndexDeletesForCell(
     alloc: Allocator,
     deletes: *std.ArrayListUnmanaged([]const u8),
@@ -3648,6 +4061,30 @@ fn appendArrayElementIndexDeletesForCell(
 
     var it = seen.keyIterator();
     while (it.next()) |key| alloc.free(key.*);
+}
+
+fn appendArrayValueIndexDeleteForCell(
+    alloc: Allocator,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    cell: relational_row_codec.Cell,
+) !void {
+    if (cell.value_type != .bytes_val or !cell.is_json) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .array) return;
+    const array_key = try arrayValueIndexKeyForValueAlloc(alloc, parsed.value);
+    defer alloc.free(array_key);
+    const key = try internal_keys.relationalArrayValueIndexKeyAlloc(alloc, cell.path, array_key, doc_key);
+    var key_owned = true;
+    errdefer if (key_owned) alloc.free(key);
+    if (owned_keys) |keys| {
+        try keys.append(alloc, key);
+        key_owned = false;
+    }
+    try deletes.append(alloc, key);
+    key_owned = false;
 }
 
 const JsonValueIndexEntry = struct {
@@ -3721,6 +4158,66 @@ fn appendJsonValueIndexDeletesForCell(
     }
 }
 
+fn appendJsonPathIndexWritesForCell(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    cell: relational_row_codec.Cell,
+) !void {
+    if (cell.value_type != .bytes_val or !cell.is_json) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{}) catch return;
+    defer parsed.deinit();
+
+    var paths = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (paths.items) |path| alloc.free(path);
+        paths.deinit(alloc);
+    }
+    try collectJsonPathIndexPathsAlloc(alloc, "", parsed.value, &paths);
+    for (paths.items) |path| {
+        const key = try internal_keys.relationalJsonPathIndexKeyAlloc(alloc, cell.path, path, doc_key);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        if (owned_keys) |keys| {
+            try keys.append(alloc, key);
+            key_owned = false;
+        }
+        try writes.append(alloc, .{ .key = key, .value = "" });
+        key_owned = false;
+    }
+}
+
+fn appendJsonPathIndexDeletesForCell(
+    alloc: Allocator,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    cell: relational_row_codec.Cell,
+) !void {
+    if (cell.value_type != .bytes_val or !cell.is_json) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{}) catch return;
+    defer parsed.deinit();
+
+    var paths = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (paths.items) |path| alloc.free(path);
+        paths.deinit(alloc);
+    }
+    try collectJsonPathIndexPathsAlloc(alloc, "", parsed.value, &paths);
+    for (paths.items) |path| {
+        const key = try internal_keys.relationalJsonPathIndexKeyAlloc(alloc, cell.path, path, doc_key);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        if (owned_keys) |keys| {
+            try keys.append(alloc, key);
+            key_owned = false;
+        }
+        try deletes.append(alloc, key);
+        key_owned = false;
+    }
+}
+
 fn collectJsonValueIndexEntriesAlloc(
     alloc: Allocator,
     path: []const u8,
@@ -3764,6 +4261,41 @@ fn collectJsonValueIndexEntriesAlloc(
             value_key_owned = false;
         },
     }
+}
+
+fn collectJsonPathIndexPathsAlloc(
+    alloc: Allocator,
+    path: []const u8,
+    value: std.json.Value,
+    out: *std.ArrayListUnmanaged([]u8),
+) !void {
+    if (path.len > 0) try appendUniqueJsonPathIndexPathAlloc(alloc, path, out);
+    switch (value) {
+        .object => |object| {
+            for (object.keys(), object.values()) |key, child| {
+                const child_path = try joinJsonIndexPathAlloc(alloc, path, key);
+                defer alloc.free(child_path);
+                try collectJsonPathIndexPathsAlloc(alloc, child_path, child, out);
+            }
+        },
+        .array => |array| {
+            for (array.items) |child| {
+                try collectJsonPathIndexPathsAlloc(alloc, path, child, out);
+            }
+        },
+        else => {},
+    }
+}
+
+fn appendUniqueJsonPathIndexPathAlloc(
+    alloc: Allocator,
+    path: []const u8,
+    out: *std.ArrayListUnmanaged([]u8),
+) !void {
+    for (out.items) |existing| {
+        if (std.mem.eql(u8, existing, path)) return;
+    }
+    try out.append(alloc, try alloc.dupe(u8, path));
 }
 
 fn joinJsonIndexPathAlloc(alloc: Allocator, prefix: []const u8, segment: []const u8) ![]u8 {
@@ -5058,6 +5590,63 @@ test "relational column indexing policy preserves cells but suppresses scan entr
     defer alloc.free(title_index_key);
     const title_index = try store.get(alloc, title_index_key);
     defer alloc.free(title_index);
+}
+
+test "relational partial column index policy writes only predicate-matching rows" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const active_row = try relational_row_codec.serialize(alloc, &.{
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "active" } },
+        .{ .path = "email", .value_type = .bytes_val, .value = .{ .bytes_val = "ada@example.test" } },
+    });
+    defer alloc.free(active_row);
+    const inactive_row = try relational_row_codec.serialize(alloc, &.{
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "inactive" } },
+        .{ .path = "email", .value_type = .bytes_val, .value = .{ .bytes_val = "grace@example.test" } },
+    });
+    defer alloc.free(inactive_row);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "status", .path = "status", .field_type = .keyword, .indexed = true },
+        .{ .name = "email", .path = "email", .field_type = .keyword, .indexed = true, .index_where = &.{.{ .field = "status", .op = .eq, .value_json = "\"active\"" }} },
+    };
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:active", active_row, ColumnIndexPolicy.fromColumns(columns[0..]));
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:inactive", inactive_row, ColumnIndexPolicy.fromColumns(columns[0..]));
+    try store.putBatch(writes.items, deletes.items);
+
+    const active_email_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "doc:active");
+    defer alloc.free(active_email_index_key);
+    const active_email_index = try store.get(alloc, active_email_index_key);
+    defer alloc.free(active_email_index);
+
+    const inactive_email_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "doc:inactive");
+    defer alloc.free(inactive_email_index_key);
+    try std.testing.expectError(error.NotFound, store.get(alloc, inactive_email_index_key));
+
+    const inactive_cell_key = try internal_keys.relationalColumnKeyAlloc(alloc, "doc:inactive", "email");
+    defer alloc.free(inactive_cell_key);
+    const inactive_cell = try store.get(alloc, inactive_cell_key);
+    defer alloc.free(inactive_cell);
 }
 
 test "relational column scan indexes rebuild and delete from packed rows" {

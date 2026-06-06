@@ -3715,9 +3715,11 @@ pub fn build(b: *std.Build) void {
             "relational rows unique selector",
             "relational rows conflict target upsert",
             "relational rows batch returning",
+            "relational rows materializes server defaults",
             "relational rows json_set",
             "api http server resolves relational rows by unique selector",
             "relational unique owner lookup requires one active owner range",
+            "catalog source resolves groups by key and span",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

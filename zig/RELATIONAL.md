@@ -227,12 +227,12 @@ machinery:
 `upsert` overwrites or creates; `update` is a non-upsert transform and cannot
 patch primary-key components. Primary-key changes are modeled as parent-key
 updates through the storage/constraint layer, not as silent mutation of the
-public row identity. `insert` and `upsert` remain primary-key based unless a
-future explicit conflict target is added; a later SQL DSL can compile
-`ON CONFLICT (unique_col...) DO UPDATE` into that explicit path without changing
-current `upsert` semantics. `rows:get` accepts an array of primary or unique
-selectors and returns the structured identity, row JSON, version, and optional
-`physical_key`.
+public row identity. `insert` and `upsert` remain primary-key based; explicit
+`on_conflict` targets are separate row-operation metadata over primary or unique
+owner rows, so a SQL DSL can compile `ON CONFLICT (unique_col...) DO UPDATE`
+without changing primary-key `upsert` semantics. `rows:get` accepts an array of
+primary or unique selectors and returns the structured identity, row JSON,
+version, and optional `physical_key`.
 
 The physical key is an implementation detail derived from the canonical typed
 primary-key tuple. It exists for placement, WAL, row-version ownership, and
@@ -402,9 +402,9 @@ The useful compatibility split is:
   relational mode itself because the engine must enforce them consistently for
   SQL, REST, SDK, and internal callers.
 
-The remaining model-level work for a Colony-shaped SQL surface is below. These
-items should be implemented as explicit API/runtime contracts first, then mapped
-from SQL syntax by an adapter.
+The model-level contracts for a Colony-shaped SQL surface are below. They are
+implemented as explicit API/runtime contracts first, then mapped from SQL syntax
+by an adapter.
 
 #### Partial and expression indexes
 
@@ -413,6 +413,27 @@ expression keys:
 
 ```json
 {
+  "document_schemas": {
+    "row": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "keyword",
+            "x-antfly-index-where": {
+              "all": [
+                { "field": "status", "op": "eq", "value": "active" }
+              ]
+            }
+          },
+          "email_lc": {
+            "type": "keyword",
+            "generated": { "op": "lower", "field": "email" }
+          }
+        }
+      }
+    }
+  },
   "unique_constraints": [
     {
       "name": "users_active_slug_key",
@@ -440,10 +461,37 @@ required for normalized lookup keys such as `lower(email)` and for computed
 ordering/filtering terms. SQL text is parsed above this layer; the backend
 catalog stores typed Antfly AST metadata such as `{ "op": "lower",
 "field": "email" }` and predicate atoms such as `{ "field": "status", "op":
-"eq", "value": "active" }`. Schema validation checks each expression,
-dependency tracking records the base columns it reads, writes evaluate
-expression values from the committed row, and index/unique-owner maintenance
-uses those computed values in the same 2PC path as ordinary column indexes.
+"eq", "value": "active" }`.
+
+Partial secondary indexes are a per-column catalog property,
+`x-antfly-index-where`. Writes evaluate the predicate against the same
+committed packed row that supplies the column values. Matching rows receive the
+ordinary column-major, array-element, or JSON-value side rows; non-matching rows
+keep their authoritative base-row cells but do not receive secondary scan
+entries. Rebuild, split, merge, and repair code use the same runtime column
+catalog, so partial side rows are deterministic derived state. Query planning
+uses a partial secondary index only when the typed row-query predicates imply
+the index predicate, otherwise it falls back to authoritative base-row scans and
+final rechecks. The predicate grammar is the same simple typed `all` form used
+by partial unique constraints: `is_null`, `is_not_null`, `eq`, and `ne` atoms
+over declared relational columns.
+
+Unique expression constraints store the typed expression directly on the unique
+constraint, evaluate the expression from the committed row, and maintain the
+unique-owner row in the same 2PC path as ordinary column unique owners.
+Non-unique expression access paths use stored generated columns as the canonical
+model-level representation. For example, a SQL adapter lowers
+`CREATE INDEX users_lower_email_idx ON users (lower(email))` into a generated
+relational column such as `"email_lc": { "type": "keyword", "generated": {
+"op": "lower", "field": "email" } }`; because generated columns are ordinary
+packed-row columns, their column-major side rows are rebuilt, moved, repaired,
+and queried through the same path as hand-authored indexed columns. Predicate
+queries then target `email_lc = "ada@example.test"` in the typed request rather
+than carrying the SQL expression string through storage. Schema validation
+checks each expression, dependency tracking records the base columns it reads,
+writes evaluate expression values from the committed row, and
+index/unique-owner maintenance uses those computed values in the same 2PC path
+as ordinary column indexes.
 Foreign keys must not target partial or expression unique constraints because
 they do not prove total parent uniqueness over a declared column tuple.
 
@@ -557,16 +605,26 @@ deletes until the claiming transaction commits or aborts. Transaction resolution
 always consumes row-claim intent keys instead of applying them as user data, so a
 commit releases the lock rather than leaving a durable row-claim record behind.
 
-`skip_locked: false` claims all returned base rows or fails with the underlying
-intent conflict. `skip_locked: true` attempts claims in result order and returns
-only the rows whose row-claim intents were installed. Row claiming is deliberately
-base-row only: `count_only`, graph result sets, and chunk return modes are
-rejected because they do not identify a single relational row to lock. SQL
-`SELECT ... FOR UPDATE [SKIP LOCKED]` and API queue consumers should both compile
-to this same row-claim contract. The remaining distributed planner work is to
-make range-targeted query execution over `ORDER BY`/`LIMIT` continue scanning
-past skipped rows across owner ranges so `SKIP LOCKED LIMIT n` can fill `n` rows
-without over-fetching a whole table.
+The typed relational row-query request carries this as `row_claim` beside
+`where`, `order_by`, `doc_key_range`, `limit`, and `offset`. The optional
+`doc_key_range` is a start-inclusive/end-exclusive physical row-key span. The
+row-query executor clips both base-row scans and index-derived candidates to
+that span before ordering and claiming, so a distributed planner can execute the
+same typed query independently on each table/range owner. The local coordinator
+contract accepts multiple non-overlapping owner spans, merges the hydrated
+candidate streams into one globally ordered row stream, and applies `OFFSET`,
+`LIMIT`, projection, and row claiming once after that merge. `skip_locked:
+false` claims all returned base rows or fails with the underlying intent
+conflict. `skip_locked: true` attempts claims in result order and keeps scanning
+past locked candidates until the requested limit is filled or the merged stream
+is exhausted. Row claiming is deliberately base-row only: aggregate sources,
+join sides, `count_only`, graph result sets, and chunk return modes are rejected
+because they do not identify a single relational row to lock. SQL `SELECT ...
+FOR UPDATE [SKIP LOCKED]` and API queue consumers should both compile to this
+same row-claim contract. In a distributed deployment, remote owner-range routing
+and paged cursor fetch are coordinator mechanics layered on this contract so a
+coordinator can request more rows from later owners without over-fetching a whole
+table.
 
 #### Array and multivalue columns
 
@@ -589,33 +647,50 @@ projection rejects elements that do not match that declared type. That gives
 schema/catalog state, reconstruction, and write validation a stable
 `array<T>` contract instead of opaque mixed JSON.
 
-`ANY`-style predicates lower to the structured stored-doc filter shape:
+`ANY`-style and containment predicates lower to structured typed filter shapes:
 
 ```json
-{ "array_any": { "field": "tags", "value": "hot" } }
+{
+  "all": [
+    { "field": "tags", "op": "array_any", "value": "hot" },
+    { "field": "tags", "op": "array_contains", "value": ["hot", "new"] },
+    { "field": "tags", "op": "array_eq", "value": ["hot", "new"] }
+  ]
+}
 ```
 
-The predicate compares the requested value as a typed JSON value, not as a SQL
-string fragment, and it also works over nested multivalue paths such as
+The predicates compare requested values as typed JSON values, not as SQL string
+fragments. `array_any` matches when any element equals the requested value.
+`array_contains` requires an array operand and matches when every requested
+element is present; an empty requested array matches present array values.
+`array_eq` requires an array operand and performs exact ordered JSON array
+equality, so `["hot", "new"]` is distinct from `["new", "hot"]`.
+Document-pattern filters also support nested multivalue paths such as
 `{ "array_any": { "path": "items.sku", "value": "sku-2" } }`.
 
-Declared indexed array columns write value-keyed element index entries beside
-the ordinary column scan entry:
+Declared indexed array columns write value-keyed element and whole-array
+equality entries beside the ordinary column scan entry:
 
 ```text
 array_element_index(column_path, canonical_element_value, doc_key) -> ""
+array_value_index(column_path, canonical_array_value, doc_key) -> ""
 ```
 
-`array_any` resolves through that element index when the column is indexed, then
-hydrates the base row to prove the row still contains the element before building
-the doc set. Columns declared with `x-antfly-index: false` keep the same typed
-array validation and canonical row storage but resolve `array_any` by scanning
-base rows instead of writing element index entries. The remaining production work
-is planner costing and broader SQL operator coverage: canonical ordering/equality
-rules, explicit null/empty semantics, nested multivalue path indexes, and
-catalog-declared order-sensitive versus set-like comparison for arrays that
-participate in unique constraints or generated expressions. Fully schemaless
-arrays can still live inside a `json` column.
+`array_any` resolves through that element index when the column is indexed.
+`array_contains` uses one requested element as the indexed candidate source, then
+hydrates the base row to prove the row still contains every requested element
+before building the final result stream. Empty containment operands fall back to
+the base-row scan path because there is no selective element key. `array_eq`
+uses the whole-array value index as its candidate stream when available, then
+hydrates the base row and rechecks exact array equality before projection.
+Columns declared with `x-antfly-index: false` keep the same typed array
+validation and canonical row storage but resolve array predicates by scanning
+base rows instead of writing side-index entries. Row-query planning ranks array
+candidate sets by estimated cardinality alongside scalar and JSON candidate sets
+before intersecting them. Broader SQL operator sugar, such as dialect-specific
+null treatment and nested multivalue path index selection, belongs above or
+beside this typed predicate contract. Fully schemaless arrays can still live
+inside a `json` column.
 
 #### JSON path and update operators
 
@@ -633,7 +708,7 @@ need stable API and planner semantics over the stored JSON subtree:
 ```
 
 Extraction (`->`, `->>`), containment (`@>`), existence, and path predicates
-compile to a JSON-column expression contract. Patch/update operations such as
+compile to a JSON-column expression contract, not SQL text. Patch/update operations such as
 `jsonb_set` lower to the row API's typed `json_set` operation:
 `{ "field": "attrs", "path": ["billing", "plan"], "value": "pro" }`. The field
 must be a declared `json` relational column, path segments are structured
@@ -641,12 +716,34 @@ strings rather than SQL text, and the mutation lowers to the same storage
 transform path as ordinary row updates. That rewrites only the JSON cell, then
 reprojects derived full-text/path-fact/algebraic indexes for that subtree from
 the committed row. Changing a JSON column's embedded schema remains a
-derived-index rebuild, not a base-row migration. The remaining query-side work
-is represented by structured JSON predicates. Equality and existence filters
-over a declared JSON path lower to structured filters such as
-`{ "term": { "path": "attrs.billing.plan", "value": "pro" } }` and
-`{ "exists": { "field": "attrs.billing.plan" } }`. Object containment (`@>`)
-lowers to a typed containment predicate such as:
+derived-index rebuild, not a base-row migration.
+
+Path equality and existence filters over a declared JSON column lower to typed
+row-query atoms with structured path segments:
+
+```json
+{
+  "all": [
+    {
+      "field": "attrs",
+      "op": "json_path_eq",
+      "path": ["billing", "plan"],
+      "value": "pro"
+    },
+    {
+      "field": "attrs",
+      "op": "json_path_exists",
+      "path": ["flags"]
+    }
+  ]
+}
+```
+
+The public JSON API may also accept a dot path such as `"billing.plan"` when a
+path segment itself does not contain a dot. SQL `attrs -> 'billing' ->> 'plan' =
+'pro'` lowers to `json_path_eq`; SQL existence checks lower to
+`json_path_exists`. Object containment (`@>`) lowers to a typed containment
+predicate such as:
 
 ```json
 {
@@ -657,28 +754,61 @@ lowers to a typed containment predicate such as:
 }
 ```
 
+Projection/extraction uses a separate typed row-query projection list so SQL
+`->` and `->>` do not pass through the backend as SQL strings:
+
+```json
+{
+  "select": ["id"],
+  "json_extract": [
+    {
+      "as": "plan",
+      "field": "attrs",
+      "path": ["billing", "plan"],
+      "as_text": true
+    },
+    {
+      "as": "flags",
+      "field": "attrs",
+      "path": ["flags"]
+    }
+  ]
+}
+```
+
+`as_text: false` is the `->` shape and projects the selected JSON value.
+`as_text: true` is the `->>` shape and projects a JSON string containing the
+selected scalar or canonical JSON text. Missing paths and JSON null project as
+`null`. Extraction is a row projection over the committed materialized row
+image; it does not read derived JSON value indexes.
+
 Containment is recursive over actual JSON values: objects require every
 requested key to be present and contained, arrays use unordered element
 containment, and scalars use JSON value equality with numeric integer/float
 normalization. It is intentionally not lowered to a fake term filter.
 
-Declared indexed JSON columns write value-keyed leaf rows beside the ordinary
-column scan entry:
+Declared indexed JSON columns write value-keyed leaf rows and path-existence
+rows beside the ordinary column scan entry:
 
 ```text
 json_value_index(column_path, relative_json_path, canonical_leaf_value, doc_key) -> ""
+json_path_index(column_path, relative_json_path, doc_key) -> ""
 ```
 
 The relational resolver uses those rows as candidate sources for
-`json_contains`, then hydrates the authoritative base row and rechecks recursive
-containment before returning a doc set. That makes stale side rows, partial
-rebuilds, and intentionally lossy leaf choices safe. Containment predicates that
-do not have an indexable scalar leaf, such as empty object/array containment, or
-columns declared with `x-antfly-index: false`, fall back to a base-row scan with
-the same containment evaluator. The remaining production work is planner
-costing, extraction/update operator breadth, and choosing between the relational
-JSON value rows and algebraic path-fact access paths when both can serve the
-same predicate.
+`json_contains`, scalar `json_path_eq`, and `json_path_exists`, then hydrates
+the authoritative base row and rechecks recursive containment, exact path
+equality, or path existence before returning a doc set. That makes stale side
+rows, partial rebuilds, and intentionally lossy leaf choices safe. The path
+index records object, array, and scalar paths, so existence checks are not
+limited to scalar leaf values. Containment predicates that do not have an
+indexable scalar leaf, object/array path equality, empty object/array
+containment, or columns declared with `x-antfly-index: false`, fall back to a
+base-row scan with the same evaluator. Row-query planning ranks JSON candidate
+sets by estimated cardinality alongside scalar and array candidate sets before
+intersecting them. When both relational JSON value/path rows and algebraic
+path-fact access paths can serve the same predicate, the planner can choose
+between them without changing the public typed JSON predicate contract.
 
 #### Checks, defaults, and generated values
 
@@ -696,12 +826,20 @@ need table-owned `CHECK` predicates, server-side defaults, and generated values:
         "type": "object",
         "properties": {
           "id": { "type": "keyword" },
+          "request_id": {
+            "type": "keyword",
+            "x-antfly-default": { "op": "uuid_v4" }
+          },
           "email": { "type": "keyword" },
           "email_key": {
             "type": "keyword",
             "generated": { "op": "lower", "field": "email" }
           },
-          "status": { "type": "keyword", "default": "active" }
+          "status": { "type": "keyword", "default": "active" },
+          "created_at_ns": {
+            "type": "numeric",
+            "x-antfly-default": { "op": "now_ns" }
+          }
         },
         "required": ["id", "email"],
         "additionalProperties": false
@@ -712,18 +850,33 @@ need table-owned `CHECK` predicates, server-side defaults, and generated values:
 ```
 
 The model-level contract is typed JSON metadata, not SQL expression text. Literal
-column defaults are applied by the write planner before primary-key encoding,
-unique tuple derivation, constraint checks, and `RETURNING`. Stored generated
-columns currently support typed `lower(field)` and `concat(fields, separator)`
-forms; user input cannot write generated columns directly. Inserts materialize
-defaults and generated values into the committed row image. Updates and
-conflict-target updates that touch tables with checks or generated columns
-resolve the base row, apply the requested patch/JSON updates, regenerate stored
-generated values as ordinary transform operations, and validate checks against
-that final planned row image. `CHECK` predicates are named typed atoms
-(`is_null`, `is_not_null`, `eq`, `ne`, `gt`, `gte`, `lt`, `lte`) over declared
-columns so REST, SDK, and future SQL adapters compile to the same backend
-contract.
+column defaults use JSON Schema `default`. Server-owned defaults use
+`x-antfly-default` so object literals remain unambiguous. The durable default
+operations are:
+
+- `{"op":"uuid_v4"}` on string-like identity columns (`keyword`, `text`, or
+  `link`).
+- `{"op":"now_ns"}` on `numeric` or `datetime` columns, stored as epoch
+  nanoseconds.
+
+Defaults are materialized once per planned row by the write planner before
+primary-key encoding, unique tuple derivation, constraint checks, and
+`RETURNING`. A generated column that references a server-defaulted column sees
+the same UUID/timestamp value that is committed to the row. A SQL adapter should
+lower `DEFAULT`, `gen_random_uuid()`/UUID defaults, and `now()`/timestamp
+defaults into these typed operations instead of passing SQL expression text
+through storage.
+
+Stored generated columns currently support typed `lower(field)` and
+`concat(fields, separator)` forms; user input cannot write generated columns
+directly. Inserts materialize defaults and generated values into the committed
+row image. Updates and conflict-target updates that touch tables with checks or
+generated columns resolve the base row, apply the requested patch/JSON updates,
+regenerate stored generated values as ordinary transform operations, and
+validate checks against that final planned row image. `CHECK` predicates are
+named typed atoms (`is_null`, `is_not_null`, `eq`, `ne`, `gt`, `gte`, `lt`,
+`lte`) over declared columns so REST, SDK, and future SQL adapters compile to
+the same backend contract.
 
 #### Relational query lowering
 
@@ -758,33 +911,214 @@ not as SQL text:
   "where": {
     "all": [
       { "field": "tenant_id", "op": "eq", "value": "t1" },
-      { "field": "status", "op": "eq", "value": "open" }
+      { "field": "status", "op": "eq", "value": "open" },
+      { "field": "tags", "op": "array_any", "value": "hot" },
+      { "field": "tags", "op": "array_contains", "value": ["hot", "new"] },
+      { "field": "tags", "op": "array_eq", "value": ["hot", "new"] },
+      {
+        "field": "attrs",
+        "op": "json_contains",
+        "value": { "billing": { "plan": "pro" } }
+      },
+      {
+        "field": "attrs",
+        "op": "json_path_eq",
+        "path": ["billing", "plan"],
+        "value": "pro"
+      },
+      {
+        "field": "attrs",
+        "op": "json_path_exists",
+        "path": ["flags"]
+      }
     ]
   },
   "select": ["id", "status", "created_at"],
+  "json_extract": [
+    {
+      "as": "plan",
+      "field": "attrs",
+      "path": ["billing", "plan"],
+      "as_text": true
+    }
+  ],
   "order_by": [{ "field": "created_at", "direction": "desc" }],
+  "row_claim": {
+    "mode": "for_update",
+    "skip_locked": true,
+    "owner_id": "session:7",
+    "transaction_id": "00112233445566778899aabbccddeeff"
+  },
+  "doc_key_range": { "start": "tenant:t1/order:", "end": "tenant:t1/order~" },
   "limit": 50,
   "offset": 0
 }
 ```
 
 The same contract also accepts shorthand equality filters such as
-`{ "where": { "status": "ready" } }`. Predicates are typed atoms over declared
-relational columns (`is_null`, `is_not_null`, `eq`, `ne`, `gt`, `gte`, `lt`,
-`lte`), projections are field lists or `["*"]`, and ordering is over declared
+`{ "where": { "status": "ready" } }`. Scalar predicates are typed atoms over
+declared relational columns (`is_null`, `is_not_null`, `eq`, `ne`, `gt`, `gte`,
+`lt`, `lte`). Array and JSON operators are also typed atoms: `array_any`
+requires a declared `array` column and compares one typed JSON value against
+array elements; `array_contains` requires a declared `array` column and an array
+operand whose elements must all be present; `array_eq` requires a declared
+`array` column and an array operand for exact ordered equality; `json_contains`
+requires a declared `json` column and uses recursive JSON containment semantics;
+`json_path_eq` requires a declared `json` column, a structured path, and an
+exact JSON value; `json_path_exists` requires a declared `json` column and a
+structured path. Projections are field lists or `["*"]` plus optional
+`json_extract` aliases over declared JSON columns, and ordering is over declared
 scalar columns with deterministic tie-breaking by input row order. Null and
 missing order keys sort after present scalar values. The executor projects from
 the relational row JSON/codec and applies `OFFSET`/`LIMIT` after filtering and
 ordering.
+`doc_key_range` is optional; when present, it scopes the query to a
+start-inclusive/end-exclusive physical doc-key span before ordering,
+pagination, projection, or row claiming. That makes range owners a planner
+concern instead of a SQL syntax concern: SQL/REST/SDK adapters all target the
+same typed span contract.
+
+The DB executor uses the same relational filter pushdown machinery as search.
+Exact equality predicates that fully determine the primary key or a declared
+unique constraint resolve through the durable owner row first. Partial unique
+constraints are only eligible when the query predicates imply the catalog
+predicate; otherwise the planner falls back to ordinary row-query access paths so
+non-partial rows are not hidden behind the partial owner. Indexable atoms then
+select candidates from declared column-major, array-element, and JSON-value
+indexes, while unindexed or non-indexable atoms fall back to base-row scans. The
+non-unique planner records each candidate set's estimated cardinality and
+intersects the most selective known sets first, with unknown-cardinality sets
+kept after known candidates and original request order used only as a tie
+breaker.
+Candidate selection is not trusted as the final answer: every candidate is
+hydrated from the current authoritative relational base row and every scalar,
+array, and JSON predicate is rechecked against that row before projection,
+ordering, offset, and limit are applied. Candidate hydration also rejects doc
+keys outside `doc_key_range`, so indexed predicates cannot leak rows from
+another owner span. This keeps stale side rows, partial rebuilds, and unindexed
+columns correct while still letting primary/unique lookups, simple
+equality/range predicates, `array_any`, `array_eq`, and `json_contains` avoid
+whole-table scans when an access path exists. Scalar `json_path_eq` also uses the
+JSON-value side index when the declared JSON column is indexed; complex
+object/array path equality and JSON path existence use the same base-row recheck
+contract and can add dedicated access paths without changing the public typed
+query shape.
+
+A coordinator can also issue one typed row query across multiple non-overlapping
+physical row-key spans. Each span is resolved against the same base-row and
+index contracts, then the coordinator globally orders the merged candidates and
+applies pagination, projection, and optional row claims exactly once. This is
+the model-level equivalent of a SQL range router: SQL, REST, and SDK adapters
+choose spans from durable table/range ownership metadata, but the executor only
+sees typed `doc_key_range` bounds and row-query atoms. The table catalog exposes
+that bridge as a typed table doc-key range plan: it sorts the table's durable
+`RangeRecord`s, clips a requested key span to each owner range, returns the
+owning `group_id`, and stamps each span with the table topology epoch. Hosted
+and provisioned routers can validate the epoch before executing the span, then
+call the same storage-level row-query executor with the clipped
+`doc_key_range`.
+
+Aggregates consume the same typed row-query source. A single-table aggregate
+request is a source row query plus typed group keys and named metrics:
+
+```json
+{
+  "source": {
+    "where": { "status": "open" }
+  },
+  "group_by": ["customer_id"],
+  "aggregations": [
+    { "name": "order_count", "op": "count" },
+    { "name": "amount_sum", "op": "sum", "field": "amount" },
+    { "name": "amount_avg", "op": "avg", "field": "amount" },
+    { "name": "amount_min", "op": "min", "field": "amount" },
+    { "name": "amount_max", "op": "max", "field": "amount" }
+  ],
+  "order_by": [{ "field": "amount_sum", "direction": "desc" }],
+  "limit": 100,
+  "offset": 0
+}
+```
+
+The source query is evaluated through the same index-backed candidate selection
+and authoritative base-row recheck path as ordinary row queries. Grouping and
+metric folding then happen over the materialized row stream and emit typed JSON
+projection rows such as
+`{ "customer_id": "c1", "order_count": 2, "amount_sum": 30 }`. `count` without
+a field is `count(*)`; `count` with a field ignores null/missing values. Numeric
+metrics ignore null/missing values and reject non-numeric inputs for the metric
+field. Aggregate `order_by` sorts over the emitted group/metric rows before
+`offset` and `limit`, so SQL `ORDER BY amount_sum DESC LIMIT ...` lowers without
+re-reading base rows. This gives a future SQL adapter a direct lowering target for
+single-table `GROUP BY` before join streams are attached.
+
+Joins compose two typed row-query sources with explicit equality predicates and
+projection fields:
+
+```json
+{
+  "left": {
+    "where": { "kind": "order" },
+    "order_by": [{ "field": "id", "direction": "asc" }]
+  },
+  "right": {
+    "where": { "kind": "customer" }
+  },
+  "on": [
+    { "left_field": "tenant_id", "right_field": "tenant_id" },
+    { "left_field": "customer_id", "right_field": "id" }
+  ],
+  "join_type": "left",
+  "select": [
+    { "output": "order_id", "side": "left", "field": "id" },
+    { "output": "customer_name", "side": "right", "field": "name" }
+  ],
+  "order_by": [{ "field": "customer_name", "direction": "asc" }],
+  "limit": 100,
+  "offset": 0
+}
+```
+
+Each side is evaluated as a normal row query, so side-local filters use the
+same indexed candidate selection and base-row recheck path. The join executor
+then builds a hash table from the right stream using the typed `on` columns and
+probes it with the left stream. Join keys are JSON tuples; null or missing join
+components do not match, which matches SQL equality-join behavior. `inner` joins
+emit only matches. `left` joins emit unmatched left rows with right-side
+projection fields set to `null`. Joined result `order_by` sorts over projected
+joined rows, then `limit`/`offset` applies after join matching and projection.
+
+The storage-level join executor covers typed row streams. For a single-table
+store, those streams are local row-query requests against that store's runtime
+schema; for a multi-table SQL/REST/SDK coordinator, table identity is resolved
+before local execution by routing each source to the correct table/range owner
+and feeding the resulting row streams into the same typed projection and join
+contract. That keeps SQL/SDK/REST lowering unified while leaving
+PostgreSQL-specific syntax and wire behavior in the adapter layer.
 
 This is the backend AST that a SQL adapter should target for simple
-single-table `SELECT` clauses. The planner still needs to connect that contract
-to primary-key, unique-owner, partial/expression, array-element, JSON-value, and
-column-major access paths instead of materializing every candidate row first.
-Joins should lower to typed row-stream composition over the same base row
-contract, with join predicates represented as column references rather than SQL
-fragments. Aggregates should consume typed row streams and emit typed projection
-rows. Non-recursive CTEs are mostly query composition over this contract.
+single-table `SELECT`, `GROUP BY`, and local row-stream `JOIN` clauses.
+Primary-key, unique-owner, partial-unique, partial-secondary, column-major,
+array-element, and JSON-value access paths are now model-level choices beneath
+that contract for single-table row queries. Non-unique expression lookups are
+represented as stored generated columns, so they use the same column-major
+candidate extraction and base-row recheck path as other indexed scalar columns.
+Multi-range ordered merge is part of the row-query contract through
+`queryRelationalRowsAcrossRanges` and `TableDocKeyRangePlan`. Cross-table join
+planning is a coordinator composition concern: it resolves each table source
+through durable table/range ownership, executes the existing typed row-query
+contract on each owner, and supplies those materialized streams to the same
+join/aggregate executors.
+Non-recursive CTEs are first-class query composition: a
+`RelationalRowsQueryPlan`, `RelationalRowsAggregatePlan`, or
+`RelationalRowsJoinPlan` carries ordered named CTEs, each CTE is a typed
+`RelationalRowsQueryRequest`, and later CTEs, aggregate sources, join sides, or
+the final row query can name a materialized source with `source_cte`. A CTE
+definition can use the normal base row-query planner, including declared
+indexes, before materialization; predicates over a materialized CTE are
+evaluated against that materialized row stream. Forward references and duplicate
+CTE names are rejected. Durable row claims and physical doc-key ranges are
+base-row planner features and are rejected over materialized CTE sources.
 Recursive CTEs are a separate graph/fixpoint feature and should be treated as a
 distinct planner extension.
 

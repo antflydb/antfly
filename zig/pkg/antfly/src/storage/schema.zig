@@ -137,10 +137,13 @@ pub const RelationalColumn = struct {
     indexed: bool = true,
     default_value: ?RelationalDefaultValue = null,
     generated: ?RelationalGeneratedValue = null,
+    index_where: []const UniquePredicate = &.{},
 };
 
 pub const RelationalDefaultKind = enum(u8) {
     literal = 0,
+    now_ns = 1,
+    uuid_v4 = 2,
 };
 
 pub const RelationalDefaultValue = struct {
@@ -260,6 +263,7 @@ pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []
         if (a.indexed != b.indexed) return false;
         if (!relationalDefaultsEqual(a.default_value, b.default_value)) return false;
         if (!relationalGeneratedValuesEqual(a.generated, b.generated)) return false;
+        if (!uniquePredicateSlicesEqual(a.index_where, b.index_where)) return false;
     }
     return true;
 }
@@ -391,7 +395,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 21); // format version
+    try appendU32(&buf, alloc, 22); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -475,6 +479,12 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         } else {
             try buf.append(alloc, 0);
         }
+        try appendU32(&buf, alloc, @intCast(column.index_where.len));
+        for (column.index_where) |predicate| {
+            try buf.append(alloc, @intFromEnum(predicate.op));
+            try appendStr(&buf, alloc, predicate.field);
+            try appendOptStr(&buf, alloc, predicate.value_json);
+        }
     }
 
     // Foreign-key catalog (format version 11+).
@@ -544,7 +554,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 21) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 22) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -805,6 +815,9 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             for (columns[0..columns_initialized]) |column| {
                 alloc.free(column.name);
                 alloc.free(column.path);
+                if (column.default_value) |value| alloc.free(value.value_json);
+                if (column.generated) |value| freeRelationalGeneratedValue(alloc, value);
+                freeUniquePredicateSlice(alloc, column.index_where);
             }
             alloc.free(columns);
         }
@@ -858,7 +871,9 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 break :generated_blk null;
             };
             errdefer if (generated) |value| freeRelationalGeneratedValue(alloc, value);
-            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .indexed = indexed, .default_value = default_value, .generated = generated };
+            const index_where = if (fmt_version >= 22) try readUniquePredicateSliceAlloc(alloc, data, &pos) else &.{};
+            errdefer freeUniquePredicateSlice(alloc, index_where);
+            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .indexed = indexed, .default_value = default_value, .generated = generated, .index_where = index_where };
             columns_initialized += 1;
         }
         break :blk columns;
@@ -1035,6 +1050,7 @@ fn freeRelationalColumnsSlice(alloc: Allocator, columns: []const RelationalColum
         alloc.free(column.path);
         if (column.default_value) |value| alloc.free(value.value_json);
         if (column.generated) |value| freeRelationalGeneratedValue(alloc, value);
+        freeUniquePredicateSlice(alloc, column.index_where);
     }
     if (columns.len > 0) alloc.free(columns);
 }
@@ -1712,8 +1728,9 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
         .relational_columns = &.{
             .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
             .{ .name = "tenant_id", .path = "tenant_id", .field_type = .keyword, .nullable = false },
-            .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false, .default_value = .{ .value_json = "1" } },
-            .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true },
+            .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false, .default_value = .{ .value_json = "1" }, .index_where = &.{.{ .field = "tenant_id", .op = .is_not_null }} },
+            .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true, .default_value = .{ .kind = .now_ns, .value_json = "" } },
+            .{ .name = "request_id", .path = "request_id", .field_type = .keyword, .nullable = true, .default_value = .{ .kind = .uuid_v4, .value_json = "" } },
             .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true, .indexed = false },
             .{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .keyword, .nullable = true },
             .{ .name = "tenant_key", .path = "tenant_key", .field_type = .keyword, .nullable = true, .generated = .{ .op = .lower, .field = "tenant_id" } },
@@ -1774,7 +1791,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     defer freeSchema(alloc, loaded);
 
     try std.testing.expectEqual(StorageMode.relational, loaded.storage_mode);
-    try std.testing.expectEqual(@as(usize, 7), loaded.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 8), loaded.relational_columns.len);
     try std.testing.expectEqualStrings("id", loaded.relational_columns[0].name);
     try std.testing.expectEqualStrings("id", loaded.relational_columns[0].path);
     try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[0].field_type);
@@ -1788,15 +1805,23 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(AntflyType.numeric, loaded.relational_columns[2].field_type);
     try std.testing.expectEqual(AntflyType.datetime, loaded.relational_columns[3].field_type);
     try std.testing.expect(loaded.relational_columns[3].nullable);
-    try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[4].field_type);
-    try std.testing.expect(!loaded.relational_columns[4].indexed);
-    try std.testing.expectEqual(AntflyType.array, loaded.relational_columns[5].field_type);
-    try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[5].array_item_type.?);
+    try std.testing.expect(loaded.relational_columns[3].default_value != null);
+    try std.testing.expectEqual(RelationalDefaultKind.now_ns, loaded.relational_columns[3].default_value.?.kind);
+    try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[4].field_type);
+    try std.testing.expect(loaded.relational_columns[4].default_value != null);
+    try std.testing.expectEqual(RelationalDefaultKind.uuid_v4, loaded.relational_columns[4].default_value.?.kind);
+    try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[5].field_type);
+    try std.testing.expect(!loaded.relational_columns[5].indexed);
+    try std.testing.expectEqual(AntflyType.array, loaded.relational_columns[6].field_type);
+    try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[6].array_item_type.?);
     try std.testing.expect(loaded.relational_columns[2].default_value != null);
     try std.testing.expectEqualStrings("1", loaded.relational_columns[2].default_value.?.value_json);
-    try std.testing.expect(loaded.relational_columns[6].generated != null);
-    try std.testing.expectEqual(RelationalGeneratedOp.lower, loaded.relational_columns[6].generated.?.op);
-    try std.testing.expectEqualStrings("tenant_id", loaded.relational_columns[6].generated.?.field.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.relational_columns[2].index_where.len);
+    try std.testing.expectEqualStrings("tenant_id", loaded.relational_columns[2].index_where[0].field);
+    try std.testing.expectEqual(UniquePredicateOp.is_not_null, loaded.relational_columns[2].index_where[0].op);
+    try std.testing.expect(loaded.relational_columns[7].generated != null);
+    try std.testing.expectEqual(RelationalGeneratedOp.lower, loaded.relational_columns[7].generated.?.op);
+    try std.testing.expectEqualStrings("tenant_id", loaded.relational_columns[7].generated.?.field.?);
     try std.testing.expectEqual(@as(usize, 3), loaded.foreign_keys.len);
     try std.testing.expectEqualStrings("orders_customer_id_fkey", loaded.foreign_keys[0].name);
     try std.testing.expectEqualStrings("customer_id", loaded.foreign_keys[0].child_columns[0]);

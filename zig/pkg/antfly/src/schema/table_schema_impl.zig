@@ -297,6 +297,22 @@ pub const RelationalGeneratedOp = enum {
     concat,
 };
 
+pub const RelationalDefaultKind = enum {
+    literal,
+    now_ns,
+    uuid_v4,
+};
+
+pub const RelationalDefaultValue = struct {
+    kind: RelationalDefaultKind = .literal,
+    value_json: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.value_json);
+        self.* = undefined;
+    }
+};
+
 pub const RelationalGeneratedValue = struct {
     op: RelationalGeneratedOp,
     field: ?[]const u8 = null,
@@ -451,8 +467,9 @@ pub const DocumentProperty = struct {
     unevaluated_items_schema: ?*DocumentProperty = null,
     embedded_schema: ?*DocumentProperty = null,
     embedded_dynamic_templates: []DynamicTemplate = &.{},
-    default_value_json: ?[]const u8 = null,
+    default_value: ?RelationalDefaultValue = null,
     generated: ?RelationalGeneratedValue = null,
+    index_where: []UniquePredicate = &.{},
 
     pub fn deinit(self: *DocumentProperty, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -540,8 +557,13 @@ pub const DocumentProperty = struct {
         }
         for (self.embedded_dynamic_templates) |*dynamic_template| dynamic_template.deinit(alloc);
         if (self.embedded_dynamic_templates.len > 0) alloc.free(self.embedded_dynamic_templates);
-        if (self.default_value_json) |value| alloc.free(value);
+        if (self.default_value) |*value| value.deinit(alloc);
         if (self.generated) |*generated| generated.deinit(alloc);
+        for (self.index_where) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value| alloc.free(value);
+        }
+        if (self.index_where.len > 0) alloc.free(self.index_where);
         self.* = undefined;
     }
 };
@@ -1398,6 +1420,9 @@ fn validatePropertySchemaKeywords(context: SchemaContext, object: std.json.Objec
     if (object.get("x-antfly-index")) |antfly_index| {
         if (antfly_index != .null and antfly_index != .bool) return error.InvalidSchemaUpdateRequest;
     }
+    if (object.get("x-antfly-index-where")) |index_where| {
+        if (index_where != .null) try validateUniquePredicateDefinition(index_where);
+    }
     if (object.get("x-antfly-include-in-all")) |include_in_all| {
         if (include_in_all != .null) try validateAntflyIncludeInAllDefinition(include_in_all);
     }
@@ -1989,6 +2014,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
         for (document_schema.properties) |property| {
             try validateRelationalEmbeddedJsonProperty(property);
             try validateRelationalGeneratedProperty(schema, document_schema, property);
+            try validateRelationalPartialIndexProperty(schema, property);
             if (isRelationalStorageProperty(property)) relational_columns += 1;
         }
     }
@@ -2190,6 +2216,13 @@ fn validateRelationalGeneratedProperty(schema: TableSchema, document_schema: Doc
             }
         },
     }
+}
+
+fn validateRelationalPartialIndexProperty(schema: TableSchema, property: DocumentProperty) !void {
+    if (property.index_where.len == 0) return;
+    if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+    if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
+    for (property.index_where) |predicate| try validateRelationalUniquePredicate(schema, predicate);
 }
 
 fn isRelationalTextLikeProperty(property: DocumentProperty) bool {
@@ -2598,11 +2631,18 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         for (include_in_all_fields) |field_name| alloc.free(field_name);
         if (include_in_all_fields.len > 0) alloc.free(include_in_all_fields);
     }
-    const default_value_json = if (object.get("default")) |default_value|
-        try stringifyJsonValue(alloc, default_value)
-    else
-        null;
-    errdefer if (default_value_json) |owned| alloc.free(owned);
+    if (object.get("default") != null and object.get("x-antfly-default") != null) return error.InvalidSchemaUpdateRequest;
+    const default_value = if (object.get("x-antfly-default")) |server_default_value| blk: {
+        if (server_default_value == .null) break :blk null;
+        break :blk try parseRelationalDefaultValue(alloc, server_default_value);
+    } else if (object.get("default")) |literal_default| RelationalDefaultValue{
+        .kind = .literal,
+        .value_json = try stringifyJsonValue(alloc, literal_default),
+    } else null;
+    errdefer if (default_value) |owned_default| {
+        var mutable_default = owned_default;
+        mutable_default.deinit(alloc);
+    };
     const generated = if (object.get("generated")) |generated_value| blk: {
         if (generated_value == .null) break :blk null;
         break :blk try parseRelationalGeneratedValue(alloc, generated_value);
@@ -2611,6 +2651,17 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         var mutable_generated = owned_generated;
         mutable_generated.deinit(alloc);
     };
+    const index_where: []UniquePredicate = if (object.get("x-antfly-index-where")) |where_value|
+        if (where_value == .null) &.{} else try parseUniquePredicates(alloc, where_value)
+    else
+        &.{};
+    errdefer {
+        for (index_where) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value| alloc.free(value);
+        }
+        if (index_where.len > 0) alloc.free(index_where);
+    }
     const embedded_schema = if (object.get("schema")) |schema_value| blk: {
         if (schema_value == .null) break :blk null;
         if (schema_value != .object) return error.InvalidSchemaUpdateRequest;
@@ -2907,8 +2958,9 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .unevaluated_items_schema = unevaluated_items_schema,
         .embedded_schema = embedded_schema,
         .embedded_dynamic_templates = embedded_dynamic_templates,
-        .default_value_json = default_value_json,
+        .default_value = default_value,
         .generated = generated,
+        .index_where = index_where,
     };
     if (property.dynamic_infer_types and (!(property.additional_properties_allowed orelse false) or property.additional_properties_schema != null)) {
         return error.InvalidSchemaUpdateRequest;
@@ -3354,6 +3406,23 @@ fn parsePrimaryKey(alloc: std.mem.Allocator, value: std.json.Value) !PrimaryKey 
     return .{
         .columns = try parseStringArrayAlloc(alloc, object.get("columns").?),
     };
+}
+
+fn parseRelationalDefaultValue(alloc: std.mem.Allocator, value: std.json.Value) !RelationalDefaultValue {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const op_value = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
+    if (op_value != .string) return error.InvalidSchemaUpdateRequest;
+    const op_text = op_value.string;
+    if (enumTokenEql(op_text, "now_ns")) {
+        return .{ .kind = .now_ns, .value_json = try alloc.dupe(u8, "") };
+    }
+    if (enumTokenEql(op_text, "uuid_v4")) {
+        return .{ .kind = .uuid_v4, .value_json = try alloc.dupe(u8, "") };
+    }
+    return error.InvalidSchemaUpdateRequest;
 }
 
 fn parseRelationalGeneratedValue(alloc: std.mem.Allocator, value: std.json.Value) !RelationalGeneratedValue {
