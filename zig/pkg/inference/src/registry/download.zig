@@ -46,10 +46,21 @@ pub fn parseProjectorSelection(value: []const u8) ?ProjectorSelection {
     return .{ .match = value };
 }
 
-const HubFile = struct {
+pub const HubFile = struct {
     name: []const u8,
     size: ?u64 = null,
     sha256: ?[]const u8 = null,
+};
+
+pub const PayloadSupportSummary = struct {
+    has_gguf: bool = false,
+    has_onnx: bool = false,
+    has_safetensors: bool = false,
+    has_framework_weights: bool = false,
+
+    pub fn hasCompatiblePayload(self: PayloadSupportSummary) bool {
+        return self.has_gguf or self.has_onnx or self.has_safetensors;
+    }
 };
 
 const SyntheticMetadataPlan = union(enum) {
@@ -209,6 +220,86 @@ fn basename(path: []const u8) []const u8 {
 
 fn isGgufFile(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".gguf");
+}
+
+fn isOnnxFile(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".onnx");
+}
+
+fn isSafetensorsFile(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".safetensors") or std.mem.endsWith(u8, path, ".safetensors.index.json");
+}
+
+fn isFrameworkWeightFile(path: []const u8) bool {
+    const base = basename(path);
+    return std.mem.eql(u8, base, "pytorch_model.bin") or
+        (std.mem.startsWith(u8, base, "pytorch_model-") and std.mem.endsWith(u8, base, ".bin")) or
+        std.mem.eql(u8, base, "tf_model.h5") or
+        std.mem.eql(u8, base, "flax_model.msgpack") or
+        std.mem.endsWith(u8, base, ".ckpt");
+}
+
+pub fn summarizePayloadSupport(files: []const HubFile) PayloadSupportSummary {
+    var summary: PayloadSupportSummary = .{};
+    for (files) |file| {
+        summary.has_gguf = summary.has_gguf or isGgufFile(file.name);
+        summary.has_onnx = summary.has_onnx or isOnnxFile(file.name);
+        summary.has_safetensors = summary.has_safetensors or isSafetensorsFile(file.name);
+        summary.has_framework_weights = summary.has_framework_weights or isFrameworkWeightFile(file.name);
+    }
+    return summary;
+}
+
+fn appendModelRef(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    owner: []const u8,
+    name: []const u8,
+    variant: []const u8,
+) !void {
+    try out.appendSlice(alloc, owner);
+    try out.append(alloc, '/');
+    try out.appendSlice(alloc, name);
+    if (variant.len > 0 and !std.mem.eql(u8, variant, "auto")) {
+        try out.append(alloc, ':');
+        try out.appendSlice(alloc, variant);
+    }
+}
+
+fn isOpenAiClipRef(owner: []const u8, name: []const u8) bool {
+    return std.mem.eql(u8, owner, "openai") and std.mem.startsWith(u8, name, "clip-");
+}
+
+pub fn noModelFilesAdviceAlloc(
+    alloc: std.mem.Allocator,
+    owner: []const u8,
+    name: []const u8,
+    variant: []const u8,
+    files: []const HubFile,
+) ![]u8 {
+    const summary = summarizePayloadSupport(files);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try out.appendSlice(alloc, "No compatible model files found for ");
+    try appendModelRef(alloc, &out, owner, name, variant);
+    try out.appendSlice(alloc, ".\n");
+    try out.appendSlice(alloc, "Antfly inference pull expects GGUF, ONNX, or safetensors payloads.");
+    if (summary.has_framework_weights and !summary.hasCompatiblePayload()) {
+        try out.appendSlice(alloc, " This repo appears to publish framework weights only, such as PyTorch, TensorFlow, or Flax files.");
+    }
+    try out.append(alloc, '\n');
+
+    if (isOpenAiClipRef(owner, name)) {
+        try out.appendSlice(alloc, "For v0.2 CLIP/CLAP embeddings, use:\n");
+        try out.appendSlice(alloc, "  antfly inference pull antflydb/clipclap:gguf:Q4_K\n");
+        try out.appendSlice(alloc, "For an ONNX CLIP export, try:\n");
+        try out.appendSlice(alloc, "  antfly inference pull Xenova/clip-vit-base-patch32:hybrid\n");
+    } else {
+        try out.appendSlice(alloc, "Use a repo or variant that includes GGUF, ONNX, or safetensors model files.\n");
+    }
+
+    return try out.toOwnedSlice(alloc);
 }
 
 fn isGgufProjectorFile(path: []const u8) bool {
@@ -1054,6 +1145,11 @@ pub fn downloadModel(
     }
 
     if (!found_model_payload) {
+        const advice = noModelFilesAdviceAlloc(allocator, owner, name, variant, files) catch null;
+        if (advice) |message| {
+            defer allocator.free(message);
+            std.debug.print("{s}", .{message});
+        }
         return error.NoModelFilesFound;
     }
 
@@ -1572,6 +1668,43 @@ test "gguf selection keeps clipclap clip and clap pair together" {
     try std.testing.expectEqual(@as(usize, 2), to_download.items.len);
     try std.testing.expectEqualStrings("clipclap-clip.Q4_K.gguf", to_download.items[0].name);
     try std.testing.expectEqualStrings("clipclap-clap.Q4_K.gguf", to_download.items[1].name);
+}
+
+test "payload support summary distinguishes framework-only repos" {
+    const files = [_]HubFile{
+        .{ .name = "config.json" },
+        .{ .name = "pytorch_model.bin" },
+        .{ .name = "tf_model.h5" },
+        .{ .name = "flax_model.msgpack" },
+    };
+
+    const summary = summarizePayloadSupport(&files);
+    try std.testing.expect(!summary.hasCompatiblePayload());
+    try std.testing.expect(summary.has_framework_weights);
+    try std.testing.expect(!summary.has_onnx);
+    try std.testing.expect(!summary.has_safetensors);
+    try std.testing.expect(!summary.has_gguf);
+}
+
+test "no model files advice recommends blessed clipclap ref for openai clip" {
+    const files = [_]HubFile{
+        .{ .name = "config.json" },
+        .{ .name = "pytorch_model.bin" },
+    };
+
+    const advice = try noModelFilesAdviceAlloc(
+        std.testing.allocator,
+        "openai",
+        "clip-vit-base-patch32",
+        "hybrid",
+        &files,
+    );
+    defer std.testing.allocator.free(advice);
+
+    try std.testing.expect(std.mem.indexOf(u8, advice, "openai/clip-vit-base-patch32:hybrid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, advice, "framework weights only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, advice, "antflydb/clipclap:gguf:Q4_K") != null);
+    try std.testing.expect(std.mem.indexOf(u8, advice, "Xenova/clip-vit-base-patch32:hybrid") != null);
 }
 
 test "gguf clipclap selection does not mix quantized pairs" {

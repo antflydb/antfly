@@ -8028,9 +8028,11 @@ pub const DB = struct {
     fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
         if (index_manager.textIndex(index_name)) |entry| {
             const text_snapshot = entry.snapshot();
+            const term_count = textIndexTermCount(entry);
             return .{
                 .kind = .full_text,
                 .doc_count = text_snapshot.global_doc_count,
+                .term_count = term_count,
                 .updated_at_ns = platform_time.monotonicNs(),
             };
         }
@@ -8064,6 +8066,17 @@ pub const DB = struct {
             };
         }
         return null;
+    }
+
+    fn textIndexTermCount(entry: anytype) u64 {
+        const snap = entry.acquireSnapshot();
+        defer snap.release();
+        var terms: u64 = 0;
+        for (snap.segments) |*seg| {
+            const layout = seg.layoutStats(true);
+            terms +|= layout.inverted_one_hit_terms +| layout.inverted_postings_terms;
+        }
+        return terms;
     }
 
     fn saveIndexStatusSnapshots(
@@ -8490,6 +8503,7 @@ pub const DB = struct {
                     if (self.core.textIndex(cfg.name)) |entry| {
                         const text_snapshot = entry.snapshot();
                         item.doc_count = text_snapshot.global_doc_count;
+                        item.term_count = textIndexTermCount(entry);
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         term_doc_freq_cache_hits += text_snapshot.term_doc_freq_cache_hits;
                         term_doc_freq_cache_misses += text_snapshot.term_doc_freq_cache_misses;
@@ -32196,6 +32210,7 @@ test "db stats uses full text visible count when available" {
         defer types.freeDBStats(alloc, stats);
         try std.testing.expectEqual(@as(u64, 2), stats.doc_count);
         try std.testing.expectEqual(@as(u64, 2), stats.indexes[0].doc_count);
+        try std.testing.expect(stats.indexes[0].term_count > 0);
     }
 
     try db.batch(.{
@@ -32209,6 +32224,49 @@ test "db stats uses full text visible count when available" {
         try std.testing.expectEqual(@as(u64, 1), stats.doc_count);
         try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].doc_count);
     }
+}
+
+test "db schemaless full text indexes strings into _all for bare text search" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha beta\"}" },
+            .{ .key = "doc:b", .value = "{\"nested\":{\"body\":\"gamma delta\"}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var top_level = try db.search(alloc, .{
+        .index_name = "ft_v0",
+        .query = .{ .match = .{ .field = "_all", .text = "alpha" } },
+        .limit = 10,
+    });
+    defer top_level.deinit();
+    try std.testing.expectEqual(@as(u32, 1), top_level.total_hits);
+    try std.testing.expectEqualStrings("doc:a", top_level.hits[0].id);
+
+    var nested = try db.search(alloc, .{
+        .index_name = "ft_v0",
+        .query = .{ .match = .{ .field = "_all", .text = "gamma" } },
+        .limit = 10,
+    });
+    defer nested.deinit();
+    try std.testing.expectEqual(@as(u32, 1), nested.total_hits);
+    try std.testing.expectEqualStrings("doc:b", nested.hits[0].id);
 }
 
 test "db stats does not scan primary docs when full text count is available" {
@@ -35824,6 +35882,7 @@ test "db text compaction preserves ordinal filters across reopen" {
 
 test "db best effort force compact leaves text merge debt under pressure" {
     const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
@@ -35853,6 +35912,30 @@ test "db best effort force compact leaves text merge debt under pressure" {
         .ttl_cleanup = .{ .enabled = false },
     });
     defer db.close();
+
+    const schema_json =
+        \\{
+        \\  "default_type": "doc",
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "body": {
+        \\            "type": "string",
+        \\            "x-antfly-types": ["text"]
+        \\          }
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
 
     try db.addIndex(.{
         .name = "ft_v1",
