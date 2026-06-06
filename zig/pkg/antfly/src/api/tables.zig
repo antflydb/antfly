@@ -924,6 +924,9 @@ fn validateRelationalStorageModeUpdateAlloc(
     if (!runtime_schema_mod.relationalColumnCatalogsEqual(current_runtime.relational_columns, next_runtime.relational_columns)) {
         return error.InvalidSchemaUpdateRequest;
     }
+    if (!runtime_schema_mod.relationalCheckCatalogsEqual(current_runtime.checks, next_runtime.checks)) {
+        return error.InvalidSchemaUpdateRequest;
+    }
     try validateConstraintCatalogTransition(current_runtime, next_runtime);
 }
 

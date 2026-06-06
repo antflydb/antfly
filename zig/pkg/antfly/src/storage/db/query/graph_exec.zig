@@ -1469,6 +1469,8 @@ pub const CompiledPatternFilter = union(enum) {
     pub const FieldPredicate = union(enum) {
         term: []const u8,
         terms: []const []const u8,
+        array_any: std.json.Value,
+        json_contains: std.json.Value,
         match: []const u8,
         prefix: []const u8,
         wildcard: []const u8,
@@ -1489,6 +1491,8 @@ pub const CompiledPatternFilter = union(enum) {
             return switch (self) {
                 .term => |value| jsonValuesContainTerm(values, value),
                 .terms => |terms| jsonValuesContainAnyTerm(values, terms),
+                .array_any => |value| jsonValuesContainArrayAny(values, value),
+                .json_contains => |value| jsonValuesContainJsonContaining(values, value),
                 .match => |value| jsonValuesContainMatch(values, value),
                 .prefix => |value| jsonValuesContainPrefix(values, value),
                 .wildcard => |value| jsonValuesContainWildcard(values, value),
@@ -1683,6 +1687,12 @@ fn extractPatternField(filter_query: std.json.Value) ![]const u8 {
         if (filter_query.object.get("terms")) |terms| {
             break :blk try extractPatternTermsField(terms);
         }
+        if (filter_query.object.get("array_any")) |array_any| {
+            break :blk (try extractPatternFieldJsonValue(array_any)).field;
+        }
+        if (filter_query.object.get("json_contains")) |json_contains| {
+            break :blk (try extractPatternFieldJsonValue(json_contains)).field;
+        }
         if (filter_query.object.get("match")) |match| {
             break :blk try extractPatternFieldFromStringShape(match, "text");
         }
@@ -1766,6 +1776,11 @@ const PatternFieldTerms = struct {
     terms: []const []const u8,
 };
 
+const PatternFieldJsonValue = struct {
+    field: []const u8,
+    value: std.json.Value,
+};
+
 fn patternFieldOrPathValue(object: std.json.ObjectMap) ?std.json.Value {
     return object.get("field") orelse object.get("path");
 }
@@ -1821,6 +1836,19 @@ fn extractPatternTermsField(value: std.json.Value) ![]const u8 {
     const entry = it.next() orelse return error.InvalidArgument;
     if (entry.value_ptr.* != .array) return error.InvalidArgument;
     return entry.key_ptr.*;
+}
+
+fn extractPatternFieldJsonValue(value: std.json.Value) !PatternFieldJsonValue {
+    if (value != .object) return error.InvalidArgument;
+    if (patternFieldOrPathValue(value.object)) |field_value| {
+        if (field_value != .string) return error.InvalidArgument;
+        const raw_value = value.object.get("value") orelse return error.InvalidArgument;
+        return .{ .field = field_value.string, .value = raw_value };
+    }
+    if (value.object.count() != 1) return error.InvalidArgument;
+    var it = value.object.iterator();
+    const entry = it.next() orelse return error.InvalidArgument;
+    return .{ .field = entry.key_ptr.*, .value = entry.value_ptr.* };
 }
 
 fn extractPatternFuzzyField(value: std.json.Value) ![]const u8 {
@@ -1910,6 +1938,12 @@ fn compilePatternFieldPredicate(alloc: Allocator, filter_query: std.json.Value) 
     }
     if (filter_query.object.get("terms")) |terms| {
         return .{ .terms = (try extractPatternFieldTerms(alloc, terms)).terms };
+    }
+    if (filter_query.object.get("array_any")) |array_any| {
+        return .{ .array_any = (try extractPatternFieldJsonValue(array_any)).value };
+    }
+    if (filter_query.object.get("json_contains")) |json_contains| {
+        return .{ .json_contains = (try extractPatternFieldJsonValue(json_contains)).value };
     }
     if (filter_query.object.get("match")) |match| {
         return .{ .match = (try extractPatternFieldString(alloc, match, "text")).value };
@@ -2039,6 +2073,97 @@ fn jsonValuesContainAnyTerm(values: []const std.json.Value, terms: []const []con
         if (jsonValuesContainTerm(values, term)) return true;
     }
     return false;
+}
+
+fn jsonValuesContainArrayAny(values: []const std.json.Value, expected: std.json.Value) bool {
+    for (values) |value| {
+        switch (value) {
+            .array => |array| {
+                for (array.items) |item| {
+                    if (jsonValuesEqual(item, expected)) return true;
+                }
+            },
+            else => if (jsonValuesEqual(value, expected)) return true,
+        }
+    }
+    return false;
+}
+
+fn jsonValuesContainJsonContaining(values: []const std.json.Value, expected: std.json.Value) bool {
+    for (values) |value| {
+        if (jsonValueContains(value, expected)) return true;
+    }
+    return false;
+}
+
+fn jsonValueContains(container: std.json.Value, expected: std.json.Value) bool {
+    return switch (expected) {
+        .object => |expected_object| blk: {
+            if (container != .object) break :blk false;
+            for (expected_object.keys(), expected_object.values()) |key, expected_value| {
+                const actual_value = container.object.get(key) orelse break :blk false;
+                if (!jsonValueContains(actual_value, expected_value)) break :blk false;
+            }
+            break :blk true;
+        },
+        .array => |expected_array| blk: {
+            if (container != .array) break :blk false;
+            for (expected_array.items) |expected_item| {
+                var matched = false;
+                for (container.array.items) |actual_item| {
+                    if (jsonValueContains(actual_item, expected_item)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) break :blk false;
+            }
+            break :blk true;
+        },
+        else => jsonValuesEqual(container, expected),
+    };
+}
+
+fn jsonValuesEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
+    return switch (lhs) {
+        .null => rhs == .null,
+        .bool => |value| rhs == .bool and rhs.bool == value,
+        .integer => |value| switch (rhs) {
+            .integer => |other| other == value,
+            .float => |other| @as(f64, @floatFromInt(value)) == other,
+            else => false,
+        },
+        .float => |value| switch (rhs) {
+            .integer => |other| value == @as(f64, @floatFromInt(other)),
+            .float => |other| other == value,
+            else => false,
+        },
+        .number_string => |value| switch (rhs) {
+            .number_string => |other| std.mem.eql(u8, value, other),
+            .string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .string => |value| switch (rhs) {
+            .string => |other| std.mem.eql(u8, value, other),
+            .number_string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .array => |array| blk: {
+            if (rhs != .array or array.items.len != rhs.array.items.len) break :blk false;
+            for (array.items, rhs.array.items) |lhs_item, rhs_item| {
+                if (!jsonValuesEqual(lhs_item, rhs_item)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => |object| blk: {
+            if (rhs != .object or object.count() != rhs.object.count()) break :blk false;
+            for (object.keys(), object.values()) |key, lhs_value| {
+                const rhs_value = rhs.object.get(key) orelse break :blk false;
+                if (!jsonValuesEqual(lhs_value, rhs_value)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
 }
 
 fn jsonValuesContainMatch(values: []const std.json.Value, text: []const u8) bool {
@@ -2896,6 +3021,31 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     , .{});
     defer parsed_terms_with_null.deinit();
 
+    var parsed_array_any = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"array_any":{"field":"tags","value":"hot"}}
+    , .{});
+    defer parsed_array_any.deinit();
+
+    var parsed_nested_array_any = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"array_any":{"path":"items.sku","value":"sku-2"}}
+    , .{});
+    defer parsed_nested_array_any.deinit();
+
+    var parsed_array_any_miss = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"array_any":{"field":"tags","value":"cold"}}
+    , .{});
+    defer parsed_array_any_miss.deinit();
+
+    var parsed_json_contains = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"json_contains":{"field":"payload","value":{"status":"open","meta":{"priority":2},"labels":["ready"]}}}
+    , .{});
+    defer parsed_json_contains.deinit();
+
+    var parsed_json_contains_miss = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"json_contains":{"field":"payload","value":{"meta":{"priority":3}}}}
+    , .{});
+    defer parsed_json_contains_miss.deinit();
+
     var parsed_bool_with_filter = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"bool":{"must":[{"term":{"published":"true"}}],"filter":[{"term":{"tag":"mango"}}]}}
     , .{});
@@ -2907,7 +3057,7 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     defer parsed_bool_with_filter_miss.deinit();
 
     var parsed_geo_doc = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"published":true,"tag":"mango","score":5.0,"ip":"10.1.2.3","location":{"lon":-122.4194,"lat":37.7749},"meta":{"deleted_at":"2026-01-01T00:00:00Z","archived":false,"optional":null}}
+        \\{"published":true,"tag":"mango","tags":["hot","ready"],"items":[{"sku":"sku-1"},{"sku":"sku-2"}],"score":5.0,"ip":"10.1.2.3","location":{"lon":-122.4194,"lat":37.7749},"meta":{"deleted_at":"2026-01-01T00:00:00Z","archived":false,"optional":null},"payload":{"status":"open","meta":{"priority":2,"owner":"alice"},"labels":["ready","queued"]}}
     , .{});
     defer parsed_geo_doc.deinit();
 
@@ -2926,6 +3076,11 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_path_exists.value));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_path_term_bool.value));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_terms_with_null.value));
+    try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_array_any.value));
+    try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_nested_array_any.value));
+    try std.testing.expect(!(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_array_any_miss.value)));
+    try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_json_contains.value));
+    try std.testing.expect(!(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_json_contains_miss.value)));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_bool_with_filter.value));
     try std.testing.expect(!(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_bool_with_filter_miss.value)));
 
@@ -2935,6 +3090,9 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     try std.testing.expect(compiled == .bool_query);
     try std.testing.expectEqual(@as(usize, 2), compiled.bool_query.must.len);
     try std.testing.expect(try compiled.matches(alloc, "doc:b", parsed_geo_doc.value));
+
+    const compiled_contains = try compilePatternFilter(compiled_arena.allocator(), parsed_json_contains.value);
+    try std.testing.expect(try compiled_contains.matches(alloc, "doc:b", parsed_geo_doc.value));
 }
 
 test "executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents" {

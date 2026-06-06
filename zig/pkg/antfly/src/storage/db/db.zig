@@ -211,6 +211,7 @@ const foreign_key_action_default_cascade_max_depth: u32 = 64;
 const unique_constraint_integrity_progress_key_prefix = "\x00\x00__metadata__:unique_constraint_integrity_progress";
 const foreign_key_externalized_parent_check_intent_key_prefix = "\x00\x00__metadata__:txn_fk_externalized_parent_check:";
 const foreign_key_constraint_timing_override_intent_key_prefix = "\x00\x00__metadata__:txn_fk_constraint_timing:";
+const row_claim_intent_key_prefix = "\x00\x00__metadata__:txn_row_claim:";
 pub const ReplayProgress = struct {
     sequence: u64 = 0,
     target_sequence: u64 = 0,
@@ -3639,17 +3640,32 @@ pub const DB = struct {
         };
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.merge_effective_req_ns, merge_effective_req_start_ns);
 
+        var effective_predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
+        defer effective_predicates.deinit(self.alloc);
+        var owned_row_claim_predicate_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_row_claim_predicate_keys.items) |key| self.alloc.free(key);
+            owned_row_claim_predicate_keys.deinit(self.alloc);
+        }
         if (effective_req.predicates.len > 0) {
-            const predicates_start_ns = monotonicTimeNs();
-            var predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
-            defer predicates.deinit(self.alloc);
             for (effective_req.predicates) |predicate| {
-                try predicates.append(self.alloc, .{
+                try effective_predicates.append(self.alloc, .{
                     .key = predicate.key,
                     .expected_version = predicate.expected_version,
                 });
             }
-            try self.core.checkVersionPredicates(predicates.items, null);
+        }
+        try appendRowClaimPredicatesForMutationKeys(
+            self.alloc,
+            &effective_predicates,
+            &owned_row_claim_predicate_keys,
+            effective_req.writes,
+            effective_req.deletes,
+        );
+
+        if (effective_predicates.items.len > 0) {
+            const predicates_start_ns = monotonicTimeNs();
+            try self.core.checkVersionPredicates(effective_predicates.items, null);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.predicates_ns, predicates_start_ns);
         }
 
@@ -6377,6 +6393,11 @@ pub const DB = struct {
             for (owned_metadata_values.items) |value| self.alloc.free(value);
             owned_metadata_values.deinit(self.alloc);
         }
+        var owned_row_claim_predicate_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_row_claim_predicate_keys.items) |key| self.alloc.free(key);
+            owned_row_claim_predicate_keys.deinit(self.alloc);
+        }
 
         for (effective_ops.writes) |write| {
             try intents.append(self.alloc, .{
@@ -6396,6 +6417,13 @@ pub const DB = struct {
                 .expected_version = predicate.expected_version,
             });
         }
+        try appendRowClaimPredicatesForMutationKeys(
+            self.alloc,
+            &predicates,
+            &owned_row_claim_predicate_keys,
+            effective_ops.writes,
+            effective_ops.deletes,
+        );
         try self.applyForeignKeyParentDeleteActions(
             &intents,
             &owned_fk_action_keys,
@@ -6458,6 +6486,52 @@ pub const DB = struct {
         );
 
         try self.writeIntents(txn_id, intents.items, predicates.items);
+    }
+
+    pub fn claimRowsForTransaction(
+        self: *DB,
+        txn_id: types.TxnId,
+        row_keys: []const []const u8,
+        claim: types.RowClaimRequest,
+    ) !void {
+        if (claim.mode != .for_update) return error.InvalidQueryRequest;
+        if (row_keys.len == 0) return;
+
+        var owned_claim_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_claim_keys.items) |key| self.alloc.free(key);
+            owned_claim_keys.deinit(self.alloc);
+        }
+        var intents = std.ArrayListUnmanaged(transactions_mod.WriteIntent).empty;
+        defer intents.deinit(self.alloc);
+
+        for (row_keys) |row_key| {
+            if (!isUserRowMutationKey(row_key)) return error.InvalidQueryRequest;
+            const claim_key = try rowClaimIntentKeyAlloc(self.alloc, row_key);
+            var claim_key_owned = true;
+            errdefer if (claim_key_owned) self.alloc.free(claim_key);
+            try owned_claim_keys.append(self.alloc, claim_key);
+            claim_key_owned = false;
+            try intents.append(self.alloc, .{
+                .key = claim_key,
+                .value = null,
+            });
+        }
+
+        try self.writeIntents(txn_id, intents.items, &.{});
+    }
+
+    fn tryClaimRowForTransaction(
+        self: *DB,
+        txn_id: types.TxnId,
+        row_key: []const u8,
+        claim: types.RowClaimRequest,
+    ) !bool {
+        self.claimRowsForTransaction(txn_id, &.{row_key}, claim) catch |err| switch (err) {
+            transactions_mod.TxnError.IntentConflict => return false,
+            else => return err,
+        };
+        return true;
     }
 
     fn appendForeignKeyActionScheduleIntents(
@@ -7276,10 +7350,15 @@ pub const DB = struct {
                 if (metadata_mutations.len > 0) self.alloc.free(metadata_mutations);
             }
             for (metadata_mutations) |mutation| {
-                if (!isForeignKeyActionScheduleMetadataKey(mutation.key)) continue;
+                if (!isRowClaimIntentMetadataKey(mutation.key) and !isForeignKeyActionScheduleMetadataKey(mutation.key)) continue;
                 const skip_key = try self.alloc.dupe(u8, mutation.key);
                 var skip_key_owned = true;
                 errdefer if (skip_key_owned) self.alloc.free(skip_key);
+                if (isRowClaimIntentMetadataKey(mutation.key)) {
+                    try relational_skip_intent_keys.append(self.alloc, skip_key);
+                    skip_key_owned = false;
+                    continue;
+                }
                 try relational_skip_intent_keys.append(self.alloc, skip_key);
                 skip_key_owned = false;
 
@@ -14210,6 +14289,9 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
+        if (req.row_claim != null) {
+            return try self.searchWithRowClaim(alloc, req, exec_ctx);
+        }
         const bench_profile = benchQueryProfileEnabled();
         const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var generation_ns: u64 = 0;
@@ -14247,6 +14329,62 @@ pub const DB = struct {
             );
         }
         return result;
+    }
+
+    fn searchWithRowClaim(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        exec_ctx: types.ExecutionContext,
+    ) anyerror!types.SearchResult {
+        const claim = req.row_claim orelse return error.InvalidQueryRequest;
+        const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
+        if (claim.mode != .for_update) return error.InvalidQueryRequest;
+        if (req.count_only) return error.UnsupportedQueryRequest;
+        if (req.return_mode != .parent) return error.UnsupportedQueryRequest;
+        if (req.graph_queries.len > 0) return error.UnsupportedQueryRequest;
+
+        var search_req = req;
+        search_req.row_claim = null;
+        var result = try self.searchWithExecutionContext(alloc, search_req, exec_ctx);
+        errdefer result.deinit();
+        try self.applyRowClaimToSearchResult(&result, txn_id, claim);
+        return result;
+    }
+
+    fn applyRowClaimToSearchResult(
+        self: *DB,
+        result: *types.SearchResult,
+        txn_id: types.TxnId,
+        claim: types.RowClaimRequest,
+    ) !void {
+        if (result.graph_results.len > 0) return error.UnsupportedQueryRequest;
+        if (!claim.skip_locked) {
+            var row_keys = std.ArrayListUnmanaged([]const u8).empty;
+            defer row_keys.deinit(self.alloc);
+            for (result.hits) |hit| try row_keys.append(self.alloc, hit.id);
+            try self.claimRowsForTransaction(txn_id, row_keys.items, claim);
+            return;
+        }
+
+        var kept = std.ArrayListUnmanaged(types.SearchHit).empty;
+        errdefer {
+            for (kept.items) |*hit| hit.deinit(result.alloc);
+            kept.deinit(result.alloc);
+        }
+        for (result.hits) |hit| {
+            if (try self.tryClaimRowForTransaction(txn_id, hit.id, claim)) {
+                try kept.append(result.alloc, try hit.clone(result.alloc));
+            }
+        }
+        const old_hits = result.hits;
+        result.hits = &.{};
+        result.total_hits = 0;
+        for (old_hits) |*hit| hit.deinit(result.alloc);
+        if (old_hits.len > 0) result.alloc.free(old_hits);
+        result.hits = try kept.toOwnedSlice(result.alloc);
+        result.total_hits = @intCast(result.hits.len);
+        result.total_hits_relation = .exact;
     }
 
     fn searchLocked(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
@@ -17214,6 +17352,51 @@ fn isMetadataKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "\x00\x00__metadata__:") or
         isSplitMetadataKey(key) or
         internal_keys.isTtlKey(key);
+}
+
+fn isRowClaimIntentMetadataKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, row_claim_intent_key_prefix);
+}
+
+fn isUserRowMutationKey(key: []const u8) bool {
+    return !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key);
+}
+
+fn rowClaimIntentKeyAlloc(alloc: Allocator, row_key: []const u8) ![]u8 {
+    return try std.mem.concat(alloc, u8, &.{ row_claim_intent_key_prefix, row_key });
+}
+
+fn appendRowClaimPredicateForKey(
+    alloc: Allocator,
+    predicates: *std.ArrayListUnmanaged(transactions_mod.VersionPredicate),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    row_key: []const u8,
+) !void {
+    if (!isUserRowMutationKey(row_key)) return;
+    const claim_key = try rowClaimIntentKeyAlloc(alloc, row_key);
+    var claim_key_owned = true;
+    errdefer if (claim_key_owned) alloc.free(claim_key);
+    try owned_keys.append(alloc, claim_key);
+    claim_key_owned = false;
+    try predicates.append(alloc, .{
+        .key = claim_key,
+        .expected_version = 0,
+    });
+}
+
+fn appendRowClaimPredicatesForMutationKeys(
+    alloc: Allocator,
+    predicates: *std.ArrayListUnmanaged(transactions_mod.VersionPredicate),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    writes: anytype,
+    deletes: []const []const u8,
+) !void {
+    for (writes) |write| {
+        try appendRowClaimPredicateForKey(alloc, predicates, owned_keys, write.key);
+    }
+    for (deletes) |key| {
+        try appendRowClaimPredicateForKey(alloc, predicates, owned_keys, key);
+    }
 }
 
 fn isForeignKeyActionScheduleMetadataKey(key: []const u8) bool {
@@ -49114,6 +49297,94 @@ test "db transaction write request detects concurrent intent conflicts" {
 
     try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(txn2, .{
         .writes = &.{.{ .key = "doc:shared", .value = "{\"title\":\"from2\"}" }},
+    }));
+}
+
+test "db row claims block transactional and direct mutations until resolution" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"base\"}" }},
+        .timestamp_ns = 1_000,
+    });
+
+    const claim_txn = try db.beginTransaction(2_000);
+    try db.claimRowsForTransaction(claim_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:claim",
+        .txn_id = claim_txn,
+    });
+
+    const writer_txn = try db.beginTransaction(2_001);
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(writer_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"blocked\"}" }},
+    }));
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.batch(.{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"direct\"}" }},
+        .timestamp_ns = 2_002,
+    }));
+
+    try db.commitTransaction(claim_txn, 2_010);
+    try db.writeTransaction(writer_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"updated\"}" }},
+    });
+    try db.commitTransaction(writer_txn, 2_011);
+
+    const raw = (try db.get(alloc, "doc:claim")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"updated\"}", raw);
+}
+
+test "db row claim search skip locked returns claimed subset" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:locked", .value = "{\"title\":\"locked\"}" },
+            .{ .key = "doc:free", .value = "{\"title\":\"free\"}" },
+        },
+        .timestamp_ns = 1_000,
+    });
+
+    const locker_txn = try db.beginTransaction(2_000);
+    try db.claimRowsForTransaction(locker_txn, &.{"doc:locked"}, .{
+        .mode = .for_update,
+        .owner_id = "session:locker",
+        .txn_id = locker_txn,
+    });
+
+    const search_txn = try db.beginTransaction(2_001);
+    var claimed = try db.search(alloc, .{
+        .row_claim = .{
+            .mode = .for_update,
+            .skip_locked = true,
+            .owner_id = "session:search",
+            .txn_id = search_txn,
+        },
+        .limit = 10,
+    });
+    defer claimed.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), claimed.total_hits);
+    try std.testing.expectEqualStrings("doc:free", claimed.hits[0].id);
+
+    const blocked_txn = try db.beginTransaction(2_002);
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(blocked_txn, .{
+        .writes = &.{.{ .key = "doc:free", .value = "{\"title\":\"blocked\"}" }},
     }));
 }
 

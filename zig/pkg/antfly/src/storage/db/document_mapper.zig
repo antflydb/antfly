@@ -1567,8 +1567,10 @@ pub fn buildRelationalRowValueFromValueAlloc(
             return error.InvalidBatchRequest;
         }
         if (column.field_type == .array and found != .array) {
-            if (column.nullable) continue;
             return error.InvalidBatchRequest;
+        }
+        if (column.field_type == .array) {
+            try validateRelationalArrayColumnValue(column, found);
         }
         const value = try coerceRelationalStorageValue(alloc, value_type, found) orelse {
             if (column.nullable) continue;
@@ -1582,7 +1584,7 @@ pub fn buildRelationalRowValueFromValueAlloc(
         try cells.append(alloc, .{
             .path = column.path,
             .value_type = value_type,
-            .is_json = column.field_type == .json,
+            .is_json = column.field_type == .json or column.field_type == .array,
             .value = value,
         });
     }
@@ -1642,6 +1644,27 @@ fn relationalStorageValueType(field_type: runtime_schema.AntflyType) typed_dv.Va
         .boolean => .bool_val,
         .geopoint => .geo_point,
         else => .bytes_val,
+    };
+}
+
+fn validateRelationalArrayColumnValue(column: runtime_schema.RelationalColumn, json_value: std.json.Value) !void {
+    const item_type = column.array_item_type orelse return;
+    if (json_value != .array) return error.InvalidBatchRequest;
+    for (json_value.array.items) |item| {
+        if (!relationalArrayItemValueMatches(item_type, item)) return error.InvalidBatchRequest;
+    }
+}
+
+fn relationalArrayItemValueMatches(item_type: runtime_schema.AntflyType, item: std.json.Value) bool {
+    return switch (item_type) {
+        .text, .keyword, .link, .html, .search_as_you_type, .blob, .geoshape => item == .string,
+        .numeric => jsonNumberValue(item) != null,
+        .datetime => coerceRelationalTypedValue(.u64_val, item) != null,
+        .boolean => item == .bool,
+        .geopoint => coerceRelationalTypedValue(.geo_point, item) != null,
+        .json => true,
+        .array => item == .array,
+        .embedding => false,
     };
 }
 
@@ -3733,7 +3756,7 @@ test "relational KV row value round-trips a document through project + reconstru
         .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
         .{ .name = "note", .path = "note", .field_type = .keyword, .nullable = true },
         .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true },
-        .{ .name = "tags", .path = "tags", .field_type = .array, .nullable = true },
+        .{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .keyword, .nullable = true },
     };
 
     // "note" absent -> omitted; payload is a structured json column; tags is a
@@ -3773,6 +3796,10 @@ test "relational KV row value round-trips a document through project + reconstru
     try std.testing.expectError(
         error.InvalidBatchRequest,
         buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\",\"amount\":12.5,\"tags\":\"hot\"}", &columns),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\",\"amount\":12.5,\"tags\":[\"hot\",1]}", &columns),
     );
 }
 

@@ -1104,6 +1104,7 @@ pub const RowClaimRequest = struct {
     skip_locked: bool = false,
     lease_ms: u64 = 30_000,
     owner_id: []const u8 = "",
+    txn_id: ?TxnId = null,
 };
 
 pub const NamedGraphQuery = struct {

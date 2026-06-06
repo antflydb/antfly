@@ -38,6 +38,7 @@ pub const TableSchema = struct {
     primary_key: ?PrimaryKey = null,
     foreign_keys: []ForeignKey = &.{},
     unique_constraints: []UniqueConstraint = &.{},
+    checks: []RelationalCheck = &.{},
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
         alloc.free(self.default_type);
@@ -51,6 +52,8 @@ pub const TableSchema = struct {
         if (self.foreign_keys.len > 0) alloc.free(self.foreign_keys);
         for (self.unique_constraints) |*constraint| constraint.deinit(alloc);
         if (self.unique_constraints.len > 0) alloc.free(self.unique_constraints);
+        for (self.checks) |*check| check.deinit(alloc);
+        if (self.checks.len > 0) alloc.free(self.checks);
         self.* = undefined;
     }
 };
@@ -264,6 +267,51 @@ pub const UniquePredicate = struct {
     value_json: ?[]const u8 = null,
 };
 
+pub const RelationalCheckOp = enum {
+    is_null,
+    is_not_null,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+};
+
+pub const RelationalCheck = struct {
+    name: []const u8,
+    field: []const u8,
+    op: RelationalCheckOp,
+    value_json: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.field);
+        if (self.value_json) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalGeneratedOp = enum {
+    lower,
+    concat,
+};
+
+pub const RelationalGeneratedValue = struct {
+    op: RelationalGeneratedOp,
+    field: ?[]const u8 = null,
+    fields: [][]const u8 = &.{},
+    separator: []const u8 = "",
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.field) |field| alloc.free(field);
+        for (self.fields) |field| alloc.free(field);
+        if (self.fields.len > 0) alloc.free(self.fields);
+        alloc.free(self.separator);
+        self.* = undefined;
+    }
+};
+
 pub const DocumentSchema = struct {
     name: []const u8,
     min_properties: ?u64 = null,
@@ -403,6 +451,8 @@ pub const DocumentProperty = struct {
     unevaluated_items_schema: ?*DocumentProperty = null,
     embedded_schema: ?*DocumentProperty = null,
     embedded_dynamic_templates: []DynamicTemplate = &.{},
+    default_value_json: ?[]const u8 = null,
+    generated: ?RelationalGeneratedValue = null,
 
     pub fn deinit(self: *DocumentProperty, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -490,6 +540,8 @@ pub const DocumentProperty = struct {
         }
         for (self.embedded_dynamic_templates) |*dynamic_template| dynamic_template.deinit(alloc);
         if (self.embedded_dynamic_templates.len > 0) alloc.free(self.embedded_dynamic_templates);
+        if (self.default_value_json) |value| alloc.free(value);
+        if (self.generated) |*generated| generated.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -865,6 +917,7 @@ fn validateSchemaValue(value: std.json.Value) !void {
     if (root.get("primary_key")) |primary_key| if (primary_key != .null) try validatePrimaryKey(primary_key);
     if (root.get("foreign_keys")) |foreign_keys| if (foreign_keys != .null) try validateForeignKeys(foreign_keys);
     if (root.get("unique_constraints")) |constraints| if (constraints != .null) try validateUniqueConstraints(constraints);
+    if (root.get("checks")) |checks| if (checks != .null) try validateRelationalChecksValue(checks);
 }
 
 fn validatePrimaryKey(value: std.json.Value) !void {
@@ -1059,6 +1112,43 @@ fn validateUniquePredicateAtom(value: std.json.Value) !void {
     if (!needs_value and !forbids_value) return error.InvalidSchemaUpdateRequest;
     if (needs_value and object.get("value") == null) return error.InvalidSchemaUpdateRequest;
     if (forbids_value and object.get("value") != null) return error.InvalidSchemaUpdateRequest;
+}
+
+fn validateRelationalChecksValue(value: std.json.Value) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    for (array.items) |item| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "name") and
+                !std.mem.eql(u8, entry.key_ptr.*, "field") and
+                !std.mem.eql(u8, entry.key_ptr.*, "op") and
+                !std.mem.eql(u8, entry.key_ptr.*, "value"))
+            {
+                return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        const name = object.get("name") orelse return error.InvalidSchemaUpdateRequest;
+        const field = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
+        const op = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
+        if (name != .string or name.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (field != .string or field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (op != .string) return error.InvalidSchemaUpdateRequest;
+        const needs_value =
+            enumTokenEql(op.string, "eq") or enumTokenEql(op.string, "ne") or
+            enumTokenEql(op.string, "gt") or enumTokenEql(op.string, "gte") or
+            enumTokenEql(op.string, "lt") or enumTokenEql(op.string, "lte");
+        const forbids_value = enumTokenEql(op.string, "is_null") or enumTokenEql(op.string, "is_not_null");
+        if (!needs_value and !forbids_value) return error.InvalidSchemaUpdateRequest;
+        if (needs_value and object.get("value") == null) return error.InvalidSchemaUpdateRequest;
+        if (forbids_value and object.get("value") != null) return error.InvalidSchemaUpdateRequest;
+    }
 }
 
 fn validateDocumentSchemas(value: std.json.Value) !void {
@@ -1854,6 +1944,9 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("unique_constraints")) |constraints| {
         if (constraints != .null) parsed.unique_constraints = try parseUniqueConstraints(alloc, constraints);
     }
+    if (root.get("checks")) |checks| {
+        if (checks != .null) parsed.checks = try parseRelationalChecks(alloc, checks);
+    }
     if (parsed.storage_mode == .relational) {
         if (root.get("enforce_types")) |enforce_types| {
             if (enforce_types != .null and !enforce_types.bool) return error.InvalidSchemaUpdateRequest;
@@ -1879,7 +1972,7 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
 
 fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (schema.storage_mode != .relational) {
-        if (schema.primary_key != null or schema.foreign_keys.len != 0 or schema.unique_constraints.len != 0) return error.InvalidSchemaUpdateRequest;
+        if (schema.primary_key != null or schema.foreign_keys.len != 0 or schema.unique_constraints.len != 0 or schema.checks.len != 0) return error.InvalidSchemaUpdateRequest;
         return;
     }
     if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;
@@ -1895,6 +1988,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
 
         for (document_schema.properties) |property| {
             try validateRelationalEmbeddedJsonProperty(property);
+            try validateRelationalGeneratedProperty(schema, document_schema, property);
             if (isRelationalStorageProperty(property)) relational_columns += 1;
         }
     }
@@ -1902,6 +1996,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (relational_columns == 0) return error.InvalidSchemaUpdateRequest;
     try validateRelationalPrimaryKey(schema);
     try validateRelationalUniqueConstraints(schema);
+    try validateRelationalChecks(schema);
     try validateRelationalForeignKeys(schema);
 }
 
@@ -2046,6 +2141,63 @@ fn validateRelationalUniquePredicate(schema: TableSchema, predicate: UniquePredi
         .is_null, .is_not_null => if (predicate.value_json != null) return error.InvalidSchemaUpdateRequest,
         .eq, .ne => if (predicate.value_json == null) return error.InvalidSchemaUpdateRequest,
     }
+}
+
+fn validateRelationalChecks(schema: TableSchema) !void {
+    for (schema.checks, 0..) |check, i| {
+        const property = findDocumentProperty(schema.document_schemas[0].properties, check.field) orelse return error.InvalidSchemaUpdateRequest;
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        switch (check.op) {
+            .is_null, .is_not_null => if (check.value_json != null) return error.InvalidSchemaUpdateRequest,
+            .eq, .ne => if (check.value_json == null) return error.InvalidSchemaUpdateRequest,
+            .gt, .gte, .lt, .lte => {
+                if (check.value_json == null) return error.InvalidSchemaUpdateRequest;
+                const field_type = property.field_type orelse return error.InvalidSchemaUpdateRequest;
+                if (!std.mem.eql(u8, field_type, "numeric") and
+                    !std.mem.eql(u8, field_type, "number") and
+                    !std.mem.eql(u8, field_type, "integer") and
+                    !std.mem.eql(u8, field_type, "datetime"))
+                {
+                    return error.InvalidSchemaUpdateRequest;
+                }
+            },
+        }
+        for (schema.checks[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, check.name)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn validateRelationalGeneratedProperty(schema: TableSchema, document_schema: DocumentSchema, property: DocumentProperty) !void {
+    const generated = property.generated orelse return;
+    if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+    if (requiredFieldsContain(document_schema.required_fields, property.name)) return error.InvalidSchemaUpdateRequest;
+    switch (generated.op) {
+        .lower => {
+            const source_name = generated.field orelse return error.InvalidSchemaUpdateRequest;
+            if (std.mem.eql(u8, source_name, property.name)) return error.InvalidSchemaUpdateRequest;
+            const source = findDocumentProperty(schema.document_schemas[0].properties, source_name) orelse return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalTextLikeProperty(source)) return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalTextLikeProperty(property)) return error.InvalidSchemaUpdateRequest;
+        },
+        .concat => {
+            if (generated.fields.len == 0) return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalTextLikeProperty(property)) return error.InvalidSchemaUpdateRequest;
+            for (generated.fields) |source_name| {
+                if (std.mem.eql(u8, source_name, property.name)) return error.InvalidSchemaUpdateRequest;
+                const source = findDocumentProperty(schema.document_schemas[0].properties, source_name) orelse return error.InvalidSchemaUpdateRequest;
+                if (!isRelationalStorageProperty(source)) return error.InvalidSchemaUpdateRequest;
+            }
+        },
+    }
+}
+
+fn isRelationalTextLikeProperty(property: DocumentProperty) bool {
+    const field_type = property.field_type orelse return false;
+    return std.mem.eql(u8, field_type, "keyword") or
+        std.mem.eql(u8, field_type, "link") or
+        std.mem.eql(u8, field_type, "string") or
+        std.mem.eql(u8, field_type, "text");
 }
 
 fn uniqueConstraintsEquivalent(a: UniqueConstraint, b: UniqueConstraint) bool {
@@ -2446,6 +2598,19 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         for (include_in_all_fields) |field_name| alloc.free(field_name);
         if (include_in_all_fields.len > 0) alloc.free(include_in_all_fields);
     }
+    const default_value_json = if (object.get("default")) |default_value|
+        try stringifyJsonValue(alloc, default_value)
+    else
+        null;
+    errdefer if (default_value_json) |owned| alloc.free(owned);
+    const generated = if (object.get("generated")) |generated_value| blk: {
+        if (generated_value == .null) break :blk null;
+        break :blk try parseRelationalGeneratedValue(alloc, generated_value);
+    } else null;
+    errdefer if (generated) |owned_generated| {
+        var mutable_generated = owned_generated;
+        mutable_generated.deinit(alloc);
+    };
     const embedded_schema = if (object.get("schema")) |schema_value| blk: {
         if (schema_value == .null) break :blk null;
         if (schema_value != .object) return error.InvalidSchemaUpdateRequest;
@@ -2742,6 +2907,8 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .unevaluated_items_schema = unevaluated_items_schema,
         .embedded_schema = embedded_schema,
         .embedded_dynamic_templates = embedded_dynamic_templates,
+        .default_value_json = default_value_json,
+        .generated = generated,
     };
     if (property.dynamic_infer_types and (!(property.additional_properties_allowed orelse false) or property.additional_properties_schema != null)) {
         return error.InvalidSchemaUpdateRequest;
@@ -3187,6 +3354,73 @@ fn parsePrimaryKey(alloc: std.mem.Allocator, value: std.json.Value) !PrimaryKey 
     return .{
         .columns = try parseStringArrayAlloc(alloc, object.get("columns").?),
     };
+}
+
+fn parseRelationalGeneratedValue(alloc: std.mem.Allocator, value: std.json.Value) !RelationalGeneratedValue {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const op_value = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
+    if (op_value != .string) return error.InvalidSchemaUpdateRequest;
+    const op_text = op_value.string;
+    if (enumTokenEql(op_text, "lower")) {
+        const field_value = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
+        if (field_value != .string or field_value.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        return .{
+            .op = .lower,
+            .field = try alloc.dupe(u8, field_value.string),
+            .separator = try alloc.dupe(u8, ""),
+        };
+    }
+    if (enumTokenEql(op_text, "concat")) {
+        const fields_value = object.get("fields") orelse return error.InvalidSchemaUpdateRequest;
+        if (fields_value != .array or fields_value.array.items.len == 0) return error.InvalidSchemaUpdateRequest;
+        const separator = if (object.get("separator")) |separator_value| blk: {
+            if (separator_value != .string) return error.InvalidSchemaUpdateRequest;
+            break :blk separator_value.string;
+        } else "";
+        return .{
+            .op = .concat,
+            .fields = try parseStringArrayAlloc(alloc, fields_value),
+            .separator = try alloc.dupe(u8, separator),
+        };
+    }
+    return error.InvalidSchemaUpdateRequest;
+}
+
+fn parseRelationalChecks(alloc: std.mem.Allocator, value: std.json.Value) ![]RelationalCheck {
+    const array = value.array;
+    if (array.items.len == 0) return &.{};
+    const out = try alloc.alloc(RelationalCheck, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*check| check.deinit(alloc);
+        alloc.free(out);
+    }
+    for (array.items) |item| {
+        const object = item.object;
+        out[initialized] = .{
+            .name = try alloc.dupe(u8, object.get("name").?.string),
+            .field = try alloc.dupe(u8, object.get("field").?.string),
+            .op = try parseRelationalCheckOp(object.get("op").?.string),
+            .value_json = if (object.get("value")) |check_value| try stringifyJsonValue(alloc, check_value) else null,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseRelationalCheckOp(op_text: []const u8) !RelationalCheckOp {
+    if (enumTokenEql(op_text, "is_null")) return .is_null;
+    if (enumTokenEql(op_text, "is_not_null")) return .is_not_null;
+    if (enumTokenEql(op_text, "eq")) return .eq;
+    if (enumTokenEql(op_text, "ne")) return .ne;
+    if (enumTokenEql(op_text, "gt")) return .gt;
+    if (enumTokenEql(op_text, "gte")) return .gte;
+    if (enumTokenEql(op_text, "lt")) return .lt;
+    if (enumTokenEql(op_text, "lte")) return .lte;
+    return error.InvalidSchemaUpdateRequest;
 }
 
 fn parseUniqueConstraints(alloc: std.mem.Allocator, value: std.json.Value) ![]UniqueConstraint {

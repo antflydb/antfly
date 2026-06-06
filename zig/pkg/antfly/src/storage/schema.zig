@@ -132,8 +132,50 @@ pub const RelationalColumn = struct {
     name: []const u8,
     path: []const u8,
     field_type: AntflyType = .text,
+    array_item_type: ?AntflyType = null,
     nullable: bool = true,
     indexed: bool = true,
+    default_value: ?RelationalDefaultValue = null,
+    generated: ?RelationalGeneratedValue = null,
+};
+
+pub const RelationalDefaultKind = enum(u8) {
+    literal = 0,
+};
+
+pub const RelationalDefaultValue = struct {
+    kind: RelationalDefaultKind = .literal,
+    value_json: []const u8,
+};
+
+pub const RelationalGeneratedOp = enum(u8) {
+    lower = 0,
+    concat = 1,
+};
+
+pub const RelationalGeneratedValue = struct {
+    op: RelationalGeneratedOp,
+    field: ?[]const u8 = null,
+    fields: []const []const u8 = &.{},
+    separator: []const u8 = "",
+};
+
+pub const RelationalCheckOp = enum(u8) {
+    is_null = 0,
+    is_not_null = 1,
+    eq = 2,
+    ne = 3,
+    gt = 4,
+    gte = 5,
+    lt = 6,
+    lte = 7,
+};
+
+pub const RelationalCheck = struct {
+    name: []const u8,
+    field: []const u8,
+    op: RelationalCheckOp,
+    value_json: ?[]const u8 = null,
 };
 
 pub const ForeignKeyAction = enum(u8) {
@@ -213,8 +255,37 @@ pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []
         if (!std.mem.eql(u8, a.name, b.name)) return false;
         if (!std.mem.eql(u8, a.path, b.path)) return false;
         if (a.field_type != b.field_type) return false;
+        if (a.array_item_type != b.array_item_type) return false;
         if (a.nullable != b.nullable) return false;
         if (a.indexed != b.indexed) return false;
+        if (!relationalDefaultsEqual(a.default_value, b.default_value)) return false;
+        if (!relationalGeneratedValuesEqual(a.generated, b.generated)) return false;
+    }
+    return true;
+}
+
+fn relationalDefaultsEqual(a: ?RelationalDefaultValue, b: ?RelationalDefaultValue) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.?.kind == b.?.kind and std.mem.eql(u8, a.?.value_json, b.?.value_json);
+}
+
+fn relationalGeneratedValuesEqual(a: ?RelationalGeneratedValue, b: ?RelationalGeneratedValue) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    if (a.?.op != b.?.op) return false;
+    if (!optionalStringsEqual(a.?.field, b.?.field)) return false;
+    if (!stringSlicesEqual(a.?.fields, b.?.fields)) return false;
+    return std.mem.eql(u8, a.?.separator, b.?.separator);
+}
+
+pub fn relationalCheckCatalogsEqual(current: []const RelationalCheck, next: []const RelationalCheck) bool {
+    if (current.len != next.len) return false;
+    for (current, next) |a, b| {
+        if (!std.mem.eql(u8, a.name, b.name)) return false;
+        if (!std.mem.eql(u8, a.field, b.field)) return false;
+        if (a.op != b.op) return false;
+        if (!optionalStringsEqual(a.value_json, b.value_json)) return false;
     }
     return true;
 }
@@ -299,6 +370,7 @@ pub const TableSchema = struct {
     primary_key: ?PrimaryKey = null,
     foreign_keys: []const ForeignKey = &.{},
     unique_constraints: []const UniqueConstraint = &.{},
+    checks: []const RelationalCheck = &.{},
 };
 
 // ============================================================================
@@ -319,7 +391,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 19); // format version
+    try appendU32(&buf, alloc, 21); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -378,8 +450,31 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try appendStr(&buf, alloc, column.name);
         try appendStr(&buf, alloc, column.path);
         try buf.append(alloc, @intFromEnum(column.field_type));
+        if (column.array_item_type) |item_type| {
+            try buf.append(alloc, 1);
+            try buf.append(alloc, @intFromEnum(item_type));
+        } else {
+            try buf.append(alloc, 0);
+        }
         try buf.append(alloc, if (column.nullable) 1 else 0);
         try buf.append(alloc, if (column.indexed) 1 else 0);
+        if (column.default_value) |default_value| {
+            try buf.append(alloc, 1);
+            try buf.append(alloc, @intFromEnum(default_value.kind));
+            try appendStr(&buf, alloc, default_value.value_json);
+        } else {
+            try buf.append(alloc, 0);
+        }
+        if (column.generated) |generated| {
+            try buf.append(alloc, 1);
+            try buf.append(alloc, @intFromEnum(generated.op));
+            try appendOptStr(&buf, alloc, generated.field);
+            try appendU32(&buf, alloc, @intCast(generated.fields.len));
+            for (generated.fields) |field| try appendStr(&buf, alloc, field);
+            try appendStr(&buf, alloc, generated.separator);
+        } else {
+            try buf.append(alloc, 0);
+        }
     }
 
     // Foreign-key catalog (format version 11+).
@@ -427,6 +522,15 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, 0);
     }
 
+    // Relational check catalog (format version 20+).
+    try appendU32(&buf, alloc, @intCast(schema.checks.len));
+    for (schema.checks) |check| {
+        try appendStr(&buf, alloc, check.name);
+        try appendStr(&buf, alloc, check.field);
+        try buf.append(alloc, @intFromEnum(check.op));
+        try appendOptStr(&buf, alloc, check.value_json);
+    }
+
     const result = try alloc.dupe(u8, buf.items);
     buf.deinit(alloc);
     return result;
@@ -440,7 +544,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 19) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 21) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -711,6 +815,15 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer alloc.free(path);
             const field_type: AntflyType = @enumFromInt(data[pos]);
             pos += 1;
+            const array_item_type: ?AntflyType = if (fmt_version >= 21 and data[pos] == 1) item_blk: {
+                pos += 1;
+                const item_type: AntflyType = @enumFromInt(data[pos]);
+                pos += 1;
+                break :item_blk item_type;
+            } else item_blk: {
+                if (fmt_version >= 21) pos += 1;
+                break :item_blk null;
+            };
             const nullable = data[pos] == 1;
             pos += 1;
             const indexed = if (fmt_version >= 10) indexed_blk: {
@@ -718,7 +831,34 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 pos += 1;
                 break :indexed_blk value;
             } else true;
-            column.* = .{ .name = name, .path = path, .field_type = field_type, .nullable = nullable, .indexed = indexed };
+            const default_value: ?RelationalDefaultValue = if (fmt_version >= 20 and data[pos] == 1) default_blk: {
+                pos += 1;
+                const kind: RelationalDefaultKind = @enumFromInt(data[pos]);
+                pos += 1;
+                const value_json = try alloc.dupe(u8, readStr(data, &pos));
+                break :default_blk .{ .kind = kind, .value_json = value_json };
+            } else default_blk: {
+                if (fmt_version >= 20) pos += 1;
+                break :default_blk null;
+            };
+            errdefer if (default_value) |value| alloc.free(value.value_json);
+            const generated: ?RelationalGeneratedValue = if (fmt_version >= 20 and data[pos] == 1) generated_blk: {
+                pos += 1;
+                const op: RelationalGeneratedOp = @enumFromInt(data[pos]);
+                pos += 1;
+                const field = try readOptStrAlloc(alloc, data, &pos);
+                errdefer if (field) |value| alloc.free(value);
+                const fields = try readStringSliceAlloc(alloc, data, &pos);
+                errdefer freeStringSlice(alloc, fields);
+                const separator = try alloc.dupe(u8, readStr(data, &pos));
+                errdefer alloc.free(separator);
+                break :generated_blk .{ .op = op, .field = field, .fields = fields, .separator = separator };
+            } else generated_blk: {
+                if (fmt_version >= 20) pos += 1;
+                break :generated_blk null;
+            };
+            errdefer if (generated) |value| freeRelationalGeneratedValue(alloc, value);
+            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .indexed = indexed, .default_value = default_value, .generated = generated };
             columns_initialized += 1;
         }
         break :blk columns;
@@ -826,6 +966,30 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
     };
     errdefer if (primary_key) |key| freePrimaryKey(alloc, key);
 
+    const checks: []RelationalCheck = if (fmt_version >= 20) blk: {
+        const check_count = readU32(data, &pos);
+        const checks = try alloc.alloc(RelationalCheck, check_count);
+        var checks_initialized: usize = 0;
+        errdefer {
+            for (checks[0..checks_initialized]) |check| freeRelationalCheck(alloc, check);
+            alloc.free(checks);
+        }
+        for (checks) |*check| {
+            const name = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(name);
+            const field = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(field);
+            const op: RelationalCheckOp = @enumFromInt(data[pos]);
+            pos += 1;
+            const value_json = try readOptStrAlloc(alloc, data, &pos);
+            errdefer if (value_json) |value| alloc.free(value);
+            check.* = .{ .name = name, .field = field, .op = op, .value_json = value_json };
+            checks_initialized += 1;
+        }
+        break :blk checks;
+    } else &.{};
+    errdefer freeRelationalChecksSlice(alloc, checks);
+
     return .{
         .version = version,
         .default_type = default_type,
@@ -839,6 +1003,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .primary_key = primary_key,
         .foreign_keys = foreign_keys,
         .unique_constraints = unique_constraints,
+        .checks = checks,
     };
 }
 
@@ -861,14 +1026,23 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
     if (s.primary_key) |primary_key| freePrimaryKey(alloc, primary_key);
     freeForeignKeysSlice(alloc, s.foreign_keys);
     freeUniqueConstraintsSlice(alloc, s.unique_constraints);
+    freeRelationalChecksSlice(alloc, s.checks);
 }
 
 fn freeRelationalColumnsSlice(alloc: Allocator, columns: []const RelationalColumn) void {
     for (columns) |column| {
         alloc.free(column.name);
         alloc.free(column.path);
+        if (column.default_value) |value| alloc.free(value.value_json);
+        if (column.generated) |value| freeRelationalGeneratedValue(alloc, value);
     }
     if (columns.len > 0) alloc.free(columns);
+}
+
+fn freeRelationalGeneratedValue(alloc: Allocator, generated: RelationalGeneratedValue) void {
+    if (generated.field) |field| alloc.free(field);
+    freeStringSlice(alloc, generated.fields);
+    alloc.free(generated.separator);
 }
 
 fn freeForeignKeysSlice(alloc: Allocator, foreign_keys: []const ForeignKey) void {
@@ -906,6 +1080,17 @@ fn freeUniquePredicateSlice(alloc: Allocator, predicates: []const UniquePredicat
         if (predicate.value_json) |value| alloc.free(value);
     }
     if (predicates.len > 0) alloc.free(predicates);
+}
+
+fn freeRelationalChecksSlice(alloc: Allocator, checks: []const RelationalCheck) void {
+    for (checks) |check| freeRelationalCheck(alloc, check);
+    if (checks.len > 0) alloc.free(checks);
+}
+
+fn freeRelationalCheck(alloc: Allocator, check: RelationalCheck) void {
+    alloc.free(check.name);
+    alloc.free(check.field);
+    if (check.value_json) |value| alloc.free(value);
 }
 
 fn freePrimaryKey(alloc: Allocator, primary_key: PrimaryKey) void {
@@ -1527,10 +1712,11 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
         .relational_columns = &.{
             .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
             .{ .name = "tenant_id", .path = "tenant_id", .field_type = .keyword, .nullable = false },
-            .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+            .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false, .default_value = .{ .value_json = "1" } },
             .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true },
             .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true, .indexed = false },
-            .{ .name = "tags", .path = "tags", .field_type = .array, .nullable = true },
+            .{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .keyword, .nullable = true },
+            .{ .name = "tenant_key", .path = "tenant_key", .field_type = .keyword, .nullable = true, .generated = .{ .op = .lower, .field = "tenant_id" } },
         },
         .primary_key = .{ .columns = &.{ "tenant_id", "id" } },
         .foreign_keys = &.{
@@ -1576,6 +1762,9 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                 },
             },
         },
+        .checks = &.{
+            .{ .name = "amount_nonnegative", .field = "amount", .op = .gte, .value_json = "0" },
+        },
     };
 
     const data = try serializeSchema(alloc, schema);
@@ -1585,7 +1774,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     defer freeSchema(alloc, loaded);
 
     try std.testing.expectEqual(StorageMode.relational, loaded.storage_mode);
-    try std.testing.expectEqual(@as(usize, 6), loaded.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 7), loaded.relational_columns.len);
     try std.testing.expectEqualStrings("id", loaded.relational_columns[0].name);
     try std.testing.expectEqualStrings("id", loaded.relational_columns[0].path);
     try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[0].field_type);
@@ -1602,6 +1791,12 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[4].field_type);
     try std.testing.expect(!loaded.relational_columns[4].indexed);
     try std.testing.expectEqual(AntflyType.array, loaded.relational_columns[5].field_type);
+    try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[5].array_item_type.?);
+    try std.testing.expect(loaded.relational_columns[2].default_value != null);
+    try std.testing.expectEqualStrings("1", loaded.relational_columns[2].default_value.?.value_json);
+    try std.testing.expect(loaded.relational_columns[6].generated != null);
+    try std.testing.expectEqual(RelationalGeneratedOp.lower, loaded.relational_columns[6].generated.?.op);
+    try std.testing.expectEqualStrings("tenant_id", loaded.relational_columns[6].generated.?.field.?);
     try std.testing.expectEqual(@as(usize, 3), loaded.foreign_keys.len);
     try std.testing.expectEqualStrings("orders_customer_id_fkey", loaded.foreign_keys[0].name);
     try std.testing.expectEqualStrings("customer_id", loaded.foreign_keys[0].child_columns[0]);
@@ -1629,6 +1824,10 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[1].expressions.len);
     try std.testing.expectEqual(UniqueExpressionOp.lower, loaded.unique_constraints[1].expressions[0].op);
     try std.testing.expectEqualStrings("email", loaded.unique_constraints[1].expressions[0].field);
+    try std.testing.expectEqual(@as(usize, 1), loaded.checks.len);
+    try std.testing.expectEqualStrings("amount_nonnegative", loaded.checks[0].name);
+    try std.testing.expectEqual(RelationalCheckOp.gte, loaded.checks[0].op);
+    try std.testing.expectEqualStrings("0", loaded.checks[0].value_json.?);
 }
 
 test "schema save/load via DocStore" {

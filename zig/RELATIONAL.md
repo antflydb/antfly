@@ -475,9 +475,30 @@ primary-key tuple, and `{ "target": { "unique": { "name": "..." } } }` means
 the named unique constraint's tuple inferred from the inserted row. That
 inference supports ordinary columns, typed expressions such as `lower(email)`,
 and typed partial predicates without copying SQL text into storage metadata. The
-conflict target and optional partial-index predicate must be part of the durable
-plan so concurrent inserts for the same unique value conflict on the same owner
-record.
+conflict target and partial-index predicate must be part of the durable plan so
+concurrent inserts for the same unique value conflict on the same owner record.
+For a partial unique constraint, the row API requires the conflict target to
+repeat the catalog predicate in typed form:
+
+```json
+{
+  "target": {
+    "unique": {
+      "name": "users_active_email_key",
+      "where": {
+        "all": [
+          { "field": "email", "op": "is_not_null" },
+          { "field": "status", "op": "eq", "value": "active" }
+        ]
+      }
+    }
+  }
+}
+```
+
+If the supplied predicate is missing or does not match the catalog predicate,
+the request is rejected before owner lookup. Rows that do not satisfy the
+partial predicate do not resolve a unique owner and follow the insert path.
 
 #### Mutation result projection
 
@@ -515,24 +536,37 @@ for queue and ledger workloads:
   "claim": {
     "mode": "for_update",
     "skip_locked": true,
-    "lease_ms": 30000
+    "lease_ms": 30000,
+    "owner_id": "session:7",
+    "transaction_id": "00112233445566778899aabbccddeeff"
   },
   "order_by": [{ "field": "created_at", "direction": "asc" }],
   "limit": 100
 }
 ```
 
-The implementation should use durable row-intent ownership and 2PC visibility.
-A claim is not a best-effort scan filter: the range owner must install an
-intent/lease record for selected rows, competing claimers must either wait or
-skip locked rows according to the request, and commit/abort/recovery must clear
-or expire claims deterministically. The query API already has a typed
-`claim`/`row_claim` contract with `mode`, `skip_locked`, `lease_ms`, and
-`owner_id`; the remaining execution work is to have range owners turn that
-contract into durable row claim records during candidate selection and to expose
-release/renew behavior through transaction/session ownership. This is the
-storage primitive that SQL `SELECT ... FOR UPDATE SKIP LOCKED` and API queue
-consumers should share.
+Claims are transaction-bound. The query/API contract carries `mode`,
+`skip_locked`, `lease_ms`, `owner_id`, and a 16-byte transaction identity exposed
+as `transaction_id`/`txn_id` hex at the API boundary. Storage lowers each claimed
+base row to a metadata key under `txn_row_claim:<row-key>` and writes a pending
+2PC delete intent for that key. The intent is the lock: competing claimers and
+ordinary writers both hit the same transaction-manager conflict check. Ordinary
+batch and transaction mutations add an expected-absent predicate on the row claim
+key, so a pending claim blocks direct writes, transactional writes, updates, and
+deletes until the claiming transaction commits or aborts. Transaction resolution
+always consumes row-claim intent keys instead of applying them as user data, so a
+commit releases the lock rather than leaving a durable row-claim record behind.
+
+`skip_locked: false` claims all returned base rows or fails with the underlying
+intent conflict. `skip_locked: true` attempts claims in result order and returns
+only the rows whose row-claim intents were installed. Row claiming is deliberately
+base-row only: `count_only`, graph result sets, and chunk return modes are
+rejected because they do not identify a single relational row to lock. SQL
+`SELECT ... FOR UPDATE [SKIP LOCKED]` and API queue consumers should both compile
+to this same row-claim contract. The remaining distributed planner work is to
+make range-targeted query execution over `ORDER BY`/`LIMIT` continue scanning
+past skipped rows across owner ranges so `SKIP LOCKED LIMIT n` can fill `n` rows
+without over-fetching a whole table.
 
 #### Array and multivalue columns
 
@@ -549,15 +583,28 @@ Array values need canonical physical encoding, equality/containment semantics,
 
 The engine distinguishes declared arrays from opaque JSON with a first-class
 relational `array` column type. The current physical row codec stores the array
-as canonical bytes and rejects scalar values for that column, so schema/catalog
-state, reconstruction, and write validation can reason about arrays explicitly.
-The remaining production work is element metadata and element indexes: a
-declared array column must carry stable element type, canonical
-ordering/equality rules, null/empty semantics, and optional element index
-entries for containment and `ANY` filters. For arrays that are also used by
-unique constraints or generated expressions, the catalog must specify whether
-order-sensitive or set-like comparison is used. Fully schemaless arrays can
-still live inside a `json` column.
+as canonical bytes and rejects scalar values for that column. Runtime schema
+columns persist `array_item_type` when the JSON schema declares `items`, and row
+projection rejects elements that do not match that declared type. That gives
+schema/catalog state, reconstruction, and write validation a stable
+`array<T>` contract instead of opaque mixed JSON.
+
+`ANY`-style predicates lower to the structured stored-doc filter shape:
+
+```json
+{ "array_any": { "field": "tags", "value": "hot" } }
+```
+
+The predicate compares the requested value as a typed JSON value, not as a SQL
+string fragment, and it also works over nested multivalue paths such as
+`{ "array_any": { "path": "items.sku", "value": "sku-2" } }`. The remaining
+production work is index acceleration and full planner costing: declared array
+columns still need catalog-declared element indexes, canonical ordering/equality
+rules, null/empty semantics, and optional element index entries for containment
+and `ANY` filters. For arrays that are also used by unique constraints or
+generated expressions, the catalog must specify whether order-sensitive or
+set-like comparison is used. Fully schemaless arrays can still live inside a
+`json` column.
 
 #### JSON path and update operators
 
@@ -584,13 +631,28 @@ transform path as ordinary row updates. That rewrites only the JSON cell, then
 reprojects derived full-text/path-fact/algebraic indexes for that subtree from
 the committed row. Changing a JSON column's embedded schema remains a
 derived-index rebuild, not a base-row migration. The remaining query-side work
-is partially represented by a typed `json_filter` query contract. Equality and
-existence filters over a declared JSON path lower to structured filters such as
+is represented by structured JSON predicates. Equality and existence filters
+over a declared JSON path lower to structured filters such as
 `{ "term": { "path": "attrs.billing.plan", "value": "pro" } }` and
 `{ "exists": { "field": "attrs.billing.plan" } }`. Object containment (`@>`)
-is intentionally not lowered to a fake term filter; it still needs a
-planner-visible JSON containment expression plus an index/path-fact execution
-strategy.
+lowers to a typed containment predicate such as:
+
+```json
+{
+  "json_contains": {
+    "field": "attrs",
+    "value": { "billing": { "plan": "pro" }, "flags": ["active"] }
+  }
+}
+```
+
+Containment is recursive over actual JSON values: objects require every
+requested key to be present and contained, arrays use unordered element
+containment, and scalars use JSON value equality with numeric integer/float
+normalization. It is intentionally not lowered to a fake term filter. The
+remaining production work is index/path-fact acceleration and planner costing
+for containment-capable JSON paths; until a declared JSON subindex can prove the
+predicate, the stored-doc matcher is the correctness fallback.
 
 #### Checks, defaults, and generated values
 
@@ -600,27 +662,42 @@ need table-owned `CHECK` predicates, server-side defaults, and generated values:
 ```json
 {
   "checks": [
-    { "name": "orders_amount_nonnegative", "expression": "amount >= 0" }
+    { "name": "orders_amount_nonnegative", "field": "amount", "op": "gte", "value": 0 }
   ],
-  "columns": {
-    "created_at": { "type": "datetime", "default": { "function": "now" } },
-    "slug": {
-      "type": "keyword",
-      "generated": {
-        "stored": true,
-        "expression": "lower(name)"
+  "document_schemas": {
+    "row": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "keyword" },
+          "email": { "type": "keyword" },
+          "email_key": {
+            "type": "keyword",
+            "generated": { "op": "lower", "field": "email" }
+          },
+          "status": { "type": "keyword", "default": "active" }
+        },
+        "required": ["id", "email"],
+        "additionalProperties": false
       }
     }
   }
 }
 ```
 
-Defaults are applied by the write participant before projection and constraint
-checks, so every write path sees the same values. Generated stored columns are
-computed from the planned row and persisted as ordinary relational cells; they
-can participate in indexes, unique constraints, foreign keys, and `RETURNING`.
-`CHECK` predicates evaluate against the final planned row image after defaults,
-patches, JSON updates, and generated values are applied.
+The model-level contract is typed JSON metadata, not SQL expression text. Literal
+column defaults are applied by the write planner before primary-key encoding,
+unique tuple derivation, constraint checks, and `RETURNING`. Stored generated
+columns currently support typed `lower(field)` and `concat(fields, separator)`
+forms; user input cannot write generated columns directly. Inserts materialize
+defaults and generated values into the committed row image. Updates and
+conflict-target updates that touch tables with checks or generated columns
+resolve the base row, apply the requested patch/JSON updates, regenerate stored
+generated values as ordinary transform operations, and validate checks against
+that final planned row image. `CHECK` predicates are named typed atoms
+(`is_null`, `is_not_null`, `eq`, `ne`, `gt`, `gte`, `lt`, `lte`) over declared
+columns so REST, SDK, and future SQL adapters compile to the same backend
+contract.
 
 #### Relational query lowering
 

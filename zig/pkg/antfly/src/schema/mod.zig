@@ -73,6 +73,8 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     errdefer freeRuntimeForeignKeys(alloc, foreign_keys);
     const unique_constraints = try deriveRuntimeUniqueConstraints(alloc, schema);
     errdefer freeRuntimeUniqueConstraints(alloc, unique_constraints);
+    const checks = try deriveRuntimeRelationalChecks(alloc, schema);
+    errdefer freeRuntimeRelationalChecks(alloc, checks);
     const storage_mode: storage_schema.StorageMode = switch (schema.storage_mode) {
         .document => .document,
         .relational => .relational,
@@ -101,6 +103,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .primary_key = primary_key,
         .foreign_keys = foreign_keys,
         .unique_constraints = unique_constraints,
+        .checks = checks,
     };
 }
 
@@ -207,8 +210,11 @@ fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableS
                 .name = name,
                 .path = path,
                 .field_type = field_type,
+                .array_item_type = runtimeRelationalArrayItemType(property),
                 .nullable = nullable,
                 .indexed = if (property.antfly_index) |indexed| indexed else true,
+                .default_value = if (property.default_value_json) |value_json| .{ .value_json = try alloc.dupe(u8, value_json) } else null,
+                .generated = if (property.generated) |generated| try cloneRelationalGeneratedValue(alloc, generated) else null,
             });
         }
     }
@@ -220,8 +226,32 @@ fn freeRuntimeRelationalColumns(alloc: std.mem.Allocator, columns: []storage_sch
     for (columns) |column| {
         alloc.free(column.name);
         alloc.free(column.path);
+        if (column.default_value) |value| alloc.free(value.value_json);
+        if (column.generated) |value| freeRuntimeRelationalGeneratedValue(alloc, value);
     }
     if (columns.len > 0) alloc.free(columns);
+}
+
+fn cloneRelationalGeneratedValue(
+    alloc: std.mem.Allocator,
+    value: impl.RelationalGeneratedValue,
+) !storage_schema.RelationalGeneratedValue {
+    return .{
+        .op = switch (value.op) {
+            .lower => .lower,
+            .concat => .concat,
+        },
+        .field = if (value.field) |field| try alloc.dupe(u8, field) else null,
+        .fields = try cloneStringSlice(alloc, value.fields),
+        .separator = try alloc.dupe(u8, value.separator),
+    };
+}
+
+fn freeRuntimeRelationalGeneratedValue(alloc: std.mem.Allocator, value: storage_schema.RelationalGeneratedValue) void {
+    if (value.field) |field| alloc.free(field);
+    for (value.fields) |field| alloc.free(field);
+    if (value.fields.len > 0) alloc.free(value.fields);
+    alloc.free(value.separator);
 }
 
 fn deriveRuntimePrimaryKey(alloc: std.mem.Allocator, schema: ParsedTableSchema) !?storage_schema.PrimaryKey {
@@ -338,6 +368,47 @@ fn freeRuntimeUniqueConstraints(alloc: std.mem.Allocator, constraints: []storage
     if (constraints.len > 0) alloc.free(constraints);
 }
 
+fn deriveRuntimeRelationalChecks(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.RelationalCheck {
+    if (schema.checks.len == 0) return &.{};
+    const checks = try alloc.alloc(storage_schema.RelationalCheck, schema.checks.len);
+    var initialized: usize = 0;
+    errdefer {
+        if (initialized > 0) {
+            freeRuntimeRelationalChecks(alloc, checks[0..initialized]);
+        } else {
+            alloc.free(checks);
+        }
+    }
+    for (schema.checks) |check| {
+        checks[initialized] = .{
+            .name = try alloc.dupe(u8, check.name),
+            .field = try alloc.dupe(u8, check.field),
+            .op = switch (check.op) {
+                .is_null => .is_null,
+                .is_not_null => .is_not_null,
+                .eq => .eq,
+                .ne => .ne,
+                .gt => .gt,
+                .gte => .gte,
+                .lt => .lt,
+                .lte => .lte,
+            },
+            .value_json = if (check.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
+        };
+        initialized += 1;
+    }
+    return checks;
+}
+
+fn freeRuntimeRelationalChecks(alloc: std.mem.Allocator, checks: []storage_schema.RelationalCheck) void {
+    for (checks) |check| {
+        alloc.free(check.name);
+        alloc.free(check.field);
+        if (check.value_json) |value_json| alloc.free(value_json);
+    }
+    if (checks.len > 0) alloc.free(checks);
+}
+
 fn cloneUniqueExpressions(alloc: std.mem.Allocator, values: []const impl.UniqueExpression) ![]const storage_schema.UniqueExpression {
     if (values.len == 0) return &.{};
     const out = try alloc.alloc(storage_schema.UniqueExpression, values.len);
@@ -432,6 +503,12 @@ fn runtimeRelationalColumnType(property: anytype) ?storage_schema.AntflyType {
         property.dynamic_infer_types) return .json;
     if (property.const_value != null or property.enum_values.len > 0) return .keyword;
     return null;
+}
+
+fn runtimeRelationalArrayItemType(property: anytype) ?storage_schema.AntflyType {
+    if (property.field_type == null or !std.mem.eql(u8, property.field_type.?, "array")) return null;
+    const item = property.item orelse return null;
+    return runtimeRelationalColumnType(item.*);
 }
 
 fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) bool {
@@ -1063,6 +1140,7 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expect(!findRuntimeColumn(runtime, "amount").?.indexed);
     try std.testing.expectEqual(storage_schema.AntflyType.datetime, findRuntimeColumn(runtime, "created_at").?.field_type);
     try std.testing.expectEqual(storage_schema.AntflyType.array, findRuntimeColumn(runtime, "tags").?.field_type);
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, findRuntimeColumn(runtime, "tags").?.array_item_type.?);
     // nested object and json field both become json columns
     try std.testing.expectEqual(storage_schema.AntflyType.json, findRuntimeColumn(runtime, "attrs").?.field_type);
     try std.testing.expectEqual(storage_schema.AntflyType.json, findRuntimeColumn(runtime, "payload").?.field_type);

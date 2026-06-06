@@ -254,17 +254,24 @@ pub fn parseRowsBatchRequestWithResolver(
             const key = (try physicalPrimaryKeyFromWhereAlloc(alloc, table_name, schema, op_value.object.get("where") orelse return error.InvalidRowsRequest, unique_resolver, false)) orelse return error.RowSelectorNotFound;
             var key_transferred = false;
             errdefer if (!key_transferred) alloc.free(key);
-            const operations = try updateTransformOperationsAlloc(alloc, schema, op_value);
+            var operations = try updateTransformOperationsAlloc(alloc, schema, op_value);
             var operations_transferred = false;
             errdefer if (!operations_transferred) freeTransformOps(alloc, operations);
-            var returning_base = try returningBaseRowForKey(alloc, table_name, key, unique_resolver, op_value);
+            const needs_planned_row = schemaHasGeneratedColumns(schema) or schema.checks.len != 0 or op_value.object.get("returning") != null;
+            var returning_base = if (needs_planned_row)
+                try lookupBaseRowForKey(alloc, table_name, key, unique_resolver)
+            else
+                null;
             defer if (returning_base) |*row| row.deinit(alloc);
             try appendExpectedVersionPredicateAlloc(alloc, &predicates, op_value, key);
             if (returning_base) |row| {
                 try appendVersionPredicateAlloc(alloc, &predicates, key, row.version);
                 const projected_json = (try db_mod.transform.resolveDocumentTransform(alloc, row.json, .{ .key = key, .operations = operations })) orelse return error.RowSelectorNotFound;
                 defer alloc.free(projected_json);
-                try appendReturningProjectionFromJsonAlloc(alloc, &returning_rows, op_value, projected_json);
+                const planned_json = try plannedExistingRelationalRowJsonAlloc(alloc, schema, projected_json);
+                defer alloc.free(planned_json);
+                if (schemaHasGeneratedColumns(schema)) operations = try extendOperationsWithGeneratedColumnsAlloc(alloc, operations, schema, planned_json);
+                try appendReturningProjectionFromJsonAlloc(alloc, &returning_rows, op_value, planned_json);
             }
             try transforms.append(alloc, .{ .key = key, .operations = operations });
             key_transferred = true;
@@ -461,6 +468,289 @@ const ConflictAction = enum {
     nothing,
 };
 
+fn plannedRelationalRowJsonAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_value: std.json.Value,
+) ![]u8 {
+    return try plannedRelationalRowJsonWithOptionsAlloc(alloc, schema, row_value, true);
+}
+
+fn plannedExistingRelationalRowJsonAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_json: []const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    return try plannedRelationalRowJsonWithOptionsAlloc(alloc, schema, parsed.value, false);
+}
+
+fn plannedRelationalRowJsonWithOptionsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_value: std.json.Value,
+    reject_generated_input: bool,
+) ![]u8 {
+    if (row_value != .object) return error.InvalidRowsRequest;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    var first = true;
+
+    var it = row_value.object.iterator();
+    while (it.next()) |entry| {
+        const column = findRelationalColumn(schema.relational_columns, entry.key_ptr.*) orelse return error.InvalidRowsRequest;
+        if (column.generated != null) {
+            if (reject_generated_input) return error.InvalidRowsRequest;
+            continue;
+        }
+        try appendJsonFieldValue(alloc, writer, &first, entry.key_ptr.*, entry.value_ptr.*);
+    }
+
+    for (schema.relational_columns) |column| {
+        if (row_value.object.get(column.path) != null) continue;
+        if (column.default_value) |default_value| {
+            try appendRawJsonFieldValue(alloc, writer, &first, column.path, default_value.value_json);
+        }
+    }
+
+    for (schema.relational_columns) |column| {
+        const generated = column.generated orelse continue;
+        const value_json = try generatedColumnValueJsonAlloc(alloc, schema, row_value, generated);
+        defer alloc.free(value_json);
+        try appendRawJsonFieldValue(alloc, writer, &first, column.path, value_json);
+    }
+
+    try writer.writeByte('}');
+    const planned = try out.toOwnedSlice();
+    errdefer alloc.free(planned);
+    try validateRelationalChecks(alloc, schema, planned);
+    return planned;
+}
+
+fn schemaHasGeneratedColumns(schema: runtime_schema.TableSchema) bool {
+    for (schema.relational_columns) |column| {
+        if (column.generated != null) return true;
+    }
+    return false;
+}
+
+fn appendJsonFieldValue(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    first: *bool,
+    field: []const u8,
+    value: std.json.Value,
+) !void {
+    if (!first.*) try writer.writeByte(',');
+    first.* = false;
+    try writer.print("{f}:", .{std.json.fmt(field, .{})});
+    _ = alloc;
+    try std.json.Stringify.value(value, .{}, writer);
+}
+
+fn appendRawJsonFieldValue(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    first: *bool,
+    field: []const u8,
+    value_json: []const u8,
+) !void {
+    if (!first.*) try writer.writeByte(',');
+    first.* = false;
+    try writer.print("{f}:", .{std.json.fmt(field, .{})});
+    _ = alloc;
+    try writer.writeAll(value_json);
+}
+
+fn generatedColumnValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_value: std.json.Value,
+    generated: runtime_schema.RelationalGeneratedValue,
+) ![]u8 {
+    return switch (generated.op) {
+        .lower => blk: {
+            const field = generated.field orelse return error.InvalidRowsRequest;
+            const source = try plannedStringFieldValueAlloc(alloc, schema, row_value, field);
+            defer alloc.free(source);
+            const lowered = try std.ascii.allocLowerString(alloc, source);
+            defer alloc.free(lowered);
+            break :blk try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(lowered, .{})});
+        },
+        .concat => blk: {
+            var joined = std.ArrayListUnmanaged(u8).empty;
+            defer joined.deinit(alloc);
+            for (generated.fields, 0..) |field, i| {
+                if (i != 0) try joined.appendSlice(alloc, generated.separator);
+                const value = try plannedScalarFieldTextAlloc(alloc, schema, row_value, field);
+                defer alloc.free(value);
+                try joined.appendSlice(alloc, value);
+            }
+            break :blk try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(joined.items, .{})});
+        },
+    };
+}
+
+fn plannedStringFieldValueAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_value: std.json.Value,
+    field: []const u8,
+) ![]u8 {
+    if (row_value.object.get(field)) |value| {
+        if (value != .string) return error.InvalidRowsRequest;
+        return try alloc.dupe(u8, value.string);
+    }
+    const column = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
+    const default_value = column.default_value orelse return error.InvalidRowsRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, default_value.value_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .string) return error.InvalidRowsRequest;
+    return try alloc.dupe(u8, parsed.value.string);
+}
+
+fn plannedScalarFieldTextAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_value: std.json.Value,
+    field: []const u8,
+) ![]u8 {
+    if (row_value.object.get(field)) |value| return try scalarJsonValueTextAlloc(alloc, value);
+    const column = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
+    const default_value = column.default_value orelse return error.InvalidRowsRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, default_value.value_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    return try scalarJsonValueTextAlloc(alloc, parsed.value);
+}
+
+fn scalarJsonValueTextAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return switch (value) {
+        .string => |text| try alloc.dupe(u8, text),
+        .integer => |integer| try std.fmt.allocPrint(alloc, "{d}", .{integer}),
+        .float => |float| try std.fmt.allocPrint(alloc, "{d}", .{float}),
+        .bool => |enabled| try alloc.dupe(u8, if (enabled) "true" else "false"),
+        else => error.InvalidRowsRequest,
+    };
+}
+
+fn validateRelationalChecks(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    row_json: []const u8,
+) !void {
+    if (schema.checks.len == 0) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    for (schema.checks) |check| {
+        if (!try relationalCheckPasses(alloc, parsed.value, check)) return error.InvalidRowsRequest;
+    }
+}
+
+fn extendOperationsWithGeneratedColumnsAlloc(
+    alloc: std.mem.Allocator,
+    operations: []db_mod.types.TransformOp,
+    schema: runtime_schema.TableSchema,
+    planned_json: []const u8,
+) ![]db_mod.types.TransformOp {
+    var generated_count: usize = 0;
+    for (schema.relational_columns) |column| {
+        if (column.generated != null) generated_count += 1;
+    }
+    if (generated_count == 0) return operations;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, planned_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    const extended = try alloc.alloc(db_mod.types.TransformOp, operations.len + generated_count);
+    @memcpy(extended[0..operations.len], operations);
+    alloc.free(operations);
+    var index = operations.len;
+    errdefer freeTransformOps(alloc, extended[operations.len..index]);
+
+    for (schema.relational_columns) |column| {
+        if (column.generated == null) continue;
+        const value = jsonValueAtPath(parsed.value, column.path) orelse return error.InvalidRowsRequest;
+        const value_json = try jsonValueStringifyAlloc(alloc, value.*);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        const path = try alloc.dupe(u8, column.path);
+        var path_transferred = false;
+        errdefer if (!path_transferred) alloc.free(path);
+        extended[index] = .{
+            .op = .set,
+            .path = path,
+            .value_json = value_json,
+        };
+        path_transferred = true;
+        value_transferred = true;
+        index += 1;
+    }
+    return extended;
+}
+
+fn relationalCheckPasses(
+    alloc: std.mem.Allocator,
+    row: std.json.Value,
+    check: runtime_schema.RelationalCheck,
+) !bool {
+    const value = jsonValueAtPath(row, check.field);
+    return switch (check.op) {
+        .is_null => value == null or value.?.* == .null,
+        .is_not_null => value != null and value.?.* != .null,
+        .eq, .ne, .gt, .gte, .lt, .lte => blk: {
+            const expected_json = check.value_json orelse return error.InvalidRowsRequest;
+            var expected = std.json.parseFromSlice(std.json.Value, alloc, expected_json, .{}) catch return error.InvalidRowsRequest;
+            defer expected.deinit();
+            const actual = value orelse break :blk false;
+            const comparison = compareJsonScalars(actual.*, expected.value) orelse return error.InvalidRowsRequest;
+            break :blk switch (check.op) {
+                .eq => comparison == .eq,
+                .ne => comparison != .eq,
+                .gt => comparison == .gt,
+                .gte => comparison == .gt or comparison == .eq,
+                .lt => comparison == .lt,
+                .lte => comparison == .lt or comparison == .eq,
+                else => unreachable,
+            };
+        },
+    };
+}
+
+const ScalarComparison = enum { lt, eq, gt };
+
+fn compareJsonScalars(actual: std.json.Value, expected: std.json.Value) ?ScalarComparison {
+    if (jsonNumericValue(actual)) |left| {
+        const right = jsonNumericValue(expected) orelse return null;
+        if (left < right) return .lt;
+        if (left > right) return .gt;
+        return .eq;
+    }
+    if (actual == .string and expected == .string) {
+        const order = std.mem.order(u8, actual.string, expected.string);
+        return switch (order) {
+            .lt => .lt,
+            .eq => .eq,
+            .gt => .gt,
+        };
+    }
+    if (actual == .bool and expected == .bool) {
+        if (actual.bool == expected.bool) return .eq;
+        return if (!actual.bool and expected.bool) .lt else .gt;
+    }
+    if (actual == .null and expected == .null) return .eq;
+    return null;
+}
+
+fn jsonNumericValue(value: std.json.Value) ?f64 {
+    return switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        else => null,
+    };
+}
+
 fn appendInsertAlloc(
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
@@ -469,7 +759,7 @@ fn appendInsertAlloc(
     writes: *std.ArrayListUnmanaged(db_mod.types.BatchWrite),
     predicates: *std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate),
 ) !void {
-    const row_json = try jsonValueStringifyAlloc(alloc, row_value);
+    const row_json = try plannedRelationalRowJsonAlloc(alloc, schema, row_value);
     var row_json_transferred = false;
     errdefer if (!row_json_transferred) alloc.free(row_json);
     const key = try physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, row_json);
@@ -507,7 +797,7 @@ fn appendInsertWithConflictAlloc(
     const target_value = conflict_value.object.get("target") orelse return error.InvalidRowsRequest;
     if (target_value != .object) return error.InvalidRowsRequest;
 
-    const row_json = try jsonValueStringifyAlloc(alloc, row_value);
+    const row_json = try plannedRelationalRowJsonAlloc(alloc, schema, row_value);
     defer alloc.free(row_json);
 
     const conflict_key = try conflictTargetPrimaryKeyAlloc(alloc, table_name, schema, row_json, target_value, resolver);
@@ -517,17 +807,20 @@ fn appendInsertWithConflictAlloc(
         switch (action) {
             .nothing => return,
             .update => {
-                const operations = try updateTransformOperationsAlloc(alloc, schema, conflict_value);
+                var operations = try updateTransformOperationsAlloc(alloc, schema, conflict_value);
                 var operations_transferred = false;
                 errdefer if (!operations_transferred) freeTransformOps(alloc, operations);
-                if (op_value.object.get("returning") != null) {
+                if (op_value.object.get("returning") != null or schemaHasGeneratedColumns(schema) or schema.checks.len != 0) {
                     const existing = (try resolver.lookupPrimary(alloc, table_name, key)) orelse return error.RowSelectorNotFound;
                     var existing_mut = existing;
                     defer existing_mut.deinit(alloc);
                     try appendVersionPredicateAlloc(alloc, predicates, key, existing.version);
                     const projected_json = (try db_mod.transform.resolveDocumentTransform(alloc, existing.json, .{ .key = key, .operations = operations })) orelse return error.RowSelectorNotFound;
                     defer alloc.free(projected_json);
-                    try appendReturningProjectionFromJsonAlloc(alloc, returning_rows, op_value, projected_json);
+                    const planned_json = try plannedExistingRelationalRowJsonAlloc(alloc, schema, projected_json);
+                    defer alloc.free(planned_json);
+                    if (schemaHasGeneratedColumns(schema)) operations = try extendOperationsWithGeneratedColumnsAlloc(alloc, operations, schema, planned_json);
+                    try appendReturningProjectionFromJsonAlloc(alloc, returning_rows, op_value, planned_json);
                 }
                 const transform_key = try alloc.dupe(u8, key);
                 var key_transferred = false;
@@ -575,12 +868,71 @@ fn conflictTargetPrimaryKeyAlloc(
         const name_value = unique_value.object.get("name") orelse return error.InvalidRowsRequest;
         if (name_value != .string) return error.InvalidRowsRequest;
         const constraint = findUniqueConstraint(schema.unique_constraints, name_value.string) orelse return error.InvalidRowsRequest;
+        try validateConflictTargetPredicateMatchesConstraint(alloc, unique_value, constraint);
         const encoded_value = (try uniqueConstraintValueFromRowAlloc(alloc, schema, constraint, row_json)) orelse return null;
         defer alloc.free(encoded_value);
         return try resolver.resolveUnique(alloc, table_name, constraint.name, encoded_value);
     }
 
     return error.InvalidRowsRequest;
+}
+
+fn validateConflictTargetPredicateMatchesConstraint(
+    alloc: std.mem.Allocator,
+    unique_value: std.json.Value,
+    constraint: runtime_schema.UniqueConstraint,
+) !void {
+    const where_value = unique_value.object.get("where");
+    if (constraint.where.len == 0) {
+        if (where_value != null) return error.InvalidRowsRequest;
+        return;
+    }
+    const supplied = where_value orelse return error.InvalidRowsRequest;
+    try validateUniquePredicateJsonMatches(alloc, supplied, constraint.where);
+}
+
+fn validateUniquePredicateJsonMatches(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    predicates: []const runtime_schema.UniquePredicate,
+) !void {
+    if (value != .object) return error.InvalidRowsRequest;
+    const all_value = value.object.get("all") orelse return error.InvalidRowsRequest;
+    if (all_value != .array or all_value.array.items.len != predicates.len) return error.InvalidRowsRequest;
+    for (all_value.array.items, predicates) |item, predicate| {
+        try validateUniquePredicateAtomJsonMatches(alloc, item, predicate);
+    }
+}
+
+fn validateUniquePredicateAtomJsonMatches(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    predicate: runtime_schema.UniquePredicate,
+) !void {
+    if (value != .object) return error.InvalidRowsRequest;
+    const field_value = value.object.get("field") orelse return error.InvalidRowsRequest;
+    const op_value = value.object.get("op") orelse return error.InvalidRowsRequest;
+    if (field_value != .string or !std.mem.eql(u8, field_value.string, predicate.field)) return error.InvalidRowsRequest;
+    if (op_value != .string or !std.mem.eql(u8, op_value.string, uniquePredicateOpToken(predicate.op))) return error.InvalidRowsRequest;
+
+    const supplied_value = value.object.get("value");
+    if (predicate.value_json) |expected_json| {
+        const supplied = supplied_value orelse return error.InvalidRowsRequest;
+        const supplied_json = try jsonValueStringifyAlloc(alloc, supplied);
+        defer alloc.free(supplied_json);
+        if (!std.mem.eql(u8, supplied_json, expected_json)) return error.InvalidRowsRequest;
+    } else if (supplied_value != null) {
+        return error.InvalidRowsRequest;
+    }
+}
+
+fn uniquePredicateOpToken(op: runtime_schema.UniquePredicateOp) []const u8 {
+    return switch (op) {
+        .is_null => "is_null",
+        .is_not_null => "is_not_null",
+        .eq => "eq",
+        .ne => "ne",
+    };
 }
 
 pub fn physicalPrimaryKeyFromWhereAlloc(
@@ -867,6 +1219,16 @@ fn returningBaseRowForKey(
     return (try resolver.lookupPrimary(alloc, table_name, key)) orelse return error.RowSelectorNotFound;
 }
 
+fn lookupBaseRowForKey(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    key: []const u8,
+    unique_resolver: ?UniqueSelectorResolver,
+) !ResolvedPrimaryRow {
+    const resolver = unique_resolver orelse return error.UnsupportedRowsSelector;
+    return (try resolver.lookupPrimary(alloc, table_name, key)) orelse return error.RowSelectorNotFound;
+}
+
 fn appendReturningProjectionAlloc(
     alloc: std.mem.Allocator,
     returning_rows: *std.ArrayListUnmanaged([]const u8),
@@ -1023,6 +1385,98 @@ test "relational rows batch derives deterministic physical primary keys" {
     try std.testing.expectEqual(@as(usize, 1), batch.predicates.len);
     try std.testing.expectEqualStrings(batch.writes[0].key, batch.deletes[0]);
     try std.testing.expect(std.mem.startsWith(u8, batch.writes[0].key, physical_primary_key_prefix));
+}
+
+test "relational rows batch returning materializes defaults generated columns and checks" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_key":{"type":"keyword","generated":{"op":"lower","field":"email"}},"status":{"type":"keyword","default":"active"},"amount":{"type":"numeric","default":1}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"checks":[{"name":"amount_positive","field":"amount","op":"gte","value":0},{"name":"status_present","field":"status","op":"is_not_null"}]}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    var batch = try parseRowsBatchRequest(
+        std.testing.allocator,
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u1\",\"email\":\"ADA@EXAMPLE.TEST\"},\"returning\":[\"id\",\"email_key\",\"status\",\"amount\"]}]}",
+        schema,
+    );
+    defer batch.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), batch.writes.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"email\":\"ADA@EXAMPLE.TEST\",\"status\":\"active\",\"amount\":1,\"email_key\":\"ada@example.test\"}", batch.writes[0].value);
+    try std.testing.expectEqual(@as(usize, 1), batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"email_key\":\"ada@example.test\",\"status\":\"active\",\"amount\":1}", batch.returning_rows[0]);
+
+    const Resolver = struct {
+        fn iface(self: *@This()) UniqueSelectorResolver {
+            return .{
+                .ptr = self,
+                .resolve = resolve,
+                .lookup_primary = lookupPrimary,
+            };
+        }
+
+        fn resolve(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+        ) !?[]u8 {
+            return null;
+        }
+
+        fn lookupPrimary(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            physical_key: []const u8,
+        ) !?ResolvedPrimaryRow {
+            try std.testing.expectEqualStrings("users", table_name);
+            try std.testing.expect(std.mem.startsWith(u8, physical_key, physical_primary_key_prefix));
+            return .{
+                .json = try alloc.dupe(u8, "{\"id\":\"u1\",\"email\":\"ADA@EXAMPLE.TEST\",\"email_key\":\"ada@example.test\",\"status\":\"active\",\"amount\":1}"),
+                .version = 9,
+            };
+        }
+    };
+
+    var resolver = Resolver{};
+    var update_batch = try parseRowsBatchRequestWithResolver(
+        std.testing.allocator,
+        "users",
+        "{\"operations\":[{\"op\":\"update\",\"where\":{\"primary\":{\"id\":\"u1\"}},\"patch\":{\"email\":\"GRACE@EXAMPLE.TEST\"},\"returning\":[\"email\",\"email_key\"]}]}",
+        schema,
+        resolver.iface(),
+    );
+    defer update_batch.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), update_batch.transforms.len);
+    try std.testing.expectEqual(@as(usize, 2), update_batch.transforms[0].operations.len);
+    try std.testing.expectEqualStrings("email", update_batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"GRACE@EXAMPLE.TEST\"", update_batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("email_key", update_batch.transforms[0].operations[1].path);
+    try std.testing.expectEqualStrings("\"grace@example.test\"", update_batch.transforms[0].operations[1].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), update_batch.predicates.len);
+    try std.testing.expectEqual(@as(u64, 9), update_batch.predicates[0].expected_version);
+    try std.testing.expectEqual(@as(usize, 1), update_batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"email\":\"GRACE@EXAMPLE.TEST\",\"email_key\":\"grace@example.test\"}", update_batch.returning_rows[0]);
+
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        parseRowsBatchRequest(
+            std.testing.allocator,
+            "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u2\",\"email\":\"bad@example.test\",\"amount\":-1}}]}",
+            schema,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        parseRowsBatchRequest(
+            std.testing.allocator,
+            "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u3\",\"email\":\"bad@example.test\",\"email_key\":\"user-supplied\"}}]}",
+            schema,
+        ),
+    );
 }
 
 test "relational rows unique selector resolves through owner lookup" {
@@ -1182,6 +1636,87 @@ test "relational rows conflict target upsert resolves expression unique owner" {
     try std.testing.expectEqual(@as(usize, 0), nothing_req.returning_rows.len);
     try std.testing.expectEqual(@as(u32, 0), nothing_req.inserted);
     try std.testing.expectEqual(@as(u32, 0), nothing_req.transformed);
+}
+
+test "relational rows conflict target upsert validates partial unique predicate" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_active_email_key","columns":["email"],"where":{"all":[{"field":"email","op":"is_not_null"},{"field":"status","op":"eq","value":"active"}]}}]}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    const Resolver = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) UniqueSelectorResolver {
+            return .{ .ptr = self, .resolve = resolve };
+        }
+
+        fn resolve(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            encoded_value: []const u8,
+        ) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("users", table_name);
+            try std.testing.expectEqualStrings("users_active_email_key", constraint_name);
+            try std.testing.expect(encoded_value.len > 0);
+            self.calls += 1;
+            return try alloc.dupe(u8, "\x00antfly-rel-pk:active-owner");
+        }
+    };
+
+    const conflict_where = "\"where\":{\"all\":[{\"field\":\"email\",\"op\":\"is_not_null\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]}";
+    var resolver = Resolver{};
+    var update_req = try parseRowsBatchRequestWithResolver(
+        std.testing.allocator,
+        "users",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u2\",\"email\":\"a@example.test\",\"status\":\"active\",\"name\":\"Ann\"},\"on_conflict\":{\"target\":{\"unique\":{\"name\":\"users_active_email_key\"," ++ conflict_where ++ "}},\"action\":\"update\",\"patch\":{\"name\":\"Ada\"}}}]}",
+        schema,
+        resolver.iface(),
+    );
+    defer update_req.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 0), update_req.writes.len);
+    try std.testing.expectEqual(@as(usize, 1), update_req.transforms.len);
+    try std.testing.expectEqualStrings("\x00antfly-rel-pk:active-owner", update_req.transforms[0].key);
+
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        parseRowsBatchRequestWithResolver(
+            std.testing.allocator,
+            "users",
+            "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u3\",\"email\":\"a@example.test\",\"status\":\"active\"},\"on_conflict\":{\"target\":{\"unique\":{\"name\":\"users_active_email_key\"}},\"action\":\"nothing\"}}]}",
+            schema,
+            resolver.iface(),
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        parseRowsBatchRequestWithResolver(
+            std.testing.allocator,
+            "users",
+            "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u4\",\"email\":\"a@example.test\",\"status\":\"active\"},\"on_conflict\":{\"target\":{\"unique\":{\"name\":\"users_active_email_key\",\"where\":{\"all\":[{\"field\":\"email\",\"op\":\"is_not_null\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"inactive\"}]}}},\"action\":\"nothing\"}}]}",
+            schema,
+            resolver.iface(),
+        ),
+    );
+
+    var inactive_req = try parseRowsBatchRequestWithResolver(
+        std.testing.allocator,
+        "users",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u5\",\"email\":\"a@example.test\",\"status\":\"inactive\"},\"on_conflict\":{\"target\":{\"unique\":{\"name\":\"users_active_email_key\"," ++ conflict_where ++ "}},\"action\":\"nothing\"}}]}",
+        schema,
+        resolver.iface(),
+    );
+    defer inactive_req.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), inactive_req.writes.len);
+    try std.testing.expectEqual(@as(usize, 0), inactive_req.transforms.len);
+    try std.testing.expectEqual(@as(usize, 1), inactive_req.predicates.len);
 }
 
 test "relational rows conflict target upsert resolves primary existence" {

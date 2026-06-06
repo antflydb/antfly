@@ -1778,13 +1778,28 @@ fn parseRowClaimRequestAlloc(
     } else 30_000;
     const owner_value = claim_value.object.get("owner_id") orelse return error.InvalidQueryRequest;
     if (owner_value != .string or owner_value.string.len == 0) return error.InvalidQueryRequest;
+    const txn_value = claim_value.object.get("transaction_id") orelse
+        claim_value.object.get("txn_id") orelse
+        return error.InvalidQueryRequest;
+    if (txn_value != .string) return error.InvalidQueryRequest;
+    const txn_id = parseTxnIdHex(txn_value.string) catch return error.InvalidQueryRequest;
 
     return .{
         .mode = mode,
         .skip_locked = skip_locked,
         .lease_ms = lease_ms,
         .owner_id = try alloc.dupe(u8, owner_value.string),
+        .txn_id = txn_id,
     };
+}
+
+fn parseTxnIdHex(text: []const u8) !db_mod.types.TxnId {
+    if (text.len != 32) return error.InvalidQueryRequest;
+    var out: db_mod.types.TxnId = undefined;
+    for (&out, 0..) |*byte, i| {
+        byte.* = try std.fmt.parseInt(u8, text[i * 2 ..][0..2], 16);
+    }
+    return out;
 }
 
 fn mergeJsonFilterQueryJsonAlloc(
@@ -5486,7 +5501,7 @@ test "api query contract includes stored source when fields are omitted" {
 test "api query contract parses typed row claim request" {
     const alloc = std.testing.allocator;
     var parsed = try parseQueryRequest(alloc, null, "jobs",
-        \\{"full_text_search":{"match_all":{}},"claim":{"mode":"for_update","skip_locked":true,"lease_ms":30000,"owner_id":"session:1"},"limit":5}
+        \\{"full_text_search":{"match_all":{}},"claim":{"mode":"for_update","skip_locked":true,"lease_ms":30000,"owner_id":"session:1","transaction_id":"00112233445566778899aabbccddeeff"},"limit":5}
     );
     defer parsed.deinit(alloc);
 
@@ -5495,13 +5510,18 @@ test "api query contract parses typed row claim request" {
     try std.testing.expect(claim.skip_locked);
     try std.testing.expectEqual(@as(u64, 30_000), claim.lease_ms);
     try std.testing.expectEqualStrings("session:1", claim.owner_id);
+    try std.testing.expectEqual(@as(u8, 0x00), claim.txn_id.?[0]);
+    try std.testing.expectEqual(@as(u8, 0xff), claim.txn_id.?[15]);
     try std.testing.expectEqual(@as(u32, 5), parsed.req.limit);
 
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "jobs",
-        \\{"claim":{"mode":"for_update","owner_id":""}}
+        \\{"claim":{"mode":"for_update","owner_id":"","transaction_id":"00112233445566778899aabbccddeeff"}}
     ));
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "jobs",
-        \\{"claim":{"mode":"share","owner_id":"session:1"}}
+        \\{"claim":{"mode":"for_update","owner_id":"session:1"}}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "jobs",
+        \\{"claim":{"mode":"share","owner_id":"session:1","transaction_id":"00112233445566778899aabbccddeeff"}}
     ));
 }
 
