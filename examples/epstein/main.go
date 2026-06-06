@@ -189,23 +189,25 @@ var needsOCRFallback = docsaf.NeedsOCRFallback
 var templatesFS embed.FS
 
 const (
-	DefaultAntflyURL       = "http://localhost:8080/db/v1"
-	DefaultInferenceURL    = "http://localhost:8080"
-	DefaultFullTextIndex   = "full_text_index_v0"
-	DefaultEmbeddingIndex  = "embeddings"
-	DefaultEmbeddingModel  = "antflydb/clipclap"
-	DefaultEmbeddingPull   = "antflydb/clipclap:gguf:Q4_K"
-	DefaultEmbeddingDims   = 512
-	DefaultChunkerModel    = "fixed-bert-tokenizer"
-	DefaultOCRModel        = "Xenova/trocr-base-printed"
-	DefaultRecognizerModel = "fastino/gliner2-base-v1"
-	DefaultAutographIndex  = "autograph_relations"
-	DefaultAutographAsset  = "relations_v1"
-	DefaultAutographModel  = "ggml-org/gemma-4-E4B-it-GGUF"
-	DefaultEntityLabels    = "person,organization,location,date,case,document,facility,aircraft"
-	DefaultRelationLabels  = "associated with,communicated with,traveled to,visited,worked for,represented by,mentioned in,located in"
-	DefaultEntityMaxChars  = 3000
-	DefaultEntityOverlap   = 300
+	DefaultAntflyURL        = "http://localhost:8080/db/v1"
+	DefaultInferenceURL     = "http://localhost:8080"
+	DefaultFullTextIndex    = "full_text_index_v0"
+	DefaultEmbeddingIndex   = "embeddings"
+	DefaultEmbeddingModel   = "antflydb/clipclap"
+	DefaultEmbeddingPull    = "antflydb/clipclap:gguf:Q4_K"
+	DefaultEmbeddingDims    = 512
+	DefaultChunkerModel     = "fixed-bert-tokenizer"
+	DefaultOCRModel         = "microsoft/Florence-2-base-ft"
+	DefaultRecognizerModel  = "antflydb/gliner2-base-v1-q4_k"
+	DefaultAutographIndex   = "autograph_relations"
+	DefaultAutographAsset   = "relations_v1"
+	DefaultAutographModel   = DefaultRecognizerModel
+	DefaultGeneratorModel   = "ggml-org/gemma-4-E4B-it-GGUF"
+	DefaultArtifactProducer = "extractor"
+	DefaultEntityLabels     = "person,organization,location,date,case,document,facility,aircraft"
+	DefaultRelationLabels   = "associated with,communicated with,traveled to,visited,worked for,represented by,mentioned in,located in"
+	DefaultEntityMaxChars   = 3000
+	DefaultEntityOverlap    = 300
 )
 
 // Archive.org download URLs for Epstein documents
@@ -1456,9 +1458,10 @@ func loadCmd(args []string) error {
 	enableArtifactGraph := fs.Bool("enable-artifact-graph", false, "Create artifact-backed autograph relation graph index")
 	artifactGraphIndex := fs.String("artifact-graph-index", DefaultAutographIndex, "Artifact graph index name")
 	artifactName := fs.String("artifact-name", DefaultAutographAsset, "Generated asset artifact name for relation extraction")
-	artifactExtractorModel := fs.String("artifact-extractor-model", DefaultAutographModel, "Antfly generator model for tool-call artifact relation extraction")
-	artifactLabels := fs.String("artifact-labels", DefaultEntityLabels, "Artifact generator entity labels (comma-separated)")
-	artifactRelationLabels := fs.String("artifact-relation-labels", DefaultRelationLabels, "Artifact generator relation labels (comma-separated)")
+	artifactProducer := fs.String("artifact-producer", DefaultArtifactProducer, "Artifact producer type: extractor or generator")
+	artifactExtractorModel := fs.String("artifact-extractor-model", DefaultAutographModel, "Antfly model for artifact relation extraction")
+	artifactLabels := fs.String("artifact-labels", DefaultEntityLabels, "Artifact extractor entity labels (comma-separated)")
+	artifactRelationLabels := fs.String("artifact-relation-labels", DefaultRelationLabels, "Artifact extractor relation labels (comma-separated)")
 
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
@@ -1500,7 +1503,7 @@ func loadCmd(args []string) error {
 			return fmt.Errorf("failed to create search index config: %w", err)
 		}
 		if *enableArtifactGraph {
-			graphIndex, err := createArtifactGraphIndex(*artifactGraphIndex, *artifactName, *artifactExtractorModel, *inferenceURL, splitCSV(*artifactLabels), splitCSV(*artifactRelationLabels))
+			graphIndex, err := createArtifactGraphIndex(*artifactGraphIndex, *artifactName, *artifactProducer, *artifactExtractorModel, *inferenceURL, splitCSV(*artifactLabels), splitCSV(*artifactRelationLabels))
 			if err != nil {
 				return fmt.Errorf("failed to create artifact graph index config: %w", err)
 			}
@@ -1569,9 +1572,10 @@ func syncCmd(args []string) error {
 	enableArtifactGraph := fs.Bool("enable-artifact-graph", false, "Create artifact-backed autograph relation graph index")
 	artifactGraphIndex := fs.String("artifact-graph-index", DefaultAutographIndex, "Artifact graph index name")
 	artifactName := fs.String("artifact-name", DefaultAutographAsset, "Generated asset artifact name for relation extraction")
-	artifactExtractorModel := fs.String("artifact-extractor-model", DefaultAutographModel, "Antfly generator model for tool-call artifact relation extraction")
-	artifactLabels := fs.String("artifact-labels", DefaultEntityLabels, "Artifact generator entity labels (comma-separated)")
-	artifactRelationLabels := fs.String("artifact-relation-labels", DefaultRelationLabels, "Artifact generator relation labels (comma-separated)")
+	artifactProducer := fs.String("artifact-producer", DefaultArtifactProducer, "Artifact producer type: extractor or generator")
+	artifactExtractorModel := fs.String("artifact-extractor-model", DefaultAutographModel, "Antfly model for artifact relation extraction")
+	artifactLabels := fs.String("artifact-labels", DefaultEntityLabels, "Artifact extractor entity labels (comma-separated)")
+	artifactRelationLabels := fs.String("artifact-relation-labels", DefaultRelationLabels, "Artifact extractor relation labels (comma-separated)")
 	noHeaderFooter := fs.Bool("no-header-footer-detection", false, "Disable header/footer detection (faster)")
 	noMirroredRepair := fs.Bool("no-mirrored-text-repair", false, "Disable mirrored text repair (faster)")
 	var zipPaths StringSliceFlag
@@ -1620,7 +1624,7 @@ func syncCmd(args []string) error {
 			return fmt.Errorf("failed to create search index config: %w", err)
 		}
 		if *enableArtifactGraph {
-			graphIndex, err := createArtifactGraphIndex(*artifactGraphIndex, *artifactName, *artifactExtractorModel, *inferenceURL, splitCSV(*artifactLabels), splitCSV(*artifactRelationLabels))
+			graphIndex, err := createArtifactGraphIndex(*artifactGraphIndex, *artifactName, *artifactProducer, *artifactExtractorModel, *inferenceURL, splitCSV(*artifactLabels), splitCSV(*artifactRelationLabels))
 			if err != nil {
 				return fmt.Errorf("failed to create artifact graph index config: %w", err)
 			}
@@ -2047,15 +2051,22 @@ func createSearchTableIndexes(embeddingIndex antfly.IndexConfig) (map[string]ant
 	}, nil
 }
 
-func createArtifactGraphIndex(indexName, artifactName, model, inferenceURL string, labels, relationLabels []string) (*antfly.IndexConfig, error) {
+func createArtifactGraphIndex(indexName, artifactName, producerType, model, inferenceURL string, labels, relationLabels []string) (*antfly.IndexConfig, error) {
 	if strings.TrimSpace(indexName) == "" {
 		return nil, fmt.Errorf("artifact graph index name is required")
 	}
 	if strings.TrimSpace(artifactName) == "" {
 		return nil, fmt.Errorf("artifact name is required")
 	}
+	producerType = strings.TrimSpace(strings.ToLower(producerType))
+	if producerType == "" {
+		producerType = DefaultArtifactProducer
+	}
+	if producerType != "extractor" && producerType != "generator" {
+		return nil, fmt.Errorf("artifact producer must be extractor or generator")
+	}
 	if strings.TrimSpace(model) == "" {
-		return nil, fmt.Errorf("artifact generator model is required")
+		return nil, fmt.Errorf("artifact extractor model is required")
 	}
 	inferenceAPIURL, err := inferenceMLBaseURL(inferenceURL)
 	if err != nil {
@@ -2070,6 +2081,12 @@ func createArtifactGraphIndex(indexName, artifactName, model, inferenceURL strin
 
 	relationEnum := append([]string(nil), relationLabels...)
 	labelEnum := append([]string(nil), labels...)
+	relationSchemas := make([]map[string]any, 0, len(relationLabels))
+	for _, label := range relationLabels {
+		relationSchemas = append(relationSchemas, map[string]any{"type": label})
+	}
+
+	producerJSON := artifactProducerConfig(producerType, model, inferenceAPIURL, labelEnum, relationEnum, relationSchemas)
 
 	raw := map[string]any{
 		"name": indexName,
@@ -2081,90 +2098,32 @@ func createArtifactGraphIndex(indexName, artifactName, model, inferenceURL strin
 			"format":   "extraction_relation",
 		},
 		"artifact": map[string]any{
-			"name":         artifactName,
-			"kind":         "asset",
-			"field":        "content",
-			"content_type": "application/json",
-			"producer_json": map[string]any{
-				"type": "generator",
-				"config": map[string]any{
-					"provider":    "antfly",
-					"model":       model,
-					"api_url":     inferenceAPIURL,
-					"tool_output": "arguments",
-					"tool_name":   "emit_relations",
-					"tool_choice": map[string]any{
-						"type": "function",
-						"function": map[string]any{
-							"name": "emit_relations",
-						},
-					},
-					"tools": []map[string]any{
-						{
-							"type": "function",
-							"function": map[string]any{
-								"name":        "emit_relations",
-								"description": "Extract autograph, signature, sender, recipient, and related entity relationships from the document text. Return only relations directly supported by the text.",
-								"parameters": map[string]any{
-									"type":                 "object",
-									"additionalProperties": false,
-									"required":             []string{"relations"},
-									"properties": map[string]any{
-										"relations": map[string]any{
-											"type": "array",
-											"items": map[string]any{
-												"type":                 "object",
-												"additionalProperties": false,
-												"required":             []string{"type", "target"},
-												"properties": map[string]any{
-													"type": map[string]any{
-														"type": "string",
-														"enum": relationEnum,
-													},
-													"source": map[string]any{
-														"type":        "object",
-														"description": "Optional source endpoint. Omit this to use the current document as the source.",
-														"properties": map[string]any{
-															"id":    map[string]any{"type": "string"},
-															"label": map[string]any{"type": "string", "enum": labelEnum},
-															"text":  map[string]any{"type": "string"},
-														},
-													},
-													"target": map[string]any{
-														"type":        "object",
-														"description": "Target endpoint for the relation. Use id for the normalized entity name.",
-														"required":    []string{"id"},
-														"properties": map[string]any{
-															"id":    map[string]any{"type": "string"},
-															"label": map[string]any{"type": "string", "enum": labelEnum},
-															"text":  map[string]any{"type": "string"},
-														},
-													},
-													"confidence": map[string]any{
-														"type":    "number",
-														"minimum": 0,
-														"maximum": 1,
-													},
-													"evidence": map[string]any{
-														"type":        "string",
-														"description": "Short text span or explanation supporting the relation.",
-													},
-												},
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
+			"name":          artifactName,
+			"kind":          "asset",
+			"field":         "content",
+			"content_type":  "application/json",
+			"producer_json": producerJSON,
 		},
 		"algebraic_planning": map[string]any{
 			"bounded_traversal": map[string]any{
 				"law": "provenance_semiring",
 			},
 		},
+	}
+	if producerType == "extractor" {
+		raw["nodes"] = map[string]any{
+			"model":  "document",
+			"target": "{{ _item.target.text }}",
+		}
+		raw["edge"] = map[string]any{
+			"weight": "{{ _item.score }}",
+			"metadata": map[string]any{
+				"type":          "{{ _item.type }}",
+				"source_entity": "{{ _item.source.text }}",
+				"target_entity": "{{ _item.target.text }}",
+				"score":         "{{ _item.score }}",
+			},
+		}
 	}
 
 	encoded, err := json.Marshal(raw)
@@ -2176,6 +2135,101 @@ func createArtifactGraphIndex(indexName, artifactName, model, inferenceURL strin
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func artifactProducerConfig(producerType, model, inferenceAPIURL string, labels, relationLabels []string, relationSchemas []map[string]any) map[string]any {
+	if producerType == "extractor" {
+		return map[string]any{
+			"type": "extractor",
+			"config": map[string]any{
+				"provider": "antfly",
+				"model":    model,
+				"api_url":  inferenceAPIURL,
+				"schema": map[string]any{
+					"entities":  labels,
+					"relations": relationSchemas,
+				},
+				"options": map[string]any{
+					"include_confidence": true,
+					"include_spans":      true,
+				},
+			},
+		}
+	}
+	return map[string]any{
+		"type": "generator",
+		"config": map[string]any{
+			"provider":    "antfly",
+			"model":       model,
+			"api_url":     inferenceAPIURL,
+			"tool_output": "arguments",
+			"tool_name":   "emit_relations",
+			"tool_choice": map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name": "emit_relations",
+				},
+			},
+			"tools": []map[string]any{
+				{
+					"type": "function",
+					"function": map[string]any{
+						"name":        "emit_relations",
+						"description": "Extract autograph, signature, sender, recipient, and related entity relationships from the document text. Return only relations directly supported by the text.",
+						"parameters": map[string]any{
+							"type":                 "object",
+							"additionalProperties": false,
+							"required":             []string{"relations"},
+							"properties": map[string]any{
+								"relations": map[string]any{
+									"type": "array",
+									"items": map[string]any{
+										"type":                 "object",
+										"additionalProperties": false,
+										"required":             []string{"type", "target"},
+										"properties": map[string]any{
+											"type": map[string]any{
+												"type": "string",
+												"enum": relationLabels,
+											},
+											"source": map[string]any{
+												"type":        "object",
+												"description": "Optional source endpoint. Omit this to use the current document as the source.",
+												"properties": map[string]any{
+													"id":    map[string]any{"type": "string"},
+													"label": map[string]any{"type": "string", "enum": labels},
+													"text":  map[string]any{"type": "string"},
+												},
+											},
+											"target": map[string]any{
+												"type":        "object",
+												"description": "Target endpoint for the relation. Use id for the normalized entity name.",
+												"required":    []string{"id"},
+												"properties": map[string]any{
+													"id":    map[string]any{"type": "string"},
+													"label": map[string]any{"type": "string", "enum": labels},
+													"text":  map[string]any{"type": "string"},
+												},
+											},
+											"confidence": map[string]any{
+												"type":    "number",
+												"minimum": 0,
+												"maximum": 1,
+											},
+											"evidence": map[string]any{
+												"type":        "string",
+												"description": "Short text span or explanation supporting the relation.",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
 }
 
 func searchIndexNames() []string {

@@ -157,6 +157,7 @@ func TestCreateArtifactGraphIndexIncludesProducerConfig(t *testing.T) {
 	idx, err := createArtifactGraphIndex(
 		DefaultAutographIndex,
 		DefaultAutographAsset,
+		"generator",
 		"gemma4-test",
 		DefaultInferenceURL,
 		[]string{"person", "organization"},
@@ -211,6 +212,51 @@ func TestCreateArtifactGraphIndexIncludesProducerConfig(t *testing.T) {
 	tools, ok := cfg["tools"].([]any)
 	if !ok || len(tools) != 1 {
 		t.Fatalf("tools missing from producer config: %#v", cfg)
+	}
+}
+
+func TestCreateArtifactGraphIndexDefaultsToExtractorConfig(t *testing.T) {
+	idx, err := createArtifactGraphIndex(
+		DefaultAutographIndex,
+		DefaultAutographAsset,
+		"",
+		DefaultRecognizerModel,
+		DefaultInferenceURL,
+		[]string{"person", "organization"},
+		[]string{"communicated with"},
+	)
+	if err != nil {
+		t.Fatalf("createArtifactGraphIndex failed: %v", err)
+	}
+
+	encoded, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatalf("marshal graph index: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("unmarshal graph index: %v", err)
+	}
+	artifact := got["artifact"].(map[string]any)
+	producer := artifact["producer_json"].(map[string]any)
+	if producer["type"] != "extractor" {
+		t.Fatalf("producer type = %v, want extractor", producer["type"])
+	}
+	cfg := producer["config"].(map[string]any)
+	if cfg["provider"] != "antfly" || cfg["model"] != DefaultRecognizerModel {
+		t.Fatalf("unexpected extractor config: %#v", cfg)
+	}
+	schema := cfg["schema"].(map[string]any)
+	if len(schema["entities"].([]any)) != 2 || len(schema["relations"].([]any)) != 1 {
+		t.Fatalf("unexpected extractor schema: %#v", schema)
+	}
+	nodes := got["nodes"].(map[string]any)
+	if nodes["target"] != "{{ _item.target.text }}" {
+		t.Fatalf("unexpected extractor node mapping: %#v", nodes)
+	}
+	edge := got["edge"].(map[string]any)
+	if edge["weight"] != "{{ _item.score }}" {
+		t.Fatalf("unexpected extractor edge mapping: %#v", edge)
 	}
 }
 

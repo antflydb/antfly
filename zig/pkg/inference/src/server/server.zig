@@ -2212,7 +2212,9 @@ pub const Node = struct {
             var response_text = result.text;
             var tool_response_text: ?[]u8 = null;
             defer if (tool_response_text) |text| ctx.allocator.free(text);
-            const parsed_tool_calls = if (tool_parser) |*parser| blk: {
+            var fallback_tool_calls: ?[]tool_parser_mod.ToolCall = null;
+            defer if (fallback_tool_calls) |calls| tool_parser_mod.freeToolCalls(ctx.allocator, calls);
+            var parsed_tool_calls = if (tool_parser) |*parser| blk: {
                 parser.reset();
                 _ = parser.feed(result.text) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
@@ -2223,6 +2225,12 @@ pub const Node = struct {
                 const calls = parser.toolCalls();
                 break :blk if (calls.len > 0) calls else null;
             } else null;
+
+            if (parsed_tool_calls == null and tool_parser != null) {
+                fallback_tool_calls = tool_parser_mod.synthesizeForcedFunctionToolCallFromJsonContent(ctx.allocator, response_text, parsed_tool_choice) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                if (fallback_tool_calls) |calls| parsed_tool_calls = calls;
+            }
 
             if (parsed_tool_calls == null and tool_parser != null and response_text.len == 0) {
                 response_text = "No tool call was emitted.";
@@ -2318,7 +2326,9 @@ pub const Node = struct {
                 var response_text = result.text;
                 var tool_response_text: ?[]u8 = null;
                 defer if (tool_response_text) |text| ctx.allocator.free(text);
-                const parsed_tool_calls = if (tool_parser) |*parser| blk: {
+                var fallback_tool_calls: ?[]tool_parser_mod.ToolCall = null;
+                defer if (fallback_tool_calls) |calls| tool_parser_mod.freeToolCalls(ctx.allocator, calls);
+                var parsed_tool_calls = if (tool_parser) |*parser| blk: {
                     parser.reset();
                     _ = parser.feed(result.text) catch |err|
                         return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
@@ -2329,6 +2339,12 @@ pub const Node = struct {
                     const calls = parser.toolCalls();
                     break :blk if (calls.len > 0) calls else null;
                 } else null;
+
+                if (parsed_tool_calls == null and tool_parser != null) {
+                    fallback_tool_calls = tool_parser_mod.synthesizeForcedFunctionToolCallFromJsonContent(ctx.allocator, response_text, parsed_tool_choice) catch |err|
+                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    if (fallback_tool_calls) |calls| parsed_tool_calls = calls;
+                }
 
                 if (parsed_tool_calls == null and tool_parser != null and response_text.len == 0) {
                     response_text = "No tool call was emitted.";
@@ -2599,7 +2615,9 @@ pub const Node = struct {
         var response_text = result.text;
         var tool_response_text: ?[]u8 = null;
         defer if (tool_response_text) |text| ctx.allocator.free(text);
-        const parsed_tool_calls = if (tool_parser) |*parser| blk: {
+        var fallback_tool_calls: ?[]tool_parser_mod.ToolCall = null;
+        defer if (fallback_tool_calls) |calls| tool_parser_mod.freeToolCalls(ctx.allocator, calls);
+        var parsed_tool_calls = if (tool_parser) |*parser| blk: {
             parser.reset();
             _ = parser.feed(result.text) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
@@ -2610,6 +2628,12 @@ pub const Node = struct {
             const calls = parser.toolCalls();
             break :blk if (calls.len > 0) calls else null;
         } else null;
+
+        if (parsed_tool_calls == null and tool_parser != null) {
+            fallback_tool_calls = tool_parser_mod.synthesizeForcedFunctionToolCallFromJsonContent(ctx.allocator, response_text, parsed_tool_choice) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+            if (fallback_tool_calls) |calls| parsed_tool_calls = calls;
+        }
 
         if (parsed_tool_calls == null and tool_parser != null and response_text.len == 0) {
             response_text = "No tool call was emitted.";
