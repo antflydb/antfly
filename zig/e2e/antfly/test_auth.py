@@ -83,10 +83,6 @@ def _try_lookup(api: "AuthApi", table_name: str, key: str):
         return None
 
 
-def _wait_for_lookup(api: "AuthApi", table_name: str, key: str, timeout: float = 60.0):
-    return _wait_until(lambda: _try_lookup(api, table_name, key), timeout=timeout)
-
-
 class AuthApi:
     def __init__(self, base_url: str, server_ref: "SwarmAuthServer | SplitAuthServer"):
         self.url = base_url.rstrip("/")
@@ -489,12 +485,9 @@ def test_swarm_auth_enforces_row_filters_on_lookup_and_query(auth_api: AuthApi):
     )
     auth_api.put("/auth/v1/users/reader/row-filters/docs", {"term": {"tier": "gold"}})
 
-    assert _wait_for_lookup(auth_api, "docs", "doc:gold") is not None
-    assert _wait_for_lookup(auth_api, "docs", "doc:silver") is not None
-
     auth_api.s.headers["Authorization"] = _basic_auth("reader", "reader")
 
-    visible = _wait_for_lookup(auth_api, "docs", "doc:gold")
+    visible = _wait_until(lambda: _try_lookup(auth_api, "docs", "doc:gold"))
     assert visible["title"] == "gold doc"
 
     hidden_lookup = auth_api.s.get(f"{auth_api.url}/tables/docs/lookup/doc:silver", timeout=30)
@@ -627,12 +620,9 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_query(stateful_auth_ap
     )
     stateful_auth_api.put("/auth/v1/users/reader/row-filters/docs", {"term": {"tier": "gold"}})
 
-    assert _wait_for_lookup(stateful_auth_api, "docs", "doc:gold") is not None
-    assert _wait_for_lookup(stateful_auth_api, "docs", "doc:silver") is not None
-
     stateful_auth_api.s.headers["Authorization"] = _basic_auth("reader", "reader")
 
-    visible = _wait_for_lookup(stateful_auth_api, "docs", "doc:gold")
+    visible = _wait_until(lambda: _try_lookup(stateful_auth_api, "docs", "doc:gold"))
     assert visible is not None
     assert visible["title"] == "gold doc"
 

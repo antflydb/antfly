@@ -2617,6 +2617,7 @@ pub fn build(b: *std.Build) void {
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "provisioned table write cache retires stale db when index metadata changes",
+        "primary lookup adopts seeded write cache across visible generation bump",
     };
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
