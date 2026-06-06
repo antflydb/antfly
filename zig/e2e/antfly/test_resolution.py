@@ -174,7 +174,7 @@ class _Api:
     def query_table(self, table: str, payload: dict, *, timeout: float = 30.0) -> dict:
         return self._check(self.s.post(f"{self.url}/tables/{table}/query", json=payload, timeout=timeout))
 
-    def diagnostic(self) -> str:
+    def diagnostic(self, *, graph_payload: dict | None = None) -> str:
         parts: list[str] = []
         for label, path in (
             ("documents table", "/tables/documents"),
@@ -186,8 +186,36 @@ class _Api:
                 parts.append(f"[{label}] {response.status_code} {response.text[:4000]}")
             except requests.RequestException as exc:
                 parts.append(f"[{label}] unavailable: {exc!r}")
+        if graph_payload is not None:
+            parts.append(self._graph_probe_diagnostic(graph_payload))
         parts.append(f"[metadata snapshot]\n{self._server.metadata_snapshot_diagnostic()}")
         parts.append(f"[logs]\n{self._server.debug_logs()}")
+        return "\n".join(parts)
+
+    def _graph_probe_diagnostic(self, payload: dict) -> str:
+        parts: list[str] = ["[graph query probes]"]
+        for index, base_url in enumerate(self._server.data_api_urls):
+            url = base_url.rstrip("/")
+            try:
+                status = self.s.get(
+                    f"{url}/tables/documents/indexes/relations_graph",
+                    timeout=5,
+                )
+                parts.append(
+                    f"[data {index} graph index] {status.status_code} {status.text[:3000]}"
+                )
+            except requests.RequestException as exc:
+                parts.append(f"[data {index} graph index] unavailable: {exc!r}")
+
+            try:
+                query = self.s.post(
+                    f"{url}/tables/documents/query",
+                    json=payload,
+                    timeout=5,
+                )
+                parts.append(f"[data {index} graph query] {query.status_code} {query.text[:3000]}")
+            except requests.RequestException as exc:
+                parts.append(f"[data {index} graph query] unavailable: {exc!r}")
         return "\n".join(parts)
 
 
@@ -334,7 +362,7 @@ def _wait_for_mention_hydration(
         f"mention graph did not hydrate promoted entities within {deadline.timeout_s}s "
         f"(elapsed={deadline.elapsed():.1f}s, start_node={start_node!r}, "
         f"expected={expected_names!r}, last={last!r}, last_error={last_error!r})\n"
-        f"{api.diagnostic()}"
+        f"{api.diagnostic(graph_payload=payload)}"
     )
 
 

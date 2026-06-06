@@ -93,6 +93,13 @@ pub fn messagesHaveAudio(messages: []const Message) bool {
     return false;
 }
 
+pub fn userFacingErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.AudioInputTooLong => "audio input is too long for the Gemma4 direct audio projector; trim the clip or raise clip.audio.max_tokens in the projector metadata",
+        else => @errorName(err),
+    };
+}
+
 pub const GenerationConfig = struct {
     max_tokens: i32 = 256,
     temperature: f32 = 0,

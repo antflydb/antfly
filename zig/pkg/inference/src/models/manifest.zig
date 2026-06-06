@@ -2355,6 +2355,34 @@ test "listing manifest detects gguf assets without gguf metadata parse" {
     try std.testing.expect(manifest.gguf_projector_path != null);
 }
 
+test "manifest treats gemma4 unified config as generator" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{"model_type":"gemma4_unified","text_config":{"model_type":"gemma4_unified_text"}}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "gemma-4-12B-it-Q4_K_M.gguf", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mmproj-gemma-4-12B-it-bf16.gguf", .data = "" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try std.testing.expectEqualStrings("gemma4_unified", manifest.config_model_arch);
+    try std.testing.expect(manifest.gguf_path != null);
+    try std.testing.expect(manifest.gguf_projector_path != null);
+}
+
 test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {
     const allocator = std.testing.allocator;
 
