@@ -757,6 +757,7 @@ pub const WriteParticipant = struct {
         constraint: schema_mod.UniqueConstraint,
         encoded_value: []const u8,
     ) !void {
+        if (!uniqueConstraintCanBackForeignKey(constraint)) return;
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (foreign_key.on_delete != .set_null) continue;
@@ -847,6 +848,7 @@ pub const WriteParticipant = struct {
         constraint: schema_mod.UniqueConstraint,
         encoded_value: []const u8,
     ) anyerror!void {
+        if (!uniqueConstraintCanBackForeignKey(constraint)) return;
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (foreign_key.on_delete != .cascade) continue;
@@ -1030,6 +1032,7 @@ pub const WriteParticipant = struct {
         constraint: schema_mod.UniqueConstraint,
         encoded_value: []const u8,
     ) !void {
+        if (!uniqueConstraintCanBackForeignKey(constraint)) return;
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (!foreignKeyDeleteActionRestricts(foreign_key)) continue;
@@ -1047,6 +1050,7 @@ pub const WriteParticipant = struct {
         constraint: schema_mod.UniqueConstraint,
         encoded_value: []const u8,
     ) !void {
+        if (!uniqueConstraintCanBackForeignKey(constraint)) return;
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (!foreignKeyUpdateActionRestricts(foreign_key)) continue;
@@ -1064,6 +1068,7 @@ pub const WriteParticipant = struct {
         constraint: schema_mod.UniqueConstraint,
         encoded_value: []const u8,
     ) anyerror!void {
+        if (!uniqueConstraintCanBackForeignKey(constraint)) return;
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (foreign_key.on_update != .set_null) continue;
@@ -1078,6 +1083,7 @@ pub const WriteParticipant = struct {
         old_encoded_value: []const u8,
         new_parent_row: []const u8,
     ) anyerror!void {
+        if (!uniqueConstraintCanBackForeignKey(constraint)) return;
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (foreign_key.on_update != .cascade) continue;
@@ -1263,9 +1269,14 @@ fn foreignKeyUpdateActionRestricts(foreign_key: schema_mod.ForeignKey) bool {
 
 fn findUniqueConstraintByColumns(constraints: []const schema_mod.UniqueConstraint, columns: []const []const u8) ?schema_mod.UniqueConstraint {
     for (constraints) |constraint| {
+        if (!uniqueConstraintCanBackForeignKey(constraint)) continue;
         if (stringSlicesEqual(constraint.columns, columns)) return constraint;
     }
     return null;
+}
+
+fn uniqueConstraintCanBackForeignKey(constraint: schema_mod.UniqueConstraint) bool {
+    return constraint.where.len == 0 and constraint.expressions.len == 0;
 }
 
 fn foreignKeyParentExists(
@@ -1587,14 +1598,67 @@ fn findCellInRow(cells: []const relational_row_codec.Cell, path: []const u8) ?re
 }
 
 pub fn uniqueConstraintTupleValueAlloc(alloc: Allocator, row_value: []const u8, constraint: schema_mod.UniqueConstraint) !?[]u8 {
-    return try uniqueConstraintColumnsTupleValueAlloc(alloc, row_value, constraint.columns);
+    if (!(try rowMatchesUniqueConstraintPredicates(alloc, row_value, constraint.where))) return null;
+    return try uniqueConstraintKeysTupleValueAlloc(alloc, row_value, constraint.columns, constraint.expressions);
 }
 
-fn uniqueConstraintColumnsTupleValueAlloc(alloc: Allocator, row_value: []const u8, columns: []const []const u8) !?[]u8 {
+fn rowMatchesUniqueConstraintPredicates(alloc: Allocator, row_value: []const u8, predicates: []const schema_mod.UniquePredicate) !bool {
+    for (predicates) |predicate| {
+        if (!(try rowMatchesUniqueConstraintPredicate(alloc, row_value, predicate))) return false;
+    }
+    return true;
+}
+
+fn rowMatchesUniqueConstraintPredicate(alloc: Allocator, row_value: []const u8, predicate: schema_mod.UniquePredicate) !bool {
+    const cell = try relational_row_codec.findCellByPath(row_value, predicate.field);
+    return switch (predicate.op) {
+        .is_null => cell == null,
+        .is_not_null => cell != null,
+        .eq => blk: {
+            const present = cell orelse break :blk false;
+            const value_json = predicate.value_json orelse return error.InvalidColumnValue;
+            break :blk try cellEqualsJsonLiteral(alloc, present, value_json);
+        },
+        .ne => blk: {
+            const present = cell orelse break :blk false;
+            const value_json = predicate.value_json orelse return error.InvalidColumnValue;
+            break :blk !(try cellEqualsJsonLiteral(alloc, present, value_json));
+        },
+    };
+}
+
+fn cellEqualsJsonLiteral(alloc: Allocator, cell: relational_row_codec.Cell, value_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+    defer parsed.deinit();
+    switch (cell.value) {
+        .bytes_val => |bytes| return parsed.value == .string and std.mem.eql(u8, bytes, parsed.value.string),
+        .bool_val => |value| return parsed.value == .bool and value == parsed.value.bool,
+        .u64_val => |value| switch (parsed.value) {
+            .integer => |parsed_int| return parsed_int >= 0 and value == @as(u64, @intCast(parsed_int)),
+            else => return false,
+        },
+        .f64_val => |value| switch (parsed.value) {
+            .integer => |parsed_int| return value == @as(f64, @floatFromInt(parsed_int)),
+            .float => |parsed_float| return value == parsed_float,
+            else => return false,
+        },
+        .geo_point => return false,
+    }
+}
+
+fn uniqueConstraintKeysTupleValueAlloc(alloc: Allocator, row_value: []const u8, columns: []const []const u8, expressions: []const schema_mod.UniqueExpression) !?[]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     for (columns) |column_path| {
         const component = (try uniqueConstraintColumnValueAlloc(alloc, row_value, column_path)) orelse {
+            out.deinit(alloc);
+            return null;
+        };
+        defer alloc.free(component);
+        try internal_keys.appendEncodedComponent(&out, alloc, component);
+    }
+    for (expressions) |expression| {
+        const component = (try uniqueConstraintExpressionValueAlloc(alloc, row_value, expression)) orelse {
             out.deinit(alloc);
             return null;
         };
@@ -1703,6 +1767,27 @@ fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
 fn uniqueConstraintColumnValueAlloc(alloc: Allocator, row_value: []const u8, column_path: []const u8) !?[]u8 {
     const cell = (try relational_row_codec.findCellByPath(row_value, column_path)) orelse return null;
     if (cell.is_json) return error.InvalidColumnValue;
+    return try uniqueConstraintCellValueAlloc(alloc, cell);
+}
+
+fn uniqueConstraintExpressionValueAlloc(alloc: Allocator, row_value: []const u8, expression: schema_mod.UniqueExpression) !?[]u8 {
+    return switch (expression.op) {
+        .lower => blk: {
+            const cell = (try relational_row_codec.findCellByPath(row_value, expression.field)) orelse return null;
+            if (cell.is_json) return error.InvalidColumnValue;
+            const bytes = switch (cell.value) {
+                .bytes_val => |value| value,
+                else => return error.InvalidColumnValue,
+            };
+            const lowered = try alloc.alloc(u8, bytes.len + 1);
+            lowered[0] = @intFromEnum(typed_dv.ValueType.bytes_val);
+            for (bytes, 0..) |ch, i| lowered[i + 1] = std.ascii.toLower(ch);
+            break :blk lowered;
+        },
+    };
+}
+
+fn uniqueConstraintCellValueAlloc(alloc: Allocator, cell: relational_row_codec.Cell) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.append(alloc, @intFromEnum(cell.value_type));

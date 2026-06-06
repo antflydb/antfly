@@ -314,6 +314,8 @@ fn deriveRuntimeUniqueConstraints(alloc: std.mem.Allocator, schema: ParsedTableS
         constraints[initialized] = .{
             .name = try alloc.dupe(u8, constraint.name),
             .columns = try cloneStringSlice(alloc, constraint.columns),
+            .expressions = try cloneUniqueExpressions(alloc, constraint.expressions),
+            .where = try cloneUniquePredicates(alloc, constraint.where),
         };
         initialized += 1;
     }
@@ -325,8 +327,62 @@ fn freeRuntimeUniqueConstraints(alloc: std.mem.Allocator, constraints: []storage
         alloc.free(constraint.name);
         for (constraint.columns) |column| alloc.free(column);
         if (constraint.columns.len > 0) alloc.free(constraint.columns);
+        for (constraint.expressions) |expression| alloc.free(expression.field);
+        if (constraint.expressions.len > 0) alloc.free(constraint.expressions);
+        for (constraint.where) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+        if (constraint.where.len > 0) alloc.free(constraint.where);
     }
     if (constraints.len > 0) alloc.free(constraints);
+}
+
+fn cloneUniqueExpressions(alloc: std.mem.Allocator, values: []const impl.UniqueExpression) ![]const storage_schema.UniqueExpression {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.UniqueExpression, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |expression| alloc.free(expression.field);
+        alloc.free(out);
+    }
+    for (values) |value| {
+        out[initialized] = .{
+            .op = switch (value.op) {
+                .lower => .lower,
+            },
+            .field = try alloc.dupe(u8, value.field),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneUniquePredicates(alloc: std.mem.Allocator, values: []const impl.UniquePredicate) ![]const storage_schema.UniquePredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.UniquePredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+        alloc.free(out);
+    }
+    for (values) |value| {
+        out[initialized] = .{
+            .field = try alloc.dupe(u8, value.field),
+            .op = switch (value.op) {
+                .is_null => .is_null,
+                .is_not_null => .is_not_null,
+                .eq => .eq,
+                .ne => .ne,
+            },
+            .value_json = if (value.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
+        };
+        initialized += 1;
+    }
+    return out;
 }
 
 fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {

@@ -382,6 +382,265 @@ index-local metadata; they are not a second relational column store. Joins and
 `GROUP BY`-over-join are unchanged — they already exist (see `JOINS.md`,
 `ALGEBRAIC.md`).
 
+### SQL compatibility boundary
+
+Relational mode is the storage and API substrate that a SQL DSL can target. It
+is not itself a PostgreSQL wire server, SQL parser, migration runner, or PL/SQL
+runtime. PostgreSQL-specific compatibility work such as `pgx` protocol behavior,
+`golang-migrate` replay, extensions, triggers, PL/pgSQL functions, and exact
+PostgreSQL DDL syntax belongs in an adapter layer above this model.
+
+The useful compatibility split is:
+
+- **Adapter-level PostgreSQL compatibility:** wire protocol, SQL text parsing,
+  PostgreSQL catalog views, migration-file replay, extension emulation,
+  PostgreSQL-specific DDL syntax, PL/pgSQL, trigger/function compatibility, and
+  exact error-code/message mapping. These can sit above the Antfly API and do
+  not need to change the relational storage model.
+- **Model-level SQL semantics:** the durable row, index, constraint, mutation,
+  and query contracts that multiple frontends can target. These belong in
+  relational mode itself because the engine must enforce them consistently for
+  SQL, REST, SDK, and internal callers.
+
+The remaining model-level work for a Colony-shaped SQL surface is below. These
+items should be implemented as explicit API/runtime contracts first, then mapped
+from SQL syntax by an adapter.
+
+#### Partial and expression indexes
+
+Secondary indexes and unique constraints need optional predicates plus
+expression keys:
+
+```json
+{
+  "unique_constraints": [
+    {
+      "name": "users_active_slug_key",
+      "columns": ["tenant_id", "slug"],
+      "where": {
+        "all": [
+          { "field": "status", "op": "eq", "value": "active" }
+        ]
+      }
+    },
+    {
+      "name": "users_lower_email_key",
+      "columns": ["tenant_id"],
+      "expressions": [
+        { "op": "lower", "field": "email" }
+      ]
+    }
+  ]
+}
+```
+
+Partial unique constraints are required for common SQL patterns such as "one
+active row" and "unique when nullable value is present". Expression indexes are
+required for normalized lookup keys such as `lower(email)` and for computed
+ordering/filtering terms. SQL text is parsed above this layer; the backend
+catalog stores typed Antfly AST metadata such as `{ "op": "lower",
+"field": "email" }` and predicate atoms such as `{ "field": "status", "op":
+"eq", "value": "active" }`. Schema validation checks each expression,
+dependency tracking records the base columns it reads, writes evaluate
+expression values from the committed row, and index/unique-owner maintenance
+uses those computed values in the same 2PC path as ordinary column indexes.
+Foreign keys must not target partial or expression unique constraints because
+they do not prove total parent uniqueness over a declared column tuple.
+
+#### Conflict-target upsert
+
+`ON CONFLICT (cols...) [WHERE predicate] DO UPDATE/NOTHING` should lower to an
+explicit conflict-target operation over a primary or unique owner row:
+
+```json
+{
+  "op": "insert",
+  "row": { "tenant_id": "t1", "email": "a@example.com", "name": "Ann" },
+  "on_conflict": {
+    "target": {
+      "unique": { "name": "users_tenant_email_key" }
+    },
+    "action": "update",
+    "patch": { "name": "Ann" }
+  }
+}
+```
+
+This is distinct from the current primary-key based `upsert`, which always
+addresses row identity. Conflict-target upsert first resolves the owner row for
+the named primary/unique target, then applies `DO NOTHING` or a guarded
+read-modify-write update to that resolved row. The backend does not accept SQL
+fragments here: `{ "target": { "primary": true } }` means the inserted row's
+primary-key tuple, and `{ "target": { "unique": { "name": "..." } } }` means
+the named unique constraint's tuple inferred from the inserted row. That
+inference supports ordinary columns, typed expressions such as `lower(email)`,
+and typed partial predicates without copying SQL text into storage metadata. The
+conflict target and optional partial-index predicate must be part of the durable
+plan so concurrent inserts for the same unique value conflict on the same owner
+record.
+
+#### Mutation result projection
+
+`INSERT/UPDATE/DELETE ... RETURNING` should be represented as a mutation output
+projection:
+
+```json
+{
+  "op": "update",
+  "where": { "primary": { "tenant_id": "t1", "id": "u1" } },
+  "patch": { "status": "disabled" },
+  "returning": ["tenant_id", "id", "status", "updated_at"]
+}
+```
+
+The row API exposes this as a typed `returning` field on each mutation, for
+example `{ "returning": ["tenant_id", "id", "status"] }` or
+`{ "returning": ["*"] }`. The result is emitted as a `returning` array on the
+batch response. Inserts project the proposed row image. Updates resolve the base
+row, apply the same transform logic used by storage, and project the post-image.
+Deletes project the resolved pre-delete row image. Update/delete returning adds a
+version predicate for the row image that was projected, so the commit either
+installs/removes the value represented in the response or fails with an OCC
+conflict. The projection is deliberately based on row JSON/relational row state
+captured for the mutation, not a derived index read after commit.
+
+#### Row claiming and lock semantics
+
+`FOR UPDATE` and `FOR UPDATE SKIP LOCKED` need a first-class row-claim contract
+for queue and ledger workloads:
+
+```json
+{
+  "query": { "table": "jobs", "where": { "status": "ready" } },
+  "claim": {
+    "mode": "for_update",
+    "skip_locked": true,
+    "lease_ms": 30000
+  },
+  "order_by": [{ "field": "created_at", "direction": "asc" }],
+  "limit": 100
+}
+```
+
+The implementation should use durable row-intent ownership and 2PC visibility.
+A claim is not a best-effort scan filter: the range owner must install an
+intent/lease record for selected rows, competing claimers must either wait or
+skip locked rows according to the request, and commit/abort/recovery must clear
+or expire claims deterministically. The query API already has a typed
+`claim`/`row_claim` contract with `mode`, `skip_locked`, `lease_ms`, and
+`owner_id`; the remaining execution work is to have range owners turn that
+contract into durable row claim records during candidate selection and to expose
+release/renew behavior through transaction/session ownership. This is the
+storage primitive that SQL `SELECT ... FOR UPDATE SKIP LOCKED` and API queue
+consumers should share.
+
+#### Array and multivalue columns
+
+Array values need canonical physical encoding, equality/containment semantics,
+`ANY`-style predicates, and index support where declared:
+
+```json
+{
+  "columns": {
+    "tags": { "type": "array", "items": { "type": "keyword" }, "indexed": true }
+  }
+}
+```
+
+The engine should distinguish arrays from opaque JSON. A declared array column
+has a stable element type, canonical value ordering/equality rules, null/empty
+semantics, and optional element index entries for containment and `ANY` filters.
+For arrays that are also used by unique constraints or generated expressions,
+the catalog must specify whether order-sensitive or set-like comparison is used.
+Fully schemaless arrays can still live inside a `json` column.
+
+#### JSON path and update operators
+
+JSON columns already reuse document-style indexing, but SQL-shaped operators
+need stable API and planner semantics over the stored JSON subtree:
+
+```json
+{
+  "op": "update",
+  "where": { "primary": { "tenant_id": "t1", "id": "u1" } },
+  "json_set": [
+    { "field": "attrs", "path": ["billing", "plan"], "value": "pro" }
+  ]
+}
+```
+
+Extraction (`->`, `->>`), containment (`@>`), existence, and path predicates
+should compile to a JSON-column expression contract. Patch/update operations
+such as `jsonb_set` must rewrite only the JSON cell, then reproject derived
+full-text/path-fact/algebraic indexes for that subtree from the committed row.
+Changing a JSON column's embedded schema remains a derived-index rebuild, not a
+base-row migration.
+
+#### Checks, defaults, and generated values
+
+Required schema fields cover `NOT NULL`, but ordinary relational schemas also
+need table-owned `CHECK` predicates, server-side defaults, and generated values:
+
+```json
+{
+  "checks": [
+    { "name": "orders_amount_nonnegative", "expression": "amount >= 0" }
+  ],
+  "columns": {
+    "created_at": { "type": "datetime", "default": { "function": "now" } },
+    "slug": {
+      "type": "keyword",
+      "generated": {
+        "stored": true,
+        "expression": "lower(name)"
+      }
+    }
+  }
+}
+```
+
+Defaults are applied by the write participant before projection and constraint
+checks, so every write path sees the same values. Generated stored columns are
+computed from the planned row and persisted as ordinary relational cells; they
+can participate in indexes, unique constraints, foreign keys, and `RETURNING`.
+`CHECK` predicates evaluate against the final planned row image after defaults,
+patches, JSON updates, and generated values are applied.
+
+#### Relational query lowering
+
+Joins, aggregates, `ORDER BY`, `LIMIT`, and `OFFSET` already have engine pieces,
+but they need a first-class relational query contract that plans against base
+rows and declared indexes before a SQL DSL can expose them as ordinary query
+clauses:
+
+```json
+{
+  "from": "orders",
+  "where": { "tenant_id": "t1", "status": "open" },
+  "join": [
+    {
+      "table": "customers",
+      "on": [["orders.tenant_id", "customers.tenant_id"],
+             ["orders.customer_id", "customers.customer_id"]]
+    }
+  ],
+  "select": ["orders.id", "customers.name"],
+  "order_by": [{ "field": "orders.created_at", "direction": "desc" }],
+  "limit": 50,
+  "offset": 0
+}
+```
+
+The planner should prefer primary-key, unique-owner, partial/expression, and
+column-major indexes; fall back to base-row scans when required; and keep
+projection/materialization on the relational row codec. Non-recursive CTEs are
+mostly query composition over this contract. Recursive CTEs are a separate
+graph/fixpoint feature and should be treated as a distinct planner extension.
+
+Those model-level items are not PostgreSQL-specific. They are the durable
+relational semantics that the storage model should expose so a future SQL
+dialect, REST API, or client SDK can compile to the same operations.
+
 ### Schema evolution
 
 `schema_capability.classifyChange` already distinguishes additive changes

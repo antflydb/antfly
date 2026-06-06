@@ -3386,6 +3386,7 @@ pub fn build(b: *std.Build) void {
             "table schema write validation",
             "metadata.schema update",
             "metadata.query routing",
+            "api query contract parses typed row claim request",
             "derive initial ranges",
             // api/indexes.zig: index status/config encoders and aggregation.
             "index encoders expose",
@@ -3710,6 +3711,8 @@ pub fn build(b: *std.Build) void {
         .root_module = api_rows_test_mod,
         .filters = &.{
             "relational rows unique selector",
+            "relational rows conflict target upsert",
+            "relational rows batch returning",
             "api http server resolves relational rows by unique selector",
             "relational unique owner lookup requires one active owner range",
         },

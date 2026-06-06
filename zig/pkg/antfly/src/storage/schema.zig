@@ -175,6 +175,30 @@ pub const ForeignKey = struct {
 pub const UniqueConstraint = struct {
     name: []const u8,
     columns: []const []const u8 = &.{},
+    expressions: []const UniqueExpression = &.{},
+    where: []const UniquePredicate = &.{},
+};
+
+pub const UniqueExpressionOp = enum(u8) {
+    lower = 0,
+};
+
+pub const UniqueExpression = struct {
+    op: UniqueExpressionOp,
+    field: []const u8,
+};
+
+pub const UniquePredicateOp = enum(u8) {
+    is_null = 0,
+    is_not_null = 1,
+    eq = 2,
+    ne = 3,
+};
+
+pub const UniquePredicate = struct {
+    field: []const u8,
+    op: UniquePredicateOp,
+    value_json: ?[]const u8 = null,
 };
 
 pub const PrimaryKey = struct {
@@ -221,8 +245,35 @@ pub fn uniqueConstraintCatalogsEqual(current: []const UniqueConstraint, next: []
     for (current, next) |a, b| {
         if (!std.mem.eql(u8, a.name, b.name)) return false;
         if (!stringSlicesEqual(a.columns, b.columns)) return false;
+        if (!uniqueExpressionSlicesEqual(a.expressions, b.expressions)) return false;
+        if (!uniquePredicateSlicesEqual(a.where, b.where)) return false;
     }
     return true;
+}
+
+fn uniqueExpressionSlicesEqual(a: []const UniqueExpression, b: []const UniqueExpression) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left.op != right.op) return false;
+        if (!std.mem.eql(u8, left.field, right.field)) return false;
+    }
+    return true;
+}
+
+fn uniquePredicateSlicesEqual(a: []const UniquePredicate, b: []const UniquePredicate) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left.op != right.op) return false;
+        if (!std.mem.eql(u8, left.field, right.field)) return false;
+        if (!optionalStringsEqual(left.value_json, right.value_json)) return false;
+    }
+    return true;
+}
+
+fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
@@ -266,7 +317,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 17); // format version
+    try appendU32(&buf, alloc, 19); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -352,6 +403,17 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try appendStr(&buf, alloc, constraint.name);
         try appendU32(&buf, alloc, @intCast(constraint.columns.len));
         for (constraint.columns) |column| try appendStr(&buf, alloc, column);
+        try appendU32(&buf, alloc, @intCast(constraint.expressions.len));
+        for (constraint.expressions) |expression| {
+            try buf.append(alloc, @intFromEnum(expression.op));
+            try appendStr(&buf, alloc, expression.field);
+        }
+        try appendU32(&buf, alloc, @intCast(constraint.where.len));
+        for (constraint.where) |predicate| {
+            try buf.append(alloc, @intFromEnum(predicate.op));
+            try appendStr(&buf, alloc, predicate.field);
+            try appendOptStr(&buf, alloc, predicate.value_json);
+        }
     }
 
     // Primary-key catalog (format version 17+).
@@ -376,7 +438,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 17) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 19) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -736,9 +798,15 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer alloc.free(name);
             const columns = try readStringSliceAlloc(alloc, data, &pos);
             errdefer freeStringSlice(alloc, columns);
+            const expressions = if (fmt_version >= 19) try readUniqueExpressionSliceAlloc(alloc, data, &pos) else &.{};
+            errdefer freeUniqueExpressionSlice(alloc, expressions);
+            const where = if (fmt_version >= 19) try readUniquePredicateSliceAlloc(alloc, data, &pos) else &.{};
+            errdefer freeUniquePredicateSlice(alloc, where);
             constraint.* = .{
                 .name = name,
                 .columns = columns,
+                .expressions = expressions,
+                .where = where,
             };
             constraints_initialized += 1;
         }
@@ -821,6 +889,21 @@ fn freeUniqueConstraintsSlice(alloc: Allocator, constraints: []const UniqueConst
 fn freeUniqueConstraint(alloc: Allocator, constraint: UniqueConstraint) void {
     alloc.free(constraint.name);
     freeStringSlice(alloc, constraint.columns);
+    freeUniqueExpressionSlice(alloc, constraint.expressions);
+    freeUniquePredicateSlice(alloc, constraint.where);
+}
+
+fn freeUniqueExpressionSlice(alloc: Allocator, expressions: []const UniqueExpression) void {
+    for (expressions) |expression| alloc.free(expression.field);
+    if (expressions.len > 0) alloc.free(expressions);
+}
+
+fn freeUniquePredicateSlice(alloc: Allocator, predicates: []const UniquePredicate) void {
+    for (predicates) |predicate| {
+        alloc.free(predicate.field);
+        if (predicate.value_json) |value| alloc.free(value);
+    }
+    if (predicates.len > 0) alloc.free(predicates);
 }
 
 fn freePrimaryKey(alloc: Allocator, primary_key: PrimaryKey) void {
@@ -1194,6 +1277,13 @@ fn appendOptStr(buf: *std.ArrayListUnmanaged(u8), alloc: Allocator, s: ?[]const 
     }
 }
 
+fn readOptStrAlloc(alloc: Allocator, data: []const u8, pos: *usize) !?[]const u8 {
+    const present = data[pos.*] == 1;
+    pos.* += 1;
+    if (!present) return null;
+    return try alloc.dupe(u8, readStr(data, pos));
+}
+
 fn readU32(data: []const u8, pos: *usize) u32 {
     const val = std.mem.readInt(u32, data[pos.*..][0..4], .little);
     pos.* += 4;
@@ -1224,6 +1314,65 @@ fn readStringSliceAlloc(alloc: Allocator, data: []const u8, pos: *usize) ![]cons
     }
     for (out) |*value| {
         value.* = try alloc.dupe(u8, readStr(data, pos));
+        initialized += 1;
+    }
+    return out;
+}
+
+fn readUniqueExpressionSliceAlloc(alloc: Allocator, data: []const u8, pos: *usize) ![]const UniqueExpression {
+    const count = readU32(data, pos);
+    if (count == 0) return &.{};
+    const out = try alloc.alloc(UniqueExpression, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |expression| alloc.free(expression.field);
+        alloc.free(out);
+    }
+    for (out) |*expression| {
+        const op: UniqueExpressionOp = switch (data[pos.*]) {
+            0 => .lower,
+            else => return error.InvalidSchema,
+        };
+        pos.* += 1;
+        expression.* = .{
+            .op = op,
+            .field = try alloc.dupe(u8, readStr(data, pos)),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn readUniquePredicateSliceAlloc(alloc: Allocator, data: []const u8, pos: *usize) ![]const UniquePredicate {
+    const count = readU32(data, pos);
+    if (count == 0) return &.{};
+    const out = try alloc.alloc(UniquePredicate, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value| alloc.free(value);
+        }
+        alloc.free(out);
+    }
+    for (out) |*predicate| {
+        const op: UniquePredicateOp = switch (data[pos.*]) {
+            0 => .is_null,
+            1 => .is_not_null,
+            2 => .eq,
+            3 => .ne,
+            else => return error.InvalidSchema,
+        };
+        pos.* += 1;
+        const field = try alloc.dupe(u8, readStr(data, pos));
+        errdefer alloc.free(field);
+        const value_json = try readOptStrAlloc(alloc, data, pos);
+        errdefer if (value_json) |value| alloc.free(value);
+        predicate.* = .{
+            .field = field,
+            .op = op,
+            .value_json = value_json,
+        };
         initialized += 1;
     }
     return out;
@@ -1412,6 +1561,16 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
             .{
                 .name = "users_tenant_email_key",
                 .columns = &.{ "tenant_id", "email" },
+                .where = &.{
+                    .{ .field = "email", .op = .is_not_null },
+                },
+            },
+            .{
+                .name = "users_lower_email_key",
+                .columns = &.{"tenant_id"},
+                .expressions = &.{
+                    .{ .op = .lower, .field = "email" },
+                },
             },
         },
     };
@@ -1454,11 +1613,18 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expect(loaded.foreign_keys[2].deferrable);
     try std.testing.expectEqual(ForeignKeyMatch.simple, loaded.foreign_keys[2].match);
     try std.testing.expectEqual(ForeignKeyValidationState.enforced, loaded.foreign_keys[2].validation_state);
-    try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints.len);
+    try std.testing.expectEqual(@as(usize, 2), loaded.unique_constraints.len);
     try std.testing.expectEqualStrings("users_tenant_email_key", loaded.unique_constraints[0].name);
     try std.testing.expectEqual(@as(usize, 2), loaded.unique_constraints[0].columns.len);
     try std.testing.expectEqualStrings("tenant_id", loaded.unique_constraints[0].columns[0]);
     try std.testing.expectEqualStrings("email", loaded.unique_constraints[0].columns[1]);
+    try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[0].where.len);
+    try std.testing.expectEqualStrings("email", loaded.unique_constraints[0].where[0].field);
+    try std.testing.expectEqual(UniquePredicateOp.is_not_null, loaded.unique_constraints[0].where[0].op);
+    try std.testing.expectEqualStrings("users_lower_email_key", loaded.unique_constraints[1].name);
+    try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[1].expressions.len);
+    try std.testing.expectEqual(UniqueExpressionOp.lower, loaded.unique_constraints[1].expressions[0].op);
+    try std.testing.expectEqualStrings("email", loaded.unique_constraints[1].expressions[0].field);
 }
 
 test "schema save/load via DocStore" {

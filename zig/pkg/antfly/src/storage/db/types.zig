@@ -1047,6 +1047,7 @@ pub const SearchRequest = struct {
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     defer_stored_projection: bool = false,
+    row_claim: ?RowClaimRequest = null,
     limit: u32 = 10,
     offset: u32 = 0,
     include_stored: bool = true,
@@ -1092,6 +1093,17 @@ pub const ReturnMode = enum {
     parent,
     chunk,
     parent_with_chunks,
+};
+
+pub const RowClaimMode = enum {
+    for_update,
+};
+
+pub const RowClaimRequest = struct {
+    mode: RowClaimMode = .for_update,
+    skip_locked: bool = false,
+    lease_ms: u64 = 30_000,
+    owner_id: []const u8 = "",
 };
 
 pub const NamedGraphQuery = struct {

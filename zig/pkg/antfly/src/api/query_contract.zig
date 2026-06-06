@@ -1746,6 +1746,47 @@ fn applyCommonSearchRequestOptions(
     if (req.count_only and req.reranker != null) return error.UnsupportedQueryRequest;
 }
 
+fn parseRowClaimRequestAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) !?db_mod.types.RowClaimRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const claim_value = parsed.value.object.get("claim") orelse return null;
+    if (claim_value != .object) return error.InvalidQueryRequest;
+
+    const mode_value = claim_value.object.get("mode") orelse return error.InvalidQueryRequest;
+    if (mode_value != .string) return error.InvalidQueryRequest;
+    const mode: db_mod.types.RowClaimMode = if (std.mem.eql(u8, mode_value.string, "for_update"))
+        .for_update
+    else
+        return error.InvalidQueryRequest;
+
+    const skip_locked = if (claim_value.object.get("skip_locked")) |value| blk: {
+        if (value != .bool) return error.InvalidQueryRequest;
+        break :blk value.bool;
+    } else false;
+    const lease_ms = if (claim_value.object.get("lease_ms")) |value| blk: {
+        const parsed_ms = switch (value) {
+            .integer => |integer| if (integer > 0) @as(u64, @intCast(integer)) else return error.InvalidQueryRequest,
+            .number_string => |text| std.fmt.parseUnsigned(u64, text, 10) catch return error.InvalidQueryRequest,
+            else => return error.InvalidQueryRequest,
+        };
+        if (parsed_ms == 0) return error.InvalidQueryRequest;
+        break :blk parsed_ms;
+    } else 30_000;
+    const owner_value = claim_value.object.get("owner_id") orelse return error.InvalidQueryRequest;
+    if (owner_value != .string or owner_value.string.len == 0) return error.InvalidQueryRequest;
+
+    return .{
+        .mode = mode,
+        .skip_locked = skip_locked,
+        .lease_ms = lease_ms,
+        .owner_id = try alloc.dupe(u8, owner_value.string),
+    };
+}
+
 fn applySearchRequestFields(
     alloc: std.mem.Allocator,
     generated_fields: ?[]const []const u8,
@@ -1787,9 +1828,11 @@ pub fn parseQueryRequest(
 
     const has_internal_shard_fields = try queryBodyHasInternalShardFields(alloc, body);
     const has_public_doc_filter_bindings = try queryBodyHasPublicDocFilterBindings(alloc, body);
+    const has_row_claim = try queryBodyHasRowClaim(alloc, body);
     const contract_body = try queryBodyForGeneratedContractAlloc(alloc, body, .{
         .strip_internal_shard_fields = has_internal_shard_fields,
         .strip_public_doc_filter_bindings = has_public_doc_filter_bindings,
+        .strip_row_claim = has_row_claim,
     });
     defer if (contract_body) |owned| alloc.free(owned);
     const body_for_contract = contract_body orelse body;
@@ -1810,6 +1853,7 @@ pub fn parseQueryRequest(
     errdefer freeSearchRequest(alloc, &req);
 
     try applyCommonSearchRequestOptions(alloc, request, &req);
+    req.row_claim = try parseRowClaimRequestAlloc(alloc, body);
     req.distributed_text_stats = try parseDistributedTextStatsAlloc(alloc, body);
     try parseInternalDocIdConstraintsAlloc(alloc, body, &req);
 
@@ -4485,6 +4529,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     if (req.aggregations_json.len > 0) alloc.free(req.aggregations_json);
     if (req.filter_prefix.len > 0) alloc.free(req.filter_prefix);
     if (req.reranker) |*reranker| reranker.deinit(alloc);
+    if (req.row_claim) |claim| if (claim.owner_id.len > 0) alloc.free(@constCast(claim.owner_id));
     if (req.reranker_query_text.len > 0) alloc.free(req.reranker_query_text);
     if (req.merge_config) |merge_config| {
         for (merge_config.weights) |item| alloc.free(item.name);
@@ -4545,6 +4590,13 @@ fn queryBodyHasPublicDocFilterBindings(alloc: std.mem.Allocator, body: []const u
     return parsed.value.object.get("with") != null;
 }
 
+fn queryBodyHasRowClaim(alloc: std.mem.Allocator, body: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    return parsed.value.object.get("claim") != null;
+}
+
 fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
@@ -4572,6 +4624,7 @@ fn queryBodyHasInternalShardFields(alloc: std.mem.Allocator, body: []const u8) !
 const QueryContractStripOptions = struct {
     strip_internal_shard_fields: bool = false,
     strip_public_doc_filter_bindings: bool = false,
+    strip_row_claim: bool = false,
 };
 
 fn queryBodyForGeneratedContractAlloc(
@@ -4579,7 +4632,7 @@ fn queryBodyForGeneratedContractAlloc(
     body: []const u8,
     options: QueryContractStripOptions,
 ) !?[]u8 {
-    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings) return null;
+    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_row_claim) return null;
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
@@ -4587,6 +4640,9 @@ fn queryBodyForGeneratedContractAlloc(
 
     if (options.strip_public_doc_filter_bindings) {
         _ = parsed.value.object.orderedRemove("with");
+    }
+    if (options.strip_row_claim) {
+        _ = parsed.value.object.orderedRemove("claim");
     }
     if (options.strip_internal_shard_fields) {
         removeInternalShardFields(&parsed.value.object);
@@ -5321,6 +5377,28 @@ test "api query contract includes stored source when fields are omitted" {
     try std.testing.expect(parsed.req.include_stored);
     try std.testing.expect(!parsed.req.defer_stored_projection);
     try std.testing.expectEqual(@as(usize, 0), parsed.req.fields.len);
+}
+
+test "api query contract parses typed row claim request" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseQueryRequest(alloc, null, "jobs",
+        \\{"full_text_search":{"match_all":{}},"claim":{"mode":"for_update","skip_locked":true,"lease_ms":30000,"owner_id":"session:1"},"limit":5}
+    );
+    defer parsed.deinit(alloc);
+
+    const claim = parsed.req.row_claim orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_update, claim.mode);
+    try std.testing.expect(claim.skip_locked);
+    try std.testing.expectEqual(@as(u64, 30_000), claim.lease_ms);
+    try std.testing.expectEqualStrings("session:1", claim.owner_id);
+    try std.testing.expectEqual(@as(u32, 5), parsed.req.limit);
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "jobs",
+        \\{"claim":{"mode":"for_update","owner_id":""}}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "jobs",
+        \\{"claim":{"mode":"share","owner_id":"session:1"}}
+    ));
 }
 
 test "api query contract accepts multi_match bool_prefix full text" {

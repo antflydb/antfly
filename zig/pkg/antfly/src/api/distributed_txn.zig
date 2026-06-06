@@ -2148,6 +2148,7 @@ fn catalogHasForeignKeysReferencingParentUniqueConstraints(
                 if (stringSlicesEqual(foreign_key.parent_columns, primary_key.columns)) return true;
             }
             for (parent_constraints) |constraint| {
+                if (!uniqueConstraintCanBackForeignKey(constraint)) continue;
                 if (stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) return true;
             }
         }
@@ -2191,6 +2192,7 @@ fn addForeignKeyParentUpdateParticipantsForWrite(
     }
 
     for (parent_runtime_schema.unique_constraints) |constraint| {
+        if (!uniqueConstraintCanBackForeignKey(constraint)) continue;
         const old_value = try relational_store.uniqueConstraintTupleValueAlloc(alloc, old_row, constraint);
         defer if (old_value) |value| alloc.free(value);
         const new_value = try relational_store.uniqueConstraintTupleValueAlloc(alloc, new_row, constraint);
@@ -2233,6 +2235,7 @@ fn addForeignKeyParentUpdateParticipantsForUniqueValue(
         for (child_runtime_schema.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (!std.mem.eql(u8, foreignKeyParentCatalogTableName(table.name, child_runtime_schema.default_type, foreign_key), parent_table_name)) continue;
+            if (!uniqueConstraintCanBackForeignKey(parent_constraint)) continue;
             if (!stringSlicesEqual(foreign_key.parent_columns, parent_constraint.columns)) continue;
             if (!foreignKeyUpdateActionSupported(foreign_key)) return error.UnsupportedOperation;
 
@@ -2706,6 +2709,11 @@ fn columnPathTouchesAny(raw_path: []const u8, columns: []const []const u8) bool 
     return false;
 }
 
+fn columnPathTouches(raw_path: []const u8, column: []const u8) bool {
+    const path = normalizeTransformPathView(raw_path) orelse return true;
+    return jsonPathsOverlap(path, normalizeTransformPathView(column) orelse return true);
+}
+
 fn normalizeTransformPathView(path: []const u8) ?[]const u8 {
     if (path.len == 0) return null;
     if (path[0] != '$') return path;
@@ -2802,7 +2810,7 @@ fn transformTouchesUniqueConstraint(
 ) !bool {
     for (constraints) |constraint| {
         for (transform.operations) |op| {
-            if (columnPathTouchesAny(op.path, constraint.columns)) return true;
+            if (constraintMetadataTouchesPath(constraint, op.path)) return true;
             if (op.op == .rename) {
                 const value_json = op.value_json orelse return true;
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return true;
@@ -2811,11 +2819,29 @@ fn transformTouchesUniqueConstraint(
                     .string => |text| text,
                     else => return true,
                 };
-                if (columnPathTouchesAny(target_path, constraint.columns)) return true;
+                if (constraintMetadataTouchesPath(constraint, target_path)) return true;
             }
         }
     }
     return false;
+}
+
+fn constraintMetadataTouchesPath(constraint: storage_schema.UniqueConstraint, path: []const u8) bool {
+    if (columnPathTouchesAny(path, constraint.columns)) return true;
+    for (constraint.expressions) |expression| {
+        const dependency = uniqueExpressionDependency(expression);
+        if (columnPathTouches(path, dependency)) return true;
+    }
+    for (constraint.where) |predicate| {
+        if (columnPathTouches(path, predicate.field)) return true;
+    }
+    return false;
+}
+
+fn uniqueExpressionDependency(expression: storage_schema.UniqueExpression) []const u8 {
+    return switch (expression.op) {
+        .lower => expression.field,
+    };
 }
 
 fn keyHasRuntimeOwnerConstraintTransform(
@@ -3016,6 +3042,7 @@ fn foreignKeyParentUniqueConstraintNameAlloc(
         }
     }
     for (runtime_schema.unique_constraints) |constraint| {
+        if (!uniqueConstraintCanBackForeignKey(constraint)) continue;
         if (stringSlicesEqual(constraint.columns, foreign_key.parent_columns)) return try alloc.dupe(u8, constraint.name);
     }
     return null;
@@ -3123,9 +3150,14 @@ fn foreignKeyUpdateActionSupported(foreign_key: storage_schema.ForeignKey) bool 
 
 fn findUniqueConstraintByColumns(constraints: []const storage_schema.UniqueConstraint, columns: []const []const u8) ?storage_schema.UniqueConstraint {
     for (constraints) |constraint| {
+        if (!uniqueConstraintCanBackForeignKey(constraint)) continue;
         if (stringSlicesEqual(constraint.columns, columns)) return constraint;
     }
     return null;
+}
+
+fn uniqueConstraintCanBackForeignKey(constraint: storage_schema.UniqueConstraint) bool {
+    return constraint.where.len == 0 and constraint.expressions.len == 0;
 }
 
 fn appendForeignKeyParentDeleteCheck(

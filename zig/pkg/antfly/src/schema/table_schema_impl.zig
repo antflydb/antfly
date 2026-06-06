@@ -224,13 +224,44 @@ pub const ForeignKey = struct {
 pub const UniqueConstraint = struct {
     name: []const u8,
     columns: [][]const u8 = &.{},
+    expressions: []UniqueExpression = &.{},
+    where: []UniquePredicate = &.{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.name);
         for (self.columns) |column| alloc.free(column);
         if (self.columns.len > 0) alloc.free(self.columns);
+        for (self.expressions) |expression| alloc.free(expression.field);
+        if (self.expressions.len > 0) alloc.free(self.expressions);
+        for (self.where) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value| alloc.free(value);
+        }
+        if (self.where.len > 0) alloc.free(self.where);
         self.* = undefined;
     }
+};
+
+pub const UniqueExpressionOp = enum {
+    lower,
+};
+
+pub const UniqueExpression = struct {
+    op: UniqueExpressionOp,
+    field: []const u8,
+};
+
+pub const UniquePredicateOp = enum {
+    is_null,
+    is_not_null,
+    eq,
+    ne,
+};
+
+pub const UniquePredicate = struct {
+    field: []const u8,
+    op: UniquePredicateOp,
+    value_json: ?[]const u8 = null,
 };
 
 pub const DocumentSchema = struct {
@@ -934,14 +965,25 @@ fn validateUniqueConstraints(value: std.json.Value) !void {
         }
         const name = object.get("name") orelse return error.InvalidSchemaUpdateRequest;
         if (name != .string or name.string.len == 0) return error.InvalidSchemaUpdateRequest;
-        const columns = object.get("columns") orelse return error.InvalidSchemaUpdateRequest;
-        try validateStringArray(columns, true);
+        const columns = object.get("columns");
+        const expressions = object.get("expressions");
+        if (columns == null and expressions == null) return error.InvalidSchemaUpdateRequest;
+        if (columns) |columns_value| try validateStringArray(columns_value, false);
+        if (expressions) |expressions_value| try validateUniqueExpressionArray(expressions_value);
+        const column_count = if (columns) |columns_value| columns_value.array.items.len else 0;
+        const expression_count = if (expressions) |expressions_value| expressions_value.array.items.len else 0;
+        if (column_count + expression_count == 0) return error.InvalidSchemaUpdateRequest;
+        if (object.get("where")) |where| {
+            try validateUniquePredicateDefinition(where);
+        }
     }
 }
 
 fn isAllowedUniqueConstraintField(field: []const u8) bool {
     return std.mem.eql(u8, field, "name") or
-        std.mem.eql(u8, field, "columns");
+        std.mem.eql(u8, field, "columns") or
+        std.mem.eql(u8, field, "expressions") or
+        std.mem.eql(u8, field, "where");
 }
 
 fn validateStringArray(value: std.json.Value, require_non_empty: bool) !void {
@@ -953,6 +995,70 @@ fn validateStringArray(value: std.json.Value, require_non_empty: bool) !void {
     for (array.items) |item| {
         if (item != .string or item.string.len == 0) return error.InvalidSchemaUpdateRequest;
     }
+}
+
+fn validateUniqueExpressionArray(value: std.json.Value) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    for (array.items) |item| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "op") and !std.mem.eql(u8, entry.key_ptr.*, "field")) return error.InvalidSchemaUpdateRequest;
+        }
+        const op = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
+        const field = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
+        if (op != .string or !enumTokenEql(op.string, "lower")) return error.InvalidSchemaUpdateRequest;
+        if (field != .string or field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn validateUniquePredicateDefinition(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "all")) return error.InvalidSchemaUpdateRequest;
+    }
+    const all = object.get("all") orelse return error.InvalidSchemaUpdateRequest;
+    const array = switch (all) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    if (array.items.len == 0) return error.InvalidSchemaUpdateRequest;
+    for (array.items) |item| try validateUniquePredicateAtom(item);
+}
+
+fn validateUniquePredicateAtom(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "field") and
+            !std.mem.eql(u8, entry.key_ptr.*, "op") and
+            !std.mem.eql(u8, entry.key_ptr.*, "value"))
+        {
+            return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    const field = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
+    const op = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
+    if (field != .string or field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (op != .string) return error.InvalidSchemaUpdateRequest;
+    const needs_value = enumTokenEql(op.string, "eq") or enumTokenEql(op.string, "ne");
+    const forbids_value = enumTokenEql(op.string, "is_null") or enumTokenEql(op.string, "is_not_null");
+    if (!needs_value and !forbids_value) return error.InvalidSchemaUpdateRequest;
+    if (needs_value and object.get("value") == null) return error.InvalidSchemaUpdateRequest;
+    if (forbids_value and object.get("value") != null) return error.InvalidSchemaUpdateRequest;
 }
 
 fn validateDocumentSchemas(value: std.json.Value) !void {
@@ -1880,6 +1986,8 @@ fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) 
 
 fn findUniqueConstraintByColumns(constraints: []const UniqueConstraint, columns: []const []const u8) ?UniqueConstraint {
     for (constraints) |constraint| {
+        if (constraint.where.len != 0) continue;
+        if (constraint.expressions.len != 0) continue;
         if (stringSlicesEqual(constraint.columns, columns)) return constraint;
     }
     return null;
@@ -1893,7 +2001,7 @@ fn relationalConstraintColumnTypesCompatible(child: DocumentProperty, parent: Do
 
 fn validateRelationalUniqueConstraints(schema: TableSchema) !void {
     for (schema.unique_constraints, 0..) |constraint, i| {
-        if (constraint.columns.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (constraint.columns.len + constraint.expressions.len == 0) return error.InvalidSchemaUpdateRequest;
         for (constraint.columns, 0..) |column, column_index| {
             const property = findDocumentProperty(schema.document_schemas[0].properties, column) orelse return error.InvalidSchemaUpdateRequest;
             if (!isRelationalUniqueConstraintColumn(property)) return error.InvalidSchemaUpdateRequest;
@@ -1901,11 +2009,77 @@ fn validateRelationalUniqueConstraints(schema: TableSchema) !void {
                 if (std.mem.eql(u8, previous_column, column)) return error.InvalidSchemaUpdateRequest;
             }
         }
+        for (constraint.expressions, 0..) |expression, expression_index| {
+            try validateRelationalUniqueConstraintExpression(schema, expression);
+            for (constraint.expressions[0..expression_index]) |previous_expression| {
+                if (uniqueExpressionsEqual(previous_expression, expression)) return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        for (constraint.where) |predicate| try validateRelationalUniquePredicate(schema, predicate);
         for (schema.unique_constraints[0..i]) |previous| {
             if (std.mem.eql(u8, previous.name, constraint.name)) return error.InvalidSchemaUpdateRequest;
-            if (stringSlicesEqual(previous.columns, constraint.columns)) return error.InvalidSchemaUpdateRequest;
+            if (uniqueConstraintsEquivalent(previous, constraint)) return error.InvalidSchemaUpdateRequest;
         }
     }
+}
+
+fn validateRelationalUniqueConstraintExpression(schema: TableSchema, expression: UniqueExpression) !void {
+    const property = findDocumentProperty(schema.document_schemas[0].properties, expression.field) orelse return error.InvalidSchemaUpdateRequest;
+    switch (expression.op) {
+        .lower => {
+            const field_type = property.field_type orelse return error.InvalidSchemaUpdateRequest;
+            if (!std.mem.eql(u8, field_type, "keyword") and
+                !std.mem.eql(u8, field_type, "link") and
+                !std.mem.eql(u8, field_type, "string") and
+                !std.mem.eql(u8, field_type, "text"))
+            {
+                return error.InvalidSchemaUpdateRequest;
+            }
+        },
+    }
+}
+
+fn validateRelationalUniquePredicate(schema: TableSchema, predicate: UniquePredicate) !void {
+    const property = findDocumentProperty(schema.document_schemas[0].properties, predicate.field) orelse return error.InvalidSchemaUpdateRequest;
+    if (!isRelationalUniqueConstraintColumn(property)) return error.InvalidSchemaUpdateRequest;
+    switch (predicate.op) {
+        .is_null, .is_not_null => if (predicate.value_json != null) return error.InvalidSchemaUpdateRequest,
+        .eq, .ne => if (predicate.value_json == null) return error.InvalidSchemaUpdateRequest,
+    }
+}
+
+fn uniqueConstraintsEquivalent(a: UniqueConstraint, b: UniqueConstraint) bool {
+    if (!stringSlicesEqual(a.columns, b.columns)) return false;
+    if (!uniqueExpressionSlicesEqual(a.expressions, b.expressions)) return false;
+    return uniquePredicateSlicesEqual(a.where, b.where);
+}
+
+fn uniqueExpressionSlicesEqual(a: []const UniqueExpression, b: []const UniqueExpression) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!uniqueExpressionsEqual(left, right)) return false;
+    }
+    return true;
+}
+
+fn uniqueExpressionsEqual(a: UniqueExpression, b: UniqueExpression) bool {
+    return a.op == b.op and std.mem.eql(u8, a.field, b.field);
+}
+
+fn uniquePredicateSlicesEqual(a: []const UniquePredicate, b: []const UniquePredicate) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left.op != right.op) return false;
+        if (!std.mem.eql(u8, left.field, right.field)) return false;
+        if (!optionalStringsEqual(left.value_json, right.value_json)) return false;
+    }
+    return true;
+}
+
+fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
@@ -3028,11 +3202,68 @@ fn parseUniqueConstraints(alloc: std.mem.Allocator, value: std.json.Value) ![]Un
         const object = item.object;
         constraints[initialized] = .{
             .name = try alloc.dupe(u8, object.get("name").?.string),
-            .columns = try parseStringArrayAlloc(alloc, object.get("columns").?),
+            .columns = if (object.get("columns")) |columns| try parseStringArrayAlloc(alloc, columns) else &.{},
+            .expressions = if (object.get("expressions")) |expressions| try parseUniqueExpressions(alloc, expressions) else &.{},
+            .where = if (object.get("where")) |where| try parseUniquePredicates(alloc, where) else &.{},
         };
         initialized += 1;
     }
     return constraints;
+}
+
+fn parseUniqueExpressions(alloc: std.mem.Allocator, value: std.json.Value) ![]UniqueExpression {
+    const array = value.array;
+    if (array.items.len == 0) return &.{};
+    const out = try alloc.alloc(UniqueExpression, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |expression| alloc.free(expression.field);
+        alloc.free(out);
+    }
+    for (array.items) |item| {
+        const object = item.object;
+        const op = object.get("op").?.string;
+        out[initialized] = .{
+            .op = if (enumTokenEql(op, "lower")) .lower else return error.InvalidSchemaUpdateRequest,
+            .field = try alloc.dupe(u8, object.get("field").?.string),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseUniquePredicates(alloc: std.mem.Allocator, value: std.json.Value) ![]UniquePredicate {
+    const array = value.object.get("all").?.array;
+    const out = try alloc.alloc(UniquePredicate, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+        alloc.free(out);
+    }
+    for (array.items) |item| {
+        const object = item.object;
+        const op_text = object.get("op").?.string;
+        const op: UniquePredicateOp = if (enumTokenEql(op_text, "is_null"))
+            .is_null
+        else if (enumTokenEql(op_text, "is_not_null"))
+            .is_not_null
+        else if (enumTokenEql(op_text, "eq"))
+            .eq
+        else if (enumTokenEql(op_text, "ne"))
+            .ne
+        else
+            return error.InvalidSchemaUpdateRequest;
+        out[initialized] = .{
+            .field = try alloc.dupe(u8, object.get("field").?.string),
+            .op = op,
+            .value_json = if (object.get("value")) |predicate_value| try stringifyJsonValue(alloc, predicate_value) else null,
+        };
+        initialized += 1;
+    }
+    return out;
 }
 
 fn parseStringArrayAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
@@ -4518,13 +4749,19 @@ test "relational schema rejects unsupported unique constraint shapes" {
             "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"payload\":{\"type\":\"json\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"bad\",\"columns\":[\"email\",\"payload\"]}]}",
         ),
     );
-    try std.testing.expectError(
-        error.InvalidSchemaUpdateRequest,
-        parseSchema(
-            std.testing.allocator,
-            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"bad\",\"columns\":[\"email\"],\"where\":\"email IS NOT NULL\"}]}",
-        ),
+    var parsed_partial = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"email_present_key\",\"columns\":[\"email\"],\"where\":{\"all\":[{\"field\":\"email\",\"op\":\"is_not_null\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]}},{\"name\":\"email_lower_key\",\"expressions\":[{\"op\":\"lower\",\"field\":\"email\"}]}]}",
     );
+    defer parsed_partial.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), parsed_partial.unique_constraints.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed_partial.unique_constraints[0].where.len);
+    try std.testing.expectEqualStrings("email", parsed_partial.unique_constraints[0].where[0].field);
+    try std.testing.expectEqual(UniquePredicateOp.is_not_null, parsed_partial.unique_constraints[0].where[0].op);
+    try std.testing.expectEqualStrings("\"active\"", parsed_partial.unique_constraints[0].where[1].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed_partial.unique_constraints[1].expressions.len);
+    try std.testing.expectEqual(UniqueExpressionOp.lower, parsed_partial.unique_constraints[1].expressions[0].op);
+    try std.testing.expectEqualStrings("email", parsed_partial.unique_constraints[1].expressions[0].field);
 }
 
 test "parse dynamic template contract and validate selectors" {

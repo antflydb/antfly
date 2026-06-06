@@ -5624,7 +5624,39 @@ pub const DB = struct {
     }
 
     fn uniqueConstraintsEqual(a: schema_mod.UniqueConstraint, b: schema_mod.UniqueConstraint) bool {
-        return std.mem.eql(u8, a.name, b.name) and stringSlicesEqual(a.columns, b.columns);
+        return std.mem.eql(u8, a.name, b.name) and
+            stringSlicesEqual(a.columns, b.columns) and
+            uniqueExpressionSlicesEqual(a.expressions, b.expressions) and
+            uniquePredicateSlicesEqual(a.where, b.where);
+    }
+
+    fn uniqueConstraintCanBackForeignKey(constraint: schema_mod.UniqueConstraint) bool {
+        return constraint.where.len == 0 and constraint.expressions.len == 0;
+    }
+
+    fn uniqueExpressionSlicesEqual(a: []const schema_mod.UniqueExpression, b: []const schema_mod.UniqueExpression) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |left, right| {
+            if (left.op != right.op) return false;
+            if (!std.mem.eql(u8, left.field, right.field)) return false;
+        }
+        return true;
+    }
+
+    fn uniquePredicateSlicesEqual(a: []const schema_mod.UniquePredicate, b: []const schema_mod.UniquePredicate) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |left, right| {
+            if (left.op != right.op) return false;
+            if (!std.mem.eql(u8, left.field, right.field)) return false;
+            if (!optionalStringsEqual(left.value_json, right.value_json)) return false;
+        }
+        return true;
+    }
+
+    fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null and b == null) return true;
+        if (a == null or b == null) return false;
+        return std.mem.eql(u8, a.?, b.?);
     }
 
     fn foreignKeysSameDefinition(a: schema_mod.ForeignKey, b: schema_mod.ForeignKey) bool {
@@ -6950,6 +6982,7 @@ pub const DB = struct {
                 if (parent_constraint_name.len == 0) return error.ForeignKeyViolation;
                 if (std.mem.eql(u8, foreign_key.parent_table, runtime_schema.default_type)) {
                     const parent_constraint = findUniqueConstraintByName(runtime_schema.unique_constraints, parent_constraint_name) orelse return error.ForeignKeyViolation;
+                    if (!uniqueConstraintCanBackForeignKey(parent_constraint)) return error.ForeignKeyViolation;
                     if (!stringSlicesEqual(parent_constraint.columns, foreign_key.parent_columns)) return error.ForeignKeyViolation;
                 }
             }
@@ -47614,7 +47647,7 @@ test "db relational unique constraints enforce committed scalar values" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"handle":{"type":"keyword"},"age":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]},{"name":"users_age_key","columns":["age"]},{"name":"users_tenant_handle_key","columns":["tenant_id","handle"]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"handle":{"type":"keyword"},"age":{"type":"numeric"},"slug":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]},{"name":"users_age_key","columns":["age"]},{"name":"users_tenant_handle_key","columns":["tenant_id","handle"]},{"name":"users_active_slug_key","columns":["slug"],"where":{"all":[{"field":"status","op":"eq","value":"active"}]}},{"name":"users_lower_email_key","expressions":[{"op":"lower","field":"email"}]}]}
     ;
     var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -47631,6 +47664,9 @@ test "db relational unique constraints enforce committed scalar values" {
             .{ .key = "user:partial-b", .value = "{\"id\":\"user:partial-b\",\"tenant_id\":\"tenant:a\"}" },
             .{ .key = "user:null-a", .value = "{\"id\":\"user:null-a\"}" },
             .{ .key = "user:null-b", .value = "{\"id\":\"user:null-b\"}" },
+            .{ .key = "user:inactive-a", .value = "{\"id\":\"user:inactive-a\",\"slug\":\"sam\",\"status\":\"inactive\"}" },
+            .{ .key = "user:inactive-b", .value = "{\"id\":\"user:inactive-b\",\"slug\":\"sam\",\"status\":\"inactive\"}" },
+            .{ .key = "user:active-a", .value = "{\"id\":\"user:active-a\",\"slug\":\"sam\",\"status\":\"active\"}" },
         },
     });
 
@@ -47638,10 +47674,16 @@ test "db relational unique constraints enforce committed scalar values" {
         .writes = &.{.{ .key = "user:2", .value = "{\"id\":\"user:2\",\"email\":\"a@example.com\",\"age\":31}" }},
     }));
     try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:2-case", .value = "{\"id\":\"user:2-case\",\"email\":\"A@EXAMPLE.COM\",\"age\":41}" }},
+    }));
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
         .writes = &.{.{ .key = "user:3", .value = "{\"id\":\"user:3\",\"email\":\"b@example.com\",\"age\":30}" }},
     }));
     try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
         .writes = &.{.{ .key = "user:tenant-a-dup", .value = "{\"id\":\"user:tenant-a-dup\",\"tenant_id\":\"tenant:a\",\"handle\":\"sam\"}" }},
+    }));
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:active-b", .value = "{\"id\":\"user:active-b\",\"slug\":\"sam\",\"status\":\"active\"}" }},
     }));
 
     try db.batch(.{
@@ -47676,6 +47718,12 @@ test "db relational unique constraints enforce committed scalar values" {
     });
     try db.batch(.{
         .writes = &.{.{ .key = "user:tenant-a-reuse", .value = "{\"id\":\"user:tenant-a-reuse\",\"tenant_id\":\"tenant:a\",\"handle\":\"sam\"}" }},
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:active-a", .value = "{\"id\":\"user:active-a\",\"slug\":\"sam\",\"status\":\"inactive\"}" }},
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:active-b", .value = "{\"id\":\"user:active-b\",\"slug\":\"sam\",\"status\":\"active\"}" }},
     });
 
     const txn_id = try db.beginTransaction(20_000);

@@ -247,6 +247,8 @@ const RowsUniqueSelectorResolverContext = struct {
         return .{
             .ptr = self,
             .resolve = resolve,
+            .resolve_primary = resolvePrimary,
+            .lookup_primary = lookupPrimary,
         };
     }
 
@@ -262,6 +264,34 @@ const RowsUniqueSelectorResolverContext = struct {
         return source.relationalUniqueOwnerLookup(alloc, table_name, constraint_name, encoded_value, .read_index) catch |err| switch (err) {
             error.NotFound => null,
             else => err,
+        };
+    }
+
+    fn resolvePrimary(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        physical_key: []const u8,
+    ) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const source = self.source orelse return error.UnsupportedOperation;
+        var lookup = (try source.lookup(alloc, table_name, physical_key, .{}, .read_index)) orelse return false;
+        lookup.deinit(alloc);
+        return true;
+    }
+
+    fn lookupPrimary(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        physical_key: []const u8,
+    ) !?relational_rows_api.ResolvedPrimaryRow {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const source = self.source orelse return error.UnsupportedOperation;
+        const lookup = (try source.lookup(alloc, table_name, physical_key, .{}, .read_index)) orelse return null;
+        return .{
+            .json = lookup.json,
+            .version = lookup.version,
         };
     }
 };
@@ -5520,6 +5550,12 @@ pub const ApiHttpServer = struct {
             else => return try textResponse(self.alloc, 400, "invalid rows request"),
         };
         defer rows_req.deinit(self.alloc);
+
+        if (rows_req.writes.len == 0 and rows_req.deletes.len == 0 and rows_req.transforms.len == 0 and rows_req.predicates.len == 0) {
+            const response_body = try relational_rows_api.encodeRowsBatchResponseAlloc(self.alloc, rows_req);
+            defer self.alloc.free(response_body);
+            return try jsonBodyResponseWithStatus(self.alloc, 201, response_body);
+        }
 
         var committed_via_txn = false;
         if (schema.storage_mode == .relational) {
