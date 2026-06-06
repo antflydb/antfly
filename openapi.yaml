@@ -7147,7 +7147,8 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: Optional optimistic-concurrency predicate for update/delete. The predicate applies to the physical row resolved from primary or unique identity.
+          description: Optional optimistic-concurrency predicate for update/delete. The predicate applies
+            to the physical row resolved from primary or unique identity.
       required:
         - op
     RowsBatchRequest:
