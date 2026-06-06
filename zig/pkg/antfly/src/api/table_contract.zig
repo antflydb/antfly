@@ -58,13 +58,20 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         req.indexes_json = try alloc.dupe(u8, tables_api.default_indexes_json);
     }
 
-    if (parsed.value.schema) |schema| {
-        const raw_schema = try stringifyJsonAlloc(alloc, schema);
-        defer alloc.free(raw_schema);
-        req.schema_json = tables_api.parseSchemaUpdateRequest(alloc, raw_schema) catch |err| switch (err) {
-            error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
-            else => return err,
-        };
+    if (raw_root.get("schema")) |schema_value| {
+        if (schema_value != .null) {
+            const raw_schema = try stringifyJsonAlloc(alloc, schema_value);
+            defer alloc.free(raw_schema);
+            const validated_schema = tables_api.parseSchemaUpdateRequest(alloc, raw_schema) catch |err| switch (err) {
+                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
+                else => return err,
+            };
+            defer alloc.free(validated_schema);
+            req.schema_json = tables_api.normalizeSchemaVersion(alloc, validated_schema, 0) catch |err| switch (err) {
+                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
+                else => return err,
+            };
+        }
     }
     if (parsed.value.replication_sources) |replication_sources| {
         req.replication_sources_json = try stringifyJsonAlloc(alloc, replication_sources);
@@ -402,6 +409,8 @@ test "table contract parses create table via generated openapi type" {
     try std.testing.expectEqualStrings("docs", req.description.?);
     try std.testing.expectEqualStrings(tables_api.default_indexes_json, req.indexes_json.?);
     try std.testing.expect(std.mem.indexOf(u8, req.schema_json.?, "\"default_type\":\"doc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.schema_json.?, "\"version\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.schema_json.?, "\"version\":null") == null);
 }
 
 test "table contract preserves multi shard create table requests" {
