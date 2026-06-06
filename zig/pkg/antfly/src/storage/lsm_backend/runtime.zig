@@ -2703,12 +2703,76 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
 }
 
 pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
-    const LocalCursor = MergeCursor(BackendType, ActiveMemTable);
+    const ActiveCursor = MergeCursor(BackendType, ActiveMemTable);
+    const SnapshotCursor = MergeCursor(BackendType, State);
+    const LocalCursor = union(enum) {
+        active: ActiveCursor,
+        snapshot: SnapshotCursor,
+
+        pub fn close(self: *@This()) void {
+            switch (self.*) {
+                .active => |*cursor| cursor.close(),
+                .snapshot => |*cursor| cursor.close(),
+            }
+            self.* = undefined;
+        }
+
+        pub fn first(self: *@This()) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.first(),
+                .snapshot => |*cursor| try cursor.first(),
+            };
+        }
+
+        pub fn setUpperBound(self: *@This(), upper: ?[]const u8) void {
+            switch (self.*) {
+                .active => |*cursor| cursor.setUpperBound(upper),
+                .snapshot => |*cursor| cursor.setUpperBound(upper),
+            }
+        }
+
+        pub fn last(self: *@This()) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.last(),
+                .snapshot => |*cursor| try cursor.last(),
+            };
+        }
+
+        pub fn next(self: *@This()) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.next(),
+                .snapshot => |*cursor| try cursor.next(),
+            };
+        }
+
+        pub fn prev(self: *@This()) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.prev(),
+                .snapshot => |*cursor| try cursor.prev(),
+            };
+        }
+
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.seekAtOrAfter(key),
+                .snapshot => |*cursor| try cursor.seekAtOrAfter(key),
+            };
+        }
+
+        pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.seekAtOrBefore(key),
+                .snapshot => |*cursor| try cursor.seekAtOrBefore(key),
+            };
+        }
+    };
     return struct {
         allocator: Allocator,
         metadata_allocator: Allocator,
         backend: *BackendType,
         namespace: backend_types.Namespace,
+        mutable_snapshot: ?State = null,
+        mutable_snapshot_is_bulk_current_scan_clone: bool = false,
         immutable_memtables: []const *const State = &.{},
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
@@ -2726,9 +2790,21 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             errdefer metadata_allocator.free(levels);
             backend.retainReader();
             errdefer releaseReadReader(BackendType, backend);
-            if (@hasDecl(BackendType, "prepareCurrentScanSnapshot")) {
+            var mutable_snapshot_is_bulk_current_scan_clone = false;
+            var mutable_snapshot = if (@hasDecl(BackendType, "cloneCurrentScanMutableStateForBulkIngest")) blk: {
+                const snapshot = try backend.cloneCurrentScanMutableStateForBulkIngest();
+                mutable_snapshot_is_bulk_current_scan_clone = snapshot != null;
+                break :blk snapshot;
+            } else null;
+            errdefer if (mutable_snapshot) |*snapshot| {
+                if (mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
+                    backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
+                }
+                snapshot.deinit(backend.allocator);
+            };
+            if (mutable_snapshot == null and @hasDecl(BackendType, "prepareCurrentScanSnapshot")) {
                 try backend.prepareCurrentScanSnapshot();
-            } else if (@hasDecl(BackendType, "prepareReadSnapshot")) {
+            } else if (mutable_snapshot == null and @hasDecl(BackendType, "prepareReadSnapshot")) {
                 try backend.prepareReadSnapshot();
             }
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
@@ -2741,6 +2817,8 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 .metadata_allocator = metadata_allocator,
                 .backend = backend,
                 .namespace = namespace,
+                .mutable_snapshot = mutable_snapshot,
+                .mutable_snapshot_is_bulk_current_scan_clone = mutable_snapshot_is_bulk_current_scan_clone,
                 .immutable_memtables = immutable_memtables,
                 .runs = runs,
                 .l0_groups = l0_groups,
@@ -2754,15 +2832,26 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             self.metadata_allocator.free(self.levels);
             freeRunSnapshotList(self.metadata_allocator, self.runs);
             if (self.immutable_memtables.len > 0) self.allocator.free(self.immutable_memtables);
-            const locked = lockBackend(BackendType, backend);
-            defer unlockBackend(BackendType, backend, locked);
-            releaseReadReader(BackendType, backend);
+            {
+                const locked = lockBackend(BackendType, backend);
+                defer unlockBackend(BackendType, backend, locked);
+                if (self.mutable_snapshot) |*snapshot| {
+                    if (self.mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
+                        backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
+                    }
+                }
+                releaseReadReader(BackendType, backend);
+            }
+            if (self.mutable_snapshot) |*snapshot| snapshot.deinit(self.allocator);
             self.* = undefined;
         }
 
         pub fn openCursor(self: *@This()) !LocalCursor {
             const cursor_alloc = runtimeScratchAllocator(self.allocator);
-            return try LocalCursor.init(cursor_alloc, self.backend, &self.backend.mutable, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.namespace, false);
+            if (self.mutable_snapshot) |*snapshot| {
+                return .{ .snapshot = try SnapshotCursor.init(cursor_alloc, self.backend, snapshot, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.namespace, false) };
+            }
+            return .{ .active = try ActiveCursor.init(cursor_alloc, self.backend, &self.backend.mutable, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.namespace, false) };
         }
     };
 }

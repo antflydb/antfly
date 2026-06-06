@@ -147,6 +147,10 @@ pub const Options = struct {
     root_generation: u64 = 0,
     obsolete_retention_ns: u64 = 5 * std.time.ns_per_min,
     read_snapshot_rotate_mutable_bytes: u64 = 256 * 1024,
+    // Per-scan cap; 0 disables bulk current-scan mutable cloning.
+    bulk_ingest_current_scan_clone_max_bytes: u64 = 256 * 1024 * 1024,
+    // Aggregate active clone cap; 0 leaves aggregate admission uncapped.
+    bulk_ingest_current_scan_clone_total_max_bytes: u64 = 256 * 1024 * 1024,
 };
 
 pub const IoRuntime = storage_io.RuntimeKind;
@@ -310,6 +314,10 @@ pub const Backend = struct {
         mutable_snapshot_clone_bytes_total: u64 = 0,
         mutable_snapshot_clone_peak_bytes: u64 = 0,
         mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+        bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
+        bulk_ingest_current_scan_clone_peak_active_bytes: u64 = 0,
+        bulk_ingest_current_scan_clone_budget_denials: u64 = 0,
+        bulk_ingest_current_scan_clone_oom_fallbacks: u64 = 0,
         read_snapshot_mutable_rotations: u64 = 0,
         read_snapshot_mutable_rotation_bytes_total: u64 = 0,
         read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
@@ -389,6 +397,10 @@ pub const Backend = struct {
             dst_reason.bytes_total +|= src_reason.bytes_total;
             dst_reason.peak_bytes = @max(dst_reason.peak_bytes, src_reason.peak_bytes);
         }
+        dst.bulk_ingest_current_scan_clone_active_bytes +|= src.bulk_ingest_current_scan_clone_active_bytes;
+        dst.bulk_ingest_current_scan_clone_peak_active_bytes = @max(dst.bulk_ingest_current_scan_clone_peak_active_bytes, src.bulk_ingest_current_scan_clone_peak_active_bytes);
+        dst.bulk_ingest_current_scan_clone_budget_denials +|= src.bulk_ingest_current_scan_clone_budget_denials;
+        dst.bulk_ingest_current_scan_clone_oom_fallbacks +|= src.bulk_ingest_current_scan_clone_oom_fallbacks;
         dst.read_snapshot_mutable_rotations +|= src.read_snapshot_mutable_rotations;
         dst.read_snapshot_mutable_rotation_bytes_total +|= src.read_snapshot_mutable_rotation_bytes_total;
         dst.read_snapshot_mutable_rotation_peak_bytes = @max(dst.read_snapshot_mutable_rotation_peak_bytes, src.read_snapshot_mutable_rotation_peak_bytes);
@@ -759,6 +771,8 @@ pub const Backend = struct {
 
     allocator: Allocator,
     mu: std.atomic.Mutex = .unlocked,
+    // Cached score used by best-effort maintenance scheduling and metrics.
+    // A value of 1 can still mean "known debt, exact score not refreshed yet".
     cached_maintenance_hint: CounterU64 = .init(1),
     options: Options,
     root_generation: u64 = 0,
@@ -803,6 +817,10 @@ pub const Backend = struct {
     mutable_snapshot_clone_bytes_total: u64 = 0,
     mutable_snapshot_clone_peak_bytes: u64 = 0,
     mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+    bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
+    bulk_ingest_current_scan_clone_peak_active_bytes: u64 = 0,
+    bulk_ingest_current_scan_clone_budget_denials: u64 = 0,
+    bulk_ingest_current_scan_clone_oom_fallbacks: u64 = 0,
     read_snapshot_mutable_rotations: u64 = 0,
     read_snapshot_mutable_rotation_bytes_total: u64 = 0,
     read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
@@ -976,6 +994,10 @@ pub const Backend = struct {
             .mutable_snapshot_clone_bytes_total = self.mutable_snapshot_clone_bytes_total,
             .mutable_snapshot_clone_peak_bytes = self.mutable_snapshot_clone_peak_bytes,
             .mutable_snapshot_clone_by_reason = self.mutable_snapshot_clone_by_reason,
+            .bulk_ingest_current_scan_clone_active_bytes = self.bulk_ingest_current_scan_clone_active_bytes,
+            .bulk_ingest_current_scan_clone_peak_active_bytes = self.bulk_ingest_current_scan_clone_peak_active_bytes,
+            .bulk_ingest_current_scan_clone_budget_denials = self.bulk_ingest_current_scan_clone_budget_denials,
+            .bulk_ingest_current_scan_clone_oom_fallbacks = self.bulk_ingest_current_scan_clone_oom_fallbacks,
             .read_snapshot_mutable_rotations = self.read_snapshot_mutable_rotations,
             .read_snapshot_mutable_rotation_bytes_total = self.read_snapshot_mutable_rotation_bytes_total,
             .read_snapshot_mutable_rotation_peak_bytes = self.read_snapshot_mutable_rotation_peak_bytes,
@@ -1201,7 +1223,7 @@ pub const Backend = struct {
 
     fn refreshCachedMaintenanceHintLocked(self: *Backend) u64 {
         const score = self.maintenanceScoreLocked();
-        self.cached_maintenance_hint.store(if (score > 0) 1 else 0, .release);
+        self.cached_maintenance_hint.store(score, .release);
         return score;
     }
 
@@ -1210,7 +1232,7 @@ pub const Backend = struct {
         manager.observeUsage(
             .lsm_in_memory_state,
             &self.tracked_in_memory_state_bytes,
-            stats.mutable_bytes + stats.immutable_bytes,
+            stats.mutable_bytes +| stats.immutable_bytes +| stats.bulk_ingest_current_scan_clone_active_bytes,
         );
     }
 
@@ -1240,6 +1262,7 @@ pub const Backend = struct {
         for (self.activeImmutableMemtables()) |state| {
             bytes +|= estimateStateBytes(state);
         }
+        bytes +|= self.bulk_ingest_current_scan_clone_active_bytes;
         return bytes;
     }
 
@@ -1403,14 +1426,10 @@ pub const Backend = struct {
         return try self.snapshotMutableStateWithReason(.other);
     }
 
-    pub fn snapshotMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !*const State {
-        if (self.mutable_read_snapshot) |snapshot| return snapshot;
-        if (self.mutable.entries.items.len == 0) return &self.empty_mutable_snapshot;
-        const snapshot = try self.allocator.create(State);
-        errdefer self.allocator.destroy(snapshot);
-        snapshot.* = try self.mutable.clone(self.allocator);
+    fn cloneMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !State {
+        var snapshot = try self.mutable.clone(self.allocator);
         errdefer snapshot.deinit(self.allocator);
-        const snapshot_bytes = estimateStateBytes(snapshot);
+        const snapshot_bytes = estimateStateBytes(&snapshot);
         self.mutable_snapshot_clone_calls +|= 1;
         self.mutable_snapshot_clone_bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_peak_bytes = @max(self.mutable_snapshot_clone_peak_bytes, snapshot_bytes);
@@ -1418,9 +1437,67 @@ pub const Backend = struct {
         self.mutable_snapshot_clone_by_reason[reason_index].calls +|= 1;
         self.mutable_snapshot_clone_by_reason[reason_index].bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes = @max(self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes, snapshot_bytes);
+        return snapshot;
+    }
+
+    pub fn snapshotMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !*const State {
+        if (self.mutable_read_snapshot) |snapshot| return snapshot;
+        if (self.mutable.entries.items.len == 0) return &self.empty_mutable_snapshot;
+        const snapshot = try self.allocator.create(State);
+        errdefer self.allocator.destroy(snapshot);
+        snapshot.* = try self.cloneMutableStateWithReason(reason);
+        errdefer snapshot.deinit(self.allocator);
         try self.retired_mutable_snapshots.ensureUnusedCapacity(self.allocator, 1);
         self.mutable_read_snapshot = snapshot;
         return snapshot;
+    }
+
+    pub fn cloneCurrentScanMutableStateForBulkIngest(self: *Backend) !?State {
+        if (!self.bulkIngestActive()) return null;
+        if (self.options.bulk_ingest_current_scan_clone_max_bytes == 0) return null;
+        if (self.mutable.entries.items.len == 0) return State{};
+        const mutable_bytes = estimateStateBytes(&self.mutable);
+        if (mutable_bytes > self.options.bulk_ingest_current_scan_clone_max_bytes) return null;
+        if (!self.canAdmitBulkIngestCurrentScanClone(mutable_bytes)) {
+            self.bulk_ingest_current_scan_clone_budget_denials +|= 1;
+            return null;
+        }
+        var snapshot = self.cloneMutableStateWithReason(.other) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.bulk_ingest_current_scan_clone_oom_fallbacks +|= 1;
+                return null;
+            },
+        };
+        errdefer snapshot.deinit(self.allocator);
+        const snapshot_bytes = estimateStateBytes(&snapshot);
+        if (!self.canAdmitBulkIngestCurrentScanClone(snapshot_bytes)) {
+            self.bulk_ingest_current_scan_clone_budget_denials +|= 1;
+            return null;
+        }
+        self.bulk_ingest_current_scan_clone_active_bytes +|= snapshot_bytes;
+        self.bulk_ingest_current_scan_clone_peak_active_bytes = @max(
+            self.bulk_ingest_current_scan_clone_peak_active_bytes,
+            self.bulk_ingest_current_scan_clone_active_bytes,
+        );
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+        return snapshot;
+    }
+
+    fn canAdmitBulkIngestCurrentScanClone(self: *const Backend, bytes: u64) bool {
+        const total_max = self.options.bulk_ingest_current_scan_clone_total_max_bytes;
+        if (total_max == 0) return true;
+        if (bytes > total_max) return false;
+        return self.bulk_ingest_current_scan_clone_active_bytes <= total_max - bytes;
+    }
+
+    pub fn releaseCurrentScanMutableStateForBulkIngest(self: *Backend, snapshot: *const State) void {
+        const snapshot_bytes = estimateStateBytes(snapshot);
+        if (snapshot_bytes >= self.bulk_ingest_current_scan_clone_active_bytes) {
+            self.bulk_ingest_current_scan_clone_active_bytes = 0;
+        } else {
+            self.bulk_ingest_current_scan_clone_active_bytes -= snapshot_bytes;
+        }
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
 
     pub fn invalidateMutableReadSnapshot(self: *Backend) void {
@@ -7273,7 +7350,7 @@ test "lsm backend bulk ingest finish leaves L0 debt without foreground budget" {
 
     try std.testing.expectEqual(@as(usize, 5), countLevelRuns(backend.runs.items, 0));
     try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
-    try std.testing.expectEqual(@as(u64, 1), backend.maintenanceDebtHint());
+    try std.testing.expect(backend.maintenanceDebtHint() > 0);
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:0"));
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:4"));
 }
@@ -9559,6 +9636,160 @@ test "lsm backend current scan keeps frozen mutable values across later writes" 
 
     const second = try cursor.next() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("doc:c", second.key);
+}
+
+test "lsm backend bulk current scan clones mutable under memory cap" {
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1024,
+        .bulk_ingest_current_scan_clone_max_bytes = 1024 * 1024,
+        .resource_manager = &manager,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    defer if (bulk_active) backend.abortBulkIngestSession();
+
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "A");
+        try write.put("doc:c", "C");
+        try write.commit();
+    }
+
+    const before_maintenance = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
+
+    {
+        var scan = try runtime.beginCurrentScan();
+        defer scan.abort();
+
+        const after_open = backend.snapshotMaintenanceStats();
+        try std.testing.expectEqual(before_writes.immutable_rotations, backend.snapshotWriteStats().immutable_rotations);
+        try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+        try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls + 1, after_open.mutable_snapshot_clone_calls);
+        try std.testing.expect(after_open.bulk_ingest_current_scan_clone_active_bytes > 0);
+        try std.testing.expectEqual(after_open.bulk_ingest_current_scan_clone_active_bytes, after_open.bulk_ingest_current_scan_clone_peak_active_bytes);
+        try std.testing.expectEqual(
+            after_open.mutable_bytes +| after_open.immutable_bytes +| after_open.bulk_ingest_current_scan_clone_active_bytes,
+            manager.sliceStats(.lsm_in_memory_state).used_bytes,
+        );
+
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+
+        const first = try cursor.seekAtOrAfter("doc:a") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("doc:a", first.key);
+
+        {
+            var write = try runtime.beginWrite();
+            try write.put("doc:b", "B");
+            try write.commit();
+        }
+
+        const second = try cursor.next() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("doc:c", second.key);
+    }
+
+    const after_close = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), after_close.bulk_ingest_current_scan_clone_active_bytes);
+    try std.testing.expect(after_close.bulk_ingest_current_scan_clone_peak_active_bytes > 0);
+    try std.testing.expectEqual(
+        after_close.mutable_bytes +| after_close.immutable_bytes,
+        manager.sliceStats(.lsm_in_memory_state).used_bytes,
+    );
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+}
+
+test "lsm backend bulk current scan rotates mutable above aggregate clone memory cap" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1024,
+        .bulk_ingest_current_scan_clone_max_bytes = 1024 * 1024,
+        .bulk_ingest_current_scan_clone_total_max_bytes = 1,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    defer if (bulk_active) backend.abortBulkIngestSession();
+
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "A");
+        try write.commit();
+    }
+
+    const before_maintenance = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
+
+    {
+        var scan = try runtime.beginCurrentScan();
+        defer scan.abort();
+
+        const after_open = backend.snapshotMaintenanceStats();
+        try std.testing.expectEqual(before_writes.immutable_rotations + 1, backend.snapshotWriteStats().immutable_rotations);
+        try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+        try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls, after_open.mutable_snapshot_clone_calls);
+        try std.testing.expectEqual(before_maintenance.bulk_ingest_current_scan_clone_budget_denials + 1, after_open.bulk_ingest_current_scan_clone_budget_denials);
+        try std.testing.expectEqual(@as(u64, 0), after_open.bulk_ingest_current_scan_clone_active_bytes);
+
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+        try std.testing.expectEqualStrings("doc:a", (try cursor.seekAtOrAfter("doc:a")).?.key);
+    }
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+}
+
+test "lsm backend bulk current scan rotates mutable above clone memory cap" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1024,
+        .bulk_ingest_current_scan_clone_max_bytes = 1,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    defer if (bulk_active) backend.abortBulkIngestSession();
+
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "A");
+        try write.commit();
+    }
+
+    const before_maintenance = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
+
+    {
+        var scan = try runtime.beginCurrentScan();
+        defer scan.abort();
+
+        const after_open = backend.snapshotMaintenanceStats();
+        try std.testing.expectEqual(before_writes.immutable_rotations + 1, backend.snapshotWriteStats().immutable_rotations);
+        try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+        try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls, after_open.mutable_snapshot_clone_calls);
+
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+        try std.testing.expectEqualStrings("doc:a", (try cursor.seekAtOrAfter("doc:a")).?.key);
+    }
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
 }
 
 test "lsm backend read txn getManySorted uses sorted-by-run path for leaf-sized sparse batches" {

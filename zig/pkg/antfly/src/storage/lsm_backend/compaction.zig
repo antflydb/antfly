@@ -1513,9 +1513,10 @@ fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *Backe
     var consumed_entries: usize = 0;
     var emitted_entries: usize = 0;
 
-    while (true) {
-        const candidate_source = try bestCursorSourceIndex(cursors[0..initialized_cursors]) orelse break;
-        const winner_source = try newestCursorSourceAtKey(cursors[0..initialized_cursors], candidate_source);
+    var heap = try PersistedRunMergeHeap.init(allocator, cursors[0..initialized_cursors]);
+    defer heap.deinit();
+
+    while (heap.peekSource()) |winner_source| {
         const winner = (try cursors[winner_source].currentEntry()) orelse return error.InvalidTableFile;
         const entry_bytes = tableEntryLogicalBytes(winner);
         if (output_active) {
@@ -1538,7 +1539,7 @@ fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *Backe
         }
         try output.appendEntry(winner, entry_bytes);
         emitted_entries += 1;
-        consumed_entries += try advanceCursorsAtKey(cursors[0..initialized_cursors], winner);
+        consumed_entries += try heap.advanceTopSourcesAtKey(winner);
 
         if (output_active) {
             if (output.entry_count > 0 and target_bytes > 0 and output.logical_bytes >= target_bytes) {
@@ -1749,44 +1750,113 @@ const PersistedRunCursor = struct {
     }
 };
 
-fn bestCursorSourceIndex(cursors: []PersistedRunCursor) !?usize {
-    var best: ?usize = null;
-    for (cursors, 0..) |*cursor, i| {
-        const candidate = (try cursor.currentEntry()) orelse continue;
-        if (best == null) {
-            best = i;
-            continue;
-        }
-        const incumbent = (try cursors[best.?].currentEntry()) orelse {
-            best = i;
-            continue;
+const PersistedRunMergeHeap = struct {
+    allocator: std.mem.Allocator,
+    cursors: []PersistedRunCursor,
+    sources: []usize,
+    advanced_sources: []usize,
+    len: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, cursors: []PersistedRunCursor) !PersistedRunMergeHeap {
+        const sources = try allocator.alloc(usize, cursors.len);
+        errdefer allocator.free(sources);
+        const advanced_sources = try allocator.alloc(usize, cursors.len);
+        errdefer allocator.free(advanced_sources);
+
+        var heap = PersistedRunMergeHeap{
+            .allocator = allocator,
+            .cursors = cursors,
+            .sources = sources,
+            .advanced_sources = advanced_sources,
         };
-        if (compareTableEntry(candidate, incumbent) == .lt) best = i;
-    }
-    return best;
-}
+        errdefer heap.deinit();
 
-fn newestCursorSourceAtKey(cursors: []PersistedRunCursor, candidate_source: usize) !usize {
-    var winner = candidate_source;
-    const winner_entry = (try cursors[winner].currentEntry()) orelse return error.InvalidTableFile;
-    for (cursors, 0..) |*cursor, i| {
-        const entry = (try cursor.currentEntry()) orelse continue;
-        if (compareTableEntry(entry, winner_entry) != .eq) continue;
-        if (i < winner) winner = i;
+        for (cursors, 0..) |*cursor, source| {
+            if (cursor.position != null) try heap.pushSource(source);
+        }
+        return heap;
     }
-    return winner;
-}
 
-fn advanceCursorsAtKey(cursors: []PersistedRunCursor, key_entry: lsm_table_file.Entry) !usize {
-    var advanced: usize = 0;
-    for (cursors) |*cursor| {
-        const entry = (try cursor.currentEntry()) orelse continue;
-        if (compareTableEntry(entry, key_entry) != .eq) continue;
-        cursor.advance();
-        advanced += 1;
+    fn deinit(self: *PersistedRunMergeHeap) void {
+        self.allocator.free(self.sources);
+        self.allocator.free(self.advanced_sources);
+        self.* = undefined;
     }
-    return advanced;
-}
+
+    fn peekSource(self: *const PersistedRunMergeHeap) ?usize {
+        if (self.len == 0) return null;
+        return self.sources[0];
+    }
+
+    fn advanceTopSourcesAtKey(self: *PersistedRunMergeHeap, key_entry: lsm_table_file.Entry) !usize {
+        var advanced_len: usize = 0;
+        while (self.peekSource()) |source| {
+            const entry = (try self.cursors[source].currentEntry()) orelse return error.InvalidTableFile;
+            if (compareTableEntry(entry, key_entry) != .eq) break;
+            _ = try self.popSource();
+            self.cursors[source].advance();
+            self.advanced_sources[advanced_len] = source;
+            advanced_len += 1;
+        }
+
+        for (self.advanced_sources[0..advanced_len]) |source| {
+            if (self.cursors[source].position != null) try self.pushSource(source);
+        }
+        return advanced_len;
+    }
+
+    fn pushSource(self: *PersistedRunMergeHeap, source: usize) !void {
+        std.debug.assert(self.len < self.sources.len);
+        self.sources[self.len] = source;
+        self.len += 1;
+        try self.siftUp(self.len - 1);
+    }
+
+    fn popSource(self: *PersistedRunMergeHeap) !usize {
+        if (self.len == 0) return error.InvalidTableFile;
+        const source = self.sources[0];
+        self.len -= 1;
+        if (self.len > 0) {
+            self.sources[0] = self.sources[self.len];
+            try self.siftDown(0);
+        }
+        return source;
+    }
+
+    fn siftUp(self: *PersistedRunMergeHeap, start_index: usize) !void {
+        var index = start_index;
+        while (index > 0) {
+            const parent = (index - 1) / 2;
+            if (!try self.sourceLess(self.sources[index], self.sources[parent])) break;
+            std.mem.swap(usize, &self.sources[index], &self.sources[parent]);
+            index = parent;
+        }
+    }
+
+    fn siftDown(self: *PersistedRunMergeHeap, start_index: usize) !void {
+        var index = start_index;
+        while (true) {
+            const left = index * 2 + 1;
+            if (left >= self.len) break;
+            const right = left + 1;
+            var child = left;
+            if (right < self.len and try self.sourceLess(self.sources[right], self.sources[left])) {
+                child = right;
+            }
+            if (!try self.sourceLess(self.sources[child], self.sources[index])) break;
+            std.mem.swap(usize, &self.sources[index], &self.sources[child]);
+            index = child;
+        }
+    }
+
+    fn sourceLess(self: *PersistedRunMergeHeap, lhs_source: usize, rhs_source: usize) !bool {
+        const lhs = (try self.cursors[lhs_source].currentEntry()) orelse return error.InvalidTableFile;
+        const rhs = (try self.cursors[rhs_source].currentEntry()) orelse return error.InvalidTableFile;
+        const order = compareTableEntry(lhs, rhs);
+        if (order != .eq) return order == .lt;
+        return lhs_source < rhs_source;
+    }
+};
 
 fn tableEntryLogicalBytes(entry: lsm_table_file.Entry) usize {
     return 1 + (3 * @sizeOf(u32)) +

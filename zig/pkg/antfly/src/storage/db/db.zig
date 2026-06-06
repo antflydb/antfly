@@ -354,11 +354,11 @@ const OverwriteProbeEntry = struct {
     write_index: usize,
 };
 
-const dense_catch_up_default_deferred_l0_limit: usize = 4;
+const dense_catch_up_default_deferred_l0_limit: usize = 64;
 const dense_catch_up_default_deferred_hbc_leaf_splits_per_publish: usize = 64;
 const dense_catch_up_default_deferred_hbc_leaf_split_members_per_publish: usize = 16 * 1024;
-const dense_catch_up_default_maintenance_steps: usize = 8;
-const dense_catch_up_default_maintenance_cooldown_ns: u64 = 250 * std.time.ns_per_ms;
+const dense_catch_up_default_maintenance_steps: usize = 32;
+const dense_catch_up_default_maintenance_cooldown_ns: u64 = 0;
 const dense_catch_up_default_maintenance_urgent_score: u64 = 1_000_000;
 const dense_catch_up_startup_max_records_default: usize = 32;
 const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
@@ -15164,9 +15164,13 @@ test "dense catch-up maintenance cooldown skips light repeated maintenance" {
     const now_ns = std.time.ns_per_s;
     try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns));
     try noteDenseCatchUpMaintenanceRun(&ctx, "vec", now_ns);
-    try std.testing.expect(!shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
+    if (denseCatchUpMaintenanceCooldownNs() == 0) {
+        try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + 1));
+    } else {
+        try std.testing.expect(!shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
+        try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs()));
+    }
     try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", denseCatchUpMaintenanceUrgentScore(), now_ns + 1));
-    try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs()));
 }
 
 fn readEnvUsize(name: [:0]const u8, default_value: usize) usize {
