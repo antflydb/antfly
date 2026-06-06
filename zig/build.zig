@@ -6054,6 +6054,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_recall_harness = b.addRunArtifact(recall_harness);
+    run_recall_harness.stdio = .inherit;
     if (b.args) |args| {
         run_recall_harness.addArgs(args);
     }
@@ -6130,6 +6131,7 @@ pub fn build(b: *std.Build) void {
     antfly_step.dependOn(&run_antfly.step);
 
     const run_recall_harness_default = b.addRunArtifact(recall_harness);
+    run_recall_harness_default.stdio = .inherit;
     run_recall_harness_default.addArgs(&.{
         "--dataset-dir",
         "testdata/vectorsets",
