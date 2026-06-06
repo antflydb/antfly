@@ -79,6 +79,10 @@ const always_files = [_][]const u8{
     "modules.json",
     "config_sentence_transformers.json",
     "1_SpladePooling/config.json",
+    "added_tokens.json",
+    "gliner_config.json",
+    "termite_bundle.json",
+    "spm.model",
     "model_manifest.json",
     "antfly_metadata.json",
     "antfly_inference_variants.json",
@@ -336,6 +340,88 @@ fn appendBestClipclapGgufPair(
     return appendFirstCompleteClipclapGgufPair(allocator, to_download, files);
 }
 
+fn isGlinerEncoderGgufFile(path: []const u8) bool {
+    return glinerGgufSuffix(path, "encoder") != null;
+}
+
+fn isGlinerHeadGgufFile(path: []const u8) bool {
+    return glinerGgufSuffix(path, "head") != null;
+}
+
+fn glinerGgufSuffix(path: []const u8, component: []const u8) ?[]const u8 {
+    if (!isGgufFile(path)) return null;
+    const base = basename(path);
+    if (std.mem.eql(u8, component, "encoder") and std.mem.eql(u8, base, "encoder.gguf")) return "";
+    if (std.mem.eql(u8, component, "head") and std.mem.eql(u8, base, "gliner_head.gguf")) return "";
+
+    var prefix_buf: [48]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "gliner2-{s}", .{component}) catch return null;
+    if (!std.mem.startsWith(u8, base, prefix)) return null;
+    const ext = ".gguf";
+    const rest = base[prefix.len..];
+    if (std.mem.eql(u8, rest, ext)) return "";
+    if (rest.len <= 1 + ext.len or rest[0] != '.') return null;
+    if (!std.mem.endsWith(u8, rest, ext)) return null;
+    return rest[1 .. rest.len - ext.len];
+}
+
+fn glinerGgufMatchesSuffix(path: []const u8, component: []const u8, suffix: []const u8) bool {
+    const actual = glinerGgufSuffix(path, component) orelse return false;
+    return std.ascii.eqlIgnoreCase(actual, suffix);
+}
+
+fn appendGlinerSplitGgufBundleForQuant(
+    allocator: std.mem.Allocator,
+    to_download: *std.ArrayListUnmanaged(HubFile),
+    files: []const HubFile,
+    quant_suffix: []const u8,
+) !bool {
+    var encoder: ?HubFile = null;
+    var head: ?HubFile = null;
+
+    for (files) |f| {
+        if (encoder == null and glinerGgufMatchesSuffix(f.name, "encoder", quant_suffix)) {
+            encoder = f;
+        } else if (head == null and glinerGgufMatchesSuffix(f.name, "head", quant_suffix)) {
+            head = f;
+        }
+    }
+
+    if (encoder == null or head == null) return false;
+    try to_download.append(allocator, encoder.?);
+    try to_download.append(allocator, head.?);
+    return true;
+}
+
+fn appendGlinerSplitGgufBundle(
+    allocator: std.mem.Allocator,
+    to_download: *std.ArrayListUnmanaged(HubFile),
+    files: []const HubFile,
+    quant_filter: ?[]const u8,
+) !bool {
+    if (quant_filter) |quant| {
+        return appendGlinerSplitGgufBundleForQuant(allocator, to_download, files, quant);
+    }
+
+    for (&gguf_quant_preference) |quant| {
+        if (try appendGlinerSplitGgufBundleForQuant(allocator, to_download, files, quant)) return true;
+    }
+    if (try appendGlinerSplitGgufBundleForQuant(allocator, to_download, files, "")) return true;
+
+    for (files) |f| {
+        const suffix = glinerGgufSuffix(f.name, "encoder") orelse continue;
+        if (try appendGlinerSplitGgufBundleForQuant(allocator, to_download, files, suffix)) return true;
+    }
+    return false;
+}
+
+fn hasGlinerSplitGgufCandidate(files: []const HubFile) bool {
+    for (files) |file| {
+        if (isGlinerEncoderGgufFile(file.name) or isGlinerHeadGgufFile(file.name)) return true;
+    }
+    return false;
+}
+
 fn hasClipclapGgufCandidate(files: []const HubFile) bool {
     for (files) |file| {
         if (isClipclapClipGgufFile(file.name) or isClipclapClapGgufFile(file.name)) return true;
@@ -355,6 +441,11 @@ fn appendBestRequestedGgufPayload(
         return true;
     }
     if (has_clipclap_gguf) return false;
+    const has_gliner_split_gguf = hasGlinerSplitGgufCandidate(files);
+    if (try appendGlinerSplitGgufBundle(allocator, to_download, files, quant_filter)) {
+        return true;
+    }
+    if (has_gliner_split_gguf) return false;
     if (try appendBestGgufFile(allocator, to_download, files, quant_filter)) {
         _ = try appendSelectedGgufProjectorFile(allocator, to_download, files, projector_selection);
         return true;
@@ -1513,6 +1604,60 @@ test "gguf clipclap partial pair does not fall back to generic single file" {
 
     try std.testing.expect(!try appendBestRequestedGgufPayload(allocator, &to_download, &files, "Q4_K", .auto));
     try std.testing.expectEqual(@as(usize, 0), to_download.items.len);
+}
+
+test "gguf selection keeps gliner encoder and head together" {
+    const allocator = std.testing.allocator;
+
+    const files = [_]HubFile{
+        .{ .name = "encoder.gguf" },
+        .{ .name = "gliner_head.gguf" },
+        .{ .name = "unrelated-Q4_K_M.gguf" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    try std.testing.expect(try appendBestRequestedGgufPayload(allocator, &to_download, &files, null, .auto));
+
+    try std.testing.expectEqual(@as(usize, 2), to_download.items.len);
+    try std.testing.expectEqualStrings("encoder.gguf", to_download.items[0].name);
+    try std.testing.expectEqualStrings("gliner_head.gguf", to_download.items[1].name);
+}
+
+test "gguf gliner partial bundle does not fall back to generic single file" {
+    const allocator = std.testing.allocator;
+
+    const files = [_]HubFile{
+        .{ .name = "encoder.gguf" },
+        .{ .name = "unrelated-Q4_K_M.gguf" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    try std.testing.expect(!try appendBestRequestedGgufPayload(allocator, &to_download, &files, null, .auto));
+    try std.testing.expectEqual(@as(usize, 0), to_download.items.len);
+}
+
+test "gguf selection keeps canonical gliner quantized pairs together" {
+    const allocator = std.testing.allocator;
+
+    const files = [_]HubFile{
+        .{ .name = "gliner2-encoder.Q8_0.gguf" },
+        .{ .name = "gliner2-head.Q8_0.gguf" },
+        .{ .name = "gliner2-encoder.Q4_K.gguf" },
+        .{ .name = "gliner2-head.Q4_K.gguf" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    try std.testing.expect(try appendBestRequestedGgufPayload(allocator, &to_download, &files, "Q4_K", .auto));
+
+    try std.testing.expectEqual(@as(usize, 2), to_download.items.len);
+    try std.testing.expectEqualStrings("gliner2-encoder.Q4_K.gguf", to_download.items[0].name);
+    try std.testing.expectEqualStrings("gliner2-head.Q4_K.gguf", to_download.items[1].name);
 }
 
 test "projector-only selection finds mmproj gguf" {
