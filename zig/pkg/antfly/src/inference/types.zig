@@ -30,11 +30,26 @@ pub const ChatWireFlavor = enum {
     termite_native,
 };
 
+pub const ChatRequestOptions = struct {
+    tools_json: ?[]const u8 = null,
+    tool_choice_json: ?[]const u8 = null,
+};
+
 pub fn chatRequestJsonAlloc(
     alloc: std.mem.Allocator,
     model: []const u8,
     messages: []const ChatMessage,
     flavor: ChatWireFlavor,
+) ![]u8 {
+    return try chatRequestJsonWithOptionsAlloc(alloc, model, messages, flavor, .{});
+}
+
+pub fn chatRequestJsonWithOptionsAlloc(
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    messages: []const ChatMessage,
+    flavor: ChatWireFlavor,
+    options: ChatRequestOptions,
 ) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -45,7 +60,16 @@ pub fn chatRequestJsonAlloc(
         if (i > 0) try out.append(alloc, ',');
         try appendChatMessageJson(alloc, &out, message, flavor);
     }
-    try out.appendSlice(alloc, "]}");
+    try out.append(alloc, ']');
+    if (options.tools_json) |tools_json| {
+        try out.appendSlice(alloc, ",\"tools\":");
+        try out.appendSlice(alloc, tools_json);
+    }
+    if (options.tool_choice_json) |tool_choice_json| {
+        try out.appendSlice(alloc, ",\"tool_choice\":");
+        try out.appendSlice(alloc, tool_choice_json);
+    }
+    try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -215,13 +239,100 @@ pub const SparseEmbedResult = struct {
 
 pub const GenerateResult = struct {
     content: []const u8,
+    tool_calls: []ToolCall = &.{},
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *GenerateResult) void {
         self.allocator.free(self.content);
+        for (self.tool_calls) |*tool_call| tool_call.deinit(self.allocator);
+        if (self.tool_calls.len > 0) self.allocator.free(self.tool_calls);
         self.* = undefined;
     }
 };
+
+/// Some OpenAI-compatible providers and native model adapters emit a forced
+/// function call as plain JSON content instead of a `tool_calls` entry. The
+/// provider boundary normalizes that shape into the internal OpenAI-compatible
+/// ToolCall representation. This is intentionally narrow: a single function
+/// must be forced, that function must exist in `tools`, and the content must
+/// parse as JSON.
+pub fn synthesizeForcedToolCallFromContent(
+    alloc: std.mem.Allocator,
+    content_raw: []const u8,
+    tools_json: ?[]const u8,
+    tool_choice_json: ?[]const u8,
+) ![]ToolCall {
+    const content = jsonContentPayload(content_raw);
+    if (content.len == 0) return &.{};
+
+    const forced_name = (try forcedToolNameAlloc(alloc, tool_choice_json)) orelse return &.{};
+    defer alloc.free(forced_name);
+    if (!(try toolsContainFunction(alloc, tools_json, forced_name))) return &.{};
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{
+        .allocate = .alloc_always,
+    }) catch return &.{};
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .object, .array => {},
+        else => return &.{},
+    }
+
+    const arguments = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    errdefer alloc.free(arguments);
+    const calls = try alloc.alloc(ToolCall, 1);
+    errdefer alloc.free(calls);
+    calls[0] = .{
+        .id = try alloc.dupe(u8, "call_forced_0"),
+        .name = try alloc.dupe(u8, forced_name),
+        .arguments = arguments,
+    };
+    return calls;
+}
+
+fn forcedToolNameAlloc(alloc: std.mem.Allocator, tool_choice_json: ?[]const u8) !?[]u8 {
+    const raw = tool_choice_json orelse return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{
+        .allocate = .alloc_always,
+    }) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const function = parsed.value.object.get("function") orelse return null;
+    if (function != .object) return null;
+    const name = function.object.get("name") orelse return null;
+    if (name != .string or name.string.len == 0) return null;
+    return try alloc.dupe(u8, name.string);
+}
+
+fn toolsContainFunction(alloc: std.mem.Allocator, tools_json: ?[]const u8, name: []const u8) !bool {
+    const raw = tools_json orelse return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{
+        .allocate = .alloc_always,
+    }) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .array) return false;
+    for (parsed.value.array.items) |tool| {
+        if (tool != .object) continue;
+        const tool_type = tool.object.get("type") orelse continue;
+        if (tool_type != .string or !std.mem.eql(u8, tool_type.string, "function")) continue;
+        const function = tool.object.get("function") orelse continue;
+        if (function != .object) continue;
+        const function_name = function.object.get("name") orelse continue;
+        if (function_name == .string and std.mem.eql(u8, function_name.string, name)) return true;
+    }
+    return false;
+}
+
+fn jsonContentPayload(raw: []const u8) []const u8 {
+    var text = std.mem.trim(u8, raw, " \t\r\n");
+    if (!std.mem.startsWith(u8, text, "```")) return text;
+    const first_newline = std.mem.indexOfScalar(u8, text, '\n') orelse return text;
+    text = std.mem.trim(u8, text[first_newline + 1 ..], " \t\r\n");
+    if (std.mem.endsWith(u8, text, "```")) {
+        text = std.mem.trim(u8, text[0 .. text.len - 3], " \t\r\n");
+    }
+    return text;
+}
 
 pub const RerankResult = struct {
     scores: []const f32,
@@ -314,4 +425,52 @@ test "openai compatible chat serialization converts image media urls" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"media\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image_url\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://example.test/image.png\"") != null);
+}
+
+test "forced tool call synthesis normalizes plain JSON content" {
+    const alloc = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"emit_relations","parameters":{"type":"object"}}}]
+    ;
+    const tool_choice =
+        \\{"type":"function","function":{"name":"emit_relations"}}
+    ;
+
+    const calls = try synthesizeForcedToolCallFromContent(alloc,
+        \\{"relations":[{"type":"mentioned in","target":{"id":"Ada"}}]}
+    , tools, tool_choice);
+    defer {
+        for (calls) |*call| call.deinit(alloc);
+        if (calls.len > 0) alloc.free(calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("emit_relations", calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, calls[0].arguments, "\"relations\"") != null);
+}
+
+test "forced tool call synthesis accepts fenced JSON and rejects non-forced content" {
+    const alloc = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"emit_relations","parameters":{"type":"object"}}}]
+    ;
+    const tool_choice =
+        \\{"type":"function","function":{"name":"emit_relations"}}
+    ;
+    const fenced =
+        \\```json
+        \\{"relations":[]}
+        \\```
+    ;
+
+    const calls = try synthesizeForcedToolCallFromContent(alloc, fenced, tools, tool_choice);
+    defer {
+        for (calls) |*call| call.deinit(alloc);
+        if (calls.len > 0) alloc.free(calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("{\"relations\":[]}", calls[0].arguments);
+
+    const skipped = try synthesizeForcedToolCallFromContent(alloc, "{\"relations\":[]}", tools, "\"auto\"");
+    try std.testing.expectEqual(@as(usize, 0), skipped.len);
 }

@@ -27,6 +27,8 @@ pub const Provider = struct {
     http: *httpx.Client,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
+    tools_json: ?[]const u8 = null,
+    tool_choice_json: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -56,6 +58,11 @@ pub const Provider = struct {
             self.allocator.free(h[1]);
         }
         self.auth_header = .{ "Authorization", try self.allocator.dupe(u8, auth_header) };
+    }
+
+    pub fn setToolOptions(self: *Provider, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) void {
+        self.tools_json = tools_json;
+        self.tool_choice_json = tool_choice_json;
     }
 
     pub fn embedder(self: *Provider) inference.Embedder {
@@ -126,13 +133,23 @@ pub const Provider = struct {
             choices: []const struct {
                 message: struct {
                     content: ?[]const u8 = null,
+                    tool_calls: ?[]const struct {
+                        id: ?[]const u8 = null,
+                        function: struct {
+                            name: []const u8,
+                            arguments: []const u8,
+                        },
+                    } = null,
                 },
             },
         };
 
         const url = try std.fmt.allocPrint(self.allocator, "{s}/chat/completions", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try inference.chatRequestJsonAlloc(self.allocator, model, messages, .openai_compatible);
+        const json_body = try inference.chatRequestJsonWithOptionsAlloc(self.allocator, model, messages, .openai_compatible, .{
+            .tools_json = self.tools_json,
+            .tool_choice_json = self.tool_choice_json,
+        });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         defer resp.deinit();
@@ -143,15 +160,47 @@ pub const Provider = struct {
 
         const choices = parsed.value.choices;
         if (choices.len > 0) {
+            var tool_calls = try cloneOpenAIToolCalls(alloc, choices[0].message.tool_calls);
+            errdefer freeToolCalls(alloc, tool_calls);
             if (choices[0].message.content) |content| {
+                if (tool_calls.len == 0) {
+                    tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, content, self.tools_json, self.tool_choice_json);
+                }
                 return .{
                     .content = try alloc.dupe(u8, content),
+                    .tool_calls = tool_calls,
+                    .allocator = alloc,
+                };
+            }
+            if (tool_calls.len > 0) {
+                return .{
+                    .content = try alloc.dupe(u8, ""),
+                    .tool_calls = tool_calls,
                     .allocator = alloc,
                 };
             }
         }
 
         return error.GenerateRequestFailed;
+    }
+
+    fn cloneOpenAIToolCalls(alloc: std.mem.Allocator, maybe_calls: anytype) ![]inference.ToolCall {
+        const calls = maybe_calls orelse return &.{};
+        const out = try alloc.alloc(inference.ToolCall, calls.len);
+        errdefer alloc.free(out);
+        for (calls, 0..) |call, i| {
+            out[i] = .{
+                .id = try alloc.dupe(u8, call.id orelse ""),
+                .name = try alloc.dupe(u8, call.function.name),
+                .arguments = try alloc.dupe(u8, call.function.arguments),
+            };
+        }
+        return out;
+    }
+
+    fn freeToolCalls(alloc: std.mem.Allocator, calls: []inference.ToolCall) void {
+        for (calls) |*call| call.deinit(alloc);
+        if (calls.len > 0) alloc.free(calls);
     }
 
     fn authHeaders(self: *const Provider) ?[]const [2][]const u8 {
