@@ -292,6 +292,10 @@ pub const GlinerPipeline = struct {
         if (self.config.token_p == 0 or label_token == 0 or self.config.token_sep_text == 0)
             return error.MissingSpecialTokenIds;
 
+        if (self.session.backend() == .onnx and texts.len > 1) {
+            return self.recognizeWithLabelTokenBatchSerial(texts, labels, label_token, threshold, flat_ner);
+        }
+
         const results = try alloc.alloc([]Entity, texts.len);
         @memset(results, &.{});
         var initialized_results: usize = 0;
@@ -448,6 +452,44 @@ pub const GlinerPipeline = struct {
 
         for (prepared[0..prepared_len]) |*row| row.deinit(alloc);
         alloc.free(prepared);
+        return results;
+    }
+
+    fn recognizeWithLabelTokenBatchSerial(
+        self: *GlinerPipeline,
+        texts: []const []const u8,
+        labels: []const []const u8,
+        label_token: i32,
+        threshold: f32,
+        flat_ner: bool,
+    ) anyerror![][]Entity {
+        const alloc = self.allocator;
+        const results = try alloc.alloc([]Entity, texts.len);
+        @memset(results, &.{});
+        var initialized_results: usize = 0;
+        errdefer {
+            for (results[0..initialized_results]) |entities| {
+                for (entities) |entity| alloc.free(entity.text);
+                alloc.free(entities);
+            }
+            alloc.free(results);
+        }
+
+        for (texts, 0..) |_, i| {
+            const single = try self.recognizeWithLabelTokenBatch(texts[i .. i + 1], labels, label_token, threshold, flat_ner);
+            if (single.len != 1) {
+                for (single) |entities| {
+                    for (entities) |entity| alloc.free(entity.text);
+                    alloc.free(entities);
+                }
+                alloc.free(single);
+                return error.UnexpectedOutputShape;
+            }
+            results[i] = single[0];
+            alloc.free(single);
+            initialized_results += 1;
+        }
+
         return results;
     }
 
