@@ -3668,6 +3668,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache reserves retirement slots when pruning multiple leased generations",
+            "primary lookup adopts seeded write cache across visible generation bump",
             "provisioned table write source coalesces same-group waiters",
             "provisioned table write coalescer isolates failed waiters",
             "unique integrity owner topology inspection reports active and transitional ranges",

@@ -260,6 +260,103 @@ func TestCreateArtifactGraphIndexDefaultsToExtractorConfig(t *testing.T) {
 	}
 }
 
+func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
+	req := graphVisualizationQuery("Maxwell")
+	fullText, ok := req["full_text_search"].(map[string]any)
+	if !ok || fullText["query"] != "Maxwell" {
+		t.Fatalf("unexpected full-text search: %#v", req["full_text_search"])
+	}
+	graphSearches, ok := req["graph_searches"].(map[string]any)
+	if !ok {
+		t.Fatalf("graph searches missing: %#v", req)
+	}
+	graph, ok := graphSearches["relations"].(map[string]any)
+	if !ok {
+		t.Fatalf("relations graph search missing: %#v", graphSearches)
+	}
+	if graph["type"] != "traverse" {
+		t.Fatalf("graph type = %q, want traverse", graph["type"])
+	}
+	if graph["index_name"] != DefaultAutographIndex {
+		t.Fatalf("graph index = %q, want %s", graph["index_name"], DefaultAutographIndex)
+	}
+	startNodes, ok := graph["start_nodes"].(map[string]any)
+	if !ok || startNodes["result_ref"] != "$full_text_results" || startNodes["limit"] != 8 {
+		t.Fatalf("unexpected start nodes: %#v", graph["start_nodes"])
+	}
+	if graph["include_documents"] != true {
+		t.Fatalf("graph query should include documents")
+	}
+	params, ok := graph["params"].(map[string]any)
+	if !ok || params["direction"] != "both" || params["max_depth"] != 1 {
+		t.Fatalf("unexpected graph params: %#v", graph["params"])
+	}
+}
+
+func TestBuildGraphVisualizationConvertsGraphResults(t *testing.T) {
+	resp := antfly.QueryResponses{
+		Responses: []antfly.QueryResult{
+			{
+				GraphResults: map[string]antfly.GraphQueryResult{
+					"relations": {
+						Type: antfly.GraphQueryTypeTraverse,
+						Nodes: []antfly.GraphResultNode{
+							{
+								Key:   "doc-a",
+								Depth: 0,
+								Document: map[string]any{
+									"title": "Alpha page",
+									"url":   "http://example.test/a.pdf",
+									"metadata": map[string]any{
+										"source_file": "court/source.pdf",
+										"page_number": float64(12),
+									},
+								},
+							},
+							{
+								Key:   "doc-b",
+								Depth: 1,
+								Document: map[string]any{
+									"title": "Beta page",
+								},
+								PathEdges: []antfly.PathEdge{
+									{Source: "doc-a", Target: "doc-b", Type: "mentioned in", Weight: 0.75},
+								},
+							},
+							{
+								Key:      "Jeffrey Epstein",
+								Depth:    1,
+								Distance: 0.5,
+								Path:     []string{"doc-a", "Jeffrey Epstein"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	viz := buildGraphVisualization("Maxwell", &resp)
+	if viz.Query != "Maxwell" {
+		t.Fatalf("query = %q, want Maxwell", viz.Query)
+	}
+	if len(viz.Nodes) != 3 {
+		t.Fatalf("nodes = %d, want 3: %#v", len(viz.Nodes), viz.Nodes)
+	}
+	if viz.Nodes[0].Label != "Alpha page" || viz.Nodes[0].Subtitle != "source.pdf - page 12" {
+		t.Fatalf("unexpected first node: %#v", viz.Nodes[0])
+	}
+	if len(viz.Edges) != 2 {
+		t.Fatalf("edges = %d, want 2: %#v", len(viz.Edges), viz.Edges)
+	}
+	if viz.Edges[0].Source != "doc-a" || viz.Edges[0].Target != "doc-b" || viz.Edges[0].Type != "mentioned in" {
+		t.Fatalf("unexpected edge: %#v", viz.Edges[0])
+	}
+	if viz.Edges[1].Source != "doc-a" || viz.Edges[1].Target != "Jeffrey Epstein" || viz.Edges[1].Type != "related" {
+		t.Fatalf("unexpected path-derived edge: %#v", viz.Edges[1])
+	}
+}
+
 func TestInferenceMLBaseURLNormalizesRoots(t *testing.T) {
 	tests := []struct {
 		name string

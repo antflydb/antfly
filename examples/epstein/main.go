@@ -16,6 +16,7 @@ import (
 	"iter"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1787,6 +1788,7 @@ func serveCmd(args []string) error {
 	// Create server
 	server := &SearchServer{
 		client:    client,
+		antflyURL: strings.TrimRight(*antflyURL, "/"),
 		tableName: *tableName,
 		tmpl:      tmpl,
 	}
@@ -1798,6 +1800,7 @@ func serveCmd(args []string) error {
 	mux.HandleFunc("/", server.handleIndex)
 	mux.HandleFunc("/search", server.handleSearch)
 	mux.HandleFunc("/api/search", server.handleAPISearch)
+	mux.HandleFunc("/api/graph", server.handleAPIGraph)
 
 	// Serve static PDF files from the pages directory
 	pagesDir := filepath.Join(*pdfDir, "pages")
@@ -1832,6 +1835,7 @@ func serveCmd(args []string) error {
 // SearchServer handles web requests
 type SearchServer struct {
 	client    *antfly.AntflyClient
+	antflyURL string
 	tableName string
 	tmpl      *template.Template
 }
@@ -1860,6 +1864,27 @@ type SearchPageData struct {
 	Error   string
 	Took    string
 	Total   int
+}
+
+type GraphVisualization struct {
+	Query string      `json:"query"`
+	Nodes []GraphNode `json:"nodes"`
+	Edges []GraphEdge `json:"edges"`
+}
+
+type GraphNode struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	Subtitle string `json:"subtitle,omitempty"`
+	URL      string `json:"url,omitempty"`
+	Depth    int    `json:"depth,omitempty"`
+}
+
+type GraphEdge struct {
+	Source string  `json:"source"`
+	Target string  `json:"target"`
+	Type   string  `json:"type"`
+	Weight float64 `json:"weight,omitempty"`
 }
 
 func (s *SearchServer) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -1952,6 +1977,234 @@ func (s *SearchServer) handleAPISearch(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *SearchServer) handleAPIGraph(w http.ResponseWriter, r *http.Request) {
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" {
+		http.Error(w, "missing query parameter 'q'", http.StatusBadRequest)
+		return
+	}
+
+	resp, err := s.queryGraphVisualization(r.Context(), graphVisualizationQuery(query))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	viz := buildGraphVisualization(query, resp)
+	if len(viz.Edges) == 0 {
+		if fallback, err := s.queryGraphVisualization(r.Context(), graphVisualizationSampleQuery()); err == nil {
+			viz = buildGraphVisualization(query, fallback)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(viz)
+}
+
+func (s *SearchServer) queryGraphVisualization(ctx context.Context, payload map[string]any) (*antfly.QueryResponses, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal graph query: %w", err)
+	}
+
+	endpoint := fmt.Sprintf("%s/tables/%s/query", s.antflyURL, url.PathEscape(s.tableName))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create graph query request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("query graph: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("query graph: %s", strings.TrimSpace(string(data)))
+	}
+
+	var decoded antfly.QueryResponses
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("decode graph query: %w", err)
+	}
+	return &decoded, nil
+}
+
+func graphVisualizationQuery(searchText string) map[string]any {
+	return map[string]any{
+		"full_text_search": map[string]any{
+			"query": searchText,
+		},
+		"limit": 8,
+		"graph_searches": map[string]any{
+			"relations": map[string]any{
+				"type":              "traverse",
+				"index_name":        DefaultAutographIndex,
+				"start_nodes":       map[string]any{"result_ref": "$full_text_results", "limit": 8},
+				"include_documents": true,
+				"fields":            []string{"title", "url", "metadata"},
+				"params": map[string]any{
+					"direction":     "both",
+					"max_depth":     1,
+					"max_results":   80,
+					"include_paths": true,
+				},
+			},
+		},
+	}
+}
+
+func graphVisualizationSampleQuery() map[string]any {
+	return map[string]any{
+		"query": map[string]any{
+			"match_all": map[string]any{},
+		},
+		"limit": 8,
+		"graph_searches": map[string]any{
+			"relations": map[string]any{
+				"type":              "traverse",
+				"index_name":        DefaultAutographIndex,
+				"start_nodes":       map[string]any{"result_ref": "$fused_results", "limit": 8},
+				"include_documents": true,
+				"fields":            []string{"title", "url", "metadata"},
+				"params": map[string]any{
+					"direction":     "both",
+					"max_depth":     1,
+					"max_results":   80,
+					"include_paths": true,
+				},
+			},
+		},
+	}
+}
+
+func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVisualization {
+	viz := GraphVisualization{Query: query}
+	if resp == nil || len(resp.Responses) == 0 {
+		return viz
+	}
+	graph, ok := resp.Responses[0].GraphResults["relations"]
+	if !ok {
+		return viz
+	}
+
+	nodeByID := map[string]int{}
+	addNode := func(node GraphNode) {
+		if node.ID == "" {
+			return
+		}
+		if idx, ok := nodeByID[node.ID]; ok {
+			if viz.Nodes[idx].Label == node.ID && node.Label != "" {
+				viz.Nodes[idx].Label = node.Label
+			}
+			if viz.Nodes[idx].Subtitle == "" {
+				viz.Nodes[idx].Subtitle = node.Subtitle
+			}
+			if viz.Nodes[idx].URL == "" {
+				viz.Nodes[idx].URL = node.URL
+			}
+			return
+		}
+		if strings.TrimSpace(node.Label) == "" {
+			node.Label = node.ID
+		}
+		nodeByID[node.ID] = len(viz.Nodes)
+		viz.Nodes = append(viz.Nodes, node)
+	}
+
+	edgeSeen := map[string]struct{}{}
+	addEdge := func(edge GraphEdge) {
+		if edge.Source == "" || edge.Target == "" {
+			return
+		}
+		addNode(GraphNode{ID: edge.Source, Label: edge.Source})
+		addNode(GraphNode{ID: edge.Target, Label: edge.Target})
+		key := edge.Source + "\x00" + edge.Target + "\x00" + edge.Type
+		if _, ok := edgeSeen[key]; ok {
+			return
+		}
+		edgeSeen[key] = struct{}{}
+		viz.Edges = append(viz.Edges, edge)
+	}
+
+	for _, resultNode := range graph.Nodes {
+		addNode(graphNodeFromResult(resultNode))
+		for _, edge := range resultNode.PathEdges {
+			addEdge(GraphEdge{
+				Source: edge.Source,
+				Target: edge.Target,
+				Type:   edge.Type,
+				Weight: edge.Weight,
+			})
+		}
+		for _, edge := range graphEdgesFromPath(resultNode) {
+			addEdge(edge)
+		}
+		for _, edge := range resultNode.Edges {
+			addEdge(GraphEdge{
+				Source: string(edge.Source),
+				Target: string(edge.Target),
+				Type:   edge.Type,
+				Weight: edge.Weight,
+			})
+		}
+	}
+
+	return viz
+}
+
+func graphEdgesFromPath(node antfly.GraphResultNode) []GraphEdge {
+	if len(node.Path) < 2 || len(node.PathEdges) > 0 {
+		return nil
+	}
+	edges := make([]GraphEdge, 0, len(node.Path)-1)
+	for i := 1; i < len(node.Path); i++ {
+		edges = append(edges, GraphEdge{
+			Source: node.Path[i-1],
+			Target: node.Path[i],
+			Type:   "related",
+			Weight: node.Distance,
+		})
+	}
+	return edges
+}
+
+func graphNodeFromResult(node antfly.GraphResultNode) GraphNode {
+	title := node.Key
+	url := ""
+	subtitle := ""
+	if node.Document != nil {
+		if value, ok := node.Document["title"].(string); ok && strings.TrimSpace(value) != "" {
+			title = value
+		}
+		if value, ok := node.Document["url"].(string); ok {
+			url = value
+		}
+		if metadata, ok := node.Document["metadata"].(map[string]any); ok {
+			subtitle = graphNodeSubtitle(metadata)
+		}
+	}
+	return GraphNode{
+		ID:       node.Key,
+		Label:    title,
+		Subtitle: subtitle,
+		URL:      url,
+		Depth:    node.Depth,
+	}
+}
+
+func graphNodeSubtitle(metadata map[string]any) string {
+	parts := make([]string, 0, 2)
+	if source, ok := metadata["source_file"].(string); ok && source != "" {
+		parts = append(parts, filepath.Base(source))
+	}
+	if page, ok := metadata["page_number"].(float64); ok && page > 0 {
+		parts = append(parts, fmt.Sprintf("page %d", int(page)))
+	}
+	return strings.Join(parts, " - ")
 }
 
 func extractEntityChips(value any, limit int) []EntityChip {

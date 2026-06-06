@@ -327,6 +327,7 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
     return switch (err) {
         error.EmbedRateLimited,
         error.EmbedTransientFailure,
+        error.ModelNotFound,
         error.ConnectionRefused,
         error.ConnectionResetByPeer,
         error.ConnectionTimedOut,
@@ -341,6 +342,10 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+test "enrichment treats missing local model as retryable" {
+    try std.testing.expect(isRetryableEnrichmentError(error.ModelNotFound));
 }
 
 fn noteTransientEmbedRetry(runtime: *EnrichmentRuntime, err: anyerror) void {
@@ -371,6 +376,66 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
         .retrying = runtime.retrying,
         .worker_failed = runtime.worker_failed,
     };
+}
+
+fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_state.RuntimeStatus) void {
+    runtime.error_count = persisted_status.error_count;
+    runtime.retryable_error_count = persisted_status.retryable_error_count;
+    runtime.fatal_error_count = persisted_status.fatal_error_count;
+    runtime.retrying = persisted_status.retrying and !persisted_status.worker_failed;
+    runtime.worker_failed = persisted_status.worker_failed;
+    runtime.target_sequence = @max(runtime.applied_sequence, persisted_status.target_sequence);
+}
+
+test "enrichment runtime restore preserves retry target across restart" {
+    var runtime = struct {
+        applied_sequence: u64 = 3,
+        target_sequence: u64 = 0,
+        error_count: u64 = 0,
+        retryable_error_count: u64 = 0,
+        fatal_error_count: u64 = 0,
+        retrying: bool = false,
+        worker_failed: bool = false,
+    }{};
+
+    restorePersistedRuntimeStatus(&runtime, .{
+        .target_sequence = 9,
+        .error_count = 2,
+        .retryable_error_count = 2,
+        .fatal_error_count = 0,
+        .retrying = true,
+        .worker_failed = false,
+    });
+
+    try std.testing.expectEqual(@as(u64, 9), runtime.target_sequence);
+    try std.testing.expectEqual(@as(u64, 2), runtime.error_count);
+    try std.testing.expectEqual(@as(u64, 2), runtime.retryable_error_count);
+    try std.testing.expect(runtime.retrying);
+    try std.testing.expect(!runtime.worker_failed);
+}
+
+test "enrichment runtime restore does not resume persisted fatal failure" {
+    var runtime = struct {
+        applied_sequence: u64 = 7,
+        target_sequence: u64 = 0,
+        error_count: u64 = 0,
+        retryable_error_count: u64 = 0,
+        fatal_error_count: u64 = 0,
+        retrying: bool = false,
+        worker_failed: bool = false,
+    }{};
+
+    restorePersistedRuntimeStatus(&runtime, .{
+        .target_sequence = 4,
+        .error_count = 1,
+        .fatal_error_count = 1,
+        .retrying = true,
+        .worker_failed = true,
+    });
+
+    try std.testing.expectEqual(@as(u64, 7), runtime.target_sequence);
+    try std.testing.expect(!runtime.retrying);
+    try std.testing.expect(runtime.worker_failed);
 }
 
 fn clearPublishedGeneratedArtifacts(runtime: *EnrichmentRuntime) void {
@@ -798,7 +863,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             },
         };
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
-        runtime.target_sequence = runtime.applied_sequence;
+        const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
+        restorePersistedRuntimeStatus(&runtime, persisted_status);
         return runtime;
     }
 
@@ -1027,7 +1093,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             }),
         };
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
-        runtime.target_sequence = runtime.applied_sequence;
+        const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
+        restorePersistedRuntimeStatus(&runtime, persisted_status);
         return runtime;
     }
 

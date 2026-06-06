@@ -46,10 +46,21 @@ pub fn parseProjectorSelection(value: []const u8) ?ProjectorSelection {
     return .{ .match = value };
 }
 
-const HubFile = struct {
+pub const HubFile = struct {
     name: []const u8,
     size: ?u64 = null,
     sha256: ?[]const u8 = null,
+};
+
+pub const PayloadSupportSummary = struct {
+    has_gguf: bool = false,
+    has_onnx: bool = false,
+    has_safetensors: bool = false,
+    has_framework_weights: bool = false,
+
+    pub fn hasCompatiblePayload(self: PayloadSupportSummary) bool {
+        return self.has_gguf or self.has_onnx or self.has_safetensors;
+    }
 };
 
 const SyntheticMetadataPlan = union(enum) {
@@ -79,6 +90,10 @@ const always_files = [_][]const u8{
     "modules.json",
     "config_sentence_transformers.json",
     "1_SpladePooling/config.json",
+    "added_tokens.json",
+    "gliner_config.json",
+    "termite_bundle.json",
+    "spm.model",
     "model_manifest.json",
     "antfly_metadata.json",
     "antfly_inference_variants.json",
@@ -205,6 +220,86 @@ fn basename(path: []const u8) []const u8 {
 
 fn isGgufFile(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".gguf");
+}
+
+fn isOnnxFile(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".onnx");
+}
+
+fn isSafetensorsFile(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".safetensors") or std.mem.endsWith(u8, path, ".safetensors.index.json");
+}
+
+fn isFrameworkWeightFile(path: []const u8) bool {
+    const base = basename(path);
+    return std.mem.eql(u8, base, "pytorch_model.bin") or
+        (std.mem.startsWith(u8, base, "pytorch_model-") and std.mem.endsWith(u8, base, ".bin")) or
+        std.mem.eql(u8, base, "tf_model.h5") or
+        std.mem.eql(u8, base, "flax_model.msgpack") or
+        std.mem.endsWith(u8, base, ".ckpt");
+}
+
+pub fn summarizePayloadSupport(files: []const HubFile) PayloadSupportSummary {
+    var summary: PayloadSupportSummary = .{};
+    for (files) |file| {
+        summary.has_gguf = summary.has_gguf or isGgufFile(file.name);
+        summary.has_onnx = summary.has_onnx or isOnnxFile(file.name);
+        summary.has_safetensors = summary.has_safetensors or isSafetensorsFile(file.name);
+        summary.has_framework_weights = summary.has_framework_weights or isFrameworkWeightFile(file.name);
+    }
+    return summary;
+}
+
+fn appendModelRef(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    owner: []const u8,
+    name: []const u8,
+    variant: []const u8,
+) !void {
+    try out.appendSlice(alloc, owner);
+    try out.append(alloc, '/');
+    try out.appendSlice(alloc, name);
+    if (variant.len > 0 and !std.mem.eql(u8, variant, "auto")) {
+        try out.append(alloc, ':');
+        try out.appendSlice(alloc, variant);
+    }
+}
+
+fn isOpenAiClipRef(owner: []const u8, name: []const u8) bool {
+    return std.mem.eql(u8, owner, "openai") and std.mem.startsWith(u8, name, "clip-");
+}
+
+pub fn noModelFilesAdviceAlloc(
+    alloc: std.mem.Allocator,
+    owner: []const u8,
+    name: []const u8,
+    variant: []const u8,
+    files: []const HubFile,
+) ![]u8 {
+    const summary = summarizePayloadSupport(files);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try out.appendSlice(alloc, "No compatible model files found for ");
+    try appendModelRef(alloc, &out, owner, name, variant);
+    try out.appendSlice(alloc, ".\n");
+    try out.appendSlice(alloc, "Antfly inference pull expects GGUF, ONNX, or safetensors payloads.");
+    if (summary.has_framework_weights and !summary.hasCompatiblePayload()) {
+        try out.appendSlice(alloc, " This repo appears to publish framework weights only, such as PyTorch, TensorFlow, or Flax files.");
+    }
+    try out.append(alloc, '\n');
+
+    if (isOpenAiClipRef(owner, name)) {
+        try out.appendSlice(alloc, "For v0.2 CLIP/CLAP embeddings, use:\n");
+        try out.appendSlice(alloc, "  antfly inference pull antflydb/clipclap:gguf:Q4_K\n");
+        try out.appendSlice(alloc, "For an ONNX CLIP export, try:\n");
+        try out.appendSlice(alloc, "  antfly inference pull Xenova/clip-vit-base-patch32:hybrid\n");
+    } else {
+        try out.appendSlice(alloc, "Use a repo or variant that includes GGUF, ONNX, or safetensors model files.\n");
+    }
+
+    return try out.toOwnedSlice(alloc);
 }
 
 fn isGgufProjectorFile(path: []const u8) bool {
@@ -336,6 +431,88 @@ fn appendBestClipclapGgufPair(
     return appendFirstCompleteClipclapGgufPair(allocator, to_download, files);
 }
 
+fn isGlinerEncoderGgufFile(path: []const u8) bool {
+    return glinerGgufSuffix(path, "encoder") != null;
+}
+
+fn isGlinerHeadGgufFile(path: []const u8) bool {
+    return glinerGgufSuffix(path, "head") != null;
+}
+
+fn glinerGgufSuffix(path: []const u8, component: []const u8) ?[]const u8 {
+    if (!isGgufFile(path)) return null;
+    const base = basename(path);
+    if (std.mem.eql(u8, component, "encoder") and std.mem.eql(u8, base, "encoder.gguf")) return "";
+    if (std.mem.eql(u8, component, "head") and std.mem.eql(u8, base, "gliner_head.gguf")) return "";
+
+    var prefix_buf: [48]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "gliner2-{s}", .{component}) catch return null;
+    if (!std.mem.startsWith(u8, base, prefix)) return null;
+    const ext = ".gguf";
+    const rest = base[prefix.len..];
+    if (std.mem.eql(u8, rest, ext)) return "";
+    if (rest.len <= 1 + ext.len or rest[0] != '.') return null;
+    if (!std.mem.endsWith(u8, rest, ext)) return null;
+    return rest[1 .. rest.len - ext.len];
+}
+
+fn glinerGgufMatchesSuffix(path: []const u8, component: []const u8, suffix: []const u8) bool {
+    const actual = glinerGgufSuffix(path, component) orelse return false;
+    return std.ascii.eqlIgnoreCase(actual, suffix);
+}
+
+fn appendGlinerSplitGgufBundleForQuant(
+    allocator: std.mem.Allocator,
+    to_download: *std.ArrayListUnmanaged(HubFile),
+    files: []const HubFile,
+    quant_suffix: []const u8,
+) !bool {
+    var encoder: ?HubFile = null;
+    var head: ?HubFile = null;
+
+    for (files) |f| {
+        if (encoder == null and glinerGgufMatchesSuffix(f.name, "encoder", quant_suffix)) {
+            encoder = f;
+        } else if (head == null and glinerGgufMatchesSuffix(f.name, "head", quant_suffix)) {
+            head = f;
+        }
+    }
+
+    if (encoder == null or head == null) return false;
+    try to_download.append(allocator, encoder.?);
+    try to_download.append(allocator, head.?);
+    return true;
+}
+
+fn appendGlinerSplitGgufBundle(
+    allocator: std.mem.Allocator,
+    to_download: *std.ArrayListUnmanaged(HubFile),
+    files: []const HubFile,
+    quant_filter: ?[]const u8,
+) !bool {
+    if (quant_filter) |quant| {
+        return appendGlinerSplitGgufBundleForQuant(allocator, to_download, files, quant);
+    }
+
+    for (&gguf_quant_preference) |quant| {
+        if (try appendGlinerSplitGgufBundleForQuant(allocator, to_download, files, quant)) return true;
+    }
+    if (try appendGlinerSplitGgufBundleForQuant(allocator, to_download, files, "")) return true;
+
+    for (files) |f| {
+        const suffix = glinerGgufSuffix(f.name, "encoder") orelse continue;
+        if (try appendGlinerSplitGgufBundleForQuant(allocator, to_download, files, suffix)) return true;
+    }
+    return false;
+}
+
+fn hasGlinerSplitGgufCandidate(files: []const HubFile) bool {
+    for (files) |file| {
+        if (isGlinerEncoderGgufFile(file.name) or isGlinerHeadGgufFile(file.name)) return true;
+    }
+    return false;
+}
+
 fn hasClipclapGgufCandidate(files: []const HubFile) bool {
     for (files) |file| {
         if (isClipclapClipGgufFile(file.name) or isClipclapClapGgufFile(file.name)) return true;
@@ -355,6 +532,11 @@ fn appendBestRequestedGgufPayload(
         return true;
     }
     if (has_clipclap_gguf) return false;
+    const has_gliner_split_gguf = hasGlinerSplitGgufCandidate(files);
+    if (try appendGlinerSplitGgufBundle(allocator, to_download, files, quant_filter)) {
+        return true;
+    }
+    if (has_gliner_split_gguf) return false;
     if (try appendBestGgufFile(allocator, to_download, files, quant_filter)) {
         _ = try appendSelectedGgufProjectorFile(allocator, to_download, files, projector_selection);
         return true;
@@ -963,6 +1145,11 @@ pub fn downloadModel(
     }
 
     if (!found_model_payload) {
+        const advice = noModelFilesAdviceAlloc(allocator, owner, name, variant, files) catch null;
+        if (advice) |message| {
+            defer allocator.free(message);
+            std.debug.print("{s}", .{message});
+        }
         return error.NoModelFilesFound;
     }
 
@@ -1483,6 +1670,43 @@ test "gguf selection keeps clipclap clip and clap pair together" {
     try std.testing.expectEqualStrings("clipclap-clap.Q4_K.gguf", to_download.items[1].name);
 }
 
+test "payload support summary distinguishes framework-only repos" {
+    const files = [_]HubFile{
+        .{ .name = "config.json" },
+        .{ .name = "pytorch_model.bin" },
+        .{ .name = "tf_model.h5" },
+        .{ .name = "flax_model.msgpack" },
+    };
+
+    const summary = summarizePayloadSupport(&files);
+    try std.testing.expect(!summary.hasCompatiblePayload());
+    try std.testing.expect(summary.has_framework_weights);
+    try std.testing.expect(!summary.has_onnx);
+    try std.testing.expect(!summary.has_safetensors);
+    try std.testing.expect(!summary.has_gguf);
+}
+
+test "no model files advice recommends blessed clipclap ref for openai clip" {
+    const files = [_]HubFile{
+        .{ .name = "config.json" },
+        .{ .name = "pytorch_model.bin" },
+    };
+
+    const advice = try noModelFilesAdviceAlloc(
+        std.testing.allocator,
+        "openai",
+        "clip-vit-base-patch32",
+        "hybrid",
+        &files,
+    );
+    defer std.testing.allocator.free(advice);
+
+    try std.testing.expect(std.mem.indexOf(u8, advice, "openai/clip-vit-base-patch32:hybrid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, advice, "framework weights only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, advice, "antflydb/clipclap:gguf:Q4_K") != null);
+    try std.testing.expect(std.mem.indexOf(u8, advice, "Xenova/clip-vit-base-patch32:hybrid") != null);
+}
+
 test "gguf clipclap selection does not mix quantized pairs" {
     const allocator = std.testing.allocator;
 
@@ -1513,6 +1737,60 @@ test "gguf clipclap partial pair does not fall back to generic single file" {
 
     try std.testing.expect(!try appendBestRequestedGgufPayload(allocator, &to_download, &files, "Q4_K", .auto));
     try std.testing.expectEqual(@as(usize, 0), to_download.items.len);
+}
+
+test "gguf selection keeps gliner encoder and head together" {
+    const allocator = std.testing.allocator;
+
+    const files = [_]HubFile{
+        .{ .name = "encoder.gguf" },
+        .{ .name = "gliner_head.gguf" },
+        .{ .name = "unrelated-Q4_K_M.gguf" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    try std.testing.expect(try appendBestRequestedGgufPayload(allocator, &to_download, &files, null, .auto));
+
+    try std.testing.expectEqual(@as(usize, 2), to_download.items.len);
+    try std.testing.expectEqualStrings("encoder.gguf", to_download.items[0].name);
+    try std.testing.expectEqualStrings("gliner_head.gguf", to_download.items[1].name);
+}
+
+test "gguf gliner partial bundle does not fall back to generic single file" {
+    const allocator = std.testing.allocator;
+
+    const files = [_]HubFile{
+        .{ .name = "encoder.gguf" },
+        .{ .name = "unrelated-Q4_K_M.gguf" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    try std.testing.expect(!try appendBestRequestedGgufPayload(allocator, &to_download, &files, null, .auto));
+    try std.testing.expectEqual(@as(usize, 0), to_download.items.len);
+}
+
+test "gguf selection keeps canonical gliner quantized pairs together" {
+    const allocator = std.testing.allocator;
+
+    const files = [_]HubFile{
+        .{ .name = "gliner2-encoder.Q8_0.gguf" },
+        .{ .name = "gliner2-head.Q8_0.gguf" },
+        .{ .name = "gliner2-encoder.Q4_K.gguf" },
+        .{ .name = "gliner2-head.Q4_K.gguf" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    try std.testing.expect(try appendBestRequestedGgufPayload(allocator, &to_download, &files, "Q4_K", .auto));
+
+    try std.testing.expectEqual(@as(usize, 2), to_download.items.len);
+    try std.testing.expectEqualStrings("gliner2-encoder.Q4_K.gguf", to_download.items[0].name);
+    try std.testing.expectEqualStrings("gliner2-head.Q4_K.gguf", to_download.items[1].name);
 }
 
 test "projector-only selection finds mmproj gguf" {

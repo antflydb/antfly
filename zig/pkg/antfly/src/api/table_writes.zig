@@ -894,6 +894,16 @@ pub const ProvisionedTableWriteCache = struct {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             return self.leaseEntryLocked(entry);
         }
+        return null;
+    }
+
+    fn snapshotLeaseOrAdoptSeededLocked(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+        lsm_root_generation: u64,
+        table_name: []const u8,
+    ) ?CachedDb {
+        if (self.snapshotLeaseLocked(group_id, lsm_root_generation, table_name)) |cached| return cached;
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
@@ -9427,11 +9437,11 @@ pub const ProvisionedTableWriteSource = struct {
         lockAtomic(&self.local_db_mutex);
         var cached: ?ProvisionedTableWriteCache.CachedDb = null;
         if (self.write_cache) |cache| {
-            cached = cache.snapshotLeaseLocked(group_id, lsm_root_generation, table_name);
+            cached = cache.snapshotLeaseOrAdoptSeededLocked(group_id, lsm_root_generation, table_name);
         }
         if (cached == null) {
             if (self.startup_write_cache) |cache| {
-                cached = cache.snapshotLeaseLocked(group_id, lsm_root_generation, table_name);
+                cached = cache.snapshotLeaseOrAdoptSeededLocked(group_id, lsm_root_generation, table_name);
             }
         }
         self.local_db_mutex.unlock();
@@ -15770,6 +15780,7 @@ fn extractIndexConfigJsonWithOptions(
         if (std.mem.eql(u8, entry.key_ptr.*, "type") or
             std.mem.eql(u8, entry.key_ptr.*, "name") or
             std.mem.eql(u8, entry.key_ptr.*, "description") or
+            std.mem.eql(u8, entry.key_ptr.*, "validation") or
             std.mem.eql(u8, entry.key_ptr.*, "enrichments"))
         {
             continue;
@@ -29899,12 +29910,14 @@ test "primary lookup adopts seeded write cache across visible generation bump" {
         .sync_level = .write,
     });
     seeded.deinit(alloc);
-    write_cache.entries.items[0].allow_generation_adoption = true;
-
-    const misses_before = write_cache.miss_count.load(.monotonic);
-    generation = 2;
 
     const primary_lookup = source.primaryLookupDbSource();
+    generation = 2;
+    try std.testing.expect((try primary_lookup.leaseGroup(alloc, "docs", 7001, generation)) == null);
+
+    write_cache.entries.items[0].allow_generation_adoption = true;
+    const misses_before = write_cache.miss_count.load(.monotonic);
+
     var lease = (try primary_lookup.leaseGroup(alloc, "docs", 7001, generation)).?;
     defer lease.release(alloc);
 

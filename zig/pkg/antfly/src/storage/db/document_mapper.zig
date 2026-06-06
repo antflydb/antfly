@@ -2296,6 +2296,10 @@ fn appendSchemaLessStringTextFields(
         .field_name = try alloc.dupe(u8, path),
         .text = text,
     });
+    try fields.append(alloc, .{
+        .field_name = "_all",
+        .text = text,
+    });
     if (text.len > schema_less_exact_max_bytes or std.mem.endsWith(u8, path, schema_less_exact_field_suffix)) return;
     const exact_field = try schemaLessExactFieldNameAlloc(alloc, path);
     try fields.append(alloc, .{
@@ -2870,6 +2874,7 @@ test "document mapper builds text segment from top-level string fields" {
     try std.testing.expect((try reader.invertedIndex("title.keyword")) != null);
     try std.testing.expect((try reader.invertedIndex("body")) != null);
     try std.testing.expect((try reader.invertedIndex("body.keyword")) != null);
+    try std.testing.expect((try reader.invertedIndex("_all")) != null);
     try std.testing.expect((try reader.invertedIndex("count")) == null);
 }
 
@@ -2971,6 +2976,7 @@ test "document mapper builds text segment from nested string fields without sche
     try std.testing.expect((try reader.invertedIndex("title")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.summary")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.tags")) != null);
+    try std.testing.expect((try reader.invertedIndex("_all")) != null);
 }
 
 test "document mapper schema-less fast projection indexes nested string fields" {
@@ -3001,6 +3007,7 @@ test "document mapper schema-less fast projection indexes nested string fields" 
     try std.testing.expect((try reader.invertedIndex("meta.summary.keyword")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.tags")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.tags.keyword")) != null);
+    try std.testing.expect((try reader.invertedIndex("_all")) != null);
 }
 
 test "document mapper schema-less projection indexes exact fields with embeddings stripped" {

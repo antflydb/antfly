@@ -64,3 +64,7 @@ test "bedrock provider request helpers" {
 test "managed embedder resolves file-backed api key rotation at request time" {
     try managed_embedder.testFileBackedApiKeyRotation();
 }
+
+test "managed embedder dimension probe validation modes" {
+    try managed_embedder.testDimensionProbeValidationModes();
+}

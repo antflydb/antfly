@@ -2077,7 +2077,7 @@ fn extractCanonicalObjectField(alloc: std.mem.Allocator, schema_json: []const u8
     return try stringifyJsonValue(alloc, value);
 }
 
-fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
+pub fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
     const source = if (schema_json.len > 0) schema_json else "{}";
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
     defer parsed.deinit();

@@ -34,6 +34,7 @@ const public_table_http = @import("public_table_http.zig");
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
 const table_reads = @import("table_reads.zig");
+const table_writes = @import("table_writes.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const transactions_api = @import("transactions.zig");
 const distributed_txn = @import("distributed_txn.zig");
@@ -1482,6 +1483,28 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid create table request");
         };
         defer create_req.deinit(alloc);
+        const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+            alloc,
+            create_req.indexes_json orelse tables_api.default_indexes_json,
+            .{
+                .antfly_provider = self.api_server.antfly_provider,
+                .secret_store = self.api_server.cfg.secret_store,
+                .remote_content = self.api_server.cfg.remote_content,
+                .inference_api_key = self.api_server.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => {
+                _ = ctx.status(400);
+                return ctx.text("unsupported table index configuration");
+            },
+            error.EmbeddingProbeUnavailable => {
+                _ = ctx.status(503);
+                return ctx.text("table index validation probe unavailable");
+            },
+            else => return err,
+        };
+        if (create_req.indexes_json) |old_indexes_json| alloc.free(old_indexes_json);
+        create_req.indexes_json = normalized_indexes_json;
         tables_api.validatePublicAlgebraicIndexesJson(alloc, create_req.indexes_json orelse tables_api.default_indexes_json) catch {
             _ = ctx.status(400);
             return ctx.text("unsupported table index configuration");
@@ -1517,6 +1540,10 @@ pub const AntflyApiHandler = struct {
                 error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => {
                     _ = ctx.status(400);
                     return ctx.text("unsupported table index configuration");
+                },
+                error.EmbeddingProbeUnavailable => {
+                    _ = ctx.status(503);
+                    return ctx.text("table index validation probe unavailable");
                 },
                 else => {
                     std.log.err("public create table local create failed table={s} err={}", .{ table_name, err });

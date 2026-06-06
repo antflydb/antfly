@@ -223,6 +223,8 @@ fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
 fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, args: []const []const u8) !void {
     if (args.len == 0) {
         print("usage: {s} pull <owner/name|hf:owner/name>[:gguf|:gguf:Q4_K_M|:mmproj] [--token <hf-token>] [--models-dir <dir>] [--tasks <task1,task2>] [--capabilities <cap1,cap2>] [--projector <auto|none|Q8_0|filename>]\n", .{usage_name});
+        print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
+        print("CLIP/CLAP v0.2 example: {s} pull antflydb/clipclap:gguf:Q4_K\n", .{usage_name});
         return;
     }
     const ref = args[0];
@@ -313,10 +315,11 @@ fn printUsage(usage_name: []const u8) void {
         \\  --capabilities <list> Comma-separated capability hints for the pulled model
         \\  --projector <value> Projector sidecar selection for GGUF pulls: auto, none, quant suffix, or filename
         \\  --models-dir <dir>    Models directory (default: ~/.antfly/inference/models)
-        \\  variants          <model-ref>:gguf, <model-ref>:gguf:Q4_K_M, <model-ref>:mmproj
+        \\  variants          <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors
         \\                    default :gguf now prefers smaller GGUF quants; use :gguf:Q... for larger files
+        \\  CLIP/CLAP v0.2    {s} pull antflydb/clipclap:gguf:Q4_K
         \\
-    , .{usage_name});
+    , .{ usage_name, usage_name });
 }
 
 test "run config parses shared scraping fields and ignores api_url" {
