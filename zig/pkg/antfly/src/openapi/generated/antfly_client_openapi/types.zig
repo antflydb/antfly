@@ -4306,6 +4306,8 @@ pub const RowOperation = struct {
     where: ?RowSelector = null,
     /// Top-level field patch for update operations.
     patch: ?std.json.Value = null,
+    /// Optional optimistic-concurrency predicate for update/delete. The predicate applies to the physical row resolved from primary or unique identity.
+    expected_version: ?i64 = null,
 };
 
 pub const RowsGetRequest = struct {

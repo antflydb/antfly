@@ -30,6 +30,7 @@ const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
+const api_relational_rows = @import("../api/relational_rows.zig");
 const api_table_router = @import("../api/table_router.zig");
 const test_contract_helpers = @import("../api/test_contract_helpers.zig");
 const api_table_writes = @import("../api/table_writes.zig");
@@ -53,6 +54,8 @@ const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
+const schema_mod = @import("../schema/mod.zig");
+const storage_schema = @import("../storage/schema.zig");
 const platform_clock = @import("../platform/clock.zig");
 const platform_time = @import("../platform/time.zig");
 const usermgr = @import("../usermgr/mod.zig");
@@ -1050,6 +1053,107 @@ fn expectBodyContainsAll(body: []const u8, needles: []const []const u8) !void {
     for (needles) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, body, needle) != null);
     }
+}
+
+fn relationalPhysicalKeyForRowAlloc(alloc: std.mem.Allocator, schema_json: []const u8, row_json: []const u8) ![]u8 {
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, schema);
+    return try api_relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, row_json);
+}
+
+fn fetchPublicRowsRequest(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    suffix: []const u8,
+    body: []const u8,
+    expected_status: u16,
+) !api_http_client.QueryResponse {
+    const path = try std.fmt.allocPrint(client.alloc, "{s}{s}{s}", .{
+        api_http_routes.Routes.tables_prefix,
+        table_name,
+        suffix,
+    });
+    defer client.alloc.free(path);
+    const uri = try raft_transport.Routes.join(client.alloc, base_uri, path);
+    defer client.alloc.free(uri);
+
+    var resp = try client.executor.execute(client.alloc, .{
+        .method = .POST,
+        .uri = uri,
+        .content_type = "application/json",
+        .body = body,
+    });
+    defer resp.deinit(client.alloc);
+    if (resp.status != expected_status) {
+        std.debug.print("public rows request unexpected status={d} uri={s} body={s}\n", .{ resp.status, uri, resp.body });
+        return error.UnexpectedHttpStatus;
+    }
+    return .{ .body = try client.alloc.dupe(u8, resp.body) };
+}
+
+fn fetchPublicRowsGet(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+) !api_http_client.QueryResponse {
+    return try fetchPublicRowsRequest(client, base_uri, table_name, api_http_routes.Routes.rows_get_suffix, body, 200);
+}
+
+fn fetchPublicRowsBatchExpectStatus(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+    expected_status: u16,
+) !api_http_client.QueryResponse {
+    return try fetchPublicRowsRequest(client, base_uri, table_name, api_http_routes.Routes.rows_batch_suffix, body, expected_status);
+}
+
+fn fetchPublicTransactionCommitRaw(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    body: []const u8,
+) !api_http_client.TransactionResponse {
+    const uri = try raft_transport.Routes.join(client.alloc, base_uri, api_http_routes.Routes.transactions_commit);
+    defer client.alloc.free(uri);
+    var resp = try client.executor.execute(client.alloc, .{
+        .method = .POST,
+        .uri = uri,
+        .content_type = "application/json",
+        .body = body,
+    });
+    defer resp.deinit(client.alloc);
+    return .{
+        .status = resp.status,
+        .body = try client.alloc.dupe(u8, resp.body),
+    };
+}
+
+fn waitForUniqueOwnerGroupActive(
+    cluster: *MetadataHttpClusterSimulation,
+    table_id: u64,
+    constraint_name: []const u8,
+    rounds: usize,
+) !u64 {
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        const leader_index = currentMetadataLeaderIndex(cluster) orelse 0;
+        var snapshot = try cluster.node(leader_index).adminSnapshot();
+        defer cluster.node(leader_index).freeAdminSnapshot(&snapshot);
+        for (snapshot.unique_constraint_ranges) |range| {
+            if (range.table_id != table_id) continue;
+            if (!std.mem.eql(u8, range.constraint_name, constraint_name)) continue;
+            if (!metadata_table_manager.uniqueConstraintRangeRoutable(range)) continue;
+            _ = try waitForSingleActiveGroupHost(cluster, range.group_id, 8);
+            return range.group_id;
+        }
+        try cluster.stepAll();
+    }
+    return error.TestExpectedEqual;
 }
 
 fn waitForSplitResolvedGroups(
@@ -5364,10 +5468,13 @@ fn runMetadataVoprRelationalIdentityCampaign(alloc: std.mem.Allocator, cfg: Meta
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
     const parent_schema =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"name":{"type":"keyword"}},"required":["tenant_id","customer_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","customer_id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"}},"required":["tenant_id","customer_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","customer_id"]},"unique_constraints":[{"name":"vopr_customers_email_key","columns":["tenant_id","email"]}]}
     ;
     const child_schema =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"order_id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["tenant_id","order_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","order_id"]},"foreign_keys":[{"name":"vopr_orders_customer_fkey","columns":["tenant_id","customer_id"],"references":{"table":"vopr-rel-parent","columns":["tenant_id","customer_id"]},"on_delete":"restrict","on_update":"restrict","match":"full","timing":"immediate","validation_state":"enforced"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"order_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"customer_email":{"type":"keyword"}},"required":["tenant_id","order_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","order_id"]},"foreign_keys":[{"name":"vopr_orders_customer_fkey","columns":["tenant_id","customer_id"],"references":{"table":"vopr-rel-parent","columns":["tenant_id","customer_id"]},"on_delete":"restrict","on_update":"restrict","match":"full","timing":"immediate","validation_state":"enforced"},{"name":"vopr_orders_customer_email_fkey","columns":["tenant_id","customer_email"],"references":{"table":"vopr-rel-parent","columns":["tenant_id","email"]},"on_delete":"restrict","on_update":"restrict","match":"simple","timing":"immediate","validation_state":"enforced"}]}
+    ;
+    const grandchild_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"order_id":{"type":"keyword"},"line_id":{"type":"keyword"},"sku":{"type":"keyword"}},"required":["tenant_id","order_id","line_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","order_id","line_id"]},"foreign_keys":[{"name":"vopr_lines_order_fkey","columns":["tenant_id","order_id"],"references":{"table":"vopr-rel-child","columns":["tenant_id","order_id"]},"on_delete":"cascade","on_update":"restrict","match":"full","timing":"immediate","validation_state":"enforced"}]}
     ;
     const leader_index = try metadataVoprLeaderIndex(&cluster);
     try workflow.bootstrapDesiredFromCommitted(cluster.node(leader_index));
@@ -5375,14 +5482,21 @@ fn runMetadataVoprRelationalIdentityCampaign(alloc: std.mem.Allocator, cfg: Meta
     try workflow.controlLoop().stateRef().tableManager().upsertRange(.{ .group_id = cfg.range_group_id, .table_id = cfg.table_id, .start_key = "doc:a", .end_key = "doc:z" });
     try workflow.controlLoop().stateRef().tableManager().upsertTable(.{ .table_id = cfg.table_id + 1, .name = "vopr-rel-child", .schema_json = child_schema, .desired_replica_count = 2, .min_ranges = 1, .placement_role = "data" });
     try workflow.controlLoop().stateRef().tableManager().upsertRange(.{ .group_id = cfg.range_group_id + 1, .table_id = cfg.table_id + 1, .start_key = "doc:a", .end_key = "doc:z" });
+    try workflow.controlLoop().stateRef().tableManager().upsertTable(.{ .table_id = cfg.table_id + 2, .name = "vopr-rel-grandchild", .schema_json = grandchild_schema, .desired_replica_count = 2, .min_ranges = 1, .placement_role = "data" });
+    try workflow.controlLoop().stateRef().tableManager().upsertRange(.{ .group_id = cfg.range_group_id + 2, .table_id = cfg.table_id + 2, .start_key = "doc:a", .end_key = "doc:z" });
     _ = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try metadataVoprHealAll(&cluster, &campaign_state);
 
     try std.testing.expect(try cluster.waitForGroupStatusCount(cfg.range_group_id, .active, 2, 64));
     try std.testing.expect(try cluster.waitForGroupStatusCount(cfg.range_group_id + 1, .active, 2, 64));
+    try std.testing.expect(try cluster.waitForGroupStatusCount(cfg.range_group_id + 2, .active, 2, 64));
     try metadataVoprRequireUniqueOwnerRange(&cluster, cfg.table_id, db_mod.relational_store.primary_key_constraint_name);
+    try metadataVoprRequireUniqueOwnerRange(&cluster, cfg.table_id, "vopr_customers_email_key");
     try metadataVoprRequireUniqueOwnerRange(&cluster, cfg.table_id + 1, db_mod.relational_store.primary_key_constraint_name);
+    try metadataVoprRequireUniqueOwnerRange(&cluster, cfg.table_id + 2, db_mod.relational_store.primary_key_constraint_name);
     try metadataVoprRequireForeignKeyReferenceRange(&cluster, cfg.table_id + 1, "vopr_orders_customer_fkey", cfg.table_id);
+    try metadataVoprRequireForeignKeyReferenceRange(&cluster, cfg.table_id + 1, "vopr_orders_customer_email_fkey", cfg.table_id);
+    try metadataVoprRequireForeignKeyReferenceRange(&cluster, cfg.table_id + 2, "vopr_lines_order_fkey", cfg.table_id + 1);
 }
 
 test "metadata VOPR seeded smoke campaign" {
@@ -9624,6 +9738,164 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     try std.testing.expect(std.mem.indexOf(u8, deleted.body, "\"deleted\":3") != null);
 
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "docs", "doc:z", null));
+}
+
+test "metadata http cluster simulation resolves relational unique selectors across hosted storage restart" {
+    const alloc = std.testing.allocator;
+    const users_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"user_id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["tenant_id","user_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","user_id"]},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"]}]}
+    ;
+    const ada_row = "{\"tenant_id\":\"t1\",\"user_id\":\"user:ada\",\"email\":\"ada@example.test\",\"status\":\"new\"}";
+    const grace_row = "{\"tenant_id\":\"t1\",\"user_id\":\"user:grace\",\"email\":\"grace@example.test\",\"status\":\"new\"}";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = raft_engine.core.MemoryStorage.init(alloc);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(alloc);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(alloc);
+    defer store_c.deinit();
+
+    var factory_a = TestDescriptorFactory{ .alloc = alloc, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = alloc, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = alloc, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const root_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/meta-sim-rel-unique-a", .{tmp.sub_path});
+    defer alloc.free(root_a);
+    const root_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/meta-sim-rel-unique-b", .{tmp.sub_path});
+    defer alloc.free(root_b);
+    const root_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/meta-sim-rel-unique-c", .{tmp.sub_path});
+    defer alloc.free(root_c);
+    factory_a.split_runtime.replica_root_dir = root_a;
+    factory_b.split_runtime.replica_root_dir = root_b;
+    factory_c.split_runtime.replica_root_dir = root_c;
+    const cat_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/meta-sim-rel-unique-a.txt", .{tmp.sub_path});
+    defer alloc.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/meta-sim-rel-unique-b.txt", .{tmp.sub_path});
+    defer alloc.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/meta-sim-rel-unique-c.txt", .{tmp.sub_path});
+    defer alloc.free(cat_c);
+
+    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        makeHostSimConfig(1, 4860, root_a, cat_a),
+        makeHostSimConfig(2, 4860, root_b, cat_b),
+        makeHostSimConfig(3, 4860, root_c, cat_c),
+    };
+    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        makeHostSimDeps(&factory_a),
+        makeHostSimDeps(&factory_b),
+        makeHostSimDeps(&factory_c),
+    };
+
+    var cluster = try MetadataHttpClusterSimulation.init(alloc, 4860, configs[0..], deps[0..]);
+    defer cluster.deinit();
+    defer cluster.stopAll();
+    const leader_index = try startBootstrappedMetadataCluster(&cluster, 32, true);
+
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    const initial_ranges = [_]metadata_table_manager.RangeRecord{
+        .{
+            .group_id = 4861,
+            .table_id = 486,
+            .start_key = "",
+            .end_key = "\xff",
+        },
+        .{
+            .group_id = 4862,
+            .table_id = 486,
+            .start_key = "\xff",
+            .end_key = null,
+        },
+    };
+    const create_summary = try workflow.createTableWithRanges(&cluster.node(leader_index), .{
+        .table_id = 486,
+        .name = "users",
+        .description = "relational unique selector cluster users",
+        .schema_json = users_schema,
+        .desired_replica_count = 1,
+        .min_ranges = 1,
+    }, initial_ranges[0..]);
+    try std.testing.expect(create_summary.table_upserts > 0);
+    try std.testing.expect(try cluster.waitForGroupStatusCount(4861, .active, 1, 48));
+    try std.testing.expect(try cluster.waitForGroupStatusCount(4862, .active, 1, 48));
+    try std.testing.expect(try waitForProjectedTablePresenceOnAllNodes(&cluster, "users", 48));
+    const primary_owner_group = try waitForUniqueOwnerGroupActive(&cluster, 486, db_mod.relational_store.primary_key_constraint_name, 48);
+    const email_owner_group = try waitForUniqueOwnerGroupActive(&cluster, 486, "users_tenant_email_key", 48);
+    try std.testing.expect(primary_owner_group != 0);
+    try std.testing.expect(email_owner_group != 0);
+
+    var rig: PublicApiTestRig(3) = undefined;
+    try rig.initLeaderBackedInPlace(alloc, &cluster, .{ root_a, root_b, root_c });
+    defer rig.deinit();
+
+    const row_host = try waitForSingleActiveGroupHost(&cluster, 4861, 48);
+    const client_index = (row_host + 1) % 3;
+    const client_base = rig.api_base_uris[client_index];
+    try std.testing.expect(cluster.node(client_index).status(4861) != .active);
+
+    const insert_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"sync_level\":\"write\",\"operations\":[{{\"op\":\"insert\",\"row\":{s}}},{{\"op\":\"insert\",\"row\":{s}}}]}}",
+        .{ ada_row, grace_row },
+    );
+    defer alloc.free(insert_body);
+    var inserted = try fetchPublicRowsBatchExpectStatus(&rig.client, client_base, "users", insert_body, 201);
+    defer inserted.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, inserted.body, "\"inserted\":2") != null);
+
+    var initial_get = try fetchPublicRowsGet(
+        &rig.client,
+        client_base,
+        "users",
+        "{\"keys\":[{\"unique\":{\"name\":\"users_tenant_email_key\",\"values\":{\"tenant_id\":\"t1\",\"email\":\"ada@example.test\"}}}],\"include_physical_key\":true}",
+    );
+    defer initial_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(initial_get.body, &.{ "\"found\":true", "\"user_id\":\"user:ada\"", "\"physical_key\"" });
+
+    try cluster.restartNode(row_host);
+    _ = try waitForSingleActiveGroupHost(&cluster, 4861, 96);
+    try cluster.stepAll();
+
+    var update = try fetchPublicRowsBatchExpectStatus(
+        &rig.client,
+        client_base,
+        "users",
+        "{\"operations\":[{\"op\":\"update\",\"where\":{\"unique\":{\"name\":\"users_tenant_email_key\",\"values\":{\"tenant_id\":\"t1\",\"email\":\"ada@example.test\"}}},\"patch\":{\"status\":\"active\"}}]}",
+        201,
+    );
+    defer update.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, update.body, "\"transformed\":1") != null);
+
+    var updated_get = try fetchPublicRowsGet(
+        &rig.client,
+        client_base,
+        "users",
+        "{\"keys\":[{\"unique\":{\"name\":\"users_tenant_email_key\",\"values\":{\"tenant_id\":\"t1\",\"email\":\"ada@example.test\"}}}]}",
+    );
+    defer updated_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(updated_get.body, &.{ "\"found\":true", "\"status\":\"active\"" });
+
+    var deleted = try fetchPublicRowsBatchExpectStatus(
+        &rig.client,
+        client_base,
+        "users",
+        "{\"operations\":[{\"op\":\"delete\",\"where\":{\"unique\":{\"name\":\"users_tenant_email_key\",\"values\":{\"tenant_id\":\"t1\",\"email\":\"ada@example.test\"}}}}]}",
+        201,
+    );
+    defer deleted.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.body, "\"deleted\":1") != null);
+
+    var missing_get = try fetchPublicRowsGet(
+        &rig.client,
+        client_base,
+        "users",
+        "{\"keys\":[{\"unique\":{\"name\":\"users_tenant_email_key\",\"values\":{\"tenant_id\":\"t1\",\"email\":\"ada@example.test\"}}}],\"include_physical_key\":true}",
+    );
+    defer missing_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(missing_get.body, &.{ "\"found\":false", "\"physical_key\":null" });
 }
 
 test "metadata http cluster simulation forwards public table io across split ranges from a non-host node" {

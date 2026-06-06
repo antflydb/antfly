@@ -8035,6 +8035,9 @@ pub const ProvisionedTableWriteSource = struct {
             });
         defer if (opened) |*db| db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &opened.?);
+        if (prepared_open.?.schema_json) |schema_json| {
+            if (schema_json.len > 0) try applyLocalTableSchemaJson(cache.alloc, &opened.?, schema_json);
+        }
 
         var cached = blk: {
             lockAtomic(&self.local_db_mutex);
@@ -13157,6 +13160,9 @@ pub const HostedProvisionedTableWriteSource = struct {
             });
         defer if (opened) |*db| db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &opened.?);
+        if (prepared_open.?.schema_json) |schema_json| {
+            if (schema_json.len > 0) try applyLocalTableSchemaJson(cache.write_cache.alloc, &opened.?, schema_json);
+        }
 
         var cached = blk: {
             lockAtomic(&cache.mutex);
@@ -16041,7 +16047,14 @@ fn openManagedDbForTableGroupWithCacheAndRuntime(
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !db_mod.DB {
     const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
-    const indexes_json = (try loadTableIndexesJson(alloc, catalog, table_name)) orelse {
+    const metadata = try loadTableManagedMetadata(alloc, catalog, table_name);
+    defer if (metadata) |managed| {
+        if (managed.indexes_json) |value| alloc.free(value);
+        if (managed.schema_json) |value| alloc.free(value);
+    };
+    const indexes_json = if (metadata) |managed| managed.indexes_json else null;
+    const schema_json = if (metadata) |managed| managed.schema_json else null;
+    if (indexes_json == null) {
         var db = try db_mod.DB.open(alloc, path, .{
             .lsm_cache = lsm_cache,
             .hbc_cache = hbc_cache,
@@ -16053,11 +16066,18 @@ fn openManagedDbForTableGroupWithCacheAndRuntime(
         });
         errdefer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
+        if (schema_json) |value| {
+            if (value.len > 0) try applyLocalTableSchemaJson(alloc, &db, value);
+        }
         return db;
-    };
-    defer alloc.free(indexes_json);
+    }
 
-    return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, .default, backend_runtime, identity_namespace);
+    var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(alloc, path, indexes_json.?, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, .default, backend_runtime, identity_namespace);
+    errdefer db.close();
+    if (schema_json) |value| {
+        if (value.len > 0) try applyLocalTableSchemaJson(alloc, &db, value);
+    }
+    return db;
 }
 
 fn openManagedDbForTableWithIndexesJson(

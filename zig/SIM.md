@@ -252,9 +252,34 @@ Current coverage:
 - `lib-metadata-vopr-chaos-test` includes
   `metadata VOPR relational identity owner topology campaign`, which runs a
   virtual metadata cluster through deterministic transport faults, creates a
-  composite-primary-key parent and composite-primary-key child with a composite
-  FK, and asserts the primary-key and FK-ref owner ranges converge as routable
-  metadata topology.
+  composite-primary-key parent with a composite unique constraint, a
+  composite-primary-key child with FKs to both the parent primary key and
+  parent unique key, and a grandchild with a cascading FK to the child primary
+  key. It asserts primary-key, unique-owner, and FK-ref owner ranges converge as
+  routable metadata topology.
+- `metadata-fk-test` covers owner-range lifecycle behavior for primary,
+  unique-owner, and FK-ref topology, including the reconciler contract that
+  schema-derived defaults seed missing ranges but do not overwrite committed
+  split, merge, or rebuild topology for still-declared constraints.
+- `db-foreign-key-test` covers FK-ref owner validation and repair for exact
+  parent prefixes and bounded parent-key owner ranges. Range repair deletes
+  stale reverse-reference rows only inside the claimed owner span, leaves
+  out-of-range owner rows untouched, and preserves committed base rows. It also
+  includes a deterministic modeled relational identity workload with composite
+  primary identity, composite unique identity, FKs to both, invalid-write
+  rejection, FK-ref repair, durable paged `set_null`, durable paged `cascade`,
+  reopen handoff, and final invariant checks. Durable paged action-job tests
+  cover cursor persistence and reverse-reference cleanup across reopen.
+- `api-transactions-test` covers distributed FK participant planning, including
+  child writes, parent deletes, unique-parent routing, set-null and cascade
+  action scheduling/execution, recursive cascade scheduling, and fail-closed
+  behavior when FK-ref owner topology is transitional. It also includes a
+  deterministic relational identity workload that mutates FK-ref and
+  unique-owner topology across active, split-active, splitting, and merging
+  states while live child writes, unique-parent checks, set-null action pages,
+  cascade action pages, and child owner movement during pending action work
+  continue to route through durable owner records or fail closed before any
+  worker mutation.
 
 The workload model should add operations for:
 
@@ -317,9 +342,14 @@ The fault matrix should include:
 - Directed source-to-target partitions between row participants, owner
   participants, and metadata leader.
 - Duplicate, reordered, and replayed internal group write requests.
-- Storage reopen after base-row commit without corresponding owner-row commit;
-  recovery must either complete the prepared transaction or leave no committed
-  partial constraint state.
+- Combining the storage-backed row-level modeled workload with metadata owner
+  movement in one cluster-level campaign: live row writes, owner
+  split/merge/rebuild/move, validation, repair, action jobs, partitions, and
+  restarts in the same replayable run. The API transaction coordinator now has
+  deterministic combined owner-topology/action-routing coverage, including
+  child owner movement while action work is pending, but the remaining gap is
+  wiring that same combined schedule through real table storage groups inside a
+  cluster simulation with partitions and restarts.
 
 Build-target placement:
 

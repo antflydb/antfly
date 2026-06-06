@@ -4493,8 +4493,14 @@ fn lookupRelationalUniqueOwnerInDb(
 ) !?[]u8 {
     const key = try relationalUniqueOwnerKeyAlloc(alloc, constraint_name, encoded_value);
     defer alloc.free(key);
-    try reads.prepareLookupWithConsistency(group_id, key, .{}, consistency);
-    return try db.get(alloc, key);
+    reads.prepareLookupWithConsistency(group_id, key, .{}, consistency) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return db.getRawStoreValue(alloc, key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => err,
+    };
 }
 
 fn lookupRelationalUniqueOwnerProvisionedLocal(
@@ -19235,6 +19241,22 @@ test "relational unique owner lookup requires one active owner range" {
                         .group_id = 7201,
                         .state = metadata_table_manager.unique_constraint_range_rebuilding,
                     },
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_handle_key",
+                        .start_encoded_value = "",
+                        .end_encoded_value = null,
+                        .group_id = 7202,
+                        .state = metadata_table_manager.unique_constraint_range_splitting,
+                    },
+                    .{
+                        .table_id = 7,
+                        .constraint_name = "users_username_key",
+                        .start_encoded_value = "",
+                        .end_encoded_value = null,
+                        .group_id = 7203,
+                        .state = metadata_table_manager.unique_constraint_range_merging,
+                    },
                 })[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
@@ -19249,5 +19271,7 @@ test "relational unique owner lookup requires one active owner range" {
     try std.testing.expectEqual(@as(u64, 7101), try resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_email_key", "a"));
     try std.testing.expectEqual(@as(u64, 7102), try resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_email_key", "z"));
     try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_phone_key", "p"));
+    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_handle_key", "h"));
+    try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_username_key", "u"));
     try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "missing_key", "a"));
 }

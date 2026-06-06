@@ -3195,6 +3195,10 @@ pub fn build(b: *std.Build) void {
         "metadata http cluster simulation serves public traffic across automatic merge after donor leader restart under delayed raft transport",
         "metadata http cluster simulation serves public traffic across automatic merge after leader partition under delayed raft transport",
         "metadata http cluster simulation serves public traffic across automatic merge after metadata leader partition",
+        "metadata http cluster simulation resolves relational unique selectors across hosted storage restart",
+    };
+    const lib_metadata_relational_public_chaos_default_filters = [_][]const u8{
+        "metadata http cluster simulation resolves relational unique selectors across hosted storage restart",
     };
     const lib_metadata_placement_chaos_default_filters = [_][]const u8{
         "metadata http cluster simulation survives metadata leader restart during placement reconcile",
@@ -3202,6 +3206,7 @@ pub fn build(b: *std.Build) void {
     };
     const lib_metadata_transition_chaos_filters = selectTestFilters(b, &lib_metadata_transition_chaos_default_filters);
     const lib_metadata_public_chaos_filters = selectTestFilters(b, &lib_metadata_public_chaos_default_filters);
+    const lib_metadata_relational_public_chaos_filters = selectTestFilters(b, &lib_metadata_relational_public_chaos_default_filters);
     const lib_metadata_placement_chaos_filters = selectTestFilters(b, &lib_metadata_placement_chaos_default_filters);
 
     const lib_metadata_transition_chaos_test_step = b.step("lib-metadata-transition-chaos-test", "Run metadata split/merge transition restart and partition chaos simulations");
@@ -3213,6 +3218,11 @@ pub fn build(b: *std.Build) void {
     var metadata_public_chaos_progress_tail: ?*std.Build.Step = null;
     metadata_public_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-public-chaos-test", lib_metadata_public_chaos_filters, metadata_public_chaos_progress_tail);
     lib_metadata_public_chaos_test_step.dependOn(metadata_public_chaos_progress_tail.?);
+
+    const lib_metadata_relational_public_chaos_test_step = b.step("lib-metadata-relational-public-chaos-test", "Run metadata relational public traffic chaos simulations");
+    var metadata_relational_public_chaos_progress_tail: ?*std.Build.Step = null;
+    metadata_relational_public_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-relational-public-chaos-test", lib_metadata_relational_public_chaos_filters, metadata_relational_public_chaos_progress_tail);
+    lib_metadata_relational_public_chaos_test_step.dependOn(metadata_relational_public_chaos_progress_tail.?);
 
     const lib_metadata_placement_chaos_test_step = b.step("lib-metadata-placement-chaos-test", "Run metadata placement restart chaos simulations");
     var metadata_placement_chaos_progress_tail: ?*std.Build.Step = null;
@@ -3634,9 +3644,11 @@ pub fn build(b: *std.Build) void {
             "distributed txn coordinator ignores unrelated foreign key child tables for parent delete planning",
             "distributed txn coordinator routes distributed foreign key set-null actions across child ranges",
             "foreign key action page executes owner ref cleanup and child mutation through routed participants",
+            "foreign key action page fails closed for transitional ref owner topology",
             "foreign key action page routes update cascade child mutations with replacement parent key",
             "foreign key action page schedules recursive cascade work for deleted children",
             "foreign key action page accepts same table runtime parent identity for durable schedules",
+            "distributed txn relational identity workload mixes owner topology churn and actions",
             "distributed txn coordinator routes distributed foreign key cascade actions across child ranges",
             "distributed txn coordinator rejects distributed foreign key cascade actions without ref owner topology",
         },
@@ -4571,12 +4583,15 @@ pub fn build(b: *std.Build) void {
             "db foreign key integrity job records persist intent and completion",
             "db foreign key maintenance leases use durable realtime clock",
             "db foreign key action job applies set-null children in durable pages",
+            "db foreign key action job applies cascade children in durable pages",
+            "db foreign key modeled relational identity workload covers repair and actions",
             "db foreign key action job rejects stale page finish after lease handoff",
             "db foreign key action job requeue preserves durable cursor and clears failed claim",
             "db foreign key action schedule records zero-owner seed failures durably",
             "db foreign key action job records page execution failures",
             "db foreign key ref children page by child cursor",
             "db foreign key ref owner validation repairs stale parent prefix rows",
+            "db foreign key ref owner range validation repairs stale parent-key span rows",
         },
     });
     const run_db_foreign_key_tests = b.addRunArtifact(db_foreign_key_tests);

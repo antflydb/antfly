@@ -10512,6 +10512,137 @@ test "foreign key action page executes owner ref cleanup and child mutation thro
     try std.testing.expectEqual(@as(usize, 2), recorder.resolved);
 }
 
+test "foreign key action page fails closed for transitional ref owner topology" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"set_null"}]}
+    ;
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const metadata_table_manager = @import("../metadata/table_manager.zig");
+            const raft_reconciler = @import("../raft/reconciler.zig");
+            const metadata_transition_state = @import("../metadata/transition_state.zig");
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 7, .name = "docs", .schema_json = schema_json, .placement_role = "data" },
+                    .{ .table_id = 8, .name = "customers", .placement_role = "data" },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                })[0..]),
+                .foreign_key_ref_ranges = @constCast((&[_]metadata_table_manager.ForeignKeyReferenceRangeRecord{.{
+                    .child_table_id = 7,
+                    .constraint_name = "orders_customer_id_fkey",
+                    .parent_table_id = 8,
+                    .start_parent_key = "",
+                    .end_parent_key = null,
+                    .group_id = 9001,
+                    .topology_epoch = 43,
+                    .state = metadata_table_manager.foreign_key_ref_range_splitting,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+    };
+
+    const Recorder = struct {
+        page_calls: usize = 0,
+        begin_calls: usize = 0,
+        prepare_calls: usize = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .begin_group = begin,
+                    .prepare_group = prepare,
+                    .resolve_group = resolve,
+                    .status_group = status,
+                    .lookup_group = lookup,
+                    .foreign_key_ref_children_page_group = foreignKeyRefChildrenPageGroup,
+                },
+            };
+        }
+
+        fn begin(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.begin_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+
+        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.prepare_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
+
+        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            return .pending;
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8) !?table_reads.LookupResponse {
+            return error.TestUnexpectedResult;
+        }
+
+        fn foreignKeyRefChildrenPageGroup(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: ForeignKeyRefChildrenRequest,
+        ) !db_mod.types.ForeignKeyRefChildrenPage {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.page_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var recorder = Recorder{};
+    const txn_id = try parseTxnIdHex("abcdef00112233445566778899aabbcd");
+    try std.testing.expectError(error.TopologyChanged, executeForeignKeyActionPage(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        txn_id,
+        11_100,
+        11_101,
+        "docs",
+        9001,
+        "ON DELETE SET NULL",
+        "orders_customer_id_fkey",
+        "customers",
+        "cust:z-customer",
+        null,
+        null,
+        null,
+        10,
+        0,
+        foreign_key_action_default_cascade_max_depth,
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), recorder.page_calls);
+    try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
+    try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
+}
+
 test "foreign key action page routes update cascade child mutations with replacement parent key" {
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"orders_customer_id_key","columns":["customer_id"]}],"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_update":"cascade"}]}
@@ -11127,6 +11258,320 @@ test "foreign key action page accepts same table runtime parent identity for dur
     try std.testing.expect(recorder.prepared_owner);
     try std.testing.expect(recorder.prepared_child);
     try std.testing.expectEqual(@as(usize, 2), recorder.resolved);
+}
+
+test "distributed txn relational identity workload mixes owner topology churn and actions" {
+    const metadata_table_manager = @import("../metadata/table_manager.zig");
+    const metadata_api = @import("../metadata/api.zig");
+    const raft_reconciler = @import("../raft/reconciler.zig");
+    const metadata_transition_state = @import("../metadata/transition_state.zig");
+
+    const customers_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["tenant_id","customer_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","customer_id"]},"unique_constraints":[{"name":"customers_tenant_email_key","columns":["tenant_id","email"]}]}
+    ;
+    const orders_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"order_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"customer_email":{"type":"keyword"},"nullable_customer_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["tenant_id","order_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","order_id"]},"foreign_keys":[{"name":"orders_customer_pk_fkey","columns":["tenant_id","customer_id"],"references":{"table":"customers","columns":["tenant_id","customer_id"]},"on_delete":"restrict"},{"name":"orders_customer_email_fkey","columns":["tenant_id","customer_email"],"references":{"table":"customers","columns":["tenant_id","email"]},"on_delete":"restrict"},{"name":"orders_nullable_customer_fkey","columns":["nullable_customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"set_null"}]}
+    ;
+    const line_items_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"order_id":{"type":"keyword"},"line_id":{"type":"keyword"}},"required":["tenant_id","order_id","line_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","order_id","line_id"]},"foreign_keys":[{"name":"lines_order_fkey","columns":["tenant_id","order_id"],"references":{"table":"orders","columns":["tenant_id","order_id"]},"on_delete":"cascade"}]}
+    ;
+
+    const TopologyPhase = enum {
+        active_single,
+        fk_ref_splitting,
+        fk_ref_split_active,
+        unique_splitting,
+        unique_split_active,
+        action_ref_merging,
+        child_owner_moved,
+    };
+
+    const Catalog = struct {
+        tables: [3]metadata_table_manager.TableRecord = undefined,
+        ranges: [4]metadata_table_manager.RangeRecord = undefined,
+        fk_ranges: [6]metadata_table_manager.ForeignKeyReferenceRangeRecord = undefined,
+        fk_range_count: usize = 0,
+        unique_ranges: [6]metadata_table_manager.UniqueConstraintRangeRecord = undefined,
+        unique_range_count: usize = 0,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn configure(self: *@This(), phase: TopologyPhase) void {
+            self.tables = .{
+                .{ .table_id = 8, .name = "customers", .schema_json = customers_schema_json, .placement_role = "data" },
+                .{ .table_id = 7, .name = "orders", .schema_json = orders_schema_json, .placement_role = "data" },
+                .{ .table_id = 9, .name = "line_items", .schema_json = line_items_schema_json, .placement_role = "data" },
+            };
+            self.ranges = .{
+                .{ .group_id = 8001, .table_id = 8, .start_key = "", .end_key = null },
+                .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "order:m" },
+                .{ .group_id = if (phase == .child_owner_moved) 7003 else 7002, .table_id = 7, .start_key = "order:m", .end_key = null },
+                .{ .group_id = 7101, .table_id = 9, .start_key = "", .end_key = null },
+            };
+
+            self.fk_range_count = 0;
+            self.addForeignKeyRange("orders_customer_pk_fkey", 7, 8, 9001, "", null, if (phase == .fk_ref_splitting) metadata_table_manager.foreign_key_ref_range_splitting else metadata_table_manager.foreign_key_ref_range_active);
+            if (phase == .fk_ref_split_active) {
+                self.fk_ranges[0].end_parent_key = "\xff";
+                self.addForeignKeyRange("orders_customer_pk_fkey", 7, 8, 9002, "\xff", null, metadata_table_manager.foreign_key_ref_range_active);
+            }
+            self.addForeignKeyRange("orders_customer_email_fkey", 7, 8, 9003, "", null, metadata_table_manager.foreign_key_ref_range_active);
+            self.addForeignKeyRange("orders_nullable_customer_fkey", 7, 8, 9004, "", null, if (phase == .action_ref_merging) metadata_table_manager.foreign_key_ref_range_merging else metadata_table_manager.foreign_key_ref_range_active);
+            self.addForeignKeyRange("lines_order_fkey", 9, 7, 9005, "", null, metadata_table_manager.foreign_key_ref_range_active);
+
+            self.unique_range_count = 0;
+            self.addUniqueRange(8, relational_store.primary_key_constraint_name, 9111, "", null, metadata_table_manager.unique_constraint_range_active);
+            self.addUniqueRange(8, "customers_tenant_email_key", 9101, "", null, if (phase == .unique_splitting) metadata_table_manager.unique_constraint_range_splitting else metadata_table_manager.unique_constraint_range_active);
+            if (phase == .unique_split_active) {
+                self.unique_ranges[1].end_encoded_value = "\xff";
+                self.addUniqueRange(8, "customers_tenant_email_key", 9102, "\xff", null, metadata_table_manager.unique_constraint_range_active);
+            }
+            self.addUniqueRange(7, relational_store.primary_key_constraint_name, 9201, "", null, metadata_table_manager.unique_constraint_range_active);
+            self.addUniqueRange(9, relational_store.primary_key_constraint_name, 9301, "", null, metadata_table_manager.unique_constraint_range_active);
+        }
+
+        fn addForeignKeyRange(
+            self: *@This(),
+            constraint_name: []const u8,
+            child_table_id: u64,
+            parent_table_id: u64,
+            group_id: u64,
+            start_parent_key: []const u8,
+            end_parent_key: ?[]const u8,
+            state: []const u8,
+        ) void {
+            self.fk_ranges[self.fk_range_count] = .{
+                .child_table_id = child_table_id,
+                .constraint_name = constraint_name,
+                .parent_table_id = parent_table_id,
+                .start_parent_key = start_parent_key,
+                .end_parent_key = end_parent_key,
+                .group_id = group_id,
+                .topology_epoch = group_id,
+                .state = state,
+            };
+            self.fk_range_count += 1;
+        }
+
+        fn addUniqueRange(
+            self: *@This(),
+            table_id: u64,
+            constraint_name: []const u8,
+            group_id: u64,
+            start_encoded_value: []const u8,
+            end_encoded_value: ?[]const u8,
+            state: []const u8,
+        ) void {
+            self.unique_ranges[self.unique_range_count] = .{
+                .table_id = table_id,
+                .constraint_name = constraint_name,
+                .start_encoded_value = start_encoded_value,
+                .end_encoded_value = end_encoded_value,
+                .group_id = group_id,
+                .topology_epoch = group_id,
+                .state = state,
+            };
+            self.unique_range_count += 1;
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = self.ranges[0..],
+                .foreign_key_ref_ranges = self.fk_ranges[0..self.fk_range_count],
+                .unique_constraint_ranges = self.unique_ranges[0..self.unique_range_count],
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Recorder = struct {
+        begin_calls: usize = 0,
+        prepare_calls: usize = 0,
+        resolve_calls: usize = 0,
+        lookup_calls: usize = 0,
+        page_calls: usize = 0,
+        parent_checks: usize = 0,
+        externalized_checks: usize = 0,
+        ref_writes: usize = 0,
+        ref_deletes: usize = 0,
+        unique_writes: usize = 0,
+        action_schedules: usize = 0,
+        set_null_children: usize = 0,
+        cascade_children: usize = 0,
+        expected_order_z_group: u64 = 7002,
+
+        fn reset(self: *@This()) void {
+            self.* = .{};
+        }
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .begin_group = begin,
+                    .prepare_group = prepare,
+                    .resolve_group = resolve,
+                    .status_group = status,
+                    .lookup_group = lookup,
+                    .foreign_key_ref_children_page_group = foreignKeyRefChildrenPageGroup,
+                },
+            };
+        }
+
+        fn begin(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(req.participants.len > 0);
+            self.begin_calls += 1;
+        }
+
+        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnPrepareRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.prepare_calls += 1;
+            self.parent_checks += req.req.foreign_key_parent_checks.len;
+            self.externalized_checks += req.req.foreign_key_externalized_parent_checks.len;
+            self.ref_writes += req.req.foreign_key_ref_writes.len;
+            self.ref_deletes += req.req.foreign_key_ref_deletes.len;
+            self.unique_writes += req.req.unique_constraint_writes.len;
+            self.action_schedules += req.req.foreign_key_action_schedules.len;
+            self.set_null_children += req.req.foreign_key_set_null_children.len;
+            self.cascade_children += req.req.foreign_key_cascade_children.len;
+            if (req.req.foreign_key_ref_writes.len != 0 or req.req.foreign_key_ref_deletes.len != 0 or req.req.foreign_key_action_schedules.len != 0) {
+                try std.testing.expect(group_id == 9001 or group_id == 9002 or group_id == 9003 or group_id == 9004 or group_id == 9005);
+            }
+            if (req.req.unique_constraint_writes.len != 0 or req.req.unique_constraint_deletes.len != 0) {
+                try std.testing.expect(group_id == 9101 or group_id == 9102 or group_id == 9111 or group_id == 9201 or group_id == 9301);
+            }
+            if (req.req.foreign_key_set_null_children.len != 0) {
+                try std.testing.expectEqual(self.expected_order_z_group, group_id);
+            }
+        }
+
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+            self.resolve_calls += 1;
+        }
+
+        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            return .pending;
+        }
+
+        fn lookup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lookup_calls += 1;
+            try std.testing.expectEqual(self.expected_order_z_group, group_id);
+            try std.testing.expectEqualStrings("orders", table_name);
+            try std.testing.expectEqualStrings("order:z", key);
+            return .{
+                .json = try alloc.dupe(u8, "{\"tenant_id\":\"t1\",\"order_id\":\"order:z\",\"customer_id\":\"customer:a\",\"customer_email\":\"ada@example.test\",\"nullable_customer_id\":\"customer:b\",\"status\":\"open\"}"),
+                .version = 88,
+            };
+        }
+
+        fn foreignKeyRefChildrenPageGroup(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: ForeignKeyRefChildrenRequest,
+        ) !db_mod.types.ForeignKeyRefChildrenPage {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.page_calls += 1;
+            if (group_id == 9004) {
+                try std.testing.expectEqualStrings("orders", table_name);
+                try std.testing.expectEqualStrings("orders_nullable_customer_fkey", req.constraint_name);
+                const children = try alloc.alloc(db_mod.types.ForeignKeyRefChild, 1);
+                children[0] = .{ .child_table = try alloc.dupe(u8, "row"), .child_key = try alloc.dupe(u8, "order:z") };
+                return .{ .children = children, .complete = true };
+            }
+            try std.testing.expectEqual(@as(u64, 9005), group_id);
+            try std.testing.expectEqualStrings("line_items", table_name);
+            try std.testing.expectEqualStrings("lines_order_fkey", req.constraint_name);
+            const children = try alloc.alloc(db_mod.types.ForeignKeyRefChild, 1);
+            children[0] = .{ .child_table = try alloc.dupe(u8, "row"), .child_key = try alloc.dupe(u8, "line:z") };
+            return .{ .children = children, .complete = true };
+        }
+    };
+
+    var catalog = Catalog{};
+    catalog.configure(.active_single);
+    var recorder = Recorder{};
+    const write_order = TableCommitRequest{
+        .table_name = "orders",
+        .writes = &.{.{ .key = "order:a", .value = "{\"tenant_id\":\"t1\",\"order_id\":\"order:a\",\"customer_id\":\"customer:a\",\"customer_email\":\"ada@example.test\"}" }},
+        .predicates = &.{.{ .key = "order:a", .expected_version = 0 }},
+    };
+
+    const active_write = try executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444441"), 10_000, 10_001, &.{write_order}, null);
+    try std.testing.expect(active_write == .committed);
+    try std.testing.expect(recorder.parent_checks >= 2);
+    try std.testing.expect(recorder.externalized_checks >= 2);
+    try std.testing.expect(recorder.ref_writes >= 2);
+    try std.testing.expect(recorder.unique_writes >= 1);
+
+    catalog.configure(.fk_ref_splitting);
+    recorder.reset();
+    try std.testing.expectError(error.UnknownGroup, executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444442"), 10_010, 10_011, &.{write_order}, null));
+    try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
+
+    catalog.configure(.fk_ref_split_active);
+    recorder.reset();
+    const split_write = try executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444443"), 10_020, 10_021, &.{write_order}, null);
+    try std.testing.expect(split_write == .committed);
+    try std.testing.expect(recorder.ref_writes >= 2);
+
+    catalog.configure(.unique_splitting);
+    recorder.reset();
+    try std.testing.expectError(error.UnknownGroup, executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444444"), 10_030, 10_031, &.{write_order}, null));
+    try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
+
+    catalog.configure(.unique_split_active);
+    recorder.reset();
+    const unique_split_write = try executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444445"), 10_040, 10_041, &.{write_order}, null);
+    try std.testing.expect(unique_split_write == .committed);
+    try std.testing.expect(recorder.parent_checks >= 2);
+    try std.testing.expect(recorder.ref_writes >= 2);
+
+    catalog.configure(.action_ref_merging);
+    recorder.reset();
+    try std.testing.expectError(error.TopologyChanged, executeForeignKeyActionPage(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444446"), 10_050, 10_051, "orders", 9004, "set_null", "orders_nullable_customer_fkey", "customers", "customer:b", null, null, null, 4, 0, foreign_key_action_default_cascade_max_depth, null));
+    try std.testing.expectEqual(@as(usize, 0), recorder.page_calls);
+    try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
+
+    catalog.configure(.child_owner_moved);
+    recorder.reset();
+    recorder.expected_order_z_group = 7003;
+    var set_null_execution = try executeForeignKeyActionPage(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444447"), 10_060, 10_061, "orders", 9004, "set_null", "orders_nullable_customer_fkey", "customers", "customer:b", null, null, null, 4, 0, foreign_key_action_default_cascade_max_depth, null);
+    defer set_null_execution.deinit(std.testing.allocator);
+    try std.testing.expect(set_null_execution.complete);
+    try std.testing.expectEqual(@as(usize, 1), set_null_execution.applied_children);
+    try std.testing.expect(recorder.lookup_calls >= 1);
+    try std.testing.expect(recorder.set_null_children >= 1);
+    try std.testing.expect(recorder.ref_deletes >= 1);
+
+    recorder.reset();
+    var cascade_execution = try executeForeignKeyActionPage(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444448"), 10_070, 10_071, "line_items", 9005, "cascade", "lines_order_fkey", "orders", "order:z", null, null, null, 4, 0, foreign_key_action_default_cascade_max_depth, null);
+    defer cascade_execution.deinit(std.testing.allocator);
+    try std.testing.expect(cascade_execution.complete);
+    try std.testing.expectEqual(@as(usize, 1), cascade_execution.applied_children);
+    try std.testing.expect(recorder.cascade_children >= 1);
+    try std.testing.expect(recorder.ref_deletes >= 1);
 }
 
 test "distributed txn coordinator routes distributed foreign key cascade actions across child ranges" {

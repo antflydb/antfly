@@ -259,7 +259,10 @@ const RowsUniqueSelectorResolverContext = struct {
     ) !?[]u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const source = self.source orelse return error.UnsupportedOperation;
-        return try source.relationalUniqueOwnerLookup(alloc, table_name, constraint_name, encoded_value, .read_index);
+        return source.relationalUniqueOwnerLookup(alloc, table_name, constraint_name, encoded_value, .read_index) catch |err| switch (err) {
+            error.NotFound => null,
+            else => err,
+        };
     }
 };
 
@@ -5518,16 +5521,53 @@ pub const ApiHttpServer = struct {
         };
         defer rows_req.deinit(self.alloc);
 
-        _ = (source.batch(self.alloc, table_name, rows_req.req) catch |err| switch (err) {
-            error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows request"),
-            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-            error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
-            error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
-            else => {
-                std.log.err("public table rows batch failed table={s} err={}", .{ table_name, err });
-                return try textResponse(self.alloc, 500, "rows batch failed");
-            },
-        }) orelse return try textResponse(self.alloc, 404, "not found");
+        var committed_via_txn = false;
+        if (schema.storage_mode == .relational) {
+            const txn_writes = try self.alloc.alloc(db_mod.types.TransactionWrite, rows_req.writes.len);
+            defer self.alloc.free(txn_writes);
+            for (rows_req.writes, 0..) |write, i| {
+                txn_writes[i] = .{ .key = write.key, .value = write.value };
+            }
+            const txn_tables = [_]distributed_txn.TableCommitRequest{.{
+                .table_name = table_name,
+                .writes = txn_writes,
+                .deletes = rows_req.deletes,
+                .transforms = rows_req.transforms,
+                .predicates = rows_req.predicates,
+            }};
+            if (source.commitTransaction(self.alloc, txn_tables[0..], rows_req.req.sync_level) catch |err| switch (err) {
+                error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows request"),
+                error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
+                error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
+                error.UnsupportedOperation => null,
+                else => {
+                    std.log.err("public table rows transaction failed table={s} err={}", .{ table_name, err });
+                    return try textResponse(self.alloc, 500, "rows batch failed");
+                },
+            }) |outcome| {
+                switch (outcome) {
+                    .committed => committed_via_txn = true,
+                    .conflict => return try textResponse(self.alloc, 409, "version conflict"),
+                }
+            }
+        }
+
+        if (!committed_via_txn) {
+            _ = (source.batch(self.alloc, table_name, rows_req.req) catch |err| switch (err) {
+                error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows request"),
+                error.VersionConflict, error.IntentConflict => return try textResponse(self.alloc, 409, "version conflict"),
+                error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
+                else => {
+                    std.log.err("public table rows batch failed table={s} err={}", .{ table_name, err });
+                    return try textResponse(self.alloc, 500, "rows batch failed");
+                },
+            }) orelse return try textResponse(self.alloc, 404, "not found");
+        }
 
         const response_body = try relational_rows_api.encodeRowsBatchResponseAlloc(self.alloc, rows_req);
         defer self.alloc.free(response_body);
@@ -11674,12 +11714,19 @@ test "api http server resolves relational rows by unique selector" {
     try std.testing.expect(first_get.get("found").?.bool);
     try std.testing.expectEqualStrings("ada@example.test", first_get.get("row").?.object.get("email").?.string);
     try std.testing.expect(first_get.get("physical_key").? == .string);
+    const original_version = first_get.get("version").?.integer;
 
+    const update_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"operations\":[{{\"op\":\"update\",\"where\":{{\"unique\":{{\"name\":\"users_email_key\",\"values\":{{\"email\":\"ada@example.test\"}}}}}},\"expected_version\":{d},\"patch\":{{\"status\":\"active\"}}}}]}}",
+        .{original_version},
+    );
+    defer alloc.free(update_body);
     var update_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/users/rows:batch",
         .content_type = "application/json",
-        .body = "{\"operations\":[{\"op\":\"update\",\"where\":{\"unique\":{\"name\":\"users_email_key\",\"values\":{\"email\":\"ada@example.test\"}}},\"patch\":{\"status\":\"active\"}}]}",
+        .body = update_body,
     });
     defer update_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), update_resp.status);
@@ -11697,12 +11744,34 @@ test "api http server resolves relational rows by unique selector" {
     const updated = parsed_updated.value.object.get("rows").?.array.items[0].object;
     try std.testing.expect(updated.get("found").?.bool);
     try std.testing.expectEqualStrings("active", updated.get("row").?.object.get("status").?.string);
+    const updated_version = updated.get("version").?.integer;
 
+    const stale_delete_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"operations\":[{{\"op\":\"delete\",\"where\":{{\"unique\":{{\"name\":\"users_email_key\",\"values\":{{\"email\":\"ada@example.test\"}}}}}},\"expected_version\":{d}}}]}}",
+        .{original_version},
+    );
+    defer alloc.free(stale_delete_body);
+    var stale_delete_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/users/rows:batch",
+        .content_type = "application/json",
+        .body = stale_delete_body,
+    });
+    defer stale_delete_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), stale_delete_resp.status);
+
+    const delete_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"operations\":[{{\"op\":\"delete\",\"where\":{{\"unique\":{{\"name\":\"users_email_key\",\"values\":{{\"email\":\"ada@example.test\"}}}}}},\"expected_version\":{d}}}]}}",
+        .{updated_version},
+    );
+    defer alloc.free(delete_body);
     var delete_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/users/rows:batch",
         .content_type = "application/json",
-        .body = "{\"operations\":[{\"op\":\"delete\",\"where\":{\"unique\":{\"name\":\"users_email_key\",\"values\":{\"email\":\"ada@example.test\"}}}}]}",
+        .body = delete_body,
     });
     defer delete_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), delete_resp.status);

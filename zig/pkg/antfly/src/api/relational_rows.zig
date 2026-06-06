@@ -175,6 +175,7 @@ pub fn parseRowsBatchRequestWithResolver(
             const key = (try physicalPrimaryKeyFromWhereAlloc(alloc, table_name, schema, op_value.object.get("where") orelse return error.InvalidRowsRequest, unique_resolver, false)) orelse return error.RowSelectorNotFound;
             var key_transferred = false;
             errdefer if (!key_transferred) alloc.free(key);
+            try appendExpectedVersionPredicateAlloc(alloc, &predicates, op_value, key);
             try deletes.append(alloc, key);
             key_transferred = true;
             deleted += 1;
@@ -190,6 +191,7 @@ pub fn parseRowsBatchRequestWithResolver(
             const operations = try patchToTransformOperationsAlloc(alloc, schema.primary_key.?, patch);
             var operations_transferred = false;
             errdefer if (!operations_transferred) freeTransformOps(alloc, operations);
+            try appendExpectedVersionPredicateAlloc(alloc, &predicates, op_value, key);
             try transforms.append(alloc, .{ .key = key, .operations = operations });
             key_transferred = true;
             operations_transferred = true;
@@ -515,6 +517,32 @@ fn primaryKeyContains(primary_key: runtime_schema.PrimaryKey, column: []const u8
     return false;
 }
 
+fn appendExpectedVersionPredicateAlloc(
+    alloc: std.mem.Allocator,
+    predicates: *std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate),
+    op_value: std.json.Value,
+    key: []const u8,
+) !void {
+    const expected_version_value = op_value.object.get("expected_version") orelse return;
+    const expected_version = try parseExpectedVersion(expected_version_value);
+    const predicate_key = try alloc.dupe(u8, key);
+    var predicate_key_transferred = false;
+    errdefer if (!predicate_key_transferred) alloc.free(predicate_key);
+    try predicates.append(alloc, .{
+        .key = predicate_key,
+        .expected_version = expected_version,
+    });
+    predicate_key_transferred = true;
+}
+
+fn parseExpectedVersion(value: std.json.Value) !u64 {
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @intCast(integer) else error.InvalidRowsRequest,
+        .string => |text| std.fmt.parseUnsigned(u64, text, 10) catch return error.InvalidRowsRequest,
+        else => error.InvalidRowsRequest,
+    };
+}
+
 fn identityResponseJsonAlloc(alloc: std.mem.Allocator, selector: std.json.Value) ![]u8 {
     if (selector != .object) return error.InvalidRowsRequest;
     if (selector.object.get("primary")) |primary_value| {
@@ -653,4 +681,21 @@ test "relational rows unique selector resolves through owner lookup" {
     try std.testing.expectEqualStrings("\x00antfly-rel-pk:test", get_req.keys[0].?);
     try std.testing.expectEqualStrings("{\"unique\":{\"name\":\"users_email_key\",\"values\":{\"email\":\"ada@example.test\"}}}", get_req.identities_json[0]);
     try std.testing.expect(get_req.include_physical_key);
+
+    var update_req = try parseRowsBatchRequestWithResolver(
+        std.testing.allocator,
+        "users",
+        "{\"operations\":[{\"op\":\"update\",\"where\":{\"unique\":{\"name\":\"users_email_key\",\"values\":{\"email\":\"ada@example.test\"}}},\"expected_version\":17,\"patch\":{\"status\":\"active\"}},{\"op\":\"delete\",\"where\":{\"unique\":{\"name\":\"users_email_key\",\"values\":{\"email\":\"ada@example.test\"}}},\"expected_version\":\"18\"}]}",
+        schema,
+        resolver.iface(),
+    );
+    defer update_req.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 1), update_req.transforms.len);
+    try std.testing.expectEqual(@as(usize, 1), update_req.deletes.len);
+    try std.testing.expectEqual(@as(usize, 2), update_req.predicates.len);
+    try std.testing.expectEqualStrings(update_req.transforms[0].key, update_req.predicates[0].key);
+    try std.testing.expectEqual(@as(u64, 17), update_req.predicates[0].expected_version);
+    try std.testing.expectEqualStrings(update_req.deletes[0], update_req.predicates[1].key);
+    try std.testing.expectEqual(@as(u64, 18), update_req.predicates[1].expected_version);
 }
