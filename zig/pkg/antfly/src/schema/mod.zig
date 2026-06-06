@@ -416,9 +416,9 @@ fn runtimeRelationalColumnType(property: anytype) ?storage_schema.AntflyType {
         if (std.mem.eql(u8, field_type, "geopoint")) return .geopoint;
         if (std.mem.eql(u8, field_type, "geoshape")) return .geoshape;
         if (std.mem.eql(u8, field_type, "blob")) return .blob;
+        if (std.mem.eql(u8, field_type, "array")) return .array;
         if (std.mem.eql(u8, field_type, "json") or
-            std.mem.eql(u8, field_type, "object") or
-            std.mem.eql(u8, field_type, "array")) return .json;
+            std.mem.eql(u8, field_type, "object")) return .json;
         if (std.mem.eql(u8, field_type, "embedding")) return null;
         if (property.integer_only) return .numeric;
         return null;
@@ -1039,7 +1039,7 @@ fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?stor
 test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}]}
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}]}
     );
     defer parsed.deinit(alloc);
 
@@ -1047,7 +1047,7 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     defer storage_schema.freeSchema(alloc, runtime);
 
     try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
-    try std.testing.expectEqual(@as(usize, 7), runtime.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 8), runtime.relational_columns.len);
 
     const id = findRuntimeColumn(runtime, "id").?;
     try std.testing.expectEqual(storage_schema.AntflyType.keyword, id.field_type);
@@ -1062,6 +1062,7 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expect(findRuntimeColumn(runtime, "amount").?.nullable);
     try std.testing.expect(!findRuntimeColumn(runtime, "amount").?.indexed);
     try std.testing.expectEqual(storage_schema.AntflyType.datetime, findRuntimeColumn(runtime, "created_at").?.field_type);
+    try std.testing.expectEqual(storage_schema.AntflyType.array, findRuntimeColumn(runtime, "tags").?.field_type);
     // nested object and json field both become json columns
     try std.testing.expectEqual(storage_schema.AntflyType.json, findRuntimeColumn(runtime, "attrs").?.field_type);
     try std.testing.expectEqual(storage_schema.AntflyType.json, findRuntimeColumn(runtime, "payload").?.field_type);

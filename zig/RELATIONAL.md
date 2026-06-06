@@ -547,12 +547,17 @@ Array values need canonical physical encoding, equality/containment semantics,
 }
 ```
 
-The engine should distinguish arrays from opaque JSON. A declared array column
-has a stable element type, canonical value ordering/equality rules, null/empty
-semantics, and optional element index entries for containment and `ANY` filters.
-For arrays that are also used by unique constraints or generated expressions,
-the catalog must specify whether order-sensitive or set-like comparison is used.
-Fully schemaless arrays can still live inside a `json` column.
+The engine distinguishes declared arrays from opaque JSON with a first-class
+relational `array` column type. The current physical row codec stores the array
+as canonical bytes and rejects scalar values for that column, so schema/catalog
+state, reconstruction, and write validation can reason about arrays explicitly.
+The remaining production work is element metadata and element indexes: a
+declared array column must carry stable element type, canonical
+ordering/equality rules, null/empty semantics, and optional element index
+entries for containment and `ANY` filters. For arrays that are also used by
+unique constraints or generated expressions, the catalog must specify whether
+order-sensitive or set-like comparison is used. Fully schemaless arrays can
+still live inside a `json` column.
 
 #### JSON path and update operators
 

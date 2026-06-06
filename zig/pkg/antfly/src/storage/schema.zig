@@ -68,6 +68,7 @@ pub const AntflyType = enum(u8) {
     html = 10,
     search_as_you_type = 11,
     json = 12,
+    array = 13,
 };
 
 pub const FieldMapping = struct {
@@ -124,8 +125,9 @@ pub const StorageMode = enum(u8) {
 };
 
 /// A declared typed column of a relational table. `json` columns
-/// (field_type == .json) are indexed as document subtrees rather than as a
-/// typed column.
+/// (field_type == .json) are indexed as document subtrees; `array` columns keep
+/// a first-class relational type while storing canonical array bytes until
+/// element-level indexes are declared.
 pub const RelationalColumn = struct {
     name: []const u8,
     path: []const u8,
@@ -1528,6 +1530,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
             .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
             .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true },
             .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true, .indexed = false },
+            .{ .name = "tags", .path = "tags", .field_type = .array, .nullable = true },
         },
         .primary_key = .{ .columns = &.{ "tenant_id", "id" } },
         .foreign_keys = &.{
@@ -1582,7 +1585,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     defer freeSchema(alloc, loaded);
 
     try std.testing.expectEqual(StorageMode.relational, loaded.storage_mode);
-    try std.testing.expectEqual(@as(usize, 5), loaded.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 6), loaded.relational_columns.len);
     try std.testing.expectEqualStrings("id", loaded.relational_columns[0].name);
     try std.testing.expectEqualStrings("id", loaded.relational_columns[0].path);
     try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[0].field_type);
@@ -1598,6 +1601,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expect(loaded.relational_columns[3].nullable);
     try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[4].field_type);
     try std.testing.expect(!loaded.relational_columns[4].indexed);
+    try std.testing.expectEqual(AntflyType.array, loaded.relational_columns[5].field_type);
     try std.testing.expectEqual(@as(usize, 3), loaded.foreign_keys.len);
     try std.testing.expectEqualStrings("orders_customer_id_fkey", loaded.foreign_keys[0].name);
     try std.testing.expectEqualStrings("customer_id", loaded.foreign_keys[0].child_columns[0]);

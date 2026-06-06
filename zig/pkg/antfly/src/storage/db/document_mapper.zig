@@ -1566,6 +1566,10 @@ pub fn buildRelationalRowValueFromValueAlloc(
             if (column.nullable) continue;
             return error.InvalidBatchRequest;
         }
+        if (column.field_type == .array and found != .array) {
+            if (column.nullable) continue;
+            return error.InvalidBatchRequest;
+        }
         const value = try coerceRelationalStorageValue(alloc, value_type, found) orelse {
             if (column.nullable) continue;
             return error.InvalidBatchRequest;
@@ -3722,11 +3726,13 @@ test "relational KV row value round-trips a document through project + reconstru
         .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
         .{ .name = "note", .path = "note", .field_type = .keyword, .nullable = true },
         .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true },
+        .{ .name = "tags", .path = "tags", .field_type = .array, .nullable = true },
     };
 
-    // "note" absent -> omitted; payload is a structured json column.
+    // "note" absent -> omitted; payload is a structured json column; tags is a
+    // first-class relational array column stored as canonical bytes.
     const doc_json =
-        \\{"id":"abc","amount":12.5,"ts":1000,"active":true,"payload":{"k":1}}
+        \\{"id":"abc","amount":12.5,"ts":1000,"active":true,"payload":{"k":1},"tags":["hot","new"]}
     ;
 
     const row_value = try buildRelationalRowValueAlloc(alloc, doc_json, &columns);
@@ -3741,12 +3747,15 @@ test "relational KV row value round-trips a document through project + reconstru
     defer parsed.deinit();
     const obj = parsed.value.object;
 
-    try std.testing.expectEqual(@as(usize, 5), obj.count());
+    try std.testing.expectEqual(@as(usize, 6), obj.count());
     try std.testing.expectEqualStrings("abc", obj.get("id").?.string);
     try std.testing.expectEqual(@as(i64, 1000), obj.get("ts").?.integer);
     try std.testing.expect(obj.get("active").?.bool);
     try std.testing.expect(obj.get("note") == null);
     try std.testing.expectEqual(@as(i64, 1), obj.get("payload").?.object.get("k").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), obj.get("tags").?.array.items.len);
+    try std.testing.expectEqualStrings("hot", obj.get("tags").?.array.items[0].string);
+    try std.testing.expectEqualStrings("new", obj.get("tags").?.array.items[1].string);
     const amount = obj.get("amount").?;
     const amount_num: f64 = switch (amount) {
         .float => |f| f,
@@ -3754,6 +3763,10 @@ test "relational KV row value round-trips a document through project + reconstru
         else => unreachable,
     };
     try std.testing.expectEqual(@as(f64, 12.5), amount_num);
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\",\"amount\":12.5,\"tags\":\"hot\"}", &columns),
+    );
 }
 
 test "relational KV row value rejects missing required columns" {
