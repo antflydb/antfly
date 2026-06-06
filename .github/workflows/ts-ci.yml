@@ -69,17 +69,23 @@ jobs:
     runs-on: arc-antfly-heavy
     env:
       PNPM_STORE_PATH: /mnt/cache/pnpm-store
-      PLAYWRIGHT_BROWSERS_PATH: /mnt/cache/ms-playwright
-      XDG_CACHE_HOME: /mnt/cache/xdg
-      TMPDIR: /mnt/cache/tmp
     defaults:
       run:
         working-directory: ts
     steps:
       - name: Configure cache directories
         run: |
-          mkdir -p "$PNPM_STORE_PATH" "$PLAYWRIGHT_BROWSERS_PATH" "$XDG_CACHE_HOME" "$TMPDIR"
-          df -h / /mnt/cache
+          playwright_browsers_path="${RUNNER_TEMP}/playwright-browsers"
+          xdg_cache_home="${RUNNER_TEMP}/xdg"
+          tmpdir="${RUNNER_TEMP}/tmp"
+
+          {
+            echo "PLAYWRIGHT_BROWSERS_PATH=${playwright_browsers_path}"
+            echo "XDG_CACHE_HOME=${xdg_cache_home}"
+            echo "TMPDIR=${tmpdir}"
+          } >> "$GITHUB_ENV"
+
+          mkdir -p "$PNPM_STORE_PATH" "$playwright_browsers_path" "$xdg_cache_home" "$tmpdir"
         working-directory: .
 
       - uses: actions/checkout@v6
@@ -91,7 +97,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: lts/*
           cache: 'pnpm'
           cache-dependency-path: ts/pnpm-lock.yaml
 
@@ -107,7 +113,7 @@ jobs:
       - name: Cache Playwright Browsers
         uses: actions/cache@v5
         with:
-          path: /mnt/cache/ms-playwright
+          path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('ts/pnpm-lock.yaml') }}
           restore-keys: |
             playwright-${{ runner.os }}-
@@ -121,7 +127,7 @@ jobs:
 
       - name: Install Playwright Chromium
         working-directory: ts/apps/antfarm
-        timeout-minutes: 20
+        timeout-minutes: 10
         run: |
           set -euxo pipefail
           time pnpm exec playwright install chromium
@@ -130,7 +136,7 @@ jobs:
 
       - name: Install Playwright Firefox
         working-directory: ts/apps/antfarm
-        timeout-minutes: 20
+        timeout-minutes: 10
         run: |
           set -euxo pipefail
           time pnpm exec playwright install firefox
