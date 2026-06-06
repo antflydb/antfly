@@ -229,6 +229,7 @@ pub const ModelRegistry = struct {
         token: ?[]const u8,
         tasks_csv: ?[]const u8,
         capabilities_csv: ?[]const u8,
+        projector_selection: download.ProjectorSelection,
     ) !void {
         const ref = try ModelRef.parse(ref_str);
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
@@ -241,7 +242,7 @@ pub const ModelRegistry = struct {
         var progress = ProgressPrinter{};
         try download.downloadModel(self.allocator, io, ref.owner, ref.name, ref.variant, dest, .{
             .token = token,
-        }, .{
+        }, projector_selection, .{
             .callback = ProgressPrinter.onProgress,
             .context = &progress,
         });

@@ -39,6 +39,8 @@ pub const Provider = struct {
     http: *httpx.Client,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
+    tools_json: ?[]const u8 = null,
+    tool_choice_json: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -67,6 +69,11 @@ pub const Provider = struct {
             self.allocator.free(h[1]);
         }
         self.auth_header = .{ "Authorization", try self.allocator.dupe(u8, auth_header) };
+    }
+
+    pub fn setToolOptions(self: *Provider, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) void {
+        self.tools_json = tools_json;
+        self.tool_choice_json = tool_choice_json;
     }
 
     fn authHeaders(self: *const Provider) ?[]const [2][]const u8 {
@@ -278,13 +285,23 @@ pub const Provider = struct {
             choices: []const struct {
                 message: struct {
                     content: ?[]const u8 = null,
+                    tool_calls: ?[]const struct {
+                        id: ?[]const u8 = null,
+                        function: struct {
+                            name: []const u8,
+                            arguments: []const u8,
+                        },
+                    } = null,
                 },
             },
         };
 
         const url = try std.fmt.allocPrint(self.allocator, "{s}/generate", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try inference.chatRequestJsonAlloc(self.allocator, model, messages, .termite_native);
+        const json_body = try inference.chatRequestJsonWithOptionsAlloc(self.allocator, model, messages, .termite_native, .{
+            .tools_json = self.tools_json,
+            .tool_choice_json = self.tool_choice_json,
+        });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
             .json = json_body,
@@ -298,12 +315,38 @@ pub const Provider = struct {
         defer parsed.deinit();
         const choices = parsed.value.choices;
         if (choices.len == 0) return error.EmptyResponse;
-        const content = choices[0].message.content orelse return error.EmptyResponse;
+        var tool_calls = try cloneOpenAIToolCalls(alloc, choices[0].message.tool_calls);
+        errdefer freeToolCalls(alloc, tool_calls);
+        const content = choices[0].message.content orelse "";
+        if (tool_calls.len == 0 and content.len > 0) {
+            tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, content, self.tools_json, self.tool_choice_json);
+        }
+        if (content.len == 0 and tool_calls.len == 0) return error.EmptyResponse;
 
         return .{
             .content = try alloc.dupe(u8, content),
+            .tool_calls = tool_calls,
             .allocator = alloc,
         };
+    }
+
+    fn cloneOpenAIToolCalls(alloc: std.mem.Allocator, maybe_calls: anytype) ![]inference.ToolCall {
+        const calls = maybe_calls orelse return &.{};
+        const out = try alloc.alloc(inference.ToolCall, calls.len);
+        errdefer alloc.free(out);
+        for (calls, 0..) |call, i| {
+            out[i] = .{
+                .id = try alloc.dupe(u8, call.id orelse ""),
+                .name = try alloc.dupe(u8, call.function.name),
+                .arguments = try alloc.dupe(u8, call.function.arguments),
+            };
+        }
+        return out;
+    }
+
+    fn freeToolCalls(alloc: std.mem.Allocator, calls: []inference.ToolCall) void {
+        for (calls) |*call| call.deinit(alloc);
+        if (calls.len > 0) alloc.free(calls);
     }
 
     fn rerankImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, query: []const u8, documents: []const []const u8) anyerror!inference.RerankResult {

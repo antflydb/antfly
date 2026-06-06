@@ -84,6 +84,11 @@ export EPSTEIN_ZIP="/path/to/T9/DataSet_10.zip"
 # Process PDFs into page records. --split-pages enables direct PDF viewing.
 ./epstein prepare --dir "$EPSTEIN_DOCS_DIR" --split-pages
 
+# Small smoke run from a large local disk: process only the first few PDFs and pages.
+./epstein prepare --dir /Volumes/T9/epstein-files --split-pages \
+  --limit-files 2 --limit-pages 50 \
+  --output epstein-smoke.json
+
 # Optional: OCR low-quality pages through Zig Antfly inference.
 ./epstein enrich --input epstein-docs.json --dir "$EPSTEIN_DOCS_DIR"
 
@@ -92,6 +97,11 @@ export EPSTEIN_ZIP="/path/to/T9/DataSet_10.zip"
 
 # Load into Antfly using ClipClap embeddings.
 ./epstein load --input epstein-docs-enriched-entities.json --create-table
+
+# Load the small smoke file and enable the Zig artifact-backed relation graph.
+./epstein load --input epstein-smoke.json --table epstein_smoke --create-table \
+  --enable-artifact-graph \
+  --artifact-extractor-model ggml-org/gemma-4-E4B-it-GGUF
 ```
 
 For ZIP sources that should not be extracted first:
@@ -143,6 +153,10 @@ Flags:
   --ocr-url   Antfly inference URL (default: ANTFLY_INFERENCE_URL or http://localhost:8080)
   --ocr-models
               OCR models to try (default: Xenova/trocr-base-printed)
+  --limit-files
+              Process at most this many source PDFs (default: all)
+  --limit-pages
+              Keep at most this many parsed pages in output (default: all)
 ```
 
 ### `load`
@@ -165,6 +179,17 @@ Flags:
   --chunker-model   Chunker model (default: fixed-bert-tokenizer)
   --target-tokens   Target tokens per chunk (default: 512)
   --overlap-tokens  Overlap between chunks (default: 50)
+  --enable-artifact-graph
+                    Create an artifact-backed autograph relation graph index
+  --artifact-graph-index
+                    Graph index name (default: autograph_relations)
+  --artifact-name   Generated asset artifact name (default: relations_v1)
+  --artifact-extractor-model
+                    Antfly generator model for tool-call relation extraction
+                    (default: ggml-org/gemma-4-E4B-it-GGUF)
+  --artifact-labels Entity labels for the artifact generator
+  --artifact-relation-labels
+                    Relation labels for the artifact generator
 ```
 
 ### `sync`

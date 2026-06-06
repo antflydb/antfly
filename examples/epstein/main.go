@@ -195,9 +195,13 @@ const (
 	DefaultEmbeddingIndex  = "embeddings"
 	DefaultEmbeddingModel  = "antflydb/clipclap"
 	DefaultEmbeddingPull   = "antflydb/clipclap:gguf:Q4_K"
+	DefaultEmbeddingDims   = 512
 	DefaultChunkerModel    = "fixed-bert-tokenizer"
 	DefaultOCRModel        = "Xenova/trocr-base-printed"
 	DefaultRecognizerModel = "fastino/gliner2-base-v1"
+	DefaultAutographIndex  = "autograph_relations"
+	DefaultAutographAsset  = "relations_v1"
+	DefaultAutographModel  = "ggml-org/gemma-4-E4B-it-GGUF"
 	DefaultEntityLabels    = "person,organization,location,date,case,document,facility,aircraft"
 	DefaultRelationLabels  = "associated with,communicated with,traveled to,visited,worked for,represented by,mentioned in,located in"
 	DefaultEntityMaxChars  = 3000
@@ -289,6 +293,25 @@ func splitCSV(value string) []string {
 		}
 	}
 	return out
+}
+
+func parseSyncLevelFlag(value string) (antfly.SyncLevel, error) {
+	switch normalized := strings.ToLower(strings.TrimSpace(value)); normalized {
+	case "propose":
+		return antfly.SyncLevelPropose, nil
+	case "write":
+		return antfly.SyncLevelWrite, nil
+	case "full_text":
+		return antfly.SyncLevelFullText, nil
+	case "aknn", "embeddings":
+		return antfly.SyncLevelAknn, nil
+	case "full_index":
+		return antfly.SyncLevelFullIndex, nil
+	case "enrichments":
+		return antfly.SyncLevelEnrichments, nil
+	default:
+		return "", fmt.Errorf("invalid --sync-level %q (expected write, full_text, aknn, full_index, enrichments, or propose)", value)
+	}
 }
 
 // downloadCmd downloads Epstein documents from archive.org
@@ -633,6 +656,9 @@ func iterateZipPDFs(zipPath string, fn func(name string, data []byte) error) err
 		}
 
 		if err := fn(filepath.Base(f.Name), data); err != nil {
+			if err == filepath.SkipAll {
+				return nil
+			}
 			return err
 		}
 	}
@@ -918,6 +944,8 @@ func prepareCmd(args []string) error {
 	noHeaderFooter := fs.Bool("no-header-footer-detection", false, "Disable header/footer detection (faster, single pass)")
 	noMirroredRepair := fs.Bool("no-mirrored-text-repair", false, "Disable mirrored text repair (faster)")
 	smartJoin := fs.Bool("smart-join", false, "Enable smart line joining to defragment text layouts")
+	limitFiles := fs.Int("limit-files", 0, "Process at most this many source PDFs (0 = all)")
+	limitPages := fs.Int("limit-pages", 0, "Keep at most this many parsed pages in output (0 = all)")
 	numWorkers := fs.Int("workers", runtime.NumCPU(), "Number of parallel workers for parsing (split-pages mode only)")
 	var zipPaths StringSliceFlag
 	fs.Var(&zipPaths, "zip", "Path to ZIP archive containing PDFs (repeatable, skips extraction)")
@@ -949,6 +977,12 @@ func prepareCmd(args []string) error {
 	fmt.Printf("Header/footer detection: %v\n", !*noHeaderFooter)
 	fmt.Printf("Mirrored text repair: %v\n", !*noMirroredRepair)
 	fmt.Printf("Smart line joining: %v\n", *smartJoin)
+	if *limitFiles > 0 {
+		fmt.Printf("Limit files: %d\n", *limitFiles)
+	}
+	if *limitPages > 0 {
+		fmt.Printf("Limit pages: %d\n", *limitPages)
+	}
 	if *splitPages {
 		fmt.Printf("Workers: %d\n", *numWorkers)
 	}
@@ -1006,6 +1040,7 @@ func prepareCmd(args []string) error {
 
 		// Find and split all PDF files from directory (including subdirectories from extracted ZIPs)
 		if dirExists {
+			sourcePDFsSeen := 0
 			if err := filepath.WalkDir(*dirPath, func(path string, d os.DirEntry, err error) error {
 				if err != nil {
 					return err
@@ -1020,6 +1055,10 @@ func prepareCmd(args []string) error {
 				if !strings.HasSuffix(strings.ToLower(d.Name()), ".pdf") {
 					return nil
 				}
+				if *limitFiles > 0 && sourcePDFsSeen >= *limitFiles {
+					return filepath.SkipAll
+				}
+				sourcePDFsSeen++
 
 				relPath, _ := filepath.Rel(*dirPath, path)
 				fmt.Printf("  Processing %s...\n", relPath)
@@ -1190,6 +1229,9 @@ func prepareCmd(args []string) error {
 				fmt.Printf("    %d PDFs in archive\n", zipPDFCount)
 				zipIdx := 0
 				if err := iterateZipPDFs(zipPath, func(name string, data []byte) error {
+					if *limitFiles > 0 && zipIdx >= *limitFiles {
+						return filepath.SkipAll
+					}
 					zipIdx++
 					pb, meta, err := splitPDFToPagesFromBytes(data, name)
 					if err != nil {
@@ -1309,7 +1351,12 @@ func prepareCmd(args []string) error {
 			}
 			for _, zipPath := range zipPaths {
 				fmt.Printf("Processing ZIP: %s\n", zipPath)
+				zipIdx := 0
 				if err := iterateZipPDFs(zipPath, func(name string, data []byte) error {
+					if *limitFiles > 0 && zipIdx >= *limitFiles {
+						return filepath.SkipAll
+					}
+					zipIdx++
 					zipSections, err := pdfProcessor.Process(name, "", *baseURL, data)
 					if err != nil {
 						fmt.Printf("  Warning: failed to process %s: %v\n", name, err)
@@ -1331,6 +1378,11 @@ func prepareCmd(args []string) error {
 			sections[i].Content = smartJoinLines(sections[i].Content)
 		}
 		fmt.Printf("\n")
+	}
+
+	if *limitPages > 0 && len(sections) > *limitPages {
+		fmt.Printf("Limiting output to first %d pages (from %d parsed pages)\n\n", *limitPages, len(sections))
+		sections = sections[:*limitPages]
 	}
 
 	fmt.Printf("Found %d document sections (pages)\n\n", len(sections))
@@ -1395,13 +1447,25 @@ func loadCmd(args []string) error {
 	createTable := fs.Bool("create-table", false, "Create table if it doesn't exist")
 	numShards := fs.Int("num-shards", 1, "Number of shards for new table")
 	batchSize := fs.Int("batch-size", 25, "Linear merge batch size")
+	limitRecords := fs.Int("limit-records", 0, "Maximum records to load (0 = all)")
+	syncLevelFlag := fs.String("sync-level", "write", "Merge sync level: write, full_text, aknn, full_index, enrichments, or propose")
 	embeddingModel := fs.String("embedding-model", DefaultEmbeddingModel, "Embedding model to use")
 	chunkerModel := fs.String("chunker-model", DefaultChunkerModel, "Chunker model")
 	targetTokens := fs.Int("target-tokens", 512, "Target tokens for chunking")
 	overlapTokens := fs.Int("overlap-tokens", 50, "Overlap tokens for chunking")
+	enableArtifactGraph := fs.Bool("enable-artifact-graph", false, "Create artifact-backed autograph relation graph index")
+	artifactGraphIndex := fs.String("artifact-graph-index", DefaultAutographIndex, "Artifact graph index name")
+	artifactName := fs.String("artifact-name", DefaultAutographAsset, "Generated asset artifact name for relation extraction")
+	artifactExtractorModel := fs.String("artifact-extractor-model", DefaultAutographModel, "Antfly generator model for tool-call artifact relation extraction")
+	artifactLabels := fs.String("artifact-labels", DefaultEntityLabels, "Artifact generator entity labels (comma-separated)")
+	artifactRelationLabels := fs.String("artifact-relation-labels", DefaultRelationLabels, "Artifact generator relation labels (comma-separated)")
 
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+	syncLevel, err := parseSyncLevelFlag(*syncLevelFlag)
+	if err != nil {
+		return err
 	}
 
 	ctx := context.Background()
@@ -1417,7 +1481,11 @@ func loadCmd(args []string) error {
 	fmt.Printf("Inference URL: %s\n", *inferenceURL)
 	fmt.Printf("Table: %s\n", *tableName)
 	fmt.Printf("Input: %s\n", *inputFile)
+	if *limitRecords > 0 {
+		fmt.Printf("Limit records: %d\n", *limitRecords)
+	}
 	fmt.Printf("Dry run: %v\n\n", *dryRun)
+	fmt.Printf("Sync level: %s\n\n", syncLevel)
 
 	// Create table if requested
 	if *createTable {
@@ -1430,6 +1498,13 @@ func loadCmd(args []string) error {
 		indexes, err := createSearchTableIndexes(*embeddingIndex)
 		if err != nil {
 			return fmt.Errorf("failed to create search index config: %w", err)
+		}
+		if *enableArtifactGraph {
+			graphIndex, err := createArtifactGraphIndex(*artifactGraphIndex, *artifactName, *artifactExtractorModel, *inferenceURL, splitCSV(*artifactLabels), splitCSV(*artifactRelationLabels))
+			if err != nil {
+				return fmt.Errorf("failed to create artifact graph index config: %w", err)
+			}
+			indexes[*artifactGraphIndex] = *graphIndex
 		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
@@ -1456,11 +1531,11 @@ func loadCmd(args []string) error {
 	}
 	defer f.Close()
 
-	pages := streamJSONPages(f, *batchSize)
+	pages := streamJSONPagesWithLimit(f, *batchSize, *limitRecords)
 
 	mergeResult, err := client.ExecuteLinearMerge(ctx, *tableName, pages, antfly.ExecuteLinearMergeOptions{
 		DryRun:    *dryRun,
-		SyncLevel: antfly.SyncLevelAknn,
+		SyncLevel: syncLevel,
 		OnBatch: func(batch int, result *antfly.LinearMergeResult) {
 			fmt.Printf("[batch %d] upserted: %d, took: %s\n", batch, result.Upserted, result.Took)
 		},
@@ -1486,10 +1561,17 @@ func syncCmd(args []string) error {
 	createTable := fs.Bool("create-table", false, "Create table if needed")
 	numShards := fs.Int("num-shards", 1, "Number of shards")
 	batchSize := fs.Int("batch-size", 25, "Batch size")
+	syncLevelFlag := fs.String("sync-level", "write", "Merge sync level: write, full_text, aknn, full_index, enrichments, or propose")
 	embeddingModel := fs.String("embedding-model", DefaultEmbeddingModel, "Embedding model")
 	chunkerModel := fs.String("chunker-model", DefaultChunkerModel, "Chunker model")
 	targetTokens := fs.Int("target-tokens", 512, "Target tokens")
 	overlapTokens := fs.Int("overlap-tokens", 50, "Overlap tokens")
+	enableArtifactGraph := fs.Bool("enable-artifact-graph", false, "Create artifact-backed autograph relation graph index")
+	artifactGraphIndex := fs.String("artifact-graph-index", DefaultAutographIndex, "Artifact graph index name")
+	artifactName := fs.String("artifact-name", DefaultAutographAsset, "Generated asset artifact name for relation extraction")
+	artifactExtractorModel := fs.String("artifact-extractor-model", DefaultAutographModel, "Antfly generator model for tool-call artifact relation extraction")
+	artifactLabels := fs.String("artifact-labels", DefaultEntityLabels, "Artifact generator entity labels (comma-separated)")
+	artifactRelationLabels := fs.String("artifact-relation-labels", DefaultRelationLabels, "Artifact generator relation labels (comma-separated)")
 	noHeaderFooter := fs.Bool("no-header-footer-detection", false, "Disable header/footer detection (faster)")
 	noMirroredRepair := fs.Bool("no-mirrored-text-repair", false, "Disable mirrored text repair (faster)")
 	var zipPaths StringSliceFlag
@@ -1497,6 +1579,10 @@ func syncCmd(args []string) error {
 
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+	syncLevel, err := parseSyncLevelFlag(*syncLevelFlag)
+	if err != nil {
+		return err
 	}
 
 	ctx := context.Background()
@@ -1512,6 +1598,7 @@ func syncCmd(args []string) error {
 	fmt.Printf("Inference URL: %s\n", *inferenceURL)
 	fmt.Printf("Directory: %s\n", *dirPath)
 	fmt.Printf("Table: %s\n", *tableName)
+	fmt.Printf("Sync level: %s\n", syncLevel)
 	if len(zipPaths) > 0 {
 		fmt.Printf("ZIP sources: %d\n", len(zipPaths))
 		for _, zp := range zipPaths {
@@ -1531,6 +1618,13 @@ func syncCmd(args []string) error {
 		indexes, err := createSearchTableIndexes(*embeddingIndex)
 		if err != nil {
 			return fmt.Errorf("failed to create search index config: %w", err)
+		}
+		if *enableArtifactGraph {
+			graphIndex, err := createArtifactGraphIndex(*artifactGraphIndex, *artifactName, *artifactExtractorModel, *inferenceURL, splitCSV(*artifactLabels), splitCSV(*artifactRelationLabels))
+			if err != nil {
+				return fmt.Errorf("failed to create artifact graph index config: %w", err)
+			}
+			indexes[*artifactGraphIndex] = *graphIndex
 		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
@@ -1648,7 +1742,7 @@ func syncCmd(args []string) error {
 
 	mergeResult, err := client.ExecuteLinearMerge(ctx, *tableName, pages, antfly.ExecuteLinearMergeOptions{
 		DryRun:    *dryRun,
-		SyncLevel: antfly.SyncLevelAknn,
+		SyncLevel: syncLevel,
 		OnBatch: func(batch int, result *antfly.LinearMergeResult) {
 			fmt.Printf("[batch %d] upserted: %d, took: %s\n", batch, result.Upserted, result.Took)
 		},
@@ -1910,6 +2004,7 @@ func createEmbeddingIndex(embeddingModel, inferenceURL, chunkerModel string, tar
 	}
 
 	chunker := antfly.ChunkerConfig{}
+	chunker.Provider = antfly.ChunkerProviderAntfly
 	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
 		ApiUrl: chunkerURL,
 		Model:  chunkerModel,
@@ -1923,9 +2018,10 @@ func createEmbeddingIndex(embeddingModel, inferenceURL, chunkerModel string, tar
 	}
 
 	err = embeddingIndexConfig.FromEmbeddingsIndexConfig(antfly.EmbeddingsIndexConfig{
-		Field:    "content",
-		Embedder: *embedder,
-		Chunker:  chunker,
+		Field:     "content",
+		Dimension: DefaultEmbeddingDims,
+		Embedder:  *embedder,
+		Chunker:   chunker,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure embedding index: %w", err)
@@ -1946,14 +2042,140 @@ func createFullTextIndex() (antfly.IndexConfig, error) {
 }
 
 func createSearchTableIndexes(embeddingIndex antfly.IndexConfig) (map[string]antfly.IndexConfig, error) {
-	fullTextIndex, err := createFullTextIndex()
+	return map[string]antfly.IndexConfig{
+		DefaultEmbeddingIndex: embeddingIndex,
+	}, nil
+}
+
+func createArtifactGraphIndex(indexName, artifactName, model, inferenceURL string, labels, relationLabels []string) (*antfly.IndexConfig, error) {
+	if strings.TrimSpace(indexName) == "" {
+		return nil, fmt.Errorf("artifact graph index name is required")
+	}
+	if strings.TrimSpace(artifactName) == "" {
+		return nil, fmt.Errorf("artifact name is required")
+	}
+	if strings.TrimSpace(model) == "" {
+		return nil, fmt.Errorf("artifact generator model is required")
+	}
+	inferenceAPIURL, err := inferenceMLBaseURL(inferenceURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid artifact inference URL: %w", err)
+	}
+	if len(labels) == 0 {
+		return nil, fmt.Errorf("at least one artifact entity label is required")
+	}
+	if len(relationLabels) == 0 {
+		return nil, fmt.Errorf("at least one artifact relation label is required")
+	}
+
+	relationEnum := append([]string(nil), relationLabels...)
+	labelEnum := append([]string(nil), labels...)
+
+	raw := map[string]any{
+		"name": indexName,
+		"type": antfly.IndexTypeGraph,
+		"source": map[string]any{
+			"kind":     "artifact",
+			"artifact": artifactName,
+			"path":     "$.relations[*]",
+			"format":   "extraction_relation",
+		},
+		"artifact": map[string]any{
+			"name":         artifactName,
+			"kind":         "asset",
+			"field":        "content",
+			"content_type": "application/json",
+			"producer_json": map[string]any{
+				"type": "generator",
+				"config": map[string]any{
+					"provider":    "antfly",
+					"model":       model,
+					"api_url":     inferenceAPIURL,
+					"tool_output": "arguments",
+					"tool_name":   "emit_relations",
+					"tool_choice": map[string]any{
+						"type": "function",
+						"function": map[string]any{
+							"name": "emit_relations",
+						},
+					},
+					"tools": []map[string]any{
+						{
+							"type": "function",
+							"function": map[string]any{
+								"name":        "emit_relations",
+								"description": "Extract autograph, signature, sender, recipient, and related entity relationships from the document text. Return only relations directly supported by the text.",
+								"parameters": map[string]any{
+									"type":                 "object",
+									"additionalProperties": false,
+									"required":             []string{"relations"},
+									"properties": map[string]any{
+										"relations": map[string]any{
+											"type": "array",
+											"items": map[string]any{
+												"type":                 "object",
+												"additionalProperties": false,
+												"required":             []string{"type", "target"},
+												"properties": map[string]any{
+													"type": map[string]any{
+														"type": "string",
+														"enum": relationEnum,
+													},
+													"source": map[string]any{
+														"type":        "object",
+														"description": "Optional source endpoint. Omit this to use the current document as the source.",
+														"properties": map[string]any{
+															"id":    map[string]any{"type": "string"},
+															"label": map[string]any{"type": "string", "enum": labelEnum},
+															"text":  map[string]any{"type": "string"},
+														},
+													},
+													"target": map[string]any{
+														"type":        "object",
+														"description": "Target endpoint for the relation. Use id for the normalized entity name.",
+														"required":    []string{"id"},
+														"properties": map[string]any{
+															"id":    map[string]any{"type": "string"},
+															"label": map[string]any{"type": "string", "enum": labelEnum},
+															"text":  map[string]any{"type": "string"},
+														},
+													},
+													"confidence": map[string]any{
+														"type":    "number",
+														"minimum": 0,
+														"maximum": 1,
+													},
+													"evidence": map[string]any{
+														"type":        "string",
+														"description": "Short text span or explanation supporting the relation.",
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		"algebraic_planning": map[string]any{
+			"bounded_traversal": map[string]any{
+				"law": "provenance_semiring",
+			},
+		},
+	}
+
+	encoded, err := json.Marshal(raw)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]antfly.IndexConfig{
-		DefaultFullTextIndex:  fullTextIndex,
-		DefaultEmbeddingIndex: embeddingIndex,
-	}, nil
+	var cfg antfly.IndexConfig
+	if err := json.Unmarshal(encoded, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }
 
 func searchIndexNames() []string {
@@ -1995,6 +2217,10 @@ func truncateContent(content string, maxLen int) string {
 // (as produced by writeJSONSorted) so that sequential pages form valid
 // non-overlapping ranges for linear merge.
 func streamJSONPages(r io.Reader, batchSize int) iter.Seq[map[string]any] {
+	return streamJSONPagesWithLimit(r, batchSize, 0)
+}
+
+func streamJSONPagesWithLimit(r io.Reader, batchSize int, limit int) iter.Seq[map[string]any] {
 	return func(yield func(map[string]any) bool) {
 		dec := json.NewDecoder(bufio.NewReaderSize(r, 256*1024))
 		dec.UseNumber()
@@ -2006,6 +2232,7 @@ func streamJSONPages(r io.Reader, batchSize int) iter.Seq[map[string]any] {
 		}
 
 		page := make(map[string]any, batchSize)
+		loaded := 0
 		for dec.More() {
 			// Read key
 			tok, err := dec.Token()
@@ -2023,12 +2250,17 @@ func streamJSONPages(r io.Reader, batchSize int) iter.Seq[map[string]any] {
 				return
 			}
 
+			value = normalizePreparedRecordForLoad(value)
 			page[key] = value
+			loaded++
 			if len(page) >= batchSize {
 				if !yield(page) {
 					return
 				}
 				page = make(map[string]any, batchSize)
+			}
+			if limit > 0 && loaded >= limit {
+				break
 			}
 		}
 
@@ -2036,6 +2268,21 @@ func streamJSONPages(r io.Reader, batchSize int) iter.Seq[map[string]any] {
 			yield(page)
 		}
 	}
+}
+
+func normalizePreparedRecordForLoad(value any) any {
+	record, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+
+	if docType, ok := record["_type"]; ok {
+		if _, exists := record["document_type"]; !exists {
+			record["document_type"] = docType
+		}
+		delete(record, "_type")
+	}
+	return record
 }
 
 // writeJSONSorted writes a map as a JSON object with keys in sorted order,
@@ -3146,9 +3393,32 @@ type entityWindowSpan struct {
 	End   int `json:"end"`
 }
 
+const recognizedObjectObjectRecognition = "recognition"
+
+type recognizedEntity struct {
+	Text  string  `json:"text"`
+	Label string  `json:"label"`
+	Start int     `json:"start,omitempty"`
+	End   int     `json:"end,omitempty"`
+	Score float32 `json:"score,omitempty"`
+}
+
+type recognizedRelation struct {
+	Head  recognizedEntity `json:"head"`
+	Label string           `json:"label"`
+	Score float32          `json:"score,omitempty"`
+	Tail  recognizedEntity `json:"tail"`
+}
+
+type recognizedObject struct {
+	Entities  []recognizedEntity   `json:"entities,omitempty"`
+	Object    string               `json:"object,omitempty"`
+	Relations []recognizedRelation `json:"relations,omitempty"`
+}
+
 type entityAccum struct {
-	entities         []inferenceoapi.InferenceRecognizeEntity
-	relations        []inferenceoapi.InferenceRelation
+	entities         []recognizedEntity
+	relations        []recognizedRelation
 	failed           []entityWindowSpan
 	windows          int
 	errors           int
@@ -3577,7 +3847,7 @@ func recognizeEntityWindowBatch(
 		usedModel = model
 	}
 
-	resultsByIndex := make(map[int]inferenceoapi.InferenceRecognizeObject, len(resp.Data))
+	resultsByIndex := make(map[int]recognizedObject, len(resp.Data))
 	for resultIdx, result := range resp.Data {
 		idx := resultIdx
 		if idx >= 0 && idx < len(windows) {
@@ -3615,10 +3885,10 @@ func inferenceExtractionInputs(texts []string) ([]inferenceoapi.ExtractionInput,
 	return inputs, nil
 }
 
-func inferenceRecognizeObjectFromExtraction(item inferenceoapi.ExtractionObject) inferenceoapi.InferenceRecognizeObject {
-	entities := make([]inferenceoapi.InferenceRecognizeEntity, len(item.Entities))
+func inferenceRecognizeObjectFromExtraction(item inferenceoapi.ExtractionObject) recognizedObject {
+	entities := make([]recognizedEntity, len(item.Entities))
 	for i, entity := range item.Entities {
-		entities[i] = inferenceoapi.InferenceRecognizeEntity{
+		entities[i] = recognizedEntity{
 			Text:  entity.Text,
 			Label: entity.Label,
 			Score: entity.Score,
@@ -3626,23 +3896,23 @@ func inferenceRecognizeObjectFromExtraction(item inferenceoapi.ExtractionObject)
 			End:   entity.End,
 		}
 	}
-	relations := make([]inferenceoapi.InferenceRelation, 0, len(item.Relations))
+	relations := make([]recognizedRelation, 0, len(item.Relations))
 	for _, relation := range item.Relations {
-		relations = append(relations, inferenceoapi.InferenceRelation{
+		relations = append(relations, recognizedRelation{
 			Head:  inferenceRelationEndpointEntity(relation.Source, entities),
 			Label: relation.Type,
 			Score: relation.Score,
 			Tail:  inferenceRelationEndpointEntity(relation.Target, entities),
 		})
 	}
-	return inferenceoapi.InferenceRecognizeObject{
+	return recognizedObject{
 		Entities:  entities,
-		Object:    inferenceoapi.InferenceRecognizeObjectObjectRecognition,
+		Object:    recognizedObjectObjectRecognition,
 		Relations: relations,
 	}
 }
 
-func inferenceRelationEndpointEntity(endpoint inferenceoapi.ExtractionRelationEndpoint, entities []inferenceoapi.InferenceRecognizeEntity) inferenceoapi.InferenceRecognizeEntity {
+func inferenceRelationEndpointEntity(endpoint inferenceoapi.ExtractionRelationEndpoint, entities []recognizedEntity) recognizedEntity {
 	if endpoint.EntityIndex >= 0 && endpoint.EntityIndex < len(entities) {
 		return entities[endpoint.EntityIndex]
 	}
@@ -3653,25 +3923,25 @@ func inferenceRelationEndpointEntity(endpoint inferenceoapi.ExtractionRelationEn
 			}
 		}
 	}
-	return inferenceoapi.InferenceRecognizeEntity{}
+	return recognizedEntity{}
 }
 
-func offsetEntities(entities []inferenceoapi.InferenceRecognizeEntity, base int) []inferenceoapi.InferenceRecognizeEntity {
-	out := make([]inferenceoapi.InferenceRecognizeEntity, len(entities))
+func offsetEntities(entities []recognizedEntity, base int) []recognizedEntity {
+	out := make([]recognizedEntity, len(entities))
 	for i, entity := range entities {
 		out[i] = offsetEntity(entity, base)
 	}
 	return out
 }
 
-func offsetEntity(entity inferenceoapi.InferenceRecognizeEntity, base int) inferenceoapi.InferenceRecognizeEntity {
+func offsetEntity(entity recognizedEntity, base int) recognizedEntity {
 	entity.Start += base
 	entity.End += base
 	return entity
 }
 
-func offsetRelations(relations []inferenceoapi.InferenceRelation, base int) []inferenceoapi.InferenceRelation {
-	out := make([]inferenceoapi.InferenceRelation, len(relations))
+func offsetRelations(relations []recognizedRelation, base int) []recognizedRelation {
+	out := make([]recognizedRelation, len(relations))
 	for i, relation := range relations {
 		relation.Head = offsetEntity(relation.Head, base)
 		relation.Tail = offsetEntity(relation.Tail, base)
@@ -3680,15 +3950,15 @@ func offsetRelations(relations []inferenceoapi.InferenceRelation, base int) []in
 	return out
 }
 
-func metadataEntities(value any) []inferenceoapi.InferenceRecognizeEntity {
+func metadataEntities(value any) []recognizedEntity {
 	items, ok := value.([]any)
 	if !ok {
-		if entities, ok := value.([]inferenceoapi.InferenceRecognizeEntity); ok {
-			return append([]inferenceoapi.InferenceRecognizeEntity(nil), entities...)
+		if entities, ok := value.([]recognizedEntity); ok {
+			return append([]recognizedEntity(nil), entities...)
 		}
 		return nil
 	}
-	entities := make([]inferenceoapi.InferenceRecognizeEntity, 0, len(items))
+	entities := make([]recognizedEntity, 0, len(items))
 	for _, item := range items {
 		entity, ok := metadataEntity(item)
 		if ok {
@@ -3698,15 +3968,15 @@ func metadataEntities(value any) []inferenceoapi.InferenceRecognizeEntity {
 	return entities
 }
 
-func metadataRelations(value any) []inferenceoapi.InferenceRelation {
+func metadataRelations(value any) []recognizedRelation {
 	items, ok := value.([]any)
 	if !ok {
-		if relations, ok := value.([]inferenceoapi.InferenceRelation); ok {
-			return append([]inferenceoapi.InferenceRelation(nil), relations...)
+		if relations, ok := value.([]recognizedRelation); ok {
+			return append([]recognizedRelation(nil), relations...)
 		}
 		return nil
 	}
-	relations := make([]inferenceoapi.InferenceRelation, 0, len(items))
+	relations := make([]recognizedRelation, 0, len(items))
 	for _, item := range items {
 		relation, ok := metadataRelation(item)
 		if ok {
@@ -3716,15 +3986,15 @@ func metadataRelations(value any) []inferenceoapi.InferenceRelation {
 	return relations
 }
 
-func metadataEntity(value any) (inferenceoapi.InferenceRecognizeEntity, bool) {
-	if entity, ok := value.(inferenceoapi.InferenceRecognizeEntity); ok {
+func metadataEntity(value any) (recognizedEntity, bool) {
+	if entity, ok := value.(recognizedEntity); ok {
 		return entity, true
 	}
 	m, ok := value.(map[string]any)
 	if !ok {
-		return inferenceoapi.InferenceRecognizeEntity{}, false
+		return recognizedEntity{}, false
 	}
-	return inferenceoapi.InferenceRecognizeEntity{
+	return recognizedEntity{
 		Text:  metadataString(m["text"]),
 		Label: metadataString(m["label"]),
 		Start: metadataInt(m["start"]),
@@ -3733,20 +4003,20 @@ func metadataEntity(value any) (inferenceoapi.InferenceRecognizeEntity, bool) {
 	}, true
 }
 
-func metadataRelation(value any) (inferenceoapi.InferenceRelation, bool) {
-	if relation, ok := value.(inferenceoapi.InferenceRelation); ok {
+func metadataRelation(value any) (recognizedRelation, bool) {
+	if relation, ok := value.(recognizedRelation); ok {
 		return relation, true
 	}
 	m, ok := value.(map[string]any)
 	if !ok {
-		return inferenceoapi.InferenceRelation{}, false
+		return recognizedRelation{}, false
 	}
 	head, headOK := metadataEntity(m["head"])
 	tail, tailOK := metadataEntity(m["tail"])
 	if !headOK || !tailOK {
-		return inferenceoapi.InferenceRelation{}, false
+		return recognizedRelation{}, false
 	}
-	return inferenceoapi.InferenceRelation{
+	return recognizedRelation{
 		Head:  head,
 		Label: metadataString(m["label"]),
 		Score: metadataFloat32(m["score"]),
@@ -3818,8 +4088,8 @@ func stringSlicesEqual(a, b []string) bool {
 	return true
 }
 
-func dedupeEntities(entities []inferenceoapi.InferenceRecognizeEntity) []inferenceoapi.InferenceRecognizeEntity {
-	byKey := make(map[string]inferenceoapi.InferenceRecognizeEntity, len(entities))
+func dedupeEntities(entities []recognizedEntity) []recognizedEntity {
+	byKey := make(map[string]recognizedEntity, len(entities))
 	for _, entity := range entities {
 		key := entityKey(entity)
 		if existing, ok := byKey[key]; !ok || entity.Score > existing.Score {
@@ -3827,11 +4097,11 @@ func dedupeEntities(entities []inferenceoapi.InferenceRecognizeEntity) []inferen
 		}
 	}
 
-	out := make([]inferenceoapi.InferenceRecognizeEntity, 0, len(byKey))
+	out := make([]recognizedEntity, 0, len(byKey))
 	for _, entity := range byKey {
 		out = append(out, entity)
 	}
-	slices.SortFunc(out, func(a, b inferenceoapi.InferenceRecognizeEntity) int {
+	slices.SortFunc(out, func(a, b recognizedEntity) int {
 		if a.Start != b.Start {
 			return a.Start - b.Start
 		}
@@ -3846,8 +4116,8 @@ func dedupeEntities(entities []inferenceoapi.InferenceRecognizeEntity) []inferen
 	return out
 }
 
-func dedupeRelations(relations []inferenceoapi.InferenceRelation) []inferenceoapi.InferenceRelation {
-	byKey := make(map[string]inferenceoapi.InferenceRelation, len(relations))
+func dedupeRelations(relations []recognizedRelation) []recognizedRelation {
+	byKey := make(map[string]recognizedRelation, len(relations))
 	for _, relation := range relations {
 		key := relationKey(relation)
 		if existing, ok := byKey[key]; !ok || relation.Score > existing.Score {
@@ -3855,11 +4125,11 @@ func dedupeRelations(relations []inferenceoapi.InferenceRelation) []inferenceoap
 		}
 	}
 
-	out := make([]inferenceoapi.InferenceRelation, 0, len(byKey))
+	out := make([]recognizedRelation, 0, len(byKey))
 	for _, relation := range byKey {
 		out = append(out, relation)
 	}
-	slices.SortFunc(out, func(a, b inferenceoapi.InferenceRelation) int {
+	slices.SortFunc(out, func(a, b recognizedRelation) int {
 		if a.Head.Start != b.Head.Start {
 			return a.Head.Start - b.Head.Start
 		}
@@ -3877,11 +4147,11 @@ func dedupeRelations(relations []inferenceoapi.InferenceRelation) []inferenceoap
 	return out
 }
 
-func entityKey(entity inferenceoapi.InferenceRecognizeEntity) string {
+func entityKey(entity recognizedEntity) string {
 	return fmt.Sprintf("%s\x00%s\x00%d\x00%d", entity.Label, entity.Text, entity.Start, entity.End)
 }
 
-func relationKey(relation inferenceoapi.InferenceRelation) string {
+func relationKey(relation recognizedRelation) string {
 	return fmt.Sprintf("%s\x00%s\x00%s", relation.Label, entityKey(relation.Head), entityKey(relation.Tail))
 }
 
