@@ -71,11 +71,20 @@ pub fn main(init: std.process.Init) !void {
     const alloc = gpa_state.allocator();
 
     const cfg = try parseArgs(init.minimal.args);
+    std.debug.print("recall_harness_start dataset_dir={s} dataset_filter={s} suite={s}\n", .{
+        cfg.dataset_dir,
+        cfg.dataset_filter orelse "<all>",
+        @tagName(cfg.suite),
+    });
+
     var heartbeat = Heartbeat{};
-    const heartbeat_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Heartbeat.run, .{&heartbeat});
+    const heartbeat_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Heartbeat.run, .{&heartbeat}) catch |err| blk: {
+        std.debug.print("recall_harness_heartbeat_disabled err={s}\n", .{@errorName(err)});
+        break :blk null;
+    };
     defer {
         heartbeat.stop.store(true, .release);
-        heartbeat_thread.join();
+        if (heartbeat_thread) |thread| thread.join();
     }
 
     var ok = true;
