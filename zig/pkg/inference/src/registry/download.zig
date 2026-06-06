@@ -28,6 +28,24 @@ pub const HubConfig = struct {
     base_url: []const u8 = "https://huggingface.co",
 };
 
+pub const ProjectorSelection = union(enum) {
+    auto,
+    none,
+    match: []const u8,
+};
+
+pub fn parseProjectorSelection(value: []const u8) ?ProjectorSelection {
+    if (std.mem.eql(u8, value, "auto") or std.mem.eql(u8, value, "default")) return .auto;
+    if (std.mem.eql(u8, value, "none") or
+        std.mem.eql(u8, value, "off") or
+        std.mem.eql(u8, value, "false"))
+    {
+        return .none;
+    }
+    if (value.len == 0) return null;
+    return .{ .match = value };
+}
+
 const HubFile = struct {
     name: []const u8,
     size: ?u64 = null,
@@ -330,6 +348,7 @@ fn appendBestRequestedGgufPayload(
     to_download: *std.ArrayListUnmanaged(HubFile),
     files: []const HubFile,
     quant_filter: ?[]const u8,
+    projector_selection: ProjectorSelection,
 ) !bool {
     const has_clipclap_gguf = hasClipclapGgufCandidate(files);
     if (try appendBestClipclapGgufPair(allocator, to_download, files, quant_filter)) {
@@ -337,7 +356,7 @@ fn appendBestRequestedGgufPayload(
     }
     if (has_clipclap_gguf) return false;
     if (try appendBestGgufFile(allocator, to_download, files, quant_filter)) {
-        _ = try appendBestGgufProjectorFile(allocator, to_download, files);
+        _ = try appendSelectedGgufProjectorFile(allocator, to_download, files, projector_selection);
         return true;
     }
     return false;
@@ -408,6 +427,39 @@ fn appendBestGgufProjectorFile(
         }
     }
 
+    return false;
+}
+
+fn appendSelectedGgufProjectorFile(
+    allocator: std.mem.Allocator,
+    to_download: *std.ArrayListUnmanaged(HubFile),
+    files: []const HubFile,
+    selection: ProjectorSelection,
+) !bool {
+    return switch (selection) {
+        .auto => appendBestGgufProjectorFile(allocator, to_download, files),
+        .none => false,
+        .match => |value| appendMatchingGgufProjectorFile(allocator, to_download, files, value),
+    };
+}
+
+fn appendMatchingGgufProjectorFile(
+    allocator: std.mem.Allocator,
+    to_download: *std.ArrayListUnmanaged(HubFile),
+    files: []const HubFile,
+    selector: []const u8,
+) !bool {
+    for (files) |f| {
+        if (!isGgufProjectorFile(f.name)) continue;
+        const base = basename(f.name);
+        if (std.mem.eql(u8, f.name, selector) or
+            std.mem.eql(u8, base, selector) or
+            ggufQuantSuffixMatches(f.name, selector))
+        {
+            try to_download.append(allocator, f);
+            return true;
+        }
+    }
     return false;
 }
 
@@ -805,6 +857,7 @@ pub fn downloadModel(
     variant: []const u8,
     dest_dir: []const u8,
     config: HubConfig,
+    projector_selection: ProjectorSelection,
     progress: ProgressSink,
 ) !void {
     // Create destination directory (pure Zig, cross-platform)
@@ -825,7 +878,10 @@ pub fn downloadModel(
     defer to_download.deinit(allocator);
     var synthetic_metadata: SyntheticMetadataPlan = .none;
 
-    const want_mmproj = std.mem.eql(u8, variant, "mmproj") or std.mem.eql(u8, variant, "projector");
+    const want_mmproj = std.mem.eql(u8, variant, "mmproj") or
+        std.mem.eql(u8, variant, "projector") or
+        std.mem.startsWith(u8, variant, "mmproj:") or
+        std.mem.startsWith(u8, variant, "projector:");
 
     // Always-download files (config, tokenizer, etc.) unless explicitly only
     // fetching the external multimodal projector.
@@ -858,14 +914,20 @@ pub fn downloadModel(
             variant["gguf:".len..]
         else
             null;
-        if (try appendBestRequestedGgufPayload(allocator, &to_download, files, quant_filter)) {
+        if (try appendBestRequestedGgufPayload(allocator, &to_download, files, quant_filter, projector_selection)) {
             found_model_payload = true;
         }
     }
 
     // External multimodal projector only.
     if (want_mmproj) {
-        if (try appendBestGgufProjectorFile(allocator, &to_download, files))
+        const mmproj_selection: ProjectorSelection = if (std.mem.startsWith(u8, variant, "mmproj:"))
+            .{ .match = variant["mmproj:".len..] }
+        else if (std.mem.startsWith(u8, variant, "projector:"))
+            .{ .match = variant["projector:".len..] }
+        else
+            projector_selection;
+        if (try appendSelectedGgufProjectorFile(allocator, &to_download, files, mmproj_selection))
             found_model_payload = true;
     }
 
@@ -1449,7 +1511,7 @@ test "gguf clipclap partial pair does not fall back to generic single file" {
     var to_download = std.ArrayListUnmanaged(HubFile).empty;
     defer to_download.deinit(allocator);
 
-    try std.testing.expect(!try appendBestRequestedGgufPayload(allocator, &to_download, &files, "Q4_K"));
+    try std.testing.expect(!try appendBestRequestedGgufPayload(allocator, &to_download, &files, "Q4_K", .auto));
     try std.testing.expectEqual(@as(usize, 0), to_download.items.len);
 }
 
@@ -1469,6 +1531,42 @@ test "projector-only selection finds mmproj gguf" {
 
     try std.testing.expectEqual(@as(usize, 1), to_download.items.len);
     try std.testing.expectEqualStrings("mmproj-gemma-4-e2b-it-f16.gguf", to_download.items[0].name);
+}
+
+test "gguf selection honors requested projector suffix" {
+    const allocator = std.testing.allocator;
+
+    const files = [_]HubFile{
+        .{ .name = "gemma-4-E4B-it-Q4_K_M.gguf" },
+        .{ .name = "mmproj-gemma-4-E4B-it-bf16.gguf" },
+        .{ .name = "mmproj-gemma-4-E4B-it-Q8_0.gguf" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    try std.testing.expect(try appendBestRequestedGgufPayload(allocator, &to_download, &files, "Q4_K_M", .{ .match = "Q8_0" }));
+
+    try std.testing.expectEqual(@as(usize, 2), to_download.items.len);
+    try std.testing.expectEqualStrings("gemma-4-E4B-it-Q4_K_M.gguf", to_download.items[0].name);
+    try std.testing.expectEqualStrings("mmproj-gemma-4-E4B-it-Q8_0.gguf", to_download.items[1].name);
+}
+
+test "gguf selection can skip projector sidecar" {
+    const allocator = std.testing.allocator;
+
+    const files = [_]HubFile{
+        .{ .name = "gemma-4-E4B-it-Q4_K_M.gguf" },
+        .{ .name = "mmproj-gemma-4-E4B-it-bf16.gguf" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    try std.testing.expect(try appendBestRequestedGgufPayload(allocator, &to_download, &files, "Q4_K_M", .none));
+
+    try std.testing.expectEqual(@as(usize, 1), to_download.items.len);
+    try std.testing.expectEqualStrings("gemma-4-E4B-it-Q4_K_M.gguf", to_download.items[0].name);
 }
 
 test "safetensors selection prefers model index and matching shards" {

@@ -44,6 +44,7 @@ const runtime_status_refresh_max_db_opens_per_run: usize = 16;
 const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_s;
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
 const provisioned_startup_catch_up_interval_ms: u64 = std.time.ms_per_s;
+const metrics_lsm_maintenance_snapshot_ttl_ns: u64 = 60 * std.time.ns_per_s;
 const data_raft_batch_leader_wait_ns: u64 = 25 * std.time.ns_per_s;
 const data_raft_batch_leader_retry_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const data_raft_metadata_resync_interval_ns: u64 = 500 * std.time.ns_per_ms;
@@ -322,6 +323,19 @@ const RaftTableApplyStateMachine = struct {
 /// remote metadata API.
 pub const HealthSource = struct {
     data_server: *DataServer,
+    lsm_maintenance_metrics_mutex: std.atomic.Mutex = .unlocked,
+    lsm_maintenance_metrics_stats: lsm_backend_mod.Backend.MaintenanceStats = .{},
+    lsm_maintenance_metrics_built_at_ns: u64 = 0,
+    lsm_maintenance_metrics_last_refresh_duration_ns: u64 = 0,
+    lsm_maintenance_metrics_refreshes: u64 = 0,
+    lsm_maintenance_metrics_refreshing: bool = false,
+
+    const CachedLsmMaintenanceStats = struct {
+        stats: lsm_backend_mod.Backend.MaintenanceStats,
+        age_ns: u64,
+        last_refresh_duration_ns: u64,
+        refreshes: u64,
+    };
 
     pub fn readiness(self: *HealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
@@ -466,13 +480,62 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_bulk_deferred_total", "counter", "Data server LSM maintenance background wake cycles deferred behind active bulk ingest", self.data_server.lsm_maintenance_bulk_deferred.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_lock_deferred_total", "counter", "Data server LSM maintenance background wake cycles deferred behind foreground locks", self.data_server.lsm_maintenance_lock_deferred.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_next_eligible_ns", "gauge", "Monotonic timestamp when background LSM maintenance can next run", self.data_server.lsm_maintenance_next_eligible_ns.load(.monotonic));
-        try writeLsmMaintenanceMetrics(writer, self.data_server.write_source.lsmMaintenanceStatsBestEffort());
+        const lsm_maintenance_stats = self.cachedLsmMaintenanceStats();
+        try writeLsmMaintenanceSnapshotMetrics(writer, lsm_maintenance_stats);
+        try writeLsmMaintenanceMetrics(writer, lsm_maintenance_stats.stats);
         try writeLsmWriteMetrics(writer, self.data_server.write_source.lsmWriteStatsBestEffort());
         try writeTextMergeMetrics(writer, self.data_server.write_source.textMergeStatsBestEffort());
         try writeAsyncIndexingMetrics(writer, self.data_server.write_source.asyncIndexingStatsBestEffort());
         try antfly.db.query_metrics.writePrometheus(writer);
     }
+
+    fn cachedLsmMaintenanceStats(self: *HealthSource) CachedLsmMaintenanceStats {
+        const now_ns: u64 = @intCast(platform_time.monotonicNs());
+        var should_refresh = false;
+        lockAtomic(&self.lsm_maintenance_metrics_mutex);
+        if ((self.lsm_maintenance_metrics_built_at_ns == 0 or ageSinceNs(now_ns, self.lsm_maintenance_metrics_built_at_ns) >= metrics_lsm_maintenance_snapshot_ttl_ns) and !self.lsm_maintenance_metrics_refreshing) {
+            self.lsm_maintenance_metrics_refreshing = true;
+            should_refresh = true;
+        }
+        const cached = self.lsmMaintenanceStatsSnapshotLocked(now_ns);
+        self.lsm_maintenance_metrics_mutex.unlock();
+        if (!should_refresh) return cached;
+
+        const refresh_started_ns: u64 = @intCast(platform_time.monotonicNs());
+        const refreshed_stats = self.data_server.write_source.lsmMaintenanceStatsBestEffort();
+        const refresh_finished_ns: u64 = @intCast(platform_time.monotonicNs());
+
+        lockAtomic(&self.lsm_maintenance_metrics_mutex);
+        self.lsm_maintenance_metrics_stats = refreshed_stats;
+        self.lsm_maintenance_metrics_built_at_ns = refresh_finished_ns;
+        self.lsm_maintenance_metrics_last_refresh_duration_ns = refresh_finished_ns - refresh_started_ns;
+        self.lsm_maintenance_metrics_refreshes += 1;
+        self.lsm_maintenance_metrics_refreshing = false;
+        const refreshed = self.lsmMaintenanceStatsSnapshotLocked(refresh_finished_ns);
+        self.lsm_maintenance_metrics_mutex.unlock();
+        return refreshed;
+    }
+
+    fn lsmMaintenanceStatsSnapshotLocked(self: *const HealthSource, now_ns: u64) CachedLsmMaintenanceStats {
+        return .{
+            .stats = self.lsm_maintenance_metrics_stats,
+            .age_ns = ageSinceNs(now_ns, self.lsm_maintenance_metrics_built_at_ns),
+            .last_refresh_duration_ns = self.lsm_maintenance_metrics_last_refresh_duration_ns,
+            .refreshes = self.lsm_maintenance_metrics_refreshes,
+        };
+    }
 };
+
+fn ageSinceNs(now_ns: u64, built_at_ns: u64) u64 {
+    if (built_at_ns == 0 or now_ns < built_at_ns) return 0;
+    return now_ns - built_at_ns;
+}
+
+fn writeLsmMaintenanceSnapshotMetrics(writer: *std.Io.Writer, snapshot: HealthSource.CachedLsmMaintenanceStats) !void {
+    try health_metrics.appendPromMetric(writer, "antfly_metrics_lsm_snapshot_age_seconds", "gauge", "Age of the cached LSM maintenance metrics snapshot", snapshot.age_ns / std.time.ns_per_s);
+    try health_metrics.appendPromMetric(writer, "antfly_metrics_lsm_snapshot_refreshes_total", "counter", "Cached LSM maintenance metrics snapshot refreshes completed", snapshot.refreshes);
+    try health_metrics.appendPromMetric(writer, "antfly_metrics_lsm_snapshot_last_refresh_duration_ns", "gauge", "Duration of the most recent LSM maintenance metrics snapshot refresh in monotonic nanoseconds", snapshot.last_refresh_duration_ns);
+}
 
 fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.MaintenanceStats) !void {
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_entries", "gauge", "Cached write LSM active mutable memtable entries", stats.mutable_entries);
@@ -12987,6 +13050,9 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_provisioned_read_cache_misses_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_provisioned_write_cache_hits_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_provisioned_write_cache_misses_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_metrics_lsm_snapshot_age_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_metrics_lsm_snapshot_refreshes_total 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_metrics_lsm_snapshot_last_refresh_duration_ns") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_mutable_bytes 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_immutable_memtables 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_immutable_bytes 0") != null);

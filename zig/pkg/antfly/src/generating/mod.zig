@@ -25,6 +25,7 @@ const common_secrets = @import("../common/secrets.zig");
 pub const Role = lib.Role;
 pub const ContentPart = lib.ContentPart;
 pub const ChatMessageContent = lib.ChatMessageContent;
+pub const ToolCall = lib.ToolCall;
 pub const ChatMessage = lib.ChatMessage;
 pub const GenerateResult = lib.GenerateResult;
 pub const Provider = lib.Provider;
@@ -190,6 +191,7 @@ const BackendState = struct {
                         try provider.setAuthorizationHeader(auth_header);
                     }
                 }
+                provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .remote_antfly => |*provider| blk: {
@@ -199,6 +201,7 @@ const BackendState = struct {
                         try provider.setAuthorizationHeader(auth_header);
                     }
                 }
+                provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .vertex => |*provider| try provider.generator().generate(alloc, model, messages),
@@ -231,10 +234,25 @@ const BackendState = struct {
 
         return .{
             .content = try alloc.dupe(u8, result.content),
+            .tool_calls = try cloneToolCalls(alloc, result.tool_calls),
             .allocator = alloc,
         };
     }
 };
+
+fn cloneToolCalls(alloc: std.mem.Allocator, calls: []const inference.types.ToolCall) ![]lib.ToolCall {
+    if (calls.len == 0) return &.{};
+    const out = try alloc.alloc(lib.ToolCall, calls.len);
+    errdefer alloc.free(out);
+    for (calls, 0..) |call, i| {
+        out[i] = .{
+            .id = try alloc.dupe(u8, call.id),
+            .name = try alloc.dupe(u8, call.name),
+            .arguments = try alloc.dupe(u8, call.arguments),
+        };
+    }
+    return out;
+}
 
 fn optionalBearerAuthHeaderOwned(
     state: *BackendState,

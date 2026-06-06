@@ -229,6 +229,7 @@ pub const ModelRegistry = struct {
         token: ?[]const u8,
         tasks_csv: ?[]const u8,
         capabilities_csv: ?[]const u8,
+        projector_selection: download.ProjectorSelection,
     ) !void {
         const ref = try ModelRef.parse(ref_str);
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
@@ -241,7 +242,7 @@ pub const ModelRegistry = struct {
         var progress = ProgressPrinter{};
         try download.downloadModel(self.allocator, io, ref.owner, ref.name, ref.variant, dest, .{
             .token = token,
-        }, .{
+        }, projector_selection, .{
             .callback = ProgressPrinter.onProgress,
             .context = &progress,
         });
@@ -630,8 +631,33 @@ fn appendCsvTasks(
 ) !void {
     var it = std.mem.tokenizeScalar(u8, csv, ',');
     while (it.next()) |raw_task| {
-        try appendUniqueOwnedString(allocator, tasks, raw_task);
+        try appendUniqueOwnedString(allocator, tasks, normalizeTaskHint(raw_task));
     }
+}
+
+fn normalizeTaskHint(raw_task: []const u8) []const u8 {
+    return if (std.mem.eql(u8, raw_task, "embedders"))
+        "embed"
+    else if (std.mem.eql(u8, raw_task, "rerankers"))
+        "rerank"
+    else if (std.mem.eql(u8, raw_task, "chunkers"))
+        "chunk"
+    else if (std.mem.eql(u8, raw_task, "generators"))
+        "generate"
+    else if (std.mem.eql(u8, raw_task, "recognizers"))
+        "recognize"
+    else if (std.mem.eql(u8, raw_task, "classifiers"))
+        "classify"
+    else if (std.mem.eql(u8, raw_task, "rewriters"))
+        "rewrite"
+    else if (std.mem.eql(u8, raw_task, "readers"))
+        "read"
+    else if (std.mem.eql(u8, raw_task, "transcribers"))
+        "transcribe"
+    else if (std.mem.eql(u8, raw_task, "extractors"))
+        "extract"
+    else
+        raw_task;
 }
 
 fn appendCsvCapabilities(
@@ -648,9 +674,10 @@ fn appendCsvCapabilities(
 fn appendInferredInputs(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
+    effective_type: manifest_mod.ModelType,
     inputs: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    if (manifest.inputs.len > 0) {
+    if (manifest.inputs.len > 0 and effective_type == manifest.model_type) {
         for (manifest.inputs) |input| try appendUniqueOwnedString(allocator, inputs, input);
         return;
     }
@@ -660,7 +687,7 @@ fn appendInferredInputs(
         manifest.gguf_projector_path != null;
     const has_audio = manifest.audio_model_path != null or manifest.audio_projection_path != null;
 
-    switch (manifest.model_type) {
+    switch (effective_type) {
         .embedder => {
             try appendUniqueOwnedString(allocator, inputs, "text");
             if (has_visual) try appendUniqueOwnedString(allocator, inputs, "image");
@@ -668,10 +695,10 @@ fn appendInferredInputs(
         },
         .chunker, .reranker, .generator, .recognizer, .classifier, .rewriter => {
             try appendUniqueOwnedString(allocator, inputs, "text");
-            if (manifest.model_type == .generator and has_visual) {
+            if (effective_type == .generator and has_visual) {
                 try appendUniqueOwnedString(allocator, inputs, "image");
             }
-            if (manifest.model_type == .generator and has_audio) {
+            if (effective_type == .generator and has_audio) {
                 try appendUniqueOwnedString(allocator, inputs, "audio");
             }
         },
@@ -724,31 +751,32 @@ fn appendJsonStringArray(
 
 fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.ModelType) manifest_mod.ModelType {
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "recognize") or std.mem.eql(u8, task, "extract")) return .recognizer;
+        if (std.mem.eql(u8, task, "recognize") or std.mem.eql(u8, task, "recognizers") or
+            std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .recognizer;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "classify")) return .classifier;
+        if (std.mem.eql(u8, task, "classify") or std.mem.eql(u8, task, "classifiers")) return .classifier;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "rerank")) return .reranker;
+        if (std.mem.eql(u8, task, "rerank") or std.mem.eql(u8, task, "rerankers")) return .reranker;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "read")) return .reader;
+        if (std.mem.eql(u8, task, "read") or std.mem.eql(u8, task, "readers")) return .reader;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "transcribe")) return .transcriber;
+        if (std.mem.eql(u8, task, "transcribe") or std.mem.eql(u8, task, "transcribers")) return .transcriber;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "rewrite")) return .rewriter;
+        if (std.mem.eql(u8, task, "rewrite") or std.mem.eql(u8, task, "rewriters")) return .rewriter;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "chunk")) return .chunker;
+        if (std.mem.eql(u8, task, "chunk") or std.mem.eql(u8, task, "chunkers")) return .chunker;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "generate")) return .generator;
+        if (std.mem.eql(u8, task, "generate") or std.mem.eql(u8, task, "generators")) return .generator;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "embed")) return .embedder;
+        if (std.mem.eql(u8, task, "embed") or std.mem.eql(u8, task, "embedders")) return .embedder;
     }
     return fallback;
 }
@@ -775,12 +803,14 @@ fn synthesizePulledModelManifestJson(
         try appendManifestTasks(allocator, &manifest, &tasks);
     }
 
+    const manifest_type = manifestTypeFromTasks(tasks.items, manifest.model_type);
+
     var inputs = std.ArrayListUnmanaged([]const u8).empty;
     defer {
         for (inputs.items) |input| allocator.free(input);
         inputs.deinit(allocator);
     }
-    try appendInferredInputs(allocator, &manifest, &inputs);
+    try appendInferredInputs(allocator, &manifest, manifest_type, &inputs);
 
     var capabilities = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -790,7 +820,6 @@ fn synthesizePulledModelManifestJson(
     try appendInferredCapabilities(allocator, io, &manifest, dest_dir, tasks.items, &capabilities);
     if (capabilities_csv) |csv| try appendCsvCapabilities(allocator, &capabilities, csv);
 
-    const manifest_type = manifestTypeFromTasks(tasks.items, manifest.model_type);
     const sparse_3d_output_layout = inferredSparse3DOutputLayout(allocator, io, &manifest, dest_dir, tasks.items);
 
     var body = std.ArrayListUnmanaged(u8).empty;
@@ -951,6 +980,31 @@ test "synthesized pulled manifest marks splade embedders as sparse" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"embed\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\":[\"sparse\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"sparse_3d_output_layout\":\"batch_seq\"") != null);
+}
+
+test "synthesized pulled manifest accepts plural task directory hints" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/florence-reader");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/florence-reader/config.json",
+        .data = "{\"model_type\":\"florence2\"}",
+    });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/florence-reader" });
+    defer allocator.free(model_dir);
+
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, io, model_dir, "readers", null);
+    defer allocator.free(manifest_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"reader\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"read\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"image\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\"") == null);
 }
 
 test "synthesized pulled manifest preserves explicit sparse capability" {
