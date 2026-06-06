@@ -2002,6 +2002,7 @@ fn antflyTypeName(value: runtime_schema_mod.AntflyType) []const u8 {
         .html => "html",
         .search_as_you_type => "search_as_you_type",
         .json => "json",
+        .array => "array",
     };
 }
 
