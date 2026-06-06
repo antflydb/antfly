@@ -128,7 +128,7 @@ The durable write path should look closer to Lucene/Tantivy/Pebble:
 
 Current status:
 
-- `zig build lsm-write-bench` exists and emits JSONL for sorted load, random load, overwrite, and delete workloads.
+- `zig build lsm-write-bench` exists and emits JSONL for sorted load, random load, focused random-ingest-plus-compaction-drain, overwrite, and delete workloads.
 - `zig build lsm-write-bench-compare` compares median timings and write-amplification counters by scenario/workload.
 - `zig build text-segment-write-bench` exists for full-text segment build, on-disk publish, merge, and force-merge mechanics outside the DB catalog.
 - `zig build hbc-write-bench` exists for empty bulk build vs default online HBC batches vs online batches with absent-id hints vs experimental coalesced leaf writes, with storage write counters and `HBCIndex.WriteProfile`.
@@ -143,6 +143,7 @@ Current status:
 - Runtime `.bulk_ingest` commits now direct-ingest the transaction state when the batch reaches the effective bulk threshold and there is no older mutable state that would shadow newer runs. Smaller bulk batches still accumulate in mutable state under the elevated threshold.
 - `lsm-write-bench` routes sorted `.bulk_ingest` loads through sorted-run ingestion. On the 100k native smoke run, default sorted load wrote 23 table files, 24 manifests, performed 3 compactions, and issued 670 range reads; sorted bulk ingest wrote 1 table file, 1 manifest, performed 0 compactions, and issued 0 reads.
 - `lsm-write-bench` wraps random `.bulk_ingest` loads in an outer no-compaction session. On the 100k native smoke run, random bulk ingest wrote 20 table files and 1 manifest, performed 0 flushes/compactions, and issued 0 reads; before the outer publish window it still wrote a manifest per 5k replay batch, and before no-compaction finish it also compacted across batches at session close.
+- `lsm-write-bench --workload-set ingest_compact` measures random ingest plus a full maintenance drain as one timed region, which keeps shape and policy experiments out of end-to-end benchmark harnesses until they have isolated storage evidence.
 - HBC replay now enables the existing grouped leaf-write path for bulk batches whose vector IDs are known-new and defers quantized rebuilds to the end of each HBC write batch. This is not the final mutation-batch design, but it moves the coalescing path out of benchmark-only status.
 - HBC grouped mutation batching now handles no-split leaf groups with two or more inserts, writes changed leaf ranges during mutation, batch-refreshes unique ancestor range chains after split candidates settle, and defers bounded overflow leaf splits until the batch-end split-candidate phase. The split phase recursively requeues left/right leaves until they fit under `leaf_size`. Very large routed groups still fall back to the existing online path until the recursive split budget is proven under larger replay workloads.
 - `HBCIndex.WriteProfile` and `hbc-write-bench` now expose grouped-path guardrail counters: grouped leaf groups, grouped items, fallback items, split candidates, recursive splits, leaf range writes, ancestor range refreshes/nodes, grouped node body writes, and vec-leaf mapping writes.
