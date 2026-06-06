@@ -4714,11 +4714,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("bench/storage/lsm_write_bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        .link_libc = true,
     });
     const lsm_write_bench_root_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lsm_write_bench_root.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        .link_libc = true,
     });
     lsm_write_bench_root_mod.addImport("bloom", bloom_mod);
     lsm_write_bench_root_mod.addImport("antfly_platform", platform_mod);
