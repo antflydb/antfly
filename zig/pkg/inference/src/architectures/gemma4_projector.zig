@@ -29,6 +29,7 @@ const CT = ops.CT;
 
 const default_spatial_merge_size: usize = 3;
 const default_max_image_tokens: usize = 280;
+const default_max_direct_audio_tokens: usize = 16_384;
 
 pub const ProjectedImages = struct {
     allocator: std.mem.Allocator,
@@ -60,6 +61,7 @@ const Config = struct {
     intermediate_size: usize,
     block_count: usize,
     head_count: usize,
+    direct_unified: bool = false,
     image_size: usize,
     patch_size: usize,
     layer_norm_eps: f32,
@@ -81,6 +83,9 @@ const AudioConfig = struct {
     intermediate_size: usize,
     block_count: usize,
     head_count: usize,
+    direct_unified: bool = false,
+    raw_samples_per_token: usize = 640,
+    max_direct_audio_tokens: usize = default_max_direct_audio_tokens,
     mel_bins: usize,
     layer_norm_eps: f32,
     conv_channels0: usize = 128,
@@ -144,8 +149,8 @@ pub fn isSupportedImageProjectorFile(file: *const gguf_format.File) bool {
 
 /// Run Gemma 4's external GGUF vision projector.
 ///
-/// This supports the `gemma4v` image projector path. Gemma 4 audio projectors use
-/// separate `a.*` tensors and are intentionally not routed through this function.
+/// This supports the `gemma4v` image projector path and the `gemma4uv`
+/// combined image/audio projector metadata used by Gemma 4 12B.
 pub fn encodeProjectedImages(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -243,6 +248,10 @@ fn encodeSingleAudio(
     cfg: AudioConfig,
     audio_bytes: []const u8,
 ) !EncodedAudio {
+    if (cfg.direct_unified) {
+        return encodeUnifiedDirectAudio(cb, allocator, store, cfg, audio_bytes);
+    }
+
     var features = try prepareGemma4AudioFeatures(allocator, audio_bytes, cfg.mel_bins);
     defer features.deinit();
 
@@ -289,6 +298,67 @@ fn encodeSingleAudio(
         .embeddings = embeddings,
         .tokens = valid_count,
     };
+}
+
+fn encodeUnifiedDirectAudio(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    store: *tensor_store_mod.GgufStore,
+    cfg: AudioConfig,
+    audio_bytes: []const u8,
+) !EncodedAudio {
+    const frames = try prepareGemma4RawAudioFrames(allocator, audio_bytes, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens);
+    defer allocator.free(frames);
+    const token_count = frames.len / cfg.raw_samples_per_token;
+    if (token_count == 0) {
+        return .{
+            .embeddings = try allocator.alloc(f32, 0),
+            .tokens = 0,
+        };
+    }
+    const frame_shape = [_]i32{ @intCast(token_count), @intCast(cfg.raw_samples_per_token) };
+    const frame_ct = try cb.fromFloat32Shape(frames, &frame_shape);
+    defer cb.free(frame_ct);
+
+    const normed = try rmsNormNoScaleCt(cb, allocator, frame_ct, token_count, cfg.raw_samples_per_token, cfg.layer_norm_eps);
+    defer cb.free(normed);
+    const projection_w = try loadLinearWeightCt(cb, allocator, store, "mm.a.input_projection.weight", cfg.raw_samples_per_token, cfg.text_hidden);
+    defer cb.free(projection_w);
+    const projected = try cb.linearNoBias(normed, projection_w, token_count, cfg.raw_samples_per_token, cfg.text_hidden);
+    defer cb.free(projected);
+
+    return .{
+        .embeddings = try cb.toFloat32(projected, allocator),
+        .tokens = token_count,
+    };
+}
+
+fn prepareGemma4RawAudioFrames(
+    allocator: std.mem.Allocator,
+    audio_bytes: []const u8,
+    samples_per_token: usize,
+    max_tokens: usize,
+) ![]f32 {
+    if (samples_per_token == 0) return error.InvalidTensorShape;
+    const target_rate: u32 = 16_000;
+    const max_samples = std.math.mul(usize, samples_per_token, max_tokens) catch return error.InvalidTensorShape;
+
+    var decoded = try audio.decode(allocator, audio_bytes, .{});
+    defer decoded.deinit();
+    const resampled = try audio.copyOrResample(allocator, decoded.samples, decoded.sample_rate, target_rate);
+    defer allocator.free(resampled);
+
+    if (resampled.len > max_samples) return error.AudioInputTooLong;
+    const real_samples = resampled.len;
+    const frames = if (real_samples == 0)
+        0
+    else
+        (real_samples + samples_per_token - 1) / samples_per_token;
+    const out_len = std.math.mul(usize, frames, samples_per_token) catch return error.InvalidTensorShape;
+    const out = try allocator.alloc(f32, out_len);
+    @memset(out, 0.0);
+    if (real_samples > 0) @memcpy(out[0..real_samples], resampled[0..real_samples]);
+    return out;
 }
 
 const AudioFeatures = struct {
@@ -491,6 +561,10 @@ fn encodeSingleImage(
     cfg: Config,
     image_bytes: []const u8,
 ) !EncodedImage {
+    if (cfg.direct_unified) {
+        return encodeUnifiedDirectImage(cb, allocator, store, cfg, image_bytes);
+    }
+
     const decoded = try image.decode(allocator, image_bytes);
     defer decoded.deinit(allocator);
 
@@ -548,12 +622,171 @@ fn encodeSingleImage(
     };
 }
 
+fn encodeUnifiedDirectImage(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    store: *tensor_store_mod.GgufStore,
+    cfg: Config,
+    image_bytes: []const u8,
+) !EncodedImage {
+    const decoded = try image.decode(allocator, image_bytes);
+    defer decoded.deinit(allocator);
+
+    const geometry = targetGeometry(cfg, decoded.width, decoded.height);
+    const pixel_values = try image.preprocessDecodedRectScaledWithResample(
+        allocator,
+        decoded,
+        @intCast(geometry.width),
+        @intCast(geometry.height),
+        cfg.image_mean,
+        cfg.image_std,
+        1.0 / 255.0,
+        .bilinear,
+    );
+    defer allocator.free(pixel_values);
+
+    const patches = try extractDirectImagePatches(allocator, pixel_values, cfg, geometry);
+    defer allocator.free(patches);
+    try applyLayerNormFromTensors(allocator, store, patches, geometry.tokenCount(), cfg.patch_size * cfg.patch_size * 3, "v.patch_norm.1", 1e-5);
+
+    const patch_dim = cfg.patch_size * cfg.patch_size * 3;
+    const patch_shape = [_]i32{ @intCast(geometry.tokenCount()), @intCast(patch_dim) };
+    const patch_ct = try cb.fromFloat32Shape(patches, &patch_shape);
+    defer cb.free(patch_ct);
+    const patch_w = try loadLinearWeightCt(cb, allocator, store, "v.patch_embd.weight", patch_dim, cfg.vision_hidden);
+    defer cb.free(patch_w);
+    const patch_projected = try cb.linearNoBias(patch_ct, patch_w, geometry.tokenCount(), patch_dim, cfg.vision_hidden);
+    defer cb.free(patch_projected);
+
+    const hidden = try cb.toFloat32(patch_projected, allocator);
+    defer allocator.free(hidden);
+    try addBiasFromTensor(allocator, store, hidden, geometry.tokenCount(), cfg.vision_hidden, "v.patch_embd.bias");
+    try applyLayerNormFromTensors(allocator, store, hidden, geometry.tokenCount(), cfg.vision_hidden, "v.patch_norm.2", 1e-5);
+    try addPositionEmbeddingsInPlace(allocator, store, cfg, hidden, geometry);
+    try applyLayerNormFromTensors(allocator, store, hidden, geometry.tokenCount(), cfg.vision_hidden, "v.patch_norm.3", 1e-5);
+
+    const hidden_shape = [_]i32{ @intCast(geometry.tokenCount()), @intCast(cfg.vision_hidden) };
+    const hidden_ct = try cb.fromFloat32Shape(hidden, &hidden_shape);
+    defer cb.free(hidden_ct);
+    const normed = try rmsNormNoScaleCt(cb, allocator, hidden_ct, geometry.tokenCount(), cfg.vision_hidden, cfg.layer_norm_eps);
+    defer cb.free(normed);
+    const projection_w = try loadLinearWeightCt(cb, allocator, store, "mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
+    defer cb.free(projection_w);
+    const projected = try cb.linearNoBias(normed, projection_w, geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
+    defer cb.free(projected);
+
+    return .{
+        .embeddings = try cb.toFloat32(projected, allocator),
+        .tokens = geometry.tokenCount(),
+    };
+}
+
+fn extractDirectImagePatches(
+    allocator: std.mem.Allocator,
+    pixel_values: []const f32,
+    cfg: Config,
+    geometry: Geometry,
+) ![]f32 {
+    const patch_dim = cfg.patch_size * cfg.patch_size * 3;
+    const token_count = geometry.tokenCount();
+    if (pixel_values.len != 3 * geometry.height * geometry.width) return error.InvalidPatchEmbeddingShape;
+    if (geometry.grid_x != geometry.pooled_x or geometry.grid_y != geometry.pooled_y) return error.InvalidPatchEmbeddingShape;
+
+    const out = try allocator.alloc(f32, token_count * patch_dim);
+    for (0..geometry.grid_y) |grid_y| {
+        for (0..geometry.grid_x) |grid_x| {
+            const token = grid_y * geometry.grid_x + grid_x;
+            const dst_base = token * patch_dim;
+            var dst: usize = dst_base;
+            for (0..3) |channel| {
+                for (0..cfg.patch_size) |py| {
+                    const src_y = grid_y * cfg.patch_size + py;
+                    const src_row = channel * geometry.height * geometry.width + src_y * geometry.width;
+                    const src_x = grid_x * cfg.patch_size;
+                    @memcpy(out[dst..][0..cfg.patch_size], pixel_values[src_row + src_x ..][0..cfg.patch_size]);
+                    dst += cfg.patch_size;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+fn applyLayerNormFromTensors(
+    allocator: std.mem.Allocator,
+    store: *tensor_store_mod.GgufStore,
+    data: []f32,
+    rows: usize,
+    dim: usize,
+    prefix: []const u8,
+    eps: f32,
+) !void {
+    const weight_name = try std.fmt.allocPrint(allocator, "{s}.weight", .{prefix});
+    defer allocator.free(weight_name);
+    const bias_name = try std.fmt.allocPrint(allocator, "{s}.bias", .{prefix});
+    defer allocator.free(bias_name);
+    var weight = try loadTensorF32(store, weight_name);
+    defer weight.deinit();
+    var bias = try loadTensorF32(store, bias_name);
+    defer bias.deinit();
+    try layerNormRowsInPlace(data, rows, dim, weight.data, bias.data, eps);
+}
+
+fn layerNormRowsInPlace(
+    data: []f32,
+    rows: usize,
+    dim: usize,
+    weight: []const f32,
+    bias: []const f32,
+    eps: f32,
+) !void {
+    if (data.len != rows * dim or weight.len != dim or bias.len != dim) return error.InvalidTensorShape;
+    for (0..rows) |row| {
+        const base = row * dim;
+        var mean: f32 = 0.0;
+        for (0..dim) |i| mean += data[base + i];
+        mean /= @floatFromInt(dim);
+        var variance: f32 = 0.0;
+        for (0..dim) |i| {
+            const delta = data[base + i] - mean;
+            variance += delta * delta;
+        }
+        variance /= @floatFromInt(dim);
+        const inv_std = 1.0 / @sqrt(variance + eps);
+        for (0..dim) |i| {
+            data[base + i] = (data[base + i] - mean) * inv_std * weight[i] + bias[i];
+        }
+    }
+}
+
+fn addBiasFromTensor(
+    allocator: std.mem.Allocator,
+    store: *tensor_store_mod.GgufStore,
+    data: []f32,
+    rows: usize,
+    dim: usize,
+    name: []const u8,
+) !void {
+    _ = allocator;
+    var bias = try loadTensorF32(store, name);
+    defer bias.deinit();
+    if (data.len != rows * dim or bias.data.len != dim) return error.InvalidTensorShape;
+    for (0..rows) |row| {
+        const base = row * dim;
+        for (0..dim) |i| data[base + i] += bias.data[i];
+    }
+}
+
 fn parseConfig(file: *const gguf_format.File) !Config {
     const view = gguf_metadata.View.init(file);
     const arch = view.getString("general.architecture") orelse return error.InvalidGgufProjector;
     if (!std.mem.eql(u8, arch, "clip")) return error.InvalidGgufProjector;
     const projector_type = view.getString("clip.vision.projector_type") orelse return error.InvalidGgufProjector;
-    if (!std.mem.eql(u8, projector_type, "gemma4v")) return error.UnsupportedGgufProjector;
+    if (!projector_format_mod.isGemma4ImageProjectorType(projector_type)) return error.UnsupportedGgufProjector;
+    const block_count: usize = @intCast(view.getU64("clip.vision.block_count") orelse return error.InvalidGgufProjector);
+    const direct_unified = std.mem.eql(u8, projector_type, "gemma4uv") and block_count == 0;
+    const projection_scale_factor: usize = @intCast(view.getU64("clip.vision.projector_scale_factor") orelse default_spatial_merge_size);
+    const metadata_patch_size: usize = @intCast(view.getU64("clip.vision.patch_size") orelse return error.InvalidGgufProjector);
 
     var image_mean = [3]f32{ 0.0, 0.0, 0.0 };
     var image_std = [3]f32{ 1.0, 1.0, 1.0 };
@@ -568,13 +801,15 @@ fn parseConfig(file: *const gguf_format.File) !Config {
         .text_hidden = @intCast(view.getU64("clip.vision.projection_dim") orelse return error.InvalidGgufProjector),
         .vision_hidden = @intCast(view.getU64("clip.vision.embedding_length") orelse return error.InvalidGgufProjector),
         .intermediate_size = @intCast(view.getU64("clip.vision.feed_forward_length") orelse return error.InvalidGgufProjector),
-        .block_count = @intCast(view.getU64("clip.vision.block_count") orelse return error.InvalidGgufProjector),
+        .block_count = block_count,
         .head_count = @intCast(view.getU64("clip.vision.attention.head_count") orelse return error.InvalidGgufProjector),
+        .direct_unified = direct_unified,
         .image_size = @intCast(view.getU64("clip.vision.image_size") orelse return error.InvalidGgufProjector),
-        .patch_size = @intCast(view.getU64("clip.vision.patch_size") orelse return error.InvalidGgufProjector),
+        .patch_size = if (direct_unified) metadata_patch_size * projection_scale_factor else metadata_patch_size,
         .layer_norm_eps = view.getF32("clip.vision.attention.layer_norm_epsilon") orelse 1e-6,
         .image_mean = image_mean,
         .image_std = image_std,
+        .spatial_merge_size = if (direct_unified) 1 else default_spatial_merge_size,
     };
 }
 
@@ -1088,18 +1323,65 @@ fn parseAudioConfig(file: *const gguf_format.File) !AudioConfig {
     const arch = view.getString("general.architecture") orelse return error.InvalidGgufProjector;
     if (!std.mem.eql(u8, arch, "clip")) return error.InvalidGgufProjector;
     const projector_type = view.getString("clip.audio.projector_type") orelse return error.AudioProjectorNotFound;
-    if (!std.mem.eql(u8, projector_type, "gemma4a")) return error.UnsupportedGgufProjector;
+    if (!projector_format_mod.isGemma4AudioProjectorType(projector_type)) return error.UnsupportedGgufProjector;
+    const block_count: usize = @intCast(view.getU64("clip.audio.block_count") orelse return error.InvalidGgufProjector);
+    const direct_unified = std.mem.eql(u8, projector_type, "gemma4ua") or
+        (std.mem.eql(u8, projector_type, "gemma4uv") and block_count == 0);
 
     return .{
         .text_hidden = @intCast(view.getU64("clip.audio.projection_dim") orelse return error.InvalidGgufProjector),
         .audio_hidden = @intCast(view.getU64("clip.audio.embedding_length") orelse return error.InvalidGgufProjector),
         .output_hidden = @intCast(view.getU64("clip.audio.projection_dim") orelse return error.InvalidGgufProjector),
         .intermediate_size = @intCast(view.getU64("clip.audio.feed_forward_length") orelse return error.InvalidGgufProjector),
-        .block_count = @intCast(view.getU64("clip.audio.block_count") orelse return error.InvalidGgufProjector),
+        .block_count = block_count,
         .head_count = @intCast(view.getU64("clip.audio.attention.head_count") orelse return error.InvalidGgufProjector),
+        .direct_unified = direct_unified,
+        .raw_samples_per_token = if (direct_unified) @intCast(view.getU64("clip.audio.samples_per_token") orelse view.getU64("clip.audio.embedding_length") orelse 640) else 640,
+        .max_direct_audio_tokens = @intCast(view.getU64("clip.audio.max_tokens") orelse default_max_direct_audio_tokens),
         .mel_bins = @intCast(view.getU64("clip.audio.num_mel_bins") orelse 128),
         .layer_norm_eps = view.getF32("clip.audio.attention.layer_norm_epsilon") orelse 1e-5,
     };
+}
+
+test "gemma4 unified projector metadata parses image and audio configs" {
+    const allocator = std.testing.allocator;
+    const metadata = [_]gguf_format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+        .{ .key = "clip.vision.projector_type", .value = .{ .string = "gemma4uv" } },
+        .{ .key = "clip.vision.projection_dim", .value = .{ .u32 = 3840 } },
+        .{ .key = "clip.vision.embedding_length", .value = .{ .u32 = 3840 } },
+        .{ .key = "clip.vision.feed_forward_length", .value = .{ .u32 = 0 } },
+        .{ .key = "clip.vision.block_count", .value = .{ .u32 = 0 } },
+        .{ .key = "clip.vision.attention.head_count", .value = .{ .u32 = 0 } },
+        .{ .key = "clip.vision.image_size", .value = .{ .u32 = 224 } },
+        .{ .key = "clip.vision.patch_size", .value = .{ .u32 = 16 } },
+        .{ .key = "clip.vision.attention.layer_norm_epsilon", .value = .{ .f32 = 0.000001 } },
+        .{ .key = "clip.audio.projector_type", .value = .{ .string = "gemma4ua" } },
+        .{ .key = "clip.audio.projection_dim", .value = .{ .u32 = 3840 } },
+        .{ .key = "clip.audio.embedding_length", .value = .{ .u32 = 640 } },
+        .{ .key = "clip.audio.feed_forward_length", .value = .{ .u32 = 0 } },
+        .{ .key = "clip.audio.block_count", .value = .{ .u32 = 0 } },
+        .{ .key = "clip.audio.attention.head_count", .value = .{ .u32 = 0 } },
+        .{ .key = "clip.audio.num_mel_bins", .value = .{ .u32 = 128 } },
+        .{ .key = "clip.audio.attention.layer_norm_epsilon", .value = .{ .f32 = 0.000001 } },
+    };
+    var layout = try @import("../gguf/writer.zig").buildLayout(allocator, &metadata, &.{});
+    defer layout.deinit(allocator);
+    var parsed = try gguf_format.parse(allocator, layout.header_bytes);
+    defer parsed.deinit(allocator);
+
+    const image_cfg = try parseConfig(&parsed);
+    try std.testing.expectEqual(@as(usize, 3840), image_cfg.text_hidden);
+    try std.testing.expectEqual(@as(usize, 3840), image_cfg.vision_hidden);
+    try std.testing.expectEqual(@as(usize, 224), image_cfg.image_size);
+    try std.testing.expectEqual(@as(usize, 48), image_cfg.patch_size);
+    try std.testing.expect(image_cfg.direct_unified);
+
+    const audio_cfg = try parseAudioConfig(&parsed);
+    try std.testing.expectEqual(@as(usize, 3840), audio_cfg.text_hidden);
+    try std.testing.expectEqual(@as(usize, 640), audio_cfg.audio_hidden);
+    try std.testing.expectEqual(@as(usize, 640), audio_cfg.raw_samples_per_token);
+    try std.testing.expect(audio_cfg.direct_unified);
 }
 
 fn metadataF32Triple(view: gguf_metadata.View, key: []const u8) ?[3]f32 {
@@ -1241,9 +1523,31 @@ fn addPositionEmbeddings(
     patch_embeddings: []const f32,
     geometry: Geometry,
 ) ![]f32 {
+    const patch_count = geometry.grid_x * geometry.grid_y;
+    const out = try allocator.alloc(f32, patch_count * cfg.vision_hidden);
+    @memcpy(out, patch_embeddings);
+    errdefer allocator.free(out);
+    try addPositionEmbeddingsInPlace(allocator, store, cfg, out, geometry);
+    return out;
+}
+
+fn addPositionEmbeddingsInPlace(
+    allocator: std.mem.Allocator,
+    store: *tensor_store_mod.GgufStore,
+    cfg: Config,
+    patch_embeddings: []f32,
+    geometry: Geometry,
+) !void {
+    _ = allocator;
     var pos = try loadTensorF32(store, "v.position_embd.weight");
     defer pos.deinit();
-    if (pos.shape.len != 3 or pos.shape[0] != 2 or pos.shape[2] != @as(i64, @intCast(cfg.vision_hidden))) {
+    const hidden_first = pos.shape.len == 3 and
+        pos.shape[0] == @as(i64, @intCast(cfg.vision_hidden)) and
+        pos.shape[2] == 2;
+    const axis_first = pos.shape.len == 3 and
+        pos.shape[0] == 2 and
+        pos.shape[2] == @as(i64, @intCast(cfg.vision_hidden));
+    if (!hidden_first and !axis_first) {
         return error.InvalidPositionEmbeddingShape;
     }
     const positions_per_axis: usize = @intCast(pos.shape[1]);
@@ -1252,19 +1556,93 @@ fn addPositionEmbeddings(
     }
 
     const patch_count = geometry.grid_x * geometry.grid_y;
-    const out = try allocator.alloc(f32, patch_count * cfg.vision_hidden);
+    if (patch_embeddings.len != patch_count * cfg.vision_hidden) return error.InvalidPositionEmbeddingShape;
     for (0..geometry.grid_y) |y| {
         for (0..geometry.grid_x) |x| {
             const patch_idx = y * geometry.grid_x + x;
             const dst = patch_idx * cfg.vision_hidden;
-            const y_pos = (0 * positions_per_axis + y) * cfg.vision_hidden;
-            const x_pos = (1 * positions_per_axis + x) * cfg.vision_hidden;
             for (0..cfg.vision_hidden) |h| {
-                out[dst + h] = patch_embeddings[dst + h] + pos.data[y_pos + h] + pos.data[x_pos + h];
+                patch_embeddings[dst + h] += positionEmbeddingValue(pos.data, cfg.vision_hidden, positions_per_axis, 0, x, h, hidden_first) +
+                    positionEmbeddingValue(pos.data, cfg.vision_hidden, positions_per_axis, 1, y, h, hidden_first);
             }
         }
     }
-    return out;
+}
+
+fn positionEmbeddingValue(
+    data: []const f32,
+    hidden: usize,
+    positions_per_axis: usize,
+    axis: usize,
+    position: usize,
+    h: usize,
+    hidden_first: bool,
+) f32 {
+    return if (hidden_first)
+        data[(axis * positions_per_axis + position) * hidden + h]
+    else
+        data[(h * positions_per_axis + position) * 2 + axis];
+}
+
+test "gemma4 position embedding indexes hidden-first and axis-first layouts" {
+    const hidden: usize = 3;
+    const positions: usize = 4;
+    const hidden_first = [_]f32{
+        100, 101, 102, 110, 111, 112, 120, 121, 122, 130, 131, 132,
+        200, 201, 202, 210, 211, 212, 220, 221, 222, 230, 231, 232,
+    };
+    try std.testing.expectEqual(@as(f32, 111), positionEmbeddingValue(&hidden_first, hidden, positions, 0, 1, 1, true));
+    try std.testing.expectEqual(@as(f32, 221), positionEmbeddingValue(&hidden_first, hidden, positions, 1, 2, 1, true));
+
+    const axis_first = [_]f32{
+        100, 200, 110, 210, 120, 220, 130, 230,
+        101, 201, 111, 211, 121, 221, 131, 231,
+        102, 202, 112, 212, 122, 222, 132, 232,
+    };
+    try std.testing.expectEqual(@as(f32, 111), positionEmbeddingValue(&axis_first, hidden, positions, 0, 1, 1, false));
+    try std.testing.expectEqual(@as(f32, 221), positionEmbeddingValue(&axis_first, hidden, positions, 1, 2, 1, false));
+}
+
+test "gemma4 12b real mmproj optional projector smoke" {
+    const platform = @import("antfly_platform");
+    const native_compute = @import("../ops/native_compute.zig");
+    const compat = @import("../io/compat.zig");
+
+    const mmproj_path = platform.env.getenvSlice("ANTFLY_GEMMA4_12B_MMPROJ_PATH") orelse return error.SkipZigTest;
+    const image_path = platform.env.getenvSlice("ANTFLY_GEMMA4_12B_IMAGE_PATH");
+    const audio_path = platform.env.getenvSlice("ANTFLY_GEMMA4_12B_AUDIO_PATH");
+    if (image_path == null and audio_path == null) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var store = try tensor_store_mod.GgufStore.initAbsolute(allocator, mmproj_path);
+    defer store.tensorStore().deinit();
+
+    var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer native_compute.deinitPrefetchQueue(&weight_store);
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    if (image_path) |path| {
+        const image_bytes = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+        defer allocator.free(image_bytes);
+        var projected = try encodeProjectedImagesFromStore(&cb, allocator, store, &.{image_bytes});
+        defer projected.deinit();
+
+        try std.testing.expectEqual(@as(usize, 1), projected.tokens_per_image.len);
+        try std.testing.expect(projected.tokens_per_image[0] > 0);
+        try std.testing.expectEqual(projected.tokens_per_image[0] * projected.hidden_size, projected.embeddings.len);
+    }
+
+    if (audio_path) |path| {
+        const audio_bytes = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(128 * 1024 * 1024));
+        defer allocator.free(audio_bytes);
+        var projected = try encodeProjectedAudioFromStore(&cb, allocator, store, &.{audio_bytes});
+        defer projected.deinit();
+
+        try std.testing.expectEqual(@as(usize, 1), projected.tokens_per_audio.len);
+        try std.testing.expect(projected.tokens_per_audio[0] > 0);
+        try std.testing.expectEqual(projected.tokens_per_audio[0] * projected.hidden_size, projected.embeddings.len);
+    }
 }
 
 fn encoderBlock(

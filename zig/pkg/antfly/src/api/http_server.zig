@@ -3120,6 +3120,7 @@ pub const ApiHttpServer = struct {
                     },
                 ) catch |err| switch (err) {
                     error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
+                    error.EmbeddingProbeUnavailable => return try textResponse(self.alloc, 503, "table index validation probe unavailable"),
                     else => return err,
                 };
                 if (create_req.indexes_json) |old_indexes_json| self.alloc.free(old_indexes_json);
@@ -5144,6 +5145,7 @@ pub const ApiHttpServer = struct {
             },
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             else => return error.InternalFailure,
         };
         defer alloc.free(normalized_index_json);
@@ -5155,6 +5157,7 @@ pub const ApiHttpServer = struct {
             .inference_api_key = self.cfg.inference_api_key,
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             else => return error.InternalFailure,
         };
 
@@ -5179,6 +5182,7 @@ pub const ApiHttpServer = struct {
         if (self.table_writes) |table_writes_source| {
             _ = table_writes_source.createIndex(alloc, table_name, index_name, normalized_index_json) catch |err| switch (err) {
                 error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+                error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
                 else => {
                     std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
                 },

@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,7 +11,6 @@ import (
 	"testing"
 
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
-	inferenceoapi "github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
@@ -133,6 +133,9 @@ func TestCreateEmbeddingIndexUsesAntflyClipClap(t *testing.T) {
 	if cfg.Embedder.Provider != antfly.EmbedderProviderAntfly {
 		t.Fatalf("embedder provider = %q, want %q", cfg.Embedder.Provider, antfly.EmbedderProviderAntfly)
 	}
+	if cfg.Dimension != DefaultEmbeddingDims {
+		t.Fatalf("embedding dimension = %d, want %d", cfg.Dimension, DefaultEmbeddingDims)
+	}
 	if embedder.Model != DefaultEmbeddingModel {
 		t.Fatalf("embedder model = %q, want %q", embedder.Model, DefaultEmbeddingModel)
 	}
@@ -141,9 +144,216 @@ func TestCreateEmbeddingIndexUsesAntflyClipClap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AsAntflyChunkerConfig failed: %v", err)
 	}
+	if cfg.Chunker.Provider != antfly.ChunkerProviderAntfly {
+		t.Fatalf("chunker provider = %q, want %q", cfg.Chunker.Provider, antfly.ChunkerProviderAntfly)
+	}
 	wantChunkerURL := DefaultInferenceURL + "/ai/v1"
 	if chunker.ApiUrl != wantChunkerURL {
 		t.Fatalf("chunker api URL = %q, want %q", chunker.ApiUrl, wantChunkerURL)
+	}
+}
+
+func TestCreateArtifactGraphIndexIncludesProducerConfig(t *testing.T) {
+	idx, err := createArtifactGraphIndex(
+		DefaultAutographIndex,
+		DefaultAutographAsset,
+		"generator",
+		"gemma4-test",
+		DefaultInferenceURL,
+		[]string{"person", "organization"},
+		[]string{"communicated with"},
+	)
+	if err != nil {
+		t.Fatalf("createArtifactGraphIndex failed: %v", err)
+	}
+
+	encoded, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatalf("marshal graph index: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("unmarshal graph index: %v", err)
+	}
+	if got["name"] != DefaultAutographIndex {
+		t.Fatalf("name = %v, want %s", got["name"], DefaultAutographIndex)
+	}
+	source, ok := got["source"].(map[string]any)
+	if !ok {
+		t.Fatalf("source missing from graph index: %s", encoded)
+	}
+	if source["artifact"] != DefaultAutographAsset || source["path"] != "$.relations[*]" {
+		t.Fatalf("unexpected source config: %#v", source)
+	}
+	artifact, ok := got["artifact"].(map[string]any)
+	if !ok {
+		t.Fatalf("artifact missing from graph index: %s", encoded)
+	}
+	producer, ok := artifact["producer_json"].(map[string]any)
+	if !ok {
+		t.Fatalf("producer_json missing from artifact config: %#v", artifact)
+	}
+	cfg, ok := producer["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("producer config missing: %#v", producer)
+	}
+	if cfg["provider"] != "antfly" || cfg["model"] != "gemma4-test" {
+		t.Fatalf("unexpected producer config: %#v", cfg)
+	}
+	if cfg["api_url"] != DefaultInferenceURL+"/ai/v1" {
+		t.Fatalf("api_url = %v, want %s", cfg["api_url"], DefaultInferenceURL+"/ai/v1")
+	}
+	if producer["type"] != "generator" {
+		t.Fatalf("producer type = %v, want generator", producer["type"])
+	}
+	if cfg["tool_output"] != "arguments" || cfg["tool_name"] != "emit_relations" {
+		t.Fatalf("unexpected tool output config: %#v", cfg)
+	}
+	tools, ok := cfg["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools missing from producer config: %#v", cfg)
+	}
+}
+
+func TestCreateArtifactGraphIndexDefaultsToExtractorConfig(t *testing.T) {
+	idx, err := createArtifactGraphIndex(
+		DefaultAutographIndex,
+		DefaultAutographAsset,
+		"",
+		DefaultRecognizerModel,
+		DefaultInferenceURL,
+		[]string{"person", "organization"},
+		[]string{"communicated with"},
+	)
+	if err != nil {
+		t.Fatalf("createArtifactGraphIndex failed: %v", err)
+	}
+
+	encoded, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatalf("marshal graph index: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("unmarshal graph index: %v", err)
+	}
+	artifact := got["artifact"].(map[string]any)
+	producer := artifact["producer_json"].(map[string]any)
+	if producer["type"] != "extractor" {
+		t.Fatalf("producer type = %v, want extractor", producer["type"])
+	}
+	cfg := producer["config"].(map[string]any)
+	if cfg["provider"] != "antfly" || cfg["model"] != DefaultRecognizerModel {
+		t.Fatalf("unexpected extractor config: %#v", cfg)
+	}
+	schema := cfg["schema"].(map[string]any)
+	if len(schema["entities"].([]any)) != 2 || len(schema["relations"].([]any)) != 1 {
+		t.Fatalf("unexpected extractor schema: %#v", schema)
+	}
+	nodes := got["nodes"].(map[string]any)
+	if nodes["target"] != "{{ _item.target.text }}" {
+		t.Fatalf("unexpected extractor node mapping: %#v", nodes)
+	}
+	edge := got["edge"].(map[string]any)
+	if edge["weight"] != "{{ _item.score }}" {
+		t.Fatalf("unexpected extractor edge mapping: %#v", edge)
+	}
+}
+
+func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
+	req := graphVisualizationQuery("Maxwell")
+	fullText, ok := req["full_text_search"].(map[string]any)
+	if !ok || fullText["query"] != "Maxwell" {
+		t.Fatalf("unexpected full-text search: %#v", req["full_text_search"])
+	}
+	graphSearches, ok := req["graph_searches"].(map[string]any)
+	if !ok {
+		t.Fatalf("graph searches missing: %#v", req)
+	}
+	graph, ok := graphSearches["relations"].(map[string]any)
+	if !ok {
+		t.Fatalf("relations graph search missing: %#v", graphSearches)
+	}
+	if graph["type"] != "traverse" {
+		t.Fatalf("graph type = %q, want traverse", graph["type"])
+	}
+	if graph["index_name"] != DefaultAutographIndex {
+		t.Fatalf("graph index = %q, want %s", graph["index_name"], DefaultAutographIndex)
+	}
+	startNodes, ok := graph["start_nodes"].(map[string]any)
+	if !ok || startNodes["result_ref"] != "$full_text_results" || startNodes["limit"] != 8 {
+		t.Fatalf("unexpected start nodes: %#v", graph["start_nodes"])
+	}
+	if graph["include_documents"] != true {
+		t.Fatalf("graph query should include documents")
+	}
+	params, ok := graph["params"].(map[string]any)
+	if !ok || params["direction"] != "both" || params["max_depth"] != 1 {
+		t.Fatalf("unexpected graph params: %#v", graph["params"])
+	}
+}
+
+func TestBuildGraphVisualizationConvertsGraphResults(t *testing.T) {
+	resp := antfly.QueryResponses{
+		Responses: []antfly.QueryResult{
+			{
+				GraphResults: map[string]antfly.GraphQueryResult{
+					"relations": {
+						Type: antfly.GraphQueryTypeTraverse,
+						Nodes: []antfly.GraphResultNode{
+							{
+								Key:   "doc-a",
+								Depth: 0,
+								Document: map[string]any{
+									"title": "Alpha page",
+									"url":   "http://example.test/a.pdf",
+									"metadata": map[string]any{
+										"source_file": "court/source.pdf",
+										"page_number": float64(12),
+									},
+								},
+							},
+							{
+								Key:   "doc-b",
+								Depth: 1,
+								Document: map[string]any{
+									"title": "Beta page",
+								},
+								PathEdges: []antfly.PathEdge{
+									{Source: "doc-a", Target: "doc-b", Type: "mentioned in", Weight: 0.75},
+								},
+							},
+							{
+								Key:      "Jeffrey Epstein",
+								Depth:    1,
+								Distance: 0.5,
+								Path:     []string{"doc-a", "Jeffrey Epstein"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	viz := buildGraphVisualization("Maxwell", &resp)
+	if viz.Query != "Maxwell" {
+		t.Fatalf("query = %q, want Maxwell", viz.Query)
+	}
+	if len(viz.Nodes) != 3 {
+		t.Fatalf("nodes = %d, want 3: %#v", len(viz.Nodes), viz.Nodes)
+	}
+	if viz.Nodes[0].Label != "Alpha page" || viz.Nodes[0].Subtitle != "source.pdf - page 12" {
+		t.Fatalf("unexpected first node: %#v", viz.Nodes[0])
+	}
+	if len(viz.Edges) != 2 {
+		t.Fatalf("edges = %d, want 2: %#v", len(viz.Edges), viz.Edges)
+	}
+	if viz.Edges[0].Source != "doc-a" || viz.Edges[0].Target != "doc-b" || viz.Edges[0].Type != "mentioned in" {
+		t.Fatalf("unexpected edge: %#v", viz.Edges[0])
+	}
+	if viz.Edges[1].Source != "doc-a" || viz.Edges[1].Target != "Jeffrey Epstein" || viz.Edges[1].Type != "related" {
+		t.Fatalf("unexpected path-derived edge: %#v", viz.Edges[1])
 	}
 }
 
@@ -177,7 +387,36 @@ func TestInferenceMLBaseURLRejectsLegacyAPI(t *testing.T) {
 	}
 }
 
-func TestCreateSearchTableIndexesIncludesQueriedIndexes(t *testing.T) {
+func TestParseSyncLevelFlag(t *testing.T) {
+	tests := []struct {
+		in   string
+		want antfly.SyncLevel
+	}{
+		{in: "write", want: antfly.SyncLevelWrite},
+		{in: " full_text ", want: antfly.SyncLevelFullText},
+		{in: "aknn", want: antfly.SyncLevelAknn},
+		{in: "embeddings", want: antfly.SyncLevelAknn},
+		{in: "full_index", want: antfly.SyncLevelFullIndex},
+		{in: "enrichments", want: antfly.SyncLevelEnrichments},
+		{in: "propose", want: antfly.SyncLevelPropose},
+	}
+
+	for _, tt := range tests {
+		got, err := parseSyncLevelFlag(tt.in)
+		if err != nil {
+			t.Fatalf("parseSyncLevelFlag(%q) failed: %v", tt.in, err)
+		}
+		if got != tt.want {
+			t.Fatalf("parseSyncLevelFlag(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+
+	if _, err := parseSyncLevelFlag("later"); err == nil {
+		t.Fatalf("parseSyncLevelFlag accepted invalid value")
+	}
+}
+
+func TestCreateSearchTableIndexesUsesServerDefaultFullText(t *testing.T) {
 	embeddingIndex, err := createEmbeddingIndex(DefaultEmbeddingModel, DefaultInferenceURL, DefaultChunkerModel, 512, 50)
 	if err != nil {
 		t.Fatalf("createEmbeddingIndex failed: %v", err)
@@ -186,13 +425,81 @@ func TestCreateSearchTableIndexesIncludesQueriedIndexes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createSearchTableIndexes failed: %v", err)
 	}
-	for _, name := range searchIndexNames() {
-		if _, ok := indexes[name]; !ok {
-			t.Fatalf("search index %q missing from created table indexes: %#v", name, indexes)
-		}
+	if _, ok := indexes[DefaultEmbeddingIndex]; !ok {
+		t.Fatalf("embedding index missing from created table indexes: %#v", indexes)
 	}
-	if indexes[DefaultFullTextIndex].Type != antfly.IndexTypeFullText {
-		t.Fatalf("full-text index type = %q, want %q", indexes[DefaultFullTextIndex].Type, antfly.IndexTypeFullText)
+	if _, ok := indexes[DefaultFullTextIndex]; ok {
+		t.Fatalf("full-text index should be provided by server default, got explicit config: %#v", indexes[DefaultFullTextIndex])
+	}
+}
+
+func TestStreamJSONPagesNormalizesReservedTypeField(t *testing.T) {
+	input := `{
+  "doc_001": {
+    "_type": "pdf_page",
+    "content": "one",
+    "metadata": {"page_number": 1}
+  },
+  "doc_002": {
+    "_type": "pdf_page",
+    "document_type": "custom_page",
+    "content": "two"
+  }
+}`
+
+	var batches []map[string]any
+	for batch := range streamJSONPages(strings.NewReader(input), 1) {
+		batches = append(batches, batch)
+	}
+	if len(batches) != 2 {
+		t.Fatalf("batch count = %d, want 2", len(batches))
+	}
+
+	first, ok := batches[0]["doc_001"].(map[string]any)
+	if !ok {
+		t.Fatalf("doc_001 has type %T, want map[string]any", batches[0]["doc_001"])
+	}
+	if _, ok := first["_type"]; ok {
+		t.Fatalf("doc_001 still has reserved _type field")
+	}
+	if got := first["document_type"]; got != "pdf_page" {
+		t.Fatalf("doc_001 document_type = %v, want pdf_page", got)
+	}
+	if got := first["content"]; got != "one" {
+		t.Fatalf("doc_001 content = %v, want one", got)
+	}
+
+	second, ok := batches[1]["doc_002"].(map[string]any)
+	if !ok {
+		t.Fatalf("doc_002 has type %T, want map[string]any", batches[1]["doc_002"])
+	}
+	if _, ok := second["_type"]; ok {
+		t.Fatalf("doc_002 still has reserved _type field")
+	}
+	if got := second["document_type"]; got != "custom_page" {
+		t.Fatalf("doc_002 document_type = %v, want custom_page", got)
+	}
+}
+
+func TestStreamJSONPagesWithLimit(t *testing.T) {
+	input := `{
+  "doc_001": {"content": "one"},
+  "doc_002": {"content": "two"},
+  "doc_003": {"content": "three"}
+}`
+
+	var batches []map[string]any
+	for batch := range streamJSONPagesWithLimit(strings.NewReader(input), 2, 1) {
+		batches = append(batches, batch)
+	}
+	if len(batches) != 1 {
+		t.Fatalf("batch count = %d, want 1", len(batches))
+	}
+	if len(batches[0]) != 1 {
+		t.Fatalf("record count = %d, want 1", len(batches[0]))
+	}
+	if _, ok := batches[0]["doc_001"]; !ok {
+		t.Fatalf("limited batch missing first record: %#v", batches[0])
 	}
 }
 
@@ -293,7 +600,7 @@ func TestSplitEntityWindowsRebasesAndOverlaps(t *testing.T) {
 }
 
 func TestOffsetAndDedupeEntities(t *testing.T) {
-	entities := []inferenceoapi.InferenceRecognizeEntity{
+	entities := []recognizedEntity{
 		{Text: "Jane", Label: "person", Start: 2, End: 6, Score: 0.2},
 		{Text: "Jane", Label: "person", Start: 2, End: 6, Score: 0.9},
 	}
@@ -312,9 +619,9 @@ func TestOffsetAndDedupeEntities(t *testing.T) {
 }
 
 func TestDedupeRelationsKeepsHighestScore(t *testing.T) {
-	head := inferenceoapi.InferenceRecognizeEntity{Text: "Jane", Label: "person", Start: 12, End: 16}
-	tail := inferenceoapi.InferenceRecognizeEntity{Text: "Acme", Label: "organization", Start: 25, End: 29}
-	relations := dedupeRelations([]inferenceoapi.InferenceRelation{
+	head := recognizedEntity{Text: "Jane", Label: "person", Start: 12, End: 16}
+	tail := recognizedEntity{Text: "Acme", Label: "organization", Start: 25, End: 29}
+	relations := dedupeRelations([]recognizedRelation{
 		{Head: head, Tail: tail, Label: "worked for", Score: 0.4},
 		{Head: head, Tail: tail, Label: "worked for", Score: 0.8},
 	})

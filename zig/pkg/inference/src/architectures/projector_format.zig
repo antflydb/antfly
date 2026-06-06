@@ -53,17 +53,28 @@ pub fn detectFile(file: *const gguf_format.File) Kind {
 
     const has_image = blk: {
         const projector_type = view.getString("clip.vision.projector_type") orelse break :blk false;
-        break :blk std.mem.eql(u8, projector_type, "gemma4v");
+        break :blk isGemma4ImageProjectorType(projector_type);
     };
     const has_audio = blk: {
         const projector_type = view.getString("clip.audio.projector_type") orelse break :blk false;
-        break :blk std.mem.eql(u8, projector_type, "gemma4a");
+        break :blk isGemma4AudioProjectorType(projector_type);
     };
 
     if (has_image and has_audio) return .clip_gemma4_image_audio;
     if (has_image) return .clip_gemma4_image;
     if (has_audio) return .clip_gemma4_audio;
     return .unknown;
+}
+
+pub fn isGemma4ImageProjectorType(projector_type: []const u8) bool {
+    return std.mem.eql(u8, projector_type, "gemma4v") or
+        std.mem.eql(u8, projector_type, "gemma4uv");
+}
+
+pub fn isGemma4AudioProjectorType(projector_type: []const u8) bool {
+    return std.mem.eql(u8, projector_type, "gemma4a") or
+        std.mem.eql(u8, projector_type, "gemma4ua") or
+        std.mem.eql(u8, projector_type, "gemma4uv");
 }
 
 pub fn isAntfly(kind: Kind) bool {
@@ -109,6 +120,24 @@ test "detect clip gemma4 image projector" {
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = layout.header_bytes });
 
     try std.testing.expectEqual(Kind.clip_gemma4_image, try detectPath(allocator, path));
+}
+
+test "detect clip gemma4 unified image audio projector" {
+    const allocator = std.testing.allocator;
+    const path = try std.fs.path.join(allocator, &.{ "/tmp", "antfly-projector-format-clip-unified.gguf" });
+    defer allocator.free(path);
+    defer compat.cwd().deleteFile(compat.io(), path) catch {};
+
+    const metadata = [_]gguf_mod.format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+        .{ .key = "clip.vision.projector_type", .value = .{ .string = "gemma4uv" } },
+        .{ .key = "clip.audio.projector_type", .value = .{ .string = "gemma4ua" } },
+    };
+    var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
+    defer layout.deinit(allocator);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = layout.header_bytes });
+
+    try std.testing.expectEqual(Kind.clip_gemma4_image_audio, try detectPath(allocator, path));
 }
 
 test "detect unknown projector metadata" {

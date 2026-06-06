@@ -335,6 +335,7 @@ const (
 	GeneratorProviderMock      = oapi.GeneratorProviderMock
 	RerankerProviderAntfly     = oapi.RerankerProviderAntfly
 	RerankerProviderOllama     = oapi.RerankerProviderOllama
+	ChunkerProviderAntfly      = oapi.ChunkerProviderAntfly
 
 	// MergeStrategy values
 	MergeStrategyRrf      = oapi.MergeStrategyRrf
@@ -347,10 +348,12 @@ const (
 	LinearMergePageStatusError   = oapi.LinearMergePageStatusError
 
 	// SyncLevel values
-	SyncLevelPropose  = oapi.SyncLevelPropose
-	SyncLevelWrite    = oapi.SyncLevelWrite
-	SyncLevelFullText = oapi.SyncLevelFullText
-	SyncLevelAknn     = oapi.SyncLevelAknn
+	SyncLevelPropose     = oapi.SyncLevelPropose
+	SyncLevelWrite       = oapi.SyncLevelWrite
+	SyncLevelFullText    = oapi.SyncLevelFullText
+	SyncLevelAknn        = oapi.SyncLevelAknn
+	SyncLevelFullIndex   = oapi.SyncLevelFullIndex
+	SyncLevelEnrichments = oapi.SyncLevelEnrichments
 
 	// RouteType values
 	RouteTypeQuestion = oapi.RouteTypeQuestion

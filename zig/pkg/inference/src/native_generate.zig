@@ -651,6 +651,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var result = pipeline.generate(&messages, config) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
+        } else if (err == error.AudioInputTooLong) {
+            print("error: {s}\n", .{generation.userFacingErrorMessage(err)});
         }
         return err;
     };

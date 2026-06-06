@@ -255,8 +255,10 @@ fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iter
 
 fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const ref = args.next() orelse {
-        std.debug.print("usage: antfly inference pull <model-ref> [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>]\n", .{});
+        std.debug.print("usage: antfly inference pull <model-ref> [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>] [--projector <auto|none|Q8_0|filename>]\n", .{});
         std.debug.print("       antfly inference pull <https-url-to-tabular_model.json> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{});
+        std.debug.print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
+        std.debug.print("CLIP/CLAP v0.2 example: antfly inference pull antflydb/clipclap:gguf:Q4_K\n", .{});
         return;
     };
 
@@ -273,6 +275,7 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var tasks_csv: ?[]const u8 = null;
     var capabilities_csv: ?[]const u8 = null;
+    var projector_selection: inference.registry.download.ProjectorSelection = .auto;
     var i: usize = 1;
     while (i < argv.items.len) : (i += 1) {
         const arg = argv.items[i];
@@ -291,6 +294,10 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         } else if (std.mem.eql(u8, arg, "--capabilities")) {
             i += 1;
             if (i < argv.items.len) capabilities_csv = argv.items[i];
+        } else if (std.mem.eql(u8, arg, "--projector")) {
+            i += 1;
+            const value = if (i < argv.items.len) argv.items[i] else return error.InvalidArguments;
+            projector_selection = inference.registry.download.parseProjectorSelection(value) orelse return error.InvalidArguments;
         }
     }
 
@@ -303,7 +310,7 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
 
     var reg = inference.registry.ModelRegistry.init(alloc, models_dir);
     defer reg.deinit();
-    try reg.pull(io, ref, token, tasks_csv, capabilities_csv);
+    try reg.pull(io, ref, token, tasks_csv, capabilities_csv, projector_selection);
 
     std.debug.print("done.\n", .{});
 }
@@ -384,6 +391,7 @@ fn printUsage() void {
         \\  --name <name>    Local predictor name when pulling a tabular model URL
         \\  --tasks <list>   Comma-separated task hints for the pulled model
         \\  --capabilities <list> Comma-separated capability hints for the pulled model
+        \\  --projector <value> Projector sidecar selection for GGUF pulls: auto, none, quant suffix, or filename
         \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>     Traditional ML directory for URL pulls (default: ~/.antfly/inference/ml)
         \\
