@@ -576,10 +576,21 @@ need stable API and planner semantics over the stored JSON subtree:
 
 Extraction (`->`, `->>`), containment (`@>`), existence, and path predicates
 should compile to a JSON-column expression contract. Patch/update operations
-such as `jsonb_set` must rewrite only the JSON cell, then reproject derived
-full-text/path-fact/algebraic indexes for that subtree from the committed row.
-Changing a JSON column's embedded schema remains a derived-index rebuild, not a
-base-row migration.
+such as `jsonb_set` lower to the row API's typed `json_set` operation:
+`{ "field": "attrs", "path": ["billing", "plan"], "value": "pro" }`. The field
+must be a declared `json` relational column, path segments are structured
+strings rather than SQL text, and the mutation lowers to the same storage
+transform path as ordinary row updates. That rewrites only the JSON cell, then
+reprojects derived full-text/path-fact/algebraic indexes for that subtree from
+the committed row. Changing a JSON column's embedded schema remains a
+derived-index rebuild, not a base-row migration. The remaining query-side work
+is partially represented by a typed `json_filter` query contract. Equality and
+existence filters over a declared JSON path lower to structured filters such as
+`{ "term": { "path": "attrs.billing.plan", "value": "pro" } }` and
+`{ "exists": { "field": "attrs.billing.plan" } }`. Object containment (`@>`)
+is intentionally not lowered to a fake term filter; it still needs a
+planner-visible JSON containment expression plus an index/path-fact execution
+strategy.
 
 #### Checks, defaults, and generated values
 

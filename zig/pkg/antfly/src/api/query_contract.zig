@@ -1787,6 +1787,96 @@ fn parseRowClaimRequestAlloc(
     };
 }
 
+fn mergeJsonFilterQueryJsonAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    filter_query_json: *[]const u8,
+) !void {
+    const json_filter_query_json = try parseJsonFilterQueryJsonAlloc(alloc, body);
+    if (json_filter_query_json.len == 0) return;
+    errdefer alloc.free(json_filter_query_json);
+
+    if (filter_query_json.*.len == 0) {
+        filter_query_json.* = json_filter_query_json;
+        return;
+    }
+
+    const clauses = [_][]const u8{ filter_query_json.*, json_filter_query_json };
+    const combined = try buildStructuredFilterClausesJsonAlloc(alloc, &clauses, .all);
+    alloc.free(@constCast(filter_query_json.*));
+    alloc.free(json_filter_query_json);
+    filter_query_json.* = combined;
+}
+
+fn parseJsonFilterQueryJsonAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const json_filter = parsed.value.object.get("json_filter") orelse return "";
+    if (json_filter != .array or json_filter.array.items.len == 0) return error.InvalidQueryRequest;
+
+    var clauses = std.ArrayListUnmanaged([]u8).empty;
+    errdefer deinitOwnedStringArrayList(alloc, &clauses);
+    for (json_filter.array.items) |item| {
+        const clause = try jsonFilterClauseAlloc(alloc, item);
+        errdefer alloc.free(clause);
+        try clauses.append(alloc, clause);
+    }
+    const out = try buildStructuredFilterClausesJsonAlloc(alloc, clauses.items, .all);
+    deinitOwnedStringArrayList(alloc, &clauses);
+    return out;
+}
+
+fn jsonFilterClauseAlloc(alloc: std.mem.Allocator, item: std.json.Value) ![]u8 {
+    if (item != .object) return error.InvalidQueryRequest;
+    const field_value = item.object.get("field") orelse return error.InvalidQueryRequest;
+    if (field_value != .string or field_value.string.len == 0) return error.InvalidQueryRequest;
+    const path_value = item.object.get("path") orelse return error.InvalidQueryRequest;
+    if (path_value != .array or path_value.array.items.len == 0) return error.InvalidQueryRequest;
+    const full_path = try jsonFilterPathAlloc(alloc, field_value.string, path_value);
+    defer alloc.free(full_path);
+
+    const op_value = item.object.get("op") orelse return error.InvalidQueryRequest;
+    if (op_value != .string) return error.InvalidQueryRequest;
+    if (std.mem.eql(u8, op_value.string, "eq")) {
+        const value = item.object.get("value") orelse return error.InvalidQueryRequest;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.print("{{\"term\":{{\"path\":{f},\"value\":", .{std.json.fmt(full_path, .{})});
+        try std.json.Stringify.value(value, .{}, writer);
+        try writer.writeAll("}}");
+        return try out.toOwnedSlice();
+    }
+    if (std.mem.eql(u8, op_value.string, "exists")) {
+        if (item.object.get("value") != null) return error.InvalidQueryRequest;
+        return try std.fmt.allocPrint(alloc, "{{\"exists\":{{\"field\":{f}}}}}", .{std.json.fmt(full_path, .{})});
+    }
+    return error.UnsupportedQueryRequest;
+}
+
+fn jsonFilterPathAlloc(
+    alloc: std.mem.Allocator,
+    field: []const u8,
+    path_value: std.json.Value,
+) ![]u8 {
+    if (std.mem.indexOfScalar(u8, field, '.') != null) return error.InvalidQueryRequest;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll(field);
+    for (path_value.array.items) |segment| {
+        if (segment != .string or segment.string.len == 0) return error.InvalidQueryRequest;
+        if (std.mem.indexOfScalar(u8, segment.string, '.') != null) return error.InvalidQueryRequest;
+        try writer.writeByte('.');
+        try writer.writeAll(segment.string);
+    }
+    return try out.toOwnedSlice();
+}
+
 fn applySearchRequestFields(
     alloc: std.mem.Allocator,
     generated_fields: ?[]const []const u8,
@@ -1829,10 +1919,12 @@ pub fn parseQueryRequest(
     const has_internal_shard_fields = try queryBodyHasInternalShardFields(alloc, body);
     const has_public_doc_filter_bindings = try queryBodyHasPublicDocFilterBindings(alloc, body);
     const has_row_claim = try queryBodyHasRowClaim(alloc, body);
+    const has_json_filter = try queryBodyHasJsonFilter(alloc, body);
     const contract_body = try queryBodyForGeneratedContractAlloc(alloc, body, .{
         .strip_internal_shard_fields = has_internal_shard_fields,
         .strip_public_doc_filter_bindings = has_public_doc_filter_bindings,
         .strip_row_claim = has_row_claim,
+        .strip_json_filter = has_json_filter,
     });
     defer if (contract_body) |owned| alloc.free(owned);
     const body_for_contract = contract_body orelse body;
@@ -1862,6 +1954,7 @@ pub fn parseQueryRequest(
 
     var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, req.limit);
     errdefer normalized_query.deinit(alloc);
+    try mergeJsonFilterQueryJsonAlloc(alloc, body, &normalized_query.filter_query_json);
 
     if (req.reranker != null) {
         req.reranker_query_text = try buildRerankerQueryText(alloc, request);
@@ -4597,6 +4690,13 @@ fn queryBodyHasRowClaim(alloc: std.mem.Allocator, body: []const u8) !bool {
     return parsed.value.object.get("claim") != null;
 }
 
+fn queryBodyHasJsonFilter(alloc: std.mem.Allocator, body: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    return parsed.value.object.get("json_filter") != null;
+}
+
 fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
@@ -4625,6 +4725,7 @@ const QueryContractStripOptions = struct {
     strip_internal_shard_fields: bool = false,
     strip_public_doc_filter_bindings: bool = false,
     strip_row_claim: bool = false,
+    strip_json_filter: bool = false,
 };
 
 fn queryBodyForGeneratedContractAlloc(
@@ -4632,7 +4733,7 @@ fn queryBodyForGeneratedContractAlloc(
     body: []const u8,
     options: QueryContractStripOptions,
 ) !?[]u8 {
-    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_row_claim) return null;
+    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_row_claim and !options.strip_json_filter) return null;
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
@@ -4643,6 +4744,9 @@ fn queryBodyForGeneratedContractAlloc(
     }
     if (options.strip_row_claim) {
         _ = parsed.value.object.orderedRemove("claim");
+    }
+    if (options.strip_json_filter) {
+        _ = parsed.value.object.orderedRemove("json_filter");
     }
     if (options.strip_internal_shard_fields) {
         removeInternalShardFields(&parsed.value.object);
@@ -5398,6 +5502,28 @@ test "api query contract parses typed row claim request" {
     ));
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "jobs",
         \\{"claim":{"mode":"share","owner_id":"session:1"}}
+    ));
+}
+
+test "api query contract parses typed json filters" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseQueryRequest(alloc, null, "users",
+        \\{"json_filter":[{"field":"attrs","path":["billing","plan"],"op":"eq","value":"pro"},{"field":"attrs","path":["billing","plan"],"op":"exists"}],"limit":5}
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "{\"bool\":{\"must\":[{\"term\":{\"path\":\"attrs.billing.plan\",\"value\":\"pro\"}},{\"exists\":{\"field\":\"attrs.billing.plan\"}}]}}",
+        parsed.req.filter_query_json,
+    );
+    try std.testing.expect(parsed.req.full_text.? == .match_all);
+    try std.testing.expectEqual(@as(u32, 5), parsed.req.limit);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "users",
+        \\{"json_filter":[{"field":"attrs","path":["billing"],"op":"contains","value":{"plan":"pro"}}]}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "users",
+        \\{"json_filter":[{"field":"attrs.bad","path":["billing"],"op":"eq","value":"pro"}]}
     ));
 }
 

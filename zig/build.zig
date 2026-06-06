@@ -3387,6 +3387,7 @@ pub fn build(b: *std.Build) void {
             "metadata.schema update",
             "metadata.query routing",
             "api query contract parses typed row claim request",
+            "api query contract parses typed json filters",
             "derive initial ranges",
             // api/indexes.zig: index status/config encoders and aggregation.
             "index encoders expose",
@@ -3713,6 +3714,7 @@ pub fn build(b: *std.Build) void {
             "relational rows unique selector",
             "relational rows conflict target upsert",
             "relational rows batch returning",
+            "relational rows json_set",
             "api http server resolves relational rows by unique selector",
             "relational unique owner lookup requires one active owner range",
         },
