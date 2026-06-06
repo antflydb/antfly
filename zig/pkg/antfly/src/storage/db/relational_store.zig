@@ -2085,6 +2085,225 @@ pub fn scanColumnAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+pub fn arrayElementIndexKeyForValueAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, value, .{});
+}
+
+pub fn jsonValueIndexKeyForValueAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, value, .{});
+}
+
+pub fn freeDocKeys(alloc: Allocator, doc_keys: [][]u8) void {
+    for (doc_keys) |doc_key| alloc.free(doc_key);
+    alloc.free(doc_keys);
+}
+
+pub fn scanArrayElementDocKeysAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    column_path: []const u8,
+    element_key: []const u8,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) ![][]u8 {
+    const lower_doc_bound = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
+    defer alloc.free(lower_doc_bound);
+    const upper_doc_bound = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
+    defer if (upper_doc_bound) |buf| alloc.free(buf);
+
+    const lower = try internal_keys.relationalArrayElementIndexPrefixAlloc(alloc, column_path, element_key);
+    defer alloc.free(lower);
+    const upper = try nextPrefixAlloc(alloc, lower);
+    defer if (upper) |buf| alloc.free(buf);
+
+    const scanned = try store.scanRange(alloc, lower, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var out = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (out.items) |doc_key| alloc.free(doc_key);
+        out.deinit(alloc);
+    }
+
+    for (scanned) |entry| {
+        var decoded = (try internal_keys.decodeRelationalArrayElementIndexKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!std.mem.eql(u8, decoded.column_path, column_path)) continue;
+        if (!std.mem.eql(u8, decoded.element_key, element_key)) continue;
+        if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
+        if (!try currentRowHasArrayElementKey(alloc, store, decoded.doc_key, column_path, element_key)) continue;
+        try out.append(alloc, try alloc.dupe(u8, decoded.doc_key));
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+fn currentRowHasArrayElementKey(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    column_path: []const u8,
+    element_key: []const u8,
+) !bool {
+    const raw_row = try getRawAlloc(alloc, store, doc_key) orelse return false;
+    defer alloc.free(raw_row);
+    const cell = (try relational_row_codec.findCellByPath(raw_row, column_path)) orelse return false;
+    if (cell.value_type != .bytes_val or !cell.is_json) return false;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return false;
+    for (parsed.value.array.items) |item| {
+        const item_key = try arrayElementIndexKeyForValueAlloc(alloc, item);
+        defer alloc.free(item_key);
+        if (std.mem.eql(u8, item_key, element_key)) return true;
+    }
+    return false;
+}
+
+pub fn jsonContainsHasIndexableLeaf(value: std.json.Value) bool {
+    switch (value) {
+        .null, .bool, .integer, .float, .number_string, .string => return true,
+        .array => |array| {
+            for (array.items) |item| {
+                if (jsonContainsHasIndexableLeaf(item)) return true;
+            }
+            return false;
+        },
+        .object => |object| {
+            for (object.values()) |item| {
+                if (jsonContainsHasIndexableLeaf(item)) return true;
+            }
+            return false;
+        },
+    }
+}
+
+pub fn scanJsonContainmentDocKeysAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    column_path: []const u8,
+    wanted: std.json.Value,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) ![][]u8 {
+    var leaves = std.ArrayListUnmanaged(JsonValueIndexEntry).empty;
+    defer {
+        for (leaves.items) |*entry| entry.deinit(alloc);
+        leaves.deinit(alloc);
+    }
+    try collectJsonValueIndexEntriesAlloc(alloc, "", wanted, &leaves);
+    if (leaves.items.len == 0) return try alloc.alloc([]u8, 0);
+
+    const lower_doc_bound = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
+    defer alloc.free(lower_doc_bound);
+    const upper_doc_bound = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
+    defer if (upper_doc_bound) |buf| alloc.free(buf);
+
+    const first = leaves.items[0];
+    const lower = try internal_keys.relationalJsonValueIndexPrefixAlloc(alloc, column_path, first.json_path, first.value_key);
+    defer alloc.free(lower);
+    const upper = try nextPrefixAlloc(alloc, lower);
+    defer if (upper) |buf| alloc.free(buf);
+
+    const scanned = try store.scanRange(alloc, lower, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var out = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (out.items) |doc_key| alloc.free(doc_key);
+        out.deinit(alloc);
+    }
+
+    for (scanned) |entry| {
+        var decoded = (try internal_keys.decodeRelationalJsonValueIndexKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!std.mem.eql(u8, decoded.column_path, column_path)) continue;
+        if (!std.mem.eql(u8, decoded.json_path, first.json_path)) continue;
+        if (!std.mem.eql(u8, decoded.value_key, first.value_key)) continue;
+        if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
+        if (!try currentRowJsonContains(alloc, store, decoded.doc_key, column_path, wanted)) continue;
+        try out.append(alloc, try alloc.dupe(u8, decoded.doc_key));
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+fn currentRowJsonContains(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    column_path: []const u8,
+    wanted: std.json.Value,
+) !bool {
+    const raw_row = try getRawAlloc(alloc, store, doc_key) orelse return false;
+    defer alloc.free(raw_row);
+    const cell = (try relational_row_codec.findCellByPath(raw_row, column_path)) orelse return false;
+    return try jsonCellContains(alloc, cell, wanted);
+}
+
+pub fn jsonCellContains(alloc: Allocator, cell: relational_row_codec.Cell, wanted: std.json.Value) !bool {
+    if (cell.value_type != .bytes_val or !cell.is_json) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{}) catch return false;
+    defer parsed.deinit();
+    return jsonValueContains(parsed.value, wanted);
+}
+
+pub fn jsonValueContains(candidate: std.json.Value, wanted: std.json.Value) bool {
+    return switch (wanted) {
+        .object => |wanted_object| blk: {
+            if (candidate != .object) break :blk false;
+            for (wanted_object.keys(), wanted_object.values()) |key, wanted_value| {
+                const candidate_value = candidate.object.get(key) orelse break :blk false;
+                if (!jsonValueContains(candidate_value, wanted_value)) break :blk false;
+            }
+            break :blk true;
+        },
+        .array => |wanted_array| blk: {
+            if (candidate != .array) break :blk false;
+            for (wanted_array.items) |wanted_item| {
+                var matched = false;
+                for (candidate.array.items) |candidate_item| {
+                    if (jsonValueContains(candidate_item, wanted_item)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) break :blk false;
+            }
+            break :blk true;
+        },
+        else => jsonValuesEqualForContainment(candidate, wanted),
+    };
+}
+
+fn jsonValuesEqualForContainment(lhs: std.json.Value, rhs: std.json.Value) bool {
+    return switch (lhs) {
+        .null => rhs == .null,
+        .bool => |value| rhs == .bool and rhs.bool == value,
+        .integer => |value| switch (rhs) {
+            .integer => |other| other == value,
+            .float => |other| @as(f64, @floatFromInt(value)) == other,
+            else => false,
+        },
+        .float => |value| switch (rhs) {
+            .integer => |other| value == @as(f64, @floatFromInt(other)),
+            .float => |other| other == value,
+            else => false,
+        },
+        .number_string => |value| switch (rhs) {
+            .number_string => |other| std.mem.eql(u8, value, other),
+            .string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .string => |value| switch (rhs) {
+            .string => |other| std.mem.eql(u8, value, other),
+            .number_string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .array, .object => jsonValueContains(lhs, rhs) and jsonValueContains(rhs, lhs),
+    };
+}
+
 pub fn rebuildAllColumnIndexesFromRowsInRange(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -2148,25 +2367,93 @@ pub fn pruneColumnIndexesForMissingRowsInRange(
     const upper_doc_bound = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
     defer if (upper_doc_bound) |buf| alloc.free(buf);
 
-    const lower = [_]u8{internal_keys.relational_column_index_namespace};
-    const upper = [_]u8{internal_keys.relational_column_index_namespace + 1};
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    try appendMissingRowColumnIndexDeletesForNamespace(
+        alloc,
+        store,
+        &deletes,
+        &owned_keys,
+        internal_keys.relational_column_index_namespace,
+        lower_doc_bound,
+        upper_doc_bound,
+    );
+    try appendMissingRowColumnIndexDeletesForNamespace(
+        alloc,
+        store,
+        &deletes,
+        &owned_keys,
+        internal_keys.relational_array_element_index_namespace,
+        lower_doc_bound,
+        upper_doc_bound,
+    );
+    try appendMissingRowColumnIndexDeletesForNamespace(
+        alloc,
+        store,
+        &deletes,
+        &owned_keys,
+        internal_keys.relational_json_value_index_namespace,
+        lower_doc_bound,
+        upper_doc_bound,
+    );
+    if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
+}
+
+fn appendMissingRowColumnIndexDeletesForNamespace(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    namespace: u8,
+    lower_doc_bound: []const u8,
+    upper_doc_bound: ?[]const u8,
+) !void {
+    const lower = [_]u8{namespace};
+    const upper = [_]u8{namespace + 1};
     const scanned = try store.scanRange(alloc, lower[0..], upper[0..]);
     defer docstore_mod.DocStore.freeResults(alloc, scanned);
 
-    var deletes = std.ArrayListUnmanaged([]const u8).empty;
-    defer deletes.deinit(alloc);
     for (scanned) |entry| {
-        var decoded = (try internal_keys.decodeRelationalColumnIndexKeyAlloc(alloc, entry.key)) orelse continue;
-        defer decoded.deinit(alloc);
-        if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
-        const row_exists = try getRawAlloc(alloc, store, decoded.doc_key);
+        const doc_key = try decodedColumnIndexDocKeyAlloc(alloc, entry.key) orelse continue;
+        defer alloc.free(doc_key);
+        if (!(try docKeyFallsInRange(alloc, doc_key, lower_doc_bound, upper_doc_bound))) continue;
+        const row_exists = try getRawAlloc(alloc, store, doc_key);
         if (row_exists) |raw| {
             alloc.free(raw);
         } else {
-            try deletes.append(alloc, entry.key);
+            const key = try alloc.dupe(u8, entry.key);
+            var key_owned = true;
+            errdefer if (key_owned) alloc.free(key);
+            try owned_keys.append(alloc, key);
+            key_owned = false;
+            try deletes.append(alloc, key);
         }
     }
-    if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
+}
+
+fn decodedColumnIndexDocKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (key.len == 0) return null;
+    if (key[0] == internal_keys.relational_column_index_namespace) {
+        var decoded = (try internal_keys.decodeRelationalColumnIndexKeyAlloc(alloc, key)) orelse return null;
+        defer decoded.deinit(alloc);
+        return try alloc.dupe(u8, decoded.doc_key);
+    }
+    if (key[0] == internal_keys.relational_array_element_index_namespace) {
+        var decoded = (try internal_keys.decodeRelationalArrayElementIndexKeyAlloc(alloc, key)) orelse return null;
+        defer decoded.deinit(alloc);
+        return try alloc.dupe(u8, decoded.doc_key);
+    }
+    if (key[0] == internal_keys.relational_json_value_index_namespace) {
+        var decoded = (try internal_keys.decodeRelationalJsonValueIndexKeyAlloc(alloc, key)) orelse return null;
+        defer decoded.deinit(alloc);
+        return try alloc.dupe(u8, decoded.doc_key);
+    }
+    return null;
 }
 
 pub fn deleteColumnIndexesByDocRange(
@@ -2203,7 +2490,71 @@ pub fn deleteColumnIndexesByDocRange(
         column_major_owned = false;
         try deletes.append(alloc, column_major);
     }
+    try appendArrayElementIndexDeletesForDocRange(alloc, store, &deletes, &owned_keys, lower_doc_key, upper_doc_key);
+    try appendJsonValueIndexDeletesForDocRange(alloc, store, &deletes, &owned_keys, lower_doc_key, upper_doc_key);
     if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
+}
+
+fn appendArrayElementIndexDeletesForDocRange(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) !void {
+    const lower_doc_bound = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
+    defer alloc.free(lower_doc_bound);
+    const upper_doc_bound = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
+    defer if (upper_doc_bound) |buf| alloc.free(buf);
+
+    const lower = [_]u8{internal_keys.relational_array_element_index_namespace};
+    const upper = [_]u8{internal_keys.relational_array_element_index_namespace + 1};
+    const scanned = try store.scanRange(alloc, lower[0..], upper[0..]);
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    for (scanned) |entry| {
+        var decoded = (try internal_keys.decodeRelationalArrayElementIndexKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
+        const key = try alloc.dupe(u8, entry.key);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        try owned_keys.append(alloc, key);
+        key_owned = false;
+        try deletes.append(alloc, key);
+    }
+}
+
+fn appendJsonValueIndexDeletesForDocRange(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) !void {
+    const lower_doc_bound = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
+    defer alloc.free(lower_doc_bound);
+    const upper_doc_bound = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
+    defer if (upper_doc_bound) |buf| alloc.free(buf);
+
+    const lower = [_]u8{internal_keys.relational_json_value_index_namespace};
+    const upper = [_]u8{internal_keys.relational_json_value_index_namespace + 1};
+    const scanned = try store.scanRange(alloc, lower[0..], upper[0..]);
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    for (scanned) |entry| {
+        var decoded = (try internal_keys.decodeRelationalJsonValueIndexKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!(try docKeyFallsInRange(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound))) continue;
+        const key = try alloc.dupe(u8, entry.key);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        try owned_keys.append(alloc, key);
+        key_owned = false;
+        try deletes.append(alloc, key);
+    }
 }
 
 pub fn deleteColumnIndexesForRowRange(
@@ -3027,6 +3378,8 @@ fn foreignKeyNameInCatalog(foreign_keys: []const schema_mod.ForeignKey, name: []
 
 fn clearColumnIndexNamespace(alloc: Allocator, store: *docstore_mod.DocStore) !void {
     try clearColumnIndexNamespacePrefix(alloc, store, internal_keys.relational_column_index_namespace);
+    try clearColumnIndexNamespacePrefix(alloc, store, internal_keys.relational_array_element_index_namespace);
+    try clearColumnIndexNamespacePrefix(alloc, store, internal_keys.relational_json_value_index_namespace);
     try clearColumnIndexNamespacePrefix(alloc, store, internal_keys.relational_column_index_by_doc_namespace);
 }
 
@@ -3041,7 +3394,10 @@ fn clearColumnIndexNamespacePrefix(alloc: Allocator, store: *docstore_mod.DocSto
     defer deletes.deinit(alloc);
     try deletes.ensureUnusedCapacity(alloc, scanned.len);
     for (scanned) |entry| {
-        if (!internal_keys.isRelationalColumnIndexKey(entry.key) and !internal_keys.isRelationalColumnIndexByDocKey(entry.key)) continue;
+        if (!internal_keys.isRelationalColumnIndexKey(entry.key) and
+            !internal_keys.isRelationalArrayElementIndexKey(entry.key) and
+            !internal_keys.isRelationalJsonValueIndexKey(entry.key) and
+            !internal_keys.isRelationalColumnIndexByDocKey(entry.key)) continue;
         deletes.appendAssumeCapacity(entry.key);
     }
     if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
@@ -3174,6 +3530,9 @@ fn appendColumnIndexWriteForCell(
         .value = "",
     });
     by_doc_key_owned = false;
+
+    try appendArrayElementIndexWritesForCell(alloc, writes, owned_keys, doc_key, cell);
+    try appendJsonValueIndexWritesForCell(alloc, writes, owned_keys, doc_key, cell);
 }
 
 fn appendColumnIndexDeleteForCell(
@@ -3202,6 +3561,214 @@ fn appendColumnIndexDeleteForCell(
     }
     try deletes.append(alloc, by_doc_key);
     by_doc_key_owned = false;
+
+    try appendArrayElementIndexDeletesForCell(alloc, deletes, owned_keys, doc_key, cell);
+    try appendJsonValueIndexDeletesForCell(alloc, deletes, owned_keys, doc_key, cell);
+}
+
+fn appendArrayElementIndexWritesForCell(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    cell: relational_row_codec.Cell,
+) !void {
+    if (cell.value_type != .bytes_val or !cell.is_json) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .array) return;
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    for (parsed.value.array.items) |item| {
+        const element_key = try arrayElementIndexKeyForValueAlloc(alloc, item);
+        var element_key_owned = true;
+        errdefer if (element_key_owned) alloc.free(element_key);
+        const gop = try seen.getOrPut(alloc, element_key);
+        if (gop.found_existing) {
+            alloc.free(element_key);
+            element_key_owned = false;
+            continue;
+        }
+        gop.key_ptr.* = element_key;
+        element_key_owned = false;
+
+        const key = try internal_keys.relationalArrayElementIndexKeyAlloc(alloc, cell.path, element_key, doc_key);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        if (owned_keys) |keys| {
+            try keys.append(alloc, key);
+            key_owned = false;
+        }
+        try writes.append(alloc, .{ .key = key, .value = "" });
+        key_owned = false;
+    }
+
+    var it = seen.keyIterator();
+    while (it.next()) |key| alloc.free(key.*);
+}
+
+fn appendArrayElementIndexDeletesForCell(
+    alloc: Allocator,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    cell: relational_row_codec.Cell,
+) !void {
+    if (cell.value_type != .bytes_val or !cell.is_json) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .array) return;
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    for (parsed.value.array.items) |item| {
+        const element_key = try arrayElementIndexKeyForValueAlloc(alloc, item);
+        var element_key_owned = true;
+        errdefer if (element_key_owned) alloc.free(element_key);
+        const gop = try seen.getOrPut(alloc, element_key);
+        if (gop.found_existing) {
+            alloc.free(element_key);
+            element_key_owned = false;
+            continue;
+        }
+        gop.key_ptr.* = element_key;
+        element_key_owned = false;
+
+        const key = try internal_keys.relationalArrayElementIndexKeyAlloc(alloc, cell.path, element_key, doc_key);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        if (owned_keys) |keys| {
+            try keys.append(alloc, key);
+            key_owned = false;
+        }
+        try deletes.append(alloc, key);
+        key_owned = false;
+    }
+
+    var it = seen.keyIterator();
+    while (it.next()) |key| alloc.free(key.*);
+}
+
+const JsonValueIndexEntry = struct {
+    json_path: []u8,
+    value_key: []u8,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.json_path);
+        alloc.free(self.value_key);
+        self.* = undefined;
+    }
+};
+
+fn appendJsonValueIndexWritesForCell(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    cell: relational_row_codec.Cell,
+) !void {
+    if (cell.value_type != .bytes_val or !cell.is_json) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{}) catch return;
+    defer parsed.deinit();
+
+    var entries = std.ArrayListUnmanaged(JsonValueIndexEntry).empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit(alloc);
+    }
+    try collectJsonValueIndexEntriesAlloc(alloc, "", parsed.value, &entries);
+    for (entries.items) |entry| {
+        const key = try internal_keys.relationalJsonValueIndexKeyAlloc(alloc, cell.path, entry.json_path, entry.value_key, doc_key);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        if (owned_keys) |keys| {
+            try keys.append(alloc, key);
+            key_owned = false;
+        }
+        try writes.append(alloc, .{ .key = key, .value = "" });
+        key_owned = false;
+    }
+}
+
+fn appendJsonValueIndexDeletesForCell(
+    alloc: Allocator,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    cell: relational_row_codec.Cell,
+) !void {
+    if (cell.value_type != .bytes_val or !cell.is_json) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{}) catch return;
+    defer parsed.deinit();
+
+    var entries = std.ArrayListUnmanaged(JsonValueIndexEntry).empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit(alloc);
+    }
+    try collectJsonValueIndexEntriesAlloc(alloc, "", parsed.value, &entries);
+    for (entries.items) |entry| {
+        const key = try internal_keys.relationalJsonValueIndexKeyAlloc(alloc, cell.path, entry.json_path, entry.value_key, doc_key);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        if (owned_keys) |keys| {
+            try keys.append(alloc, key);
+            key_owned = false;
+        }
+        try deletes.append(alloc, key);
+        key_owned = false;
+    }
+}
+
+fn collectJsonValueIndexEntriesAlloc(
+    alloc: Allocator,
+    path: []const u8,
+    value: std.json.Value,
+    out: *std.ArrayListUnmanaged(JsonValueIndexEntry),
+) !void {
+    switch (value) {
+        .object => |object| {
+            for (object.keys(), object.values()) |key, child| {
+                const child_path = try joinJsonIndexPathAlloc(alloc, path, key);
+                defer alloc.free(child_path);
+                try collectJsonValueIndexEntriesAlloc(alloc, child_path, child, out);
+            }
+        },
+        .array => |array| {
+            for (array.items) |child| {
+                try collectJsonValueIndexEntriesAlloc(alloc, path, child, out);
+            }
+        },
+        else => {
+            const value_key = try jsonValueIndexKeyForValueAlloc(alloc, value);
+            var value_key_owned = true;
+            errdefer if (value_key_owned) alloc.free(value_key);
+            const json_path = try alloc.dupe(u8, path);
+            var json_path_owned = true;
+            errdefer if (json_path_owned) alloc.free(json_path);
+            for (out.items) |entry| {
+                if (std.mem.eql(u8, entry.json_path, json_path) and std.mem.eql(u8, entry.value_key, value_key)) {
+                    alloc.free(json_path);
+                    json_path_owned = false;
+                    alloc.free(value_key);
+                    value_key_owned = false;
+                    return;
+                }
+            }
+            try out.append(alloc, .{
+                .json_path = json_path,
+                .value_key = value_key,
+            });
+            json_path_owned = false;
+            value_key_owned = false;
+        },
+    }
+}
+
+fn joinJsonIndexPathAlloc(alloc: Allocator, prefix: []const u8, segment: []const u8) ![]u8 {
+    if (prefix.len == 0) return try alloc.dupe(u8, segment);
+    return try std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, segment });
 }
 
 fn appendDeleteInternal(
@@ -4172,6 +4739,187 @@ test "relational base store scans rows and columns by document range" {
     try appendDelete(alloc, &store, &deletes, &owned_keys, "doc:a");
     try store.putBatch(writes.items, deletes.items);
     try std.testing.expectError(error.NotFound, store.get(alloc, doc_a_amount_key));
+}
+
+test "relational array element indexes support targeted containment scans" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const row_a = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "title",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "alpha" },
+        },
+        .{
+            .path = "tags",
+            .value_type = .bytes_val,
+            .is_json = true,
+            .value = .{ .bytes_val = "[\"hot\",\"new\",\"hot\"]" },
+        },
+    });
+    defer alloc.free(row_a);
+    const row_b = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "title",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "beta" },
+        },
+        .{
+            .path = "tags",
+            .value_type = .bytes_val,
+            .is_json = true,
+            .value = .{ .bytes_val = "[\"cold\"]" },
+        },
+    });
+    defer alloc.free(row_b);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a);
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b);
+    try store.putBatch(writes.items, deletes.items);
+
+    var parsed_hot = try std.json.parseFromSlice(std.json.Value, alloc, "\"hot\"", .{});
+    defer parsed_hot.deinit();
+    const hot_key = try arrayElementIndexKeyForValueAlloc(alloc, parsed_hot.value);
+    defer alloc.free(hot_key);
+    const hot_index_key = try internal_keys.relationalArrayElementIndexKeyAlloc(alloc, "tags", hot_key, "doc:a");
+    defer alloc.free(hot_index_key);
+    const hot_index_value = try store.get(alloc, hot_index_key);
+    defer alloc.free(hot_index_value);
+
+    const hot_docs = try scanArrayElementDocKeysAlloc(alloc, &store, "tags", hot_key, "doc:a", "doc:z");
+    defer freeDocKeys(alloc, hot_docs);
+    try std.testing.expectEqual(@as(usize, 1), hot_docs.len);
+    try std.testing.expectEqualStrings("doc:a", hot_docs[0]);
+
+    const row_a_cold = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "title",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "alpha" },
+        },
+        .{
+            .path = "tags",
+            .value_type = .bytes_val,
+            .is_json = true,
+            .value = .{ .bytes_val = "[\"cold\"]" },
+        },
+    });
+    defer alloc.free(row_a_cold);
+    writes.clearRetainingCapacity();
+    deletes.clearRetainingCapacity();
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a_cold);
+    try store.putBatch(writes.items, deletes.items);
+
+    try std.testing.expectError(error.NotFound, store.get(alloc, hot_index_key));
+    const hot_after_update = try scanArrayElementDocKeysAlloc(alloc, &store, "tags", hot_key, "doc:a", "doc:z");
+    defer freeDocKeys(alloc, hot_after_update);
+    try std.testing.expectEqual(@as(usize, 0), hot_after_update.len);
+
+    var parsed_cold = try std.json.parseFromSlice(std.json.Value, alloc, "\"cold\"", .{});
+    defer parsed_cold.deinit();
+    const cold_key = try arrayElementIndexKeyForValueAlloc(alloc, parsed_cold.value);
+    defer alloc.free(cold_key);
+    const cold_docs = try scanArrayElementDocKeysAlloc(alloc, &store, "tags", cold_key, "doc:a", "doc:z");
+    defer freeDocKeys(alloc, cold_docs);
+    try std.testing.expectEqual(@as(usize, 2), cold_docs.len);
+    try std.testing.expectEqualStrings("doc:a", cold_docs[0]);
+    try std.testing.expectEqualStrings("doc:b", cold_docs[1]);
+}
+
+test "relational json value indexes support targeted containment scans" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const row_a = try relational_row_codec.serialize(alloc, &.{.{
+        .path = "attrs",
+        .value_type = .bytes_val,
+        .is_json = true,
+        .value = .{ .bytes_val = "{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"active\",\"beta\"]}" },
+    }});
+    defer alloc.free(row_a);
+    const row_b = try relational_row_codec.serialize(alloc, &.{.{
+        .path = "attrs",
+        .value_type = .bytes_val,
+        .is_json = true,
+        .value = .{ .bytes_val = "{\"billing\":{\"plan\":\"free\"},\"flags\":[\"active\"]}" },
+    }});
+    defer alloc.free(row_b);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a);
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b);
+    try store.putBatch(writes.items, deletes.items);
+
+    var parsed_pro = try std.json.parseFromSlice(std.json.Value, alloc, "\"pro\"", .{});
+    defer parsed_pro.deinit();
+    const pro_key = try jsonValueIndexKeyForValueAlloc(alloc, parsed_pro.value);
+    defer alloc.free(pro_key);
+    const pro_index_key = try internal_keys.relationalJsonValueIndexKeyAlloc(alloc, "attrs", "billing.plan", pro_key, "doc:a");
+    defer alloc.free(pro_index_key);
+    const pro_index_value = try store.get(alloc, pro_index_key);
+    defer alloc.free(pro_index_value);
+
+    var wanted = try std.json.parseFromSlice(std.json.Value, alloc, "{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"active\"]}", .{});
+    defer wanted.deinit();
+    const pro_ids = try scanJsonContainmentDocKeysAlloc(alloc, &store, "attrs", wanted.value, "", "");
+    defer freeDocKeys(alloc, pro_ids);
+    try std.testing.expectEqual(@as(usize, 1), pro_ids.len);
+    try std.testing.expectEqualStrings("doc:a", pro_ids[0]);
+
+    const row_a_updated = try relational_row_codec.serialize(alloc, &.{.{
+        .path = "attrs",
+        .value_type = .bytes_val,
+        .is_json = true,
+        .value = .{ .bytes_val = "{\"billing\":{\"plan\":\"free\"},\"flags\":[\"active\"]}" },
+    }});
+    defer alloc.free(row_a_updated);
+    writes.clearRetainingCapacity();
+    deletes.clearRetainingCapacity();
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a_updated);
+    try store.putBatch(writes.items, deletes.items);
+
+    try std.testing.expectError(error.NotFound, store.get(alloc, pro_index_key));
+    const pro_ids_after = try scanJsonContainmentDocKeysAlloc(alloc, &store, "attrs", wanted.value, "", "");
+    defer freeDocKeys(alloc, pro_ids_after);
+    try std.testing.expectEqual(@as(usize, 0), pro_ids_after.len);
 }
 
 test "relational column scans hydrate values from current base rows" {

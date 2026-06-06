@@ -167,6 +167,8 @@ pub const SearchQuery = union(enum) {
     prefix: PrefixQuery,
     wildcard: WildcardQuery,
     regexp: RegexpQuery,
+    array_any: ArrayAnyQuery,
+    json_contains: JsonContainsQuery,
     bool_query: BoolQuery,
     match_all: void,
     knn: KNNQuery,
@@ -224,6 +226,16 @@ pub const TermQuery = struct {
     field: []const u8,
     term: []const u8,
     boost: f32 = 1.0,
+};
+
+pub const ArrayAnyQuery = struct {
+    field: []const u8,
+    value: std.json.Value,
+};
+
+pub const JsonContainsQuery = struct {
+    field: []const u8,
+    value: std.json.Value,
 };
 
 pub const FuzzyQuery = struct {
@@ -469,6 +481,8 @@ pub fn execute(
         .prefix => |pq| try executePrefix(alloc, snap, pq, request),
         .wildcard => |wq| try executeWildcard(alloc, snap, wq, request),
         .regexp => |rq| try executeRegexp(alloc, snap, rq, request),
+        .array_any => return error.InvalidArgument,
+        .json_contains => return error.InvalidArgument,
         .match_all => try executeMatchAll(alloc, snap, request),
         .bool_query => |bq| try executeBool(alloc, snap, bq, request),
         .knn => |kq| try executeKNN(alloc, snap, kq, request),
@@ -2042,6 +2056,8 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             .filter_slice = &.{},
         },
         .bool_query => .{ .filter = .{ .match_all = {} }, .duped_terms = &.{}, .filter_slice = &.{} },
+        .array_any => return error.InvalidArgument,
+        .json_contains => return error.InvalidArgument,
         .knn => .{ .filter = .{ .match_all = {} }, .duped_terms = &.{}, .filter_slice = &.{} },
         .hybrid => .{ .filter = .{ .match_all = {} }, .duped_terms = &.{}, .filter_slice = &.{} },
     };

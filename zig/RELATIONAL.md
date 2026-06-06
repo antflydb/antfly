@@ -597,14 +597,25 @@ schema/catalog state, reconstruction, and write validation a stable
 
 The predicate compares the requested value as a typed JSON value, not as a SQL
 string fragment, and it also works over nested multivalue paths such as
-`{ "array_any": { "path": "items.sku", "value": "sku-2" } }`. The remaining
-production work is index acceleration and full planner costing: declared array
-columns still need catalog-declared element indexes, canonical ordering/equality
-rules, null/empty semantics, and optional element index entries for containment
-and `ANY` filters. For arrays that are also used by unique constraints or
-generated expressions, the catalog must specify whether order-sensitive or
-set-like comparison is used. Fully schemaless arrays can still live inside a
-`json` column.
+`{ "array_any": { "path": "items.sku", "value": "sku-2" } }`.
+
+Declared indexed array columns write value-keyed element index entries beside
+the ordinary column scan entry:
+
+```text
+array_element_index(column_path, canonical_element_value, doc_key) -> ""
+```
+
+`array_any` resolves through that element index when the column is indexed, then
+hydrates the base row to prove the row still contains the element before building
+the doc set. Columns declared with `x-antfly-index: false` keep the same typed
+array validation and canonical row storage but resolve `array_any` by scanning
+base rows instead of writing element index entries. The remaining production work
+is planner costing and broader SQL operator coverage: canonical ordering/equality
+rules, explicit null/empty semantics, nested multivalue path indexes, and
+catalog-declared order-sensitive versus set-like comparison for arrays that
+participate in unique constraints or generated expressions. Fully schemaless
+arrays can still live inside a `json` column.
 
 #### JSON path and update operators
 
@@ -622,8 +633,8 @@ need stable API and planner semantics over the stored JSON subtree:
 ```
 
 Extraction (`->`, `->>`), containment (`@>`), existence, and path predicates
-should compile to a JSON-column expression contract. Patch/update operations
-such as `jsonb_set` lower to the row API's typed `json_set` operation:
+compile to a JSON-column expression contract. Patch/update operations such as
+`jsonb_set` lower to the row API's typed `json_set` operation:
 `{ "field": "attrs", "path": ["billing", "plan"], "value": "pro" }`. The field
 must be a declared `json` relational column, path segments are structured
 strings rather than SQL text, and the mutation lowers to the same storage
@@ -649,10 +660,25 @@ lowers to a typed containment predicate such as:
 Containment is recursive over actual JSON values: objects require every
 requested key to be present and contained, arrays use unordered element
 containment, and scalars use JSON value equality with numeric integer/float
-normalization. It is intentionally not lowered to a fake term filter. The
-remaining production work is index/path-fact acceleration and planner costing
-for containment-capable JSON paths; until a declared JSON subindex can prove the
-predicate, the stored-doc matcher is the correctness fallback.
+normalization. It is intentionally not lowered to a fake term filter.
+
+Declared indexed JSON columns write value-keyed leaf rows beside the ordinary
+column scan entry:
+
+```text
+json_value_index(column_path, relative_json_path, canonical_leaf_value, doc_key) -> ""
+```
+
+The relational resolver uses those rows as candidate sources for
+`json_contains`, then hydrates the authoritative base row and rechecks recursive
+containment before returning a doc set. That makes stale side rows, partial
+rebuilds, and intentionally lossy leaf choices safe. Containment predicates that
+do not have an indexable scalar leaf, such as empty object/array containment, or
+columns declared with `x-antfly-index: false`, fall back to a base-row scan with
+the same containment evaluator. The remaining production work is planner
+costing, extraction/update operator breadth, and choosing between the relational
+JSON value rows and algebraic path-fact access paths when both can serve the
+same predicate.
 
 #### Checks, defaults, and generated values
 
@@ -724,11 +750,43 @@ clauses:
 }
 ```
 
-The planner should prefer primary-key, unique-owner, partial/expression, and
-column-major indexes; fall back to base-row scans when required; and keep
-projection/materialization on the relational row codec. Non-recursive CTEs are
-mostly query composition over this contract. Recursive CTEs are a separate
-graph/fixpoint feature and should be treated as a distinct planner extension.
+The row API now exposes the single-table form of this as a typed query request,
+not as SQL text:
+
+```json
+{
+  "where": {
+    "all": [
+      { "field": "tenant_id", "op": "eq", "value": "t1" },
+      { "field": "status", "op": "eq", "value": "open" }
+    ]
+  },
+  "select": ["id", "status", "created_at"],
+  "order_by": [{ "field": "created_at", "direction": "desc" }],
+  "limit": 50,
+  "offset": 0
+}
+```
+
+The same contract also accepts shorthand equality filters such as
+`{ "where": { "status": "ready" } }`. Predicates are typed atoms over declared
+relational columns (`is_null`, `is_not_null`, `eq`, `ne`, `gt`, `gte`, `lt`,
+`lte`), projections are field lists or `["*"]`, and ordering is over declared
+scalar columns with deterministic tie-breaking by input row order. Null and
+missing order keys sort after present scalar values. The executor projects from
+the relational row JSON/codec and applies `OFFSET`/`LIMIT` after filtering and
+ordering.
+
+This is the backend AST that a SQL adapter should target for simple
+single-table `SELECT` clauses. The planner still needs to connect that contract
+to primary-key, unique-owner, partial/expression, array-element, JSON-value, and
+column-major access paths instead of materializing every candidate row first.
+Joins should lower to typed row-stream composition over the same base row
+contract, with join predicates represented as column references rather than SQL
+fragments. Aggregates should consume typed row streams and emit typed projection
+rows. Non-recursive CTEs are mostly query composition over this contract.
+Recursive CTEs are a separate graph/fixpoint feature and should be treated as a
+distinct planner extension.
 
 Those model-level items are not PostgreSQL-specific. They are the durable
 relational semantics that the storage model should expose so a future SQL

@@ -22,6 +22,7 @@ const fusion_mod = @import("../../search/fusion.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const docstore_mod = @import("../docstore.zig");
 const shard_mod = @import("../shard.zig");
+const schema_mod = @import("../schema.zig");
 const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
@@ -816,6 +817,49 @@ pub const ScanResult = struct {
         if (self.hashes.len > 0) alloc.free(self.hashes);
         for (self.documents) |*doc| doc.deinit(alloc);
         if (self.documents.len > 0) alloc.free(self.documents);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsQueryOrderDirection = enum {
+    asc,
+    desc,
+};
+
+pub const RelationalRowsQueryOrder = struct {
+    field: []const u8,
+    direction: RelationalRowsQueryOrderDirection = .asc,
+};
+
+pub const RelationalRowsQueryRequest = struct {
+    predicates: []schema_mod.RelationalCheck = &.{},
+    select: []const []const u8 = &.{},
+    select_all: bool = true,
+    order_by: []RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.predicates) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+        if (self.predicates.len > 0) alloc.free(self.predicates);
+        for (self.select) |field| alloc.free(field);
+        if (self.select.len > 0) alloc.free(self.select);
+        for (self.order_by) |order| alloc.free(order.field);
+        if (self.order_by.len > 0) alloc.free(self.order_by);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsQueryResult = struct {
+    rows: [][]const u8 = &.{},
+    total: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.rows) |row| alloc.free(@constCast(row));
+        if (self.rows.len > 0) alloc.free(self.rows);
         self.* = undefined;
     }
 };

@@ -2487,6 +2487,8 @@ fn searchQueryCanUseSnapshot(
         .doc_id,
         .doc_num,
         => true,
+        .array_any => false,
+        .json_contains => false,
         .knn => false,
         .hybrid => false,
         .match => |item| try snapshot.hasInvertedField(item.field),
@@ -2697,6 +2699,20 @@ fn patternFilterValueToSearchQuery(
         }
         return .{ .bool_query = .{ .should = should, .min_should = 1 } };
     }
+    if (value.object.get("array_any")) |array_any| {
+        const field_value = try singleFieldJsonValue(alloc, array_any);
+        return .{ .array_any = .{
+            .field = field_value.field,
+            .value = field_value.value,
+        } };
+    }
+    if (value.object.get("json_contains")) |json_contains| {
+        const field_value = try singleFieldJsonValue(alloc, json_contains);
+        return .{ .json_contains = .{
+            .field = field_value.field,
+            .value = field_value.value,
+        } };
+    }
     if (value.object.get("match")) |match| {
         const field_value = try singleFieldString(match, "text");
         return .{ .match = .{
@@ -2734,6 +2750,40 @@ fn patternFilterValueToSearchQuery(
     if (value.object.get("geo_distance")) |geo_query| return .{ .geo_distance = try parseGeoDistanceQuery(geo_query) };
     if (value.object.get("geo_bbox")) |geo_query| return .{ .geo_bbox = try parseGeoBBoxQuery(geo_query) };
     return error.UnsupportedQueryRequest;
+}
+
+const FieldJsonValue = struct {
+    field: []const u8,
+    value: std.json.Value,
+};
+
+fn singleFieldJsonValue(alloc: Allocator, value: std.json.Value) !FieldJsonValue {
+    if (value != .object) return error.InvalidArgument;
+    const field = if (value.object.get("field")) |field_value| blk: {
+        if (field_value != .string or field_value.string.len == 0) return error.InvalidArgument;
+        break :blk field_value.string;
+    } else if (value.object.get("path")) |path_value|
+        try patternPathValueToFieldAlloc(alloc, path_value)
+    else
+        return error.InvalidArgument;
+    const wanted = value.object.get("value") orelse return error.InvalidArgument;
+    return .{ .field = field, .value = wanted };
+}
+
+fn patternPathValueToFieldAlloc(alloc: Allocator, value: std.json.Value) ![]const u8 {
+    if (value == .string) {
+        if (value.string.len == 0) return error.InvalidArgument;
+        return value.string;
+    }
+    if (value != .array or value.array.items.len == 0) return error.InvalidArgument;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (value.array.items, 0..) |item, i| {
+        if (item != .string or item.string.len == 0) return error.InvalidArgument;
+        if (i != 0) try out.append(alloc, '.');
+        try out.appendSlice(alloc, item.string);
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 fn patternBoolFilterToSearchQuery(

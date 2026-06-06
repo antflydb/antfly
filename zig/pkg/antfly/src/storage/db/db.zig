@@ -14959,6 +14959,8 @@ pub const DB = struct {
             .match_all => try self.relationalAllRowsDocSetAlloc(alloc, generation),
             .doc_id => |doc_id| try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_id.ids, generation),
             .term => |term| try self.resolveRelationalTermFilterDocSetAlloc(alloc, runtime_schema, term, generation),
+            .array_any => |array_any| try self.resolveRelationalArrayAnyFilterDocSetAlloc(alloc, runtime_schema, array_any, generation),
+            .json_contains => |json_contains| try self.resolveRelationalJsonContainsFilterDocSetAlloc(alloc, runtime_schema, json_contains, generation),
             .term_range => |range| try self.resolveRelationalTermRangeFilterDocSetAlloc(alloc, runtime_schema, range, generation),
             .numeric_range => |range| try self.resolveRelationalNumericFilterDocSetAlloc(alloc, runtime_schema, range, generation),
             .date_range => |range| try self.resolveRelationalDateFilterDocSetAlloc(alloc, runtime_schema, range, generation),
@@ -15006,6 +15008,153 @@ pub const DB = struct {
                 return value.value_type == .bytes_val and !value.is_json and std.mem.eql(u8, value.value.bytes_val, ctx.wanted);
             }
         }{ .wanted = term.term });
+    }
+
+    fn resolveRelationalArrayAnyFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        array_any: search_mod.ArrayAnyQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, array_any.field) orelse return null;
+        if (column.field_type != .array) return null;
+
+        var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (doc_ids.items) |doc_id| alloc.free(@constCast(doc_id));
+            doc_ids.deinit(alloc);
+        }
+
+        if (column.indexed) {
+            const element_key = try relational_store_mod.arrayElementIndexKeyForValueAlloc(alloc, array_any.value);
+            defer alloc.free(element_key);
+            const indexed_doc_ids = try relational_store_mod.scanArrayElementDocKeysAlloc(alloc, self.core.store, column.path, element_key, "", "");
+            defer relational_store_mod.freeDocKeys(alloc, indexed_doc_ids);
+            for (indexed_doc_ids) |doc_id| {
+                const owned_doc_id = try alloc.dupe(u8, doc_id);
+                errdefer alloc.free(owned_doc_id);
+                try doc_ids.append(alloc, owned_doc_id);
+            }
+        } else {
+            const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+            defer relational_store_mod.freeRows(alloc, rows);
+            for (rows) |row| {
+                const cell = (try relational_row_codec.findCellByPath(row.row_value, column.path)) orelse continue;
+                const value = relational_store_mod.OwnedColumnValue{
+                    .doc_key = row.doc_key,
+                    .value_type = cell.value_type,
+                    .is_json = cell.is_json,
+                    .value = cell.value,
+                };
+                if (!(try relationalArrayColumnValueContains(alloc, value, array_any.value))) continue;
+                const owned_doc_id = try alloc.dupe(u8, row.doc_key);
+                errdefer alloc.free(owned_doc_id);
+                try doc_ids.append(alloc, owned_doc_id);
+            }
+        }
+
+        _ = generation;
+        if (doc_ids.items.len == 0) return .none;
+        return .{ .doc_keys = try doc_ids.toOwnedSlice(alloc) };
+    }
+
+    fn relationalArrayColumnValueContains(
+        alloc: Allocator,
+        value: relational_store_mod.OwnedColumnValue,
+        wanted: std.json.Value,
+    ) !bool {
+        if (value.value_type != .bytes_val or !value.is_json) return false;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.value.bytes_val, .{}) catch return false;
+        defer parsed.deinit();
+        if (parsed.value != .array) return false;
+        for (parsed.value.array.items) |item| {
+            if (jsonValuesEqual(item, wanted)) return true;
+        }
+        return false;
+    }
+
+    fn resolveRelationalJsonContainsFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        json_contains: search_mod.JsonContainsQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, json_contains.field) orelse return null;
+        if (column.field_type != .json) return null;
+
+        var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (doc_ids.items) |doc_id| alloc.free(@constCast(doc_id));
+            doc_ids.deinit(alloc);
+        }
+
+        if (column.indexed and relational_store_mod.jsonContainsHasIndexableLeaf(json_contains.value)) {
+            const indexed_doc_ids = try relational_store_mod.scanJsonContainmentDocKeysAlloc(alloc, self.core.store, column.path, json_contains.value, "", "");
+            defer relational_store_mod.freeDocKeys(alloc, indexed_doc_ids);
+            for (indexed_doc_ids) |doc_id| {
+                const owned_doc_id = try alloc.dupe(u8, doc_id);
+                errdefer alloc.free(owned_doc_id);
+                try doc_ids.append(alloc, owned_doc_id);
+            }
+        } else {
+            const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+            defer relational_store_mod.freeRows(alloc, rows);
+            for (rows) |row| {
+                const cell = (try relational_row_codec.findCellByPath(row.row_value, column.path)) orelse continue;
+                if (!(try relational_store_mod.jsonCellContains(alloc, cell, json_contains.value))) continue;
+                const owned_doc_id = try alloc.dupe(u8, row.doc_key);
+                errdefer alloc.free(owned_doc_id);
+                try doc_ids.append(alloc, owned_doc_id);
+            }
+        }
+
+        _ = generation;
+        if (doc_ids.items.len == 0) return .none;
+        return .{ .doc_keys = try doc_ids.toOwnedSlice(alloc) };
+    }
+
+    fn jsonValuesEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
+        return switch (lhs) {
+            .null => rhs == .null,
+            .bool => |value| rhs == .bool and rhs.bool == value,
+            .integer => |value| switch (rhs) {
+                .integer => |other| other == value,
+                .float => |other| @as(f64, @floatFromInt(value)) == other,
+                else => false,
+            },
+            .float => |value| switch (rhs) {
+                .integer => |other| value == @as(f64, @floatFromInt(other)),
+                .float => |other| other == value,
+                else => false,
+            },
+            .number_string => |value| switch (rhs) {
+                .number_string => |other| std.mem.eql(u8, value, other),
+                .string => |other| std.mem.eql(u8, value, other),
+                else => false,
+            },
+            .string => |value| switch (rhs) {
+                .string => |other| std.mem.eql(u8, value, other),
+                .number_string => |other| std.mem.eql(u8, value, other),
+                else => false,
+            },
+            .array => |array| blk: {
+                if (rhs != .array or array.items.len != rhs.array.items.len) break :blk false;
+                for (array.items, rhs.array.items) |lhs_item, rhs_item| {
+                    if (!jsonValuesEqual(lhs_item, rhs_item)) break :blk false;
+                }
+                break :blk true;
+            },
+            .object => |object| blk: {
+                if (rhs != .object or object.count() != rhs.object.count()) break :blk false;
+                for (object.keys(), object.values()) |key, lhs_value| {
+                    const rhs_value = rhs.object.get(key) orelse break :blk false;
+                    if (!jsonValuesEqual(lhs_value, rhs_value)) break :blk false;
+                }
+                break :blk true;
+            },
+        };
     }
 
     fn resolveRelationalTermRangeFilterDocSetAlloc(
@@ -55464,6 +55613,166 @@ test "relational unindexed column filters fall back to base rows" {
         .index_name = "ft_v1",
         .query = .{ .match = .{ .field = "title", .text = "alpha" } },
         .filter_query_json = "{\"numeric_range\":{\"field\":\"amount\",\"min\":40.0}}",
+        .limit = 10,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", filtered.hits[0].id);
+}
+
+test "relational indexed array_any filters use array element indexes" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"title\":\"alpha\",\"tags\":[\"hot\",\"new\"]}" },
+            .{ .key = "row:b", .value = "{\"title\":\"alpha\",\"tags\":[\"cold\"]}" },
+            .{ .key = "row:c", .value = "{\"title\":\"alpha\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var parsed_hot = try std.json.parseFromSlice(std.json.Value, alloc, "\"hot\"", .{});
+    defer parsed_hot.deinit();
+    const hot_key = try relational_store_mod.arrayElementIndexKeyForValueAlloc(alloc, parsed_hot.value);
+    defer alloc.free(hot_key);
+    const hot_index_key = try internal_keys.relationalArrayElementIndexKeyAlloc(alloc, "tags", hot_key, "row:a");
+    defer alloc.free(hot_index_key);
+    const hot_index_value = try db.core.store.get(alloc, hot_index_key);
+    defer alloc.free(hot_index_value);
+    const indexed_hot_ids = try relational_store_mod.scanArrayElementDocKeysAlloc(alloc, db.core.store, "tags", hot_key, "", "");
+    defer relational_store_mod.freeDocKeys(alloc, indexed_hot_ids);
+    try std.testing.expectEqual(@as(usize, 1), indexed_hot_ids.len);
+    try std.testing.expectEqualStrings("row:a", indexed_hot_ids[0]);
+
+    var direct_resolved = (try db.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+        .array_any = .{ .field = "tags", .value = parsed_hot.value },
+    }, null)) orelse return error.TestExpectedEqual;
+    defer direct_resolved.deinit(alloc);
+    const direct_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &direct_resolved, null)) orelse return error.TestExpectedEqual;
+    defer {
+        for (direct_ids) |id| alloc.free(@constCast(id));
+        alloc.free(direct_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), direct_ids.len);
+    try std.testing.expectEqualStrings("row:a", direct_ids[0]);
+
+    var unfiltered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .limit = 10,
+    });
+    defer unfiltered.deinit();
+    try std.testing.expectEqual(@as(u32, 3), unfiltered.total_hits);
+
+    var filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .filter_query_json = "{\"array_any\":{\"field\":\"tags\",\"value\":\"hot\"}}",
+        .limit = 10,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", filtered.hits[0].id);
+
+    var missing = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .filter_query_json = "{\"array_any\":{\"field\":\"tags\",\"value\":\"missing\"}}",
+        .limit = 10,
+    });
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(u32, 0), missing.total_hits);
+}
+
+test "relational indexed json_contains filters use json value indexes" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"attrs":{"type":"json"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"title\":\"alpha\",\"attrs\":{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"active\",\"beta\"]}}" },
+            .{ .key = "row:b", .value = "{\"title\":\"alpha\",\"attrs\":{\"billing\":{\"plan\":\"free\"},\"flags\":[\"active\"]}}" },
+            .{ .key = "row:c", .value = "{\"title\":\"alpha\",\"attrs\":{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"archived\"]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var parsed_pro = try std.json.parseFromSlice(std.json.Value, alloc, "\"pro\"", .{});
+    defer parsed_pro.deinit();
+    const pro_key = try relational_store_mod.jsonValueIndexKeyForValueAlloc(alloc, parsed_pro.value);
+    defer alloc.free(pro_key);
+    const pro_index_key = try internal_keys.relationalJsonValueIndexKeyAlloc(alloc, "attrs", "billing.plan", pro_key, "row:a");
+    defer alloc.free(pro_index_key);
+    const pro_index_value = try db.core.store.get(alloc, pro_index_key);
+    defer alloc.free(pro_index_value);
+
+    var wanted = try std.json.parseFromSlice(std.json.Value, alloc, "{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"active\"]}", .{});
+    defer wanted.deinit();
+    const indexed_ids = try relational_store_mod.scanJsonContainmentDocKeysAlloc(alloc, db.core.store, "attrs", wanted.value, "", "");
+    defer relational_store_mod.freeDocKeys(alloc, indexed_ids);
+    try std.testing.expectEqual(@as(usize, 1), indexed_ids.len);
+    try std.testing.expectEqualStrings("row:a", indexed_ids[0]);
+
+    var direct_resolved = (try db.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+        .json_contains = .{ .field = "attrs", .value = wanted.value },
+    }, null)) orelse return error.TestExpectedEqual;
+    defer direct_resolved.deinit(alloc);
+    const direct_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &direct_resolved, null)) orelse return error.TestExpectedEqual;
+    defer {
+        for (direct_ids) |id| alloc.free(@constCast(id));
+        alloc.free(direct_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), direct_ids.len);
+    try std.testing.expectEqualStrings("row:a", direct_ids[0]);
+
+    var filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .filter_query_json = "{\"json_contains\":{\"field\":\"attrs\",\"value\":{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"active\"]}}}",
         .limit = 10,
     });
     defer filtered.deinit();
