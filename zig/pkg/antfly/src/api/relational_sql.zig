@@ -15,9 +15,11 @@
 const std = @import("std");
 
 const db_mod = @import("../storage/db/mod.zig");
+const json_helpers = @import("json_helpers.zig");
 const platform_time = @import("../platform/time.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
+const schema_api = @import("../schema/mod.zig");
 
 pub const default_array_agg_max_items: u32 = 1024;
 
@@ -136,6 +138,105 @@ pub const LoweredJoin = struct {
     }
 };
 
+pub const LoweredDdlPlan = union(enum) {
+    create_table: CreateTablePlan,
+    create_index: CreateIndexPlan,
+    alter_table: AlterTablePlan,
+    create_update_policy: CreateUpdatePolicyPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create_table => |*plan| plan.deinit(alloc),
+            .create_index => |*plan| plan.deinit(alloc),
+            .alter_table => |*plan| plan.deinit(alloc),
+            .create_update_policy => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateTablePlan = struct {
+    table_name: []const u8,
+    columns: []const runtime_schema.RelationalColumn = &.{},
+    primary_key: ?runtime_schema.PrimaryKey = null,
+    unique_constraints: []const runtime_schema.UniqueConstraint = &.{},
+    foreign_keys: []const runtime_schema.ForeignKey = &.{},
+    checks: []const runtime_schema.RelationalCheck = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        freeDdlRelationalColumns(alloc, self.columns);
+        if (self.primary_key) |primary_key| freeDdlPrimaryKey(alloc, primary_key);
+        freeDdlUniqueConstraints(alloc, self.unique_constraints);
+        freeDdlForeignKeys(alloc, self.foreign_keys);
+        freeDdlRelationalChecks(alloc, self.checks);
+        self.* = undefined;
+    }
+};
+
+pub const CreateUpdatePolicyPlan = struct {
+    trigger_name: []const u8,
+    table_name: []const u8,
+    column_name: []const u8,
+    on_update_value: runtime_schema.RelationalDefaultValue,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.trigger_name);
+        alloc.free(self.table_name);
+        alloc.free(self.column_name);
+        alloc.free(self.on_update_value.value_json);
+        self.* = undefined;
+    }
+};
+
+pub const AlterTablePlan = struct {
+    table_name: []const u8,
+    operations: []const AlterTableOperation = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        for (self.operations) |operation| freeAlterTableOperation(alloc, operation);
+        if (self.operations.len > 0) alloc.free(self.operations);
+        self.* = undefined;
+    }
+};
+
+pub const AlterTableOperation = union(enum) {
+    add_column: runtime_schema.RelationalColumn,
+    add_unique_constraint: runtime_schema.UniqueConstraint,
+    add_foreign_key: runtime_schema.ForeignKey,
+    add_check: runtime_schema.RelationalCheck,
+};
+
+pub const CreateIndexPlan = struct {
+    index_name: []const u8,
+    table_name: []const u8,
+    unique: bool = false,
+    columns: []const []const u8 = &.{},
+    expressions: []const runtime_schema.UniqueExpression = &.{},
+    where: []const runtime_schema.UniquePredicate = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.table_name);
+        freeStringSlice(alloc, self.columns);
+        freeDdlUniqueExpressions(alloc, self.expressions);
+        freeDdlUniquePredicates(alloc, self.where);
+        self.* = undefined;
+    }
+};
+
+pub const AppliedDdlSchemaJson = struct {
+    schema_json: []u8,
+    requires_rebuild: bool = false,
+    validation_required: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.schema_json);
+        self.* = undefined;
+    }
+};
+
 const TokenKind = enum {
     identifier,
     string,
@@ -153,6 +254,8 @@ const TokenKind = enum {
     minus,
     lparen,
     rparen,
+    lbracket,
+    rbracket,
     at_contains,
     pipe_concat,
     question,
@@ -324,13 +427,1019 @@ pub fn lowerJoinAlloc(
     return try parser.parseJoin();
 }
 
+pub fn lowerDdlPlanAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !LoweredDdlPlan {
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    var parser = Parser{
+        .alloc = alloc,
+        .tokens = tokens.items,
+    };
+    return try parser.parseDdlPlan();
+}
+
+pub fn runtimeSchemaFromCreateTablePlanAlloc(
+    alloc: std.mem.Allocator,
+    plan: CreateTablePlan,
+) !runtime_schema.TableSchema {
+    if (plan.primary_key == null) return error.InvalidSqlCatalog;
+    try validateRelationalColumnCatalog(plan.columns);
+    try validatePrimaryKeyColumns(plan.columns, plan.primary_key.?);
+    try validateUniqueConstraintCatalog(plan.columns, plan.unique_constraints);
+    try validateForeignKeyCatalog(plan.columns, plan.foreign_keys);
+    try validateRelationalCheckCatalog(plan.columns, plan.checks);
+
+    const default_type = try alloc.dupe(u8, "_default");
+    const ttl_field = alloc.dupe(u8, "_timestamp") catch |err| {
+        alloc.free(default_type);
+        return err;
+    };
+    var schema: runtime_schema.TableSchema = .{
+        .default_type = default_type,
+        .ttl_field = ttl_field,
+        .enforce_types = true,
+        .storage_mode = .relational,
+    };
+    errdefer runtime_schema.freeSchema(alloc, schema);
+    schema.relational_columns = try cloneDdlRelationalColumns(alloc, plan.columns);
+    schema.primary_key = try cloneDdlPrimaryKeyMaybe(alloc, plan.primary_key);
+    schema.unique_constraints = try cloneDdlUniqueConstraints(alloc, plan.unique_constraints);
+    schema.foreign_keys = try cloneDdlForeignKeys(alloc, plan.foreign_keys);
+    schema.checks = try cloneDdlRelationalChecks(alloc, plan.checks);
+    return schema;
+}
+
+pub fn applyDdlPlanToRuntimeSchemaAlloc(
+    alloc: std.mem.Allocator,
+    current: runtime_schema.TableSchema,
+    plan: LoweredDdlPlan,
+) !runtime_schema.TableSchema {
+    return switch (plan) {
+        .create_table => |create_table| runtimeSchemaFromCreateTablePlanAlloc(alloc, create_table),
+        .create_index => |create_index| applyCreateIndexPlanAlloc(alloc, current, create_index),
+        .alter_table => |alter_table| applyAlterTablePlanAlloc(alloc, current, alter_table),
+        .create_update_policy => |update_policy| applyCreateUpdatePolicyPlanAlloc(alloc, current, update_policy),
+    };
+}
+
+pub fn schemaJsonFromCreateTablePlanAlloc(
+    alloc: std.mem.Allocator,
+    plan: CreateTablePlan,
+) ![]u8 {
+    const runtime = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+    defer runtime_schema.freeSchema(alloc, runtime);
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const root = try schemaJsonValueFromCreateTablePlanAlloc(arena, plan);
+    const schema_json = try std.json.Stringify.valueAlloc(alloc, root, .{ .emit_null_optional_fields = false });
+    errdefer alloc.free(schema_json);
+    try validateDdlAppliedSchemaJsonAlloc(alloc, schema_json);
+    return schema_json;
+}
+
+pub fn applyDdlPlanToSchemaJsonAlloc(
+    alloc: std.mem.Allocator,
+    current_schema_json: []const u8,
+    plan: LoweredDdlPlan,
+) !AppliedDdlSchemaJson {
+    switch (plan) {
+        .create_table => |create_table| {
+            if (current_schema_json.len != 0) return error.InvalidSqlCatalog;
+            return .{ .schema_json = try schemaJsonFromCreateTablePlanAlloc(alloc, create_table) };
+        },
+        .create_index, .alter_table, .create_update_policy => {},
+    }
+
+    if (current_schema_json.len == 0) return error.InvalidSqlCatalog;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, current_schema_json, .{});
+    const root = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.InvalidSqlCatalog,
+    };
+
+    var result: AppliedDdlSchemaJson = .{ .schema_json = &.{} };
+    switch (plan) {
+        .create_table => unreachable,
+        .create_index => |create_index| {
+            result.requires_rebuild = true;
+            result.validation_required = create_index.unique;
+            try applyCreateIndexPlanToSchemaJsonValue(arena, root, create_index);
+        },
+        .alter_table => |alter_table| {
+            result.requires_rebuild = true;
+            result.validation_required = true;
+            try applyAlterTablePlanToSchemaJsonValue(arena, root, alter_table);
+        },
+        .create_update_policy => |update_policy| {
+            try applyCreateUpdatePolicyPlanToSchemaJsonValue(arena, root, update_policy);
+        },
+    }
+    result.schema_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+    errdefer alloc.free(result.schema_json);
+    try validateDdlAppliedSchemaJsonAlloc(alloc, result.schema_json);
+    return result;
+}
+
+fn applyCreateIndexPlanAlloc(
+    alloc: std.mem.Allocator,
+    current: runtime_schema.TableSchema,
+    plan: CreateIndexPlan,
+) !runtime_schema.TableSchema {
+    var schema = try cloneRelationalRuntimeSchemaAlloc(alloc, current);
+    errdefer runtime_schema.freeSchema(alloc, schema);
+
+    if (plan.unique) {
+        const constraint: runtime_schema.UniqueConstraint = .{
+            .name = plan.index_name,
+            .columns = plan.columns,
+            .expressions = plan.expressions,
+            .where = plan.where,
+        };
+        try validateUniqueConstraintForColumns(schema.relational_columns, constraint);
+        try appendUniqueConstraintAlloc(alloc, &schema, constraint);
+        return schema;
+    }
+
+    if (plan.expressions.len == 1 and plan.expressions[0].op == .lower and plan.columns.len == 0) {
+        if (relationalColumnIndex(schema.relational_columns, plan.index_name) != null) return error.InvalidSqlCatalog;
+        if (relationalColumnIndex(schema.relational_columns, plan.expressions[0].field) == null) return error.InvalidSqlCatalog;
+        const generated: runtime_schema.RelationalGeneratedValue = .{
+            .op = .lower,
+            .field = plan.expressions[0].field,
+        };
+        const column: runtime_schema.RelationalColumn = .{
+            .name = plan.index_name,
+            .path = plan.index_name,
+            .field_type = .keyword,
+            .nullable = true,
+            .indexed = true,
+            .generated = generated,
+            .index_where = plan.where,
+        };
+        try validateUniquePredicatesForColumns(schema.relational_columns, plan.where);
+        try appendRelationalColumnAlloc(alloc, &schema, column);
+        return schema;
+    }
+
+    if (plan.columns.len != 1 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
+    try validateUniquePredicatesForColumns(schema.relational_columns, plan.where);
+    try markColumnIndexedAlloc(alloc, &schema, plan.columns[0], plan.where);
+    return schema;
+}
+
+fn applyAlterTablePlanAlloc(
+    alloc: std.mem.Allocator,
+    current: runtime_schema.TableSchema,
+    plan: AlterTablePlan,
+) !runtime_schema.TableSchema {
+    var schema = try cloneRelationalRuntimeSchemaAlloc(alloc, current);
+    errdefer runtime_schema.freeSchema(alloc, schema);
+
+    for (plan.operations) |operation| {
+        switch (operation) {
+            .add_column => |column| {
+                try validateGeneratedColumnForColumns(schema.relational_columns, column);
+                try validateUniquePredicatesForColumns(schema.relational_columns, column.index_where);
+                try appendRelationalColumnAlloc(alloc, &schema, column);
+            },
+            .add_unique_constraint => |constraint| {
+                try validateUniqueConstraintForColumns(schema.relational_columns, constraint);
+                try appendUniqueConstraintAlloc(alloc, &schema, constraint);
+            },
+            .add_foreign_key => |foreign_key| {
+                try validateForeignKeyForColumns(schema.relational_columns, foreign_key);
+                try appendForeignKeyAlloc(alloc, &schema, foreign_key);
+            },
+            .add_check => |check| {
+                try validateCheckForColumns(schema.relational_columns, check);
+                try appendRelationalCheckAlloc(alloc, &schema, check);
+            },
+        }
+    }
+    return schema;
+}
+
+fn applyCreateUpdatePolicyPlanAlloc(
+    alloc: std.mem.Allocator,
+    current: runtime_schema.TableSchema,
+    plan: CreateUpdatePolicyPlan,
+) !runtime_schema.TableSchema {
+    var schema = try cloneRelationalRuntimeSchemaAlloc(alloc, current);
+    errdefer runtime_schema.freeSchema(alloc, schema);
+    try setColumnOnUpdatePolicyAlloc(alloc, &schema, plan.column_name, plan.on_update_value);
+    return schema;
+}
+
 const Parser = struct {
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: usize = 0,
-    schema: runtime_schema.TableSchema,
-    params: []const SqlValue,
+    schema: runtime_schema.TableSchema = .{},
+    params: []const SqlValue = &.{},
     unique_resolver: ?relational_rows.UniqueSelectorResolver = null,
+
+    fn parseDdlPlan(self: *@This()) !LoweredDdlPlan {
+        if (self.matchKeyword("create")) {
+            if (self.matchKeyword("or")) {
+                try self.expectKeyword("replace");
+            }
+            const unique = self.matchKeyword("unique");
+            if (self.peekKeyword("index")) {
+                return .{ .create_index = try self.parseCreateIndexDdl(unique) };
+            }
+            if (unique) return error.UnsupportedSqlShape;
+            if (self.peekKeyword("trigger")) {
+                return .{ .create_update_policy = try self.parseCreateTriggerPolicyDdl() };
+            }
+            return .{ .create_table = try self.parseCreateTableDdl() };
+        }
+        if (self.matchKeyword("alter")) {
+            return .{ .alter_table = try self.parseAlterTableDdl() };
+        }
+        return error.UnsupportedSqlShape;
+    }
+
+    fn parseCreateTriggerPolicyDdl(self: *@This()) !CreateUpdatePolicyPlan {
+        try self.expectKeyword("trigger");
+        const trigger_name = try self.parseIdentifierOwned();
+        var trigger_name_transferred = false;
+        errdefer if (!trigger_name_transferred) self.alloc.free(trigger_name);
+        try self.expectKeyword("before");
+        try self.expectKeyword("update");
+        if (self.matchKeyword("of")) {
+            while (!self.peekKeyword("on")) {
+                const column = try self.parseIdentifierOwned();
+                self.alloc.free(column);
+                if (self.match(.comma) == null) break;
+            }
+        }
+        try self.expectKeyword("on");
+        const table_name = try self.parseIdentifierOwned();
+        var table_name_transferred = false;
+        errdefer if (!table_name_transferred) self.alloc.free(table_name);
+        if (self.matchKeyword("for")) {
+            try self.expectKeyword("each");
+            try self.expectKeyword("row");
+        }
+        try self.expectKeyword("execute");
+        if (!(self.matchKeyword("function") or self.matchKeyword("procedure"))) return error.UnsupportedSqlShape;
+        const function_name = try self.parseIdentifierOwned();
+        defer self.alloc.free(function_name);
+        if (!isSupportedUpdatedAtTriggerFunction(function_name)) return error.UnsupportedSqlShape;
+        try self.expect(.lparen);
+        const column_name = if (self.match(.rparen) != null)
+            try self.alloc.dupe(u8, "updated_at")
+        else blk: {
+            const parsed_column = if (self.match(.string)) |token|
+                try self.alloc.dupe(u8, token.text)
+            else
+                try self.parseIdentifierOwned();
+            var parsed_column_transferred = false;
+            errdefer if (!parsed_column_transferred) self.alloc.free(parsed_column);
+            if (self.match(.comma) != null) return error.UnsupportedSqlShape;
+            try self.expect(.rparen);
+            parsed_column_transferred = true;
+            break :blk parsed_column;
+        };
+        var column_name_transferred = false;
+        errdefer if (!column_name_transferred) self.alloc.free(column_name);
+        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
+        if (!self.atEnd()) return error.UnsupportedSqlShape;
+
+        const value_json = try self.alloc.dupe(u8, "");
+        var value_transferred = false;
+        errdefer if (!value_transferred) self.alloc.free(value_json);
+        trigger_name_transferred = true;
+        table_name_transferred = true;
+        column_name_transferred = true;
+        value_transferred = true;
+        return .{
+            .trigger_name = trigger_name,
+            .table_name = table_name,
+            .column_name = column_name,
+            .on_update_value = .{ .kind = .now_ns, .value_json = value_json },
+        };
+    }
+
+    fn parseAlterTableDdl(self: *@This()) !AlterTablePlan {
+        try self.expectKeyword("table");
+        if (self.matchKeyword("if")) {
+            try self.expectKeyword("exists");
+        }
+        const table_name = try self.parseIdentifierOwned();
+        var table_name_transferred = false;
+        errdefer if (!table_name_transferred) self.alloc.free(table_name);
+
+        var operations = std.ArrayListUnmanaged(AlterTableOperation).empty;
+        errdefer {
+            for (operations.items) |operation| freeAlterTableOperation(self.alloc, operation);
+            operations.deinit(self.alloc);
+        }
+        while (true) {
+            const operation = try self.parseAlterTableOperation();
+            var operation_transferred = false;
+            errdefer if (!operation_transferred) freeAlterTableOperation(self.alloc, operation);
+            try operations.append(self.alloc, operation);
+            operation_transferred = true;
+            if (self.match(.comma) == null) break;
+        }
+        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
+        if (!self.atEnd()) return error.UnsupportedSqlShape;
+
+        const owned_operations = try operations.toOwnedSlice(self.alloc);
+        var operations_transferred = false;
+        errdefer if (!operations_transferred) {
+            for (owned_operations) |operation| freeAlterTableOperation(self.alloc, operation);
+            self.alloc.free(owned_operations);
+        };
+        table_name_transferred = true;
+        operations_transferred = true;
+        return .{
+            .table_name = table_name,
+            .operations = owned_operations,
+        };
+    }
+
+    fn parseAlterTableOperation(self: *@This()) !AlterTableOperation {
+        try self.expectKeyword("add");
+        if (self.matchKeyword("column")) {
+            if (self.matchKeyword("if")) {
+                try self.expectKeyword("not");
+                try self.expectKeyword("exists");
+            }
+            const column = try self.parseDdlColumnDefinitionStandalone();
+            return .{ .add_column = column };
+        }
+
+        const constraint_name = if (self.matchKeyword("constraint")) try self.parseIdentifierOwned() else null;
+        var constraint_name_transferred = false;
+        errdefer if (!constraint_name_transferred) if (constraint_name) |name| self.alloc.free(name);
+        if (self.matchKeyword("unique")) {
+            const columns = try self.parseDdlColumnListAlloc();
+            defer freeStringSlice(self.alloc, columns);
+            const constraint = try self.makeDdlUniqueConstraint(constraint_name, columns);
+            if (constraint_name) |name| self.alloc.free(name);
+            constraint_name_transferred = true;
+            return .{ .add_unique_constraint = constraint };
+        }
+        if (self.matchKeyword("foreign")) {
+            const foreign_key = try self.parseDdlForeignKeyConstraint(constraint_name);
+            if (constraint_name) |name| self.alloc.free(name);
+            constraint_name_transferred = true;
+            return .{ .add_foreign_key = foreign_key };
+        }
+        if (self.matchKeyword("check")) {
+            const check = try self.parseDdlCheckConstraint(constraint_name);
+            if (constraint_name) |name| self.alloc.free(name);
+            constraint_name_transferred = true;
+            return .{ .add_check = check };
+        }
+
+        return error.UnsupportedSqlShape;
+    }
+
+    fn parseCreateIndexDdl(self: *@This(), unique: bool) !CreateIndexPlan {
+        try self.expectKeyword("index");
+        if (self.matchKeyword("concurrently")) return error.UnsupportedSqlShape;
+        if (self.matchKeyword("if")) {
+            try self.expectKeyword("not");
+            try self.expectKeyword("exists");
+        }
+        const index_name = try self.parseIdentifierOwned();
+        var index_name_transferred = false;
+        errdefer if (!index_name_transferred) self.alloc.free(index_name);
+        try self.expectKeyword("on");
+        const table_name = try self.parseIdentifierOwned();
+        var table_name_transferred = false;
+        errdefer if (!table_name_transferred) self.alloc.free(table_name);
+        if (self.matchKeyword("using")) {
+            const method = self.match(.identifier) orelse return error.UnsupportedSqlShape;
+            if (!std.ascii.eqlIgnoreCase(method.text, "btree")) return error.UnsupportedSqlShape;
+        }
+
+        var columns = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (columns.items) |column| self.alloc.free(column);
+            columns.deinit(self.alloc);
+        }
+        var expressions = std.ArrayListUnmanaged(runtime_schema.UniqueExpression).empty;
+        errdefer {
+            for (expressions.items) |expression| self.alloc.free(expression.field);
+            expressions.deinit(self.alloc);
+        }
+        try self.expect(.lparen);
+        while (true) {
+            if (self.matchKeyword("lower")) {
+                try self.expect(.lparen);
+                const field = try self.parseIdentifierOwned();
+                var field_transferred = false;
+                errdefer if (!field_transferred) self.alloc.free(field);
+                try self.expect(.rparen);
+                try expressions.append(self.alloc, .{ .op = .lower, .field = field });
+                field_transferred = true;
+            } else {
+                const column = try self.parseIdentifierOwned();
+                var column_transferred = false;
+                errdefer if (!column_transferred) self.alloc.free(column);
+                if (self.peekKind(.lparen)) return error.UnsupportedSqlShape;
+                try columns.append(self.alloc, column);
+                column_transferred = true;
+            }
+            if (self.match(.comma) == null) break;
+        }
+        try self.expect(.rparen);
+        if (columns.items.len == 0 and expressions.items.len == 0) return error.UnsupportedSqlShape;
+
+        var predicates: []const runtime_schema.UniquePredicate = &.{};
+        errdefer freeDdlUniquePredicates(self.alloc, predicates);
+        if (self.matchKeyword("where")) {
+            predicates = try self.parseDdlUniquePredicatesAlloc();
+        }
+        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
+        if (!self.atEnd()) return error.UnsupportedSqlShape;
+
+        const owned_columns = try columns.toOwnedSlice(self.alloc);
+        var columns_transferred = false;
+        errdefer if (!columns_transferred) freeStringSlice(self.alloc, owned_columns);
+        const owned_expressions = try expressions.toOwnedSlice(self.alloc);
+        var expressions_transferred = false;
+        errdefer if (!expressions_transferred) freeDdlUniqueExpressions(self.alloc, owned_expressions);
+
+        index_name_transferred = true;
+        table_name_transferred = true;
+        columns_transferred = true;
+        expressions_transferred = true;
+        return .{
+            .index_name = index_name,
+            .table_name = table_name,
+            .unique = unique,
+            .columns = owned_columns,
+            .expressions = owned_expressions,
+            .where = predicates,
+        };
+    }
+
+    fn parseCreateTableDdl(self: *@This()) !CreateTablePlan {
+        if (self.matchKeyword("temporary") or self.matchKeyword("temp") or self.matchKeyword("unlogged")) return error.UnsupportedSqlShape;
+        try self.expectKeyword("table");
+        if (self.matchKeyword("if")) {
+            try self.expectKeyword("not");
+            try self.expectKeyword("exists");
+        }
+
+        const table_name = try self.parseIdentifierOwned();
+        errdefer self.alloc.free(table_name);
+        try self.expect(.lparen);
+
+        var columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
+        errdefer {
+            freeDdlRelationalColumns(self.alloc, columns.items);
+        }
+        var primary_key: ?runtime_schema.PrimaryKey = null;
+        errdefer if (primary_key) |pk| freeDdlPrimaryKey(self.alloc, pk);
+        var unique_constraints = std.ArrayListUnmanaged(runtime_schema.UniqueConstraint).empty;
+        errdefer {
+            freeDdlUniqueConstraints(self.alloc, unique_constraints.items);
+        }
+        var foreign_keys = std.ArrayListUnmanaged(runtime_schema.ForeignKey).empty;
+        errdefer {
+            freeDdlForeignKeys(self.alloc, foreign_keys.items);
+        }
+        var checks = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+        errdefer {
+            freeDdlRelationalChecks(self.alloc, checks.items);
+        }
+
+        while (true) {
+            const constraint_name = if (self.matchKeyword("constraint")) try self.parseIdentifierOwned() else null;
+            var constraint_name_transferred = false;
+            errdefer if (!constraint_name_transferred) if (constraint_name) |name| self.alloc.free(name);
+
+            if (self.peekKeyword("primary") or self.peekKeyword("unique") or self.peekKeyword("foreign") or self.peekKeyword("check")) {
+                try self.parseDdlTableConstraint(constraint_name, &primary_key, &unique_constraints, &foreign_keys, &checks);
+                if (constraint_name) |name| self.alloc.free(name);
+                constraint_name_transferred = true;
+            } else {
+                if (constraint_name != null) return error.UnsupportedSqlShape;
+                try self.parseDdlColumnDefinition(&columns, &primary_key, &unique_constraints, &checks);
+            }
+
+            if (self.match(.comma) == null) break;
+        }
+        try self.expect(.rparen);
+        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
+        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        if (primary_key == null) return error.UnsupportedSqlShape;
+
+        return .{
+            .table_name = table_name,
+            .columns = try columns.toOwnedSlice(self.alloc),
+            .primary_key = primary_key,
+            .unique_constraints = try unique_constraints.toOwnedSlice(self.alloc),
+            .foreign_keys = try foreign_keys.toOwnedSlice(self.alloc),
+            .checks = try checks.toOwnedSlice(self.alloc),
+        };
+    }
+
+    const DdlType = struct {
+        field_type: runtime_schema.AntflyType,
+        array_item_type: ?runtime_schema.AntflyType = null,
+    };
+
+    fn parseDdlColumnDefinition(
+        self: *@This(),
+        columns: *std.ArrayListUnmanaged(runtime_schema.RelationalColumn),
+        primary_key: *?runtime_schema.PrimaryKey,
+        unique_constraints: *std.ArrayListUnmanaged(runtime_schema.UniqueConstraint),
+        checks: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+    ) !void {
+        var column = try self.parseDdlColumnDefinitionStandalone();
+        var column_transferred = false;
+        errdefer if (!column_transferred) freeDdlRelationalColumn(self.alloc, column);
+        if (findDdlColumn(columns.items, column.name) != null) return error.UnsupportedSqlShape;
+        while (!self.peekKind(.comma) and !self.peekKind(.rparen)) {
+            if (self.matchKeyword("primary")) {
+                try self.expectKeyword("key");
+                column.nullable = false;
+                try self.installDdlPrimaryKey(primary_key, &.{column.name});
+            } else if (self.matchKeyword("unique")) {
+                try self.appendDdlUniqueConstraint(unique_constraints, null, &.{column.name});
+            } else if (self.matchKeyword("check")) {
+                const check = try self.parseDdlCheckConstraint(null);
+                var check_transferred = false;
+                errdefer if (!check_transferred) freeDdlRelationalCheck(self.alloc, check);
+                try checks.append(self.alloc, check);
+                check_transferred = true;
+            } else if (self.matchKeyword("references")) {
+                return error.UnsupportedSqlShape;
+            } else if (self.matchKeyword("constraint")) {
+                return error.UnsupportedSqlShape;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        }
+
+        try columns.append(self.alloc, column);
+        column_transferred = true;
+    }
+
+    fn parseDdlColumnDefinitionStandalone(self: *@This()) !runtime_schema.RelationalColumn {
+        const name = try self.parseIdentifierOwned();
+        var name_transferred = false;
+        errdefer if (!name_transferred) self.alloc.free(name);
+
+        const ddl_type = try self.parseDdlType();
+        const path = try self.alloc.dupe(u8, name);
+        var path_transferred = false;
+        errdefer if (!path_transferred) self.alloc.free(path);
+        var column: runtime_schema.RelationalColumn = .{
+            .name = name,
+            .path = path,
+            .field_type = ddl_type.field_type,
+            .array_item_type = ddl_type.array_item_type,
+            .nullable = true,
+        };
+        var column_transferred = false;
+        errdefer if (!column_transferred) freeDdlRelationalColumn(self.alloc, column);
+        name_transferred = true;
+        path_transferred = true;
+
+        while (!self.peekKind(.comma) and !self.peekKind(.rparen) and !self.peekKind(.semicolon) and !self.peekKeyword("primary") and !self.peekKeyword("unique") and !self.peekKeyword("check") and !self.peekKeyword("references") and !self.peekKeyword("constraint")) {
+            if (self.matchKeyword("not")) {
+                try self.expectKeyword("null");
+                column.nullable = false;
+            } else if (self.matchKeyword("null")) {
+                column.nullable = true;
+            } else if (self.matchKeyword("default")) {
+                if (column.default_value != null) return error.UnsupportedSqlShape;
+                if (column.generated != null) return error.UnsupportedSqlShape;
+                column.default_value = try self.parseDdlDefaultValue(column.field_type);
+            } else if (self.matchKeyword("generated")) {
+                if (column.default_value != null or column.generated != null) return error.UnsupportedSqlShape;
+                column.generated = try self.parseDdlGeneratedValue();
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        }
+
+        column_transferred = true;
+        return column;
+    }
+
+    fn parseDdlGeneratedValue(self: *@This()) !runtime_schema.RelationalGeneratedValue {
+        try self.expectKeyword("always");
+        try self.expectKeyword("as");
+        try self.expect(.lparen);
+        const generated = try self.parseDdlGeneratedExpression();
+        var generated_transferred = false;
+        errdefer if (!generated_transferred) freeDdlGeneratedValue(self.alloc, generated);
+        try self.expect(.rparen);
+        try self.expectKeyword("stored");
+        generated_transferred = true;
+        return generated;
+    }
+
+    fn parseDdlGeneratedExpression(self: *@This()) !runtime_schema.RelationalGeneratedValue {
+        if (self.matchKeyword("lower")) {
+            try self.expect(.lparen);
+            const field = try self.parseIdentifierOwned();
+            var field_transferred = false;
+            errdefer if (!field_transferred) self.alloc.free(field);
+            try self.expect(.rparen);
+            const separator = try self.alloc.dupe(u8, "");
+            var separator_transferred = false;
+            errdefer if (!separator_transferred) self.alloc.free(separator);
+            field_transferred = true;
+            separator_transferred = true;
+            return .{ .op = .lower, .field = field, .separator = separator };
+        }
+        if (self.matchKeyword("concat")) {
+            try self.expect(.lparen);
+            var fields = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer {
+                for (fields.items) |field| self.alloc.free(field);
+                fields.deinit(self.alloc);
+            }
+            const first = try self.parseIdentifierOwned();
+            var first_transferred = false;
+            errdefer if (!first_transferred) self.alloc.free(first);
+            try fields.append(self.alloc, first);
+            first_transferred = true;
+
+            var separator: ?[]const u8 = null;
+            errdefer if (separator) |value| self.alloc.free(value);
+            while (self.match(.comma) != null) {
+                if (self.match(.string)) |token| {
+                    if (separator) |existing| {
+                        if (!std.mem.eql(u8, existing, token.text)) return error.UnsupportedSqlShape;
+                    } else {
+                        separator = try self.alloc.dupe(u8, token.text);
+                    }
+                    try self.expect(.comma);
+                } else if (separator == null) {
+                    separator = try self.alloc.dupe(u8, "");
+                }
+                const field = try self.parseIdentifierOwned();
+                var field_transferred = false;
+                errdefer if (!field_transferred) self.alloc.free(field);
+                try fields.append(self.alloc, field);
+                field_transferred = true;
+            }
+            try self.expect(.rparen);
+            if (fields.items.len < 2) return error.UnsupportedSqlShape;
+            const owned_fields = try fields.toOwnedSlice(self.alloc);
+            var fields_transferred = false;
+            errdefer if (!fields_transferred) freeStringSlice(self.alloc, owned_fields);
+            const owned_separator = separator orelse try self.alloc.dupe(u8, "");
+            separator = null;
+            fields_transferred = true;
+            return .{ .op = .concat, .fields = owned_fields, .separator = owned_separator };
+        }
+        return error.UnsupportedSqlShape;
+    }
+
+    fn parseDdlTableConstraint(
+        self: *@This(),
+        constraint_name: ?[]const u8,
+        primary_key: *?runtime_schema.PrimaryKey,
+        unique_constraints: *std.ArrayListUnmanaged(runtime_schema.UniqueConstraint),
+        foreign_keys: *std.ArrayListUnmanaged(runtime_schema.ForeignKey),
+        checks: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+    ) !void {
+        if (self.matchKeyword("primary")) {
+            try self.expectKeyword("key");
+            const columns = try self.parseDdlColumnListAlloc();
+            defer freeStringSlice(self.alloc, columns);
+            try self.installDdlPrimaryKey(primary_key, columns);
+        } else if (self.matchKeyword("unique")) {
+            const columns = try self.parseDdlColumnListAlloc();
+            defer freeStringSlice(self.alloc, columns);
+            try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, columns);
+        } else if (self.matchKeyword("foreign")) {
+            const foreign_key = try self.parseDdlForeignKeyConstraint(constraint_name);
+            var transferred = false;
+            errdefer if (!transferred) freeDdlForeignKey(self.alloc, foreign_key);
+            try foreign_keys.append(self.alloc, foreign_key);
+            transferred = true;
+        } else if (self.matchKeyword("check")) {
+            const check = try self.parseDdlCheckConstraint(constraint_name);
+            var transferred = false;
+            errdefer if (!transferred) freeDdlRelationalCheck(self.alloc, check);
+            try checks.append(self.alloc, check);
+            transferred = true;
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+
+    fn parseDdlType(self: *@This()) !DdlType {
+        const first = self.match(.identifier) orelse return error.UnsupportedSqlShape;
+        const base = ddlBaseTypeForName(first.text) orelse blk: {
+            if (std.ascii.eqlIgnoreCase(first.text, "character")) {
+                try self.expectKeyword("varying");
+                break :blk runtime_schema.AntflyType.keyword;
+            }
+            if (std.ascii.eqlIgnoreCase(first.text, "double")) {
+                try self.expectKeyword("precision");
+                break :blk runtime_schema.AntflyType.numeric;
+            }
+            if (std.ascii.eqlIgnoreCase(first.text, "timestamp")) {
+                if (self.matchKeyword("with")) {
+                    try self.expectKeyword("time");
+                    try self.expectKeyword("zone");
+                } else if (self.matchKeyword("without")) {
+                    try self.expectKeyword("time");
+                    try self.expectKeyword("zone");
+                }
+                break :blk runtime_schema.AntflyType.datetime;
+            }
+            return error.UnsupportedSqlShape;
+        };
+
+        if (self.peekKind(.lparen)) try self.skipParenthesizedTokens();
+        const is_array = if (self.match(.lbracket) != null) blk: {
+            try self.expect(.rbracket);
+            break :blk true;
+        } else false;
+        if (!is_array) return .{ .field_type = base };
+        if (base == .json or base == .array or base == .blob) return error.UnsupportedSqlShape;
+        return .{ .field_type = .array, .array_item_type = base };
+    }
+
+    fn parseDdlDefaultValue(self: *@This(), field_type: runtime_schema.AntflyType) !runtime_schema.RelationalDefaultValue {
+        if (self.matchKeyword("null")) {
+            return .{ .kind = .literal, .value_json = try self.alloc.dupe(u8, "null") };
+        }
+        if (self.matchKeyword("gen_random_uuid") or self.matchKeyword("uuid_generate_v4")) {
+            try self.expect(.lparen);
+            try self.expect(.rparen);
+            if (field_type != .keyword and field_type != .text and field_type != .link) return error.UnsupportedSqlShape;
+            return .{ .kind = .uuid_v4, .value_json = try self.alloc.dupe(u8, "") };
+        }
+        if (self.matchKeyword("now")) {
+            try self.expect(.lparen);
+            try self.expect(.rparen);
+            if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
+            return .{ .kind = .now_ns, .value_json = try self.alloc.dupe(u8, "") };
+        }
+        if (self.matchKeyword("current_timestamp")) {
+            if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
+            return .{ .kind = .now_ns, .value_json = try self.alloc.dupe(u8, "") };
+        }
+        const value = try self.parseSqlColumnValueAlloc(.{ .name = "", .path = "", .field_type = field_type });
+        return .{ .kind = .literal, .value_json = value };
+    }
+
+    fn parseDdlCheckConstraint(self: *@This(), constraint_name: ?[]const u8) !runtime_schema.RelationalCheck {
+        try self.expect(.lparen);
+        const field = try self.parseIdentifierOwned();
+        var field_transferred = false;
+        errdefer if (!field_transferred) self.alloc.free(field);
+        const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
+            if (self.matchKeyword("not")) {
+                try self.expectKeyword("null");
+                break :blk .is_not_null;
+            }
+            try self.expectKeyword("null");
+            break :blk .is_null;
+        } else try self.parseComparisonOp();
+        const value_json = if (op == .is_null or op == .is_not_null)
+            null
+        else
+            try self.parseSqlUntypedValueJsonAlloc();
+        var value_transferred = false;
+        errdefer if (!value_transferred) if (value_json) |json| self.alloc.free(json);
+        try self.expect(.rparen);
+        const name = if (constraint_name) |name|
+            try self.alloc.dupe(u8, name)
+        else
+            try std.fmt.allocPrint(self.alloc, "{s}_{s}_check", .{ field, relationalCheckOpToken(op) });
+        var name_transferred = false;
+        errdefer if (!name_transferred) self.alloc.free(name);
+        field_transferred = true;
+        value_transferred = true;
+        name_transferred = true;
+        return .{ .name = name, .field = field, .op = op, .value_json = value_json };
+    }
+
+    fn parseDdlForeignKeyConstraint(self: *@This(), constraint_name: ?[]const u8) !runtime_schema.ForeignKey {
+        try self.expectKeyword("key");
+        const child_columns = try self.parseDdlColumnListAlloc();
+        var child_transferred = false;
+        errdefer if (!child_transferred) freeStringSlice(self.alloc, child_columns);
+
+        try self.expectKeyword("references");
+        const parent_table = try self.parseIdentifierOwned();
+        var parent_table_transferred = false;
+        errdefer if (!parent_table_transferred) self.alloc.free(parent_table);
+        const parent_columns = try self.parseDdlColumnListAlloc();
+        var parent_transferred = false;
+        errdefer if (!parent_transferred) freeStringSlice(self.alloc, parent_columns);
+
+        var on_delete: runtime_schema.ForeignKeyAction = .restrict;
+        var on_update: runtime_schema.ForeignKeyAction = .restrict;
+        var deferrable = false;
+        var timing: runtime_schema.ForeignKeyTiming = .immediate;
+        while (!self.peekKind(.comma) and !self.peekKind(.rparen)) {
+            if (self.matchKeyword("on")) {
+                if (self.matchKeyword("delete")) {
+                    on_delete = try self.parseDdlForeignKeyAction();
+                } else if (self.matchKeyword("update")) {
+                    on_update = try self.parseDdlForeignKeyAction();
+                } else {
+                    return error.UnsupportedSqlShape;
+                }
+            } else if (self.matchKeyword("deferrable")) {
+                deferrable = true;
+            } else if (self.matchKeyword("not")) {
+                try self.expectKeyword("deferrable");
+                deferrable = false;
+            } else if (self.matchKeyword("initially")) {
+                if (self.matchKeyword("deferred")) {
+                    timing = .deferred;
+                    deferrable = true;
+                } else {
+                    try self.expectKeyword("immediate");
+                    timing = .immediate;
+                }
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        }
+
+        const name = if (constraint_name) |existing|
+            try self.alloc.dupe(u8, existing)
+        else
+            try std.fmt.allocPrint(self.alloc, "{s}_{s}_fkey", .{ parent_table, child_columns[0] });
+        var name_transferred = false;
+        errdefer if (!name_transferred) self.alloc.free(name);
+
+        child_transferred = true;
+        parent_table_transferred = true;
+        parent_transferred = true;
+        name_transferred = true;
+        return .{
+            .name = name,
+            .child_columns = child_columns,
+            .parent_table = parent_table,
+            .parent_columns = parent_columns,
+            .on_delete = on_delete,
+            .on_update = on_update,
+            .deferrable = deferrable,
+            .timing = timing,
+        };
+    }
+
+    fn parseDdlForeignKeyAction(self: *@This()) !runtime_schema.ForeignKeyAction {
+        if (self.matchKeyword("cascade")) return .cascade;
+        if (self.matchKeyword("restrict")) return .restrict;
+        if (self.matchKeyword("no")) {
+            try self.expectKeyword("action");
+            return .no_action;
+        }
+        if (self.matchKeyword("set")) {
+            try self.expectKeyword("null");
+            return .set_null;
+        }
+        return error.UnsupportedSqlShape;
+    }
+
+    fn parseDdlColumnListAlloc(self: *@This()) ![]const []const u8 {
+        try self.expect(.lparen);
+        var columns = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (columns.items) |column| self.alloc.free(column);
+            columns.deinit(self.alloc);
+        }
+        while (true) {
+            const column = try self.parseIdentifierOwned();
+            var transferred = false;
+            errdefer if (!transferred) self.alloc.free(column);
+            try columns.append(self.alloc, column);
+            transferred = true;
+            if (self.match(.comma) == null) break;
+        }
+        try self.expect(.rparen);
+        return try columns.toOwnedSlice(self.alloc);
+    }
+
+    fn parseDdlUniquePredicatesAlloc(self: *@This()) ![]const runtime_schema.UniquePredicate {
+        var predicates = std.ArrayListUnmanaged(runtime_schema.UniquePredicate).empty;
+        errdefer {
+            for (predicates.items) |predicate| {
+                self.alloc.free(predicate.field);
+                if (predicate.value_json) |value| self.alloc.free(value);
+            }
+            predicates.deinit(self.alloc);
+        }
+        while (true) {
+            const field = try self.parseIdentifierOwned();
+            var field_transferred = false;
+            errdefer if (!field_transferred) self.alloc.free(field);
+            if (self.matchKeyword("is")) {
+                const op: runtime_schema.UniquePredicateOp = if (self.matchKeyword("not")) blk: {
+                    try self.expectKeyword("null");
+                    break :blk .is_not_null;
+                } else blk: {
+                    try self.expectKeyword("null");
+                    break :blk .is_null;
+                };
+                try predicates.append(self.alloc, .{ .field = field, .op = op });
+                field_transferred = true;
+            } else {
+                const op: runtime_schema.UniquePredicateOp = if (self.match(.eq) != null) .eq else if (self.match(.neq) != null) .ne else return error.UnsupportedSqlShape;
+                const value_json = try self.parseSqlUntypedValueJsonAlloc();
+                var value_transferred = false;
+                errdefer if (!value_transferred) self.alloc.free(value_json);
+                try predicates.append(self.alloc, .{ .field = field, .op = op, .value_json = value_json });
+                field_transferred = true;
+                value_transferred = true;
+            }
+            if (!self.matchKeyword("and")) break;
+        }
+        return try predicates.toOwnedSlice(self.alloc);
+    }
+
+    fn installDdlPrimaryKey(self: *@This(), primary_key: *?runtime_schema.PrimaryKey, columns: []const []const u8) !void {
+        if (primary_key.* != null) return error.UnsupportedSqlShape;
+        primary_key.* = .{ .columns = try cloneStringSlice(self.alloc, columns) };
+    }
+
+    fn appendDdlUniqueConstraint(
+        self: *@This(),
+        unique_constraints: *std.ArrayListUnmanaged(runtime_schema.UniqueConstraint),
+        constraint_name: ?[]const u8,
+        columns: []const []const u8,
+    ) !void {
+        const constraint = try self.makeDdlUniqueConstraint(constraint_name, columns);
+        var transferred = false;
+        errdefer if (!transferred) freeDdlUniqueConstraint(self.alloc, constraint);
+        try unique_constraints.append(self.alloc, constraint);
+        transferred = true;
+    }
+
+    fn makeDdlUniqueConstraint(
+        self: *@This(),
+        constraint_name: ?[]const u8,
+        columns: []const []const u8,
+    ) !runtime_schema.UniqueConstraint {
+        const owned_columns = try cloneStringSlice(self.alloc, columns);
+        var columns_transferred = false;
+        errdefer if (!columns_transferred) freeStringSlice(self.alloc, owned_columns);
+        const name = if (constraint_name) |existing|
+            try self.alloc.dupe(u8, existing)
+        else
+            try self.defaultUniqueConstraintNameAlloc(columns);
+        var name_transferred = false;
+        errdefer if (!name_transferred) self.alloc.free(name);
+        columns_transferred = true;
+        name_transferred = true;
+        return .{ .name = name, .columns = owned_columns };
+    }
+
+    fn defaultUniqueConstraintNameAlloc(self: *@This(), columns: []const []const u8) ![]const u8 {
+        var buf = std.ArrayListUnmanaged(u8).empty;
+        errdefer buf.deinit(self.alloc);
+        try buf.appendSlice(self.alloc, columns[0]);
+        for (columns[1..]) |column| {
+            try buf.append(self.alloc, '_');
+            try buf.appendSlice(self.alloc, column);
+        }
+        try buf.appendSlice(self.alloc, "_key");
+        return try buf.toOwnedSlice(self.alloc);
+    }
+
+    fn parseSqlUntypedValueJsonAlloc(self: *@This()) ![]const u8 {
+        if (self.matchKeyword("true")) return try self.alloc.dupe(u8, "true");
+        if (self.matchKeyword("false")) return try self.alloc.dupe(u8, "false");
+        if (self.matchKeyword("null")) return try self.alloc.dupe(u8, "null");
+        if (self.match(.string)) |token| return try std.json.Stringify.valueAlloc(self.alloc, token.text, .{});
+        if (self.match(.number)) |token| return try self.alloc.dupe(u8, token.text);
+        return error.UnsupportedSqlShape;
+    }
+
+    fn skipParenthesizedTokens(self: *@This()) !void {
+        try self.expect(.lparen);
+        var depth: usize = 1;
+        while (self.pos < self.tokens.len and depth > 0) {
+            if (self.match(.lparen) != null) {
+                depth += 1;
+            } else if (self.match(.rparen) != null) {
+                depth -= 1;
+            } else {
+                self.pos += 1;
+            }
+        }
+        if (depth != 0) return error.UnsupportedSqlShape;
+    }
 
     fn parseQueryPlan(self: *@This()) !LoweredQueryPlan {
         if (!self.peekKeyword("with")) {
@@ -448,6 +1557,7 @@ const Parser = struct {
         errdefer freeJsonExtract(self.alloc, select.json_extract);
         errdefer freeArrayLengthProjections(self.alloc, select.array_length);
         errdefer freeCoalesceProjections(self.alloc, select.coalesce);
+        errdefer freeFieldAliasProjections(self.alloc, select.field_aliases);
 
         try self.expectKeyword("from");
         const table_name = try self.parseIdentifierOwned();
@@ -493,6 +1603,11 @@ const Parser = struct {
             freePredicateGroups(self.alloc, or_predicates.items);
             or_predicates.deinit(self.alloc);
         }
+        var not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
+        errdefer {
+            freePredicateGroups(self.alloc, not_predicates.items);
+            not_predicates.deinit(self.alloc);
+        }
         var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
         errdefer {
             freeOrderBy(self.alloc, order_by.items);
@@ -505,7 +1620,7 @@ const Parser = struct {
 
         while (!self.atEnd()) {
             if (self.matchKeyword("where")) {
-                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates);
+                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates);
             } else if (self.matchKeyword("order")) {
                 try self.expectKeyword("by");
                 try self.parseOrderBy(&order_by);
@@ -540,10 +1655,12 @@ const Parser = struct {
                 .json_path_eq = try json_path_eq.toOwnedSlice(self.alloc),
                 .json_path_exists = try json_path_exists.toOwnedSlice(self.alloc),
                 .or_predicates = try or_predicates.toOwnedSlice(self.alloc),
+                .not_predicates = try not_predicates.toOwnedSlice(self.alloc),
                 .select = select.fields,
                 .json_extract = select.json_extract,
                 .array_length = select.array_length,
                 .coalesce = select.coalesce,
+                .field_aliases = select.field_aliases,
                 .select_all = select.select_all,
                 .order_by = try order_by.toOwnedSlice(self.alloc),
                 .row_claim = row_claim,
@@ -608,6 +1725,11 @@ const Parser = struct {
             freePredicateGroups(self.alloc, or_predicates.items);
             or_predicates.deinit(self.alloc);
         }
+        var not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
+        errdefer {
+            freePredicateGroups(self.alloc, not_predicates.items);
+            not_predicates.deinit(self.alloc);
+        }
         var group_by = std.ArrayListUnmanaged([]const u8).empty;
         errdefer {
             for (group_by.items) |field| self.alloc.free(field);
@@ -628,7 +1750,7 @@ const Parser = struct {
         var offset: u32 = 0;
         while (!self.atEnd()) {
             if (self.matchKeyword("where")) {
-                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates);
+                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates);
             } else if (self.matchKeyword("group")) {
                 try self.expectKeyword("by");
                 try self.parseGroupBy(&group_by);
@@ -664,6 +1786,7 @@ const Parser = struct {
                     .json_path_eq = try json_path_eq.toOwnedSlice(self.alloc),
                     .json_path_exists = try json_path_exists.toOwnedSlice(self.alloc),
                     .or_predicates = try or_predicates.toOwnedSlice(self.alloc),
+                    .not_predicates = try not_predicates.toOwnedSlice(self.alloc),
                     .select_all = true,
                 },
                 .group_by = try group_by.toOwnedSlice(self.alloc),
@@ -879,11 +2002,16 @@ const Parser = struct {
             freeJsonSetValues(self.alloc, json_set.items);
             json_set.deinit(self.alloc);
         }
+        var array_update = std.ArrayListUnmanaged(ArrayTransformValue).empty;
+        errdefer {
+            freeArrayTransformValues(self.alloc, array_update.items);
+            array_update.deinit(self.alloc);
+        }
         while (true) {
-            try self.parseUpdateAssignment(&patch, &increment, &json_set);
+            try self.parseUpdateAssignment(&patch, &increment, &json_set, &array_update);
             if (self.match(.comma) == null) break;
         }
-        if (patch.items.len == 0 and increment.items.len == 0 and json_set.items.len == 0) return error.UnsupportedSqlShape;
+        if (patch.items.len == 0 and increment.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
 
         try self.expectKeyword("where");
         const where_json = try self.parsePrimaryWhereJsonAlloc();
@@ -903,7 +2031,7 @@ const Parser = struct {
         else
             try self.expectedVersionForWhereAlloc(table_name, where_json);
 
-        const body_json = try self.updateBodyJsonAlloc(where_json, patch.items, increment.items, json_set.items, returning_fields, explicit_expected_version);
+        const body_json = try self.updateBodyJsonAlloc(where_json, patch.items, increment.items, json_set.items, array_update.items, returning_fields, explicit_expected_version);
         defer self.alloc.free(body_json);
         var batch = try relational_rows.parseRowsBatchRequestWithResolver(self.alloc, table_name, body_json, self.schema, self.unique_resolver orelse return error.UnsupportedRowsSelector);
         errdefer batch.deinit(self.alloc);
@@ -914,6 +2042,8 @@ const Parser = struct {
         increment.deinit(self.alloc);
         freeJsonSetValues(self.alloc, json_set.items);
         json_set.deinit(self.alloc);
+        freeArrayTransformValues(self.alloc, array_update.items);
+        array_update.deinit(self.alloc);
         freeStringSlice(self.alloc, returning_fields);
 
         return .{
@@ -964,6 +2094,7 @@ const Parser = struct {
         json_extract: []const db_mod.types.RelationalRowsJsonExtractProjection = &.{},
         array_length: []const db_mod.types.RelationalRowsArrayLengthProjection = &.{},
         coalesce: []const db_mod.types.RelationalRowsCoalesceProjection = &.{},
+        field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection = &.{},
         select_all: bool = false,
     };
 
@@ -1006,6 +2137,14 @@ const Parser = struct {
             }
             coalesce.deinit(self.alloc);
         }
+        var field_aliases = std.ArrayListUnmanaged(db_mod.types.RelationalRowsFieldAliasProjection).empty;
+        errdefer {
+            for (field_aliases.items) |projection| {
+                self.alloc.free(projection.output);
+                self.alloc.free(projection.field);
+            }
+            field_aliases.deinit(self.alloc);
+        }
         while (true) {
             const item = try self.parseSelectItem();
             var item_transferred = false;
@@ -1015,6 +2154,7 @@ const Parser = struct {
                 .json_extract => |projection| try json_extract.append(self.alloc, projection),
                 .array_length => |projection| try array_length.append(self.alloc, projection),
                 .coalesce => |projection| try coalesce.append(self.alloc, projection),
+                .field_alias => |projection| try field_aliases.append(self.alloc, projection),
             }
             item_transferred = true;
             if (self.match(.comma) == null) break;
@@ -1024,6 +2164,7 @@ const Parser = struct {
             .json_extract = try json_extract.toOwnedSlice(self.alloc),
             .array_length = try array_length.toOwnedSlice(self.alloc),
             .coalesce = try coalesce.toOwnedSlice(self.alloc),
+            .field_aliases = try field_aliases.toOwnedSlice(self.alloc),
             .select_all = false,
         };
     }
@@ -1388,6 +2529,7 @@ const Parser = struct {
         json_extract: db_mod.types.RelationalRowsJsonExtractProjection,
         array_length: db_mod.types.RelationalRowsArrayLengthProjection,
         coalesce: db_mod.types.RelationalRowsCoalesceProjection,
+        field_alias: db_mod.types.RelationalRowsFieldAliasProjection,
     };
 
     const FieldJsonValue = struct {
@@ -1404,6 +2546,12 @@ const Parser = struct {
     const JsonSetValue = struct {
         field: []const u8,
         path: []const []const u8,
+        value_json: []const u8,
+    };
+
+    const ArrayTransformValue = struct {
+        field: []const u8,
+        op: db_mod.types.TransformOpType,
         value_json: []const u8,
     };
 
@@ -1428,6 +2576,7 @@ const Parser = struct {
         patch: []const FieldJsonValue = &.{},
         increment: []const FieldJsonValue = &.{},
         json_set: []const JsonSetValue = &.{},
+        array_update: []const ArrayTransformValue = &.{},
     };
 
     fn parseConflictClause(self: *@This(), insert_columns: []const []const u8, insert_values: []const []const u8) !ConflictClause {
@@ -1460,11 +2609,16 @@ const Parser = struct {
             freeJsonSetValues(self.alloc, json_set.items);
             json_set.deinit(self.alloc);
         }
+        var array_update = std.ArrayListUnmanaged(ArrayTransformValue).empty;
+        errdefer {
+            freeArrayTransformValues(self.alloc, array_update.items);
+            array_update.deinit(self.alloc);
+        }
         while (true) {
-            try self.parseConflictUpdateAssignment(insert_columns, insert_values, &patch, &increment, &json_set);
+            try self.parseConflictUpdateAssignment(insert_columns, insert_values, &patch, &increment, &json_set, &array_update);
             if (self.match(.comma) == null) break;
         }
-        if (patch.items.len == 0 and increment.items.len == 0 and json_set.items.len == 0) return error.UnsupportedSqlShape;
+        if (patch.items.len == 0 and increment.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
 
         return .{
             .target = target,
@@ -1472,6 +2626,7 @@ const Parser = struct {
             .patch = try patch.toOwnedSlice(self.alloc),
             .increment = try increment.toOwnedSlice(self.alloc),
             .json_set = try json_set.toOwnedSlice(self.alloc),
+            .array_update = try array_update.toOwnedSlice(self.alloc),
         };
     }
 
@@ -1546,6 +2701,7 @@ const Parser = struct {
         patch: *std.ArrayListUnmanaged(FieldJsonValue),
         increment: *std.ArrayListUnmanaged(FieldJsonValue),
         json_set: *std.ArrayListUnmanaged(JsonSetValue),
+        array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
     ) !void {
         const field = try self.parseIdentifierOwned();
         var field_transferred = false;
@@ -1565,7 +2721,7 @@ const Parser = struct {
             var path_transferred = false;
             errdefer if (!path_transferred) freeStringSlice(self.alloc, path);
             try self.expect(.comma);
-            const value_json = try self.parseConflictValueJsonAlloc(column, insert_columns, insert_values);
+            const value_json = try self.parseJsonValueAlloc();
             var value_transferred = false;
             errdefer if (!value_transferred) self.alloc.free(value_json);
             if (self.match(.comma) != null) {
@@ -1579,6 +2735,27 @@ const Parser = struct {
             });
             field_transferred = true;
             path_transferred = true;
+            value_transferred = true;
+            return;
+        }
+        if (self.matchKeyword("array_append") or self.matchKeyword("array_remove")) {
+            const op: db_mod.types.TransformOpType = if (std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "array_append")) .push else .pull;
+            if (column.field_type != .array) return error.InvalidSqlCatalog;
+            try self.expect(.lparen);
+            const array_field = try self.parseIdentifierOwned();
+            defer self.alloc.free(array_field);
+            if (!std.mem.eql(u8, array_field, field)) return error.UnsupportedSqlShape;
+            try self.expect(.comma);
+            const value_json = try self.parseConflictValueJsonAlloc(column, insert_columns, insert_values);
+            var value_transferred = false;
+            errdefer if (!value_transferred) self.alloc.free(value_json);
+            try self.expect(.rparen);
+            try array_update.append(self.alloc, .{
+                .field = field,
+                .op = op,
+                .value_json = value_json,
+            });
+            field_transferred = true;
             value_transferred = true;
             return;
         }
@@ -1617,7 +2794,8 @@ const Parser = struct {
             if (std.mem.startsWith(u8, token.text, "excluded.")) {
                 self.pos += 1;
                 const source = token.text["excluded.".len..];
-                if (!std.mem.eql(u8, source, column.name)) return error.UnsupportedSqlShape;
+                const source_column = relationalColumnForField(self.schema, source, null) orelse return error.InvalidSqlCatalog;
+                if (source_column.field_type != column.field_type) return error.UnsupportedSqlShape;
                 for (insert_columns, insert_values) |insert_column, insert_value| {
                     if (std.mem.eql(u8, insert_column, source)) return try self.alloc.dupe(u8, insert_value);
                 }
@@ -1737,6 +2915,7 @@ const Parser = struct {
         patch: *std.ArrayListUnmanaged(FieldJsonValue),
         increment: *std.ArrayListUnmanaged(FieldJsonValue),
         json_set: *std.ArrayListUnmanaged(JsonSetValue),
+        array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
     ) !void {
         const field = try self.parseIdentifierOwned();
         var field_transferred = false;
@@ -1770,6 +2949,27 @@ const Parser = struct {
             });
             field_transferred = true;
             path_transferred = true;
+            value_transferred = true;
+            return;
+        }
+        if (self.matchKeyword("array_append") or self.matchKeyword("array_remove")) {
+            const op: db_mod.types.TransformOpType = if (std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "array_append")) .push else .pull;
+            if (column.field_type != .array) return error.InvalidSqlCatalog;
+            try self.expect(.lparen);
+            const array_field = try self.parseIdentifierOwned();
+            defer self.alloc.free(array_field);
+            if (!std.mem.eql(u8, array_field, field)) return error.UnsupportedSqlShape;
+            try self.expect(.comma);
+            const value_json = try self.parseJsonValueAlloc();
+            var value_transferred = false;
+            errdefer if (!value_transferred) self.alloc.free(value_json);
+            try self.expect(.rparen);
+            try array_update.append(self.alloc, .{
+                .field = field,
+                .op = op,
+                .value_json = value_json,
+            });
+            field_transferred = true;
             value_transferred = true;
             return;
         }
@@ -1866,6 +3066,7 @@ const Parser = struct {
         patch: []const FieldJsonValue,
         increment: []const FieldJsonValue,
         json_set: []const JsonSetValue,
+        array_update: []const ArrayTransformValue,
         returning_fields: []const []const u8,
         expected_version: ?u64,
     ) ![]u8 {
@@ -1903,6 +3104,19 @@ const Parser = struct {
                     try writer.print("{f}", .{std.json.fmt(segment, .{})});
                 }
                 try writer.writeAll("],\"value\":");
+                try writer.writeAll(item.value_json);
+                try writer.writeByte('}');
+            }
+            try writer.writeByte(']');
+        }
+        if (array_update.len > 0) {
+            try writer.writeAll(",\"array_update\":[");
+            for (array_update, 0..) |item, i| {
+                if (i != 0) try writer.writeByte(',');
+                try writer.print("{{\"field\":{f},\"op\":{f},\"value\":", .{
+                    std.json.fmt(item.field, .{}),
+                    std.json.fmt(arrayTransformOpToken(item.op), .{}),
+                });
                 try writer.writeAll(item.value_json);
                 try writer.writeByte('}');
             }
@@ -1951,15 +3165,87 @@ const Parser = struct {
         array_eq: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayEqPredicate),
         in_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate),
         or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+        not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
     ) !void {
         if (self.whereHasTopLevelOr()) {
             try self.parseScalarOrWhere(or_predicates);
             return;
         }
         while (true) {
-            try self.parseWhereAtom(predicates, json_contains, json_path_eq, json_path_exists, array_contains, array_eq, in_predicates, false);
+            if (self.canParseScalarNotWhere()) {
+                try self.parseScalarNotWhere(not_predicates);
+            } else {
+                try self.parseWhereAtom(predicates, json_contains, json_path_eq, json_path_exists, array_contains, array_eq, in_predicates, false);
+            }
             if (!self.matchKeyword("and")) break;
         }
+    }
+
+    fn canParseScalarNotWhere(self: *@This()) bool {
+        if (!self.peekKeyword("not") or self.pos + 1 >= self.tokens.len or self.tokens[self.pos + 1].kind != .lparen) return false;
+        var i = self.pos + 2;
+        var depth: usize = 1;
+        while (i < self.tokens.len) : (i += 1) {
+            const token = self.tokens[i];
+            switch (token.kind) {
+                .lparen => return false,
+                .rparen => {
+                    depth -= 1;
+                    if (depth == 0) return true;
+                },
+                .arrow_text, .arrow_json, .at_contains, .question => return false,
+                .identifier => {
+                    if (std.ascii.eqlIgnoreCase(token.text, "or") or
+                        std.ascii.eqlIgnoreCase(token.text, "any") or
+                        std.ascii.eqlIgnoreCase(token.text, "in") or
+                        std.ascii.eqlIgnoreCase(token.text, "exists"))
+                    {
+                        return false;
+                    }
+                    if (std.ascii.eqlIgnoreCase(token.text, "not")) {
+                        if (i == 0 or self.tokens[i - 1].kind != .identifier or
+                            !std.ascii.eqlIgnoreCase(self.tokens[i - 1].text, "is"))
+                        {
+                            return false;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    fn parseScalarNotWhere(
+        self: *@This(),
+        not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+    ) !void {
+        try self.expectKeyword("not");
+        try self.expect(.lparen);
+        var branch = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+        errdefer {
+            freeRelationalChecks(self.alloc, branch.items);
+            branch.deinit(self.alloc);
+        }
+        while (true) {
+            const predicate = try self.parseScalarWherePredicateAlloc();
+            var predicate_transferred = false;
+            errdefer if (!predicate_transferred) freeRelationalCheck(self.alloc, predicate);
+            try branch.append(self.alloc, predicate);
+            predicate_transferred = true;
+            if (!self.matchKeyword("and")) break;
+        }
+        if (branch.items.len == 0) return error.UnsupportedSqlShape;
+        try self.expect(.rparen);
+
+        const predicates = try branch.toOwnedSlice(self.alloc);
+        var predicates_transferred = false;
+        errdefer if (!predicates_transferred) {
+            freeRelationalChecks(self.alloc, predicates);
+            if (predicates.len > 0) self.alloc.free(predicates);
+        };
+        try not_predicates.append(self.alloc, .{ .predicates = predicates });
+        predicates_transferred = true;
     }
 
     fn parseScalarOrWhere(
@@ -2644,6 +3930,19 @@ const Parser = struct {
                 }
                 try writer.writeByte(']');
             }
+            if (clause.array_update.len > 0) {
+                try writer.writeAll(",\"array_update\":[");
+                for (clause.array_update, 0..) |item, i| {
+                    if (i != 0) try writer.writeByte(',');
+                    try writer.print("{{\"field\":{f},\"op\":{f},\"value\":", .{
+                        std.json.fmt(item.field, .{}),
+                        std.json.fmt(arrayTransformOpToken(item.op), .{}),
+                    });
+                    try writer.writeAll(item.value_json);
+                    try writer.writeByte('}');
+                }
+                try writer.writeByte(']');
+            }
             try writer.writeByte('}');
         }
         try self.writeReturningJson(writer, returning_fields);
@@ -2702,7 +4001,17 @@ const Parser = struct {
         }
         if (self.peekKind(.arrow_json)) return error.UnsupportedSqlShape;
         if (relationalColumnForField(self.schema, field, null) == null) return error.InvalidSqlCatalog;
-        try self.consumeCompatibleProjectionAlias(field);
+        const alias = try self.parseOptionalProjectionAliasAlloc();
+        var alias_transferred = false;
+        errdefer if (!alias_transferred) if (alias) |owned| self.alloc.free(owned);
+        if (alias) |output| {
+            if (!std.mem.eql(u8, output, field)) {
+                alias_transferred = true;
+                return .{ .field_alias = .{ .output = output, .field = field } };
+            }
+            self.alloc.free(output);
+            alias_transferred = true;
+        }
         return .{ .field = field };
     }
 
@@ -2796,10 +4105,14 @@ const Parser = struct {
     }
 
     fn consumeCompatibleProjectionAlias(self: *@This(), field: []const u8) !void {
-        if (!self.matchKeyword("as")) return;
-        const alias = try self.parseIdentifierOwned();
+        const alias = (try self.parseOptionalProjectionAliasAlloc()) orelse return;
         defer self.alloc.free(alias);
         if (!std.mem.eql(u8, alias, field)) return error.UnsupportedSqlShape;
+    }
+
+    fn parseOptionalProjectionAliasAlloc(self: *@This()) !?[]const u8 {
+        if (!self.matchKeyword("as")) return null;
+        return try self.parseIdentifierOwned();
     }
 
     fn parseIdentifierOwned(self: *@This()) ![]const u8 {
@@ -3040,6 +4353,14 @@ fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUnmana
                 i += 1;
                 i = skipSqlCast(sql, i);
             },
+            '[' => {
+                try tokens.append(alloc, .{ .kind = .lbracket, .text = sql[i .. i + 1] });
+                i += 1;
+            },
+            ']' => {
+                try tokens.append(alloc, .{ .kind = .rbracket, .text = sql[i .. i + 1] });
+                i += 1;
+            },
             '@' => {
                 if (i + 1 >= sql.len or sql[i + 1] != '>') return error.UnsupportedSqlShape;
                 try tokens.append(alloc, .{ .kind = .at_contains, .text = sql[i .. i + 2] });
@@ -3243,6 +4564,907 @@ fn joinProjectionContainsOutput(select: []const db_mod.types.RelationalRowsJoinP
     return false;
 }
 
+fn isSupportedUpdatedAtTriggerFunction(name: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.');
+    const base = if (dot) |index| name[index + 1 ..] else name;
+    return std.ascii.eqlIgnoreCase(base, "touch_updated_at") or
+        std.ascii.eqlIgnoreCase(base, "set_updated_at") or
+        std.ascii.eqlIgnoreCase(base, "update_updated_at") or
+        std.ascii.eqlIgnoreCase(base, "antfly_on_update_now") or
+        std.ascii.eqlIgnoreCase(base, "antfly_touch_updated_at");
+}
+
+fn findDdlColumn(columns: []const runtime_schema.RelationalColumn, name: []const u8) ?runtime_schema.RelationalColumn {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.name, name)) return column;
+    }
+    return null;
+}
+
+fn ddlBaseTypeForName(name: []const u8) ?runtime_schema.AntflyType {
+    if (std.ascii.eqlIgnoreCase(name, "uuid")) return .keyword;
+    if (std.ascii.eqlIgnoreCase(name, "text")) return .keyword;
+    if (std.ascii.eqlIgnoreCase(name, "varchar")) return .keyword;
+    if (std.ascii.eqlIgnoreCase(name, "citext")) return .keyword;
+    if (std.ascii.eqlIgnoreCase(name, "integer")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "int")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "int4")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "bigint")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "int8")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "smallint")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "numeric")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "decimal")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "real")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "float4")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "float8")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "boolean")) return .boolean;
+    if (std.ascii.eqlIgnoreCase(name, "bool")) return .boolean;
+    if (std.ascii.eqlIgnoreCase(name, "date")) return .datetime;
+    if (std.ascii.eqlIgnoreCase(name, "timestamptz")) return .datetime;
+    if (std.ascii.eqlIgnoreCase(name, "json")) return .json;
+    if (std.ascii.eqlIgnoreCase(name, "jsonb")) return .json;
+    if (std.ascii.eqlIgnoreCase(name, "bytea")) return .blob;
+    return null;
+}
+
+fn relationalCheckOpToken(op: runtime_schema.RelationalCheckOp) []const u8 {
+    return switch (op) {
+        .is_null => "is_null",
+        .is_not_null => "is_not_null",
+        .eq => "eq",
+        .ne => "ne",
+        .gt => "gt",
+        .gte => "gte",
+        .lt => "lt",
+        .lte => "lte",
+    };
+}
+
+fn schemaJsonValueFromCreateTablePlanAlloc(alloc: std.mem.Allocator, plan: CreateTablePlan) !std.json.Value {
+    var properties = std.json.ObjectMap.empty;
+    for (plan.columns) |column| {
+        try properties.put(alloc, try alloc.dupe(u8, column.name), try schemaJsonPropertyFromColumnAlloc(alloc, column));
+    }
+
+    var required = std.json.Array.init(alloc);
+    for (plan.columns) |column| {
+        if (!column.nullable) try required.append(.{ .string = try alloc.dupe(u8, column.name) });
+    }
+
+    var row_schema = std.json.ObjectMap.empty;
+    try putJsonString(alloc, &row_schema, "type", "object");
+    try row_schema.put(alloc, try alloc.dupe(u8, "properties"), .{ .object = properties });
+    if (required.items.len > 0) try row_schema.put(alloc, try alloc.dupe(u8, "required"), .{ .array = required });
+    try row_schema.put(alloc, try alloc.dupe(u8, "additionalProperties"), .{ .bool = false });
+
+    var document_schema = std.json.ObjectMap.empty;
+    try document_schema.put(alloc, try alloc.dupe(u8, "schema"), .{ .object = row_schema });
+
+    var document_schemas = std.json.ObjectMap.empty;
+    try document_schemas.put(alloc, try alloc.dupe(u8, "row"), .{ .object = document_schema });
+
+    var root = std.json.ObjectMap.empty;
+    try putJsonString(alloc, &root, "storage_mode", "relational");
+    try putJsonString(alloc, &root, "default_type", "row");
+    try root.put(alloc, try alloc.dupe(u8, "enforce_types"), .{ .bool = true });
+    try root.put(alloc, try alloc.dupe(u8, "document_schemas"), .{ .object = document_schemas });
+    if (plan.primary_key) |primary_key| try root.put(alloc, try alloc.dupe(u8, "primary_key"), try schemaJsonPrimaryKeyAlloc(alloc, primary_key));
+    if (plan.unique_constraints.len > 0) try root.put(alloc, try alloc.dupe(u8, "unique_constraints"), try schemaJsonUniqueConstraintsAlloc(alloc, plan.unique_constraints));
+    if (plan.foreign_keys.len > 0) try root.put(alloc, try alloc.dupe(u8, "foreign_keys"), try schemaJsonForeignKeysAlloc(alloc, plan.foreign_keys));
+    if (plan.checks.len > 0) try root.put(alloc, try alloc.dupe(u8, "checks"), try schemaJsonRelationalChecksAlloc(alloc, plan.checks));
+    return .{ .object = root };
+}
+
+fn applyCreateIndexPlanToSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    plan: CreateIndexPlan,
+) !void {
+    const schema_parts = try relationalSchemaJsonParts(root);
+    if (plan.unique) {
+        const constraint: runtime_schema.UniqueConstraint = .{
+            .name = plan.index_name,
+            .columns = plan.columns,
+            .expressions = plan.expressions,
+            .where = plan.where,
+        };
+        var constraints = try rootArrayFieldAlloc(alloc, root, "unique_constraints");
+        try constraints.append(try schemaJsonUniqueConstraintAlloc(alloc, constraint));
+        return;
+    }
+
+    if (plan.expressions.len == 1 and plan.expressions[0].op == .lower and plan.columns.len == 0) {
+        if (schema_parts.properties.get(plan.index_name) != null) return error.InvalidSqlCatalog;
+        if (schema_parts.properties.get(plan.expressions[0].field) == null) return error.InvalidSqlCatalog;
+        const generated: runtime_schema.RelationalGeneratedValue = .{ .op = .lower, .field = plan.expressions[0].field };
+        const column: runtime_schema.RelationalColumn = .{
+            .name = plan.index_name,
+            .path = plan.index_name,
+            .field_type = .keyword,
+            .nullable = true,
+            .indexed = true,
+            .generated = generated,
+            .index_where = plan.where,
+        };
+        try schema_parts.properties.put(alloc, try alloc.dupe(u8, plan.index_name), try schemaJsonPropertyFromColumnAlloc(alloc, column));
+        return;
+    }
+
+    if (plan.columns.len != 1 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
+    const property = schema_parts.properties.getPtr(plan.columns[0]) orelse return error.InvalidSqlCatalog;
+    if (property.* != .object) return error.InvalidSqlCatalog;
+    try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index"), .{ .bool = true });
+    if (plan.where.len > 0) try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, plan.where));
+}
+
+fn applyAlterTablePlanToSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    plan: AlterTablePlan,
+) !void {
+    const schema_parts = try relationalSchemaJsonParts(root);
+    for (plan.operations) |operation| {
+        switch (operation) {
+            .add_column => |column| {
+                if (schema_parts.properties.get(column.name) != null) return error.InvalidSqlCatalog;
+                try schema_parts.properties.put(alloc, try alloc.dupe(u8, column.name), try schemaJsonPropertyFromColumnAlloc(alloc, column));
+                if (!column.nullable) {
+                    var required = try rootArrayFieldAlloc(alloc, schema_parts.schema, "required");
+                    try required.append(.{ .string = try alloc.dupe(u8, column.name) });
+                }
+            },
+            .add_unique_constraint => |constraint| {
+                var constraints = try rootArrayFieldAlloc(alloc, root, "unique_constraints");
+                try constraints.append(try schemaJsonUniqueConstraintAlloc(alloc, constraint));
+            },
+            .add_foreign_key => |foreign_key| {
+                var foreign_keys = try rootArrayFieldAlloc(alloc, root, "foreign_keys");
+                try foreign_keys.append(try schemaJsonForeignKeyAlloc(alloc, foreign_key));
+            },
+            .add_check => |check| {
+                var checks = try rootArrayFieldAlloc(alloc, root, "checks");
+                try checks.append(try schemaJsonRelationalCheckAlloc(alloc, check));
+            },
+        }
+    }
+}
+
+fn applyCreateUpdatePolicyPlanToSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    plan: CreateUpdatePolicyPlan,
+) !void {
+    const schema_parts = try relationalSchemaJsonParts(root);
+    const property = schema_parts.properties.getPtr(plan.column_name) orelse return error.InvalidSqlCatalog;
+    if (property.* != .object) return error.InvalidSqlCatalog;
+    try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-on-update"), try schemaJsonDefaultValueAlloc(alloc, plan.on_update_value, true));
+}
+
+const RelationalSchemaJsonParts = struct {
+    schema: *std.json.ObjectMap,
+    properties: *std.json.ObjectMap,
+};
+
+fn relationalSchemaJsonParts(root: *std.json.ObjectMap) !RelationalSchemaJsonParts {
+    const storage_mode = root.get("storage_mode") orelse return error.InvalidSqlCatalog;
+    if (storage_mode != .string or !std.mem.eql(u8, storage_mode.string, "relational")) return error.InvalidSqlCatalog;
+    const default_type = root.get("default_type") orelse return error.InvalidSqlCatalog;
+    if (default_type != .string or default_type.string.len == 0) return error.InvalidSqlCatalog;
+    const document_schemas = root.getPtr("document_schemas") orelse return error.InvalidSqlCatalog;
+    if (document_schemas.* != .object) return error.InvalidSqlCatalog;
+    const document_schema = document_schemas.object.getPtr(default_type.string) orelse return error.InvalidSqlCatalog;
+    if (document_schema.* != .object) return error.InvalidSqlCatalog;
+    const schema = document_schema.object.getPtr("schema") orelse return error.InvalidSqlCatalog;
+    if (schema.* != .object) return error.InvalidSqlCatalog;
+    const properties = schema.object.getPtr("properties") orelse return error.InvalidSqlCatalog;
+    if (properties.* != .object) return error.InvalidSqlCatalog;
+    return .{ .schema = &schema.object, .properties = &properties.object };
+}
+
+fn schemaJsonPropertyFromColumnAlloc(alloc: std.mem.Allocator, column: runtime_schema.RelationalColumn) !std.json.Value {
+    var object = std.json.ObjectMap.empty;
+    try putJsonString(alloc, &object, "type", antflyTypeSchemaName(column.field_type));
+    if (column.field_type == .array) {
+        const item_type = column.array_item_type orelse return error.InvalidSqlCatalog;
+        var item_object = std.json.ObjectMap.empty;
+        try putJsonString(alloc, &item_object, "type", antflyTypeSchemaName(item_type));
+        try object.put(alloc, try alloc.dupe(u8, "items"), .{ .object = item_object });
+    }
+    if (!column.indexed) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index"), .{ .bool = false });
+    if (column.index_where.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, column.index_where));
+    if (column.default_value) |value| {
+        const key = if (value.kind == .literal) "default" else "x-antfly-default";
+        try object.put(alloc, try alloc.dupe(u8, key), try schemaJsonDefaultValueAlloc(alloc, value, value.kind != .literal));
+    }
+    if (column.on_update_value) |value| try object.put(alloc, try alloc.dupe(u8, "x-antfly-on-update"), try schemaJsonDefaultValueAlloc(alloc, value, true));
+    if (column.generated) |generated| try object.put(alloc, try alloc.dupe(u8, "generated"), try schemaJsonGeneratedValueAlloc(alloc, generated));
+    return .{ .object = object };
+}
+
+fn schemaJsonDefaultValueAlloc(alloc: std.mem.Allocator, value: runtime_schema.RelationalDefaultValue, force_server_default: bool) !std.json.Value {
+    if (!force_server_default and value.kind == .literal) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value.value_json, .{});
+        defer parsed.deinit();
+        return try json_helpers.cloneJsonValue(alloc, parsed.value);
+    }
+    var object = std.json.ObjectMap.empty;
+    try putJsonString(alloc, &object, "op", switch (value.kind) {
+        .literal => return error.InvalidSqlCatalog,
+        .now_ns => "now_ns",
+        .uuid_v4 => "uuid_v4",
+    });
+    return .{ .object = object };
+}
+
+fn schemaJsonGeneratedValueAlloc(alloc: std.mem.Allocator, generated: runtime_schema.RelationalGeneratedValue) !std.json.Value {
+    var object = std.json.ObjectMap.empty;
+    try putJsonString(alloc, &object, "op", switch (generated.op) {
+        .lower => "lower",
+        .concat => "concat",
+    });
+    switch (generated.op) {
+        .lower => try putJsonString(alloc, &object, "field", generated.field orelse return error.InvalidSqlCatalog),
+        .concat => {
+            try object.put(alloc, try alloc.dupe(u8, "fields"), try schemaJsonStringArrayAlloc(alloc, generated.fields));
+            try putJsonString(alloc, &object, "separator", generated.separator);
+        },
+    }
+    return .{ .object = object };
+}
+
+fn schemaJsonPrimaryKeyAlloc(alloc: std.mem.Allocator, primary_key: runtime_schema.PrimaryKey) !std.json.Value {
+    var object = std.json.ObjectMap.empty;
+    try object.put(alloc, try alloc.dupe(u8, "columns"), try schemaJsonStringArrayAlloc(alloc, primary_key.columns));
+    return .{ .object = object };
+}
+
+fn schemaJsonUniqueConstraintsAlloc(alloc: std.mem.Allocator, constraints: []const runtime_schema.UniqueConstraint) !std.json.Value {
+    var array = std.json.Array.init(alloc);
+    for (constraints) |constraint| try array.append(try schemaJsonUniqueConstraintAlloc(alloc, constraint));
+    return .{ .array = array };
+}
+
+fn schemaJsonUniqueConstraintAlloc(alloc: std.mem.Allocator, constraint: runtime_schema.UniqueConstraint) !std.json.Value {
+    var object = std.json.ObjectMap.empty;
+    try putJsonString(alloc, &object, "name", constraint.name);
+    if (constraint.columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "columns"), try schemaJsonStringArrayAlloc(alloc, constraint.columns));
+    if (constraint.expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "expressions"), try schemaJsonUniqueExpressionsAlloc(alloc, constraint.expressions));
+    if (constraint.where.len > 0) try object.put(alloc, try alloc.dupe(u8, "where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, constraint.where));
+    return .{ .object = object };
+}
+
+fn schemaJsonUniqueExpressionsAlloc(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) !std.json.Value {
+    var array = std.json.Array.init(alloc);
+    for (expressions) |expression| {
+        var object = std.json.ObjectMap.empty;
+        try putJsonString(alloc, &object, "op", switch (expression.op) {
+            .lower => "lower",
+        });
+        try putJsonString(alloc, &object, "field", expression.field);
+        try array.append(.{ .object = object });
+    }
+    return .{ .array = array };
+}
+
+fn schemaJsonUniquePredicateDefinitionAlloc(alloc: std.mem.Allocator, predicates: []const runtime_schema.UniquePredicate) !std.json.Value {
+    var object = std.json.ObjectMap.empty;
+    var array = std.json.Array.init(alloc);
+    for (predicates) |predicate| try array.append(try schemaJsonUniquePredicateAlloc(alloc, predicate));
+    try object.put(alloc, try alloc.dupe(u8, "all"), .{ .array = array });
+    return .{ .object = object };
+}
+
+fn schemaJsonUniquePredicateAlloc(alloc: std.mem.Allocator, predicate: runtime_schema.UniquePredicate) !std.json.Value {
+    var object = std.json.ObjectMap.empty;
+    try putJsonString(alloc, &object, "field", predicate.field);
+    try putJsonString(alloc, &object, "op", uniquePredicateOpToken(predicate.op));
+    if (predicate.value_json) |value_json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+        defer parsed.deinit();
+        try object.put(alloc, try alloc.dupe(u8, "value"), try json_helpers.cloneJsonValue(alloc, parsed.value));
+    }
+    return .{ .object = object };
+}
+
+fn schemaJsonForeignKeysAlloc(alloc: std.mem.Allocator, foreign_keys: []const runtime_schema.ForeignKey) !std.json.Value {
+    var array = std.json.Array.init(alloc);
+    for (foreign_keys) |foreign_key| try array.append(try schemaJsonForeignKeyAlloc(alloc, foreign_key));
+    return .{ .array = array };
+}
+
+fn schemaJsonForeignKeyAlloc(alloc: std.mem.Allocator, foreign_key: runtime_schema.ForeignKey) !std.json.Value {
+    var reference = std.json.ObjectMap.empty;
+    try putJsonString(alloc, &reference, "table", foreign_key.parent_table);
+    try reference.put(alloc, try alloc.dupe(u8, "columns"), try schemaJsonStringArrayAlloc(alloc, foreign_key.parent_columns));
+
+    var object = std.json.ObjectMap.empty;
+    try putJsonString(alloc, &object, "name", foreign_key.name);
+    try object.put(alloc, try alloc.dupe(u8, "columns"), try schemaJsonStringArrayAlloc(alloc, foreign_key.child_columns));
+    try object.put(alloc, try alloc.dupe(u8, "references"), .{ .object = reference });
+    try putJsonString(alloc, &object, "on_delete", foreignKeyActionName(foreign_key.on_delete));
+    try putJsonString(alloc, &object, "on_update", foreignKeyActionName(foreign_key.on_update));
+    try putJsonString(alloc, &object, "timing", foreignKeyTimingName(foreign_key.timing));
+    try object.put(alloc, try alloc.dupe(u8, "deferrable"), .{ .bool = foreign_key.deferrable });
+    try putJsonString(alloc, &object, "match", foreignKeyMatchName(foreign_key.match));
+    try putJsonString(alloc, &object, "validation_state", foreignKeyValidationStateName(foreign_key.validation_state));
+    return .{ .object = object };
+}
+
+fn schemaJsonRelationalChecksAlloc(alloc: std.mem.Allocator, checks: []const runtime_schema.RelationalCheck) !std.json.Value {
+    var array = std.json.Array.init(alloc);
+    for (checks) |check| try array.append(try schemaJsonRelationalCheckAlloc(alloc, check));
+    return .{ .array = array };
+}
+
+fn schemaJsonRelationalCheckAlloc(alloc: std.mem.Allocator, check: runtime_schema.RelationalCheck) !std.json.Value {
+    var object = std.json.ObjectMap.empty;
+    try putJsonString(alloc, &object, "name", check.name);
+    try putJsonString(alloc, &object, "field", check.field);
+    try putJsonString(alloc, &object, "op", relationalCheckOpToken(check.op));
+    if (check.value_json) |value_json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+        defer parsed.deinit();
+        try object.put(alloc, try alloc.dupe(u8, "value"), try json_helpers.cloneJsonValue(alloc, parsed.value));
+    }
+    return .{ .object = object };
+}
+
+fn schemaJsonStringArrayAlloc(alloc: std.mem.Allocator, values: []const []const u8) !std.json.Value {
+    var array = std.json.Array.init(alloc);
+    for (values) |value| try array.append(.{ .string = try alloc.dupe(u8, value) });
+    return .{ .array = array };
+}
+
+fn rootArrayFieldAlloc(alloc: std.mem.Allocator, object: *std.json.ObjectMap, field: []const u8) !*std.json.Array {
+    const entry = try object.getOrPut(alloc, field);
+    if (!entry.found_existing) {
+        entry.key_ptr.* = try alloc.dupe(u8, field);
+        entry.value_ptr.* = .{ .array = std.json.Array.init(alloc) };
+    }
+    if (entry.value_ptr.* != .array) return error.InvalidSqlCatalog;
+    return &entry.value_ptr.array;
+}
+
+fn putJsonString(alloc: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try object.put(alloc, try alloc.dupe(u8, key), .{ .string = try alloc.dupe(u8, value) });
+}
+
+fn antflyTypeSchemaName(field_type: runtime_schema.AntflyType) []const u8 {
+    return switch (field_type) {
+        .text => "text",
+        .keyword => "keyword",
+        .numeric => "numeric",
+        .embedding => "embedding",
+        .boolean => "boolean",
+        .datetime => "datetime",
+        .geopoint => "geopoint",
+        .geoshape => "geoshape",
+        .blob => "blob",
+        .html => "html",
+        .search_as_you_type => "search_as_you_type",
+        .json => "json",
+        .array => "array",
+        .link => "link",
+    };
+}
+
+fn foreignKeyActionName(action: runtime_schema.ForeignKeyAction) []const u8 {
+    return switch (action) {
+        .restrict => "restrict",
+        .set_null => "set_null",
+        .cascade => "cascade",
+        .no_action => "no_action",
+    };
+}
+
+fn foreignKeyTimingName(timing: runtime_schema.ForeignKeyTiming) []const u8 {
+    return switch (timing) {
+        .immediate => "immediate",
+        .deferred => "deferred",
+    };
+}
+
+fn foreignKeyMatchName(match: runtime_schema.ForeignKeyMatch) []const u8 {
+    return switch (match) {
+        .simple => "simple",
+        .full => "full",
+        .partial => "partial",
+    };
+}
+
+fn foreignKeyValidationStateName(state: runtime_schema.ForeignKeyValidationState) []const u8 {
+    return switch (state) {
+        .enforced => "enforced",
+        .unvalidated => "unvalidated",
+        .validating => "validating",
+        .invalid => "invalid",
+    };
+}
+
+fn validateDdlAppliedSchemaJsonAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !void {
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer runtime_schema.freeSchema(alloc, runtime);
+    if (runtime.storage_mode != .relational) return error.InvalidSqlCatalog;
+}
+
+fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneRelationalRuntimeSchemaAlloc(alloc: std.mem.Allocator, current: runtime_schema.TableSchema) !runtime_schema.TableSchema {
+    if (current.storage_mode != .relational) return error.InvalidSqlCatalog;
+    if (current.dynamic_templates.len != 0 or current.full_text_documents.len != 0) return error.UnsupportedSqlShape;
+
+    const default_type = try alloc.dupe(u8, current.default_type);
+    const ttl_field = alloc.dupe(u8, current.ttl_field) catch |err| {
+        alloc.free(default_type);
+        return err;
+    };
+    var schema: runtime_schema.TableSchema = .{
+        .version = current.version,
+        .default_type = default_type,
+        .ttl_duration_ns = current.ttl_duration_ns,
+        .ttl_field = ttl_field,
+        .enforce_types = current.enforce_types,
+        .storage_mode = current.storage_mode,
+    };
+    errdefer runtime_schema.freeSchema(alloc, schema);
+    schema.relational_columns = try cloneDdlRelationalColumns(alloc, current.relational_columns);
+    schema.primary_key = try cloneDdlPrimaryKeyMaybe(alloc, current.primary_key);
+    schema.foreign_keys = try cloneDdlForeignKeys(alloc, current.foreign_keys);
+    schema.unique_constraints = try cloneDdlUniqueConstraints(alloc, current.unique_constraints);
+    schema.checks = try cloneDdlRelationalChecks(alloc, current.checks);
+    return schema;
+}
+
+fn cloneDdlRelationalColumn(alloc: std.mem.Allocator, column: runtime_schema.RelationalColumn) !runtime_schema.RelationalColumn {
+    const name = try alloc.dupe(u8, column.name);
+    const path = alloc.dupe(u8, column.path) catch |err| {
+        alloc.free(name);
+        return err;
+    };
+    var out: runtime_schema.RelationalColumn = .{
+        .name = name,
+        .path = path,
+        .field_type = column.field_type,
+        .array_item_type = column.array_item_type,
+        .nullable = column.nullable,
+        .indexed = column.indexed,
+    };
+    errdefer freeDdlRelationalColumn(alloc, out);
+    out.default_value = if (column.default_value) |value| try cloneDdlDefaultValue(alloc, value) else null;
+    out.on_update_value = if (column.on_update_value) |value| try cloneDdlDefaultValue(alloc, value) else null;
+    out.generated = if (column.generated) |generated| try cloneDdlGeneratedValue(alloc, generated) else null;
+    out.index_where = try cloneDdlUniquePredicates(alloc, column.index_where);
+    return out;
+}
+
+fn cloneDdlRelationalColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) ![]const runtime_schema.RelationalColumn {
+    if (columns.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.RelationalColumn, columns.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |column| freeDdlRelationalColumn(alloc, column);
+        alloc.free(out);
+    }
+    for (columns, 0..) |column, i| {
+        out[i] = try cloneDdlRelationalColumn(alloc, column);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneDdlDefaultValue(alloc: std.mem.Allocator, value: runtime_schema.RelationalDefaultValue) !runtime_schema.RelationalDefaultValue {
+    return .{
+        .kind = value.kind,
+        .value_json = try alloc.dupe(u8, value.value_json),
+    };
+}
+
+fn cloneDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.RelationalGeneratedValue) !runtime_schema.RelationalGeneratedValue {
+    var out: runtime_schema.RelationalGeneratedValue = .{
+        .op = generated.op,
+        .separator = try alloc.dupe(u8, generated.separator),
+    };
+    errdefer freeDdlGeneratedValue(alloc, out);
+    out.field = if (generated.field) |field| try alloc.dupe(u8, field) else null;
+    out.fields = try cloneStringSlice(alloc, generated.fields);
+    return out;
+}
+
+fn cloneDdlPrimaryKeyMaybe(alloc: std.mem.Allocator, primary_key: ?runtime_schema.PrimaryKey) !?runtime_schema.PrimaryKey {
+    return if (primary_key) |key| try cloneDdlPrimaryKey(alloc, key) else null;
+}
+
+fn cloneDdlPrimaryKey(alloc: std.mem.Allocator, primary_key: runtime_schema.PrimaryKey) !runtime_schema.PrimaryKey {
+    return .{ .columns = try cloneStringSlice(alloc, primary_key.columns) };
+}
+
+fn cloneDdlUniqueExpression(alloc: std.mem.Allocator, expression: runtime_schema.UniqueExpression) !runtime_schema.UniqueExpression {
+    return .{
+        .op = expression.op,
+        .field = try alloc.dupe(u8, expression.field),
+    };
+}
+
+fn cloneDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) ![]const runtime_schema.UniqueExpression {
+    if (expressions.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.UniqueExpression, expressions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |expression| alloc.free(expression.field);
+        alloc.free(out);
+    }
+    for (expressions, 0..) |expression, i| {
+        out[i] = try cloneDdlUniqueExpression(alloc, expression);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneDdlUniquePredicate(alloc: std.mem.Allocator, predicate: runtime_schema.UniquePredicate) !runtime_schema.UniquePredicate {
+    const field = try alloc.dupe(u8, predicate.field);
+    const value_json = if (predicate.value_json) |value|
+        alloc.dupe(u8, value) catch |err| {
+            alloc.free(field);
+            return err;
+        }
+    else
+        null;
+    return .{
+        .field = field,
+        .op = predicate.op,
+        .value_json = value_json,
+    };
+}
+
+fn cloneDdlUniquePredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema.UniquePredicate) ![]const runtime_schema.UniquePredicate {
+    if (predicates.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.UniquePredicate, predicates.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value| alloc.free(value);
+        }
+        alloc.free(out);
+    }
+    for (predicates, 0..) |predicate, i| {
+        out[i] = try cloneDdlUniquePredicate(alloc, predicate);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_schema.UniqueConstraint) !runtime_schema.UniqueConstraint {
+    var out: runtime_schema.UniqueConstraint = .{
+        .name = try alloc.dupe(u8, constraint.name),
+    };
+    errdefer freeDdlUniqueConstraint(alloc, out);
+    out.columns = try cloneStringSlice(alloc, constraint.columns);
+    out.expressions = try cloneDdlUniqueExpressions(alloc, constraint.expressions);
+    out.where = try cloneDdlUniquePredicates(alloc, constraint.where);
+    return out;
+}
+
+fn cloneDdlUniqueConstraints(alloc: std.mem.Allocator, constraints: []const runtime_schema.UniqueConstraint) ![]const runtime_schema.UniqueConstraint {
+    if (constraints.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.UniqueConstraint, constraints.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |constraint| freeDdlUniqueConstraint(alloc, constraint);
+        alloc.free(out);
+    }
+    for (constraints, 0..) |constraint, i| {
+        out[i] = try cloneDdlUniqueConstraint(alloc, constraint);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneDdlForeignKey(alloc: std.mem.Allocator, foreign_key: runtime_schema.ForeignKey) !runtime_schema.ForeignKey {
+    const name = try alloc.dupe(u8, foreign_key.name);
+    const parent_table = alloc.dupe(u8, foreign_key.parent_table) catch |err| {
+        alloc.free(name);
+        return err;
+    };
+    var out: runtime_schema.ForeignKey = .{
+        .name = name,
+        .parent_table = parent_table,
+        .on_delete = foreign_key.on_delete,
+        .on_update = foreign_key.on_update,
+        .timing = foreign_key.timing,
+        .deferrable = foreign_key.deferrable,
+        .match = foreign_key.match,
+        .validation_state = foreign_key.validation_state,
+    };
+    errdefer freeDdlForeignKey(alloc, out);
+    out.child_columns = try cloneStringSlice(alloc, foreign_key.child_columns);
+    out.parent_columns = try cloneStringSlice(alloc, foreign_key.parent_columns);
+    return out;
+}
+
+fn cloneDdlForeignKeys(alloc: std.mem.Allocator, foreign_keys: []const runtime_schema.ForeignKey) ![]const runtime_schema.ForeignKey {
+    if (foreign_keys.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.ForeignKey, foreign_keys.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |foreign_key| freeDdlForeignKey(alloc, foreign_key);
+        alloc.free(out);
+    }
+    for (foreign_keys, 0..) |foreign_key, i| {
+        out[i] = try cloneDdlForeignKey(alloc, foreign_key);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneDdlRelationalCheck(alloc: std.mem.Allocator, check: runtime_schema.RelationalCheck) !runtime_schema.RelationalCheck {
+    const name = try alloc.dupe(u8, check.name);
+    const field = alloc.dupe(u8, check.field) catch |err| {
+        alloc.free(name);
+        return err;
+    };
+    var out: runtime_schema.RelationalCheck = .{
+        .name = name,
+        .field = field,
+        .op = check.op,
+    };
+    errdefer freeDdlRelationalCheck(alloc, out);
+    out.value_json = if (check.value_json) |value| try alloc.dupe(u8, value) else null;
+    return out;
+}
+
+fn cloneDdlRelationalChecks(alloc: std.mem.Allocator, checks: []const runtime_schema.RelationalCheck) ![]const runtime_schema.RelationalCheck {
+    if (checks.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.RelationalCheck, checks.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |check| freeDdlRelationalCheck(alloc, check);
+        alloc.free(out);
+    }
+    for (checks, 0..) |check, i| {
+        out[i] = try cloneDdlRelationalCheck(alloc, check);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn appendRelationalColumnAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    column: runtime_schema.RelationalColumn,
+) !void {
+    if (relationalColumnIndex(schema.relational_columns, column.name) != null) return error.InvalidSqlCatalog;
+    const len = schema.relational_columns.len;
+    const out = try alloc.alloc(runtime_schema.RelationalColumn, len + 1);
+    errdefer alloc.free(out);
+    @memcpy(out[0..len], schema.relational_columns);
+    out[len] = try cloneDdlRelationalColumn(alloc, column);
+    if (len > 0) alloc.free(schema.relational_columns);
+    schema.relational_columns = out;
+}
+
+fn appendUniqueConstraintAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    constraint: runtime_schema.UniqueConstraint,
+) !void {
+    if (uniqueConstraintNameExists(schema.unique_constraints, constraint.name)) return error.InvalidSqlCatalog;
+    const len = schema.unique_constraints.len;
+    const out = try alloc.alloc(runtime_schema.UniqueConstraint, len + 1);
+    errdefer alloc.free(out);
+    @memcpy(out[0..len], schema.unique_constraints);
+    out[len] = try cloneDdlUniqueConstraint(alloc, constraint);
+    if (len > 0) alloc.free(schema.unique_constraints);
+    schema.unique_constraints = out;
+}
+
+fn appendForeignKeyAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    foreign_key: runtime_schema.ForeignKey,
+) !void {
+    if (foreignKeyNameExists(schema.foreign_keys, foreign_key.name)) return error.InvalidSqlCatalog;
+    const len = schema.foreign_keys.len;
+    const out = try alloc.alloc(runtime_schema.ForeignKey, len + 1);
+    errdefer alloc.free(out);
+    @memcpy(out[0..len], schema.foreign_keys);
+    out[len] = try cloneDdlForeignKey(alloc, foreign_key);
+    if (len > 0) alloc.free(schema.foreign_keys);
+    schema.foreign_keys = out;
+}
+
+fn appendRelationalCheckAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    check: runtime_schema.RelationalCheck,
+) !void {
+    if (relationalCheckNameExists(schema.checks, check.name)) return error.InvalidSqlCatalog;
+    const len = schema.checks.len;
+    const out = try alloc.alloc(runtime_schema.RelationalCheck, len + 1);
+    errdefer alloc.free(out);
+    @memcpy(out[0..len], schema.checks);
+    out[len] = try cloneDdlRelationalCheck(alloc, check);
+    if (len > 0) alloc.free(schema.checks);
+    schema.checks = out;
+}
+
+fn markColumnIndexedAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    column_name: []const u8,
+    predicates: []const runtime_schema.UniquePredicate,
+) !void {
+    const index = relationalColumnIndex(schema.relational_columns, column_name) orelse return error.InvalidSqlCatalog;
+    const cloned_predicates = try cloneDdlUniquePredicates(alloc, predicates);
+    errdefer freeDdlUniquePredicates(alloc, cloned_predicates);
+    const columns = @constCast(schema.relational_columns);
+    freeDdlUniquePredicates(alloc, columns[index].index_where);
+    columns[index].indexed = true;
+    columns[index].index_where = cloned_predicates;
+}
+
+fn setColumnOnUpdatePolicyAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    column_name: []const u8,
+    value: runtime_schema.RelationalDefaultValue,
+) !void {
+    const index = relationalColumnIndex(schema.relational_columns, column_name) orelse return error.InvalidSqlCatalog;
+    const columns = @constCast(schema.relational_columns);
+    if (columns[index].field_type != .numeric and columns[index].field_type != .datetime) return error.InvalidSqlCatalog;
+    const cloned_value = try cloneDdlDefaultValue(alloc, value);
+    errdefer alloc.free(cloned_value.value_json);
+    if (columns[index].on_update_value) |existing| alloc.free(existing.value_json);
+    columns[index].on_update_value = cloned_value;
+}
+
+fn validateRelationalColumnCatalog(columns: []const runtime_schema.RelationalColumn) !void {
+    for (columns, 0..) |column, i| {
+        if (relationalColumnIndex(columns[0..i], column.name) != null) return error.InvalidSqlCatalog;
+        if (!std.mem.eql(u8, column.name, column.path)) return error.InvalidSqlCatalog;
+        if (column.generated) |_| try validateGeneratedColumnForColumns(columns, column);
+        try validateUniquePredicatesForColumns(columns, column.index_where);
+        if (column.on_update_value) |_| {
+            if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
+        }
+    }
+}
+
+fn validateUniqueConstraintCatalog(columns: []const runtime_schema.RelationalColumn, constraints: []const runtime_schema.UniqueConstraint) !void {
+    for (constraints, 0..) |constraint, i| {
+        if (uniqueConstraintNameExists(constraints[0..i], constraint.name)) return error.InvalidSqlCatalog;
+        try validateUniqueConstraintForColumns(columns, constraint);
+    }
+}
+
+fn validateForeignKeyCatalog(columns: []const runtime_schema.RelationalColumn, foreign_keys: []const runtime_schema.ForeignKey) !void {
+    for (foreign_keys, 0..) |foreign_key, i| {
+        if (foreignKeyNameExists(foreign_keys[0..i], foreign_key.name)) return error.InvalidSqlCatalog;
+        try validateForeignKeyForColumns(columns, foreign_key);
+    }
+}
+
+fn validateRelationalCheckCatalog(columns: []const runtime_schema.RelationalColumn, checks: []const runtime_schema.RelationalCheck) !void {
+    for (checks, 0..) |check, i| {
+        if (relationalCheckNameExists(checks[0..i], check.name)) return error.InvalidSqlCatalog;
+        try validateCheckForColumns(columns, check);
+    }
+}
+
+fn validatePrimaryKeyColumns(columns: []const runtime_schema.RelationalColumn, primary_key: runtime_schema.PrimaryKey) !void {
+    if (primary_key.columns.len == 0) return error.InvalidSqlCatalog;
+    for (primary_key.columns) |column| {
+        const found = relationalColumnForDdl(columns, column) orelse return error.InvalidSqlCatalog;
+        if (found.nullable) return error.InvalidSqlCatalog;
+    }
+}
+
+fn validateUniqueConstraintForColumns(columns: []const runtime_schema.RelationalColumn, constraint: runtime_schema.UniqueConstraint) !void {
+    if (constraint.columns.len == 0 and constraint.expressions.len == 0) return error.InvalidSqlCatalog;
+    for (constraint.columns) |column| {
+        const found = relationalColumnForDdl(columns, column) orelse return error.InvalidSqlCatalog;
+        if (found.field_type == .json or found.field_type == .array) return error.InvalidSqlCatalog;
+    }
+    for (constraint.expressions) |expression| {
+        switch (expression.op) {
+            .lower => {
+                const found = relationalColumnForDdl(columns, expression.field) orelse return error.InvalidSqlCatalog;
+                if (found.field_type == .json or found.field_type == .array) return error.InvalidSqlCatalog;
+            },
+        }
+    }
+    try validateUniquePredicatesForColumns(columns, constraint.where);
+}
+
+fn validateForeignKeyForColumns(columns: []const runtime_schema.RelationalColumn, foreign_key: runtime_schema.ForeignKey) !void {
+    if (foreign_key.child_columns.len == 0 or foreign_key.child_columns.len != foreign_key.parent_columns.len) return error.InvalidSqlCatalog;
+    for (foreign_key.child_columns) |column| {
+        const found = relationalColumnForDdl(columns, column) orelse return error.InvalidSqlCatalog;
+        if (found.field_type == .json or found.field_type == .array) return error.InvalidSqlCatalog;
+    }
+}
+
+fn validateCheckForColumns(columns: []const runtime_schema.RelationalColumn, check: runtime_schema.RelationalCheck) !void {
+    _ = relationalColumnForDdl(columns, check.field) orelse return error.InvalidSqlCatalog;
+}
+
+fn validateGeneratedColumnForColumns(columns: []const runtime_schema.RelationalColumn, column: runtime_schema.RelationalColumn) !void {
+    const generated = column.generated orelse return;
+    switch (generated.op) {
+        .lower => {
+            const field = generated.field orelse return error.InvalidSqlCatalog;
+            if (std.mem.eql(u8, field, column.name)) return error.InvalidSqlCatalog;
+            const source = relationalColumnForDdl(columns, field) orelse return error.InvalidSqlCatalog;
+            if (source.field_type == .json or source.field_type == .array) return error.InvalidSqlCatalog;
+        },
+        .concat => {
+            if (generated.fields.len == 0) return error.InvalidSqlCatalog;
+            for (generated.fields) |field| {
+                if (std.mem.eql(u8, field, column.name)) return error.InvalidSqlCatalog;
+                const source = relationalColumnForDdl(columns, field) orelse return error.InvalidSqlCatalog;
+                if (source.field_type == .json or source.field_type == .array) return error.InvalidSqlCatalog;
+            }
+        },
+    }
+}
+
+fn validateUniquePredicatesForColumns(columns: []const runtime_schema.RelationalColumn, predicates: []const runtime_schema.UniquePredicate) !void {
+    for (predicates) |predicate| {
+        const found = relationalColumnForDdl(columns, predicate.field) orelse return error.InvalidSqlCatalog;
+        if (found.field_type == .json or found.field_type == .array) return error.InvalidSqlCatalog;
+    }
+}
+
+fn relationalColumnForDdl(columns: []const runtime_schema.RelationalColumn, name: []const u8) ?runtime_schema.RelationalColumn {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.name, name)) return column;
+    }
+    return null;
+}
+
+fn relationalColumnIndex(columns: []const runtime_schema.RelationalColumn, name: []const u8) ?usize {
+    for (columns, 0..) |column, i| {
+        if (std.mem.eql(u8, column.name, name)) return i;
+    }
+    return null;
+}
+
+fn uniqueConstraintNameExists(constraints: []const runtime_schema.UniqueConstraint, name: []const u8) bool {
+    for (constraints) |constraint| {
+        if (std.mem.eql(u8, constraint.name, name)) return true;
+    }
+    return false;
+}
+
+fn foreignKeyNameExists(foreign_keys: []const runtime_schema.ForeignKey, name: []const u8) bool {
+    for (foreign_keys) |foreign_key| {
+        if (std.mem.eql(u8, foreign_key.name, name)) return true;
+    }
+    return false;
+}
+
+fn relationalCheckNameExists(checks: []const runtime_schema.RelationalCheck, name: []const u8) bool {
+    for (checks) |check| {
+        if (std.mem.eql(u8, check.name, name)) return true;
+    }
+    return false;
+}
+
 fn conflictActionToken(action: Parser.ConflictAction) []const u8 {
     return switch (action) {
         .nothing => "nothing",
@@ -3256,6 +5478,15 @@ fn uniquePredicateOpToken(op: runtime_schema.UniquePredicateOp) []const u8 {
         .is_not_null => "is_not_null",
         .eq => "eq",
         .ne => "ne",
+    };
+}
+
+fn arrayTransformOpToken(op: db_mod.types.TransformOpType) []const u8 {
+    return switch (op) {
+        .push => "append",
+        .pull => "remove",
+        .add_to_set => "add_to_set",
+        else => unreachable,
     };
 }
 
@@ -3317,7 +5548,101 @@ fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     if (values.len > 0) alloc.free(values);
 }
 
+fn freeAlterTableOperation(alloc: std.mem.Allocator, operation: AlterTableOperation) void {
+    switch (operation) {
+        .add_column => |column| freeDdlRelationalColumn(alloc, column),
+        .add_unique_constraint => |constraint| freeDdlUniqueConstraint(alloc, constraint),
+        .add_foreign_key => |foreign_key| freeDdlForeignKey(alloc, foreign_key),
+        .add_check => |check| freeDdlRelationalCheck(alloc, check),
+    }
+}
+
+fn freeDdlRelationalColumn(alloc: std.mem.Allocator, column: runtime_schema.RelationalColumn) void {
+    alloc.free(column.name);
+    alloc.free(column.path);
+    if (column.default_value) |value| alloc.free(value.value_json);
+    if (column.on_update_value) |value| alloc.free(value.value_json);
+    if (column.generated) |generated| {
+        freeDdlGeneratedValue(alloc, generated);
+    }
+    for (column.index_where) |predicate| {
+        alloc.free(predicate.field);
+        if (predicate.value_json) |value| alloc.free(value);
+    }
+    if (column.index_where.len > 0) alloc.free(column.index_where);
+}
+
+fn freeDdlRelationalColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) void {
+    for (columns) |column| freeDdlRelationalColumn(alloc, column);
+    if (columns.len > 0) alloc.free(columns);
+}
+
+fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.RelationalGeneratedValue) void {
+    if (generated.field) |field| alloc.free(field);
+    freeStringSlice(alloc, generated.fields);
+    alloc.free(generated.separator);
+}
+
+fn freeDdlPrimaryKey(alloc: std.mem.Allocator, primary_key: runtime_schema.PrimaryKey) void {
+    freeStringSlice(alloc, primary_key.columns);
+}
+
+fn freeDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_schema.UniqueConstraint) void {
+    alloc.free(constraint.name);
+    freeStringSlice(alloc, constraint.columns);
+    freeDdlUniqueExpressions(alloc, constraint.expressions);
+    freeDdlUniquePredicates(alloc, constraint.where);
+}
+
+fn freeDdlUniqueConstraints(alloc: std.mem.Allocator, constraints: []const runtime_schema.UniqueConstraint) void {
+    for (constraints) |constraint| freeDdlUniqueConstraint(alloc, constraint);
+    if (constraints.len > 0) alloc.free(constraints);
+}
+
+fn freeDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) void {
+    for (expressions) |expression| alloc.free(expression.field);
+    if (expressions.len > 0) alloc.free(expressions);
+}
+
+fn freeDdlUniquePredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema.UniquePredicate) void {
+    for (predicates) |predicate| {
+        alloc.free(predicate.field);
+        if (predicate.value_json) |value| alloc.free(value);
+    }
+    if (predicates.len > 0) alloc.free(predicates);
+}
+
+fn freeDdlForeignKey(alloc: std.mem.Allocator, foreign_key: runtime_schema.ForeignKey) void {
+    alloc.free(foreign_key.name);
+    freeStringSlice(alloc, foreign_key.child_columns);
+    alloc.free(foreign_key.parent_table);
+    freeStringSlice(alloc, foreign_key.parent_columns);
+}
+
+fn freeDdlForeignKeys(alloc: std.mem.Allocator, foreign_keys: []const runtime_schema.ForeignKey) void {
+    for (foreign_keys) |foreign_key| freeDdlForeignKey(alloc, foreign_key);
+    if (foreign_keys.len > 0) alloc.free(foreign_keys);
+}
+
+fn freeDdlRelationalCheck(alloc: std.mem.Allocator, check: runtime_schema.RelationalCheck) void {
+    alloc.free(check.name);
+    alloc.free(check.field);
+    if (check.value_json) |value| alloc.free(value);
+}
+
+fn freeDdlRelationalChecks(alloc: std.mem.Allocator, checks: []const runtime_schema.RelationalCheck) void {
+    for (checks) |check| freeDdlRelationalCheck(alloc, check);
+    if (checks.len > 0) alloc.free(checks);
+}
+
 fn freeFieldJsonValues(alloc: std.mem.Allocator, values: []const Parser.FieldJsonValue) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.value_json);
+    }
+}
+
+fn freeArrayTransformValues(alloc: std.mem.Allocator, values: []const Parser.ArrayTransformValue) void {
     for (values) |value| {
         alloc.free(value.field);
         alloc.free(value.value_json);
@@ -3409,6 +5734,8 @@ fn freeConflictClause(alloc: std.mem.Allocator, clause: Parser.ConflictClause) v
     if (clause.increment.len > 0) alloc.free(clause.increment);
     freeJsonSetValues(alloc, clause.json_set);
     if (clause.json_set.len > 0) alloc.free(clause.json_set);
+    freeArrayTransformValues(alloc, clause.array_update);
+    if (clause.array_update.len > 0) alloc.free(clause.array_update);
 }
 
 fn freeJoinOn(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJoinOn) void {
@@ -3438,6 +5765,10 @@ fn freeSelectItem(alloc: std.mem.Allocator, item: Parser.SelectItem) void {
             alloc.free(projection.field);
         },
         .coalesce => |projection| freeCoalesceProjection(alloc, projection),
+        .field_alias => |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        },
     }
 }
 
@@ -3514,12 +5845,518 @@ fn freeCoalesceProjections(alloc: std.mem.Allocator, values: []const db_mod.type
     if (values.len > 0) alloc.free(values);
 }
 
+fn freeFieldAliasProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsFieldAliasProjection) void {
+    for (values) |value| {
+        alloc.free(value.output);
+        alloc.free(value.field);
+    }
+    if (values.len > 0) alloc.free(values);
+}
+
 fn freeOrderBy(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsQueryOrder) void {
     for (values) |value| alloc.free(value.field);
 }
 
+test "postgres sql adapter lowers create table ddl into typed schema plan" {
+    const alloc = std.testing.allocator;
+    var lowered = try lowerDdlPlanAlloc(
+        alloc,
+        \\CREATE TABLE IF NOT EXISTS usage_records (
+        \\  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+        \\  tenant_id text NOT NULL,
+        \\  amount numeric(18, 2) DEFAULT 0 CHECK (amount >= 0),
+        \\  metadata jsonb,
+        \\  tags text[],
+        \\  created_at timestamptz DEFAULT now(),
+        \\  email_key text GENERATED ALWAYS AS (lower(tenant_id)) STORED,
+        \\  CONSTRAINT usage_records_tenant_key UNIQUE (tenant_id),
+        \\  CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id) ON DELETE CASCADE
+        \\);
+        ,
+    );
+    defer lowered.deinit(alloc);
+
+    switch (lowered) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 7), plan.columns.len);
+            try std.testing.expectEqualStrings("id", plan.columns[0].name);
+            try std.testing.expectEqual(runtime_schema.AntflyType.keyword, plan.columns[0].field_type);
+            try std.testing.expect(!plan.columns[0].nullable);
+            try std.testing.expect(plan.columns[0].default_value != null);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.uuid_v4, plan.columns[0].default_value.?.kind);
+            try std.testing.expectEqualStrings("amount", plan.columns[2].name);
+            try std.testing.expectEqual(runtime_schema.AntflyType.numeric, plan.columns[2].field_type);
+            try std.testing.expect(plan.columns[2].default_value != null);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.literal, plan.columns[2].default_value.?.kind);
+            try std.testing.expectEqualStrings("0", plan.columns[2].default_value.?.value_json);
+            try std.testing.expectEqual(runtime_schema.AntflyType.json, plan.columns[3].field_type);
+            try std.testing.expectEqual(runtime_schema.AntflyType.array, plan.columns[4].field_type);
+            try std.testing.expectEqual(runtime_schema.AntflyType.keyword, plan.columns[4].array_item_type.?);
+            try std.testing.expectEqual(runtime_schema.AntflyType.datetime, plan.columns[5].field_type);
+            try std.testing.expect(plan.columns[5].default_value != null);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.now_ns, plan.columns[5].default_value.?.kind);
+            try std.testing.expectEqualStrings("email_key", plan.columns[6].name);
+            try std.testing.expect(plan.columns[6].generated != null);
+            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, plan.columns[6].generated.?.op);
+            try std.testing.expectEqualStrings("tenant_id", plan.columns[6].generated.?.field.?);
+            try std.testing.expect(plan.primary_key != null);
+            try std.testing.expectEqual(@as(usize, 1), plan.primary_key.?.columns.len);
+            try std.testing.expectEqualStrings("id", plan.primary_key.?.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.unique_constraints.len);
+            try std.testing.expectEqualStrings("usage_records_tenant_key", plan.unique_constraints[0].name);
+            try std.testing.expectEqualStrings("tenant_id", plan.unique_constraints[0].columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.foreign_keys.len);
+            try std.testing.expectEqualStrings("usage_records_tenant_fkey", plan.foreign_keys[0].name);
+            try std.testing.expectEqualStrings("tenant_id", plan.foreign_keys[0].child_columns[0]);
+            try std.testing.expectEqualStrings("tenants", plan.foreign_keys[0].parent_table);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, plan.foreign_keys[0].on_delete);
+            try std.testing.expectEqual(@as(usize, 1), plan.checks.len);
+            try std.testing.expectEqualStrings("amount", plan.checks[0].field);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, plan.checks[0].op);
+            try std.testing.expectEqualStrings("0", plan.checks[0].value_json.?);
+        },
+        .create_index => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+    }
+}
+
+test "postgres sql adapter lowers create index ddl into typed schema plan" {
+    const alloc = std.testing.allocator;
+
+    var ordinary = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX usage_records_status_idx ON usage_records (tenant_id, status);",
+    );
+    defer ordinary.deinit(alloc);
+    switch (ordinary) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("usage_records_status_idx", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.columns[0]);
+            try std.testing.expectEqualStrings("status", plan.columns[1]);
+            try std.testing.expectEqual(@as(usize, 0), plan.expressions.len);
+            try std.testing.expectEqual(@as(usize, 0), plan.where.len);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+    }
+
+    var partial_expression = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_lower_email_active_key ON users (tenant_id, lower(email)) WHERE deleted_at IS NULL AND status = 'active';",
+    );
+    defer partial_expression.deinit(alloc);
+    switch (partial_expression) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqualStrings("users_lower_email_active_key", plan.index_name);
+            try std.testing.expectEqualStrings("users", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.expressions.len);
+            try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.lower, plan.expressions[0].op);
+            try std.testing.expectEqualStrings("email", plan.expressions[0].field);
+            try std.testing.expectEqual(@as(usize, 2), plan.where.len);
+            try std.testing.expectEqualStrings("deleted_at", plan.where[0].field);
+            try std.testing.expectEqual(runtime_schema.UniquePredicateOp.is_null, plan.where[0].op);
+            try std.testing.expectEqualStrings("status", plan.where[1].field);
+            try std.testing.expectEqual(runtime_schema.UniquePredicateOp.eq, plan.where[1].op);
+            try std.testing.expectEqualStrings("\"active\"", plan.where[1].value_json.?);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX usage_records_metadata_gin ON usage_records USING gin (metadata)",
+    ));
+}
+
+test "postgres sql adapter lowers alter table ddl into typed schema plan" {
+    const alloc = std.testing.allocator;
+    var lowered = try lowerDdlPlanAlloc(
+        alloc,
+        \\ALTER TABLE usage_records
+        \\  ADD COLUMN metadata jsonb DEFAULT '{"source":"migration"}',
+        \\  ADD COLUMN tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED,
+        \\  ADD CONSTRAINT usage_records_tenant_status_key UNIQUE (tenant_id, status),
+        \\  ADD CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id) ON DELETE SET NULL,
+        \\  ADD CONSTRAINT usage_records_amount_check CHECK (amount >= 0);
+        ,
+    );
+    defer lowered.deinit(alloc);
+
+    switch (lowered) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 5), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_column => |column| {
+                    try std.testing.expectEqualStrings("metadata", column.name);
+                    try std.testing.expectEqual(runtime_schema.AntflyType.json, column.field_type);
+                    try std.testing.expect(column.default_value != null);
+                    try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.literal, column.default_value.?.kind);
+                    try std.testing.expectEqualStrings("{\"source\":\"migration\"}", column.default_value.?.value_json);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (plan.operations[1]) {
+                .add_column => |column| {
+                    try std.testing.expectEqualStrings("tenant_status_key", column.name);
+                    try std.testing.expect(column.generated != null);
+                    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat, column.generated.?.op);
+                    try std.testing.expectEqual(@as(usize, 2), column.generated.?.fields.len);
+                    try std.testing.expectEqualStrings("tenant_id", column.generated.?.fields[0]);
+                    try std.testing.expectEqualStrings("status", column.generated.?.fields[1]);
+                    try std.testing.expectEqualStrings(":", column.generated.?.separator);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (plan.operations[2]) {
+                .add_unique_constraint => |constraint| {
+                    try std.testing.expectEqualStrings("usage_records_tenant_status_key", constraint.name);
+                    try std.testing.expectEqual(@as(usize, 2), constraint.columns.len);
+                    try std.testing.expectEqualStrings("tenant_id", constraint.columns[0]);
+                    try std.testing.expectEqualStrings("status", constraint.columns[1]);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (plan.operations[3]) {
+                .add_foreign_key => |foreign_key| {
+                    try std.testing.expectEqualStrings("usage_records_tenant_fkey", foreign_key.name);
+                    try std.testing.expectEqualStrings("tenant_id", foreign_key.child_columns[0]);
+                    try std.testing.expectEqualStrings("tenants", foreign_key.parent_table);
+                    try std.testing.expectEqualStrings("id", foreign_key.parent_columns[0]);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.set_null, foreign_key.on_delete);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (plan.operations[4]) {
+                .add_check => |check| {
+                    try std.testing.expectEqualStrings("usage_records_amount_check", check.name);
+                    try std.testing.expectEqualStrings("amount", check.field);
+                    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, check.op);
+                    try std.testing.expectEqualStrings("0", check.value_json.?);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "ALTER TABLE usage_records DROP COLUMN metadata",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD COLUMN bad text GENERATED ALWAYS AS (upper(email)) STORED",
+    ));
+}
+
+test "postgres sql adapter lowers updated-at trigger ddl into typed update policy" {
+    const alloc = std.testing.allocator;
+    var lowered = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at('updated_at_ns');",
+    );
+    defer lowered.deinit(alloc);
+
+    switch (lowered) {
+        .create_update_policy => |plan| {
+            try std.testing.expectEqualStrings("update_timestamp", plan.trigger_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqualStrings("updated_at_ns", plan.column_name);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.now_ns, plan.on_update_value.kind);
+            try std.testing.expectEqualStrings("", plan.on_update_value.value_json);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+    }
+
+    var default_column = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE PROCEDURE set_updated_at();",
+    );
+    defer default_column.deinit(alloc);
+    switch (default_column) {
+        .create_update_policy => |plan| {
+            try std.testing.expectEqualStrings("updated_at", plan.column_name);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TRIGGER update_timestamp BEFORE INSERT ON usage_records EXECUTE FUNCTION touch_updated_at()",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION arbitrary_trigger()",
+    ));
+}
+
+test "postgres sql adapter applies create table ddl plan to owned runtime schema" {
+    const alloc = std.testing.allocator;
+    var lowered = try lowerDdlPlanAlloc(
+        alloc,
+        \\CREATE TABLE usage_records (
+        \\  id uuid PRIMARY KEY,
+        \\  tenant_id text NOT NULL,
+        \\  status text DEFAULT 'open',
+        \\  updated_at_ns bigint DEFAULT 0,
+        \\  CONSTRAINT usage_records_tenant_key UNIQUE (tenant_id),
+        \\  CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id),
+        \\  CONSTRAINT usage_records_updated_check CHECK (updated_at_ns >= 0)
+        \\);
+        ,
+    );
+    defer lowered.deinit(alloc);
+
+    const schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, .{}, lowered);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    try std.testing.expectEqual(runtime_schema.StorageMode.relational, schema.storage_mode);
+    try std.testing.expect(schema.enforce_types);
+    try std.testing.expectEqual(@as(usize, 4), schema.relational_columns.len);
+    try std.testing.expect(schema.primary_key != null);
+    try std.testing.expectEqualStrings("id", schema.primary_key.?.columns[0]);
+    try std.testing.expectEqual(@as(usize, 1), schema.unique_constraints.len);
+    try std.testing.expectEqualStrings("usage_records_tenant_key", schema.unique_constraints[0].name);
+    try std.testing.expectEqual(@as(usize, 1), schema.foreign_keys.len);
+    try std.testing.expectEqualStrings("usage_records_tenant_fkey", schema.foreign_keys[0].name);
+    try std.testing.expectEqual(@as(usize, 1), schema.checks.len);
+    try std.testing.expectEqualStrings("usage_records_updated_check", schema.checks[0].name);
+}
+
+test "postgres sql adapter applies additive alter table ddl plan to runtime schema" {
+    const alloc = std.testing.allocator;
+    var create = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text NOT NULL, status text);",
+    );
+    defer create.deinit(alloc);
+    const schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, .{}, create);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var alter = try lowerDdlPlanAlloc(
+        alloc,
+        \\ALTER TABLE usage_records
+        \\  ADD COLUMN tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED,
+        \\  ADD CONSTRAINT usage_records_tenant_status_key UNIQUE (tenant_id, status),
+        \\  ADD CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id),
+        \\  ADD CONSTRAINT usage_records_status_check CHECK (status != 'deleted');
+        ,
+    );
+    defer alter.deinit(alloc);
+
+    const updated = try applyDdlPlanToRuntimeSchemaAlloc(alloc, schema, alter);
+    defer runtime_schema.freeSchema(alloc, updated);
+
+    try std.testing.expectEqual(@as(usize, 4), updated.relational_columns.len);
+    const generated = relationalColumnForField(updated, "tenant_status_key", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(generated.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat, generated.generated.?.op);
+    try std.testing.expectEqual(@as(usize, 1), updated.unique_constraints.len);
+    try std.testing.expectEqualStrings("usage_records_tenant_status_key", updated.unique_constraints[0].name);
+    try std.testing.expectEqual(@as(usize, 1), updated.foreign_keys.len);
+    try std.testing.expectEqual(@as(usize, 1), updated.checks.len);
+
+    var duplicate = try lowerDdlPlanAlloc(alloc, "ALTER TABLE usage_records ADD COLUMN status text;");
+    defer duplicate.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToRuntimeSchemaAlloc(alloc, updated, duplicate));
+}
+
+test "postgres sql adapter applies create index ddl plan to runtime schema" {
+    const alloc = std.testing.allocator;
+    var create = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TABLE users (id uuid PRIMARY KEY, tenant_id text NOT NULL, email text, status text, deleted_at timestamptz);",
+    );
+    defer create.deinit(alloc);
+    const schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, .{}, create);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var partial_index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX users_status_active_idx ON users (status) WHERE deleted_at IS NULL;",
+    );
+    defer partial_index.deinit(alloc);
+    const indexed = try applyDdlPlanToRuntimeSchemaAlloc(alloc, schema, partial_index);
+    defer runtime_schema.freeSchema(alloc, indexed);
+    const status = relationalColumnForField(indexed, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(status.indexed);
+    try std.testing.expectEqual(@as(usize, 1), status.index_where.len);
+    try std.testing.expectEqualStrings("deleted_at", status.index_where[0].field);
+
+    var generated_index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX users_lower_email_idx ON users (lower(email));",
+    );
+    defer generated_index.deinit(alloc);
+    const generated_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, indexed, generated_index);
+    defer runtime_schema.freeSchema(alloc, generated_schema);
+    const generated = relationalColumnForField(generated_schema, "users_lower_email_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(generated.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, generated.generated.?.op);
+    try std.testing.expectEqualStrings("email", generated.generated.?.field.?);
+
+    var unique_index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_tenant_lower_email_key ON users (tenant_id, lower(email)) WHERE deleted_at IS NULL;",
+    );
+    defer unique_index.deinit(alloc);
+    const unique_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, generated_schema, unique_index);
+    defer runtime_schema.freeSchema(alloc, unique_schema);
+    try std.testing.expectEqual(@as(usize, 1), unique_schema.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_tenant_lower_email_key", unique_schema.unique_constraints[0].name);
+    try std.testing.expectEqual(@as(usize, 1), unique_schema.unique_constraints[0].expressions.len);
+
+    var unsupported = try lowerDdlPlanAlloc(alloc, "CREATE INDEX users_tenant_status_idx ON users (tenant_id, status);");
+    defer unsupported.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToRuntimeSchemaAlloc(alloc, schema, unsupported));
+}
+
+test "postgres sql adapter applies updated-at trigger ddl plan to runtime schema" {
+    const alloc = std.testing.allocator;
+    var create = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint);",
+    );
+    defer create.deinit(alloc);
+    const schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, .{}, create);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var trigger = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
+    );
+    defer trigger.deinit(alloc);
+    const updated = try applyDdlPlanToRuntimeSchemaAlloc(alloc, schema, trigger);
+    defer runtime_schema.freeSchema(alloc, updated);
+
+    const column = relationalColumnForField(updated, "updated_at_ns", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(column.on_update_value != null);
+    try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.now_ns, column.on_update_value.?.kind);
+}
+
+test "postgres sql adapter compiles create table ddl plan to public schema json" {
+    const alloc = std.testing.allocator;
+    var create = try lowerDdlPlanAlloc(
+        alloc,
+        \\CREATE TABLE users (
+        \\  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+        \\  tenant_id text NOT NULL,
+        \\  email text,
+        \\  attrs jsonb,
+        \\  tags text[],
+        \\  updated_at_ns bigint DEFAULT 0,
+        \\  CONSTRAINT users_tenant_email_key UNIQUE (tenant_id, email),
+        \\  CONSTRAINT users_updated_check CHECK (updated_at_ns >= 0)
+        \\);
+        ,
+    );
+    defer create.deinit(alloc);
+
+    var applied = try applyDdlPlanToSchemaJsonAlloc(alloc, "", create);
+    defer applied.deinit(alloc);
+    try std.testing.expect(!applied.requires_rebuild);
+    try std.testing.expect(!applied.validation_required);
+
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, applied.schema_json);
+    defer parsed.deinit(alloc);
+    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, runtime);
+    try std.testing.expectEqual(runtime_schema.StorageMode.relational, runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 6), runtime.relational_columns.len);
+    try std.testing.expect(runtime.primary_key != null);
+    try std.testing.expectEqualStrings("id", runtime.primary_key.?.columns[0]);
+    try std.testing.expectEqual(@as(usize, 1), runtime.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_tenant_email_key", runtime.unique_constraints[0].name);
+    try std.testing.expectEqual(@as(usize, 1), runtime.checks.len);
+}
+
+test "postgres sql adapter applies incremental ddl plans to public schema json" {
+    const alloc = std.testing.allocator;
+    var create = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TABLE users (id uuid PRIMARY KEY, tenant_id text NOT NULL, email text, status text, deleted_at timestamptz, updated_at_ns bigint);",
+    );
+    defer create.deinit(alloc);
+    var created = try applyDdlPlanToSchemaJsonAlloc(alloc, "", create);
+    defer created.deinit(alloc);
+
+    var index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_tenant_lower_email_key ON users (tenant_id, lower(email)) WHERE deleted_at IS NULL;",
+    );
+    defer index.deinit(alloc);
+    var indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, created.schema_json, index);
+    defer indexed.deinit(alloc);
+    try std.testing.expect(indexed.requires_rebuild);
+    try std.testing.expect(indexed.validation_required);
+
+    var alter = try lowerDdlPlanAlloc(
+        alloc,
+        \\ALTER TABLE users
+        \\  ADD COLUMN tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED,
+        \\  ADD CONSTRAINT users_status_check CHECK (status != 'deleted');
+        ,
+    );
+    defer alter.deinit(alloc);
+    var altered = try applyDdlPlanToSchemaJsonAlloc(alloc, indexed.schema_json, alter);
+    defer altered.deinit(alloc);
+    try std.testing.expect(altered.requires_rebuild);
+    try std.testing.expect(altered.validation_required);
+
+    var trigger = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TRIGGER users_updated_at BEFORE UPDATE ON users EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
+    );
+    defer trigger.deinit(alloc);
+    var updated = try applyDdlPlanToSchemaJsonAlloc(alloc, altered.schema_json, trigger);
+    defer updated.deinit(alloc);
+    try std.testing.expect(!updated.requires_rebuild);
+    try std.testing.expect(!updated.validation_required);
+
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, updated.schema_json);
+    defer parsed.deinit(alloc);
+    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, runtime);
+    try std.testing.expectEqual(@as(usize, 7), runtime.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.unique_constraints.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.checks.len);
+    const generated = relationalColumnForField(runtime, "tenant_status_key", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(generated.generated != null);
+    const updated_at = relationalColumnForField(runtime, "updated_at_ns", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(updated_at.on_update_value != null);
+}
+
+test "postgres sql adapter rejects unsupported ddl shapes explicitly" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TABLE audit_log (id uuid, payload jsonb)",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TRIGGER audit_row AFTER UPDATE ON usage_records EXECUTE FUNCTION audit_changes()",
+    ));
+}
+
 test "postgres sql adapter lowers colony queue select into row claim query" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"billing_cycle_start":{"type":"datetime"},"metric_type":{"type":"keyword"},"bucket_start":{"type":"datetime"},"created_at":{"type":"datetime"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3553,7 +6390,6 @@ test "postgres sql adapter lowers colony queue select into row claim query" {
 }
 
 test "postgres sql adapter lowers json text extraction predicate" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"},"created_at":{"type":"datetime"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3581,7 +6417,6 @@ test "postgres sql adapter lowers json text extraction predicate" {
 }
 
 test "postgres sql adapter lowers jsonb containment existence and extraction projection" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"},"created_at":{"type":"datetime"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3616,7 +6451,6 @@ test "postgres sql adapter lowers jsonb containment existence and extraction pro
 }
 
 test "postgres sql adapter accepts casted jsonb document literals" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3639,7 +6473,6 @@ test "postgres sql adapter accepts casted jsonb document literals" {
 }
 
 test "postgres sql adapter lowers array containment and equality predicates" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3673,7 +6506,6 @@ test "postgres sql adapter lowers array containment and equality predicates" {
 }
 
 test "postgres sql adapter lowers array_length projection" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3702,7 +6534,6 @@ test "postgres sql adapter lowers array_length projection" {
 }
 
 test "postgres sql adapter lowers coalesce projection" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"display_name":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3742,7 +6573,6 @@ test "postgres sql adapter lowers coalesce projection" {
 }
 
 test "postgres sql adapter lowers scalar any predicates" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3778,7 +6608,6 @@ test "postgres sql adapter lowers scalar any predicates" {
 }
 
 test "postgres sql adapter lowers scalar in predicates" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"priority":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3824,7 +6653,6 @@ test "postgres sql adapter lowers scalar in predicates" {
 }
 
 test "postgres sql adapter lowers scalar or predicates" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3863,8 +6691,33 @@ test "postgres sql adapter lowers scalar or predicates" {
     ));
 }
 
+test "postgres sql adapter lowers scalar not predicate groups" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE NOT (status = 'closed' AND amount > 20) AND created_at >= 10",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.predicates.len);
+    try std.testing.expectEqualStrings("created_at", lowered.query.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), lowered.query.not_predicates[0].predicates.len);
+    try std.testing.expectEqualStrings("status", lowered.query.not_predicates[0].predicates[0].field);
+    try std.testing.expectEqualStrings("amount", lowered.query.not_predicates[0].predicates[1].field);
+}
+
 test "postgres sql adapter lowers null-test order expressions" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"expires_at":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3893,7 +6746,6 @@ test "postgres sql adapter lowers null-test order expressions" {
 }
 
 test "postgres sql adapter lowers now in scalar predicates" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"created_at_ns":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3919,7 +6771,6 @@ test "postgres sql adapter lowers now in scalar predicates" {
 }
 
 test "postgres sql adapter lowers grouped aggregate queries" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","customer","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3969,7 +6820,6 @@ test "postgres sql adapter lowers grouped aggregate queries" {
 }
 
 test "postgres sql adapter lowers filtered aggregate predicates" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","customer","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4003,7 +6853,6 @@ test "postgres sql adapter lowers filtered aggregate predicates" {
 }
 
 test "postgres sql adapter lowers distinct aggregate specs" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","customer","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4042,7 +6891,6 @@ test "postgres sql adapter lowers distinct aggregate specs" {
 }
 
 test "postgres sql adapter lowers bounded array aggregate specs" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"},"metadata":{"type":"json"}},"required":["id","status","customer","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4081,7 +6929,6 @@ test "postgres sql adapter lowers bounded array aggregate specs" {
 }
 
 test "postgres sql adapter lowers global aggregate queries" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4115,7 +6962,6 @@ test "postgres sql adapter lowers global aggregate queries" {
 }
 
 test "postgres sql adapter lowers equality join queries" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"name":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
@@ -4168,7 +7014,6 @@ test "postgres sql adapter lowers equality join queries" {
 }
 
 test "postgres sql adapter lowers generated lower expressions for query pushdown" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_key":{"type":"keyword","generated":{"op":"lower","field":"email"}}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4197,7 +7042,6 @@ test "postgres sql adapter lowers generated lower expressions for query pushdown
 }
 
 test "postgres sql adapter ignores harmless identifier casts" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4209,14 +7053,16 @@ test "postgres sql adapter ignores harmless identifier casts" {
 
     var lowered = try lowerSelectAlloc(
         alloc,
-        "SELECT \"id\"::text FROM users WHERE id::text = $1 ORDER BY \"status\"::text DESC",
+        "SELECT \"id\"::text AS id_text FROM users WHERE id::text = $1 ORDER BY \"status\"::text DESC",
         schema,
         &.{.{ .string = "u1" }},
     );
     defer lowered.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), lowered.query.select.len);
-    try std.testing.expectEqualStrings("id", lowered.query.select[0]);
+    try std.testing.expectEqual(@as(usize, 0), lowered.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.field_aliases.len);
+    try std.testing.expectEqualStrings("id_text", lowered.query.field_aliases[0].output);
+    try std.testing.expectEqualStrings("id", lowered.query.field_aliases[0].field);
     try std.testing.expectEqual(@as(usize, 1), lowered.query.predicates.len);
     try std.testing.expectEqualStrings("id", lowered.query.predicates[0].field);
     try std.testing.expectEqualStrings("\"u1\"", lowered.query.predicates[0].value_json.?);
@@ -4226,7 +7072,6 @@ test "postgres sql adapter ignores harmless identifier casts" {
 }
 
 test "postgres sql adapter rejects lower predicate without generated column" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4245,7 +7090,6 @@ test "postgres sql adapter rejects lower predicate without generated column" {
 }
 
 test "postgres sql adapter lowers insert values returning into row batch" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4280,7 +7124,6 @@ test "postgres sql adapter lowers insert values returning into row batch" {
 }
 
 test "postgres sql adapter lowers insert jsonb literal" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4306,7 +7149,6 @@ test "postgres sql adapter lowers insert jsonb literal" {
 }
 
 test "postgres sql adapter lowers jsonb_build_object insert values" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4335,7 +7177,6 @@ test "postgres sql adapter lowers jsonb_build_object insert values" {
 }
 
 test "postgres sql adapter lowers convert_from jsonb insert values" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4358,7 +7199,6 @@ test "postgres sql adapter lowers convert_from jsonb insert values" {
 }
 
 test "postgres sql adapter lowers now insert values" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"created_at_ns":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4387,7 +7227,6 @@ test "postgres sql adapter lowers now insert values" {
 }
 
 test "postgres sql adapter lowers explicit default insert values" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"created_at_ns":{"type":"numeric","x-antfly-default":{"op":"now_ns"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4417,7 +7256,6 @@ test "postgres sql adapter lowers explicit default insert values" {
 }
 
 test "postgres sql adapter rejects default without column default" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4494,7 +7332,6 @@ const TestPrimaryResolver = struct {
 };
 
 test "postgres sql adapter lowers update patch with explicit version predicate" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4525,7 +7362,6 @@ test "postgres sql adapter lowers update patch with explicit version predicate" 
 }
 
 test "postgres sql adapter lowers arithmetic updates into typed increments" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4574,8 +7410,46 @@ test "postgres sql adapter lowers arithmetic updates into typed increments" {
     try std.testing.expectEqual(@as(u64, 21), minus.batch.predicates[0].expected_version);
 }
 
+test "postgres sql adapter lowers array updates into typed transforms" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"tags\":[\"old\"],\"status\":\"active\"}", .version = 22 };
+
+    var lowered = try lowerUpdateAlloc(
+        alloc,
+        "UPDATE usage_records SET tags = array_append(tags, 'new'), tags = array_remove(tags, 'old') WHERE id = $1 RETURNING tags",
+        schema,
+        &.{.{ .string = "u1" }},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 2), lowered.batch.transforms[0].operations.len);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.push, lowered.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("tags", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.pull, lowered.batch.transforms[0].operations[1].op);
+    try std.testing.expectEqualStrings("\"old\"", lowered.batch.transforms[0].operations[1].value_json.?);
+    try std.testing.expectEqual(@as(u64, 22), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"tags\":[\"new\"]}", lowered.batch.returning_rows[0]);
+
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerUpdateAlloc(
+        alloc,
+        "UPDATE usage_records SET status = array_append(status, 'bad') WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        resolver_ctx.resolver(),
+    ));
+}
+
 test "postgres sql adapter lowers now update values" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"updated_at_ns":{"type":"numeric"},"name":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4609,8 +7483,40 @@ test "postgres sql adapter lowers now update values" {
     try std.testing.expectEqual(@as(u64, 22), lowered.batch.predicates[0].expected_version);
 }
 
+test "postgres sql adapter applies server update policies" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"updated_at_ns":{"type":"numeric","x-antfly-on-update":{"op":"now_ns"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"old\",\"updated_at_ns\":1}", .version = 24 };
+
+    var lowered = try lowerUpdateAlloc(
+        alloc,
+        "UPDATE users SET status = 'active' WHERE id = $1 RETURNING status, updated_at_ns",
+        schema,
+        &.{.{ .string = "u1" }},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), lowered.batch.transforms[0].operations.len);
+    try std.testing.expectEqualStrings("status", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("updated_at_ns", lowered.batch.transforms[0].operations[1].path);
+    var returned = try std.json.parseFromSlice(std.json.Value, alloc, lowered.batch.returning_rows[0], .{});
+    defer returned.deinit();
+    try std.testing.expectEqualStrings("active", returned.value.object.get("status").?.string);
+    switch (returned.value.object.get("updated_at_ns").?) {
+        .integer => |value| try std.testing.expect(value > 1),
+        .float => |value| try std.testing.expect(value > 1),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "postgres sql adapter lowers explicit default update values" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","default":"active"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4638,7 +7544,6 @@ test "postgres sql adapter lowers explicit default update values" {
 }
 
 test "postgres sql adapter lowers jsonb_build_object update value" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4665,7 +7570,6 @@ test "postgres sql adapter lowers jsonb_build_object update value" {
 }
 
 test "postgres sql adapter lowers convert_from jsonb update value" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4692,7 +7596,6 @@ test "postgres sql adapter lowers convert_from jsonb update value" {
 }
 
 test "postgres sql adapter lowers update jsonb_set returning through row batch" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4723,7 +7626,6 @@ test "postgres sql adapter lowers update jsonb_set returning through row batch" 
 }
 
 test "postgres sql adapter lowers update jsonb concat into json set operations" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4754,7 +7656,6 @@ test "postgres sql adapter lowers update jsonb concat into json set operations" 
 }
 
 test "postgres sql adapter lowers delete with explicit version predicate" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4781,7 +7682,6 @@ test "postgres sql adapter lowers delete with explicit version predicate" {
 }
 
 test "postgres sql adapter lowers on conflict primary do nothing" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4807,7 +7707,6 @@ test "postgres sql adapter lowers on conflict primary do nothing" {
 }
 
 test "postgres sql adapter lowers on conflict primary do update with excluded values" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4838,7 +7737,6 @@ test "postgres sql adapter lowers on conflict primary do update with excluded va
 }
 
 test "postgres sql adapter lowers excluded explicit default values" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","default":"active"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -4866,8 +7764,43 @@ test "postgres sql adapter lowers excluded explicit default values" {
     try std.testing.expectEqualStrings("{\"status\":\"active\"}", lowered.batch.returning_rows[0]);
 }
 
+test "postgres sql adapter lowers cross-column excluded conflict values" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"next_status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"old\"}", .version = 14 };
+
+    var lowered = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'active') ON CONFLICT (email) DO UPDATE SET status = excluded.next_status RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), lowered.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqualStrings("status", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"active\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"active\"}", lowered.batch.returning_rows[0]);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 3) ON CONFLICT (email) DO UPDATE SET status = excluded.amount RETURNING status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+}
+
 test "postgres sql adapter lowers on conflict unique do update" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
@@ -4895,7 +7828,6 @@ test "postgres sql adapter lowers on conflict unique do update" {
 }
 
 test "postgres sql adapter lowers on conflict arithmetic update" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
@@ -4930,7 +7862,6 @@ test "postgres sql adapter lowers on conflict arithmetic update" {
 }
 
 test "postgres sql adapter lowers on conflict jsonb concat update" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
@@ -4960,7 +7891,6 @@ test "postgres sql adapter lowers on conflict jsonb concat update" {
 }
 
 test "postgres sql adapter lowers on conflict jsonb_build_object update" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
@@ -4987,7 +7917,6 @@ test "postgres sql adapter lowers on conflict jsonb_build_object update" {
 }
 
 test "postgres sql adapter lowers partial unique conflict target predicates" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_active_email_key","columns":["email"],"where":{"all":[{"field":"status","op":"eq","value":"active"}]}}]}
@@ -5015,7 +7944,6 @@ test "postgres sql adapter lowers partial unique conflict target predicates" {
 }
 
 test "postgres sql adapter lowers lower expression unique conflict target" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_lower_email_key","expressions":[{"op":"lower","field":"email"}]}]}
@@ -5043,7 +7971,6 @@ test "postgres sql adapter lowers lower expression unique conflict target" {
 }
 
 test "postgres sql adapter lowers non recursive cte query plans" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -5101,7 +8028,6 @@ test "postgres sql adapter lowers non recursive cte query plans" {
 }
 
 test "postgres sql adapter rejects unsupported colony shapes explicitly" {
-    const schema_api = @import("../schema/mod.zig");
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"organization_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}

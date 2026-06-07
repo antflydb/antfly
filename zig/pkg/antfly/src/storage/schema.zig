@@ -136,6 +136,7 @@ pub const RelationalColumn = struct {
     nullable: bool = true,
     indexed: bool = true,
     default_value: ?RelationalDefaultValue = null,
+    on_update_value: ?RelationalDefaultValue = null,
     generated: ?RelationalGeneratedValue = null,
     index_where: []const UniquePredicate = &.{},
 };
@@ -262,6 +263,7 @@ pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []
         if (a.nullable != b.nullable) return false;
         if (a.indexed != b.indexed) return false;
         if (!relationalDefaultsEqual(a.default_value, b.default_value)) return false;
+        if (!relationalDefaultsEqual(a.on_update_value, b.on_update_value)) return false;
         if (!relationalGeneratedValuesEqual(a.generated, b.generated)) return false;
         if (!uniquePredicateSlicesEqual(a.index_where, b.index_where)) return false;
     }
@@ -395,7 +397,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 22); // format version
+    try appendU32(&buf, alloc, 23); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -466,6 +468,13 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
             try buf.append(alloc, 1);
             try buf.append(alloc, @intFromEnum(default_value.kind));
             try appendStr(&buf, alloc, default_value.value_json);
+        } else {
+            try buf.append(alloc, 0);
+        }
+        if (column.on_update_value) |on_update_value| {
+            try buf.append(alloc, 1);
+            try buf.append(alloc, @intFromEnum(on_update_value.kind));
+            try appendStr(&buf, alloc, on_update_value.value_json);
         } else {
             try buf.append(alloc, 0);
         }
@@ -554,7 +563,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 22) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 23) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -816,6 +825,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 alloc.free(column.name);
                 alloc.free(column.path);
                 if (column.default_value) |value| alloc.free(value.value_json);
+                if (column.on_update_value) |value| alloc.free(value.value_json);
                 if (column.generated) |value| freeRelationalGeneratedValue(alloc, value);
                 freeUniquePredicateSlice(alloc, column.index_where);
             }
@@ -855,6 +865,17 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 break :default_blk null;
             };
             errdefer if (default_value) |value| alloc.free(value.value_json);
+            const on_update_value: ?RelationalDefaultValue = if (fmt_version >= 23 and data[pos] == 1) update_blk: {
+                pos += 1;
+                const kind: RelationalDefaultKind = @enumFromInt(data[pos]);
+                pos += 1;
+                const value_json = try alloc.dupe(u8, readStr(data, &pos));
+                break :update_blk .{ .kind = kind, .value_json = value_json };
+            } else update_blk: {
+                if (fmt_version >= 23) pos += 1;
+                break :update_blk null;
+            };
+            errdefer if (on_update_value) |value| alloc.free(value.value_json);
             const generated: ?RelationalGeneratedValue = if (fmt_version >= 20 and data[pos] == 1) generated_blk: {
                 pos += 1;
                 const op: RelationalGeneratedOp = @enumFromInt(data[pos]);
@@ -873,7 +894,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer if (generated) |value| freeRelationalGeneratedValue(alloc, value);
             const index_where = if (fmt_version >= 22) try readUniquePredicateSliceAlloc(alloc, data, &pos) else &.{};
             errdefer freeUniquePredicateSlice(alloc, index_where);
-            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .indexed = indexed, .default_value = default_value, .generated = generated, .index_where = index_where };
+            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .indexed = indexed, .default_value = default_value, .on_update_value = on_update_value, .generated = generated, .index_where = index_where };
             columns_initialized += 1;
         }
         break :blk columns;
@@ -1049,6 +1070,7 @@ fn freeRelationalColumnsSlice(alloc: Allocator, columns: []const RelationalColum
         alloc.free(column.name);
         alloc.free(column.path);
         if (column.default_value) |value| alloc.free(value.value_json);
+        if (column.on_update_value) |value| alloc.free(value.value_json);
         if (column.generated) |value| freeRelationalGeneratedValue(alloc, value);
         freeUniquePredicateSlice(alloc, column.index_where);
     }
@@ -1729,7 +1751,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
             .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
             .{ .name = "tenant_id", .path = "tenant_id", .field_type = .keyword, .nullable = false },
             .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false, .default_value = .{ .value_json = "1" }, .index_where = &.{.{ .field = "tenant_id", .op = .is_not_null }} },
-            .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true, .default_value = .{ .kind = .now_ns, .value_json = "" } },
+            .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true, .default_value = .{ .kind = .now_ns, .value_json = "" }, .on_update_value = .{ .kind = .now_ns, .value_json = "" } },
             .{ .name = "request_id", .path = "request_id", .field_type = .keyword, .nullable = true, .default_value = .{ .kind = .uuid_v4, .value_json = "" } },
             .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true, .indexed = false },
             .{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .keyword, .nullable = true },
@@ -1807,6 +1829,8 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expect(loaded.relational_columns[3].nullable);
     try std.testing.expect(loaded.relational_columns[3].default_value != null);
     try std.testing.expectEqual(RelationalDefaultKind.now_ns, loaded.relational_columns[3].default_value.?.kind);
+    try std.testing.expect(loaded.relational_columns[3].on_update_value != null);
+    try std.testing.expectEqual(RelationalDefaultKind.now_ns, loaded.relational_columns[3].on_update_value.?.kind);
     try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[4].field_type);
     try std.testing.expect(loaded.relational_columns[4].default_value != null);
     try std.testing.expectEqual(RelationalDefaultKind.uuid_v4, loaded.relational_columns[4].default_value.?.kind);

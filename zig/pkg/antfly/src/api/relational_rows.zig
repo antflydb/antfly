@@ -264,6 +264,7 @@ pub fn parseRowsBatchRequestWithResolver(
             var operations = try updateTransformOperationsAlloc(alloc, schema, op_value);
             var operations_transferred = false;
             errdefer if (!operations_transferred) freeTransformOps(alloc, operations);
+            operations = try extendOperationsWithOnUpdateAlloc(alloc, operations, schema);
             const needs_planned_row = schemaHasGeneratedColumns(schema) or schema.checks.len != 0 or op_value.object.get("returning") != null;
             var returning_base = if (needs_planned_row)
                 try lookupBaseRowForKey(alloc, table_name, key, unique_resolver)
@@ -431,6 +432,9 @@ pub fn parseRowsQueryRequest(
     const or_predicates = try parseRowsQueryOrPredicateGroupsAlloc(alloc, schema, parsed.value.object.get("where"));
     errdefer freeRowsQueryPredicateGroups(alloc, or_predicates);
 
+    const not_predicates = try parseRowsQueryNotPredicateGroupsAlloc(alloc, schema, parsed.value.object.get("where"));
+    errdefer freeRowsQueryPredicateGroups(alloc, not_predicates);
+
     const array_any = try parseRowsQueryArrayAnyPredicatesAlloc(alloc, schema, parsed.value.object.get("where"));
     errdefer freeRowsQueryArrayAnyPredicates(alloc, array_any);
 
@@ -467,6 +471,9 @@ pub fn parseRowsQueryRequest(
     const coalesce = try parseRowsQueryCoalesceProjectionsAlloc(alloc, schema, parsed.value.object.get("coalesce"));
     errdefer freeRowsQueryCoalesceProjections(alloc, coalesce);
 
+    const field_aliases = try parseRowsQueryFieldAliasProjectionsAlloc(alloc, schema, parsed.value.object.get("field_aliases"));
+    errdefer freeRowsQueryFieldAliasProjections(alloc, field_aliases);
+
     const order_by = try parseRowsQueryOrderAlloc(alloc, schema, parsed.value.object.get("order_by"));
     errdefer {
         for (order_by) |order| alloc.free(order.field);
@@ -493,11 +500,13 @@ pub fn parseRowsQueryRequest(
         .json_path_eq = json_path_eq,
         .json_path_exists = json_path_exists,
         .or_predicates = or_predicates,
+        .not_predicates = not_predicates,
         .select = select_parsed.fields,
         .json_extract = json_extract,
         .array_length = array_length,
         .coalesce = coalesce,
-        .select_all = select_parsed.all and json_extract.len == 0 and array_length.len == 0 and coalesce.len == 0,
+        .field_aliases = field_aliases,
+        .select_all = select_parsed.all and json_extract.len == 0 and array_length.len == 0 and coalesce.len == 0 and field_aliases.len == 0,
         .order_by = order_by,
         .row_claim = row_claim,
         .doc_key_range = doc_key_range,
@@ -688,7 +697,7 @@ fn parseRowsQueryPredicatesAlloc(
         return try out.toOwnedSlice(alloc);
     }
 
-    if (where_value.object.get("any") != null) return &.{};
+    if (where_value.object.get("any") != null or where_value.object.get("not") != null) return &.{};
 
     if (where_value.object.get("field") != null or where_value.object.get("op") != null) {
         if (rowsQueryPredicateAtomOpIsStructured(where_value)) return &.{};
@@ -745,6 +754,42 @@ fn parseRowsQueryOrPredicateGroupsAlloc(
     }
 
     for (any_value.array.items) |branch| {
+        const predicates = try parseRowsQueryPredicateGroupAlloc(alloc, schema, branch);
+        var predicates_transferred = false;
+        errdefer if (!predicates_transferred) {
+            freeQueryPredicates(alloc, predicates);
+            if (predicates.len > 0) alloc.free(predicates);
+        };
+        if (predicates.len == 0) return error.InvalidRowsRequest;
+        groups[initialized] = .{ .predicates = predicates };
+        predicates_transferred = true;
+        initialized += 1;
+    }
+
+    return groups;
+}
+
+fn parseRowsQueryNotPredicateGroupsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    maybe_where: ?std.json.Value,
+) ![]db_mod.types.RelationalRowsPredicateGroup {
+    const where_value = maybe_where orelse return &.{};
+    if (where_value != .object) return error.InvalidRowsRequest;
+    const not_value = where_value.object.get("not") orelse return &.{};
+    if (not_value != .array or not_value.array.items.len == 0) return error.InvalidRowsRequest;
+
+    const groups = try alloc.alloc(db_mod.types.RelationalRowsPredicateGroup, not_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (groups[0..initialized]) |group| {
+            freeQueryPredicates(alloc, group.predicates);
+            if (group.predicates.len > 0) alloc.free(group.predicates);
+        }
+        alloc.free(groups);
+    }
+
+    for (not_value.array.items) |branch| {
         const predicates = try parseRowsQueryPredicateGroupAlloc(alloc, schema, branch);
         var predicates_transferred = false;
         errdefer if (!predicates_transferred) {
@@ -1347,6 +1392,51 @@ fn parseRowsQueryCoalesceProjectionsAlloc(
     return projections;
 }
 
+fn parseRowsQueryFieldAliasProjectionsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    maybe_projection: ?std.json.Value,
+) ![]db_mod.types.RelationalRowsFieldAliasProjection {
+    const projection_value = maybe_projection orelse return &.{};
+    if (projection_value != .array) return error.InvalidRowsRequest;
+
+    const projections = try alloc.alloc(db_mod.types.RelationalRowsFieldAliasProjection, projection_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (projections[0..initialized]) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        }
+        alloc.free(projections);
+    }
+
+    for (projection_value.array.items) |item| {
+        if (item != .object) return error.InvalidRowsRequest;
+        const output_value = item.object.get("as") orelse return error.InvalidRowsRequest;
+        const field_value = item.object.get("field") orelse return error.InvalidRowsRequest;
+        if (output_value != .string or output_value.string.len == 0) return error.InvalidRowsRequest;
+        if (field_value != .string or field_value.string.len == 0) return error.InvalidRowsRequest;
+        _ = findRelationalColumn(schema.relational_columns, field_value.string) orelse return error.InvalidRowsRequest;
+
+        const output = try alloc.dupe(u8, output_value.string);
+        var output_transferred = false;
+        errdefer if (!output_transferred) alloc.free(output);
+        const field = try alloc.dupe(u8, field_value.string);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+
+        projections[initialized] = .{
+            .output = output,
+            .field = field,
+        };
+        output_transferred = true;
+        field_transferred = true;
+        initialized += 1;
+    }
+
+    return projections;
+}
+
 fn parseRowsQueryOrderAlloc(
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
@@ -1501,6 +1591,17 @@ fn queryOrPredicateGroupsPass(
     return false;
 }
 
+fn queryNotPredicateGroupsPass(
+    alloc: std.mem.Allocator,
+    row: std.json.Value,
+    groups: []const db_mod.types.RelationalRowsPredicateGroup,
+) !bool {
+    for (groups) |group| {
+        if (try queryPredicatesPass(alloc, row, group.predicates)) return false;
+    }
+    return true;
+}
+
 fn queryRequestPredicatesPass(
     alloc: std.mem.Allocator,
     row: std.json.Value,
@@ -1508,6 +1609,7 @@ fn queryRequestPredicatesPass(
 ) !bool {
     if (!try queryPredicatesPass(alloc, row, request.predicates)) return false;
     if (!try queryOrPredicateGroupsPass(alloc, row, request.or_predicates)) return false;
+    if (!try queryNotPredicateGroupsPass(alloc, row, request.not_predicates)) return false;
     for (request.array_any) |predicate| {
         if (!try queryArrayAnyPredicatePasses(alloc, row, predicate)) return false;
     }
@@ -1813,7 +1915,7 @@ fn projectRowsQueryRowAlloc(
     request: OwnedRowsQueryRequest,
     row_json: []const u8,
 ) ![]u8 {
-    if (request.select_all and request.json_extract.len == 0 and request.array_length.len == 0 and request.coalesce.len == 0) return try alloc.dupe(u8, row_json);
+    if (request.select_all and request.json_extract.len == 0 and request.array_length.len == 0 and request.coalesce.len == 0 and request.field_aliases.len == 0) return try alloc.dupe(u8, row_json);
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
@@ -1859,6 +1961,16 @@ fn projectRowsQueryRowAlloc(
         first = false;
         try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
         try writeCoalesceProjectionValue(alloc, writer, parsed.value, projection);
+    }
+    for (request.field_aliases) |projection| {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
+        if (jsonValueAtPath(parsed.value, projection.field)) |selected| {
+            try std.json.Stringify.value(selected.*, .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
     }
     try writer.writeByte('}');
     return try out.toOwnedSlice();
@@ -2046,6 +2158,14 @@ fn freeRowsQueryCoalesceProjections(alloc: std.mem.Allocator, projections: []con
     if (projections.len > 0) alloc.free(projections);
 }
 
+fn freeRowsQueryFieldAliasProjections(alloc: std.mem.Allocator, projections: []const db_mod.types.RelationalRowsFieldAliasProjection) void {
+    for (projections) |projection| {
+        alloc.free(projection.output);
+        alloc.free(projection.field);
+    }
+    if (projections.len > 0) alloc.free(projections);
+}
+
 fn freeQueryOrderKeys(alloc: std.mem.Allocator, keys: []const QueryOrderKey) void {
     for (keys) |key| switch (key) {
         .string => |text| alloc.free(text),
@@ -2174,6 +2294,43 @@ fn schemaHasGeneratedColumns(schema: runtime_schema.TableSchema) bool {
         if (column.generated != null) return true;
     }
     return false;
+}
+
+fn extendOperationsWithOnUpdateAlloc(
+    alloc: std.mem.Allocator,
+    operations: []db_mod.types.TransformOp,
+    schema: runtime_schema.TableSchema,
+) ![]db_mod.types.TransformOp {
+    var update_count: usize = 0;
+    for (schema.relational_columns) |column| {
+        if (column.on_update_value != null) update_count += 1;
+    }
+    if (update_count == 0) return operations;
+
+    const extended = try alloc.alloc(db_mod.types.TransformOp, operations.len + update_count);
+    @memcpy(extended[0..operations.len], operations);
+    alloc.free(operations);
+    var index = operations.len;
+    errdefer freeTransformOps(alloc, extended[operations.len..index]);
+
+    for (schema.relational_columns) |column| {
+        const on_update_value = column.on_update_value orelse continue;
+        const value_json = try relationalDefaultValueJsonAlloc(alloc, on_update_value);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        const path = try alloc.dupe(u8, column.path);
+        var path_transferred = false;
+        errdefer if (!path_transferred) alloc.free(path);
+        extended[index] = .{
+            .op = .set,
+            .path = path,
+            .value_json = value_json,
+        };
+        path_transferred = true;
+        value_transferred = true;
+        index += 1;
+    }
+    return extended;
 }
 
 fn appendJsonFieldValue(
@@ -2452,6 +2609,7 @@ fn appendInsertWithConflictAlloc(
                 var operations = try updateTransformOperationsAlloc(alloc, schema, conflict_value);
                 var operations_transferred = false;
                 errdefer if (!operations_transferred) freeTransformOps(alloc, operations);
+                operations = try extendOperationsWithOnUpdateAlloc(alloc, operations, schema);
                 if (op_value.object.get("returning") != null or schemaHasGeneratedColumns(schema) or schema.checks.len != 0) {
                     const existing = (try resolver.lookupPrimary(alloc, table_name, key)) orelse return error.RowSelectorNotFound;
                     var existing_mut = existing;
@@ -2740,6 +2898,10 @@ fn updateTransformOperationsAlloc(
         saw_mutation = true;
         try appendJsonSetTransformOperationsAlloc(alloc, schema, json_set, &operations);
     }
+    if (op_value.object.get("array_update")) |array_update| {
+        saw_mutation = true;
+        try appendArrayUpdateTransformOperationsAlloc(alloc, schema, array_update, &operations);
+    }
     if (!saw_mutation) return error.InvalidRowsRequest;
 
     return try operations.toOwnedSlice(alloc);
@@ -2828,6 +2990,49 @@ fn appendJsonSetTransformOperationsAlloc(
         try operations.append(alloc, .{
             .op = .set,
             .path = transform_path,
+            .value_json = value_json,
+        });
+        path_transferred = true;
+        value_transferred = true;
+    }
+}
+
+fn appendArrayUpdateTransformOperationsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    array_update: std.json.Value,
+    operations: *std.ArrayListUnmanaged(db_mod.types.TransformOp),
+) !void {
+    if (array_update != .array) return error.InvalidRowsRequest;
+    for (array_update.array.items) |item| {
+        if (item != .object) return error.InvalidRowsRequest;
+        const field_value = item.object.get("field") orelse return error.InvalidRowsRequest;
+        if (field_value != .string or field_value.string.len == 0) return error.InvalidRowsRequest;
+        const column = findRelationalColumn(schema.relational_columns, field_value.string) orelse return error.InvalidRowsRequest;
+        if (column.field_type != .array) return error.InvalidRowsRequest;
+        if (schema.primary_key) |primary_key| {
+            if (primaryKeyContains(primary_key, field_value.string)) return error.InvalidRowsRequest;
+        }
+        const op_value = item.object.get("op") orelse return error.InvalidRowsRequest;
+        if (op_value != .string) return error.InvalidRowsRequest;
+        const op: db_mod.types.TransformOpType = if (std.mem.eql(u8, op_value.string, "append"))
+            .push
+        else if (std.mem.eql(u8, op_value.string, "remove"))
+            .pull
+        else if (std.mem.eql(u8, op_value.string, "add_to_set"))
+            .add_to_set
+        else
+            return error.InvalidRowsRequest;
+        const value = item.object.get("value") orelse return error.InvalidRowsRequest;
+        const value_json = try jsonValueStringifyAlloc(alloc, value);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        const path = try alloc.dupe(u8, column.path);
+        var path_transferred = false;
+        errdefer if (!path_transferred) alloc.free(path);
+        try operations.append(alloc, .{
+            .op = op,
+            .path = path,
             .value_json = value_json,
         });
         path_transferred = true;
@@ -3198,6 +3403,59 @@ test "relational rows materializes server defaults once per planned row" {
     try std.testing.expectEqualStrings(committed_request_id.string, returned.value.object.get("request_id").?.string);
     try std.testing.expectEqualStrings(committed_request_id_lc.string, returned.value.object.get("request_id_lc").?.string);
     try std.testing.expectEqual(committed_created_at.integer, returned.value.object.get("created_at_ns").?.integer);
+}
+
+test "relational rows applies server on update policies" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"updated_at_ns":{"type":"numeric","x-antfly-on-update":{"op":"now_ns"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    const Resolver = struct {
+        fn iface(self: *@This()) UniqueSelectorResolver {
+            return .{ .ptr = self, .resolve = resolveUnique, .lookup_primary = lookupPrimary };
+        }
+
+        fn resolveUnique(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !?[]u8 {
+            return error.InvalidRowsRequest;
+        }
+
+        fn lookupPrimary(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !?ResolvedPrimaryRow {
+            return .{
+                .json = try alloc.dupe(u8, "{\"id\":\"u1\",\"status\":\"old\",\"updated_at_ns\":1}"),
+                .version = 23,
+            };
+        }
+    };
+
+    var resolver = Resolver{};
+    var batch = try parseRowsBatchRequestWithResolver(
+        std.testing.allocator,
+        "usage_records",
+        "{\"operations\":[{\"op\":\"update\",\"where\":{\"primary\":{\"id\":\"u1\"}},\"patch\":{\"status\":\"active\"},\"returning\":[\"status\",\"updated_at_ns\"]}]}",
+        schema,
+        resolver.iface(),
+    );
+    defer batch.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), batch.transforms.len);
+    try std.testing.expectEqual(@as(usize, 2), batch.transforms[0].operations.len);
+    try std.testing.expectEqualStrings("status", batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("updated_at_ns", batch.transforms[0].operations[1].path);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, batch.transforms[0].operations[1].op);
+    try std.testing.expectEqual(@as(u64, 23), batch.predicates[0].expected_version);
+
+    var returned = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, batch.returning_rows[0], .{});
+    defer returned.deinit();
+    try std.testing.expectEqualStrings("active", returned.value.object.get("status").?.string);
+    switch (returned.value.object.get("updated_at_ns").?) {
+        .integer => |value| try std.testing.expect(value > 1),
+        .float => |value| try std.testing.expect(value > 1),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 fn expectUuidV4JsonString(value: std.json.Value) !void {
@@ -3644,6 +3902,66 @@ test "relational rows batch supports typed numeric increments" {
     ));
 }
 
+test "relational rows batch supports typed array transforms" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    const Resolver = struct {
+        fn iface(self: *@This()) UniqueSelectorResolver {
+            return .{ .ptr = self, .resolve = resolveUnique, .lookup_primary = lookupPrimary };
+        }
+
+        fn resolveUnique(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !?[]u8 {
+            return error.InvalidRowsRequest;
+        }
+
+        fn lookupPrimary(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) !?ResolvedPrimaryRow {
+            return .{
+                .json = try alloc.dupe(u8, "{\"id\":\"u1\",\"tags\":[\"db\",\"old\",\"old\"],\"status\":\"active\"}"),
+                .version = 19,
+            };
+        }
+    };
+
+    var resolver = Resolver{};
+    var batch = try parseRowsBatchRequestWithResolver(
+        std.testing.allocator,
+        "usage_records",
+        "{\"operations\":[{\"op\":\"update\",\"where\":{\"primary\":{\"id\":\"u1\"}},\"array_update\":[{\"field\":\"tags\",\"op\":\"append\",\"value\":\"db\"},{\"field\":\"tags\",\"op\":\"remove\",\"value\":\"old\"},{\"field\":\"tags\",\"op\":\"add_to_set\",\"value\":\"zig\"}],\"returning\":[\"tags\"]}]}",
+        schema,
+        resolver.iface(),
+    );
+    defer batch.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), batch.transforms.len);
+    try std.testing.expectEqual(@as(usize, 3), batch.transforms[0].operations.len);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.push, batch.transforms[0].operations[0].op);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.pull, batch.transforms[0].operations[1].op);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.add_to_set, batch.transforms[0].operations[2].op);
+    try std.testing.expectEqualStrings("tags", batch.transforms[0].operations[0].path);
+    try std.testing.expectEqual(@as(u64, 19), batch.predicates[0].expected_version);
+    try std.testing.expectEqual(@as(usize, 1), batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"tags\":[\"db\",\"db\",\"zig\"]}", batch.returning_rows[0]);
+
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsBatchRequestWithResolver(
+        std.testing.allocator,
+        "usage_records",
+        "{\"operations\":[{\"op\":\"update\",\"where\":{\"primary\":{\"id\":\"u1\"}},\"array_update\":[{\"field\":\"status\",\"op\":\"append\",\"value\":\"bad\"}]}]}",
+        schema,
+        resolver.iface(),
+    ));
+}
+
 test "relational rows json_set updates declared json columns" {
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"billing":{"type":"object","properties":{"plan":{"type":"keyword"}}}}}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -3714,10 +4032,12 @@ test "relational rows query contract filters orders paginates and projects rows"
 
     var request = try parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"where\":{\"all\":[{\"field\":\"tenant_id\",\"op\":\"eq\",\"value\":\"t1\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"},{\"field\":\"amount\",\"op\":\"gt\",\"value\":3}]},\"select\":[\"id\",\"status\",\"created_at\"],\"order_by\":[{\"field\":\"created_at\",\"direction\":\"desc\"}],\"offset\":1,\"limit\":2}",
+        "{\"where\":{\"all\":[{\"field\":\"tenant_id\",\"op\":\"eq\",\"value\":\"t1\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"},{\"field\":\"amount\",\"op\":\"gt\",\"value\":3}],\"not\":[{\"all\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"archived\"}]}]},\"select\":[\"id\",\"status\",\"created_at\"],\"order_by\":[{\"field\":\"created_at\",\"direction\":\"desc\"}],\"offset\":1,\"limit\":2}",
         schema,
     );
     defer request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), request.not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), request.not_predicates[0].predicates.len);
 
     const rows = [_][]const u8{
         "{\"id\":\"u1\",\"tenant_id\":\"t1\",\"status\":\"open\",\"amount\":5,\"created_at\":20}",
@@ -3933,13 +4253,16 @@ test "relational rows query contract projects coalesce expressions" {
 
     var request = try parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"select\":[\"id\"],\"coalesce\":[{\"as\":\"name_or_email\",\"operands\":[{\"field\":\"display_name\"},{\"field\":\"email\"},{\"value\":\"unknown\"}]}],\"order_by\":[{\"field\":\"id\"}]}",
+        "{\"select\":[\"id\"],\"field_aliases\":[{\"as\":\"user_id\",\"field\":\"id\"}],\"coalesce\":[{\"as\":\"name_or_email\",\"operands\":[{\"field\":\"display_name\"},{\"field\":\"email\"},{\"value\":\"unknown\"}]}],\"order_by\":[{\"field\":\"id\"}]}",
         schema,
     );
     defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), request.coalesce.len);
     try std.testing.expectEqualStrings("name_or_email", request.coalesce[0].output);
     try std.testing.expectEqual(@as(usize, 3), request.coalesce[0].operands.len);
+    try std.testing.expectEqual(@as(usize, 1), request.field_aliases.len);
+    try std.testing.expectEqualStrings("user_id", request.field_aliases[0].output);
+    try std.testing.expectEqualStrings("id", request.field_aliases[0].field);
     try std.testing.expect(!request.select_all);
 
     const rows = [_][]const u8{
@@ -3950,9 +4273,9 @@ test "relational rows query contract projects coalesce expressions" {
     var result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, request, rows[0..]);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 3), result.total);
-    try std.testing.expectEqualStrings("{\"id\":\"a\",\"name_or_email\":\"Ada\"}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"id\":\"b\",\"name_or_email\":\"b@example.test\"}", result.rows[1]);
-    try std.testing.expectEqualStrings("{\"id\":\"c\",\"name_or_email\":\"unknown\"}", result.rows[2]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"name_or_email\":\"Ada\",\"user_id\":\"a\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"name_or_email\":\"b@example.test\",\"user_id\":\"b\"}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"name_or_email\":\"unknown\",\"user_id\":\"c\"}", result.rows[2]);
 
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,

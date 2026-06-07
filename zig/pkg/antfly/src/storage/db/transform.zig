@@ -64,6 +64,8 @@ fn applyTransformOp(alloc: Allocator, root: *std.json.Value, op: types.Transform
         .set_on_insert => if (is_insert) try setOp(alloc, &root.object, op.path, op.value_json),
         .unset => try unsetOp(alloc, &root.object, op.path),
         .inc => try incOp(alloc, &root.object, op.path, op.value_json orelse return error.InvalidArgument),
+        .push => try pushOp(alloc, &root.object, op.path, op.value_json orelse return error.InvalidArgument),
+        .pull => try pullOp(alloc, &root.object, op.path, op.value_json orelse return error.InvalidArgument),
         .add_to_set => try addToSetOp(alloc, &root.object, op.path, op.value_json orelse return error.InvalidArgument),
         .max => try maxOp(alloc, &root.object, op.path, op.value_json orelse return error.InvalidArgument),
         else => return error.UnsupportedTransformOperation,
@@ -195,6 +197,74 @@ fn addToSetOp(
     }
     try arr.append(value);
     try setNestedValue(alloc, obj, parts, .{ .array = arr });
+}
+
+fn pushOp(
+    alloc: Allocator,
+    obj: *std.json.ObjectMap,
+    path: []const u8,
+    value_json: []const u8,
+) !void {
+    const normalized = try normalizeJsonPath(path);
+    const parts = normalized.slice();
+    var value = blk: {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+        defer parsed.deinit();
+        break :blk try cloneJsonValue(alloc, parsed.value);
+    };
+    errdefer freeJsonValue(alloc, &value);
+
+    if (parts.len == 0) return error.InvalidArgument;
+    if (getNestedValue(obj, parts)) |existing| {
+        switch (existing.*) {
+            .array => |*arr| {
+                try arr.append(value);
+                return;
+            },
+            else => return error.InvalidArgument,
+        }
+    }
+
+    var arr = std.json.Array.init(alloc);
+    errdefer {
+        for (arr.items) |*item| freeJsonValue(alloc, item);
+        arr.deinit();
+    }
+    try arr.append(value);
+    try setNestedValue(alloc, obj, parts, .{ .array = arr });
+}
+
+fn pullOp(
+    alloc: Allocator,
+    obj: *std.json.ObjectMap,
+    path: []const u8,
+    value_json: []const u8,
+) !void {
+    const normalized = try normalizeJsonPath(path);
+    const parts = normalized.slice();
+    var value = blk: {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+        defer parsed.deinit();
+        break :blk try cloneJsonValue(alloc, parsed.value);
+    };
+    defer freeJsonValue(alloc, &value);
+
+    if (parts.len == 0) return error.InvalidArgument;
+    const existing = getNestedValue(obj, parts) orelse return;
+    switch (existing.*) {
+        .array => |*arr| {
+            var i: usize = 0;
+            while (i < arr.items.len) {
+                if (jsonValuesEqual(arr.items[i], value)) {
+                    var removed = arr.orderedRemove(i);
+                    freeJsonValue(alloc, &removed);
+                    continue;
+                }
+                i += 1;
+            }
+        },
+        else => return error.InvalidArgument,
+    }
 }
 
 fn getNestedValue(obj: *std.json.ObjectMap, parts: []const []const u8) ?*std.json.Value {
@@ -395,6 +465,28 @@ test "resolve document transform supports set setOnInsert max inc and addToSet" 
     try std.testing.expectEqualStrings("updated", parsed.value.object.get("status").?.string);
     try std.testing.expect(parsed.value.object.get("owner") == null);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("tags").?.array.items.len);
+}
+
+test "resolve document transform supports push and pull arrays" {
+    const alloc = std.testing.allocator;
+
+    const transform: types.DocumentTransform = .{
+        .key = "doc:1",
+        .operations = &.{
+            .{ .op = .push, .path = "tags", .value_json = "\"db\"" },
+            .{ .op = .pull, .path = "tags", .value_json = "\"old\"" },
+            .{ .op = .push, .path = "tags", .value_json = "\"zig\"" },
+        },
+    };
+
+    const resolved = try resolveDocumentTransform(
+        alloc,
+        "{\"tags\":[\"old\",\"db\",\"old\"]}",
+        transform,
+    );
+    defer alloc.free(resolved.?);
+
+    try std.testing.expectEqualStrings("{\"tags\":[\"db\",\"db\",\"zig\"]}", resolved.?);
 }
 
 test "resolve document transform applies setOnInsert only when upsert inserts" {

@@ -30,6 +30,7 @@ const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const full_text_indexes = @import("full_text_indexes.zig");
 const indexes_api = @import("indexes.zig");
 const json_helpers = @import("json_helpers.zig");
+const relational_sql = @import("relational_sql.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
 pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
@@ -46,6 +47,16 @@ pub fn effectiveSchemaJson(schema_json: ?[]const u8) []const u8 {
 }
 
 pub const ParsedTableSchema = schema_mod.ParsedTableSchema;
+pub const AppliedRelationalSqlDdlRecord = struct {
+    table: metadata_table_manager.TableRecord,
+    requires_rebuild: bool = false,
+    validation_required: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        metadata_table_manager.freeTable(alloc, self.table);
+        self.* = undefined;
+    }
+};
 pub const LsmStorageStatus = struct {
     // Table status intentionally exposes a compact operational snapshot. Full
     // low-level WAL and scheduler counters remain available through metrics.
@@ -894,6 +905,87 @@ pub fn applySchemaUpdateRecord(
     // row migration path exists. The injected marker is expanded against the
     // schema so the stored indexes_json carries the concrete derived config,
     // provisioned like any explicit algebraic index.
+    const prepared_indexes_json = try prepareTableIndexesForSchemaAlloc(alloc, table.name, updated.indexes_json, updated.schema_json);
+    alloc.free(updated.indexes_json);
+    updated.indexes_json = prepared_indexes_json;
+
+    return updated;
+}
+
+pub fn applyRelationalSqlDdlToTableRecordAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    sql: []const u8,
+) !AppliedRelationalSqlDdlRecord {
+    var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
+    defer plan.deinit(alloc);
+
+    const table_name = relationalSqlDdlPlanTableName(plan);
+    if (!std.mem.eql(u8, table.name, table_name)) return error.InvalidSchemaUpdateRequest;
+
+    const current_schema_json: []const u8 = switch (plan) {
+        .create_table => blk: {
+            if (table.schema_json.len != 0) return error.InvalidSchemaUpdateRequest;
+            break :blk "";
+        },
+        .create_index, .alter_table, .create_update_policy => table.schema_json,
+    };
+    var applied = try relational_sql.applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, plan);
+    defer applied.deinit(alloc);
+
+    const updated = try applyRelationalDdlSchemaRecordAlloc(alloc, table, applied.schema_json);
+    return .{
+        .table = updated,
+        .requires_rebuild = applied.requires_rebuild,
+        .validation_required = applied.validation_required,
+    };
+}
+
+fn relationalSqlDdlPlanTableName(plan: relational_sql.LoweredDdlPlan) []const u8 {
+    return switch (plan) {
+        .create_table => |create_table| create_table.table_name,
+        .create_index => |create_index| create_index.table_name,
+        .alter_table => |alter_table| alter_table.table_name,
+        .create_update_policy => |update_policy| update_policy.table_name,
+    };
+}
+
+fn applyRelationalDdlSchemaRecordAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    schema_json: []const u8,
+) !metadata_table_manager.TableRecord {
+    var validated = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer validated.deinit(alloc);
+    if (validated.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
+
+    var updated = try metadata_table_manager.cloneTable(alloc, table.*);
+    errdefer metadata_table_manager.freeTable(alloc, updated);
+
+    const current_version = try schemaVersion(table.schema_json);
+    const doc_schemas_changed = try documentSchemasChanged(alloc, table.schema_json, schema_json);
+    const next_version = if (table.schema_json.len == 0) 0 else if (doc_schemas_changed) current_version + 1 else current_version;
+
+    const normalized_schema_json = try normalizeSchemaVersion(alloc, schema_json, next_version);
+    alloc.free(updated.schema_json);
+    updated.schema_json = normalized_schema_json;
+
+    const refreshed_indexes_json = try regenerateAlgebraicIndexesFromSchemaAlloc(alloc, table.name, updated.indexes_json, updated.schema_json);
+    alloc.free(updated.indexes_json);
+    updated.indexes_json = refreshed_indexes_json;
+
+    if (doc_schemas_changed and table.schema_json.len > 0) {
+        if (table.read_schema_json.len == 0) {
+            const normalized_read_schema_json = try normalizeSchemaVersion(alloc, table.schema_json, current_version);
+            alloc.free(updated.read_schema_json);
+            updated.read_schema_json = normalized_read_schema_json;
+        }
+
+        const next_indexes_json = try upsertVersionedFullTextIndex(alloc, updated.indexes_json, current_version, next_version);
+        alloc.free(updated.indexes_json);
+        updated.indexes_json = next_indexes_json;
+    }
+
     const prepared_indexes_json = try prepareTableIndexesForSchemaAlloc(alloc, table.name, updated.indexes_json, updated.schema_json);
     alloc.free(updated.indexes_json);
     updated.indexes_json = prepared_indexes_json;
@@ -2781,6 +2873,91 @@ test "metadata.schema update auto-creates an algebraic index for relational tabl
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"derive_from_schema\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"group_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"capability_fingerprint\"") != null);
+}
+
+test "metadata.schema update sql ddl creates relational table record schema and derived indexes" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 12,
+        .name = "users",
+        .schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    var applied = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &table,
+        \\CREATE TABLE users (
+        \\  id uuid PRIMARY KEY,
+        \\  tenant_id text NOT NULL,
+        \\  amount numeric DEFAULT 0
+        \\);
+        ,
+    );
+    defer applied.deinit(std.testing.allocator);
+
+    try std.testing.expect(!applied.requires_rebuild);
+    try std.testing.expect(!applied.validation_required);
+    try std.testing.expect(std.mem.indexOf(u8, applied.table.schema_json, "\"version\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied.table.schema_json, "\"storage_mode\":\"relational\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied.table.read_schema_json, "\"document_schemas\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, applied.table.indexes_json, "\"algebraic_index_v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied.table.indexes_json, "\"derive_from_schema\"") == null);
+}
+
+test "metadata.schema update sql ddl applies relational catalog changes through table record path" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 13,
+        .name = "users",
+        .schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    var created = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &table,
+        "CREATE TABLE users (id uuid PRIMARY KEY, tenant_id text NOT NULL, email text, updated_at_ns bigint);",
+    );
+    defer created.deinit(std.testing.allocator);
+
+    var altered = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &created.table,
+        "ALTER TABLE users ADD COLUMN status text;",
+    );
+    defer altered.deinit(std.testing.allocator);
+
+    try std.testing.expect(altered.requires_rebuild);
+    try std.testing.expect(altered.validation_required);
+    try std.testing.expect(std.mem.indexOf(u8, altered.table.schema_json, "\"version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, altered.table.schema_json, "\"status\":{\"type\":\"keyword\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, altered.table.read_schema_json, "\"version\":0") != null);
+
+    var indexed = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &altered.table,
+        "CREATE UNIQUE INDEX users_tenant_email_key ON users (tenant_id, email);",
+    );
+    defer indexed.deinit(std.testing.allocator);
+
+    try std.testing.expect(indexed.requires_rebuild);
+    try std.testing.expect(indexed.validation_required);
+    try std.testing.expect(std.mem.indexOf(u8, indexed.table.schema_json, "\"users_tenant_email_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, indexed.table.schema_json, "\"version\":1") != null);
+
+    var trigger = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &indexed.table,
+        "CREATE TRIGGER users_updated_at BEFORE UPDATE ON users EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
+    );
+    defer trigger.deinit(std.testing.allocator);
+
+    try std.testing.expect(!trigger.requires_rebuild);
+    try std.testing.expect(!trigger.validation_required);
+    try std.testing.expect(std.mem.indexOf(u8, trigger.table.schema_json, "\"x-antfly-on-update\":{\"op\":\"now_ns\"}") != null);
 }
 
 test "metadata.schema update rejects relational storage mode and base column changes" {

@@ -906,6 +906,11 @@ pub const RelationalRowsCoalesceProjection = struct {
     operands: []const RelationalRowsCoalesceOperand = &.{},
 };
 
+pub const RelationalRowsFieldAliasProjection = struct {
+    output: []const u8,
+    field: []const u8,
+};
+
 pub const RelationalRowsDocKeyRange = struct {
     start: []const u8 = "",
     end: []const u8 = "",
@@ -922,10 +927,12 @@ pub const RelationalRowsQueryRequest = struct {
     json_path_eq: []const RelationalRowsJsonPathEqPredicate = &.{},
     json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
     or_predicates: []const RelationalRowsPredicateGroup = &.{},
+    not_predicates: []const RelationalRowsPredicateGroup = &.{},
     select: []const []const u8 = &.{},
     json_extract: []const RelationalRowsJsonExtractProjection = &.{},
     array_length: []const RelationalRowsArrayLengthProjection = &.{},
     coalesce: []const RelationalRowsCoalesceProjection = &.{},
+    field_aliases: []const RelationalRowsFieldAliasProjection = &.{},
     select_all: bool = true,
     order_by: []const RelationalRowsQueryOrder = &.{},
     row_claim: ?RowClaimRequest = null,
@@ -984,6 +991,14 @@ pub const RelationalRowsQueryRequest = struct {
             if (group.predicates.len > 0) alloc.free(group.predicates);
         }
         if (self.or_predicates.len > 0) alloc.free(self.or_predicates);
+        for (self.not_predicates) |group| {
+            for (group.predicates) |predicate| {
+                alloc.free(predicate.field);
+                if (predicate.value_json) |value_json| alloc.free(value_json);
+            }
+            if (group.predicates.len > 0) alloc.free(group.predicates);
+        }
+        if (self.not_predicates.len > 0) alloc.free(self.not_predicates);
         for (self.select) |field| alloc.free(field);
         if (self.select.len > 0) alloc.free(self.select);
         for (self.json_extract) |projection| {
@@ -1008,6 +1023,11 @@ pub const RelationalRowsQueryRequest = struct {
             if (projection.operands.len > 0) alloc.free(projection.operands);
         }
         if (self.coalesce.len > 0) alloc.free(self.coalesce);
+        for (self.field_aliases) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        }
+        if (self.field_aliases.len > 0) alloc.free(self.field_aliases);
         for (self.order_by) |order| alloc.free(order.field);
         if (self.order_by.len > 0) alloc.free(self.order_by);
         if (self.row_claim) |claim| if (claim.owner_id.len > 0) alloc.free(claim.owner_id);

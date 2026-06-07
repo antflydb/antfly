@@ -468,6 +468,7 @@ pub const DocumentProperty = struct {
     embedded_schema: ?*DocumentProperty = null,
     embedded_dynamic_templates: []DynamicTemplate = &.{},
     default_value: ?RelationalDefaultValue = null,
+    on_update_value: ?RelationalDefaultValue = null,
     generated: ?RelationalGeneratedValue = null,
     index_where: []UniquePredicate = &.{},
 
@@ -558,6 +559,7 @@ pub const DocumentProperty = struct {
         for (self.embedded_dynamic_templates) |*dynamic_template| dynamic_template.deinit(alloc);
         if (self.embedded_dynamic_templates.len > 0) alloc.free(self.embedded_dynamic_templates);
         if (self.default_value) |*value| value.deinit(alloc);
+        if (self.on_update_value) |*value| value.deinit(alloc);
         if (self.generated) |*generated| generated.deinit(alloc);
         for (self.index_where) |predicate| {
             alloc.free(predicate.field);
@@ -2643,6 +2645,14 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         var mutable_default = owned_default;
         mutable_default.deinit(alloc);
     };
+    const on_update_value = if (object.get("x-antfly-on-update")) |server_update_value| blk: {
+        if (server_update_value == .null) break :blk null;
+        break :blk try parseRelationalDefaultValue(alloc, server_update_value);
+    } else null;
+    errdefer if (on_update_value) |owned_update| {
+        var mutable_update = owned_update;
+        mutable_update.deinit(alloc);
+    };
     const generated = if (object.get("generated")) |generated_value| blk: {
         if (generated_value == .null) break :blk null;
         break :blk try parseRelationalGeneratedValue(alloc, generated_value);
@@ -2959,6 +2969,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .embedded_schema = embedded_schema,
         .embedded_dynamic_templates = embedded_dynamic_templates,
         .default_value = default_value,
+        .on_update_value = on_update_value,
         .generated = generated,
         .index_where = index_where,
     };

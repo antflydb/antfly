@@ -195,6 +195,7 @@ fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableS
             alloc.free(column.name);
             alloc.free(column.path);
             if (column.default_value) |value| alloc.free(value.value_json);
+            if (column.on_update_value) |value| alloc.free(value.value_json);
             if (column.generated) |value| freeRuntimeRelationalGeneratedValue(alloc, value);
             for (column.index_where) |predicate| {
                 alloc.free(predicate.field);
@@ -210,6 +211,7 @@ fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableS
             const field_type = runtimeRelationalColumnType(property) orelse continue;
             const nullable = !requiredFieldsContain(document_schema.required_fields, property.name);
             try validateRuntimeRelationalDefault(property.default_value, field_type);
+            try validateRuntimeRelationalOnUpdate(property.on_update_value, field_type);
             const name = try alloc.dupe(u8, property.name);
             errdefer alloc.free(name);
             const path = try alloc.dupe(u8, property.name);
@@ -222,6 +224,7 @@ fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableS
                 .nullable = nullable,
                 .indexed = if (property.antfly_index) |indexed| indexed else true,
                 .default_value = if (property.default_value) |default_value| try cloneRelationalDefaultValue(alloc, default_value) else null,
+                .on_update_value = if (property.on_update_value) |on_update_value| try cloneRelationalDefaultValue(alloc, on_update_value) else null,
                 .generated = if (property.generated) |generated| try cloneRelationalGeneratedValue(alloc, generated) else null,
                 .index_where = try cloneUniquePredicates(alloc, property.index_where),
             });
@@ -246,11 +249,23 @@ fn validateRuntimeRelationalDefault(default_value: ?impl.RelationalDefaultValue,
     }
 }
 
+fn validateRuntimeRelationalOnUpdate(on_update_value: ?impl.RelationalDefaultValue, field_type: storage_schema.AntflyType) !void {
+    const value = on_update_value orelse return;
+    switch (value.kind) {
+        .now_ns => switch (field_type) {
+            .numeric, .datetime => {},
+            else => return error.InvalidSchemaUpdateRequest,
+        },
+        .literal, .uuid_v4 => return error.InvalidSchemaUpdateRequest,
+    }
+}
+
 fn freeRuntimeRelationalColumns(alloc: std.mem.Allocator, columns: []storage_schema.RelationalColumn) void {
     for (columns) |column| {
         alloc.free(column.name);
         alloc.free(column.path);
         if (column.default_value) |value| alloc.free(value.value_json);
+        if (column.on_update_value) |value| alloc.free(value.value_json);
         if (column.generated) |value| freeRuntimeRelationalGeneratedValue(alloc, value);
         for (column.index_where) |predicate| {
             alloc.free(predicate.field);
@@ -1159,7 +1174,7 @@ fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?stor
 test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword","x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}]}
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword","x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime","x-antfly-on-update":{"op":"now_ns"}},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}]}
     );
     defer parsed.deinit(alloc);
 
@@ -1186,6 +1201,8 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expect(findRuntimeColumn(runtime, "amount").?.nullable);
     try std.testing.expect(!findRuntimeColumn(runtime, "amount").?.indexed);
     try std.testing.expectEqual(storage_schema.AntflyType.datetime, findRuntimeColumn(runtime, "created_at").?.field_type);
+    try std.testing.expect(findRuntimeColumn(runtime, "created_at").?.on_update_value != null);
+    try std.testing.expectEqual(storage_schema.RelationalDefaultKind.now_ns, findRuntimeColumn(runtime, "created_at").?.on_update_value.?.kind);
     try std.testing.expectEqual(storage_schema.AntflyType.array, findRuntimeColumn(runtime, "tags").?.field_type);
     try std.testing.expectEqual(storage_schema.AntflyType.keyword, findRuntimeColumn(runtime, "tags").?.array_item_type.?);
     // nested object and json field both become json columns

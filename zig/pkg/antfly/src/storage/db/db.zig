@@ -14517,7 +14517,7 @@ pub const DB = struct {
         row_json: []const u8,
         req: types.RelationalRowsQueryRequest,
     ) ![]u8 {
-        if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0) {
+        if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0 and req.field_aliases.len == 0) {
             return try projectLookupStoredBytes(self, alloc, doc_key, row_json, .{
                 .fields = req.select,
                 .include_all_fields = req.select_all,
@@ -14569,6 +14569,16 @@ pub const DB = struct {
             first = false;
             try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
             try writeRelationalRowsCoalesceProjectionValue(alloc, writer, parsed.value, projection);
+        }
+        for (req.field_aliases) |projection| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
+            if (relationalRowsJsonValueAtPath(parsed.value, projection.field)) |selected| {
+                try std.json.Stringify.value(selected.*, .{}, writer);
+            } else {
+                try writer.writeAll("null");
+            }
         }
         try writer.writeByte('}');
         return try out.toOwnedSlice();
@@ -16190,7 +16200,7 @@ pub const DB = struct {
         row_json: []const u8,
         req: types.RelationalRowsQueryRequest,
     ) !bool {
-        if (req.predicates.len == 0 and req.array_any.len == 0 and req.array_contains.len == 0 and req.array_eq.len == 0 and req.in_predicates.len == 0 and req.json_contains.len == 0 and req.json_path_eq.len == 0 and req.json_path_exists.len == 0 and req.or_predicates.len == 0) return true;
+        if (req.predicates.len == 0 and req.array_any.len == 0 and req.array_contains.len == 0 and req.array_eq.len == 0 and req.in_predicates.len == 0 and req.json_contains.len == 0 and req.json_path_eq.len == 0 and req.json_path_exists.len == 0 and req.or_predicates.len == 0 and req.not_predicates.len == 0) return true;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -16198,6 +16208,7 @@ pub const DB = struct {
             if (!(try relationalRowsQueryPredicatePasses(alloc, parsed.value, predicate))) return false;
         }
         if (!(try relationalRowsQueryOrPredicateGroupsPass(alloc, parsed.value, req.or_predicates))) return false;
+        if (!(try relationalRowsQueryNotPredicateGroupsPass(alloc, parsed.value, req.not_predicates))) return false;
         for (req.array_any) |predicate| {
             if (!(try relationalRowsQueryArrayAnyPredicatePasses(alloc, parsed.value, predicate))) return false;
         }
@@ -16267,6 +16278,24 @@ pub const DB = struct {
             if (group_passes) return true;
         }
         return false;
+    }
+
+    fn relationalRowsQueryNotPredicateGroupsPass(
+        alloc: Allocator,
+        row: std.json.Value,
+        groups: []const types.RelationalRowsPredicateGroup,
+    ) !bool {
+        for (groups) |group| {
+            var group_passes = true;
+            for (group.predicates) |predicate| {
+                if (!(try relationalRowsQueryPredicatePasses(alloc, row, predicate))) {
+                    group_passes = false;
+                    break;
+                }
+            }
+            if (group_passes) return false;
+        }
+        return true;
     }
 
     fn relationalRowsQueryArrayAnyPredicatePasses(
@@ -58159,6 +58188,24 @@ test "relational rows query uses indexed candidates and authoritative base rows"
     try std.testing.expectEqual(@as(u32, 2), or_result.total);
     try std.testing.expectEqualStrings("{\"id\":\"c\",\"created_at\":50}", or_result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"d\",\"created_at\":10}", or_result.rows[1]);
+
+    const not_branch_closed = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"closed\"" },
+    };
+    const not_predicates = [_]types.RelationalRowsPredicateGroup{.{
+        .predicates = not_branch_closed[0..],
+    }};
+    var not_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = in_with_recheck_predicates[0..],
+        .not_predicates = not_predicates[0..],
+        .select = select[0..1],
+        .select_all = false,
+        .limit = 10,
+    });
+    defer not_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), not_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", not_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"d\"}", not_result.rows[1]);
 }
 
 test "relational rows query planner orders candidate sets by estimated cardinality" {
@@ -59166,17 +59213,22 @@ test "relational rows query array_contains uses element index with authoritative
         .output = "display",
         .operands = coalesce_operands[0..],
     }};
+    const field_aliases = [_]types.RelationalRowsFieldAliasProjection{.{
+        .output = "row_id",
+        .field = "id",
+    }};
     var coalesce_result = try db.queryRelationalRows(alloc, runtime_schema, .{
         .select = select[0..],
         .coalesce = coalesce[0..],
+        .field_aliases = field_aliases[0..],
         .select_all = false,
         .order_by = order_by[0..],
     });
     defer coalesce_result.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 5), coalesce_result.total);
-    try std.testing.expectEqualStrings("{\"id\":\"b\",\"display\":\"b@example.test\"}", coalesce_result.rows[0]);
-    try std.testing.expectEqualStrings("{\"id\":\"a\",\"display\":\"Alpha\"}", coalesce_result.rows[1]);
-    try std.testing.expectEqualStrings("{\"id\":\"c\",\"display\":\"unknown\"}", coalesce_result.rows[2]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"display\":\"b@example.test\",\"row_id\":\"b\"}", coalesce_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"display\":\"Alpha\",\"row_id\":\"a\"}", coalesce_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"display\":\"unknown\",\"row_id\":\"c\"}", coalesce_result.rows[2]);
 
     const array_eq = [_]types.RelationalRowsArrayEqPredicate{.{
         .field = "tags",
