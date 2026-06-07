@@ -1617,19 +1617,38 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
         }
 
         fn appendEntry(self: *Self, entry: lsm_table_file.Entry, entry_bytes: usize) !void {
+            var new_smallest_namespace_name: ?[]u8 = null;
+            var new_smallest_key: []u8 = &.{};
+            var new_largest_namespace_name: ?[]u8 = null;
+            var new_largest_key: []u8 = &.{};
+            errdefer {
+                if (new_smallest_namespace_name) |name| self.backend.allocator.free(name);
+                if (new_smallest_key.len > 0) self.backend.allocator.free(new_smallest_key);
+                if (new_largest_namespace_name) |name| self.backend.allocator.free(name);
+                if (new_largest_key.len > 0) self.backend.allocator.free(new_largest_key);
+            }
+
             if (self.entry_count == 0) {
-                self.smallest_namespace_name = if (entry.namespace_name) |name| try self.backend.allocator.dupe(u8, name) else null;
-                errdefer if (self.smallest_namespace_name) |name| self.backend.allocator.free(name);
-                self.smallest_key = try self.backend.allocator.dupe(u8, entry.key);
-                errdefer self.backend.allocator.free(self.smallest_key);
+                new_smallest_namespace_name = if (entry.namespace_name) |name| try self.backend.allocator.dupe(u8, name) else null;
+                new_smallest_key = try self.backend.allocator.dupe(u8, entry.key);
+            }
+            new_largest_namespace_name = if (entry.namespace_name) |name| try self.backend.allocator.dupe(u8, name) else null;
+            new_largest_key = try self.backend.allocator.dupe(u8, entry.key);
+
+            try self.writer.appendEntry(entry);
+
+            if (self.entry_count == 0) {
+                self.smallest_namespace_name = new_smallest_namespace_name;
+                new_smallest_namespace_name = null;
+                self.smallest_key = new_smallest_key;
+                new_smallest_key = &.{};
             }
             if (self.largest_namespace_name) |name| self.backend.allocator.free(name);
             if (self.largest_key.len > 0) self.backend.allocator.free(self.largest_key);
-            self.largest_namespace_name = if (entry.namespace_name) |name| try self.backend.allocator.dupe(u8, name) else null;
-            errdefer if (self.largest_namespace_name) |name| self.backend.allocator.free(name);
-            self.largest_key = try self.backend.allocator.dupe(u8, entry.key);
-
-            try self.writer.appendEntry(entry);
+            self.largest_namespace_name = new_largest_namespace_name;
+            new_largest_namespace_name = null;
+            self.largest_key = new_largest_key;
+            new_largest_key = &.{};
             self.entry_count += 1;
             self.logical_bytes += entry_bytes;
         }

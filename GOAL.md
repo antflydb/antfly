@@ -26,6 +26,8 @@ Recent observed runs:
 | `antfly-status-lsm-sparse-1m-20260607` | 1257.437s | 639.579s | 617.858s | 191.571 | 21.6ms | 0.9899 | Latest instrumented run. Insert is close to the best observed, but optimize/query start with heavy primary LSM debt. |
 | `antfly-primary-maint-fallback-1m-20260607` | Aborted | - | - | - | - | - | Primary-only maintenance fallback did not keep up at 1M scale; aborted around 500k uploaded with 1024 total runs, 1022 L0 runs, 16.4 MiB manifest, 5.2 GiB data root, and 894 L0 run-debt. |
 | `antfly-live-write-counters-1m-20260606` | Aborted | 597.728s | Aborted | - | - | - | Upload was fast, but optimize stalled around 887.5k indexed after primary LSM reached 1267 total / 1263 L0 at optimize start. Data root was 36G when stopped. |
+| `antfly-finish-budget-1m-20260606` | Aborted | 664.881s | Aborted | - | - | - | One bounded foreground compaction step at bulk/dense catch-up finish controlled L0 (~132 at optimize start), but slowed insert and left dense catch-up only 475k/1M indexed; stopped as a bad tradeoff. |
+| `antfly-hard-pressure-only-1m-20260606` | Crashed | 590.626s | Crashed | - | - | - | Letting hard L0 pressure run during active bulk flush kept L0 bounded (~180 at optimize start) and insert was fastest, but crashed in compaction ownership during optimize; unsafe. |
 
 The 50k sanity case on `e24a9140` was healthy:
 
@@ -35,6 +37,8 @@ The 50k sanity case on `e24a9140` was healthy:
 | `Performance1536D50K` after idle status snapshot fix, `k=100` | 25.678s | 15.425s | 10.253s | 1273.643 | 3.0ms | 0.9813 |
 | `Performance1536D50K` after primary-maintenance fallback, `k=100` | 25.091s | 16.620s | 8.471s | 1254.047 | 3.0ms | 0.9813 |
 | `Performance1536D50K` with live LSM write counters, `k=100` | 30.231s | 15.450s | 14.781s | 1519.410 | 2.8ms | 0.9813 |
+| `Performance1536D50K` with hard-pressure-only patch, `k=100` | 24.327s | 15.991s | 8.335s | 1215.002 | 3.1ms | 0.9813 |
+| `Performance1536D50K` with one-step finish budget, `k=100` | 32.760s | 15.915s | 16.845s | 1520.931 | 3.0ms | 0.9818 |
 
 ## What We Know
 
@@ -69,6 +73,20 @@ The 50k sanity case on `e24a9140` was healthy:
   - During optimize, L0 eventually dropped to 763, but dense catch-up stalled around 887.5k indexed with current manifest still about 103 MiB and data root at 36 GiB. The run was stopped rather than waiting indefinitely on a non-progressing state.
   - Load/midload/optimize samples are saved under `/private/tmp/antfly-1m-live-counters-*.sample.txt`. They show catch-up replay hot in LSM merge/current-scan reads and later in `BoundWriteTxn.commit -> finalizeDeferredRunWork -> enforceWritePressure -> compactPlanAt -> StreamingRunFileWriter`, with status sampling also visible in `lsmStorageStatsFromDb` maintenance-score/stat snapshots.
   - The practical takeaway is that faster upload is not enough. It front-loads L0/manifest debt that catch-up and query readiness then pay back at much higher latency.
+- A one-step foreground compaction budget at auto-bulk/dense catch-up finish is not the right default:
+  - 50k query shape recovered to 1521 QPS and 3.0ms serial p99, with final optimize shape around 24 total runs / 22 L0.
+  - On 1M, insert slowed to 664.881s and dense catch-up entered optimize at only 475k indexed. The run had good L0 shape (~132 runs at optimize start) but shifted the bottleneck into replay scans and finish work.
+  - The midrun sample showed the HTTP insert worker mostly sleeping/waiting while catch-up was hot in primary LSM replay scans: `catchUpIndexFromMatchingCursor -> forEachReplayLaneFrom -> BoundCurrentScanTxn.LocalCursor.seekAtOrAfter -> MergeCursor`.
+- Letting hard L0 pressure run from the active-bulk immutable flush path is unsafe as implemented:
+  - The 1M run uploaded in 590.626s and started optimize at 625k indexed with ~180 L0 runs and no write-pressure overloads, which was promising.
+  - The server then crashed during optimize. Crash report `/Users/ajroetker/Library/Logs/DiagnosticReports/antfly-2026-06-06-233154.ips` shows `SIGABRT` from libmalloc: `POINTER_BEING_FREED_WAS_NOT_ALLOCATED`.
+  - Faulting stack: `PersistedOutputRunBuilder.deinit -> makePersistedRunsFromSelectedRuns -> buildCompactedRunsFromSnapshots -> compactPlanAt -> compactL0ToLimit -> Backend.enforceWritePressure -> flushOldestImmutableMemtableUnlockedBuild -> runImmutableFlushJob`.
+  - This was not an out-of-disk or OOM termination. The later edit failure was disk pressure from generated benchmark roots, but the Antfly crash itself was a compaction ownership/concurrency bug.
+- `PersistedOutputRunBuilder.appendEntry` now updates persisted-run bound metadata transactionally:
+  - The crash pointed at freeing builder-owned `largest_namespace_name`. The old append path freed the previous largest bound before replacement allocation and writer append could fail, leaving stale builder pointers for `deinit`.
+  - The fix allocates replacement smallest/largest bounds first, appends to the writer, then swaps builder ownership. Failure leaves the previous builder metadata intact for cleanup.
+  - `zig build lsm-backend-test --summary all --test-timeout 5m` passed 203 LSM backend tests after this change.
+  - This hardens a real ownership bug but does not prove that active-bulk hard L0 pressure is safe to re-enable; we still need a controlled retry with crash/metrics sampling before treating that policy as viable.
 
 ## Tradeoffs Already Tried
 
@@ -101,6 +119,12 @@ The 50k sanity case on `e24a9140` was healthy:
 
 - API-layer "optimize the index" coupling.
   Index maintenance should not leak into the API as a special-case readiness hack. The storage layer should own run publication, compaction budgeting, and drain policy.
+
+- A foreground compaction step at every auto-bulk/dense catch-up finish as a default policy.
+  It can control L0 run count, but the 1M run showed it slows insert and lets dense catch-up fall farther behind. Keep this only as an explicit offline/drain experiment, not as normal online behavior.
+
+- Running hard L0 pressure directly from the active-bulk immutable flush publication path.
+  The 1M result was directionally promising, but the implementation crashed in compaction output-run ownership during optimize. Do not re-enable this path until the `PersistedOutputRunBuilder` ownership/concurrency bug is fixed and covered by a focused regression test.
 
 ## Working Theory
 
@@ -154,6 +178,7 @@ Every benchmark result can answer: how many primary runs existed at query start,
   - max input bytes,
   - max elapsed time,
   - target L0 run count or manifest-size threshold.
+- Do not run compaction from the active-bulk immutable flush publication path until compaction output-run ownership is audited and regression-tested.
 
 Success condition:
 1M load reaches query phase with bounded primary run count and no multi-second readonly open.
