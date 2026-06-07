@@ -19,6 +19,7 @@ pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
 pub const linear_merge = @import("linear_merge.zig");
 pub const relational_rows = @import("relational_rows.zig");
+pub const relational_sql = @import("relational_sql.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
 pub const cluster_api_http = @import("cluster_api_http.zig");
@@ -161,6 +162,8 @@ test "api module compiles" {
     _ = cluster;
     _ = batch;
     _ = backups;
+    _ = relational_rows;
+    _ = relational_sql;
     _ = query;
     _ = query_contract;
     _ = cluster_api_http;

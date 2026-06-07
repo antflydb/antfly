@@ -862,10 +862,14 @@ operations are:
 Defaults are materialized once per planned row by the write planner before
 primary-key encoding, unique tuple derivation, constraint checks, and
 `RETURNING`. A generated column that references a server-defaulted column sees
-the same UUID/timestamp value that is committed to the row. A SQL adapter should
-lower `DEFAULT`, `gen_random_uuid()`/UUID defaults, and `now()`/timestamp
-defaults into these typed operations instead of passing SQL expression text
-through storage.
+the same UUID/timestamp value that is committed to the row. SQL adapters lower
+`DEFAULT`, `gen_random_uuid()`/UUID defaults, and `now()`/timestamp defaults
+into these typed operations instead of passing SQL expression text through
+storage. The PostgreSQL adapter lowerer applies the same boundary rule for
+explicit `DEFAULT` and `NOW()` expressions in inserts, updates, conflict
+updates, and scalar predicates over `numeric`/`datetime` columns: it
+materializes the value before producing the row-batch or row-query plan. Omitted
+insert fields still use the write planner's default materialization path.
 
 Stored generated columns currently support typed `lower(field)` and
 `concat(fields, separator)` forms; user input cannot write generated columns
@@ -931,6 +935,15 @@ not as SQL text:
         "op": "json_path_exists",
         "path": ["flags"]
       }
+    ],
+    "any": [
+      { "field": "status", "op": "eq", "value": "blocked" },
+      {
+        "all": [
+          { "field": "status", "op": "eq", "value": "open" },
+          { "field": "priority", "op": "gt", "value": 50 }
+        ]
+      }
     ]
   },
   "select": ["id", "status", "created_at"],
@@ -942,7 +955,20 @@ not as SQL text:
       "as_text": true
     }
   ],
-  "order_by": [{ "field": "created_at", "direction": "desc" }],
+  "coalesce": [
+    {
+      "as": "display_name",
+      "operands": [
+        { "field": "preferred_name" },
+        { "field": "email" },
+        { "value": "unknown" }
+      ]
+    }
+  ],
+  "order_by": [
+    { "field": "expires_at", "null_test": "is_null" },
+    { "field": "created_at", "direction": "desc" }
+  ],
   "row_claim": {
     "mode": "for_update",
     "skip_locked": true,
@@ -966,11 +992,23 @@ operand whose elements must all be present; `array_eq` requires a declared
 requires a declared `json` column and uses recursive JSON containment semantics;
 `json_path_eq` requires a declared `json` column, a structured path, and an
 exact JSON value; `json_path_exists` requires a declared `json` column and a
-structured path. Projections are field lists or `["*"]` plus optional
-`json_extract` aliases over declared JSON columns, and ordering is over declared
-scalar columns with deterministic tie-breaking by input row order. Null and
-missing order keys sort after present scalar values. The executor projects from
-the relational row JSON/codec and applies `OFFSET`/`LIMIT` after filtering and
+structured path. `where.any` carries scalar disjunction branches: each branch is
+either one scalar atom or an `all` list of scalar atoms, branches are unioned,
+and the row must match at least one branch in addition to any top-level `all`
+predicates. Indexed scalar OR branches are planned as independent candidate
+sets and unioned before authoritative hydrated-row recheck; unindexable branches
+fall back to base-row scanning rather than returning partial results.
+Projections are field lists or `["*"]` plus optional
+`json_extract` aliases over declared JSON columns, `array_length` aliases over
+declared array columns, and `coalesce` aliases. A `coalesce` projection contains
+ordered `field` or JSON-literal `value` operands and emits the first present
+non-null value, or `null` when every operand is missing/null. Ordering is over
+declared scalar columns or typed null-test expressions (`null_test: "is_null"` /
+`"is_not_null"`), which lets SQL shapes such as `ORDER BY (expires_at IS NULL),
+expires_at ASC` compile without synthetic user columns. Null and missing order
+keys sort after present scalar values for plain field ordering; null-test order
+keys sort by the produced boolean value. The executor projects from the
+relational row JSON/codec and applies `OFFSET`/`LIMIT` after filtering and
 ordering.
 `doc_key_range` is optional; when present, it scopes the query to a
 start-inclusive/end-exclusive physical doc-key span before ordering,
@@ -1098,6 +1136,14 @@ PostgreSQL-specific syntax and wire behavior in the adapter layer.
 
 This is the backend AST that a SQL adapter should target for simple
 single-table `SELECT`, `GROUP BY`, and local row-stream `JOIN` clauses.
+The PostgreSQL adapter lowerer now covers the local row-stream shape for
+`INNER JOIN` and `LEFT JOIN` between two aliases of a relational source:
+qualified projection fields become typed join projections, `ON a.x = b.y`
+clauses become `RelationalRowsJoinOn` equality keys, qualified `WHERE`
+predicates are split into side-local row-query predicates, and final `ORDER BY`
+uses projected output fields. Cross-table SQL joins should reuse this typed join
+request after catalog routing has resolved each table source into the correct
+range-owned row stream.
 Primary-key, unique-owner, partial-unique, partial-secondary, column-major,
 array-element, and JSON-value access paths are now model-level choices beneath
 that contract for single-table row queries. Non-unique expression lookups are
@@ -1119,12 +1165,214 @@ indexes, before materialization; predicates over a materialized CTE are
 evaluated against that materialized row stream. Forward references and duplicate
 CTE names are rejected. Durable row claims and physical doc-key ranges are
 base-row planner features and are rejected over materialized CTE sources.
+The PostgreSQL adapter exposes this through `lowerQueryPlanAlloc`: non-recursive
+`WITH name AS (SELECT ...) ... SELECT ... FROM name` lowers to ordered CTE
+queries plus a final `source_cte` query, while plain `lowerSelectAlloc` remains
+the single-select API and rejects `WITH`.
 Recursive CTEs are a separate graph/fixpoint feature and should be treated as a
 distinct planner extension.
 
 Those model-level items are not PostgreSQL-specific. They are the durable
 relational semantics that the storage model should expose so a future SQL
 dialect, REST API, or client SDK can compile to the same operations.
+
+#### Colony PostgreSQL adapter roadmap
+
+Colony's current application SQL is Postgres-shaped. The storage model above now
+has many of the durable primitives those queries need, but Colony compatibility
+is not a license to pass SQL text through the backend. The production boundary is
+a Postgres-facing adapter that parses SQL into a typed frontend AST, resolves it
+against Antfly catalog metadata, and lowers only supported shapes into explicit
+Antfly row, mutation, query, aggregate, join, CTE, window, and expression plans.
+Unsupported syntax should fail closed with a structured unsupported-shape error.
+
+Because this feature set is new, there is no legacy storage or API contract to
+preserve. The typed Antfly plan is the source of truth, and Postgres syntax is a
+front-end dialect that compiles into that plan.
+
+Current PR status:
+
+- Implemented: fail-closed SQL boundary parsing for the supported Colony-shaped
+  subset; row-query lowering for equality/range/null predicates, JSONB
+  extraction/containment/existence, array equality/containment/membership,
+  generated `lower(...)` pushdown, scalar OR predicate groups with unioned
+  candidate planning, typed null-test ordering, `ORDER BY`, `LIMIT`/`OFFSET`,
+  `FOR UPDATE [SKIP LOCKED]`, and typed projection aliases for
+  `array_length(...)` and simple `COALESCE(...)`; row-batch lowering for
+  `INSERT`, `UPDATE`, `DELETE`, `RETURNING`, `ON CONFLICT` for primary, unique,
+  partial-unique, and expression-unique targets, arithmetic increments, JSONB
+  patch/set/concat/build/convert operations, explicit `NOW()`, and explicit SQL
+  `DEFAULT`; aggregate lowering for `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`,
+  scalar `FILTER`, scalar `DISTINCT`, bounded ordered scalar `array_agg`,
+  `GROUP BY`, and output-alias `HAVING`; local equality `INNER`/`LEFT`
+  row-stream joins; and
+  non-recursive `WITH` lowering to ordered typed query plans.
+- Remaining: SQL DDL/migration compilation from the live Colony migration
+  corpus; full typed scalar expression trees for complex `COALESCE` operands,
+  structured JSON/array OR branches, broader `NOT` combinations, function/cast
+  projection aliases, and expression ordering beyond the implemented null-test
+  form; cross-table/range-routed joins; spill-bounded distinct aggregate state
+  beyond the in-memory bounded scalar implementation, and structured aggregate
+  filters beyond the implemented scalar `FILTER (WHERE ...)` path; `LEFT JOIN LATERAL`;
+  window stages such as
+  `row_number() OVER (...)`; trigger/server-update policy lowering; and the
+  Colony SQL corpus/golden-plan/execution/chaos gates that prove compatibility.
+
+The remaining Colony/Postgres work should land in these model-level slices:
+
+1. **SQL frontend and Colony corpus gate.**
+   Keep SQL parsing at the adapter boundary. The frontend resolves schemas,
+   aliases, placeholder positions, parameter types, result column names,
+   SQLSTATE-compatible errors, and `pgx` wire expectations before producing an
+   Antfly plan. Add a generated Colony SQL corpus test that records every SQL
+   string used by app code and migrations, normalizes placeholders, and asserts
+   either a stable Antfly golden plan or an intentional unsupported
+   classification with an owner and reason. This gate should run before broad
+   syntax expansion so new support is measured against the real workload.
+
+2. **DDL and migration compiler.**
+   Compile Colony migrations into Antfly schema mutations rather than replaying
+   Postgres internals. `CREATE TABLE`, primary keys, composite primary keys,
+   ordinary indexes, partial indexes, expression indexes, unique constraints,
+   foreign keys, `CHECK`, `DEFAULT`, JSONB, arrays, generated columns, and
+   server-update policies lower to durable catalog metadata. `CREATE EXTENSION`,
+   triggers, PL/pgSQL helper functions, `ALTER TABLE ... VALIDATE CONSTRAINT`,
+   dump-only syntax, and Postgres catalog bookkeeping are adapter concerns that
+   lower to explicit metadata or are ignored only when proven semantic no-ops
+   for Colony. Golden migration tests should replay the live Colony migrations
+   and compare the produced catalog JSON.
+
+3. **Typed scalar expression tree.**
+   Generalize the current typed projection/predicate pieces into a reusable
+   expression tree with explicit input columns, literals, parameters, casts,
+   deterministic functions, arithmetic, boolean operators, null tests, and
+   result types. `COALESCE`, `LOWER`, `id::text`, `NOW()`, `DEFAULT`,
+   `convert_from(..., 'UTF8')::jsonb`, `(expires_at IS NULL)`, `NOT`, and mixed
+   `AND`/`OR` combinations should all normalize through this tree. Expressions
+   used for storage semantics normalize to generated columns, expression-index
+   metadata, check constraints, or unique-expression keys. Expressions used only
+   for projection, filtering, ordering, aggregate filters, or update transforms
+   can be evaluated over hydrated row streams, with pushdown only when they map
+   to a declared primary, unique, generated, column-major, array, or JSON access
+   path.
+
+4. **Index and conflict-target completeness.**
+   Keep ordinary, partial, and expression indexes as durable typed metadata.
+   Simple expression indexes such as `lower(email)` can compile to stored
+   generated columns plus normal unique or secondary indexes when that gives the
+   best rebuild and pushdown behavior. More complex deterministic expression
+   indexes use typed expression-index definitions with declared input columns,
+   function/cast nodes, collation rules, null handling, and optional partial
+   predicates. `ON CONFLICT (cols...) [WHERE ...]` inference should share the
+   same partial-predicate and expression-key normalizer as unique enforcement,
+   so conflict handling and write-time uniqueness cannot drift.
+
+5. **DML and update transform hardening.**
+   The lowerer should continue to compile `INSERT`, `UPDATE`, `DELETE`, `ON
+   CONFLICT ... DO NOTHING`, `ON CONFLICT ... DO UPDATE`, and `RETURNING` into
+   row-batch operations with explicit primary/unique selectors, expected-version
+   predicates, transforms, and returning projections. The long-term shape adds
+   multi-row mutation plans with explicit lock/claim semantics for update/delete
+   scans, `excluded.column` resolution for every conflict update expression,
+   table-owned updated-at/server-update policies, typed array transforms, and
+   returning projection expressions over the committed row image. Non-primary
+   update/delete selectors must resolve through durable unique-owner lookup
+   before prepare; no hidden table scan should mutate rows.
+
+6. **JSONB and array SQL sugar.**
+   Keep JSONB and array semantics in typed operators. `col -> 'k'`, `col ->>
+   'k'`, `col @> $json`, path existence, `jsonb_set`, `jsonb_build_object`,
+   JSONB concatenation, and `convert_from(..., 'UTF8')::jsonb` lower to typed
+   JSON projection, predicate, construction, or transform nodes. `ANY`, `IN`,
+   `NOT IN`, equality, containment, `array_length(col, 1)`, array defaults, and
+   `string_to_array(scope, ' ') @> ...` lower to typed array membership,
+   equality, containment, scalar function, or generated-column plans. Operators
+   that require indexes or write-time maintenance become explicit catalog
+   capabilities; purely syntactic sugar stays in the adapter.
+
+7. **Joins, lateral joins, and routed execution.**
+   Equality `INNER` and `LEFT` joins lower to `RelationalRowsJoinPlan` with
+   declared sources, equality keys, join type, output projection, and bounded
+   execution strategy. Cross-table joins must route each side through durable
+   table/range ownership metadata, retain row-version visibility rules, and
+   choose lookup, hash, or merge execution from typed cardinality/index hints.
+   `LEFT JOIN LATERAL` is a separate correlated-subquery stage: for each left row
+   it executes a bounded right-side query with explicit `ORDER BY`, `LIMIT`, and
+   required index path. It should not be hidden inside the ordinary join planner.
+
+8. **CTEs and materialized stream bounds.**
+   Non-recursive `WITH` clauses compile to ordered named typed subplans and the
+   PostgreSQL adapter lowers the single-table row-query form into
+   `RelationalRowsQueryPlan`. The remaining production work is richer CTE output
+   schema tracking across aggregate/join plans, optional inlining for CTEs used
+   once, and explicit memory/spill bounds for reused materializations. Recursive
+   CTEs remain unsupported until there is a separate graph/fixpoint plan node;
+   they should not be approximated with repeated SQL evaluation.
+
+9. **Aggregates, windows, and ordered streams.**
+   `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `HAVING`, aggregate
+   ordering, and aggregate pagination lower to `RelationalRowsAggregatePlan`.
+   Scalar `FILTER (WHERE ...)` clauses are represented as per-aggregate
+   predicate trees and evaluated before each metric updates. Scalar `DISTINCT`
+   aggregate specs keep per-group/per-metric distinct state before updating the
+   aggregate metric. Scalar `array_agg` specs declare a maximum materialized
+   output count plus optional aggregate-local typed ordering, so the coordinator
+   never creates an unbounded or scan-order-dependent collection aggregate by
+   accident. The broader typed expression tree should extend filters and
+   distinct keys to structured JSON/array and complex boolean expressions, and
+   production distinct state should add explicit memory/spill budgets.
+   Window functions such as `row_number() OVER (PARTITION BY ... ORDER BY ...)`
+   are separate typed window stages over ordered materialized streams; they are
+   needed for migration/backfill ranking and wake-one job selection.
+
+10. **Order, limit, offset, and row claiming.**
+   `ORDER BY`, `LIMIT`, and `OFFSET` lower to typed order keys and pagination
+   over either base row streams, join outputs, aggregate outputs, or CTE
+   materializations. Order expressions such as `(expires_at IS NULL)` become
+   typed scalar order expressions. `FOR UPDATE` and `FOR UPDATE SKIP LOCKED`
+   lower only over base-row streams that can claim durable row ownership. They
+   remain rejected over aggregate, join, CTE-materialized, graph, and count-only
+   sources until there is an explicit lockable row-source contract. Queue claims
+   need ordered multi-range filling, durable claim ownership, OCC integration,
+   and chaos coverage with range movement.
+
+11. **Execution and chaos gates.**
+   Add execution tests for billing ledger writes, queue claims, RBAC membership
+   queries, JSONB metadata updates, usage rollups, and migration/backfill
+   queries. Add chaos/sim coverage that combines live writes, foreign-key
+   checks, unique-owner movement, range movement, repair/rebuild, row claims,
+   aggregate reads, join reads, and server-update policies in one modeled
+   workload.
+
+The production milestones are:
+
+1. **Colony CRUD and queue SQL.**
+   Replay the live schema subset, support point reads, inserts, updates, deletes,
+   conflict-target upserts, `RETURNING`, JSONB set/extract/containment, array
+   membership checks, ordered pagination, scalar expression lowering for common
+   predicates, and `FOR UPDATE [SKIP LOCKED]`.
+
+2. **Colony schema and migration parity.**
+   Run the live migration history without manual rewrites for the supported
+   subset. This includes composite primary keys, foreign keys, partial and
+   expression indexes, defaults, checks, generated columns, JSONB/array columns,
+   server-update policies, and catalog projection needed by the adapter.
+
+3. **Reporting and rollup SQL.**
+   Complete routed equality joins, aggregate dashboards, structured aggregate
+   filters, spill-bounded distinct aggregate state, richer CTE output schemas,
+   and execution tests for usage rollups and RBAC membership queries.
+
+4. **Migration/backfill advanced SQL.**
+   Add `LEFT JOIN LATERAL`, typed window stages such as `row_number()`, complex
+   expression ordering, recursive-CTE rejection with explicit alternatives, and
+   bounded materialized-stream execution for migration/backfill jobs.
+
+5. **Production compatibility hardening.**
+   Keep the Colony SQL corpus, migration golden tests, execution tests, and
+   chaos/sim suites as release gates. New Postgres-shaped syntax lands only when
+   it has a typed Antfly plan, deterministic error behavior, and coverage for
+   routing, repair, and concurrent writes.
 
 ### Schema evolution
 

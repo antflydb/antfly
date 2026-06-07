@@ -826,9 +826,15 @@ pub const RelationalRowsQueryOrderDirection = enum {
     desc,
 };
 
+pub const RelationalRowsQueryOrderNullTest = enum {
+    is_null,
+    is_not_null,
+};
+
 pub const RelationalRowsQueryOrder = struct {
     field: []const u8,
     direction: RelationalRowsQueryOrderDirection = .asc,
+    null_test: ?RelationalRowsQueryOrderNullTest = null,
 };
 
 pub const RelationalRowsArrayAnyPredicate = struct {
@@ -844,6 +850,12 @@ pub const RelationalRowsArrayContainsPredicate = struct {
 pub const RelationalRowsArrayEqPredicate = struct {
     field: []const u8,
     value_json: []const u8,
+};
+
+pub const RelationalRowsInPredicate = struct {
+    field: []const u8,
+    values_json: []const u8,
+    negated: bool = false,
 };
 
 pub const RelationalRowsJsonContainsPredicate = struct {
@@ -862,11 +874,36 @@ pub const RelationalRowsJsonPathExistsPredicate = struct {
     path: []const u8,
 };
 
+pub const RelationalRowsPredicateGroup = struct {
+    predicates: []const schema_mod.RelationalCheck = &.{},
+};
+
 pub const RelationalRowsJsonExtractProjection = struct {
     output: []const u8,
     field: []const u8,
     path: []const u8,
     as_text: bool = false,
+};
+
+pub const RelationalRowsArrayLengthProjection = struct {
+    output: []const u8,
+    field: []const u8,
+};
+
+pub const RelationalRowsCoalesceOperandKind = enum {
+    field,
+    value,
+};
+
+pub const RelationalRowsCoalesceOperand = struct {
+    kind: RelationalRowsCoalesceOperandKind,
+    field: []const u8 = "",
+    value_json: []const u8 = "",
+};
+
+pub const RelationalRowsCoalesceProjection = struct {
+    output: []const u8,
+    operands: []const RelationalRowsCoalesceOperand = &.{},
 };
 
 pub const RelationalRowsDocKeyRange = struct {
@@ -880,11 +917,15 @@ pub const RelationalRowsQueryRequest = struct {
     array_any: []const RelationalRowsArrayAnyPredicate = &.{},
     array_contains: []const RelationalRowsArrayContainsPredicate = &.{},
     array_eq: []const RelationalRowsArrayEqPredicate = &.{},
+    in_predicates: []const RelationalRowsInPredicate = &.{},
     json_contains: []const RelationalRowsJsonContainsPredicate = &.{},
     json_path_eq: []const RelationalRowsJsonPathEqPredicate = &.{},
     json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
+    or_predicates: []const RelationalRowsPredicateGroup = &.{},
     select: []const []const u8 = &.{},
     json_extract: []const RelationalRowsJsonExtractProjection = &.{},
+    array_length: []const RelationalRowsArrayLengthProjection = &.{},
+    coalesce: []const RelationalRowsCoalesceProjection = &.{},
     select_all: bool = true,
     order_by: []const RelationalRowsQueryOrder = &.{},
     row_claim: ?RowClaimRequest = null,
@@ -914,6 +955,11 @@ pub const RelationalRowsQueryRequest = struct {
             alloc.free(predicate.value_json);
         }
         if (self.array_eq.len > 0) alloc.free(self.array_eq);
+        for (self.in_predicates) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.values_json);
+        }
+        if (self.in_predicates.len > 0) alloc.free(self.in_predicates);
         for (self.json_contains) |predicate| {
             alloc.free(predicate.field);
             alloc.free(predicate.value_json);
@@ -930,6 +976,14 @@ pub const RelationalRowsQueryRequest = struct {
             alloc.free(predicate.path);
         }
         if (self.json_path_exists.len > 0) alloc.free(self.json_path_exists);
+        for (self.or_predicates) |group| {
+            for (group.predicates) |predicate| {
+                alloc.free(predicate.field);
+                if (predicate.value_json) |value_json| alloc.free(value_json);
+            }
+            if (group.predicates.len > 0) alloc.free(group.predicates);
+        }
+        if (self.or_predicates.len > 0) alloc.free(self.or_predicates);
         for (self.select) |field| alloc.free(field);
         if (self.select.len > 0) alloc.free(self.select);
         for (self.json_extract) |projection| {
@@ -938,6 +992,22 @@ pub const RelationalRowsQueryRequest = struct {
             alloc.free(projection.path);
         }
         if (self.json_extract.len > 0) alloc.free(self.json_extract);
+        for (self.array_length) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        }
+        if (self.array_length.len > 0) alloc.free(self.array_length);
+        for (self.coalesce) |projection| {
+            alloc.free(projection.output);
+            for (projection.operands) |operand| {
+                switch (operand.kind) {
+                    .field => if (operand.field.len > 0) alloc.free(operand.field),
+                    .value => if (operand.value_json.len > 0) alloc.free(operand.value_json),
+                }
+            }
+            if (projection.operands.len > 0) alloc.free(projection.operands);
+        }
+        if (self.coalesce.len > 0) alloc.free(self.coalesce);
         for (self.order_by) |order| alloc.free(order.field);
         if (self.order_by.len > 0) alloc.free(self.order_by);
         if (self.row_claim) |claim| if (claim.owner_id.len > 0) alloc.free(claim.owner_id);
@@ -976,18 +1046,24 @@ pub const RelationalRowsAggregateOp = enum {
     min,
     max,
     avg,
+    array_agg,
 };
 
 pub const RelationalRowsAggregateSpec = struct {
     name: []const u8,
     op: RelationalRowsAggregateOp,
     field: ?[]const u8 = null,
+    distinct: bool = false,
+    array_max_items: u32 = 0,
+    array_order_by: []const RelationalRowsQueryOrder = &.{},
+    filter_predicates: []const schema_mod.RelationalCheck = &.{},
 };
 
 pub const RelationalRowsAggregateRequest = struct {
     source: RelationalRowsQueryRequest = .{},
     group_by: []const []const u8 = &.{},
     aggregations: []const RelationalRowsAggregateSpec = &.{},
+    having_predicates: []const schema_mod.RelationalCheck = &.{},
     order_by: []const RelationalRowsQueryOrder = &.{},
     limit: ?u32 = null,
     offset: u32 = 0,
