@@ -6639,6 +6639,60 @@ components:
         maintenance_debt_hint:
           type: integer
           format: uint64
+        flush_count:
+          type: integer
+          format: uint64
+        flush_output_run_count:
+          type: integer
+          format: uint64
+        flush_output_bytes:
+          type: integer
+          format: uint64
+        sorted_ingest_run_count:
+          type: integer
+          format: uint64
+        sorted_ingest_bytes:
+          type: integer
+          format: uint64
+        manifest_write_count:
+          type: integer
+          format: uint64
+        manifest_bytes:
+          type: integer
+          format: uint64
+        write_pressure_event_count:
+          type: integer
+          format: uint64
+        write_pressure_compaction_count:
+          type: integer
+          format: uint64
+        write_pressure_compaction_step_count:
+          type: integer
+          format: uint64
+        write_pressure_overload_count:
+          type: integer
+          format: uint64
+        write_pressure_overload_l0_run_debt:
+          type: integer
+          format: uint64
+        immutable_rotation_count:
+          type: integer
+          format: uint64
+        immutable_flush_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_attempt_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_success_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_entry_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_direct_entry_count:
+          type: integer
+          format: uint64
     StorageStatus:
       type: object
       properties:

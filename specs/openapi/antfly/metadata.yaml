@@ -2277,6 +2277,51 @@ components:
         l0_bytes:
           type: integer
           format: uint64
+        lower_level_run_count:
+          type: integer
+          format: uint64
+        lower_level_bytes:
+          type: integer
+          format: uint64
+        max_level:
+          type: integer
+          format: uint64
+        compactable_l0_run_count:
+          type: integer
+          format: uint64
+        overlapping_l0_run_count:
+          type: integer
+          format: uint64
+        soft_limit_l0_run_count:
+          type: integer
+          format: uint64
+        hard_limit_l0_run_count:
+          type: integer
+          format: uint64
+        write_stall_l0_run_debt:
+          type: integer
+          format: uint64
+        soft_limit_l0_bytes:
+          type: integer
+          format: uint64
+        hard_limit_l0_bytes:
+          type: integer
+          format: uint64
+        write_stall_l0_byte_debt:
+          type: integer
+          format: uint64
+        level_overflow_run_count:
+          type: integer
+          format: uint64
+        level_overflow_bytes:
+          type: integer
+          format: uint64
+        obsolete_path_count:
+          type: integer
+          format: uint64
+        current_manifest_bytes:
+          type: integer
+          format: uint64
         wal_retained_bytes:
           type: integer
           format: uint64
@@ -2284,6 +2329,73 @@ components:
           type: integer
           format: uint64
         active_readers:
+          type: integer
+          format: uint64
+        active_bulk_ingest_batches:
+          type: integer
+          format: uint64
+        manifest_dirty:
+          type: boolean
+        obsolete_manifest_dirty:
+          type: boolean
+        maintenance_score:
+          type: integer
+          format: uint64
+        maintenance_debt_hint:
+          type: integer
+          format: uint64
+        flush_count:
+          type: integer
+          format: uint64
+        flush_output_run_count:
+          type: integer
+          format: uint64
+        flush_output_bytes:
+          type: integer
+          format: uint64
+        sorted_ingest_run_count:
+          type: integer
+          format: uint64
+        sorted_ingest_bytes:
+          type: integer
+          format: uint64
+        manifest_write_count:
+          type: integer
+          format: uint64
+        manifest_bytes:
+          type: integer
+          format: uint64
+        write_pressure_event_count:
+          type: integer
+          format: uint64
+        write_pressure_compaction_count:
+          type: integer
+          format: uint64
+        write_pressure_compaction_step_count:
+          type: integer
+          format: uint64
+        write_pressure_overload_count:
+          type: integer
+          format: uint64
+        write_pressure_overload_l0_run_debt:
+          type: integer
+          format: uint64
+        immutable_rotation_count:
+          type: integer
+          format: uint64
+        immutable_flush_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_attempt_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_success_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_entry_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_direct_entry_count:
           type: integer
           format: uint64
     StorageStatus: # common.StorageStats

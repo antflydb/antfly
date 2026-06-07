@@ -73,6 +73,24 @@ pub const LsmStorageStatus = struct {
     obsolete_manifest_dirty: bool = false,
     maintenance_score: u64 = 0,
     maintenance_debt_hint: u64 = 0,
+    flush_count: u64 = 0,
+    flush_output_run_count: u64 = 0,
+    flush_output_bytes: u64 = 0,
+    sorted_ingest_run_count: u64 = 0,
+    sorted_ingest_bytes: u64 = 0,
+    manifest_write_count: u64 = 0,
+    manifest_bytes: u64 = 0,
+    write_pressure_event_count: u64 = 0,
+    write_pressure_compaction_count: u64 = 0,
+    write_pressure_compaction_step_count: u64 = 0,
+    write_pressure_overload_count: u64 = 0,
+    write_pressure_overload_l0_run_debt: u64 = 0,
+    immutable_rotation_count: u64 = 0,
+    immutable_flush_count: u64 = 0,
+    direct_bulk_ingest_attempt_count: u64 = 0,
+    direct_bulk_ingest_success_count: u64 = 0,
+    direct_bulk_ingest_entry_count: u64 = 0,
+    direct_bulk_ingest_direct_entry_count: u64 = 0,
 };
 
 pub const TableStorageStatus = struct {
@@ -83,6 +101,7 @@ pub const TableStorageStatus = struct {
 
 pub fn lsmStorageStatusFromStats(stats: table_reads.LsmStorageStats) LsmStorageStatus {
     const maintenance = stats.maintenance;
+    const write = stats.write;
     return .{
         .run_count = maintenance.total_runs,
         .run_bytes = maintenance.total_run_bytes,
@@ -111,6 +130,24 @@ pub fn lsmStorageStatusFromStats(stats: table_reads.LsmStorageStats) LsmStorageS
         .obsolete_manifest_dirty = maintenance.obsolete_manifest_dirty,
         .maintenance_score = stats.maintenance_score,
         .maintenance_debt_hint = stats.maintenance_debt_hint,
+        .flush_count = write.flushes,
+        .flush_output_run_count = write.flush_output_runs,
+        .flush_output_bytes = write.flush_output_bytes,
+        .sorted_ingest_run_count = write.sorted_ingest_runs,
+        .sorted_ingest_bytes = write.sorted_ingest_bytes,
+        .manifest_write_count = write.manifest_writes,
+        .manifest_bytes = write.manifest_bytes,
+        .write_pressure_event_count = write.write_pressure_events,
+        .write_pressure_compaction_count = write.write_pressure_compactions,
+        .write_pressure_compaction_step_count = write.write_pressure_compaction_steps,
+        .write_pressure_overload_count = write.write_pressure_overloads,
+        .write_pressure_overload_l0_run_debt = write.write_pressure_overload_l0_run_debt,
+        .immutable_rotation_count = write.immutable_rotations,
+        .immutable_flush_count = write.immutable_flushes,
+        .direct_bulk_ingest_attempt_count = write.direct_bulk_ingest_attempts,
+        .direct_bulk_ingest_success_count = write.direct_bulk_ingest_successes,
+        .direct_bulk_ingest_entry_count = write.direct_bulk_ingest_entries,
+        .direct_bulk_ingest_direct_entry_count = write.direct_bulk_ingest_entries_direct,
     };
 }
 
@@ -147,6 +184,24 @@ fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStora
         .obsolete_manifest_dirty = status.obsolete_manifest_dirty,
         .maintenance_score = u64ToI64(status.maintenance_score),
         .maintenance_debt_hint = u64ToI64(status.maintenance_debt_hint),
+        .flush_count = u64ToI64(status.flush_count),
+        .flush_output_run_count = u64ToI64(status.flush_output_run_count),
+        .flush_output_bytes = u64ToI64(status.flush_output_bytes),
+        .sorted_ingest_run_count = u64ToI64(status.sorted_ingest_run_count),
+        .sorted_ingest_bytes = u64ToI64(status.sorted_ingest_bytes),
+        .manifest_write_count = u64ToI64(status.manifest_write_count),
+        .manifest_bytes = u64ToI64(status.manifest_bytes),
+        .write_pressure_event_count = u64ToI64(status.write_pressure_event_count),
+        .write_pressure_compaction_count = u64ToI64(status.write_pressure_compaction_count),
+        .write_pressure_compaction_step_count = u64ToI64(status.write_pressure_compaction_step_count),
+        .write_pressure_overload_count = u64ToI64(status.write_pressure_overload_count),
+        .write_pressure_overload_l0_run_debt = u64ToI64(status.write_pressure_overload_l0_run_debt),
+        .immutable_rotation_count = u64ToI64(status.immutable_rotation_count),
+        .immutable_flush_count = u64ToI64(status.immutable_flush_count),
+        .direct_bulk_ingest_attempt_count = u64ToI64(status.direct_bulk_ingest_attempt_count),
+        .direct_bulk_ingest_success_count = u64ToI64(status.direct_bulk_ingest_success_count),
+        .direct_bulk_ingest_entry_count = u64ToI64(status.direct_bulk_ingest_entry_count),
+        .direct_bulk_ingest_direct_entry_count = u64ToI64(status.direct_bulk_ingest_direct_entry_count),
     };
 }
 
@@ -1998,6 +2053,24 @@ test "metadata.table status encoder honors storage status overrides" {
             .obsolete_manifest_dirty = true,
             .maintenance_score = 99,
             .maintenance_debt_hint = 88,
+            .flush_count = 101,
+            .flush_output_run_count = 102,
+            .flush_output_bytes = 103,
+            .sorted_ingest_run_count = 104,
+            .sorted_ingest_bytes = 105,
+            .manifest_write_count = 106,
+            .manifest_bytes = 107,
+            .write_pressure_event_count = 108,
+            .write_pressure_compaction_count = 109,
+            .write_pressure_compaction_step_count = 110,
+            .write_pressure_overload_count = 111,
+            .write_pressure_overload_l0_run_debt = 112,
+            .immutable_rotation_count = 113,
+            .immutable_flush_count = 114,
+            .direct_bulk_ingest_attempt_count = 115,
+            .direct_bulk_ingest_success_count = 116,
+            .direct_bulk_ingest_entry_count = 117,
+            .direct_bulk_ingest_direct_entry_count = 118,
         },
     }};
 
@@ -2023,6 +2096,24 @@ test "metadata.table status encoder honors storage status overrides" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_manifest_dirty\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"maintenance_score\":99") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"maintenance_debt_hint\":88") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"flush_count\":101") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"flush_output_run_count\":102") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"flush_output_bytes\":103") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"sorted_ingest_run_count\":104") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"sorted_ingest_bytes\":105") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"manifest_write_count\":106") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"manifest_bytes\":107") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_event_count\":108") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_compaction_count\":109") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_compaction_step_count\":110") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_overload_count\":111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_overload_l0_run_debt\":112") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_rotation_count\":113") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_flush_count\":114") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_attempt_count\":115") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_success_count\":116") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_entry_count\":117") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_direct_entry_count\":118") != null);
 }
 
 test "metadata.table status encoder canonicalizes embeddings indexes without inline names" {
