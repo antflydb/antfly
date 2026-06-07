@@ -2013,6 +2013,7 @@ pub const IndexManager = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         edge_type_configs: []graph_mod.EdgeTypeConfig,
+        metric_configs: []graph_mod.GraphMetricConfig,
         artifact_source: ?GraphArtifactSource = null,
         rebuild_root_path: []u8,
         index: graph_mod.GraphIndex,
@@ -2710,6 +2711,7 @@ pub const IndexManager = struct {
             if (cfg.field_name) |field_name| self.alloc.free(field_name);
         }
         self.alloc.free(entry.edge_type_configs);
+        graph_mod.freeGraphMetricConfigs(self.alloc, entry.metric_configs);
         if (entry.artifact_source) |*source| source.deinit(self.alloc);
         self.alloc.free(entry.rebuild_root_path);
         entry.config.deinit(self.alloc);
@@ -3990,6 +3992,26 @@ pub const IndexManager = struct {
             steps += 1;
         }
         return steps;
+    }
+
+    pub fn runGraphMetricMaintenance(self: *IndexManager) !usize {
+        var total_steps: usize = 0;
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.metric_configs) |cfg| {
+                if (cfg.refresh != .background) continue;
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                switch (status.state) {
+                    .not_ready, .stale, .failed => {
+                        var published = try entry.index.runPageRankMetric(cfg.name);
+                        published.deinit(entry.index.alloc);
+                        total_steps += 1;
+                    },
+                    .disabled, .fresh, .building => {},
+                }
+            }
+        }
+        return total_steps;
     }
 
     pub const DensePostingMaintenanceOptions = struct {
@@ -10712,6 +10734,7 @@ pub const IndexManager = struct {
                     .reverse_lsm_options = self.graph_reverse_lsm_options,
                     .reverse_lsm_root_generation = self.lsm_root_generation,
                     .edge_type_configs = graph_cfg.edge_type_configs,
+                    .metric_configs = graph_cfg.metric_configs,
                     .rebuild_root_path = path,
                     .rebuild_owner_generation = coverageGenerationForConfig(cfg),
                     .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
@@ -10726,6 +10749,7 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = cloned_cfg,
                     .edge_type_configs = graph_cfg.edge_type_configs,
+                    .metric_configs = graph_cfg.metric_configs,
                     .artifact_source = graph_cfg.artifact_source,
                     .rebuild_root_path = try self.alloc.dupe(u8, path),
                     .index = index,
@@ -17457,6 +17481,7 @@ pub const GraphArtifactSource = struct {
 
 const GraphConfig = struct {
     edge_type_configs: []graph_mod.EdgeTypeConfig,
+    metric_configs: []graph_mod.GraphMetricConfig,
     artifact_source: ?GraphArtifactSource = null,
     shorthand_asset: ?enrichment_catalog.EnrichmentConfig = null,
     algebraic_semiring_traversal: bool = false,
@@ -17467,6 +17492,7 @@ const GraphConfig = struct {
             if (cfg.field_name) |field_name| alloc.free(field_name);
         }
         alloc.free(self.edge_type_configs);
+        graph_mod.freeGraphMetricConfigs(alloc, self.metric_configs);
         if (self.artifact_source) |*source| source.deinit(alloc);
         if (self.shorthand_asset) |*asset| asset.deinit(alloc);
     }
@@ -18315,10 +18341,13 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     errdefer if (shorthand_asset) |*asset| {
         asset.deinit(alloc);
     };
+    const metric_configs = try parseGraphMetricConfigs(alloc, root);
+    errdefer graph_mod.freeGraphMetricConfigs(alloc, metric_configs);
 
     const edge_types = root.object.get("edge_types") orelse {
         return .{
             .edge_type_configs = try alloc.alloc(graph_mod.EdgeTypeConfig, 0),
+            .metric_configs = metric_configs,
             .artifact_source = artifact_source,
             .shorthand_asset = shorthand_asset,
             .algebraic_semiring_traversal = algebraic_semiring_traversal,
@@ -18364,9 +18393,124 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
 
     return .{
         .edge_type_configs = configs,
+        .metric_configs = metric_configs,
         .artifact_source = artifact_source,
         .shorthand_asset = shorthand_asset,
         .algebraic_semiring_traversal = algebraic_semiring_traversal,
+    };
+}
+
+fn parseGraphMetricConfigs(alloc: Allocator, root: std.json.Value) ![]graph_mod.GraphMetricConfig {
+    const metrics_value = root.object.get("metrics") orelse return try alloc.alloc(graph_mod.GraphMetricConfig, 0);
+    if (metrics_value != .object) return error.InvalidIndexConfig;
+
+    var configs = std.ArrayListUnmanaged(graph_mod.GraphMetricConfig).empty;
+    errdefer {
+        for (configs.items) |*cfg| {
+            alloc.free(cfg.name);
+            cfg.edge_filter.deinit(alloc);
+        }
+        configs.deinit(alloc);
+    }
+
+    var it = metrics_value.object.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (entry.value_ptr.* != .object) return error.InvalidIndexConfig;
+        const metric_obj = entry.value_ptr.*.object;
+        const enabled = if (metric_obj.get("enabled")) |value| blk: {
+            if (value != .bool) return error.InvalidIndexConfig;
+            break :blk value.bool;
+        } else true;
+        if (!enabled) continue;
+
+        const kind = if (metric_obj.get("kind")) |value| blk: {
+            if (value != .string) return error.InvalidIndexConfig;
+            if (std.mem.eql(u8, value.string, "pagerank")) break :blk graph_mod.GraphMetricKind.pagerank;
+            return error.InvalidIndexConfig;
+        } else if (std.mem.eql(u8, name, "pagerank"))
+            graph_mod.GraphMetricKind.pagerank
+        else
+            return error.InvalidIndexConfig;
+
+        const refresh = if (metric_obj.get("refresh")) |value| blk: {
+            if (value != .string) return error.InvalidIndexConfig;
+            if (std.mem.eql(u8, value.string, "background")) break :blk graph_mod.GraphMetricRefreshMode.background;
+            if (std.mem.eql(u8, value.string, "manual")) break :blk graph_mod.GraphMetricRefreshMode.manual;
+            return error.InvalidIndexConfig;
+        } else graph_mod.GraphMetricRefreshMode.background;
+
+        const damping = if (metric_obj.get("damping")) |value| try jsonNumberAsF64(value) else 0.85;
+        if (damping <= 0.0 or damping >= 1.0) return error.InvalidIndexConfig;
+        const tolerance = if (metric_obj.get("tolerance")) |value| try jsonNumberAsF64(value) else 0.000001;
+        if (tolerance <= 0.0) return error.InvalidIndexConfig;
+        const max_iterations = if (metric_obj.get("max_iterations")) |value| blk: {
+            const raw = try jsonNumberAsU32(value);
+            if (raw == 0) return error.InvalidIndexConfig;
+            break :blk raw;
+        } else 50;
+
+        var cfg = graph_mod.GraphMetricConfig{
+            .name = try alloc.dupe(u8, name),
+            .kind = kind,
+            .damping = damping,
+            .tolerance = tolerance,
+            .max_iterations = max_iterations,
+            .refresh = refresh,
+            .edge_filter = try parseGraphMetricEdgeFilter(alloc, metric_obj.get("edge_filter")),
+        };
+        var cfg_moved = false;
+        errdefer if (!cfg_moved) {
+            alloc.free(cfg.name);
+            cfg.edge_filter.deinit(alloc);
+        };
+        try configs.append(alloc, cfg);
+        cfg_moved = true;
+    }
+
+    const owned = try configs.toOwnedSlice(alloc);
+    return owned;
+}
+
+fn parseGraphMetricEdgeFilter(alloc: Allocator, maybe_value: ?std.json.Value) !graph_mod.GraphMetricEdgeFilter {
+    const value = maybe_value orelse return .{};
+    if (value != .object) return error.InvalidIndexConfig;
+    if (value.object.get("types")) |types_value| {
+        if (types_value != .array or types_value.array.items.len == 0) return error.InvalidIndexConfig;
+        const edge_types = try alloc.alloc([]const u8, types_value.array.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (edge_types[0..initialized]) |edge_type| alloc.free(edge_type);
+            alloc.free(edge_types);
+        }
+        for (types_value.array.items, 0..) |item, i| {
+            if (item != .string or item.string.len == 0) return error.InvalidIndexConfig;
+            edge_types[i] = try alloc.dupe(u8, item.string);
+            initialized += 1;
+        }
+        return .{ .mode = .types, .types = edge_types };
+    }
+    if (value.object.get("mode")) |mode_value| {
+        if (mode_value != .string) return error.InvalidIndexConfig;
+        if (std.mem.eql(u8, mode_value.string, "all")) return .{};
+        return error.InvalidIndexConfig;
+    }
+    return .{};
+}
+
+fn jsonNumberAsF64(value: std.json.Value) !f64 {
+    return switch (value) {
+        .integer => |v| @floatFromInt(v),
+        .float => |v| v,
+        else => error.InvalidIndexConfig,
+    };
+}
+
+fn jsonNumberAsU32(value: std.json.Value) !u32 {
+    return switch (value) {
+        .integer => |v| if (v > 0 and v <= std.math.maxInt(u32)) @intCast(v) else error.InvalidIndexConfig,
+        .float => |v| if (v > 0 and v <= std.math.maxInt(u32) and @floor(v) == v) @intFromFloat(v) else error.InvalidIndexConfig,
+        else => error.InvalidIndexConfig,
     };
 }
 

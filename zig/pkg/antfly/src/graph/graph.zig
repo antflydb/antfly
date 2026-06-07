@@ -284,6 +284,49 @@ pub const EdgeTypeConfig = struct {
     topology: TopologyMode = .graph,
 };
 
+pub const GraphMetricKind = enum {
+    pagerank,
+};
+
+pub const GraphMetricRefreshMode = enum {
+    background,
+    manual,
+};
+
+pub const GraphMetricEdgeFilterMode = enum {
+    all,
+    types,
+};
+
+pub const GraphMetricEdgeFilter = struct {
+    mode: GraphMetricEdgeFilterMode = .all,
+    types: []const []const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.types) |edge_type| alloc.free(edge_type);
+        if (self.types.len > 0) alloc.free(self.types);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricConfig = struct {
+    name: []const u8,
+    kind: GraphMetricKind = .pagerank,
+    damping: f64 = 0.85,
+    tolerance: f64 = 0.000001,
+    max_iterations: u32 = 50,
+    refresh: GraphMetricRefreshMode = .background,
+    edge_filter: GraphMetricEdgeFilter = .{},
+};
+
+pub fn freeGraphMetricConfigs(alloc: Allocator, configs: []GraphMetricConfig) void {
+    for (configs) |*cfg| {
+        alloc.free(cfg.name);
+        cfg.edge_filter.deinit(alloc);
+    }
+    if (configs.len > 0) alloc.free(configs);
+}
+
 pub const GraphIndexOptions = struct {
     map_size: usize = 64 * 1024 * 1024,
     no_sync: bool = false,
@@ -294,6 +337,7 @@ pub const GraphIndexOptions = struct {
     reverse_lsm_options: lsm_backend.Options = .{ .flush_threshold = 1 },
     reverse_lsm_root_generation: u64 = 0,
     edge_type_configs: []const EdgeTypeConfig = &.{},
+    metric_configs: []const GraphMetricConfig = &.{},
     rebuild_root_path: ?[]const u8 = null,
     rebuild_owner_generation: u64 = 0,
     algebraic_semiring_traversal: bool = false,
@@ -333,6 +377,9 @@ pub var test_abort_reverse_rebuild_after_batches: ?usize = null;
 const graph_meta_prefix = "meta:";
 const graph_edge_count_key = "meta:edge_count";
 const graph_node_count_key = "meta:node_count";
+const graph_edge_generation_key = "meta:edge_generation";
+const graph_metric_key_prefix = "meta:metric:";
+const default_graph_metric_deferred_cleanup_ms: u64 = 60_000;
 
 pub const ReverseBackend = enum {
     lmdb,
@@ -349,12 +396,14 @@ pub const GraphIndex = struct {
     reverse_store: backend_erased.Store,
     reverse_owner: ReverseStoreOwner,
     edge_type_configs: []const EdgeTypeConfig,
+    metric_configs: []const GraphMetricConfig,
     rebuild_root_path: ?[]u8,
     rebuild_storage: ?lsm_backend.Storage,
     rebuild_owner_generation: u64,
     algebraic_semiring_traversal: bool,
     edge_count: u64,
     node_count: u64,
+    edge_generation: u64,
     algebraic_traversal_attempt_count: u64,
     algebraic_traversal_proven_count: u64,
     algebraic_traversal_rejected_count: u64,
@@ -479,6 +528,7 @@ pub const GraphIndex = struct {
         return .{
             .edge_count = try readU64OrZero(&txn, graph_edge_count_key),
             .node_count = try readU64OrZero(&txn, graph_node_count_key),
+            .edge_generation = try readU64OrZero(&txn, graph_edge_generation_key),
         };
     }
 
@@ -548,6 +598,62 @@ pub const GraphIndex = struct {
     fn persistGraphCounters(self: *GraphIndex, batch: anytype) !void {
         try putU64(batch, graph_edge_count_key, self.edge_count);
         try putU64(batch, graph_node_count_key, self.node_count);
+        try putU64(batch, graph_edge_generation_key, self.edge_generation);
+    }
+
+    fn graphMetricKeyAlloc(self: *GraphIndex, parts: []const []const u8) ![]u8 {
+        var list = std.ArrayListUnmanaged(u8).empty;
+        defer list.deinit(self.alloc);
+        try list.appendSlice(self.alloc, graph_metric_key_prefix);
+        for (parts) |part| try internal_keys.appendEncodedComponent(&list, self.alloc, part);
+        return try list.toOwnedSlice(self.alloc);
+    }
+
+    fn graphMetricScoreKeyAlloc(self: *GraphIndex, metric_name: []const u8, generation: u64, node: []const u8) ![]u8 {
+        const generation_text = try std.fmt.allocPrint(self.alloc, "{d}", .{generation});
+        defer self.alloc.free(generation_text);
+        return try self.graphMetricKeyAlloc(&.{ metric_name, "score", generation_text, node });
+    }
+
+    fn graphMetricScorePrefixAlloc(self: *GraphIndex, metric_name: []const u8, generation: u64) ![]u8 {
+        const generation_text = try std.fmt.allocPrint(self.alloc, "{d}", .{generation});
+        defer self.alloc.free(generation_text);
+        return try self.graphMetricKeyAlloc(&.{ metric_name, "score", generation_text });
+    }
+
+    fn graphMetricPublishedGenerationKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
+        return try self.graphMetricKeyAlloc(&.{ metric_name, "published_generation" });
+    }
+
+    fn graphMetricDirtyGenerationKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
+        return try self.graphMetricKeyAlloc(&.{ metric_name, "dirty_generation" });
+    }
+
+    fn graphMetricMetaKeyAlloc(self: *GraphIndex, metric_name: []const u8, generation: u64) ![]u8 {
+        const generation_text = try std.fmt.allocPrint(self.alloc, "{d}", .{generation});
+        defer self.alloc.free(generation_text);
+        return try self.graphMetricKeyAlloc(&.{ metric_name, "meta", generation_text });
+    }
+
+    fn metricPublishedGeneration(self: *GraphIndex, txn: anytype, metric_name: []const u8) !u64 {
+        const key = try self.graphMetricPublishedGenerationKeyAlloc(metric_name);
+        defer self.alloc.free(key);
+        return try readU64OrZero(txn, key);
+    }
+
+    fn metricDirtyGeneration(self: *GraphIndex, txn: anytype, metric_name: []const u8) !u64 {
+        const key = try self.graphMetricDirtyGenerationKeyAlloc(metric_name);
+        defer self.alloc.free(key);
+        return try readU64OrZero(txn, key);
+    }
+
+    fn markMetricDirty(self: *GraphIndex, batch: anytype) !void {
+        if (self.metric_configs.len == 0) return;
+        for (self.metric_configs) |cfg| {
+            const key = try self.graphMetricDirtyGenerationKeyAlloc(cfg.name);
+            defer self.alloc.free(key);
+            try putU64(batch, key, self.edge_generation);
+        }
     }
 
     fn rememberNodeRefCount(self: *GraphIndex, counts: *std.StringHashMapUnmanaged(u64), node: []const u8) !void {
@@ -590,7 +696,9 @@ pub const GraphIndex = struct {
         var maybe_entry = try cur.first();
         while (maybe_entry) |entry| {
             if (std.mem.startsWith(u8, entry.key, graph_meta_prefix)) {
-                try meta_keys.append(self.alloc, try self.alloc.dupe(u8, entry.key));
+                if (!std.mem.startsWith(u8, entry.key, graph_metric_key_prefix)) {
+                    try meta_keys.append(self.alloc, try self.alloc.dupe(u8, entry.key));
+                }
             } else {
                 edge_count += 1;
                 if (try parseReverseEdgeKeyAlloc(self.alloc, entry.key)) |parsed_owned| {
@@ -735,12 +843,14 @@ pub const GraphIndex = struct {
             .reverse_store = reverse_store.store,
             .reverse_owner = reverse_store.owner,
             .edge_type_configs = opts.edge_type_configs,
+            .metric_configs = opts.metric_configs,
             .rebuild_root_path = if (opts.rebuild_root_path) |path| try alloc.dupe(u8, path) else null,
             .rebuild_storage = opts.reverse_lsm_storage,
             .rebuild_owner_generation = opts.rebuild_owner_generation,
             .algebraic_semiring_traversal = opts.algebraic_semiring_traversal,
             .edge_count = loaded_stats.edge_count,
             .node_count = loaded_stats.node_count,
+            .edge_generation = loaded_stats.edge_generation,
             .algebraic_traversal_attempt_count = 0,
             .algebraic_traversal_proven_count = 0,
             .algebraic_traversal_rejected_count = 0,
@@ -819,6 +929,7 @@ pub const GraphIndex = struct {
     pub const Stats = struct {
         edge_count: u64 = 0,
         node_count: u64 = 0,
+        edge_generation: u64 = 0,
     };
 
     pub fn stats(self: *GraphIndex, alloc: Allocator) !Stats {
@@ -867,6 +978,7 @@ pub const GraphIndex = struct {
         return .{
             .edge_count = edge_count,
             .node_count = seen_nodes.count(),
+            .edge_generation = self.edge_generation,
         };
     }
 
@@ -946,9 +1058,11 @@ pub const GraphIndex = struct {
         errdefer reverse_batch.abort();
         const prev_edge_count = self.edge_count;
         const prev_node_count = self.node_count;
+        const prev_edge_generation = self.edge_generation;
         errdefer {
             self.edge_count = prev_edge_count;
             self.node_count = prev_node_count;
+            self.edge_generation = prev_edge_generation;
         }
 
         for (deletes) |delete| {
@@ -988,6 +1102,8 @@ pub const GraphIndex = struct {
             try reverse_batch.put(rev_key, edge_val);
         }
 
+        self.edge_generation += 1;
+        try self.markMetricDirty(&reverse_batch);
         try self.persistGraphCounters(&reverse_batch);
         try main_batch.commit();
         try reverse_batch.commit();
@@ -1483,6 +1599,356 @@ pub const GraphIndex = struct {
         return false;
     }
 
+    pub const GraphMetricState = enum {
+        disabled,
+        not_ready,
+        fresh,
+        stale,
+        building,
+        failed,
+    };
+
+    pub const GraphMetricStatus = struct {
+        name: []const u8,
+        state: GraphMetricState = .not_ready,
+        published_generation: u64 = 0,
+        edge_generation: u64 = 0,
+        converged: bool = false,
+        iterations_completed: u32 = 0,
+        delta: f64 = 0.0,
+        computed_at_ms: u64 = 0,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.name);
+            self.* = undefined;
+        }
+    };
+
+    pub const GraphMetricScore = struct {
+        node: []const u8,
+        score: f64,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.node);
+            self.* = undefined;
+        }
+    };
+
+    const GraphMetricMeta = struct {
+        converged: bool = false,
+        iterations_completed: u32 = 0,
+        delta: f64 = 0.0,
+        computed_at_ms: u64 = 0,
+    };
+
+    const graph_metric_meta_encoded_len = 8 + 8 + 8 + 8;
+
+    fn encodeGraphMetricMeta(meta: GraphMetricMeta, out: *[graph_metric_meta_encoded_len]u8) void {
+        var offset: usize = 0;
+        inline for (.{
+            if (meta.converged) @as(u64, 1) else @as(u64, 0),
+            @as(u64, meta.iterations_completed),
+            @as(u64, @bitCast(meta.delta)),
+            meta.computed_at_ms,
+        }) |value| {
+            std.mem.writeInt(u64, out[offset..][0..8], value, .little);
+            offset += 8;
+        }
+    }
+
+    fn decodeGraphMetricMeta(raw: []const u8) ?GraphMetricMeta {
+        if (raw.len != graph_metric_meta_encoded_len) return null;
+        var offset: usize = 0;
+        const converged = std.mem.readInt(u64, raw[offset..][0..8], .little) != 0;
+        offset += 8;
+        const iterations_completed: u32 = @intCast(std.mem.readInt(u64, raw[offset..][0..8], .little));
+        offset += 8;
+        const delta_bits = std.mem.readInt(u64, raw[offset..][0..8], .little);
+        offset += 8;
+        return .{
+            .converged = converged,
+            .iterations_completed = iterations_completed,
+            .delta = @bitCast(delta_bits),
+            .computed_at_ms = std.mem.readInt(u64, raw[offset..][0..8], .little),
+        };
+    }
+
+    fn putF64(batch: anytype, key: []const u8, value: f64) !void {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, @bitCast(value), .little);
+        try batch.put(key, &buf);
+    }
+
+    fn decodeF64(raw: []const u8) ?f64 {
+        if (raw.len < 8) return null;
+        const bits = std.mem.readInt(u64, raw[0..8], .little);
+        return @bitCast(bits);
+    }
+
+    fn metricConfig(self: *const GraphIndex, metric_name: []const u8) ?GraphMetricConfig {
+        for (self.metric_configs) |cfg| {
+            if (std.mem.eql(u8, cfg.name, metric_name)) return cfg;
+        }
+        return null;
+    }
+
+    fn graphMetricEdgeAllowed(filter: GraphMetricEdgeFilter, edge_type: []const u8) bool {
+        return switch (filter.mode) {
+            .all => true,
+            .types => blk: {
+                for (filter.types) |allowed| {
+                    if (std.mem.eql(u8, allowed, edge_type)) break :blk true;
+                }
+                break :blk false;
+            },
+        };
+    }
+
+    const PageRankNode = struct {
+        key: []u8,
+        rank: f64,
+        next_rank: f64 = 0.0,
+        out_degree: u64 = 0,
+    };
+
+    const PageRankEdge = struct {
+        source: usize,
+        target: usize,
+    };
+
+    fn getOrPutPageRankNode(
+        self: *GraphIndex,
+        map: *std.StringHashMapUnmanaged(usize),
+        nodes: *std.ArrayListUnmanaged(PageRankNode),
+        key: []const u8,
+    ) !usize {
+        if (map.get(key)) |idx| return idx;
+        const owned = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned);
+        const idx = nodes.items.len;
+        try nodes.append(self.alloc, .{ .key = owned, .rank = 0.0 });
+        errdefer _ = nodes.pop();
+        try map.put(self.alloc, owned, idx);
+        return idx;
+    }
+
+    fn freePageRankNodes(self: *GraphIndex, nodes: []PageRankNode) void {
+        for (nodes) |node| self.alloc.free(node.key);
+    }
+
+    fn collectPageRankGraph(
+        self: *GraphIndex,
+        filter: GraphMetricEdgeFilter,
+        nodes: *std.ArrayListUnmanaged(PageRankNode),
+        edges: *std.ArrayListUnmanaged(PageRankEdge),
+    ) !void {
+        var map = std.StringHashMapUnmanaged(usize).empty;
+        defer map.deinit(self.alloc);
+
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var entry_opt = try cur.first();
+        while (entry_opt) |entry| : (entry_opt = try cur.next()) {
+            if (std.mem.startsWith(u8, entry.key, graph_meta_prefix)) continue;
+            var parsed = (try parseReverseEdgeKeyAlloc(self.alloc, entry.key)) orelse continue;
+            defer parsed.deinit(self.alloc);
+            if (!std.mem.eql(u8, parsed.index_name, self.index_name)) continue;
+            if (!graphMetricEdgeAllowed(filter, parsed.edge_type)) continue;
+            const source_idx = try self.getOrPutPageRankNode(&map, nodes, parsed.source);
+            const target_idx = try self.getOrPutPageRankNode(&map, nodes, parsed.target);
+            nodes.items[source_idx].out_degree += 1;
+            try edges.append(self.alloc, .{ .source = source_idx, .target = target_idx });
+        }
+    }
+
+    fn deleteScoreGeneration(self: *GraphIndex, batch: anytype, metric_name: []const u8, generation: u64) !void {
+        if (generation == 0) return;
+        const prefix = try self.graphMetricScorePrefixAlloc(metric_name, generation);
+        defer self.alloc.free(prefix);
+        var keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (keys.items) |key| self.alloc.free(key);
+            keys.deinit(self.alloc);
+        }
+        var cur = try batch.openCursor();
+        defer cur.close();
+        var entry_opt = try cur.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cur.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            try keys.append(self.alloc, try self.alloc.dupe(u8, entry.key));
+        }
+        for (keys.items) |key| {
+            batch.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+    }
+
+    pub fn runPageRankMetric(self: *GraphIndex, metric_name: []const u8) !GraphMetricStatus {
+        const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+        if (cfg.kind != .pagerank) return error.UnsupportedGraphMetric;
+
+        var nodes = std.ArrayListUnmanaged(PageRankNode).empty;
+        defer {
+            self.freePageRankNodes(nodes.items);
+            nodes.deinit(self.alloc);
+        }
+        var edges = std.ArrayListUnmanaged(PageRankEdge).empty;
+        defer edges.deinit(self.alloc);
+        try self.collectPageRankGraph(cfg.edge_filter, &nodes, &edges);
+
+        const target_generation = self.edge_generation;
+        const n = nodes.items.len;
+        var converged = true;
+        var iterations_completed: u32 = 0;
+        var delta: f64 = 0.0;
+        if (n > 0) {
+            const node_count_f = @as(f64, @floatFromInt(n));
+            const initial = 1.0 / node_count_f;
+            for (nodes.items) |*node| node.rank = initial;
+            converged = false;
+
+            var iter: u32 = 0;
+            while (iter < cfg.max_iterations) : (iter += 1) {
+                const base = (1.0 - cfg.damping) / node_count_f;
+                var sink_mass: f64 = 0.0;
+                for (nodes.items) |*node| {
+                    node.next_rank = base;
+                    if (node.out_degree == 0) sink_mass += node.rank;
+                }
+                const sink_contribution = cfg.damping * sink_mass / node_count_f;
+                for (nodes.items) |*node| node.next_rank += sink_contribution;
+                for (edges.items) |edge| {
+                    const source = nodes.items[edge.source];
+                    if (source.out_degree == 0) continue;
+                    nodes.items[edge.target].next_rank += cfg.damping * source.rank / @as(f64, @floatFromInt(source.out_degree));
+                }
+                delta = 0.0;
+                for (nodes.items) |*node| {
+                    delta += @abs(node.next_rank - node.rank);
+                    node.rank = node.next_rank;
+                }
+                iterations_completed = iter + 1;
+                if (delta <= cfg.tolerance) {
+                    converged = true;
+                    break;
+                }
+            }
+        }
+
+        if (!std.math.isFinite(delta)) return error.InvalidGraphMetricScore;
+        for (nodes.items) |node| {
+            if (!std.math.isFinite(node.rank)) return error.InvalidGraphMetricScore;
+        }
+
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const prior_published = try self.metricPublishedGeneration(&batch, metric_name);
+        for (nodes.items) |node| {
+            const score_key = try self.graphMetricScoreKeyAlloc(metric_name, target_generation, node.key);
+            defer self.alloc.free(score_key);
+            try putF64(&batch, score_key, node.rank);
+        }
+        const published_key = try self.graphMetricPublishedGenerationKeyAlloc(metric_name);
+        defer self.alloc.free(published_key);
+        try putU64(&batch, published_key, target_generation);
+        const dirty_key = try self.graphMetricDirtyGenerationKeyAlloc(metric_name);
+        defer self.alloc.free(dirty_key);
+        try putU64(&batch, dirty_key, target_generation);
+        const meta_key = try self.graphMetricMetaKeyAlloc(metric_name, target_generation);
+        defer self.alloc.free(meta_key);
+        var meta_buf: [graph_metric_meta_encoded_len]u8 = undefined;
+        encodeGraphMetricMeta(.{
+            .converged = converged,
+            .iterations_completed = iterations_completed,
+            .delta = delta,
+            .computed_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+        }, &meta_buf);
+        try batch.put(meta_key, &meta_buf);
+        if (prior_published != 0 and prior_published != target_generation) {
+            try self.deleteScoreGeneration(&batch, metric_name, prior_published);
+        }
+        try batch.commit();
+        return try self.graphMetricStatus(metric_name);
+    }
+
+    pub fn graphMetricStatus(self: *GraphIndex, metric_name: []const u8) !GraphMetricStatus {
+        _ = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        const published_generation = try self.metricPublishedGeneration(&txn, metric_name);
+        const dirty_generation = try self.metricDirtyGeneration(&txn, metric_name);
+        var meta = GraphMetricMeta{};
+        if (published_generation != 0) {
+            const meta_key = try self.graphMetricMetaKeyAlloc(metric_name, published_generation);
+            defer self.alloc.free(meta_key);
+            if (txn.get(meta_key)) |raw| {
+                meta = decodeGraphMetricMeta(raw) orelse .{};
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+        }
+        return .{
+            .name = try self.alloc.dupe(u8, metric_name),
+            .state = if (published_generation == 0) .not_ready else if (dirty_generation > published_generation or self.edge_generation > published_generation) .stale else .fresh,
+            .published_generation = published_generation,
+            .edge_generation = self.edge_generation,
+            .converged = meta.converged,
+            .iterations_completed = meta.iterations_completed,
+            .delta = meta.delta,
+            .computed_at_ms = meta.computed_at_ms,
+        };
+    }
+
+    fn graphMetricNodeFromScoreKeyAlloc(self: *GraphIndex, key: []const u8, prefix: []const u8) !?[]u8 {
+        if (!std.mem.startsWith(u8, key, prefix)) return null;
+        const pos = prefix.len;
+        const term = internal_keys.findComponentTerminator(key, pos) orelse return null;
+        if (term + 2 != key.len) return null;
+        return try internal_keys.decodeBodyAlloc(self.alloc, key[pos..term]);
+    }
+
+    pub fn graphMetricTopK(self: *GraphIndex, metric_name: []const u8, limit: usize) ![]GraphMetricScore {
+        if (limit == 0) return try self.alloc.alloc(GraphMetricScore, 0);
+        _ = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        const generation = try self.metricPublishedGeneration(&txn, metric_name);
+        if (generation == 0) return error.MetricNotReady;
+        const prefix = try self.graphMetricScorePrefixAlloc(metric_name, generation);
+        defer self.alloc.free(prefix);
+        var scores = std.ArrayListUnmanaged(GraphMetricScore).empty;
+        errdefer {
+            for (scores.items) |*score| score.deinit(self.alloc);
+            scores.deinit(self.alloc);
+        }
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var entry_opt = try cur.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cur.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const score_value = decodeF64(entry.value) orelse continue;
+            const node = (try self.graphMetricNodeFromScoreKeyAlloc(entry.key, prefix)) orelse continue;
+            errdefer self.alloc.free(node);
+            try scores.append(self.alloc, .{ .node = node, .score = score_value });
+        }
+        std.mem.sort(GraphMetricScore, scores.items, {}, struct {
+            fn lessThan(_: void, a: GraphMetricScore, b: GraphMetricScore) bool {
+                if (a.score == b.score) return std.mem.lessThan(u8, a.node, b.node);
+                return a.score > b.score;
+            }
+        }.lessThan);
+        const out_len = @min(limit, scores.items.len);
+        const out = try self.alloc.dupe(GraphMetricScore, scores.items[0..out_len]);
+        for (scores.items[out_len..]) |*score| score.deinit(self.alloc);
+        scores.deinit(self.alloc);
+        return out;
+    }
+
     /// Free an edge's allocated fields.
     pub fn freeEdge(alloc: Allocator, edge: Edge) void {
         alloc.free(edge.source);
@@ -1576,6 +2042,95 @@ test "graph addEdge and getEdges out" {
     try std.testing.expectEqual(@as(usize, 2), edges.len);
     try std.testing.expectEqualStrings("doc1", edges[0].source);
     try std.testing.expectApproxEqAbs(@as(f64, 0.9), edges[0].weight, 0.001);
+}
+
+test "graph pagerank metric publishes top-k scores and status" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-pagerank");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-pagerank");
+    defer cleanupTmp(rev_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const metrics = [_]GraphMetricConfig{.{
+        .name = "pagerank",
+        .kind = .pagerank,
+        .max_iterations = 40,
+        .tolerance = 0.0000001,
+        .refresh = .manual,
+    }};
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    defer graph.close();
+
+    try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
+    try graph.addEdge("doc-c", "doc-b", "cites", 1.0, 0, 0, "");
+    try graph.addEdge("doc-b", "doc-d", "cites", 1.0, 0, 0, "");
+
+    var status = try graph.graphMetricStatus("pagerank");
+    defer status.deinit(alloc);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.not_ready, status.state);
+
+    var published = try graph.runPageRankMetric("pagerank");
+    defer published.deinit(alloc);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.fresh, published.state);
+    try std.testing.expect(published.published_generation > 0);
+    try std.testing.expect(published.iterations_completed > 0);
+
+    const top = try graph.graphMetricTopK("pagerank", 2);
+    defer {
+        for (top) |*score| score.deinit(alloc);
+        alloc.free(top);
+    }
+    try std.testing.expectEqual(@as(usize, 2), top.len);
+    try std.testing.expectEqualStrings("doc-d", top[0].node);
+    try std.testing.expect(top[0].score >= top[1].score);
+
+    try graph.addEdge("doc-d", "doc-a", "cites", 1.0, 0, 0, "");
+    var stale = try graph.graphMetricStatus("pagerank");
+    defer stale.deinit(alloc);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.stale, stale.state);
+}
+
+test "graph pagerank metric edge filter limits typed score graph" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-pagerank-filter");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-pagerank-filter");
+    defer cleanupTmp(rev_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const filter_types = [_][]const u8{"cites"};
+    const metrics = [_]GraphMetricConfig{.{
+        .name = "pagerank",
+        .kind = .pagerank,
+        .max_iterations = 30,
+        .refresh = .manual,
+        .edge_filter = .{ .mode = .types, .types = &filter_types },
+    }};
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    defer graph.close();
+
+    try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
+    try graph.addEdge("doc-x", "doc-y", "related", 1.0, 0, 0, "");
+    var published = try graph.runPageRankMetric("pagerank");
+    defer published.deinit(alloc);
+
+    const top = try graph.graphMetricTopK("pagerank", 10);
+    defer {
+        for (top) |*score| score.deinit(alloc);
+        alloc.free(top);
+    }
+    try std.testing.expectEqual(@as(usize, 2), top.len);
+    for (top) |score| {
+        try std.testing.expect(!std.mem.eql(u8, score.node, "doc-x"));
+        try std.testing.expect(!std.mem.eql(u8, score.node, "doc-y"));
+    }
 }
 
 test "graph addEdge and getEdges in (reverse index)" {

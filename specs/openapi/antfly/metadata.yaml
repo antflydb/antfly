@@ -7845,6 +7845,11 @@ components:
           additionalProperties:
             $ref: "indexes.yaml#/components/schemas/GraphQueryResult"
           description: Results from declarative graph queries.
+        graph_metric_results:
+          type: object
+          additionalProperties:
+            $ref: "indexes.yaml#/components/schemas/GraphMetricResult"
+          description: Results from direct graph metric reads.
         profile:
           x-go-type-skip-optional-pointer: false
           allOf:

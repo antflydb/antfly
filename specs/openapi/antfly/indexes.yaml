@@ -2294,3 +2294,62 @@ components:
           format: int64
           x-go-type: time.Duration
           description: "Query execution time"
+    GraphMetricStatus:
+      type: object
+      required:
+        - state
+        - published_generation
+        - edge_generation
+        - converged
+        - iterations_completed
+        - delta
+        - computed_at_ms
+      properties:
+        state:
+          type: string
+        published_generation:
+          type: integer
+          format: int64
+        edge_generation:
+          type: integer
+          format: int64
+        converged:
+          type: boolean
+        iterations_completed:
+          type: integer
+          format: int64
+        delta:
+          type: number
+          format: double
+        computed_at_ms:
+          type: integer
+          format: int64
+    GraphMetricScore:
+      type: object
+      required:
+        - node
+        - score
+      properties:
+        node:
+          type: string
+        score:
+          type: number
+          format: double
+    GraphMetricResult:
+      type: object
+      required:
+        - index_name
+        - metric
+        - scores
+        - status
+      properties:
+        index_name:
+          type: string
+        metric:
+          type: string
+        scores:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphMetricScore'
+        status:
+          $ref: '#/components/schemas/GraphMetricStatus'

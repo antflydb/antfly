@@ -15148,6 +15148,11 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/GraphQueryResult'
           description: Results from declarative graph queries.
+        graph_metric_results:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphMetricResult'
+          description: Results from direct graph metric reads.
         profile:
           x-go-type-skip-optional-pointer: false
           allOf:
@@ -21493,6 +21498,65 @@ components:
           format: int64
           x-go-type: time.Duration
           description: Query execution time
+    GraphMetricScore:
+      type: object
+      required:
+        - node
+        - score
+      properties:
+        node:
+          type: string
+        score:
+          type: number
+          format: double
+    GraphMetricStatus:
+      type: object
+      required:
+        - state
+        - published_generation
+        - edge_generation
+        - converged
+        - iterations_completed
+        - delta
+        - computed_at_ms
+      properties:
+        state:
+          type: string
+        published_generation:
+          type: integer
+          format: int64
+        edge_generation:
+          type: integer
+          format: int64
+        converged:
+          type: boolean
+        iterations_completed:
+          type: integer
+          format: int64
+        delta:
+          type: number
+          format: double
+        computed_at_ms:
+          type: integer
+          format: int64
+    GraphMetricResult:
+      type: object
+      required:
+        - index_name
+        - metric
+        - scores
+        - status
+      properties:
+        index_name:
+          type: string
+        metric:
+          type: string
+        scores:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphMetricScore'
+        status:
+          $ref: '#/components/schemas/GraphMetricStatus'
     EvalRequest:
       type: object
       x-go-type-skip-optional-pointer: true

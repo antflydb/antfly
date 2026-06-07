@@ -233,7 +233,18 @@ const IndexStatusSummary = struct {
         doc_count: ?u64 = null,
         node_count: ?u64 = null,
         edge_count: ?u64 = null,
+        metric_status: ?std.json.ArrayHashMap(GraphMetricStatusSummary) = null,
     },
+};
+
+const GraphMetricStatusSummary = struct {
+    state: []const u8,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    converged: bool = false,
+    iterations_completed: u64 = 0,
+    delta: f64 = 0.0,
+    computed_at_ms: u64 = 0,
 };
 
 fn startMetadataAdminListener(
@@ -6273,7 +6284,9 @@ test "public api e2e supports graph queries" {
     var created = try client.createTable(base_uri, "docs", create_body);
     defer created.deinit(std.testing.allocator);
 
-    var graph_index_resp = try client.createTableIndex(base_uri, "docs", "graph_idx", "{\"name\":\"graph_idx\",\"type\":\"graph\"}");
+    var graph_index_resp = try client.createTableIndex(base_uri, "docs", "graph_idx",
+        \\{"name":"graph_idx","type":"graph","metrics":{"pagerank":{"enabled":true,"refresh":"background","max_iterations":40,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}
+    );
     defer graph_index_resp.deinit(std.testing.allocator);
 
     var rounds: usize = 0;
@@ -6284,11 +6297,36 @@ test "public api e2e supports graph queries" {
         \\  "doc-a":{"title":"alpha","_edges":{"graph_idx":{"cites":[{"target":"doc-b","weight":1.5}],"related":[{"target":"doc-c","weight":0.5}]}}},
         \\  "doc-b":{"title":"beta","_edges":{"graph_idx":{"cites":[{"target":"doc-c","weight":2.0}]}}},
         \\  "doc-c":{"title":"gamma"}
-        \\}}
+        \\},"sync_level":"full_index"}
     );
     defer std.testing.allocator.free(batch_body);
     var batch = try client.fetchBatch(base_uri, "docs", batch_body);
     defer batch.deinit(std.testing.allocator);
+
+    var graph_index_status = try client.fetchTableIndex(base_uri, "docs", "graph_idx");
+    defer graph_index_status.deinit(std.testing.allocator);
+    var parsed_graph_index_status = try parseJsonBody(IndexStatusSummary, std.testing.allocator, graph_index_status.body);
+    defer parsed_graph_index_status.deinit();
+    const metric_status = parsed_graph_index_status.value.status.metric_status orelse return error.TestUnexpectedResult;
+    const pagerank_status = metric_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fresh", pagerank_status.state);
+    try std.testing.expect(pagerank_status.published_generation > 0);
+    try std.testing.expect(pagerank_status.edge_generation >= pagerank_status.published_generation);
+    try std.testing.expect(pagerank_status.iterations_completed > 0);
+
+    var metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":2,"metric_freshness":"fresh"}}
+    );
+    defer metric_query.deinit(std.testing.allocator);
+    var parsed_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, metric_query.body, .{});
+    defer parsed_metric.deinit();
+    const metric_responses = parsed_metric.value.responses orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), metric_responses.len);
+    const graph_metric_results = metric_responses[0].graph_metric_results orelse return error.TestUnexpectedResult;
+    const pagerank_result = graph_metric_results.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fresh", pagerank_result.status.state);
+    try std.testing.expectEqual(@as(usize, 2), pagerank_result.scores.len);
+    try std.testing.expect(pagerank_result.scores[0].score >= pagerank_result.scores[1].score);
 
     const graph_query_body = try test_contract_helpers.encodeGraphNeighborsQueryRequest(
         std.testing.allocator,
