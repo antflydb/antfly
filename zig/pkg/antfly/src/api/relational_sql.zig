@@ -5036,12 +5036,17 @@ const Parser = struct {
         defer if (!field_transferred) self.alloc.free(field);
         const maybe_column = relationalColumnForField(self.schema, field, null);
 
-        if (self.match(.arrow_text) != null) {
+        if (self.peekKind(.arrow_text) or self.peekKind(.arrow_json)) {
+            const as_text = self.match(.arrow_text) != null;
+            if (!as_text) try self.expect(.arrow_json);
             const path = try self.parseJsonPathOwned();
             var path_transferred = false;
             errdefer if (!path_transferred) self.alloc.free(path);
             try self.expect(.eq);
-            const value_json = try self.parseJsonValueAlloc();
+            const value_json = if (as_text)
+                try self.parseJsonValueAlloc()
+            else
+                try self.parseJsonDocumentValueAlloc();
             var value_transferred = false;
             errdefer if (!value_transferred) self.alloc.free(value_json);
             if (relationalColumnForField(self.schema, field, .json) == null) return error.InvalidSqlCatalog;
@@ -5095,8 +5100,6 @@ const Parser = struct {
             path_transferred = true;
             return;
         }
-        if (self.peekKind(.arrow_json)) return error.UnsupportedSqlShape;
-
         const column = maybe_column orelse return error.InvalidSqlCatalog;
         if (self.matchKeyword("is")) {
             const not = self.matchKeyword("not");
@@ -5874,7 +5877,9 @@ const Parser = struct {
         var field_owned = true;
         errdefer if (field_owned) self.alloc.free(field);
         if (self.peekKind(.lparen)) return error.UnsupportedSqlShape;
-        if (self.match(.arrow_text) != null) {
+        if (self.peekKind(.arrow_text) or self.peekKind(.arrow_json)) {
+            const as_text = self.match(.arrow_text) != null;
+            if (!as_text) try self.expect(.arrow_json);
             if (relationalColumnForField(self.schema, field, .json) == null) return error.InvalidSqlCatalog;
             const path = try self.parseJsonPathOwned();
             var path_owned = true;
@@ -5898,12 +5903,11 @@ const Parser = struct {
                 .expression = .{
                     .kind = .json_extract,
                     .json_path = path,
-                    .json_as_text = true,
+                    .json_as_text = as_text,
                     .operands = operands,
                 },
             } };
         }
-        if (self.peekKind(.arrow_json)) return error.UnsupportedSqlShape;
         const column = relationalColumnForField(self.schema, field, null) orelse return error.InvalidSqlCatalog;
         if (self.peekArithmeticOperator()) |_| {
             if (column.field_type != .numeric) return error.InvalidSqlCatalog;
@@ -9605,7 +9609,7 @@ test "postgres sql adapter lowers application queue select into row claim query"
     try std.testing.expect(lowered.query.row_claim.?.skip_locked);
 }
 
-test "postgres sql adapter lowers json text extraction predicate" {
+test "postgres sql adapter lowers json extraction predicates" {
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"},"created_at":{"type":"datetime"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -9630,6 +9634,22 @@ test "postgres sql adapter lowers json text extraction predicate" {
     try std.testing.expectEqualStrings("\"autoscale_delta\"", lowered.query.json_path_eq[0].value_json);
     try std.testing.expectEqualStrings("created_at", lowered.query.order_by[0].field);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.query.order_by[0].direction);
+
+    var structured = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE metadata->'flags' = $1::jsonb ORDER BY created_at DESC LIMIT 1",
+        schema,
+        &.{.{ .json = "[\"active\",\"rated\"]" }},
+    );
+    defer structured.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), structured.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), structured.query.json_path_eq.len);
+    try std.testing.expectEqualStrings("metadata", structured.query.json_path_eq[0].field);
+    try std.testing.expectEqualStrings("flags", structured.query.json_path_eq[0].path);
+    try std.testing.expectEqualStrings("[\"active\",\"rated\"]", structured.query.json_path_eq[0].value_json);
+    try std.testing.expectEqualStrings("created_at", structured.query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, structured.query.order_by[0].direction);
 }
 
 test "postgres sql adapter lowers jsonb containment existence and extraction projection" {
@@ -9644,7 +9664,7 @@ test "postgres sql adapter lowers jsonb containment existence and extraction pro
 
     var lowered = try lowerSelectAlloc(
         alloc,
-        "SELECT metadata->>'source' AS source FROM usage_records WHERE metadata @> $1::jsonb AND metadata ? 'flags' ORDER BY created_at DESC LIMIT 5",
+        "SELECT metadata->>'source' AS source, metadata->'flags' AS flags FROM usage_records WHERE metadata @> $1::jsonb AND metadata ? 'flags' ORDER BY created_at DESC LIMIT 5",
         schema,
         &.{.{ .json = "{\"billing\":{\"plan\":\"pro\"}}" }},
     );
@@ -9653,13 +9673,19 @@ test "postgres sql adapter lowers jsonb containment existence and extraction pro
     try std.testing.expect(!lowered.query.select_all);
     try std.testing.expectEqual(@as(usize, 0), lowered.query.select.len);
     try std.testing.expectEqual(@as(usize, 0), lowered.query.json_extract.len);
-    try std.testing.expectEqual(@as(usize, 1), lowered.query.expressions.len);
+    try std.testing.expectEqual(@as(usize, 2), lowered.query.expressions.len);
     try std.testing.expectEqualStrings("source", lowered.query.expressions[0].output);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, lowered.query.expressions[0].expression.kind);
     try std.testing.expectEqualStrings("source", lowered.query.expressions[0].expression.json_path);
     try std.testing.expect(lowered.query.expressions[0].expression.json_as_text);
     try std.testing.expectEqual(@as(usize, 1), lowered.query.expressions[0].expression.operands.len);
     try std.testing.expectEqualStrings("metadata", lowered.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqualStrings("flags", lowered.query.expressions[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, lowered.query.expressions[1].expression.kind);
+    try std.testing.expectEqualStrings("flags", lowered.query.expressions[1].expression.json_path);
+    try std.testing.expect(!lowered.query.expressions[1].expression.json_as_text);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.expressions[1].expression.operands.len);
+    try std.testing.expectEqualStrings("metadata", lowered.query.expressions[1].expression.operands[0].field);
     try std.testing.expectEqual(@as(usize, 1), lowered.query.json_contains.len);
     try std.testing.expectEqualStrings("metadata", lowered.query.json_contains[0].field);
     try std.testing.expectEqualStrings("{\"billing\":{\"plan\":\"pro\"}}", lowered.query.json_contains[0].value_json);
@@ -11629,10 +11655,10 @@ test "postgres sql adapter classifies application compatibility corpus" {
         .{
             .name = "single table json query",
             .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .json_path_eq = 1, .select = 1, .order_by = 1, .limit = 10 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=1:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=0:limit=10:claim=none",
-            .sql = "SELECT id, metadata->>'source' AS source FROM usage_records WHERE organization_id = $1 AND metadata->>'source' = $2 ORDER BY created_at DESC LIMIT 10",
-            .params = &.{ .{ .string = "org_1" }, .{ .string = "meter" } },
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .json_path_eq = 2, .select = 1, .order_by = 1, .limit = 10 },
+            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=2:or=0:not=0:select=1:expr=2:alias=0:order=1:order_expr=0:limit=10:claim=none",
+            .sql = "SELECT id, metadata->>'source' AS source, metadata->'flags' AS flags FROM usage_records WHERE organization_id = $1 AND metadata->>'source' = $2 AND metadata->'flags' = $3::jsonb ORDER BY created_at DESC LIMIT 10",
+            .params = &.{ .{ .string = "org_1" }, .{ .string = "meter" }, .{ .json = "[\"rated\"]" } },
         },
         .{
             .name = "single table expression query",
@@ -12090,7 +12116,7 @@ test "postgres sql adapter lowers update jsonb concat into json set operations" 
 
     var lowered = try lowerUpdateAlloc(
         alloc,
-        "UPDATE usage_records SET metadata = metadata || '{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"rated\"]}'::jsonb WHERE id = $1 RETURNING metadata.billing.plan, metadata.flags",
+        "UPDATE usage_records SET metadata = metadata || '{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"rated\"]}'::jsonb WHERE id = $1 RETURNING metadata->>'source' AS source_text, metadata->'flags' AS flags_json",
         schema,
         &.{.{ .string = "u1" }},
         resolver_ctx.resolver(),
@@ -12104,7 +12130,7 @@ test "postgres sql adapter lowers update jsonb concat into json set operations" 
     try std.testing.expectEqualStrings("metadata.flags", lowered.batch.transforms[0].operations[1].path);
     try std.testing.expectEqualStrings("[\"rated\"]", lowered.batch.transforms[0].operations[1].value_json.?);
     try std.testing.expectEqual(@as(usize, 1), lowered.batch.returning_rows.len);
-    try std.testing.expectEqualStrings("{\"metadata.billing.plan\":\"pro\",\"metadata.flags\":[\"rated\"]}", lowered.batch.returning_rows[0]);
+    try std.testing.expectEqualStrings("{\"source_text\":\"old\",\"flags_json\":[\"rated\"]}", lowered.batch.returning_rows[0]);
 }
 
 test "postgres sql adapter lowers delete with explicit version predicate" {
