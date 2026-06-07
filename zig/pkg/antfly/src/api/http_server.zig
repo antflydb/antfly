@@ -1421,7 +1421,7 @@ pub const ApiHttpServer = struct {
 
     fn bestEffortLsmStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.LsmStorageStatus {
         const source = self.table_reads orelse return null;
-        const stats = (try source.lsmStorageStats(table_name)) orelse return null;
+        const stats = (try source.lsmStorageStats(self.alloc, table_name)) orelse return null;
         return tables_api.lsmStorageStatusFromStats(stats);
     }
 
