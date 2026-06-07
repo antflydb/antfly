@@ -34,6 +34,7 @@ const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const storage_schema = @import("../storage/schema.zig");
+const schema_mod = @import("../schema/mod.zig");
 const lmdb = @import("../storage/lmdb.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_reads = @import("table_reads.zig");
@@ -1793,6 +1794,248 @@ pub const UniqueConstraintIntegrityAction = enum {
     progress,
 };
 
+pub const SecondaryIndexRebuildWorkerResult = struct {
+    group_id: u64,
+    table_id: u64,
+    index_generation: u64,
+    claimed: bool = false,
+    completed: bool = false,
+    invalidated: bool = false,
+    report: db_mod.relational_store.SecondaryIndexRebuildReport = .{},
+};
+
+pub const SecondaryIndexRebuildWorkerPassResult = struct {
+    complete: bool = true,
+    ranges_scanned: u64 = 0,
+    ranges_claimed: u64 = 0,
+    ranges_completed: u64 = 0,
+    ranges_busy: u64 = 0,
+    indexes_promoted: u64 = 0,
+    report: db_mod.relational_store.SecondaryIndexRebuildReport = .{},
+    groups: []SecondaryIndexRebuildWorkerResult = &.{},
+
+    pub fn deinit(self: *SecondaryIndexRebuildWorkerPassResult, alloc: std.mem.Allocator) void {
+        if (self.groups.len > 0) alloc.free(self.groups);
+        self.* = undefined;
+    }
+};
+
+pub const SecondaryIndexRebuildGroupRequest = struct {
+    record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+    worker_id: []const u8,
+    lease_ms: u64 = 60_000,
+};
+
+fn mergeSecondaryIndexRebuildReport(
+    aggregate: *db_mod.relational_store.SecondaryIndexRebuildReport,
+    next: db_mod.relational_store.SecondaryIndexRebuildReport,
+) void {
+    aggregate.scanned_rows += next.scanned_rows;
+    aggregate.indexed_rows += next.indexed_rows;
+    aggregate.deleted_entries += next.deleted_entries;
+    aggregate.written_entries += next.written_entries;
+}
+
+pub fn runSecondaryIndexRebuildRangeGroupLocal(
+    db: *db_mod.DB,
+    metadata: anytype,
+    record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+    worker_id: []const u8,
+    now_ms: u64,
+    lease_ms: u64,
+) !SecondaryIndexRebuildWorkerResult {
+    if (worker_id.len == 0 or lease_ms == 0) return error.InvalidSecondaryIndexRebuildRequest;
+    const selector: metadata_table_manager.SecondaryIndexRebuildRangeSelector = .{
+        .table_id = record.table_id,
+        .index_name = record.index_name,
+        .index_generation = record.index_generation,
+        .start_row_key = record.start_row_key,
+    };
+    var result = SecondaryIndexRebuildWorkerResult{
+        .group_id = record.group_id,
+        .table_id = record.table_id,
+        .index_generation = record.index_generation,
+    };
+    metadata.beginSecondaryIndexRebuildRange(.{
+        .selector = selector,
+        .lease_owner = worker_id,
+        .now_ms = now_ms,
+        .lease_expires_at_ms = now_ms +| lease_ms,
+    }) catch |err| switch (err) {
+        error.SecondaryIndexRebuildRangeClaimBusy,
+        error.SecondaryIndexRebuildRangeNotDeclared,
+        => return result,
+        else => return err,
+    };
+    result.claimed = true;
+
+    const upper = record.end_row_key orelse "";
+    result.report = db.rebuildRelationalSecondaryIndexInRange(
+        record.index_name,
+        record.index_generation,
+        record.start_row_key,
+        upper,
+    ) catch |err| {
+        metadata.invalidateSecondaryIndexRebuildRange(.{
+            .selector = selector,
+            .last_error = @errorName(err),
+        }) catch {};
+        result.invalidated = true;
+        return err;
+    };
+    try metadata.finishSecondaryIndexRebuildRange(.{
+        .selector = selector,
+        .completed_row_count = result.report.scanned_rows,
+        .progress_row_key = upper,
+    });
+    result.completed = true;
+    return result;
+}
+
+fn secondaryIndexRebuildRecordPending(record: metadata_table_manager.SecondaryIndexRebuildRangeRecord) bool {
+    return std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_declared) or
+        std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_building);
+}
+
+fn secondaryIndexRebuildRecordReady(record: metadata_table_manager.SecondaryIndexRebuildRangeRecord) bool {
+    return std.mem.eql(u8, record.state, metadata_table_manager.secondary_index_rebuild_ready);
+}
+
+fn findSecondaryIndexRebuildRecordForRange(
+    records: []const metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+    table_id: u64,
+    index_name: []const u8,
+    index_generation: u64,
+    range: metadata_table_manager.RangeRecord,
+) ?metadata_table_manager.SecondaryIndexRebuildRangeRecord {
+    for (records) |record| {
+        if (record.table_id != table_id) continue;
+        if (record.index_generation != index_generation) continue;
+        if (!std.mem.eql(u8, record.index_name, index_name)) continue;
+        if (!std.mem.eql(u8, record.start_row_key, range.start_key)) continue;
+        if (!optionalStringsEqual(record.end_row_key, range.end_key)) continue;
+        return record;
+    }
+    return null;
+}
+
+fn secondaryIndexReadyForPromotion(
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_id: u64,
+    index_name: []const u8,
+    index_generation: u64,
+) bool {
+    var ranges_seen: usize = 0;
+    for (snapshot.ranges) |range| {
+        if (range.table_id != table_id) continue;
+        ranges_seen += 1;
+        const record = findSecondaryIndexRebuildRecordForRange(
+            snapshot.secondary_index_rebuild_ranges,
+            table_id,
+            index_name,
+            index_generation,
+            range,
+        ) orelse return false;
+        if (!secondaryIndexRebuildRecordReady(record)) return false;
+    }
+    return ranges_seen > 0;
+}
+
+fn promoteReadySecondaryIndexesForCatalog(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+) !u64 {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return 0;
+    if (table.schema_json.len == 0) return 0;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
+    defer parsed.deinit(alloc);
+    if (parsed.storage_mode != .relational) return 0;
+    const runtime = try schema_mod.deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    var promoted: u64 = 0;
+    for (runtime.relational_columns) |column| {
+        if (!column.indexed) continue;
+        if (column.index_lifecycle != .building) continue;
+        if (column.index_generation == 0) continue;
+        if (!secondaryIndexReadyForPromotion(&snapshot, table.table_id, column.name, column.index_generation)) continue;
+        const did_promote = catalog.promoteSecondaryIndexReady(
+            alloc,
+            table_name,
+            column.name,
+            column.index_generation,
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation => false,
+            else => return err,
+        };
+        if (did_promote) promoted += 1;
+    }
+    return promoted;
+}
+
+fn runSecondaryIndexRebuildWorkerPassForCatalog(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    worker_id: []const u8,
+    lease_ms: u64,
+    max_work_units: usize,
+) !SecondaryIndexRebuildWorkerPassResult {
+    if (worker_id.len == 0 or lease_ms == 0 or max_work_units == 0) return error.InvalidSecondaryIndexRebuildRequest;
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{};
+
+    var groups = std.ArrayListUnmanaged(SecondaryIndexRebuildWorkerResult).empty;
+    errdefer groups.deinit(alloc);
+
+    var result: SecondaryIndexRebuildWorkerPassResult = .{};
+    for (snapshot.secondary_index_rebuild_ranges) |record| {
+        if (record.table_id != table.table_id) continue;
+        if (!secondaryIndexRebuildRecordPending(record)) continue;
+        result.ranges_scanned += 1;
+        if (result.ranges_claimed >= max_work_units) {
+            result.complete = false;
+            continue;
+        }
+
+        const one = (try source.secondaryIndexRebuildGroupLocal(
+            alloc,
+            record.group_id,
+            table_name,
+            record,
+            worker_id,
+            lease_ms,
+        )) orelse {
+            result.complete = false;
+            continue;
+        };
+        if (!one.claimed) {
+            result.ranges_busy += 1;
+            result.complete = false;
+            try groups.append(alloc, one);
+            continue;
+        }
+
+        result.ranges_claimed += 1;
+        if (one.completed) {
+            result.ranges_completed += 1;
+            mergeSecondaryIndexRebuildReport(&result.report, one.report);
+        } else {
+            result.complete = false;
+        }
+        try groups.append(alloc, one);
+    }
+
+    result.indexes_promoted = try promoteReadySecondaryIndexesForCatalog(alloc, catalog, table_name);
+    result.groups = try groups.toOwnedSlice(alloc);
+    return result;
+}
+
 pub const ForeignKeyIntegrityRequest = struct {
     action: ForeignKeyIntegrityAction = .validate,
     phase: ?[]const u8 = null,
@@ -1871,6 +2114,12 @@ pub const UniqueConstraintIntegrityRequest = struct {
     upper_doc_key: []const u8 = "",
 };
 
+pub const UniqueConstraintIntegritySchemaControllerOptions = struct {
+    action: UniqueConstraintIntegrityAction = .repair,
+    worker_id: []const u8 = "unique-schema-controller",
+    max_tables: usize = 16,
+};
+
 pub const UniqueConstraintIntegrityGroupReport = struct {
     group_id: u64,
     report: db_mod.relational_store.UniqueConstraintIntegrityReport,
@@ -1890,6 +2139,37 @@ pub const UniqueConstraintIntegrityResult = struct {
         if (self.owner_topology) |*owner_topology| owner_topology.deinit(alloc);
         for (self.progress) |*progress| progress.deinit(alloc);
         if (self.progress.len > 0) alloc.free(self.progress);
+        self.* = undefined;
+    }
+};
+
+pub const UniqueConstraintIntegritySchemaControllerTableResult = struct {
+    table_name: []u8,
+    constraint_name: []u8,
+    schema_adoption: bool = false,
+    result: UniqueConstraintIntegrityResult,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.constraint_name);
+        self.result.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const UniqueConstraintIntegritySchemaControllerResult = struct {
+    tables_scanned: usize = 0,
+    tables_with_pending_constraints: usize = 0,
+    tables_executed: usize = 0,
+    terminal_valid_results: usize = 0,
+    terminal_invalid_results: usize = 0,
+    complete: bool = true,
+    valid: bool = true,
+    results: []UniqueConstraintIntegritySchemaControllerTableResult = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.results) |*result| result.deinit(alloc);
+        if (self.results.len > 0) alloc.free(self.results);
         self.* = undefined;
     }
 };
@@ -2828,6 +3108,28 @@ pub const TableWriteSource = struct {
             lower_doc_key: []const u8,
             upper_doc_key: []const u8,
         ) anyerror!?UniqueConstraintIntegrityResult = null,
+        unique_constraint_integrity_schema_controller_maintenance_pass: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            options: UniqueConstraintIntegritySchemaControllerOptions,
+        ) anyerror!?UniqueConstraintIntegritySchemaControllerResult = null,
+        secondary_index_rebuild_worker_pass: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) anyerror!?SecondaryIndexRebuildWorkerPassResult = null,
+        secondary_index_rebuild_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+            worker_id: []const u8,
+            lease_ms: u64,
+        ) anyerror!?SecondaryIndexRebuildWorkerResult = null,
         foreign_key_integrity_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3376,6 +3678,40 @@ pub const TableWriteSource = struct {
     ) !?UniqueConstraintIntegrityResult {
         const fn_ptr = self.vtable.unique_constraint_integrity_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, action, lower_doc_key, upper_doc_key);
+    }
+
+    pub fn uniqueConstraintIntegritySchemaControllerMaintenancePass(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        options: UniqueConstraintIntegritySchemaControllerOptions,
+    ) !?UniqueConstraintIntegritySchemaControllerResult {
+        const fn_ptr = self.vtable.unique_constraint_integrity_schema_controller_maintenance_pass orelse return null;
+        return try fn_ptr(self.ptr, alloc, options);
+    }
+
+    pub fn secondaryIndexRebuildWorkerPass(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?SecondaryIndexRebuildWorkerPassResult {
+        const fn_ptr = self.vtable.secondary_index_rebuild_worker_pass orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    pub fn secondaryIndexRebuildGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?SecondaryIndexRebuildWorkerResult {
+        const fn_ptr = self.vtable.secondary_index_rebuild_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, record, worker_id, lease_ms);
     }
 
     pub fn foreignKeyIntegrityGroupLocal(
@@ -3944,6 +4280,138 @@ fn tableSchemaHasForeignKeysAlloc(alloc: std.mem.Allocator, schema_json: []const
     var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
     return parsed_schema.foreign_keys.len > 0;
+}
+
+fn validateUniqueConstraintIntegritySchemaControllerOptions(options: UniqueConstraintIntegritySchemaControllerOptions) !void {
+    if (options.worker_id.len == 0 or options.max_tables == 0) return error.InvalidUniqueIntegrityRequest;
+}
+
+fn selectedUniqueConstraintIntegrityControllerConstraintAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+) !?[]u8 {
+    if (schema_json.len == 0) return null;
+
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    for (runtime_schema.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) {
+            return try alloc.dupe(u8, constraint.name);
+        }
+    }
+    return null;
+}
+
+fn tableSchemaHasUniqueConstraintsAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !bool {
+    if (schema_json.len == 0) return false;
+
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    return parsed_schema.unique_constraints.len > 0;
+}
+
+fn appendUniqueConstraintIntegritySchemaControllerTableResult(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(UniqueConstraintIntegritySchemaControllerTableResult),
+    table_name: []const u8,
+    constraint_name: []const u8,
+    schema_adoption: bool,
+    result: UniqueConstraintIntegrityResult,
+) !void {
+    var entry = UniqueConstraintIntegritySchemaControllerTableResult{
+        .table_name = try alloc.dupe(u8, table_name),
+        .constraint_name = try alloc.dupe(u8, constraint_name),
+        .schema_adoption = schema_adoption,
+        .result = result,
+    };
+    errdefer entry.deinit(alloc);
+    try out.append(alloc, entry);
+}
+
+fn runUniqueConstraintIntegritySchemaControllerMaintenanceForTable(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    table_name: []const u8,
+    schema_json: []const u8,
+    options: UniqueConstraintIntegritySchemaControllerOptions,
+    summary: *UniqueConstraintIntegritySchemaControllerResult,
+    results: *std.ArrayListUnmanaged(UniqueConstraintIntegritySchemaControllerTableResult),
+) !void {
+    const selected = (try selectedUniqueConstraintIntegrityControllerConstraintAlloc(alloc, schema_json)) orelse return;
+    defer alloc.free(selected);
+    summary.tables_with_pending_constraints += 1;
+    if (summary.tables_executed >= options.max_tables) {
+        summary.complete = false;
+        return;
+    }
+
+    var result = (try source.uniqueConstraintIntegrity(
+        alloc,
+        table_name,
+        options.action,
+        "",
+        "",
+    )) orelse return;
+    errdefer result.deinit(alloc);
+
+    if (options.action == .repair and result.complete) {
+        var validation = (try source.uniqueConstraintIntegrity(
+            alloc,
+            table_name,
+            .validate,
+            "",
+            "",
+        )) orelse return;
+        defer validation.deinit(alloc);
+        result.valid = validation.valid;
+        result.complete = result.complete and validation.complete;
+    }
+
+    summary.tables_executed += 1;
+    summary.complete = summary.complete and result.complete;
+    summary.valid = summary.valid and result.valid;
+    if (result.complete and result.valid) summary.terminal_valid_results += 1;
+    if (result.complete and !result.valid) summary.terminal_invalid_results += 1;
+    try appendUniqueConstraintIntegritySchemaControllerTableResult(alloc, results, table_name, selected, true, result);
+}
+
+fn finalizeUniqueConstraintIntegritySchemaControllerMaintenanceResult(
+    alloc: std.mem.Allocator,
+    summary: UniqueConstraintIntegritySchemaControllerResult,
+    results: *std.ArrayListUnmanaged(UniqueConstraintIntegritySchemaControllerTableResult),
+) !UniqueConstraintIntegritySchemaControllerResult {
+    var out = summary;
+    out.results = try results.toOwnedSlice(alloc);
+    return out;
+}
+
+fn shouldPromoteUniqueConstraintAfterSchemaControllerResult(result: UniqueConstraintIntegrityResult) bool {
+    return switch (result.action) {
+        .validate, .repair => result.complete and result.valid,
+        else => false,
+    };
+}
+
+fn promoteLocalUniqueConstraintAfterSchemaControllerResult(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    constraint_name: []const u8,
+    result: UniqueConstraintIntegrityResult,
+) !void {
+    if (!shouldPromoteUniqueConstraintAfterSchemaControllerResult(result)) return;
+    const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
+    defer alloc.free(schema_json);
+    const enforced_schema_json = try tables_api.schemaWithUniqueConstraintValidationStateAlloc(
+        alloc,
+        schema_json,
+        constraint_name,
+        .enforced,
+    );
+    defer alloc.free(enforced_schema_json);
+    try applyLocalTableSchemaJson(alloc, db, enforced_schema_json);
 }
 
 fn foreignKeyIntegritySchemaControllerPassWithSchemaJson(
@@ -4626,6 +5094,48 @@ fn runCatalogForeignKeyIntegritySchemaControllerMaintenancePass(
     return try finalizeForeignKeyIntegritySchemaControllerMaintenanceResult(alloc, summary, &results, &action_schedules, &action_jobs);
 }
 
+fn runCatalogUniqueConstraintIntegritySchemaControllerMaintenancePass(
+    alloc: std.mem.Allocator,
+    source: TableWriteSource,
+    catalog: table_catalog.CatalogSource,
+    options: UniqueConstraintIntegritySchemaControllerOptions,
+) !UniqueConstraintIntegritySchemaControllerResult {
+    try validateUniqueConstraintIntegritySchemaControllerOptions(options);
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+
+    var summary = UniqueConstraintIntegritySchemaControllerResult{};
+    var results = std.ArrayListUnmanaged(UniqueConstraintIntegritySchemaControllerTableResult).empty;
+    errdefer {
+        for (results.items) |*result| result.deinit(alloc);
+        results.deinit(alloc);
+    }
+
+    for (snapshot.tables) |table| {
+        if (table.schema_json.len == 0) continue;
+        summary.tables_scanned += 1;
+        if (!(try tableSchemaHasUniqueConstraintsAlloc(alloc, table.schema_json))) continue;
+        const first_result_index = results.items.len;
+        try runUniqueConstraintIntegritySchemaControllerMaintenanceForTable(
+            alloc,
+            source,
+            table.name,
+            table.schema_json,
+            options,
+            &summary,
+            &results,
+        );
+        for (results.items[first_result_index..]) |entry| {
+            if (!entry.schema_adoption) continue;
+            if (!shouldPromoteUniqueConstraintAfterSchemaControllerResult(entry.result)) continue;
+            _ = try table_catalog.promoteUniqueConstraintEnforced(alloc, catalog, entry.table_name, entry.constraint_name);
+        }
+        if (summary.tables_executed >= options.max_tables) break;
+    }
+
+    return try finalizeUniqueConstraintIntegritySchemaControllerMaintenanceResult(alloc, summary, &results);
+}
+
 fn cloneForeignKeyIntegrityWorkStatus(
     alloc: std.mem.Allocator,
     status: ForeignKeyIntegrityWorkStatus,
@@ -5214,13 +5724,14 @@ fn inspectUniqueConstraintOwnerTopology(
     }
 
     var all_declared_complete = true;
-    const declared_owner_count = parsed_schema.unique_constraints.len + @as(usize, if (parsed_schema.primary_key != null) 1 else 0);
+    const declared_owner_count = countUniqueOwnerConstraints(parsed_schema) + @as(usize, if (parsed_schema.primary_key != null) 1 else 0);
     if (parsed_schema.primary_key != null) {
         if (!uniqueConstraintOwnerCoverageComplete(snapshot.unique_constraint_ranges, table.table_id, db_mod.relational_store.primary_key_constraint_name)) {
             all_declared_complete = false;
         }
     }
     for (parsed_schema.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) continue;
         if (!all_declared_complete) break;
         if (!uniqueConstraintOwnerCoverageComplete(snapshot.unique_constraint_ranges, table.table_id, constraint.name)) {
             all_declared_complete = false;
@@ -5255,9 +5766,18 @@ fn declaredUniqueOwnerName(
         return parsed_schema.primary_key != null;
     }
     for (parsed_schema.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) continue;
         if (std.mem.eql(u8, constraint.name, name)) return true;
     }
     return false;
+}
+
+fn countUniqueOwnerConstraints(parsed_schema: anytype) usize {
+    var count: usize = 0;
+    for (parsed_schema.unique_constraints) |constraint| {
+        if (constraint.validation_state == .enforced) count += 1;
+    }
+    return count;
 }
 
 fn stringSliceContains(values: []const []const u8, needle: []const u8) bool {
@@ -6262,6 +6782,7 @@ pub const BoundTableWriteSource = struct {
                 .foreign_key_action_schedule_group_local_requeue = foreignKeyActionScheduleGroupLocalRequeue,
                 .unique_constraint_integrity = uniqueConstraintIntegrity,
                 .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
+                .unique_constraint_integrity_schema_controller_maintenance_pass = uniqueConstraintIntegritySchemaControllerMaintenancePass,
                 .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
                 .foreign_key_integrity_work_unit_group_local = foreignKeyIntegrityWorkUnitGroupLocal,
                 .foreign_key_ref_children_group_local = foreignKeyRefChildrenGroupLocal,
@@ -6514,6 +7035,49 @@ pub const BoundTableWriteSource = struct {
             }
         }
         return try finalizeForeignKeyIntegritySchemaControllerMaintenanceResult(alloc, summary, &results, &action_schedules, &action_jobs);
+    }
+
+    fn uniqueConstraintIntegritySchemaControllerMaintenancePass(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        options: UniqueConstraintIntegritySchemaControllerOptions,
+    ) !?UniqueConstraintIntegritySchemaControllerResult {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        try validateUniqueConstraintIntegritySchemaControllerOptions(options);
+        var summary = UniqueConstraintIntegritySchemaControllerResult{};
+        var results = std.ArrayListUnmanaged(UniqueConstraintIntegritySchemaControllerTableResult).empty;
+        errdefer {
+            for (results.items) |*result| result.deinit(alloc);
+            results.deinit(alloc);
+        }
+        const schema_json = (try loadLocalTableSchemaJson(alloc, self.db)) orelse {
+            return try finalizeUniqueConstraintIntegritySchemaControllerMaintenanceResult(alloc, summary, &results);
+        };
+        defer alloc.free(schema_json);
+        if (schema_json.len > 0) {
+            summary.tables_scanned = 1;
+            if (try tableSchemaHasUniqueConstraintsAlloc(alloc, schema_json)) {
+                try runUniqueConstraintIntegritySchemaControllerMaintenanceForTable(
+                    alloc,
+                    self.source(),
+                    self.table_name,
+                    schema_json,
+                    options,
+                    &summary,
+                    &results,
+                );
+                for (results.items) |entry| {
+                    if (!entry.schema_adoption) continue;
+                    try promoteLocalUniqueConstraintAfterSchemaControllerResult(
+                        alloc,
+                        self.db,
+                        entry.constraint_name,
+                        entry.result,
+                    );
+                }
+            }
+        }
+        return try finalizeUniqueConstraintIntegritySchemaControllerMaintenanceResult(alloc, summary, &results);
     }
 
     fn foreignKeyActionJobPage(
@@ -9855,6 +10419,9 @@ pub const ProvisionedTableWriteSource = struct {
                 .foreign_key_action_schedule_group_local_mark_seeded = foreignKeyActionScheduleGroupLocalMarkSeeded,
                 .foreign_key_action_schedule_group_local_requeue = foreignKeyActionScheduleGroupLocalRequeue,
                 .unique_constraint_integrity = uniqueConstraintIntegrity,
+                .unique_constraint_integrity_schema_controller_maintenance_pass = uniqueConstraintIntegritySchemaControllerMaintenancePass,
+                .secondary_index_rebuild_worker_pass = secondaryIndexRebuildWorkerPass,
+                .secondary_index_rebuild_group_local = secondaryIndexRebuildGroupLocal,
                 .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
                 .foreign_key_integrity_work_unit_group_local = ProvisionedTableWriteSource.foreignKeyIntegrityWorkUnitGroupLocal,
                 .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
@@ -9934,6 +10501,15 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?ForeignKeyIntegritySchemaControllerResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try runCatalogForeignKeyIntegritySchemaControllerMaintenancePass(alloc, self.source(), self.catalog, options);
+    }
+
+    fn uniqueConstraintIntegritySchemaControllerMaintenancePass(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        options: UniqueConstraintIntegritySchemaControllerOptions,
+    ) !?UniqueConstraintIntegritySchemaControllerResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runCatalogUniqueConstraintIntegritySchemaControllerMaintenancePass(alloc, self.source(), self.catalog, options);
     }
 
     fn createTable(
@@ -11190,6 +11766,31 @@ pub const ProvisionedTableWriteSource = struct {
             upper_doc_key,
             violation_limit,
         );
+    }
+
+    fn secondaryIndexRebuildWorkerPass(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?SecondaryIndexRebuildWorkerPassResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runSecondaryIndexRebuildWorkerPassForCatalog(alloc, self.source(), self.catalog, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    fn secondaryIndexRebuildGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?SecondaryIndexRebuildWorkerResult {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runProvisionedSecondaryIndexRebuildGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
     }
 
     fn uniqueConstraintIntegrity(
@@ -12754,6 +13355,50 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
+    fn runProvisionedSecondaryIndexRebuildGroupLocal(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?SecondaryIndexRebuildWorkerResult {
+        if (record.group_id != group_id) return error.InvalidSecondaryIndexRebuildRequest;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const now_ms = platform_time.monotonicNs() / std.time.ns_per_ms;
+
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+            defer cached.deinit(alloc);
+            const result = try runSecondaryIndexRebuildRangeGroupLocal(cached.db, self.catalog, record, worker_id, now_ms, lease_ms);
+            if (result.claimed) {
+                try drainManagedDbBeforeClose(cached.db);
+                lockAtomic(&self.local_db_mutex);
+                self.markWriteCacheDirty(table_name);
+                self.invalidateReadCache(table_name);
+                self.local_db_mutex.unlock();
+                self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+                self.notifyLocalChange(table_name, .data);
+            }
+            return result;
+        }
+
+        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        defer db.close();
+        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+        const result = try runSecondaryIndexRebuildRangeGroupLocal(&db, self.catalog, record, worker_id, now_ms, lease_ms);
+        if (result.claimed) {
+            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            self.notifyLocalChange(table_name, .data);
+        }
+        return result;
+    }
+
     fn collectRuntimeStatusLeasesFromWriteCacheLocked(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -13270,6 +13915,9 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .foreign_key_action_schedule_group_local_mark_seeded = foreignKeyActionScheduleGroupLocalMarkSeeded,
                 .foreign_key_action_schedule_group_local_requeue = foreignKeyActionScheduleGroupLocalRequeue,
                 .unique_constraint_integrity = uniqueConstraintIntegrity,
+                .unique_constraint_integrity_schema_controller_maintenance_pass = uniqueConstraintIntegritySchemaControllerMaintenancePass,
+                .secondary_index_rebuild_worker_pass = secondaryIndexRebuildWorkerPass,
+                .secondary_index_rebuild_group_local = secondaryIndexRebuildGroupLocal,
                 .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
                 .foreign_key_integrity_work_unit_group_local = foreignKeyIntegrityWorkUnitGroupLocal,
                 .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
@@ -13277,6 +13925,63 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .foreign_key_ref_children_page_group_local = foreignKeyRefChildrenPageGroupLocal,
             },
         };
+    }
+
+    fn secondaryIndexRebuildWorkerPass(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !?SecondaryIndexRebuildWorkerPassResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runSecondaryIndexRebuildWorkerPassForCatalog(alloc, self.source(), self.catalog, table_name, worker_id, lease_ms, max_work_units);
+    }
+
+    fn secondaryIndexRebuildGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?SecondaryIndexRebuildWorkerResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (record.group_id != group_id) return error.InvalidSecondaryIndexRebuildRequest;
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            switch (route.*) {
+                .local => return try runHostedSecondaryIndexRebuildGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms),
+                .remote => |remote| {
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    const body = try std.json.Stringify.valueAlloc(alloc, SecondaryIndexRebuildGroupRequest{
+                        .record = record,
+                        .worker_id = worker_id,
+                        .lease_ms = lease_ms,
+                    }, .{});
+                    defer alloc.free(body);
+                    var response = try client.fetchGroupSecondaryIndexRebuild(remote.base_uri, group_id, table_name, body);
+                    defer response.deinit(alloc);
+                    var parsed = try std.json.parseFromSlice(SecondaryIndexRebuildWorkerResult, alloc, response.body, .{
+                        .ignore_unknown_fields = true,
+                    });
+                    defer parsed.deinit();
+                    return parsed.value;
+                },
+            }
+        }
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return try runHostedSecondaryIndexRebuildGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
     }
 
     fn foreignKeyIntegrityWorkerPass(
@@ -13348,6 +14053,15 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?ForeignKeyIntegritySchemaControllerResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try runCatalogForeignKeyIntegritySchemaControllerMaintenancePass(alloc, self.source(), self.catalog, options);
+    }
+
+    fn uniqueConstraintIntegritySchemaControllerMaintenancePass(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        options: UniqueConstraintIntegritySchemaControllerOptions,
+    ) !?UniqueConstraintIntegritySchemaControllerResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return try runCatalogUniqueConstraintIntegritySchemaControllerMaintenancePass(alloc, self.source(), self.catalog, options);
     }
 
     fn createIndex(
@@ -15551,6 +16265,27 @@ pub const HostedProvisionedTableWriteSource = struct {
         var result = try runUniqueConstraintIntegrityOnDb(alloc, cached.db, group_id, action, lower_doc_key, upper_doc_key);
         errdefer result.deinit(alloc);
         if (action == .validate or action == .dry_run or action == .repair) try drainManagedDbBeforeClose(cached.db);
+        return result;
+    }
+
+    fn runHostedSecondaryIndexRebuildGroupLocal(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+        worker_id: []const u8,
+        lease_ms: u64,
+    ) !?SecondaryIndexRebuildWorkerResult {
+        if (record.group_id != group_id) return error.InvalidSecondaryIndexRebuildRequest;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        const now_ms = platform_time.monotonicNs() / std.time.ns_per_ms;
+        const result = try runSecondaryIndexRebuildRangeGroupLocal(cached.db, self.catalog, record, worker_id, now_ms, lease_ms);
+        if (result.claimed) try drainManagedDbBeforeClose(cached.db);
         return result;
     }
 
@@ -18586,6 +19321,300 @@ test "bound table write source applies batch writes" {
     var result = (try db.lookup(alloc, "doc:a", .{})).?;
     defer result.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+}
+
+test "secondary index rebuild worker helper claims repairs and finishes range" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-secondary-index-rebuild-worker";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+
+    const building_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9,"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, building_schema_json, .{});
+    try db.batch(.{ .writes = &.{
+        .{ .key = "row:active", .value = "{\"id\":\"active\",\"amount\":1,\"status\":\"active\"}" },
+        .{ .key = "row:inactive", .value = "{\"id\":\"inactive\",\"amount\":2,\"status\":\"inactive\"}" },
+    } });
+
+    const inactive_amount_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:inactive");
+    defer alloc.free(inactive_amount_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, inactive_amount_key));
+    try db.core.store.put(inactive_amount_key, "");
+    const stale_inactive_amount = try db.core.store.get(alloc, inactive_amount_key);
+    defer alloc.free(stale_inactive_amount);
+
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 77, .name = "orders", .schema_json = building_schema_json });
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 77,
+        .index_name = "amount",
+        .index_generation = 9,
+        .start_row_key = "",
+        .end_row_key = null,
+        .group_id = 9001,
+    });
+    const records = try manager.listSecondaryIndexRebuildRanges(alloc);
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+
+    const first = try runSecondaryIndexRebuildRangeGroupLocal(&db, &manager, records[0], "worker-a", 1000, 500);
+    try std.testing.expect(first.claimed);
+    try std.testing.expect(first.completed);
+    try std.testing.expect(!first.invalidated);
+    try std.testing.expectEqual(@as(u64, 2), first.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), first.report.indexed_rows);
+
+    const final_records = try manager.listSecondaryIndexRebuildRanges(alloc);
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, final_records);
+    try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_ready, final_records[0].state);
+    try std.testing.expectEqual(@as(u64, 2), final_records[0].completed_row_count);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, inactive_amount_key));
+}
+
+test "provisioned secondary index rebuild worker pass repairs projected catalog range" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-secondary-index-rebuild-root", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 9001);
+    defer alloc.free(db_path);
+
+    const building_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9,"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    const range: metadata_table_manager.RangeRecord = .{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = 77,
+        .start_key = "",
+        .end_key = null,
+    };
+    const namespace: doc_identity.Namespace = .{
+        .table_id = 77,
+        .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
+        .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+    };
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{ .identity_namespace = namespace });
+        defer db.close();
+        try db.applyTableSchemaJson(alloc, building_schema_json, .{});
+        try db.batch(.{ .writes = &.{
+            .{ .key = "row:active", .value = "{\"id\":\"active\",\"amount\":1,\"status\":\"active\"}" },
+            .{ .key = "row:inactive", .value = "{\"id\":\"inactive\",\"amount\":2,\"status\":\"inactive\"}" },
+        } });
+        const inactive_amount_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:inactive");
+        defer alloc.free(inactive_amount_key);
+        try db.core.store.put(inactive_amount_key, "");
+    }
+
+    const Catalog = struct {
+        const ready_schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"ready","x-antfly-index-generation":9,"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ;
+
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 77,
+            .name = "orders",
+            .placement_role = "data",
+            .indexes_json = "{}",
+            .schema_json = building_schema_json,
+        },
+        range: metadata_table_manager.RangeRecord = range,
+        rebuild: metadata_table_manager.SecondaryIndexRebuildRangeRecord = .{
+            .table_id = 77,
+            .index_name = "amount",
+            .index_generation = 9,
+            .start_row_key = "",
+            .end_row_key = null,
+            .group_id = 9001,
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_secondary_index_rebuild_range = beginSecondaryIndexRebuildRange,
+                    .finish_secondary_index_rebuild_range = finishSecondaryIndexRebuildRange,
+                    .invalidate_secondary_index_rebuild_range = invalidateSecondaryIndexRebuildRange,
+                    .promote_secondary_index_ready = promoteSecondaryIndexReady,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @as([*]metadata_table_manager.RangeRecord, @ptrCast(&self.range))[0..1],
+                .secondary_index_rebuild_ranges = @as([*]metadata_table_manager.SecondaryIndexRebuildRangeRecord, @ptrCast(&self.rebuild))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn selectorMatches(self: *@This(), selector: metadata_table_manager.SecondaryIndexRebuildRangeSelector) bool {
+            return selector.table_id == self.rebuild.table_id and
+                selector.index_generation == self.rebuild.index_generation and
+                std.mem.eql(u8, selector.index_name, self.rebuild.index_name) and
+                std.mem.eql(u8, selector.start_row_key, self.rebuild.start_row_key);
+        }
+
+        fn beginSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.selectorMatches(request.selector)) return error.SecondaryIndexRebuildRangeNotFound;
+            if (!std.mem.eql(u8, self.rebuild.state, metadata_table_manager.secondary_index_rebuild_declared)) return error.SecondaryIndexRebuildRangeClaimBusy;
+            self.rebuild.state = metadata_table_manager.secondary_index_rebuild_building;
+            self.rebuild.lease_owner = request.lease_owner;
+            self.rebuild.lease_expires_at_ms = request.lease_expires_at_ms;
+        }
+
+        fn finishSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.selectorMatches(request.selector)) return error.SecondaryIndexRebuildRangeNotFound;
+            self.rebuild.state = metadata_table_manager.secondary_index_rebuild_ready;
+            self.rebuild.completed_row_count = request.completed_row_count;
+            self.rebuild.progress_row_key = request.progress_row_key;
+        }
+
+        fn invalidateSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.selectorMatches(request.selector)) return error.SecondaryIndexRebuildRangeNotFound;
+            self.rebuild.state = metadata_table_manager.secondary_index_rebuild_invalid;
+            self.rebuild.last_error = request.last_error;
+        }
+
+        fn promoteSecondaryIndexReady(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            expected_generation: u64,
+        ) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table_name, self.table.name)) return false;
+            const updated = tables_api.schemaWithSecondaryIndexReadyAlloc(
+                allocator,
+                self.table.schema_json,
+                index_name,
+                expected_generation,
+            ) catch |err| switch (err) {
+                error.SecondaryIndexNotBuilding,
+                error.SecondaryIndexGenerationMismatch,
+                error.SecondaryIndexNotFound,
+                => return false,
+                else => return err,
+            };
+            defer allocator.free(updated);
+            self.table.schema_json = ready_schema_json;
+            return true;
+        }
+    };
+
+    var catalog = Catalog{};
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+    defer source.deinit();
+
+    var pass = (try source.source().secondaryIndexRebuildWorkerPass(alloc, "orders", "worker-a", 500, 1)).?;
+    defer pass.deinit(alloc);
+    try std.testing.expect(pass.complete);
+    try std.testing.expectEqual(@as(u64, 1), pass.ranges_claimed);
+    try std.testing.expectEqual(@as(u64, 1), pass.ranges_completed);
+    try std.testing.expectEqual(@as(u64, 1), pass.indexes_promoted);
+    try std.testing.expectEqual(@as(u64, 2), pass.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), pass.report.indexed_rows);
+    try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_ready, catalog.rebuild.state);
+    try std.testing.expectEqual(@as(u64, 2), catalog.rebuild.completed_row_count);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.table.schema_json, "\"x-antfly-index-lifecycle\":\"ready\"") != null);
+
+    var reopened = try db_mod.DB.open(alloc, db_path, .{ .identity_namespace = namespace, .prefer_existing_identity_namespace = true });
+    defer reopened.close();
+    const inactive_amount_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:inactive");
+    defer alloc.free(inactive_amount_key);
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, inactive_amount_key));
+}
+
+test "secondary index promotion ignores stale ready rebuild generation" {
+    const alloc = std.testing.allocator;
+    const stale_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":10},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    const Catalog = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 77,
+            .name = "orders",
+            .placement_role = "data",
+            .indexes_json = "{}",
+            .schema_json = stale_schema_json,
+        },
+        range: metadata_table_manager.RangeRecord = .{
+            .group_id = 9001,
+            .range_id = 9101,
+            .table_id = 77,
+            .start_key = "",
+            .end_key = null,
+        },
+        rebuild: metadata_table_manager.SecondaryIndexRebuildRangeRecord = .{
+            .table_id = 77,
+            .index_name = "amount",
+            .index_generation = 9,
+            .start_row_key = "",
+            .end_row_key = null,
+            .group_id = 9001,
+            .state = metadata_table_manager.secondary_index_rebuild_ready,
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @as([*]metadata_table_manager.RangeRecord, @ptrCast(&self.range))[0..1],
+                .secondary_index_rebuild_ranges = @as([*]metadata_table_manager.SecondaryIndexRebuildRangeRecord, @ptrCast(&self.rebuild))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog = Catalog{};
+    try std.testing.expectEqual(@as(u64, 0), try promoteReadySecondaryIndexesForCatalog(alloc, catalog.iface(), "orders"));
 }
 
 test "bound table write source resolves internal group transactions into visible documents" {
@@ -26981,6 +28010,127 @@ test "foreign key action page transaction id is stable for durable page retry" {
     requeued.requeue_count = 1;
     const requeued_id = stableForeignKeyActionPageTxnId(requeued);
     try std.testing.expect(!std.mem.eql(u8, first[0..], requeued_id[0..]));
+}
+
+test "unique schema controller maintenance repairs and promotes unvalidated local constraint" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-unique-schema-controller-maintenance";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(
+        alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"],"validation_state":"unvalidated"}]}
+    ,
+        .{},
+    );
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:ada", .value = "{\"id\":\"user:ada\",\"email\":\"ada@example.test\"}" },
+            .{ .key = "user:grace", .value = "{\"id\":\"user:grace\",\"email\":\"grace@example.test\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const before = try db.validateUniqueConstraintRowsInRange("", "");
+    try std.testing.expectEqual(@as(u64, 2), before.missing_unique_rows);
+
+    var bound = BoundTableWriteSource.init("users", &db);
+    var summary = (try bound.source().uniqueConstraintIntegritySchemaControllerMaintenancePass(alloc, .{
+        .action = .repair,
+        .worker_id = "worker:unique-maintenance",
+        .max_tables = 4,
+    })).?;
+    defer summary.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_scanned);
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_with_pending_constraints);
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_executed);
+    try std.testing.expect(summary.complete);
+    try std.testing.expect(summary.valid);
+    try std.testing.expectEqual(@as(usize, 1), summary.terminal_valid_results);
+    try std.testing.expectEqual(@as(usize, 0), summary.terminal_invalid_results);
+    try std.testing.expectEqual(@as(usize, 1), summary.results.len);
+    try std.testing.expectEqualStrings("users", summary.results[0].table_name);
+    try std.testing.expectEqualStrings("users_email_key", summary.results[0].constraint_name);
+    try std.testing.expectEqual(@as(u64, 2), summary.results[0].result.report.repaired_unique_rows);
+
+    const after = try db.validateUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(after.valid());
+
+    const promoted_schema_json = (try loadLocalTableSchemaJson(alloc, &db)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(promoted_schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, promoted_schema_json, "\"validation_state\":\"enforced\"") != null);
+
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:duplicate", .value = "{\"id\":\"user:duplicate\",\"email\":\"ada@example.test\"}" }},
+        .sync_level = .write,
+    }));
+
+    var second_summary = (try bound.source().uniqueConstraintIntegritySchemaControllerMaintenancePass(alloc, .{
+        .action = .repair,
+        .worker_id = "worker:unique-maintenance",
+        .max_tables = 4,
+    })).?;
+    defer second_summary.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), second_summary.tables_scanned);
+    try std.testing.expectEqual(@as(usize, 0), second_summary.tables_with_pending_constraints);
+    try std.testing.expectEqual(@as(usize, 0), second_summary.tables_executed);
+    try std.testing.expect(second_summary.complete);
+    try std.testing.expect(second_summary.valid);
+    try std.testing.expectEqual(@as(usize, 0), second_summary.results.len);
+}
+
+test "unique schema controller maintenance keeps invalid unvalidated local constraint pending" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-unique-schema-controller-maintenance-invalid";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(
+        alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"],"validation_state":"unvalidated"}]}
+    ,
+        .{},
+    );
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:ada", .value = "{\"id\":\"user:ada\",\"email\":\"same@example.test\"}" },
+            .{ .key = "user:grace", .value = "{\"id\":\"user:grace\",\"email\":\"same@example.test\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    var bound = BoundTableWriteSource.init("users", &db);
+    var summary = (try bound.source().uniqueConstraintIntegritySchemaControllerMaintenancePass(alloc, .{
+        .action = .repair,
+        .worker_id = "worker:unique-maintenance",
+        .max_tables = 4,
+    })).?;
+    defer summary.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_scanned);
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_with_pending_constraints);
+    try std.testing.expectEqual(@as(usize, 1), summary.tables_executed);
+    try std.testing.expect(summary.complete);
+    try std.testing.expect(!summary.valid);
+    try std.testing.expectEqual(@as(usize, 0), summary.terminal_valid_results);
+    try std.testing.expectEqual(@as(usize, 1), summary.terminal_invalid_results);
+    try std.testing.expectEqual(@as(usize, 1), summary.results.len);
+    try std.testing.expectEqualStrings("users_email_key", summary.results[0].constraint_name);
+    try std.testing.expectEqual(@as(u64, 1), summary.results[0].result.report.duplicate_unique_rows);
+
+    const schema_json = (try loadLocalTableSchemaJson(alloc, &db)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, schema_json, "\"validation_state\":\"unvalidated\"") != null);
 }
 
 test "foreign key schema controller maintenance repairs unvalidated local constraint" {

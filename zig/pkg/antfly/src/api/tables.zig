@@ -49,11 +49,22 @@ pub fn effectiveSchemaJson(schema_json: ?[]const u8) []const u8 {
 pub const ParsedTableSchema = schema_mod.ParsedTableSchema;
 pub const AppliedRelationalSqlDdlRecord = struct {
     table: metadata_table_manager.TableRecord,
+    created_table: bool = false,
     requires_rebuild: bool = false,
     validation_required: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         metadata_table_manager.freeTable(alloc, self.table);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalSqlDdlTarget = struct {
+    table_name: []u8,
+    creates_table: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
         self.* = undefined;
     }
 };
@@ -707,7 +718,7 @@ fn isAlgebraicInternalConfigField(field: []const u8) bool {
 pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metadata_table_manager.TableRecord {
     const min_ranges = req.num_shards orelse 1;
     return .{
-        .table_id = deriveId(table_name, 0x54424c45),
+        .table_id = deriveTableId(table_name),
         .name = table_name,
         .description = req.description orelse "",
         .schema_json = effectiveSchemaJson(req.schema_json),
@@ -717,6 +728,10 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
         .desired_replica_count = 3,
         .min_ranges = min_ranges,
     };
+}
+
+pub fn deriveTableId(table_name: []const u8) u64 {
+    return deriveId(table_name, 0x54424c45);
 }
 
 pub fn deriveInitialRange(table: metadata_table_manager.TableRecord) metadata_table_manager.RangeRecord {
@@ -941,6 +956,22 @@ pub fn applyRelationalSqlDdlToTableRecordAlloc(
     };
 }
 
+pub fn relationalSqlDdlTargetAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !RelationalSqlDdlTarget {
+    var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
+    defer plan.deinit(alloc);
+
+    return .{
+        .table_name = try alloc.dupe(u8, relationalSqlDdlPlanTableName(plan)),
+        .creates_table = switch (plan) {
+            .create_table => true,
+            .create_index, .alter_table, .create_update_policy => false,
+        },
+    };
+}
+
 fn relationalSqlDdlPlanTableName(plan: relational_sql.LoweredDdlPlan) []const u8 {
     return switch (plan) {
         .create_table => |create_table| create_table.table_name,
@@ -1115,6 +1146,14 @@ fn foreignKeyValidationStateString(state: runtime_schema_mod.ForeignKeyValidatio
     };
 }
 
+fn uniqueConstraintValidationStateString(state: runtime_schema_mod.UniqueConstraintValidationState) ![]const u8 {
+    return switch (state) {
+        .enforced => "enforced",
+        .unvalidated => "unvalidated",
+        .validating, .invalid => error.InvalidSchemaUpdateRequest,
+    };
+}
+
 pub fn schemaWithForeignKeyValidationStateAlloc(
     alloc: std.mem.Allocator,
     schema_json: []const u8,
@@ -1145,11 +1184,100 @@ pub fn schemaWithForeignKeyValidationStateAlloc(
         if (name != .string) return error.InvalidSchemaUpdateRequest;
         if (!std.mem.eql(u8, name.string, constraint_name)) continue;
 
-        try object.put(alloc, "validation_state", .{ .string = state_text });
+        const validation_state = object.getPtr("validation_state") orelse return error.InvalidSchemaUpdateRequest;
+        validation_state.* = .{ .string = state_text };
         found = true;
         break;
     }
     if (!found) return error.ForeignKeyNotFound;
+
+    const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    errdefer alloc.free(updated);
+    var validated = try schema_mod.parseValidatedTableSchema(alloc, updated);
+    validated.deinit(alloc);
+    return updated;
+}
+
+pub fn schemaWithUniqueConstraintValidationStateAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+    constraint_name: []const u8,
+    state: runtime_schema_mod.UniqueConstraintValidationState,
+) ![]u8 {
+    const state_text = try uniqueConstraintValidationStateString(state);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const unique_constraints = root.getPtr("unique_constraints") orelse return error.UniqueConstraintNotFound;
+    const constraint_items = switch (unique_constraints.*) {
+        .array => |*array| array.items,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+
+    var found = false;
+    for (constraint_items) |*constraint| {
+        const object = switch (constraint.*) {
+            .object => |*object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        const name = object.get("name") orelse return error.InvalidSchemaUpdateRequest;
+        if (name != .string) return error.InvalidSchemaUpdateRequest;
+        if (!std.mem.eql(u8, name.string, constraint_name)) continue;
+
+        const validation_state = object.getPtr("validation_state") orelse return error.InvalidSchemaUpdateRequest;
+        validation_state.* = .{ .string = state_text };
+        found = true;
+        break;
+    }
+    if (!found) return error.UniqueConstraintNotFound;
+
+    const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    errdefer alloc.free(updated);
+    var validated = try schema_mod.parseValidatedTableSchema(alloc, updated);
+    validated.deinit(alloc);
+    return updated;
+}
+
+pub fn schemaWithSecondaryIndexReadyAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+    index_name: []const u8,
+    expected_generation: u64,
+) ![]u8 {
+    if (expected_generation == 0) return error.InvalidSchemaUpdateRequest;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const default_type_value = root.get("default_type") orelse return error.InvalidSchemaUpdateRequest;
+    if (default_type_value != .string) return error.InvalidSchemaUpdateRequest;
+    const document_schemas = root.getPtr("document_schemas") orelse return error.InvalidSchemaUpdateRequest;
+    if (document_schemas.* != .object) return error.InvalidSchemaUpdateRequest;
+    const document_schema = document_schemas.object.getPtr(default_type_value.string) orelse return error.InvalidSchemaUpdateRequest;
+    if (document_schema.* != .object) return error.InvalidSchemaUpdateRequest;
+    const schema = document_schema.object.getPtr("schema") orelse return error.InvalidSchemaUpdateRequest;
+    if (schema.* != .object) return error.InvalidSchemaUpdateRequest;
+    const properties = schema.object.getPtr("properties") orelse return error.InvalidSchemaUpdateRequest;
+    if (properties.* != .object) return error.InvalidSchemaUpdateRequest;
+    const property = properties.object.getPtr(index_name) orelse return error.SecondaryIndexNotFound;
+    if (property.* != .object) return error.InvalidSchemaUpdateRequest;
+
+    const generation_value = property.object.get("x-antfly-index-generation") orelse return error.SecondaryIndexGenerationMismatch;
+    if (generation_value != .integer or generation_value.integer <= 0) return error.InvalidSchemaUpdateRequest;
+    const generation: u64 = @intCast(generation_value.integer);
+    if (generation != expected_generation) return error.SecondaryIndexGenerationMismatch;
+
+    const lifecycle_value = property.object.getPtr("x-antfly-index-lifecycle") orelse return error.SecondaryIndexNotBuilding;
+    if (lifecycle_value.* != .string) return error.InvalidSchemaUpdateRequest;
+    if (!std.mem.eql(u8, lifecycle_value.string, "building")) return error.SecondaryIndexNotBuilding;
+    lifecycle_value.* = .{ .string = "ready" };
 
     const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     errdefer alloc.free(updated);
@@ -2906,6 +3034,18 @@ test "metadata.schema update sql ddl creates relational table record schema and 
     try std.testing.expect(std.mem.indexOf(u8, applied.table.indexes_json, "\"derive_from_schema\"") == null);
 }
 
+test "metadata.schema update sql ddl exposes catalog target and create intent" {
+    var create_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "CREATE TABLE users (id uuid PRIMARY KEY);");
+    defer create_target.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("users", create_target.table_name);
+    try std.testing.expect(create_target.creates_table);
+
+    var alter_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "ALTER TABLE users ADD COLUMN status text;");
+    defer alter_target.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("users", alter_target.table_name);
+    try std.testing.expect(!alter_target.creates_table);
+}
+
 test "metadata.schema update sql ddl applies relational catalog changes through table record path" {
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 13,
@@ -3074,6 +3214,41 @@ test "metadata.schema update rewrites foreign key validation state and preserves
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
         schemaWithForeignKeyValidationStateAlloc(alloc, schema_json, "orders_customer_id_fkey", .validating),
+    );
+}
+
+test "metadata.schema update promotes secondary index only for matching building generation" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    const updated = try schemaWithSecondaryIndexReadyAlloc(alloc, schema_json, "amount", 9);
+    defer alloc.free(updated);
+    var parsed = try parseValidatedTableSchema(alloc, updated);
+    defer parsed.deinit(alloc);
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema_mod.freeSchema(alloc, runtime);
+    var found_amount = false;
+    for (runtime.relational_columns) |column| {
+        if (!std.mem.eql(u8, column.name, "amount")) continue;
+        found_amount = true;
+        try std.testing.expectEqual(runtime_schema_mod.RelationalIndexLifecycle.ready, column.index_lifecycle);
+        try std.testing.expectEqual(@as(u64, 9), column.index_generation);
+    }
+    try std.testing.expect(found_amount);
+
+    try std.testing.expectError(
+        error.SecondaryIndexGenerationMismatch,
+        schemaWithSecondaryIndexReadyAlloc(alloc, schema_json, "amount", 10),
+    );
+    try std.testing.expectError(
+        error.SecondaryIndexNotFound,
+        schemaWithSecondaryIndexReadyAlloc(alloc, schema_json, "missing", 9),
+    );
+    try std.testing.expectError(
+        error.SecondaryIndexNotBuilding,
+        schemaWithSecondaryIndexReadyAlloc(alloc, updated, "amount", 9),
     );
 }
 

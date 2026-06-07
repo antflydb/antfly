@@ -32,6 +32,29 @@ pub const CatalogSource = struct {
     pub const VTable = struct {
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        begin_secondary_index_rebuild_range: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest,
+        ) anyerror!void = null,
+        finish_secondary_index_rebuild_range: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest,
+        ) anyerror!void = null,
+        invalidate_secondary_index_rebuild_range: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest,
+        ) anyerror!void = null,
+        promote_secondary_index_ready: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            expected_generation: u64,
+        ) anyerror!bool = null,
+        compare_and_swap_table_schema: ?*const fn (
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
+        ) anyerror!void = null,
     };
 
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
@@ -42,12 +65,60 @@ pub const CatalogSource = struct {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
     }
 
+    pub fn beginSecondaryIndexRebuildRange(
+        self: CatalogSource,
+        request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest,
+    ) !void {
+        const fn_ptr = self.vtable.begin_secondary_index_rebuild_range orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn finishSecondaryIndexRebuildRange(
+        self: CatalogSource,
+        request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest,
+    ) !void {
+        const fn_ptr = self.vtable.finish_secondary_index_rebuild_range orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn invalidateSecondaryIndexRebuildRange(
+        self: CatalogSource,
+        request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest,
+    ) !void {
+        const fn_ptr = self.vtable.invalidate_secondary_index_rebuild_range orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
+    pub fn promoteSecondaryIndexReady(
+        self: CatalogSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        expected_generation: u64,
+    ) !bool {
+        const fn_ptr = self.vtable.promote_secondary_index_ready orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, index_name, expected_generation);
+    }
+
+    pub fn compareAndSwapTableSchema(
+        self: CatalogSource,
+        request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
+    ) !void {
+        const fn_ptr = self.vtable.compare_and_swap_table_schema orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, request);
+    }
+
     pub fn fromMetadataService(svc: *metadata_service.MetadataService) CatalogSource {
         return .{
             .ptr = svc,
             .vtable = &.{
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
+                .begin_secondary_index_rebuild_range = metadataServiceBeginSecondaryIndexRebuildRange,
+                .finish_secondary_index_rebuild_range = metadataServiceFinishSecondaryIndexRebuildRange,
+                .invalidate_secondary_index_rebuild_range = metadataServiceInvalidateSecondaryIndexRebuildRange,
+                .promote_secondary_index_ready = metadataServicePromoteSecondaryIndexReady,
+                .compare_and_swap_table_schema = metadataServiceCompareAndSwapTableSchema,
             },
         };
     }
@@ -58,6 +129,11 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
+                .begin_secondary_index_rebuild_range = metadataHttpServiceBeginSecondaryIndexRebuildRange,
+                .finish_secondary_index_rebuild_range = metadataHttpServiceFinishSecondaryIndexRebuildRange,
+                .invalidate_secondary_index_rebuild_range = metadataHttpServiceInvalidateSecondaryIndexRebuildRange,
+                .promote_secondary_index_ready = metadataHttpServicePromoteSecondaryIndexReady,
+                .compare_and_swap_table_schema = metadataHttpServiceCompareAndSwapTableSchema,
             },
         };
     }
@@ -512,6 +588,115 @@ fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Adm
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataServiceBeginSecondaryIndexRebuildRange(
+    ptr: *anyopaque,
+    request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.beginSecondaryIndexRebuildRange(request);
+}
+
+fn metadataServiceFinishSecondaryIndexRebuildRange(
+    ptr: *anyopaque,
+    request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.finishSecondaryIndexRebuildRange(request);
+}
+
+fn metadataServiceInvalidateSecondaryIndexRebuildRange(
+    ptr: *anyopaque,
+    request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.invalidateSecondaryIndexRebuildRange(request);
+}
+
+fn metadataServiceCompareAndSwapTableSchema(
+    ptr: *anyopaque,
+    request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
+) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.compareAndSwapTableSchema(request);
+}
+
+fn promoteSecondaryIndexReadyOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    index_name: []const u8,
+    expected_generation: u64,
+) !bool {
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const schema_json = tables_api.schemaWithSecondaryIndexReadyAlloc(
+        alloc,
+        table.schema_json,
+        index_name,
+        expected_generation,
+    ) catch |err| switch (err) {
+        error.SecondaryIndexNotBuilding,
+        error.SecondaryIndexGenerationMismatch,
+        error.SecondaryIndexNotFound,
+        => return false,
+        else => return err,
+    };
+    defer alloc.free(schema_json);
+    const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
+    defer metadata_table_manager.freeTable(alloc, updated);
+    try service.promoteSecondaryIndexReady(.{
+        .table_id = table.table_id,
+        .index_name = index_name,
+        .expected_index_generation = expected_generation,
+        .expected_schema_json = table.schema_json,
+        .promoted_table = updated,
+    });
+    return true;
+}
+
+pub fn promoteUniqueConstraintEnforced(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    constraint_name: []const u8,
+) !bool {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const schema_json = tables_api.schemaWithUniqueConstraintValidationStateAlloc(
+        alloc,
+        table.schema_json,
+        constraint_name,
+        .enforced,
+    ) catch |err| switch (err) {
+        error.UniqueConstraintNotFound,
+        error.InvalidSchemaUpdateRequest,
+        => return false,
+        else => return err,
+    };
+    defer alloc.free(schema_json);
+    const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
+    defer metadata_table_manager.freeTable(alloc, updated);
+    try catalog.compareAndSwapTableSchema(.{
+        .table_id = table.table_id,
+        .expected_schema_json = table.schema_json,
+        .promoted_table = updated,
+    });
+    return true;
+}
+
+fn metadataServicePromoteSecondaryIndexReady(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    index_name: []const u8,
+    expected_generation: u64,
+) !bool {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try promoteSecondaryIndexReadyOnService(svc, alloc, table_name, index_name, expected_generation);
+}
+
 fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return try svc.adminSnapshot();
@@ -520,6 +705,49 @@ fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot
 fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     svc.freeAdminSnapshot(snapshot);
+}
+
+fn metadataHttpServiceBeginSecondaryIndexRebuildRange(
+    ptr: *anyopaque,
+    request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.beginSecondaryIndexRebuildRange(request);
+}
+
+fn metadataHttpServiceFinishSecondaryIndexRebuildRange(
+    ptr: *anyopaque,
+    request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.finishSecondaryIndexRebuildRange(request);
+}
+
+fn metadataHttpServiceInvalidateSecondaryIndexRebuildRange(
+    ptr: *anyopaque,
+    request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.invalidateSecondaryIndexRebuildRange(request);
+}
+
+fn metadataHttpServiceCompareAndSwapTableSchema(
+    ptr: *anyopaque,
+    request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
+) !void {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.compareAndSwapTableSchema(request);
+}
+
+fn metadataHttpServicePromoteSecondaryIndexReady(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    index_name: []const u8,
+    expected_generation: u64,
+) !bool {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try promoteSecondaryIndexReadyOnService(svc, alloc, table_name, index_name, expected_generation);
 }
 
 fn metadataServerAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -770,6 +998,67 @@ test "catalog source resolves a single-range table group" {
 
     const group_id = (try resolveSingleRangeGroup(std.testing.allocator, FakeCatalog.iface(), "docs")).?;
     try std.testing.expectEqual(@as(u64, 7001), group_id);
+}
+
+test "catalog source promotes unique constraint with table schema compare and swap" {
+    const unvalidated_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"uniq_email","columns":["email"],"validation_state":"unvalidated"}]}
+    ;
+    const enforced_schema =
+        \\{"version":1,"enforce_types":true,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"uniq_email","columns":["email"],"validation_state":"enforced"}]}
+    ;
+    const FakeCatalog = struct {
+        calls: usize = 0,
+        tables: [1]metadata_table_manager.TableRecord = .{.{
+            .table_id = 7,
+            .name = "users",
+            .schema_json = unvalidated_schema,
+            .placement_role = "data",
+        }},
+
+        fn iface(self: *@This()) CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .compare_and_swap_table_schema = compareAndSwapTableSchema,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn compareAndSwapTableSchema(
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u64, 7), request.table_id);
+            try std.testing.expectEqual(@as(u64, 7), request.promoted_table.table_id);
+            try std.testing.expectEqualStrings("users", request.promoted_table.name);
+            try std.testing.expectEqualStrings(unvalidated_schema, request.expected_schema_json);
+            try std.testing.expectEqualStrings(enforced_schema, request.promoted_table.schema_json);
+        }
+    };
+
+    var fake = FakeCatalog{};
+    try std.testing.expect(try promoteUniqueConstraintEnforced(std.testing.allocator, fake.iface(), "users", "uniq_email"));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
 test "catalog source resolves groups by key and span" {

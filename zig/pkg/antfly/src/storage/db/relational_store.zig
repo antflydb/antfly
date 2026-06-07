@@ -113,6 +113,13 @@ pub const UniqueConstraintIntegrityReport = struct {
     }
 };
 
+pub const SecondaryIndexRebuildReport = struct {
+    scanned_rows: u64 = 0,
+    indexed_rows: u64 = 0,
+    deleted_entries: u64 = 0,
+    written_entries: u64 = 0,
+};
+
 pub const ForeignKeyDeletePlanBlockReason = enum {
     none,
     restrict,
@@ -222,6 +229,27 @@ pub const ColumnIndexPolicy = struct {
             return try rowMatchesUniqueConstraintPredicates(alloc, row_value, column.index_where);
         }
         return false;
+    }
+
+    pub fn readyForQuery(self: ColumnIndexPolicy, path: []const u8) bool {
+        if (!self.restrict_to_catalog) return true;
+        for (self.columns) |column| {
+            if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
+            return column.indexed and column.index_lifecycle == .ready;
+        }
+        return false;
+    }
+
+    pub fn columnForRebuild(self: ColumnIndexPolicy, index_name: []const u8, index_generation: u64) !schema_mod.RelationalColumn {
+        if (!self.restrict_to_catalog) return error.RelationalIndexCatalogRequired;
+        for (self.columns) |column| {
+            if (!std.mem.eql(u8, column.path, index_name) and !std.mem.eql(u8, column.name, index_name)) continue;
+            if (!column.indexed) return error.RelationalIndexNotFound;
+            if (column.index_lifecycle != .building) return error.RelationalIndexNotBuilding;
+            if (column.index_generation != index_generation) return error.RelationalIndexGenerationMismatch;
+            return column;
+        }
+        return error.RelationalIndexNotFound;
     }
 };
 
@@ -419,6 +447,7 @@ pub const WriteParticipant = struct {
 
     pub fn scanColumn(self: *WriteParticipant, column_path: []const u8, lower_doc_key: []const u8, upper_doc_key: []const u8, read_version: ?u64) ![]OwnedColumnValue {
         _ = read_version;
+        if (!self.column_index_policy.readyForQuery(column_path)) return error.RelationalIndexNotReady;
         return try scanColumnAlloc(self.alloc, self.store, column_path, lower_doc_key, upper_doc_key);
     }
 
@@ -448,6 +477,7 @@ pub const WriteParticipant = struct {
         defer if (old_row) |row| self.alloc.free(row);
 
         for (self.unique_constraints) |constraint| {
+            if (!uniqueConstraintIsEnforced(constraint)) continue;
             const old_value = if (old_row) |row| try uniqueConstraintTupleValueAlloc(self.alloc, row, constraint) else null;
             defer if (old_value) |value| self.alloc.free(value);
             const new_value = if (final_state_deleted) null else try uniqueConstraintTupleValueAlloc(self.alloc, new_row, constraint);
@@ -522,6 +552,7 @@ pub const WriteParticipant = struct {
         const old_row = try getRawAlloc(self.alloc, self.store, doc_key) orelse return;
         defer self.alloc.free(old_row);
         for (self.unique_constraints) |constraint| {
+            if (!uniqueConstraintIsEnforced(constraint)) continue;
             const value = (try uniqueConstraintTupleValueAlloc(self.alloc, old_row, constraint)) orelse continue;
             defer self.alloc.free(value);
             try self.appendUniqueConstraintDelete(constraint, value);
@@ -638,6 +669,7 @@ pub const WriteParticipant = struct {
             try self.applySetNullUniqueForeignKeyRefs(primaryKeyAsUniqueConstraint(primary_key), value);
         }
         for (self.unique_constraints) |constraint| {
+            if (!uniqueConstraintIsEnforced(constraint)) continue;
             const value = (try uniqueConstraintTupleValueAlloc(self.alloc, old_row, constraint)) orelse continue;
             defer self.alloc.free(value);
             try self.applySetNullUniqueForeignKeyRefs(constraint, value);
@@ -649,6 +681,7 @@ pub const WriteParticipant = struct {
             try self.applyCascadeUniqueForeignKeyRefs(primaryKeyAsUniqueConstraint(primary_key), value);
         }
         for (self.unique_constraints) |constraint| {
+            if (!uniqueConstraintIsEnforced(constraint)) continue;
             const value = (try uniqueConstraintTupleValueAlloc(self.alloc, old_row, constraint)) orelse continue;
             defer self.alloc.free(value);
             try self.applyCascadeUniqueForeignKeyRefs(constraint, value);
@@ -660,6 +693,7 @@ pub const WriteParticipant = struct {
             try self.requireNoRestrictingUniqueForeignKeyRefs(primaryKeyAsUniqueConstraint(primary_key), value);
         }
         for (self.unique_constraints) |constraint| {
+            if (!uniqueConstraintIsEnforced(constraint)) continue;
             const value = (try uniqueConstraintTupleValueAlloc(self.alloc, old_row, constraint)) orelse continue;
             defer self.alloc.free(value);
             try self.requireNoRestrictingUniqueForeignKeyRefs(constraint, value);
@@ -1286,8 +1320,12 @@ fn findUniqueConstraintByColumns(constraints: []const schema_mod.UniqueConstrain
     return null;
 }
 
+fn uniqueConstraintIsEnforced(constraint: schema_mod.UniqueConstraint) bool {
+    return constraint.validation_state == .enforced;
+}
+
 fn uniqueConstraintCanBackForeignKey(constraint: schema_mod.UniqueConstraint) bool {
-    return constraint.where.len == 0 and constraint.expressions.len == 0;
+    return uniqueConstraintIsEnforced(constraint) and constraint.where.len == 0 and constraint.expressions.len == 0;
 }
 
 fn foreignKeyParentExists(
@@ -2645,6 +2683,77 @@ pub fn rebuildAllColumnIndexesFromRowsInRangeWithColumnIndexPolicy(
     if (writes.items.len > 0) try store.putBatch(writes.items, &.{});
 }
 
+pub fn rebuildColumnIndexFromRowsInSpanWithColumnIndexPolicy(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    index_generation: u64,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+    column_index_policy: ColumnIndexPolicy,
+) !SecondaryIndexRebuildReport {
+    const column = try column_index_policy.columnForRebuild(index_name, index_generation);
+    const target_columns = [_]schema_mod.RelationalColumn{column};
+    const target_policy = ColumnIndexPolicy.fromColumns(target_columns[0..]);
+
+    var report = SecondaryIndexRebuildReport{};
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var delete_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (delete_keys.items) |key| alloc.free(key);
+        delete_keys.deinit(alloc);
+    }
+    try appendColumnIndexDeletesForColumnInSpan(
+        alloc,
+        store,
+        &deletes,
+        &delete_keys,
+        column.path,
+        lower_doc_key,
+        upper_doc_key,
+    );
+    report.deleted_entries = deletes.items.len;
+    if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
+
+    const rows = try scanRowsSpanAlloc(alloc, store, lower_doc_key, upper_doc_key);
+    defer freeRows(alloc, rows);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    for (rows) |row| {
+        report.scanned_rows += 1;
+        const before = writes.items.len;
+        try appendColumnIndexWritesForRowWithColumnIndexPolicy(
+            alloc,
+            &writes,
+            &owned_keys,
+            &owned_values,
+            row.doc_key,
+            row.row_value,
+            target_policy,
+        );
+        if (writes.items.len > before) {
+            report.indexed_rows += 1;
+            report.written_entries += @intCast(writes.items.len - before);
+        }
+    }
+
+    if (writes.items.len > 0) try store.putBatch(writes.items, &.{});
+    return report;
+}
+
 pub fn pruneColumnIndexesForMissingRowsInRange(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -2771,6 +2880,180 @@ fn decodedColumnIndexDocKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
         return try alloc.dupe(u8, decoded.doc_key);
     }
     return null;
+}
+
+fn appendColumnIndexDeletesForColumnInSpan(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    column_path: []const u8,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) !void {
+    const lower_doc_bound = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
+    defer alloc.free(lower_doc_bound);
+    const upper_doc_bound = if (upper_doc_key.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, upper_doc_key) else null;
+    defer if (upper_doc_bound) |buf| alloc.free(buf);
+
+    try appendColumnIndexDeletesForColumnPrefix(
+        alloc,
+        store,
+        deletes,
+        owned_keys,
+        try internal_keys.relationalColumnIndexPrefixAlloc(alloc, column_path),
+        null,
+        column_path,
+        lower_doc_bound,
+        upper_doc_bound,
+    );
+    try appendColumnIndexDeletesForColumnPrefix(
+        alloc,
+        store,
+        deletes,
+        owned_keys,
+        try internal_keys.relationalArrayElementIndexColumnPrefixAlloc(alloc, column_path),
+        null,
+        column_path,
+        lower_doc_bound,
+        upper_doc_bound,
+    );
+    try appendColumnIndexDeletesForColumnPrefix(
+        alloc,
+        store,
+        deletes,
+        owned_keys,
+        try internal_keys.relationalArrayValueIndexColumnPrefixAlloc(alloc, column_path),
+        null,
+        column_path,
+        lower_doc_bound,
+        upper_doc_bound,
+    );
+    try appendColumnIndexDeletesForColumnPrefix(
+        alloc,
+        store,
+        deletes,
+        owned_keys,
+        try internal_keys.relationalJsonValueIndexColumnPrefixAlloc(alloc, column_path),
+        null,
+        column_path,
+        lower_doc_bound,
+        upper_doc_bound,
+    );
+    try appendColumnIndexDeletesForColumnPrefix(
+        alloc,
+        store,
+        deletes,
+        owned_keys,
+        try internal_keys.relationalJsonPathIndexColumnPrefixAlloc(alloc, column_path),
+        null,
+        column_path,
+        lower_doc_bound,
+        upper_doc_bound,
+    );
+
+    const reverse_lower = try internal_keys.relationalColumnIndexByDocRangeLowerAlloc(alloc, lower_doc_key);
+    const reverse_upper = if (upper_doc_key.len > 0)
+        try internal_keys.relationalColumnIndexByDocRangeLowerAlloc(alloc, upper_doc_key)
+    else
+        try alloc.dupe(u8, &[_]u8{internal_keys.relational_column_index_by_doc_namespace + 1});
+    try appendColumnIndexDeletesForColumnPrefix(
+        alloc,
+        store,
+        deletes,
+        owned_keys,
+        reverse_lower,
+        reverse_upper,
+        column_path,
+        lower_doc_bound,
+        upper_doc_bound,
+    );
+}
+
+fn appendColumnIndexDeletesForColumnPrefix(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    prefix: []u8,
+    explicit_upper: ?[]u8,
+    column_path: []const u8,
+    lower_doc_bound: []const u8,
+    upper_doc_bound: ?[]const u8,
+) !void {
+    defer alloc.free(prefix);
+    const upper = if (explicit_upper) |buf| buf else try nextPrefixAlloc(alloc, prefix);
+    defer if (upper) |buf| alloc.free(buf);
+    const scanned = try store.scanRange(alloc, prefix, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    for (scanned) |entry| {
+        if (!(try columnIndexEntryMatchesColumnAndSpan(alloc, entry.key, column_path, lower_doc_bound, upper_doc_bound))) continue;
+        const key = try alloc.dupe(u8, entry.key);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        try owned_keys.append(alloc, key);
+        key_owned = false;
+        try deletes.append(alloc, key);
+    }
+}
+
+fn columnIndexEntryMatchesColumnAndSpan(
+    alloc: Allocator,
+    key: []const u8,
+    column_path: []const u8,
+    lower_doc_bound: []const u8,
+    upper_doc_bound: ?[]const u8,
+) !bool {
+    if (key.len == 0) return false;
+    switch (key[0]) {
+        internal_keys.relational_column_index_namespace => {
+            var decoded = (try internal_keys.decodeRelationalColumnIndexKeyAlloc(alloc, key)) orelse return false;
+            defer decoded.deinit(alloc);
+            return std.mem.eql(u8, decoded.column_path, column_path) and try docKeyFallsInEncodedSpan(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound);
+        },
+        internal_keys.relational_array_element_index_namespace => {
+            var decoded = (try internal_keys.decodeRelationalArrayElementIndexKeyAlloc(alloc, key)) orelse return false;
+            defer decoded.deinit(alloc);
+            return std.mem.eql(u8, decoded.column_path, column_path) and try docKeyFallsInEncodedSpan(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound);
+        },
+        internal_keys.relational_array_value_index_namespace => {
+            var decoded = (try internal_keys.decodeRelationalArrayValueIndexKeyAlloc(alloc, key)) orelse return false;
+            defer decoded.deinit(alloc);
+            return std.mem.eql(u8, decoded.column_path, column_path) and try docKeyFallsInEncodedSpan(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound);
+        },
+        internal_keys.relational_json_value_index_namespace => {
+            var decoded = (try internal_keys.decodeRelationalJsonValueIndexKeyAlloc(alloc, key)) orelse return false;
+            defer decoded.deinit(alloc);
+            return std.mem.eql(u8, decoded.column_path, column_path) and try docKeyFallsInEncodedSpan(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound);
+        },
+        internal_keys.relational_json_path_index_namespace => {
+            var decoded = (try internal_keys.decodeRelationalJsonPathIndexKeyAlloc(alloc, key)) orelse return false;
+            defer decoded.deinit(alloc);
+            return std.mem.eql(u8, decoded.column_path, column_path) and try docKeyFallsInEncodedSpan(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound);
+        },
+        internal_keys.relational_column_index_by_doc_namespace => {
+            var decoded = (try internal_keys.decodeRelationalColumnIndexByDocKeyAlloc(alloc, key)) orelse return false;
+            defer decoded.deinit(alloc);
+            return std.mem.eql(u8, decoded.column_path, column_path) and try docKeyFallsInEncodedSpan(alloc, decoded.doc_key, lower_doc_bound, upper_doc_bound);
+        },
+        else => return false,
+    }
+}
+
+fn docKeyFallsInEncodedSpan(
+    alloc: Allocator,
+    doc_key: []const u8,
+    lower_doc_bound: []const u8,
+    upper_doc_bound: ?[]const u8,
+) !bool {
+    const encoded = try internal_keys.documentRangeLowerAlloc(alloc, doc_key);
+    defer alloc.free(encoded);
+    if (std.mem.order(u8, encoded, lower_doc_bound) == .lt) return false;
+    if (upper_doc_bound) |upper| {
+        if (std.mem.order(u8, encoded, upper) != .lt) return false;
+    }
+    return true;
 }
 
 pub fn deleteColumnIndexesByDocRange(
@@ -5628,7 +5911,7 @@ test "relational partial column index policy writes only predicate-matching rows
 
     const columns = [_]schema_mod.RelationalColumn{
         .{ .name = "status", .path = "status", .field_type = .keyword, .indexed = true },
-        .{ .name = "email", .path = "email", .field_type = .keyword, .indexed = true, .index_where = &.{.{ .field = "status", .op = .eq, .value_json = "\"active\"" }} },
+        .{ .name = "email", .path = "email", .field_type = .keyword, .indexed = true, .index_lifecycle = .building, .index_where = &.{.{ .field = "status", .op = .eq, .value_json = "\"active\"" }} },
     };
     try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:active", active_row, ColumnIndexPolicy.fromColumns(columns[0..]));
     try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:inactive", inactive_row, ColumnIndexPolicy.fromColumns(columns[0..]));
@@ -5638,6 +5921,14 @@ test "relational partial column index policy writes only predicate-matching rows
     defer alloc.free(active_email_index_key);
     const active_email_index = try store.get(alloc, active_email_index_key);
     defer alloc.free(active_email_index);
+
+    var participant = WriteParticipant.initWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, ColumnIndexPolicy.fromColumns(columns[0..]));
+    defer participant.abort(null);
+    try std.testing.expectError(error.RelationalIndexNotReady, participant.scanColumn("email", "doc:active", "doc:inactive", null));
+
+    const ready_status_values = try participant.scanColumn("status", "doc:active", "doc:inactive", null);
+    defer freeColumnValues(alloc, ready_status_values);
+    try std.testing.expectEqual(@as(usize, 2), ready_status_values.len);
 
     const inactive_email_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "doc:inactive");
     defer alloc.free(inactive_email_index_key);
@@ -5712,6 +6003,100 @@ test "relational column scan indexes rebuild and delete from packed rows" {
     const remaining_a = try store.get(alloc, doc_a_index);
     defer alloc.free(remaining_a);
     try std.testing.expectError(error.NotFound, store.get(alloc, doc_b_index));
+}
+
+test "relational secondary index range rebuild repairs only target building index generation" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const active_row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "amount",
+            .value_type = .f64_val,
+            .value = .{ .f64_val = 1.0 },
+        },
+        .{
+            .path = "status",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "active" },
+        },
+    });
+    defer alloc.free(active_row);
+    const inactive_row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "amount",
+            .value_type = .f64_val,
+            .value = .{ .f64_val = 2.0 },
+        },
+        .{
+            .path = "status",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "inactive" },
+        },
+    });
+    defer alloc.free(inactive_row);
+
+    const initial_columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .indexed = true },
+        .{ .name = "status", .path = "status", .field_type = .keyword, .indexed = true },
+    };
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:active", active_row, ColumnIndexPolicy.fromColumns(initial_columns[0..]));
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:inactive", inactive_row, ColumnIndexPolicy.fromColumns(initial_columns[0..]));
+    try store.putBatch(writes.items, deletes.items);
+
+    const active_amount_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "doc:active");
+    defer alloc.free(active_amount_index);
+    const inactive_amount_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "doc:inactive");
+    defer alloc.free(inactive_amount_index);
+    const inactive_status_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", "doc:inactive");
+    defer alloc.free(inactive_status_index);
+
+    const inactive_amount_before = try store.get(alloc, inactive_amount_index);
+    defer alloc.free(inactive_amount_before);
+
+    const rebuild_columns = [_]schema_mod.RelationalColumn{.{
+        .name = "amount",
+        .path = "amount",
+        .field_type = .numeric,
+        .indexed = true,
+        .index_lifecycle = .building,
+        .index_generation = 7,
+        .index_where = &.{.{ .field = "status", .op = .eq, .value_json = "\"active\"" }},
+    }};
+    try std.testing.expectError(
+        error.RelationalIndexGenerationMismatch,
+        rebuildColumnIndexFromRowsInSpanWithColumnIndexPolicy(alloc, &store, "amount", 8, "doc:active", "doc:z", ColumnIndexPolicy.fromColumns(rebuild_columns[0..])),
+    );
+
+    const report = try rebuildColumnIndexFromRowsInSpanWithColumnIndexPolicy(alloc, &store, "amount", 7, "doc:active", "doc:z", ColumnIndexPolicy.fromColumns(rebuild_columns[0..]));
+    try std.testing.expectEqual(@as(u64, 2), report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), report.indexed_rows);
+    try std.testing.expect(report.deleted_entries >= 4);
+    try std.testing.expectEqual(@as(u64, 2), report.written_entries);
+
+    const active_amount_after = try store.get(alloc, active_amount_index);
+    defer alloc.free(active_amount_after);
+    try std.testing.expectError(error.NotFound, store.get(alloc, inactive_amount_index));
+    const inactive_status_after = try store.get(alloc, inactive_status_index);
+    defer alloc.free(inactive_status_after);
 }
 
 test "relational column scan prune removes only entries whose base row is missing" {

@@ -135,10 +135,19 @@ pub const RelationalColumn = struct {
     array_item_type: ?AntflyType = null,
     nullable: bool = true,
     indexed: bool = true,
+    index_lifecycle: RelationalIndexLifecycle = .ready,
+    index_generation: u64 = 0,
     default_value: ?RelationalDefaultValue = null,
     on_update_value: ?RelationalDefaultValue = null,
     generated: ?RelationalGeneratedValue = null,
     index_where: []const UniquePredicate = &.{},
+};
+
+pub const RelationalIndexLifecycle = enum(u8) {
+    ready = 0,
+    building = 1,
+    invalid = 2,
+    dropping = 3,
 };
 
 pub const RelationalDefaultKind = enum(u8) {
@@ -180,6 +189,14 @@ pub const RelationalCheck = struct {
     field: []const u8,
     op: RelationalCheckOp,
     value_json: ?[]const u8 = null,
+    validation_state: RelationalCheckValidationState = .enforced,
+};
+
+pub const RelationalCheckValidationState = enum(u8) {
+    enforced = 0,
+    unvalidated = 1,
+    validating = 2,
+    invalid = 3,
 };
 
 pub const ForeignKeyAction = enum(u8) {
@@ -225,6 +242,14 @@ pub const UniqueConstraint = struct {
     columns: []const []const u8 = &.{},
     expressions: []const UniqueExpression = &.{},
     where: []const UniquePredicate = &.{},
+    validation_state: UniqueConstraintValidationState = .enforced,
+};
+
+pub const UniqueConstraintValidationState = enum(u8) {
+    enforced = 0,
+    unvalidated = 1,
+    validating = 2,
+    invalid = 3,
 };
 
 pub const UniqueExpressionOp = enum(u8) {
@@ -262,6 +287,8 @@ pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []
         if (a.array_item_type != b.array_item_type) return false;
         if (a.nullable != b.nullable) return false;
         if (a.indexed != b.indexed) return false;
+        if (a.index_lifecycle != b.index_lifecycle) return false;
+        if (a.index_generation != b.index_generation) return false;
         if (!relationalDefaultsEqual(a.default_value, b.default_value)) return false;
         if (!relationalDefaultsEqual(a.on_update_value, b.on_update_value)) return false;
         if (!relationalGeneratedValuesEqual(a.generated, b.generated)) return false;
@@ -292,6 +319,7 @@ pub fn relationalCheckCatalogsEqual(current: []const RelationalCheck, next: []co
         if (!std.mem.eql(u8, a.field, b.field)) return false;
         if (a.op != b.op) return false;
         if (!optionalStringsEqual(a.value_json, b.value_json)) return false;
+        if (a.validation_state != b.validation_state) return false;
     }
     return true;
 }
@@ -326,6 +354,7 @@ pub fn uniqueConstraintCatalogsEqual(current: []const UniqueConstraint, next: []
         if (!stringSlicesEqual(a.columns, b.columns)) return false;
         if (!uniqueExpressionSlicesEqual(a.expressions, b.expressions)) return false;
         if (!uniquePredicateSlicesEqual(a.where, b.where)) return false;
+        if (a.validation_state != b.validation_state) return false;
     }
     return true;
 }
@@ -397,7 +426,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 23); // format version
+    try appendU32(&buf, alloc, 27); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -464,6 +493,8 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         }
         try buf.append(alloc, if (column.nullable) 1 else 0);
         try buf.append(alloc, if (column.indexed) 1 else 0);
+        try buf.append(alloc, @intFromEnum(column.index_lifecycle));
+        try appendU64(&buf, alloc, column.index_generation);
         if (column.default_value) |default_value| {
             try buf.append(alloc, 1);
             try buf.append(alloc, @intFromEnum(default_value.kind));
@@ -530,6 +561,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
             try appendStr(&buf, alloc, predicate.field);
             try appendOptStr(&buf, alloc, predicate.value_json);
         }
+        try buf.append(alloc, @intFromEnum(constraint.validation_state));
     }
 
     // Primary-key catalog (format version 17+).
@@ -548,6 +580,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try appendStr(&buf, alloc, check.field);
         try buf.append(alloc, @intFromEnum(check.op));
         try appendOptStr(&buf, alloc, check.value_json);
+        try buf.append(alloc, @intFromEnum(check.validation_state));
     }
 
     const result = try alloc.dupe(u8, buf.items);
@@ -563,7 +596,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 23) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 27) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -854,6 +887,12 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 pos += 1;
                 break :indexed_blk value;
             } else true;
+            const index_lifecycle: RelationalIndexLifecycle = if (fmt_version >= 25) lifecycle_blk: {
+                const value: RelationalIndexLifecycle = @enumFromInt(data[pos]);
+                pos += 1;
+                break :lifecycle_blk value;
+            } else .ready;
+            const index_generation: u64 = if (fmt_version >= 26) readU64(data, &pos) else 0;
             const default_value: ?RelationalDefaultValue = if (fmt_version >= 20 and data[pos] == 1) default_blk: {
                 pos += 1;
                 const kind: RelationalDefaultKind = @enumFromInt(data[pos]);
@@ -894,7 +933,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer if (generated) |value| freeRelationalGeneratedValue(alloc, value);
             const index_where = if (fmt_version >= 22) try readUniquePredicateSliceAlloc(alloc, data, &pos) else &.{};
             errdefer freeUniquePredicateSlice(alloc, index_where);
-            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .indexed = indexed, .default_value = default_value, .on_update_value = on_update_value, .generated = generated, .index_where = index_where };
+            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .indexed = indexed, .index_lifecycle = index_lifecycle, .index_generation = index_generation, .default_value = default_value, .on_update_value = on_update_value, .generated = generated, .index_where = index_where };
             columns_initialized += 1;
         }
         break :blk columns;
@@ -980,11 +1019,17 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer freeUniqueExpressionSlice(alloc, expressions);
             const where = if (fmt_version >= 19) try readUniquePredicateSliceAlloc(alloc, data, &pos) else &.{};
             errdefer freeUniquePredicateSlice(alloc, where);
+            const validation_state: UniqueConstraintValidationState = if (fmt_version >= 24) state_blk: {
+                const value: UniqueConstraintValidationState = @enumFromInt(data[pos]);
+                pos += 1;
+                break :state_blk value;
+            } else .enforced;
             constraint.* = .{
                 .name = name,
                 .columns = columns,
                 .expressions = expressions,
                 .where = where,
+                .validation_state = validation_state,
             };
             constraints_initialized += 1;
         }
@@ -1019,7 +1064,9 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             pos += 1;
             const value_json = try readOptStrAlloc(alloc, data, &pos);
             errdefer if (value_json) |value| alloc.free(value);
-            check.* = .{ .name = name, .field = field, .op = op, .value_json = value_json };
+            const validation_state: RelationalCheckValidationState = if (fmt_version >= 27) @enumFromInt(data[pos]) else .enforced;
+            if (fmt_version >= 27) pos += 1;
+            check.* = .{ .name = name, .field = field, .op = op, .value_json = value_json, .validation_state = validation_state };
             checks_initialized += 1;
         }
         break :blk checks;
@@ -1750,7 +1797,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
         .relational_columns = &.{
             .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
             .{ .name = "tenant_id", .path = "tenant_id", .field_type = .keyword, .nullable = false },
-            .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false, .default_value = .{ .value_json = "1" }, .index_where = &.{.{ .field = "tenant_id", .op = .is_not_null }} },
+            .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false, .index_lifecycle = .building, .index_generation = 12345, .default_value = .{ .value_json = "1" }, .index_where = &.{.{ .field = "tenant_id", .op = .is_not_null }} },
             .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true, .default_value = .{ .kind = .now_ns, .value_json = "" }, .on_update_value = .{ .kind = .now_ns, .value_json = "" } },
             .{ .name = "request_id", .path = "request_id", .field_type = .keyword, .nullable = true, .default_value = .{ .kind = .uuid_v4, .value_json = "" } },
             .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true, .indexed = false },
@@ -1799,6 +1846,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                 .expressions = &.{
                     .{ .op = .lower, .field = "email" },
                 },
+                .validation_state = .unvalidated,
             },
         },
         .checks = &.{
@@ -1839,6 +1887,8 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(AntflyType.array, loaded.relational_columns[6].field_type);
     try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[6].array_item_type.?);
     try std.testing.expect(loaded.relational_columns[2].default_value != null);
+    try std.testing.expectEqual(RelationalIndexLifecycle.building, loaded.relational_columns[2].index_lifecycle);
+    try std.testing.expectEqual(@as(u64, 12345), loaded.relational_columns[2].index_generation);
     try std.testing.expectEqualStrings("1", loaded.relational_columns[2].default_value.?.value_json);
     try std.testing.expectEqual(@as(usize, 1), loaded.relational_columns[2].index_where.len);
     try std.testing.expectEqualStrings("tenant_id", loaded.relational_columns[2].index_where[0].field);
@@ -1869,7 +1919,9 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[0].where.len);
     try std.testing.expectEqualStrings("email", loaded.unique_constraints[0].where[0].field);
     try std.testing.expectEqual(UniquePredicateOp.is_not_null, loaded.unique_constraints[0].where[0].op);
+    try std.testing.expectEqual(UniqueConstraintValidationState.enforced, loaded.unique_constraints[0].validation_state);
     try std.testing.expectEqualStrings("users_lower_email_key", loaded.unique_constraints[1].name);
+    try std.testing.expectEqual(UniqueConstraintValidationState.unvalidated, loaded.unique_constraints[1].validation_state);
     try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[1].expressions.len);
     try std.testing.expectEqual(UniqueExpressionOp.lower, loaded.unique_constraints[1].expressions[0].op);
     try std.testing.expectEqualStrings("email", loaded.unique_constraints[1].expressions[0].field);

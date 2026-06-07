@@ -377,6 +377,7 @@ pub const StatusSource = struct {
         restore_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
+        apply_relational_sql_ddl: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
         wait_table_lifecycle: ?*const fn (ptr: *anyopaque, table_name: []const u8, expected: TableVisibility) anyerror!void = null,
@@ -425,6 +426,11 @@ pub const StatusSource = struct {
     pub fn updateSchema(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const fn_ptr = self.vtable.update_schema orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, schema_json);
+    }
+
+    pub fn applyRelationalSqlDdl(self: StatusSource, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+        const fn_ptr = self.vtable.apply_relational_sql_ddl orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, sql);
     }
 
     pub fn createIndex(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -510,6 +516,10 @@ pub const StatusSource = struct {
                 return try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json);
             }
 
+            fn applyRelationalSqlDdl(ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) anyerror!tables_api.AppliedRelationalSqlDdlRecord {
+                return try applyRelationalSqlDdlOnService(cast(ptr), alloc, sql);
+            }
+
             fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void {
                 return try createIndexOnService(cast(ptr), alloc, table_name, index_name, index_json);
             }
@@ -558,6 +568,7 @@ pub const StatusSource = struct {
             .restore_table = Gen.restoreTable,
             .drop_table = Gen.dropTable,
             .update_schema = Gen.updateSchema,
+            .apply_relational_sql_ddl = Gen.applyRelationalSqlDdl,
             .create_index = Gen.createIndex,
             .drop_index = Gen.dropIndex,
             .wait_table_lifecycle = Gen.waitTableLifecycle,
@@ -664,6 +675,53 @@ fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []c
     defer metadata_table_manager.freeTable(alloc, updated);
     try svc.upsertTable(updated);
     try svc.runRound();
+}
+
+fn applyRelationalSqlDdlOnService(
+    svc: anytype,
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    var target = try tables_api.relationalSqlDdlTargetAlloc(alloc, sql);
+    defer target.deinit(alloc);
+
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+
+    if (target.creates_table) {
+        if (tables_api.findTableByName(&snapshot, target.table_name) != null) return error.TableAlreadyExists;
+        const base_table: metadata_table_manager.TableRecord = .{
+            .table_id = tables_api.deriveTableId(target.table_name),
+            .name = target.table_name,
+            .schema_json = "",
+            .indexes_json = "{}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+            .desired_replica_count = 3,
+            .min_ranges = 1,
+        };
+        var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, &base_table, sql);
+        errdefer applied.deinit(alloc);
+        applied.created_table = true;
+
+        const ranges = try tables_api.deriveInitialRanges(alloc, applied.table);
+        defer {
+            for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
+            alloc.free(ranges);
+        }
+        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        _ = try workflow.createTableWithRanges(svc, applied.table, ranges);
+        try svc.runRound();
+        return applied;
+    }
+
+    const table = tables_api.findTableByName(&snapshot, target.table_name) orelse return error.TableNotFound;
+    var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, table, sql);
+    errdefer applied.deinit(alloc);
+    try svc.upsertTable(applied.table);
+    try svc.runRound();
+    return applied;
 }
 
 fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {

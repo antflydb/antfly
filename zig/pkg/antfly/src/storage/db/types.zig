@@ -911,6 +911,45 @@ pub const RelationalRowsFieldAliasProjection = struct {
     field: []const u8,
 };
 
+pub const RelationalRowsExpressionKind = enum {
+    field,
+    value,
+    coalesce,
+    lower,
+    concat,
+    nullif,
+    add,
+    sub,
+    mul,
+    div,
+    case,
+};
+
+pub const RelationalRowsExpressionCondition = struct {
+    lhs: RelationalRowsExpression,
+    op: schema_mod.RelationalCheckOp,
+    rhs: []const RelationalRowsExpression = &.{},
+};
+
+pub const RelationalRowsExpressionCaseBranch = struct {
+    when: RelationalRowsExpressionCondition,
+    then: RelationalRowsExpression,
+};
+
+pub const RelationalRowsExpression = struct {
+    kind: RelationalRowsExpressionKind,
+    field: []const u8 = "",
+    value_json: []const u8 = "",
+    operands: []const RelationalRowsExpression = &.{},
+    case_branches: []const RelationalRowsExpressionCaseBranch = &.{},
+    case_else: []const RelationalRowsExpression = &.{},
+};
+
+pub const RelationalRowsExpressionProjection = struct {
+    output: []const u8,
+    expression: RelationalRowsExpression,
+};
+
 pub const RelationalRowsDocKeyRange = struct {
     start: []const u8 = "",
     end: []const u8 = "",
@@ -933,6 +972,7 @@ pub const RelationalRowsQueryRequest = struct {
     array_length: []const RelationalRowsArrayLengthProjection = &.{},
     coalesce: []const RelationalRowsCoalesceProjection = &.{},
     field_aliases: []const RelationalRowsFieldAliasProjection = &.{},
+    expressions: []const RelationalRowsExpressionProjection = &.{},
     select_all: bool = true,
     order_by: []const RelationalRowsQueryOrder = &.{},
     row_claim: ?RowClaimRequest = null,
@@ -1028,6 +1068,11 @@ pub const RelationalRowsQueryRequest = struct {
             alloc.free(projection.field);
         }
         if (self.field_aliases.len > 0) alloc.free(self.field_aliases);
+        for (self.expressions) |projection| {
+            alloc.free(projection.output);
+            freeRelationalRowsExpression(alloc, projection.expression);
+        }
+        if (self.expressions.len > 0) alloc.free(self.expressions);
         for (self.order_by) |order| alloc.free(order.field);
         if (self.order_by.len > 0) alloc.free(self.order_by);
         if (self.row_claim) |claim| if (claim.owner_id.len > 0) alloc.free(claim.owner_id);
@@ -1038,6 +1083,22 @@ pub const RelationalRowsQueryRequest = struct {
         self.* = undefined;
     }
 };
+
+fn freeRelationalRowsExpression(alloc: Allocator, expression: RelationalRowsExpression) void {
+    if (expression.field.len > 0) alloc.free(expression.field);
+    if (expression.value_json.len > 0) alloc.free(expression.value_json);
+    for (expression.operands) |operand| freeRelationalRowsExpression(alloc, operand);
+    if (expression.operands.len > 0) alloc.free(expression.operands);
+    for (expression.case_branches) |branch| {
+        freeRelationalRowsExpression(alloc, branch.when.lhs);
+        for (branch.when.rhs) |rhs| freeRelationalRowsExpression(alloc, rhs);
+        if (branch.when.rhs.len > 0) alloc.free(branch.when.rhs);
+        freeRelationalRowsExpression(alloc, branch.then);
+    }
+    if (expression.case_branches.len > 0) alloc.free(expression.case_branches);
+    for (expression.case_else) |fallback| freeRelationalRowsExpression(alloc, fallback);
+    if (expression.case_else.len > 0) alloc.free(expression.case_else);
+}
 
 pub const RelationalRowsCte = struct {
     name: []const u8,
@@ -1052,6 +1113,69 @@ pub const RelationalRowsQueryPlan = struct {
 pub const RelationalRowsQueryResult = struct {
     rows: [][]const u8 = &.{},
     total: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.rows) |row| alloc.free(@constCast(row));
+        if (self.rows.len > 0) alloc.free(self.rows);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsMutationKind = enum {
+    update,
+    delete,
+};
+
+pub const RelationalRowsMutationSourceRequest = struct {
+    kind: RelationalRowsMutationKind,
+    source: RelationalRowsQueryRequest = .{},
+    operations: []const TransformOp = &.{},
+    returning: []const []const u8 = &.{},
+    returning_expressions: []const RelationalRowsExpressionProjection = &.{},
+    returning_all: bool = false,
+};
+
+pub const RelationalRowsMutationSourceResult = struct {
+    matched: u32 = 0,
+    staged: u32 = 0,
+    returning_rows: [][]const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.returning_rows) |row| alloc.free(@constCast(row));
+        if (self.returning_rows.len > 0) alloc.free(self.returning_rows);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsWindowFunction = enum {
+    row_number,
+};
+
+pub const RelationalRowsWindowSpec = struct {
+    output: []const u8,
+    function: RelationalRowsWindowFunction,
+    partition_by: []const []const u8 = &.{},
+    order_by: []const RelationalRowsQueryOrder = &.{},
+};
+
+pub const RelationalRowsWindowRequest = struct {
+    source: RelationalRowsQueryRequest = .{},
+    windows: []const RelationalRowsWindowSpec = &.{},
+    select: []const []const u8 = &.{},
+    select_all: bool = false,
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
+};
+
+pub const RelationalRowsWindowPlan = struct {
+    ctes: []const RelationalRowsCte = &.{},
+    window: RelationalRowsWindowRequest = .{},
+};
+
+pub const RelationalRowsWindowResult = struct {
+    rows: [][]const u8 = &.{},
+    total_rows: u32 = 0,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.rows) |row| alloc.free(@constCast(row));
@@ -1143,6 +1267,26 @@ pub const RelationalRowsJoinRequest = struct {
 pub const RelationalRowsJoinPlan = struct {
     ctes: []const RelationalRowsCte = &.{},
     join: RelationalRowsJoinRequest = .{},
+};
+
+pub const RelationalRowsLateralCorrelation = struct {
+    left_field: []const u8,
+    right_field: []const u8,
+};
+
+pub const RelationalRowsLateralRequest = struct {
+    left: RelationalRowsQueryRequest = .{},
+    right: RelationalRowsQueryRequest = .{},
+    correlations: []const RelationalRowsLateralCorrelation = &.{},
+    select: []const RelationalRowsJoinProjection = &.{},
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
+};
+
+pub const RelationalRowsLateralPlan = struct {
+    ctes: []const RelationalRowsCte = &.{},
+    lateral: RelationalRowsLateralRequest = .{},
 };
 
 pub const RelationalRowsJoinResult = struct {

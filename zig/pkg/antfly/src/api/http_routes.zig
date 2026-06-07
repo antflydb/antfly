@@ -63,6 +63,7 @@ pub const Routes = struct {
     pub const restore_suffix = "/restore";
     pub const foreign_key_integrity_suffix = "/foreign-key-integrity";
     pub const unique_integrity_suffix = "/unique-integrity";
+    pub const secondary_index_rebuild_suffix = "/secondary-index-rebuild";
     pub const foreign_key_ref_children_suffix = "/foreign-key-ref-children";
     pub const foreign_key_action_job_suffix = "/foreign-key-action-job";
     pub const foreign_key_action_job_progress_suffix = "/foreign-key-action-job-progress";
@@ -142,6 +143,10 @@ pub const Routes = struct {
     };
 
     pub const TableUniqueIntegrity = struct {
+        table_name: []const u8,
+    };
+
+    pub const TableSecondaryIndexRebuild = struct {
         table_name: []const u8,
     };
 
@@ -268,6 +273,11 @@ pub const Routes = struct {
     };
 
     pub const GroupUniqueIntegrity = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupSecondaryIndexRebuild = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -459,6 +469,14 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, unique_integrity_suffix)) return null;
         const table_name = path[tables_prefix.len .. path.len - unique_integrity_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableSecondaryIndexRebuild(path: []const u8) ?TableSecondaryIndexRebuild {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, secondary_index_rebuild_suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - secondary_index_rebuild_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
     }
@@ -728,6 +746,16 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, unique_integrity_suffix)) return null;
         const table_name = rest[tables_prefix.len .. rest.len - unique_integrity_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupSecondaryIndexRebuild(path: []const u8) ?GroupSecondaryIndexRebuild {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, secondary_index_rebuild_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - secondary_index_rebuild_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
     }

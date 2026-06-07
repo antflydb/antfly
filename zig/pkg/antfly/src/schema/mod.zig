@@ -223,6 +223,8 @@ fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableS
                 .array_item_type = runtimeRelationalArrayItemType(property),
                 .nullable = nullable,
                 .indexed = if (property.antfly_index) |indexed| indexed else true,
+                .index_lifecycle = runtimeRelationalIndexLifecycle(property.index_lifecycle),
+                .index_generation = property.index_generation orelse 0,
                 .default_value = if (property.default_value) |default_value| try cloneRelationalDefaultValue(alloc, default_value) else null,
                 .on_update_value = if (property.on_update_value) |on_update_value| try cloneRelationalDefaultValue(alloc, on_update_value) else null,
                 .generated = if (property.generated) |generated| try cloneRelationalGeneratedValue(alloc, generated) else null,
@@ -404,6 +406,12 @@ fn deriveRuntimeUniqueConstraints(alloc: std.mem.Allocator, schema: ParsedTableS
             .columns = try cloneStringSlice(alloc, constraint.columns),
             .expressions = try cloneUniqueExpressions(alloc, constraint.expressions),
             .where = try cloneUniquePredicates(alloc, constraint.where),
+            .validation_state = switch (constraint.validation_state) {
+                .enforced => .enforced,
+                .unvalidated => .unvalidated,
+                .validating => .validating,
+                .invalid => .invalid,
+            },
         };
         initialized += 1;
     }
@@ -452,6 +460,12 @@ fn deriveRuntimeRelationalChecks(alloc: std.mem.Allocator, schema: ParsedTableSc
                 .lte => .lte,
             },
             .value_json = if (check.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
+            .validation_state = switch (check.validation_state) {
+                .enforced => .enforced,
+                .unvalidated => .unvalidated,
+                .validating => .validating,
+                .invalid => .invalid,
+            },
         };
         initialized += 1;
     }
@@ -567,6 +581,15 @@ fn runtimeRelationalArrayItemType(property: anytype) ?storage_schema.AntflyType 
     if (property.field_type == null or !std.mem.eql(u8, property.field_type.?, "array")) return null;
     const item = property.item orelse return null;
     return runtimeRelationalColumnType(item.*);
+}
+
+fn runtimeRelationalIndexLifecycle(lifecycle: ?impl.RelationalIndexLifecycle) storage_schema.RelationalIndexLifecycle {
+    return switch (lifecycle orelse .ready) {
+        .ready => .ready,
+        .building => .building,
+        .invalid => .invalid,
+        .dropping => .dropping,
+    };
 }
 
 fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) bool {
@@ -1174,7 +1197,7 @@ fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?stor
 test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword","x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime","x-antfly-on-update":{"op":"now_ns"}},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}]}
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword","x-antfly-index-lifecycle":"building","x-antfly-index-generation":99,"x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime","x-antfly-on-update":{"op":"now_ns"}},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}]}
     );
     defer parsed.deinit(alloc);
 
@@ -1191,6 +1214,8 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expect(id.indexed);
     const customer_id = findRuntimeColumn(runtime, "customer_id").?;
     try std.testing.expectEqual(@as(usize, 1), customer_id.index_where.len);
+    try std.testing.expectEqual(storage_schema.RelationalIndexLifecycle.building, customer_id.index_lifecycle);
+    try std.testing.expectEqual(@as(u64, 99), customer_id.index_generation);
     try std.testing.expectEqualStrings("tenant_id", customer_id.index_where[0].field);
     try std.testing.expectEqual(storage_schema.UniquePredicateOp.is_not_null, customer_id.index_where[0].op);
     try std.testing.expect(runtime.primary_key != null);

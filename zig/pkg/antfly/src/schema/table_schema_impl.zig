@@ -26,6 +26,21 @@ pub const StorageMode = enum {
     }
 };
 
+pub const RelationalIndexLifecycle = enum {
+    ready,
+    building,
+    invalid,
+    dropping,
+
+    pub fn fromString(text: []const u8) ?RelationalIndexLifecycle {
+        if (std.mem.eql(u8, text, "ready")) return .ready;
+        if (std.mem.eql(u8, text, "building")) return .building;
+        if (std.mem.eql(u8, text, "invalid")) return .invalid;
+        if (std.mem.eql(u8, text, "dropping")) return .dropping;
+        return null;
+    }
+};
+
 pub const TableSchema = struct {
     version: u32 = 0,
     storage_mode: StorageMode = .document,
@@ -134,6 +149,21 @@ pub const ForeignKeyValidationState = enum {
     }
 };
 
+pub const UniqueConstraintValidationState = enum {
+    enforced,
+    unvalidated,
+    validating,
+    invalid,
+
+    pub fn fromString(text: []const u8) ?UniqueConstraintValidationState {
+        if (enumTokenEql(text, "enforced")) return .enforced;
+        if (enumTokenEql(text, "unvalidated") or enumTokenEql(text, "not_valid")) return .unvalidated;
+        if (enumTokenEql(text, "validating")) return .validating;
+        if (enumTokenEql(text, "invalid")) return .invalid;
+        return null;
+    }
+};
+
 fn foreignKeyDeferrableFromValue(value: std.json.Value) ?bool {
     return if (foreignKeyDeferrabilityFromValue(value)) |clause| clause.deferrable else null;
 }
@@ -229,6 +259,7 @@ pub const UniqueConstraint = struct {
     columns: [][]const u8 = &.{},
     expressions: []UniqueExpression = &.{},
     where: []UniquePredicate = &.{},
+    validation_state: UniqueConstraintValidationState = .enforced,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -283,6 +314,7 @@ pub const RelationalCheck = struct {
     field: []const u8,
     op: RelationalCheckOp,
     value_json: ?[]const u8 = null,
+    validation_state: RelationalCheckValidationState = .enforced,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -290,6 +322,13 @@ pub const RelationalCheck = struct {
         if (self.value_json) |value| alloc.free(value);
         self.* = undefined;
     }
+};
+
+pub const RelationalCheckValidationState = enum {
+    enforced,
+    unvalidated,
+    validating,
+    invalid,
 };
 
 pub const RelationalGeneratedOp = enum {
@@ -420,6 +459,8 @@ pub const DocumentProperty = struct {
     antfly_types: [][]const u8 = &.{},
     analyzer: ?[]const u8 = null,
     antfly_index: ?bool = null,
+    index_lifecycle: ?RelationalIndexLifecycle = null,
+    index_generation: ?u64 = null,
     integer_only: bool = false,
     format: ?[]const u8 = null,
     allows_null: bool = false,
@@ -1053,6 +1094,9 @@ fn validateUniqueConstraints(value: std.json.Value) !void {
         if (object.get("where")) |where| {
             try validateUniquePredicateDefinition(where);
         }
+        if (object.get("validation_state")) |validation_state| {
+            if (validation_state != .string or UniqueConstraintValidationState.fromString(validation_state.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
     }
 }
 
@@ -1060,7 +1104,8 @@ fn isAllowedUniqueConstraintField(field: []const u8) bool {
     return std.mem.eql(u8, field, "name") or
         std.mem.eql(u8, field, "columns") or
         std.mem.eql(u8, field, "expressions") or
-        std.mem.eql(u8, field, "where");
+        std.mem.eql(u8, field, "where") or
+        std.mem.eql(u8, field, "validation_state");
 }
 
 fn validateStringArray(value: std.json.Value, require_non_empty: bool) !void {
@@ -1153,7 +1198,8 @@ fn validateRelationalChecksValue(value: std.json.Value) !void {
             if (!std.mem.eql(u8, entry.key_ptr.*, "name") and
                 !std.mem.eql(u8, entry.key_ptr.*, "field") and
                 !std.mem.eql(u8, entry.key_ptr.*, "op") and
-                !std.mem.eql(u8, entry.key_ptr.*, "value"))
+                !std.mem.eql(u8, entry.key_ptr.*, "value") and
+                !std.mem.eql(u8, entry.key_ptr.*, "validation_state"))
             {
                 return error.InvalidSchemaUpdateRequest;
             }
@@ -1172,6 +1218,10 @@ fn validateRelationalChecksValue(value: std.json.Value) !void {
         if (!needs_value and !forbids_value) return error.InvalidSchemaUpdateRequest;
         if (needs_value and object.get("value") == null) return error.InvalidSchemaUpdateRequest;
         if (forbids_value and object.get("value") != null) return error.InvalidSchemaUpdateRequest;
+        if (object.get("validation_state")) |validation_state| {
+            if (validation_state != .string) return error.InvalidSchemaUpdateRequest;
+            _ = try parseRelationalCheckValidationState(validation_state.string);
+        }
     }
 }
 
@@ -1421,6 +1471,14 @@ fn validatePropertySchemaKeywords(context: SchemaContext, object: std.json.Objec
     }
     if (object.get("x-antfly-index")) |antfly_index| {
         if (antfly_index != .null and antfly_index != .bool) return error.InvalidSchemaUpdateRequest;
+    }
+    if (object.get("x-antfly-index-lifecycle")) |index_lifecycle| {
+        if (index_lifecycle != .null and index_lifecycle != .string) return error.InvalidSchemaUpdateRequest;
+        if (index_lifecycle == .string and RelationalIndexLifecycle.fromString(index_lifecycle.string) == null) return error.InvalidSchemaUpdateRequest;
+    }
+    if (object.get("x-antfly-index-generation")) |index_generation| {
+        if (index_generation != .null and index_generation != .integer) return error.InvalidSchemaUpdateRequest;
+        if (index_generation == .integer and index_generation.integer <= 0) return error.InvalidSchemaUpdateRequest;
     }
     if (object.get("x-antfly-index-where")) |index_where| {
         if (index_where != .null) try validateUniquePredicateDefinition(index_where);
@@ -2125,6 +2183,7 @@ fn relationalConstraintColumnTypesCompatible(child: DocumentProperty, parent: Do
 fn validateRelationalUniqueConstraints(schema: TableSchema) !void {
     for (schema.unique_constraints, 0..) |constraint, i| {
         if (constraint.columns.len + constraint.expressions.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (constraint.validation_state == .validating or constraint.validation_state == .invalid) return error.InvalidSchemaUpdateRequest;
         for (constraint.columns, 0..) |column, column_index| {
             const property = findDocumentProperty(schema.document_schemas[0].properties, column) orelse return error.InvalidSchemaUpdateRequest;
             if (!isRelationalUniqueConstraintColumn(property)) return error.InvalidSchemaUpdateRequest;
@@ -2221,6 +2280,14 @@ fn validateRelationalGeneratedProperty(schema: TableSchema, document_schema: Doc
 }
 
 fn validateRelationalPartialIndexProperty(schema: TableSchema, property: DocumentProperty) !void {
+    if (property.index_lifecycle != null) {
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
+    }
+    if (property.index_generation != null) {
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
+    }
     if (property.index_where.len == 0) return;
     if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
     if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
@@ -2625,6 +2692,22 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
+    const index_lifecycle = if (object.get("x-antfly-index-lifecycle")) |lifecycle_value|
+        switch (lifecycle_value) {
+            .string => |value| RelationalIndexLifecycle.fromString(value) orelse return error.InvalidSchemaUpdateRequest,
+            .null => null,
+            else => return error.InvalidSchemaUpdateRequest,
+        }
+    else
+        null;
+    const index_generation = if (object.get("x-antfly-index-generation")) |generation_value|
+        switch (generation_value) {
+            .integer => |value| if (value > 0) @as(u64, @intCast(value)) else return error.InvalidSchemaUpdateRequest,
+            .null => null,
+            else => return error.InvalidSchemaUpdateRequest,
+        }
+    else
+        null;
     const include_in_all_fields: [][]const u8 = if (object.get("x-antfly-include-in-all")) |include_value|
         if (include_value == .array) try parseRequiredFields(alloc, include_value.array) else &[_][]const u8{}
     else
@@ -2921,6 +3004,8 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .antfly_types = antfly_types,
         .analyzer = analyzer,
         .antfly_index = antfly_index,
+        .index_lifecycle = index_lifecycle,
+        .index_generation = index_generation,
         .integer_only = type_spec.integer_only,
         .format = format,
         .allows_null = allows_null,
@@ -3485,6 +3570,7 @@ fn parseRelationalChecks(alloc: std.mem.Allocator, value: std.json.Value) ![]Rel
             .field = try alloc.dupe(u8, object.get("field").?.string),
             .op = try parseRelationalCheckOp(object.get("op").?.string),
             .value_json = if (object.get("value")) |check_value| try stringifyJsonValue(alloc, check_value) else null,
+            .validation_state = if (object.get("validation_state")) |state| try parseRelationalCheckValidationState(state.string) else .enforced,
         };
         initialized += 1;
     }
@@ -3500,6 +3586,14 @@ fn parseRelationalCheckOp(op_text: []const u8) !RelationalCheckOp {
     if (enumTokenEql(op_text, "gte")) return .gte;
     if (enumTokenEql(op_text, "lt")) return .lt;
     if (enumTokenEql(op_text, "lte")) return .lte;
+    return error.InvalidSchemaUpdateRequest;
+}
+
+fn parseRelationalCheckValidationState(state_text: []const u8) !RelationalCheckValidationState {
+    if (enumTokenEql(state_text, "enforced")) return .enforced;
+    if (enumTokenEql(state_text, "unvalidated")) return .unvalidated;
+    if (enumTokenEql(state_text, "validating")) return .validating;
+    if (enumTokenEql(state_text, "invalid")) return .invalid;
     return error.InvalidSchemaUpdateRequest;
 }
 
@@ -3519,6 +3613,10 @@ fn parseUniqueConstraints(alloc: std.mem.Allocator, value: std.json.Value) ![]Un
             .columns = if (object.get("columns")) |columns| try parseStringArrayAlloc(alloc, columns) else &.{},
             .expressions = if (object.get("expressions")) |expressions| try parseUniqueExpressions(alloc, expressions) else &.{},
             .where = if (object.get("where")) |where| try parseUniquePredicates(alloc, where) else &.{},
+            .validation_state = if (object.get("validation_state")) |validation_state|
+                UniqueConstraintValidationState.fromString(validation_state.string).?
+            else
+                .enforced,
         };
         initialized += 1;
     }
@@ -5065,7 +5163,7 @@ test "relational schema rejects unsupported unique constraint shapes" {
     );
     var parsed_partial = try parseSchema(
         std.testing.allocator,
-        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"email_present_key\",\"columns\":[\"email\"],\"where\":{\"all\":[{\"field\":\"email\",\"op\":\"is_not_null\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]}},{\"name\":\"email_lower_key\",\"expressions\":[{\"op\":\"lower\",\"field\":\"email\"}]}]}",
+        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"email_present_key\",\"columns\":[\"email\"],\"where\":{\"all\":[{\"field\":\"email\",\"op\":\"is_not_null\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]}},{\"name\":\"email_lower_key\",\"expressions\":[{\"op\":\"lower\",\"field\":\"email\"}],\"validation_state\":\"unvalidated\"}]}",
     );
     defer parsed_partial.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), parsed_partial.unique_constraints.len);
@@ -5076,6 +5174,15 @@ test "relational schema rejects unsupported unique constraint shapes" {
     try std.testing.expectEqual(@as(usize, 1), parsed_partial.unique_constraints[1].expressions.len);
     try std.testing.expectEqual(UniqueExpressionOp.lower, parsed_partial.unique_constraints[1].expressions[0].op);
     try std.testing.expectEqualStrings("email", parsed_partial.unique_constraints[1].expressions[0].field);
+    try std.testing.expectEqual(UniqueConstraintValidationState.enforced, parsed_partial.unique_constraints[0].validation_state);
+    try std.testing.expectEqual(UniqueConstraintValidationState.unvalidated, parsed_partial.unique_constraints[1].validation_state);
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"bad\",\"columns\":[\"email\"],\"validation_state\":\"validating\"}]}",
+        ),
+    );
 }
 
 test "parse dynamic template contract and validate selectors" {

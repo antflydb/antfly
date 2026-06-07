@@ -42,6 +42,7 @@ pub const CapturedCurrentState = struct {
     ranges: []metadata_table_manager.RangeRecord,
     foreign_key_ref_ranges: []metadata_table_manager.ForeignKeyReferenceRangeRecord,
     unique_constraint_ranges: []metadata_table_manager.UniqueConstraintRangeRecord,
+    secondary_index_rebuild_ranges: []metadata_table_manager.SecondaryIndexRebuildRangeRecord,
     restore_progresses: []metadata_table_manager.RestoreProgressRecord,
     schema_progresses: []metadata_table_manager.SchemaProgressRecord,
     merged_group_statuses: []metadata_reconciler.MergedGroupStatus,
@@ -63,6 +64,8 @@ pub const CapturedCurrentState = struct {
         alloc.free(self.foreign_key_ref_ranges);
         for (self.unique_constraint_ranges) |record| metadata_table_manager.freeUniqueConstraintRange(alloc, record);
         alloc.free(self.unique_constraint_ranges);
+        for (self.secondary_index_rebuild_ranges) |record| metadata_table_manager.freeSecondaryIndexRebuildRange(alloc, record);
+        alloc.free(self.secondary_index_rebuild_ranges);
         for (self.restore_progresses) |record| metadata_table_manager.freeRestoreProgress(alloc, record);
         alloc.free(self.restore_progresses);
         alloc.free(self.schema_progresses);
@@ -151,7 +154,9 @@ pub const MetadataState = struct {
         defer self.projected.freeForeignKeyReferenceRanges(self.alloc, foreign_key_ref_ranges);
         const unique_constraint_ranges = try self.projected.listUniqueConstraintRanges(self.alloc);
         defer self.projected.freeUniqueConstraintRanges(self.alloc, unique_constraint_ranges);
-        try self.desired.replaceTopologyWithConstraintOwnerRanges(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges);
+        const secondary_index_rebuild_ranges = try self.projected.listSecondaryIndexRebuildRanges(self.alloc);
+        defer self.projected.freeSecondaryIndexRebuildRanges(self.alloc, secondary_index_rebuild_ranges);
+        try self.desired.replaceTopologyWithDerivedRanges(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, secondary_index_rebuild_ranges);
     }
 
     pub fn syncProjected(self: *MetadataState, service: anytype) !void {
@@ -163,6 +168,8 @@ pub const MetadataState = struct {
         defer freeProjectedForeignKeyReferenceRanges(self, service, projected_foreign_key_ref_ranges);
         const projected_unique_constraint_ranges = try listProjectedUniqueConstraintRanges(self, service);
         defer freeProjectedUniqueConstraintRanges(self, service, projected_unique_constraint_ranges);
+        const projected_secondary_index_rebuild_ranges = try listProjectedSecondaryIndexRebuildRanges(self, service);
+        defer freeProjectedSecondaryIndexRebuildRanges(self, service, projected_secondary_index_rebuild_ranges);
         const projected_nodes = try listProjectedNodes(self, service);
         defer freeProjectedNodes(self, service, projected_nodes);
         const projected_stores = try listProjectedStores(self, service);
@@ -172,7 +179,7 @@ pub const MetadataState = struct {
         const merge_records = try service.listProjectedMergeTransitions(self.alloc);
         defer service.freeProjectedMergeTransitions(self.alloc, merge_records);
 
-        _ = try self.projected.replaceProjectedTopologyWithConstraintOwnerRanges(projected_tables, projected_ranges, projected_foreign_key_ref_ranges, projected_unique_constraint_ranges);
+        _ = try self.projected.replaceProjectedTopologyWithDerivedRanges(projected_tables, projected_ranges, projected_foreign_key_ref_ranges, projected_unique_constraint_ranges, projected_secondary_index_rebuild_ranges);
         self.clearCommitted();
         self.clearCommittedNodes();
         self.clearCommittedStores();
@@ -254,6 +261,8 @@ pub const MetadataState = struct {
         errdefer self.projected.freeForeignKeyReferenceRanges(self.alloc, foreign_key_ref_ranges);
         const unique_constraint_ranges = try self.projected.listUniqueConstraintRanges(self.alloc);
         errdefer self.projected.freeUniqueConstraintRanges(self.alloc, unique_constraint_ranges);
+        const secondary_index_rebuild_ranges = try self.projected.listSecondaryIndexRebuildRanges(self.alloc);
+        errdefer self.projected.freeSecondaryIndexRebuildRanges(self.alloc, secondary_index_rebuild_ranges);
         const restore_progresses = try listProjectedRestoreProgress(self, service);
         errdefer freeProjectedRestoreProgress(self, service, restore_progresses);
         const schema_progresses = try listProjectedSchemaProgress(self, service);
@@ -309,6 +318,7 @@ pub const MetadataState = struct {
                 .ranges = ranges,
                 .foreign_key_ref_ranges = foreign_key_ref_ranges,
                 .unique_constraint_ranges = unique_constraint_ranges,
+                .secondary_index_rebuild_ranges = secondary_index_rebuild_ranges,
                 .stores = self.committed_stores.items,
                 .merged_group_statuses = merged_group_statuses,
                 .restore_progresses = restore_progresses,
@@ -324,6 +334,7 @@ pub const MetadataState = struct {
             .ranges = ranges,
             .foreign_key_ref_ranges = foreign_key_ref_ranges,
             .unique_constraint_ranges = unique_constraint_ranges,
+            .secondary_index_rebuild_ranges = secondary_index_rebuild_ranges,
             .restore_progresses = restore_progresses,
             .schema_progresses = schema_progresses,
             .merged_group_statuses = merged_group_statuses,
@@ -457,6 +468,31 @@ fn freeProjectedUniqueConstraintRanges(self: *MetadataState, service: anytype, r
     };
     if (@hasDecl(ServiceDeclType, "freeProjectedUniqueConstraintRanges")) {
         service.freeProjectedUniqueConstraintRanges(self.alloc, records);
+        return;
+    }
+    self.alloc.free(records);
+}
+
+fn listProjectedSecondaryIndexRebuildRanges(self: *MetadataState, service: anytype) ![]metadata_table_manager.SecondaryIndexRebuildRangeRecord {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "listProjectedSecondaryIndexRebuildRanges")) {
+        return try service.listProjectedSecondaryIndexRebuildRanges(self.alloc);
+    }
+    return try self.alloc.alloc(metadata_table_manager.SecondaryIndexRebuildRangeRecord, 0);
+}
+
+fn freeProjectedSecondaryIndexRebuildRanges(self: *MetadataState, service: anytype, records: []metadata_table_manager.SecondaryIndexRebuildRangeRecord) void {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "freeProjectedSecondaryIndexRebuildRanges")) {
+        service.freeProjectedSecondaryIndexRebuildRanges(self.alloc, records);
         return;
     }
     self.alloc.free(records);

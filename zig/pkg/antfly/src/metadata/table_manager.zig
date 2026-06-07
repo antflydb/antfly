@@ -115,6 +115,28 @@ pub const UniqueConstraintRangeRecord = struct {
     state: []const u8 = unique_constraint_range_active,
 };
 
+pub const secondary_index_rebuild_declared = "declared";
+pub const secondary_index_rebuild_building = "building";
+pub const secondary_index_rebuild_ready = "ready";
+pub const secondary_index_rebuild_invalid = "invalid";
+
+pub const SecondaryIndexRebuildRangeRecord = struct {
+    table_id: u64,
+    index_name: []const u8,
+    index_generation: u64,
+    start_row_key: []const u8,
+    end_row_key: ?[]const u8 = null,
+    group_id: u64,
+    topology_epoch: u64 = 0,
+    state: []const u8 = secondary_index_rebuild_declared,
+    lease_owner: []const u8 = "",
+    lease_expires_at_ms: u64 = 0,
+    attempts: u32 = 0,
+    completed_row_count: u64 = 0,
+    progress_row_key: []const u8 = "",
+    last_error: []const u8 = "",
+};
+
 pub const ForeignKeyReferenceRangeSelector = struct {
     child_table_id: u64,
     constraint_name: []const u8,
@@ -139,6 +161,45 @@ pub const UniqueConstraintRangeSelector = struct {
     table_id: u64,
     constraint_name: []const u8,
     start_encoded_value: []const u8,
+};
+
+pub const SecondaryIndexRebuildRangeSelector = struct {
+    table_id: u64,
+    index_name: []const u8,
+    index_generation: u64,
+    start_row_key: []const u8,
+};
+
+pub const SecondaryIndexRebuildRangeBeginRequest = struct {
+    selector: SecondaryIndexRebuildRangeSelector,
+    lease_owner: []const u8,
+    now_ms: u64 = 0,
+    lease_expires_at_ms: u64,
+};
+
+pub const SecondaryIndexRebuildRangeFinishRequest = struct {
+    selector: SecondaryIndexRebuildRangeSelector,
+    completed_row_count: u64,
+    progress_row_key: []const u8,
+};
+
+pub const SecondaryIndexRebuildRangeInvalidateRequest = struct {
+    selector: SecondaryIndexRebuildRangeSelector,
+    last_error: []const u8,
+};
+
+pub const SecondaryIndexReadyPromotionRequest = struct {
+    table_id: u64,
+    index_name: []const u8,
+    expected_index_generation: u64,
+    expected_schema_json: []const u8,
+    promoted_table: TableRecord,
+};
+
+pub const TableSchemaCompareAndSwapRequest = struct {
+    table_id: u64,
+    expected_schema_json: []const u8,
+    promoted_table: TableRecord,
 };
 
 pub const UniqueConstraintRangeSplitRequest = struct {
@@ -174,6 +235,17 @@ pub fn uniqueConstraintRangeStateValid(state: []const u8) bool {
 
 pub fn uniqueConstraintRangeRoutable(record: UniqueConstraintRangeRecord) bool {
     return std.mem.eql(u8, record.state, unique_constraint_range_active);
+}
+
+pub fn secondaryIndexRebuildRangeStateValid(state: []const u8) bool {
+    return std.mem.eql(u8, state, secondary_index_rebuild_declared) or
+        std.mem.eql(u8, state, secondary_index_rebuild_building) or
+        std.mem.eql(u8, state, secondary_index_rebuild_ready) or
+        std.mem.eql(u8, state, secondary_index_rebuild_invalid);
+}
+
+pub fn secondaryIndexRebuildRangeComplete(record: SecondaryIndexRebuildRangeRecord) bool {
+    return std.mem.eql(u8, record.state, secondary_index_rebuild_ready);
 }
 
 pub const node_lifecycle_active = "active";
@@ -402,6 +474,7 @@ pub const TableManager = struct {
     ranges: std.AutoHashMapUnmanaged(u64, RangeRecord) = .empty,
     foreign_key_ref_ranges: std.ArrayListUnmanaged(ForeignKeyReferenceRangeRecord) = .empty,
     unique_constraint_ranges: std.ArrayListUnmanaged(UniqueConstraintRangeRecord) = .empty,
+    secondary_index_rebuild_ranges: std.ArrayListUnmanaged(SecondaryIndexRebuildRangeRecord) = .empty,
     split_intents: std.AutoHashMapUnmanaged(u64, SplitIntent) = .empty,
     merge_intents: std.AutoHashMapUnmanaged(u64, MergeIntent) = .empty,
 
@@ -423,6 +496,9 @@ pub const TableManager = struct {
 
         for (self.unique_constraint_ranges.items) |record| freeUniqueConstraintRange(self.alloc, record);
         self.unique_constraint_ranges.deinit(self.alloc);
+
+        for (self.secondary_index_rebuild_ranges.items) |record| freeSecondaryIndexRebuildRange(self.alloc, record);
+        self.secondary_index_rebuild_ranges.deinit(self.alloc);
 
         var split_it = self.split_intents.valueIterator();
         while (split_it.next()) |intent| freeSplitIntent(self.alloc, intent.*);
@@ -455,6 +531,7 @@ pub const TableManager = struct {
         if (normalized.range_id == 0) normalized.range_id = normalized.group_id;
         if (self.foreignKeyReferenceRangeGroupExists(record.group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
         if (self.uniqueConstraintRangeGroupExists(record.group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (self.secondaryIndexRebuildRangeGroupExists(record.group_id)) return error.SecondaryIndexRebuildRangeGroupCollision;
         const owned = try cloneRange(self.alloc, normalized);
         errdefer freeRange(self.alloc, owned);
         if (self.ranges.getPtr(record.group_id)) |existing| {
@@ -473,6 +550,7 @@ pub const TableManager = struct {
         if (!foreignKeyReferenceRangeStateValid(record.state)) return error.InvalidForeignKeyReferenceRangeState;
         if (self.ranges.contains(record.group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
         if (self.uniqueConstraintRangeGroupExists(record.group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (self.secondaryIndexRebuildRangeGroupExists(record.group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
         if (record.end_parent_key) |end_parent_key| {
             if (std.mem.order(u8, record.start_parent_key, end_parent_key) != .lt) return error.InvalidForeignKeyReferenceRange;
         }
@@ -500,6 +578,7 @@ pub const TableManager = struct {
         if (!uniqueConstraintRangeStateValid(record.state)) return error.InvalidUniqueConstraintRangeState;
         if (self.ranges.contains(record.group_id)) return error.UniqueConstraintRangeGroupCollision;
         if (self.foreignKeyReferenceRangeGroupExists(record.group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (self.secondaryIndexRebuildRangeGroupExists(record.group_id)) return error.UniqueConstraintRangeGroupCollision;
         if (record.end_encoded_value) |end_encoded_value| {
             if (std.mem.order(u8, record.start_encoded_value, end_encoded_value) != .lt) return error.InvalidUniqueConstraintRange;
         }
@@ -521,6 +600,36 @@ pub const TableManager = struct {
         try self.unique_constraint_ranges.append(self.alloc, owned);
     }
 
+    pub fn upsertSecondaryIndexRebuildRange(self: *TableManager, record: SecondaryIndexRebuildRangeRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
+        if (!self.tables.contains(record.table_id)) return error.UnknownTable;
+        if (record.index_name.len == 0) return error.InvalidSecondaryIndex;
+        if (record.index_generation == 0) return error.InvalidSecondaryIndexGeneration;
+        if (!secondaryIndexRebuildRangeStateValid(record.state)) return error.InvalidSecondaryIndexRebuildRangeState;
+        if (self.ranges.contains(record.group_id)) return error.SecondaryIndexRebuildRangeGroupCollision;
+        if (self.foreignKeyReferenceRangeGroupExists(record.group_id)) return error.SecondaryIndexRebuildRangeGroupCollision;
+        if (self.uniqueConstraintRangeGroupExists(record.group_id)) return error.SecondaryIndexRebuildRangeGroupCollision;
+        if (record.end_row_key) |end_row_key| {
+            if (std.mem.order(u8, record.start_row_key, end_row_key) != .lt) return error.InvalidSecondaryIndexRebuildRange;
+        }
+        for (self.secondary_index_rebuild_ranges.items) |existing| {
+            if (secondaryIndexRebuildRangeIdentityMatches(existing, record)) continue;
+            if (existing.group_id == record.group_id) return error.SecondaryIndexRebuildRangeGroupCollision;
+            if (!secondaryIndexRebuildRangeIndexMatches(existing, record)) continue;
+            if (secondaryIndexRebuildRangesOverlap(existing, record)) return error.SecondaryIndexRebuildRangeOverlap;
+        }
+
+        const owned = try cloneSecondaryIndexRebuildRange(self.alloc, record);
+        errdefer freeSecondaryIndexRebuildRange(self.alloc, owned);
+        for (self.secondary_index_rebuild_ranges.items) |*existing| {
+            if (!secondaryIndexRebuildRangeIdentityMatches(existing.*, record)) continue;
+            freeSecondaryIndexRebuildRange(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.secondary_index_rebuild_ranges.append(self.alloc, owned);
+    }
+
     pub fn clearTopology(self: *TableManager) void {
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
@@ -535,6 +644,9 @@ pub const TableManager = struct {
 
         for (self.unique_constraint_ranges.items) |record| freeUniqueConstraintRange(self.alloc, record);
         self.unique_constraint_ranges.clearRetainingCapacity();
+
+        for (self.secondary_index_rebuild_ranges.items) |record| freeSecondaryIndexRebuildRange(self.alloc, record);
+        self.secondary_index_rebuild_ranges.clearRetainingCapacity();
     }
 
     pub fn replaceTopology(self: *TableManager, tables: []const TableRecord, ranges: []const RangeRecord) !void {
@@ -557,11 +669,23 @@ pub const TableManager = struct {
         foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
         unique_constraint_ranges: []const UniqueConstraintRangeRecord,
     ) !void {
+        try self.replaceTopologyWithDerivedRanges(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, &.{});
+    }
+
+    pub fn replaceTopologyWithDerivedRanges(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+        unique_constraint_ranges: []const UniqueConstraintRangeRecord,
+        secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
+    ) !void {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
         for (ranges) |record| try self.upsertRange(record);
         for (foreign_key_ref_ranges) |record| try self.upsertForeignKeyReferenceRange(record);
         for (unique_constraint_ranges) |record| try self.upsertUniqueConstraintRange(record);
+        for (secondary_index_rebuild_ranges) |record| try self.upsertSecondaryIndexRebuildRange(record);
     }
 
     pub const ProjectedTopologyLoadResult = struct {
@@ -588,6 +712,17 @@ pub const TableManager = struct {
         foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
         unique_constraint_ranges: []const UniqueConstraintRangeRecord,
     ) !ProjectedTopologyLoadResult {
+        return try self.replaceProjectedTopologyWithDerivedRanges(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, &.{});
+    }
+
+    pub fn replaceProjectedTopologyWithDerivedRanges(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+        unique_constraint_ranges: []const UniqueConstraintRangeRecord,
+        secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
+    ) !ProjectedTopologyLoadResult {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
 
@@ -613,6 +748,13 @@ pub const TableManager = struct {
             }
             try self.upsertUniqueConstraintRange(record);
         }
+        for (secondary_index_rebuild_ranges) |record| {
+            if (!self.tables.contains(record.table_id)) {
+                result.skipped_orphan_ranges += 1;
+                continue;
+            }
+            try self.upsertSecondaryIndexRebuildRange(record);
+        }
         return result;
     }
 
@@ -622,6 +764,7 @@ pub const TableManager = struct {
             freeTable(self.alloc, entry.value);
             _ = self.removeForeignKeyReferenceRangesForTable(table_id);
             _ = self.removeUniqueConstraintRangesForTable(table_id);
+            _ = self.removeSecondaryIndexRebuildRangesForTable(table_id);
             return true;
         }
         return false;
@@ -716,6 +859,41 @@ pub const TableManager = struct {
             if (!std.mem.eql(u8, record.start_encoded_value, start_encoded_value)) continue;
             freeUniqueConstraintRange(self.alloc, record);
             _ = self.unique_constraint_ranges.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn removeSecondaryIndexRebuildRangesForTable(self: *TableManager, table_id: u64) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.secondary_index_rebuild_ranges.items.len) {
+            const record = self.secondary_index_rebuild_ranges.items[i];
+            if (record.table_id != table_id) {
+                i += 1;
+                continue;
+            }
+            freeSecondaryIndexRebuildRange(self.alloc, record);
+            _ = self.secondary_index_rebuild_ranges.orderedRemove(i);
+            removed += 1;
+        }
+        return removed;
+    }
+
+    pub fn removeSecondaryIndexRebuildRange(
+        self: *TableManager,
+        table_id: u64,
+        index_name: []const u8,
+        index_generation: u64,
+        start_row_key: []const u8,
+    ) bool {
+        for (self.secondary_index_rebuild_ranges.items, 0..) |record, i| {
+            if (record.table_id != table_id) continue;
+            if (record.index_generation != index_generation) continue;
+            if (!std.mem.eql(u8, record.index_name, index_name)) continue;
+            if (!std.mem.eql(u8, record.start_row_key, start_row_key)) continue;
+            freeSecondaryIndexRebuildRange(self.alloc, record);
+            _ = self.secondary_index_rebuild_ranges.orderedRemove(i);
             return true;
         }
         return false;
@@ -1017,6 +1195,69 @@ pub const TableManager = struct {
         self.upsertUniqueConstraintRange(record) catch {};
     }
 
+    pub fn beginSecondaryIndexRebuildRange(self: *TableManager, request: SecondaryIndexRebuildRangeBeginRequest) !void {
+        const selector = request.selector;
+        const record = self.findSecondaryIndexRebuildRange(selector) orelse return error.UnknownSecondaryIndexRebuildRange;
+        const claimable = std.mem.eql(u8, record.state, secondary_index_rebuild_declared) or
+            (std.mem.eql(u8, record.state, secondary_index_rebuild_building) and record.lease_expires_at_ms != 0 and record.lease_expires_at_ms <= request.now_ms);
+        if (!claimable) {
+            if (std.mem.eql(u8, record.state, secondary_index_rebuild_building)) return error.SecondaryIndexRebuildRangeClaimBusy;
+            return error.SecondaryIndexRebuildRangeNotDeclared;
+        }
+        var updated = record.*;
+        updated.state = secondary_index_rebuild_building;
+        updated.lease_owner = request.lease_owner;
+        updated.lease_expires_at_ms = request.lease_expires_at_ms;
+        updated.attempts +%= 1;
+        updated.topology_epoch +%= 1;
+        try self.upsertSecondaryIndexRebuildRange(updated);
+    }
+
+    pub fn finishSecondaryIndexRebuildRange(self: *TableManager, request: SecondaryIndexRebuildRangeFinishRequest) !void {
+        const selector = request.selector;
+        const record = self.findSecondaryIndexRebuildRange(selector) orelse return error.UnknownSecondaryIndexRebuildRange;
+        if (!std.mem.eql(u8, record.state, secondary_index_rebuild_building)) return error.SecondaryIndexRebuildRangeNotBuilding;
+        var updated = record.*;
+        updated.state = secondary_index_rebuild_ready;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.completed_row_count = request.completed_row_count;
+        updated.progress_row_key = request.progress_row_key;
+        updated.last_error = "";
+        updated.topology_epoch +%= 1;
+        try self.upsertSecondaryIndexRebuildRange(updated);
+    }
+
+    pub fn invalidateSecondaryIndexRebuildRange(self: *TableManager, request: SecondaryIndexRebuildRangeInvalidateRequest) !void {
+        const selector = request.selector;
+        const record = self.findSecondaryIndexRebuildRange(selector) orelse return error.UnknownSecondaryIndexRebuildRange;
+        var updated = record.*;
+        updated.state = secondary_index_rebuild_invalid;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.last_error;
+        updated.topology_epoch +%= 1;
+        try self.upsertSecondaryIndexRebuildRange(updated);
+    }
+
+    fn secondaryIndexRebuildRangeGroupExists(self: *const TableManager, group_id: u64) bool {
+        for (self.secondary_index_rebuild_ranges.items) |record| {
+            if (record.group_id == group_id) return true;
+        }
+        return false;
+    }
+
+    fn findSecondaryIndexRebuildRange(self: *TableManager, selector: SecondaryIndexRebuildRangeSelector) ?*SecondaryIndexRebuildRangeRecord {
+        for (self.secondary_index_rebuild_ranges.items) |*record| {
+            if (record.table_id != selector.table_id) continue;
+            if (record.index_generation != selector.index_generation) continue;
+            if (!std.mem.eql(u8, record.index_name, selector.index_name)) continue;
+            if (!std.mem.eql(u8, record.start_row_key, selector.start_row_key)) continue;
+            return record;
+        }
+        return null;
+    }
+
     pub fn listTables(self: *TableManager, alloc: std.mem.Allocator) ![]TableRecord {
         var out = std.ArrayListUnmanaged(TableRecord).empty;
         errdefer {
@@ -1076,6 +1317,21 @@ pub const TableManager = struct {
 
     pub fn freeUniqueConstraintRanges(_: *TableManager, alloc: std.mem.Allocator, records: []UniqueConstraintRangeRecord) void {
         for (records) |record| freeUniqueConstraintRange(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listSecondaryIndexRebuildRanges(self: *TableManager, alloc: std.mem.Allocator) ![]SecondaryIndexRebuildRangeRecord {
+        var out = std.ArrayListUnmanaged(SecondaryIndexRebuildRangeRecord).empty;
+        errdefer {
+            for (out.items) |record| freeSecondaryIndexRebuildRange(alloc, record);
+            out.deinit(alloc);
+        }
+        for (self.secondary_index_rebuild_ranges.items) |record| try out.append(alloc, try cloneSecondaryIndexRebuildRange(alloc, record));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeSecondaryIndexRebuildRanges(_: *TableManager, alloc: std.mem.Allocator, records: []SecondaryIndexRebuildRangeRecord) void {
+        for (records) |record| freeSecondaryIndexRebuildRange(alloc, record);
         alloc.free(records);
     }
 
@@ -1446,6 +1702,29 @@ fn uniqueConstraintRangesAdjacent(left: UniqueConstraintRangeRecord, right: Uniq
     return std.mem.eql(u8, left_end, right.start_encoded_value);
 }
 
+fn secondaryIndexRebuildRangeIdentityMatches(a: SecondaryIndexRebuildRangeRecord, b: SecondaryIndexRebuildRangeRecord) bool {
+    return a.table_id == b.table_id and
+        a.index_generation == b.index_generation and
+        std.mem.eql(u8, a.index_name, b.index_name) and
+        std.mem.eql(u8, a.start_row_key, b.start_row_key);
+}
+
+fn secondaryIndexRebuildRangeIndexMatches(a: SecondaryIndexRebuildRangeRecord, b: SecondaryIndexRebuildRangeRecord) bool {
+    return a.table_id == b.table_id and
+        a.index_generation == b.index_generation and
+        std.mem.eql(u8, a.index_name, b.index_name);
+}
+
+fn secondaryIndexRebuildRangesOverlap(a: SecondaryIndexRebuildRangeRecord, b: SecondaryIndexRebuildRangeRecord) bool {
+    if (a.end_row_key) |a_end| {
+        if (std.mem.order(u8, a_end, b.start_row_key) != .gt) return false;
+    }
+    if (b.end_row_key) |b_end| {
+        if (std.mem.order(u8, b_end, a.start_row_key) != .gt) return false;
+    }
+    return true;
+}
+
 pub fn cloneForeignKeyReferenceRange(alloc: std.mem.Allocator, record: ForeignKeyReferenceRangeRecord) !ForeignKeyReferenceRangeRecord {
     const constraint_name = try alloc.dupe(u8, record.constraint_name);
     errdefer alloc.free(constraint_name);
@@ -1499,6 +1778,49 @@ pub fn freeUniqueConstraintRange(alloc: std.mem.Allocator, record: UniqueConstra
     alloc.free(record.start_encoded_value);
     freeOwnedOptional(alloc, record.end_encoded_value);
     alloc.free(record.state);
+}
+
+pub fn cloneSecondaryIndexRebuildRange(alloc: std.mem.Allocator, record: SecondaryIndexRebuildRangeRecord) !SecondaryIndexRebuildRangeRecord {
+    const index_name = try alloc.dupe(u8, record.index_name);
+    errdefer alloc.free(index_name);
+    const start_row_key = try alloc.dupe(u8, record.start_row_key);
+    errdefer alloc.free(start_row_key);
+    const end_row_key = try cloneOwnedOptional(alloc, record.end_row_key);
+    errdefer freeOwnedOptional(alloc, end_row_key);
+    const state = try alloc.dupe(u8, record.state);
+    errdefer alloc.free(state);
+    const lease_owner = try alloc.dupe(u8, record.lease_owner);
+    errdefer alloc.free(lease_owner);
+    const progress_row_key = try alloc.dupe(u8, record.progress_row_key);
+    errdefer alloc.free(progress_row_key);
+    const last_error = try alloc.dupe(u8, record.last_error);
+    errdefer alloc.free(last_error);
+    return .{
+        .table_id = record.table_id,
+        .index_name = index_name,
+        .index_generation = record.index_generation,
+        .start_row_key = start_row_key,
+        .end_row_key = end_row_key,
+        .group_id = record.group_id,
+        .topology_epoch = record.topology_epoch,
+        .state = state,
+        .lease_owner = lease_owner,
+        .lease_expires_at_ms = record.lease_expires_at_ms,
+        .attempts = record.attempts,
+        .completed_row_count = record.completed_row_count,
+        .progress_row_key = progress_row_key,
+        .last_error = last_error,
+    };
+}
+
+pub fn freeSecondaryIndexRebuildRange(alloc: std.mem.Allocator, record: SecondaryIndexRebuildRangeRecord) void {
+    alloc.free(record.index_name);
+    alloc.free(record.start_row_key);
+    freeOwnedOptional(alloc, record.end_row_key);
+    alloc.free(record.state);
+    alloc.free(record.lease_owner);
+    alloc.free(record.progress_row_key);
+    alloc.free(record.last_error);
 }
 
 pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) !RestoreProgressRecord {
@@ -2486,6 +2808,165 @@ test "table manager applies unique constraint range lifecycle operations" {
         try std.testing.expect(ranges[0].end_encoded_value == null);
         try std.testing.expectEqual(@as(u64, 7101), ranges[0].group_id);
         try std.testing.expectEqualStrings(unique_constraint_range_active, ranges[0].state);
+    }
+}
+
+test "table manager owns secondary index rebuild work ranges" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_status_idx",
+        .index_generation = 42,
+        .start_row_key = "",
+        .end_row_key = "order:m",
+        .group_id = 8101,
+        .topology_epoch = 11,
+    });
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_status_idx",
+        .index_generation = 42,
+        .start_row_key = "order:m",
+        .end_row_key = null,
+        .group_id = 8102,
+        .topology_epoch = 12,
+    });
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_email_idx",
+        .index_generation = 99,
+        .start_row_key = "",
+        .end_row_key = null,
+        .group_id = 8103,
+        .state = secondary_index_rebuild_building,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 1234,
+    });
+    try std.testing.expectError(error.InvalidSecondaryIndexRebuildRangeState, manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_email_idx",
+        .index_generation = 99,
+        .start_row_key = "order:z",
+        .end_row_key = null,
+        .group_id = 8104,
+        .state = "unknown",
+    }));
+    try std.testing.expectError(error.InvalidSecondaryIndexGeneration, manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_bad_idx",
+        .index_generation = 0,
+        .start_row_key = "",
+        .end_row_key = null,
+        .group_id = 8104,
+    }));
+    try std.testing.expectError(error.SecondaryIndexRebuildRangeOverlap, manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_status_idx",
+        .index_generation = 42,
+        .start_row_key = "order:h",
+        .end_row_key = "order:t",
+        .group_id = 8105,
+    }));
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_status_idx",
+        .index_generation = 42,
+        .start_row_key = "order:m",
+        .end_row_key = null,
+        .group_id = 8112,
+        .topology_epoch = 22,
+    });
+    try std.testing.expectError(error.SecondaryIndexRebuildRangeGroupCollision, manager.upsertRange(.{
+        .group_id = 8112,
+        .table_id = 7,
+        .start_key = "order:a",
+        .end_key = "order:z",
+    }));
+
+    const listed = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+    defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 3), listed.len);
+
+    var saw_replaced = false;
+    for (listed) |record| {
+        if (!std.mem.eql(u8, record.index_name, "orders_status_idx")) continue;
+        if (!std.mem.eql(u8, record.start_row_key, "order:m")) continue;
+        try std.testing.expectEqual(@as(u64, 8112), record.group_id);
+        try std.testing.expectEqual(@as(u64, 22), record.topology_epoch);
+        saw_replaced = true;
+    }
+    try std.testing.expect(saw_replaced);
+
+    try std.testing.expectEqual(@as(usize, 3), manager.removeSecondaryIndexRebuildRangesForTable(7));
+    const remaining = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+    defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "table manager applies secondary index rebuild lifecycle operations" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    const selector: SecondaryIndexRebuildRangeSelector = .{
+        .table_id = 7,
+        .index_name = "orders_status_idx",
+        .index_generation = 42,
+        .start_row_key = "",
+    };
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_status_idx",
+        .index_generation = 42,
+        .start_row_key = "",
+        .end_row_key = null,
+        .group_id = 8101,
+    });
+
+    try manager.beginSecondaryIndexRebuildRange(.{ .selector = selector, .lease_owner = "worker-a", .now_ms = 1000, .lease_expires_at_ms = 1234 });
+    {
+        const ranges = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+        defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings(secondary_index_rebuild_building, ranges[0].state);
+        try std.testing.expectEqualStrings("worker-a", ranges[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 1234), ranges[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 1), ranges[0].attempts);
+    }
+    try std.testing.expectError(error.SecondaryIndexRebuildRangeClaimBusy, manager.beginSecondaryIndexRebuildRange(.{ .selector = selector, .lease_owner = "worker-b", .now_ms = 1200, .lease_expires_at_ms = 2000 }));
+    try manager.beginSecondaryIndexRebuildRange(.{ .selector = selector, .lease_owner = "worker-b", .now_ms = 1234, .lease_expires_at_ms = 2000 });
+    {
+        const ranges = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+        defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqualStrings(secondary_index_rebuild_building, ranges[0].state);
+        try std.testing.expectEqualStrings("worker-b", ranges[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 2000), ranges[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 2), ranges[0].attempts);
+    }
+
+    try manager.finishSecondaryIndexRebuildRange(.{ .selector = selector, .completed_row_count = 17, .progress_row_key = "order:z" });
+    {
+        const ranges = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+        defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqualStrings(secondary_index_rebuild_ready, ranges[0].state);
+        try std.testing.expect(secondaryIndexRebuildRangeComplete(ranges[0]));
+        try std.testing.expectEqualStrings("", ranges[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 0), ranges[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u64, 17), ranges[0].completed_row_count);
+        try std.testing.expectEqualStrings("order:z", ranges[0].progress_row_key);
+    }
+
+    try std.testing.expectError(error.SecondaryIndexRebuildRangeNotDeclared, manager.beginSecondaryIndexRebuildRange(.{ .selector = selector, .lease_owner = "worker-b", .now_ms = 5678, .lease_expires_at_ms = 6000 }));
+    try manager.invalidateSecondaryIndexRebuildRange(.{ .selector = selector, .last_error = "schema generation moved" });
+    {
+        const ranges = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+        defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqualStrings(secondary_index_rebuild_invalid, ranges[0].state);
+        try std.testing.expectEqualStrings("schema generation moved", ranges[0].last_error);
     }
 }
 

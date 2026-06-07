@@ -56,6 +56,7 @@ pub const CurrentMetadataState = struct {
     ranges: []const table_manager.RangeRecord = &.{},
     foreign_key_ref_ranges: []const table_manager.ForeignKeyReferenceRangeRecord = &.{},
     unique_constraint_ranges: []const table_manager.UniqueConstraintRangeRecord = &.{},
+    secondary_index_rebuild_ranges: []const table_manager.SecondaryIndexRebuildRangeRecord = &.{},
     stores: []const table_manager.StoreRecord = &.{},
     merged_group_statuses: []const MergedGroupStatus = &.{},
     restore_progresses: []const table_manager.RestoreProgressRecord = &.{},
@@ -126,6 +127,7 @@ pub const ReconciliationPlan = struct {
     range_upserts: []table_manager.RangeRecord,
     foreign_key_ref_range_upserts: []table_manager.ForeignKeyReferenceRangeRecord,
     unique_constraint_range_upserts: []table_manager.UniqueConstraintRangeRecord,
+    secondary_index_rebuild_range_upserts: []table_manager.SecondaryIndexRebuildRangeRecord,
     split_upserts: []transition_state.SplitTransitionRecord,
     merge_upserts: []transition_state.MergeTransitionRecord,
     placement_removals: []PlacementRemoval,
@@ -133,6 +135,7 @@ pub const ReconciliationPlan = struct {
     range_removals: []u64,
     foreign_key_ref_range_removals: []table_manager.ForeignKeyReferenceRangeRecord,
     unique_constraint_range_removals: []table_manager.UniqueConstraintRangeRecord,
+    secondary_index_rebuild_range_removals: []table_manager.SecondaryIndexRebuildRangeRecord,
     split_removals: []u64,
     merge_removals: []u64,
     split_steps: []PlannedSplitStep,
@@ -149,6 +152,7 @@ pub const ReconciliationPlan = struct {
             .range_upserts = &.{},
             .foreign_key_ref_range_upserts = &.{},
             .unique_constraint_range_upserts = &.{},
+            .secondary_index_rebuild_range_upserts = &.{},
             .split_upserts = &.{},
             .merge_upserts = &.{},
             .placement_removals = &.{},
@@ -156,6 +160,7 @@ pub const ReconciliationPlan = struct {
             .range_removals = &.{},
             .foreign_key_ref_range_removals = &.{},
             .unique_constraint_range_removals = &.{},
+            .secondary_index_rebuild_range_removals = &.{},
             .split_removals = &.{},
             .merge_removals = &.{},
             .split_steps = &.{},
@@ -182,6 +187,8 @@ pub const ReconciliationPlan = struct {
         alloc.free(self.foreign_key_ref_range_upserts);
         for (self.unique_constraint_range_upserts) |record| table_manager.freeUniqueConstraintRange(alloc, record);
         alloc.free(self.unique_constraint_range_upserts);
+        for (self.secondary_index_rebuild_range_upserts) |record| table_manager.freeSecondaryIndexRebuildRange(alloc, record);
+        alloc.free(self.secondary_index_rebuild_range_upserts);
         for (self.split_upserts) |record| table_manager.freeSplitTransitionRecord(alloc, record);
         alloc.free(self.split_upserts);
         for (self.merge_upserts) |record| table_manager.freeMergeTransitionRecord(alloc, record);
@@ -193,6 +200,8 @@ pub const ReconciliationPlan = struct {
         alloc.free(self.foreign_key_ref_range_removals);
         for (self.unique_constraint_range_removals) |record| table_manager.freeUniqueConstraintRange(alloc, record);
         alloc.free(self.unique_constraint_range_removals);
+        for (self.secondary_index_rebuild_range_removals) |record| table_manager.freeSecondaryIndexRebuildRange(alloc, record);
+        alloc.free(self.secondary_index_rebuild_range_removals);
         alloc.free(self.split_removals);
         alloc.free(self.merge_removals);
         for (self.split_steps) |step| table_manager.freeSplitTransitionRecord(alloc, step.record);
@@ -311,6 +320,7 @@ pub const Reconciler = struct {
                 try self.ensureUniqueOwnerRange(manager, ranges, table.table_id, relational_store.primary_key_constraint_name);
             }
             for (parsed.unique_constraints) |constraint| {
+                if (constraint.validation_state != .enforced) continue;
                 try self.ensureUniqueOwnerRange(manager, ranges, table.table_id, constraint.name);
             }
         }
@@ -334,6 +344,52 @@ pub const Reconciler = struct {
             .topology_epoch = 1,
             .state = table_manager.unique_constraint_range_active,
         });
+    }
+
+    pub fn syncAutomaticSecondaryIndexRebuildRanges(
+        self: *Reconciler,
+        manager: *table_manager.TableManager,
+    ) !void {
+        const tables = try manager.listTables(self.alloc);
+        defer manager.freeTables(self.alloc, tables);
+        const ranges = try manager.listRanges(self.alloc);
+        defer manager.freeRanges(self.alloc, ranges);
+
+        const existing_ranges = try manager.listSecondaryIndexRebuildRanges(self.alloc);
+        defer manager.freeSecondaryIndexRebuildRanges(self.alloc, existing_ranges);
+
+        for (existing_ranges) |record| {
+            if (try secondaryIndexRebuildRangeStillDeclared(self.alloc, tables, ranges, record)) continue;
+            _ = manager.removeSecondaryIndexRebuildRange(record.table_id, record.index_name, record.index_generation, record.start_row_key);
+        }
+
+        for (tables) |table| {
+            if (table.schema_json.len == 0) continue;
+            var parsed = schema_mod.parseValidatedTableSchema(self.alloc, table.schema_json) catch continue;
+            defer parsed.deinit(self.alloc);
+            if (parsed.storage_mode != .relational) continue;
+            const runtime = schema_mod.deriveRuntimeTableSchema(self.alloc, parsed) catch continue;
+            defer @import("../storage/schema.zig").freeSchema(self.alloc, runtime);
+
+            for (runtime.relational_columns) |column| {
+                if (!secondaryIndexColumnNeedsRebuild(column)) continue;
+                for (ranges) |range| {
+                    if (range.table_id != table.table_id) continue;
+                    if (secondaryIndexRebuildRangeIdentityExists(self.alloc, manager, table.table_id, column.name, column.index_generation, range.start_key)) continue;
+                    const group_id = try deriveSecondaryIndexRebuildGroupId(self.alloc, manager, ranges, table.table_id, column.name, column.index_generation, range.start_key);
+                    try manager.upsertSecondaryIndexRebuildRange(.{
+                        .table_id = table.table_id,
+                        .index_name = column.name,
+                        .index_generation = column.index_generation,
+                        .start_row_key = range.start_key,
+                        .end_row_key = range.end_key,
+                        .group_id = group_id,
+                        .topology_epoch = 1,
+                        .state = table_manager.secondary_index_rebuild_declared,
+                    });
+                }
+            }
+        }
     }
 
     fn preserveCurrentDeclaredConstraintOwnerRanges(
@@ -383,6 +439,14 @@ pub const Reconciler = struct {
             if (!preservedUniqueConstraintOwnerContains(preserved_unique_owners.items, record.table_id, record.constraint_name)) continue;
             try manager.upsertUniqueConstraintRange(record);
         }
+
+        const ranges = try manager.listRanges(self.alloc);
+        defer manager.freeRanges(self.alloc, ranges);
+        for (current.secondary_index_rebuild_ranges) |record| {
+            if (!(try secondaryIndexRebuildRangeStillDeclared(self.alloc, tables, ranges, record))) continue;
+            _ = manager.removeSecondaryIndexRebuildRange(record.table_id, record.index_name, record.index_generation, record.start_row_key);
+            try manager.upsertSecondaryIndexRebuildRange(record);
+        }
     }
 
     pub fn computePlan(
@@ -399,6 +463,7 @@ pub const Reconciler = struct {
         var planner = placement_planner.PlacementPlanner.init(self.alloc);
         try self.syncAutomaticForeignKeyReferenceOwnerRanges(manager);
         try self.syncAutomaticUniqueConstraintOwnerRanges(manager);
+        try self.syncAutomaticSecondaryIndexRebuildRanges(manager);
         try self.preserveCurrentDeclaredConstraintOwnerRanges(manager, current);
         const desired_tables = try manager.listTables(self.alloc);
         defer manager.freeTables(self.alloc, desired_tables);
@@ -408,6 +473,8 @@ pub const Reconciler = struct {
         defer manager.freeForeignKeyReferenceRanges(self.alloc, desired_foreign_key_ref_ranges);
         const desired_unique_constraint_ranges = try manager.listUniqueConstraintRanges(self.alloc);
         defer manager.freeUniqueConstraintRanges(self.alloc, desired_unique_constraint_ranges);
+        const desired_secondary_index_rebuild_ranges = try manager.listSecondaryIndexRebuildRanges(self.alloc);
+        defer manager.freeSecondaryIndexRebuildRanges(self.alloc, desired_secondary_index_rebuild_ranges);
         const candidate_domains = try self.alloc.alloc(placement_planner.CandidateDomain, placement_candidate_info.len);
         defer self.alloc.free(candidate_domains);
         for (placement_candidate_info, 0..) |candidate, i| {
@@ -463,6 +530,11 @@ pub const Reconciler = struct {
             for (unique_constraint_range_upserts.items) |record| table_manager.freeUniqueConstraintRange(self.alloc, record);
             unique_constraint_range_upserts.deinit(self.alloc);
         }
+        var secondary_index_rebuild_range_upserts = std.ArrayListUnmanaged(table_manager.SecondaryIndexRebuildRangeRecord).empty;
+        errdefer {
+            for (secondary_index_rebuild_range_upserts.items) |record| table_manager.freeSecondaryIndexRebuildRange(self.alloc, record);
+            secondary_index_rebuild_range_upserts.deinit(self.alloc);
+        }
         var split_upserts = std.ArrayListUnmanaged(transition_state.SplitTransitionRecord).empty;
         errdefer {
             for (split_upserts.items) |record| table_manager.freeSplitTransitionRecord(self.alloc, record);
@@ -488,6 +560,11 @@ pub const Reconciler = struct {
         errdefer {
             for (unique_constraint_range_removals.items) |record| table_manager.freeUniqueConstraintRange(self.alloc, record);
             unique_constraint_range_removals.deinit(self.alloc);
+        }
+        var secondary_index_rebuild_range_removals = std.ArrayListUnmanaged(table_manager.SecondaryIndexRebuildRangeRecord).empty;
+        errdefer {
+            for (secondary_index_rebuild_range_removals.items) |record| table_manager.freeSecondaryIndexRebuildRange(self.alloc, record);
+            secondary_index_rebuild_range_removals.deinit(self.alloc);
         }
         var split_removals = std.ArrayListUnmanaged(u64).empty;
         errdefer split_removals.deinit(self.alloc);
@@ -534,6 +611,12 @@ pub const Reconciler = struct {
             const existing = findUniqueConstraintRangeRecord(current.unique_constraint_ranges, desired);
             if (existing == null or !uniqueConstraintRangeRecordsEqual(existing.?, desired)) {
                 try unique_constraint_range_upserts.append(self.alloc, try table_manager.cloneUniqueConstraintRange(self.alloc, desired));
+            }
+        }
+        for (desired_secondary_index_rebuild_ranges) |desired| {
+            const existing = findSecondaryIndexRebuildRangeRecord(current.secondary_index_rebuild_ranges, desired);
+            if (existing == null or !secondaryIndexRebuildRangeRecordsEqual(existing.?, desired)) {
+                try secondary_index_rebuild_range_upserts.append(self.alloc, try table_manager.cloneSecondaryIndexRebuildRange(self.alloc, desired));
             }
         }
         for (desired_splits) |desired| {
@@ -632,6 +715,11 @@ pub const Reconciler = struct {
                 try unique_constraint_range_removals.append(self.alloc, try table_manager.cloneUniqueConstraintRange(self.alloc, record));
             }
         }
+        for (current.secondary_index_rebuild_ranges) |record| {
+            if (findSecondaryIndexRebuildRangeRecord(desired_secondary_index_rebuild_ranges, record) == null) {
+                try secondary_index_rebuild_range_removals.append(self.alloc, try table_manager.cloneSecondaryIndexRebuildRange(self.alloc, record));
+            }
+        }
         for (current.split_transitions) |record| {
             if (findSplitRecord(desired_splits, record.transition_id) == null) try split_removals.append(self.alloc, record.transition_id);
         }
@@ -662,6 +750,13 @@ pub const Reconciler = struct {
                 .stable => {},
             }
         }
+        for (desired_secondary_index_rebuild_ranges) |range| {
+            switch (classifyPlacementChange(range.group_id, desired_placements, current.placement_intents, candidate_domains)) {
+                .repair_required => repair_placement_groups += 1,
+                .rebalance => rebalance_placement_groups += 1,
+                .stable => {},
+            }
+        }
 
         return .{
             .placement_upserts = try placement_upserts.toOwnedSlice(self.alloc),
@@ -669,6 +764,7 @@ pub const Reconciler = struct {
             .range_upserts = try range_upserts.toOwnedSlice(self.alloc),
             .foreign_key_ref_range_upserts = try foreign_key_ref_range_upserts.toOwnedSlice(self.alloc),
             .unique_constraint_range_upserts = try unique_constraint_range_upserts.toOwnedSlice(self.alloc),
+            .secondary_index_rebuild_range_upserts = try secondary_index_rebuild_range_upserts.toOwnedSlice(self.alloc),
             .split_upserts = try split_upserts.toOwnedSlice(self.alloc),
             .merge_upserts = try merge_upserts.toOwnedSlice(self.alloc),
             .placement_removals = try placement_removals.toOwnedSlice(self.alloc),
@@ -676,6 +772,7 @@ pub const Reconciler = struct {
             .range_removals = try range_removals.toOwnedSlice(self.alloc),
             .foreign_key_ref_range_removals = try foreign_key_ref_range_removals.toOwnedSlice(self.alloc),
             .unique_constraint_range_removals = try unique_constraint_range_removals.toOwnedSlice(self.alloc),
+            .secondary_index_rebuild_range_removals = try secondary_index_rebuild_range_removals.toOwnedSlice(self.alloc),
             .split_removals = try split_removals.toOwnedSlice(self.alloc),
             .merge_removals = try merge_removals.toOwnedSlice(self.alloc),
             .split_steps = try split_steps.toOwnedSlice(self.alloc),
@@ -1939,6 +2036,7 @@ fn foreignKeyEligibleForRoutedOwner(
         if (stringSlicesEqual(primary_key.columns, foreign_key.references.columns)) return true;
     }
     for (parent_schema.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) continue;
         if (stringSlicesEqual(constraint.columns, foreign_key.references.columns)) return true;
     }
     return false;
@@ -2008,6 +2106,7 @@ fn deriveForeignKeyReferenceOwnerGroupId(
         if (candidate == 0) continue;
         if (rangeGroupIdExists(ranges, candidate)) continue;
         if (foreignKeyReferenceGroupIdExists(alloc, manager, candidate)) continue;
+        if (secondaryIndexRebuildGroupIdExists(alloc, manager, candidate)) continue;
         return candidate;
     }
     return error.ForeignKeyReferenceRangeGroupCollision;
@@ -2047,6 +2146,7 @@ fn uniqueOwnerRangeStillDeclared(
         return parsed.primary_key != null;
     }
     for (parsed.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) continue;
         if (std.mem.eql(u8, constraint.name, record.constraint_name)) return true;
     }
     return false;
@@ -2162,6 +2262,7 @@ fn deriveUniqueConstraintOwnerGroupId(
         if (rangeGroupIdExists(ranges, candidate)) continue;
         if (foreignKeyReferenceGroupIdExists(alloc, manager, candidate)) continue;
         if (uniqueConstraintGroupIdExists(alloc, manager, candidate)) continue;
+        if (secondaryIndexRebuildGroupIdExists(alloc, manager, candidate)) continue;
         return candidate;
     }
     return error.UniqueConstraintRangeGroupCollision;
@@ -2180,6 +2281,104 @@ fn uniqueConstraintGroupIdExists(
     return false;
 }
 
+fn secondaryIndexColumnNeedsRebuild(column: anytype) bool {
+    return column.indexed and
+        column.index_generation != 0 and
+        column.index_lifecycle == .building;
+}
+
+fn secondaryIndexRebuildRangeStillDeclared(
+    alloc: std.mem.Allocator,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+    record: table_manager.SecondaryIndexRebuildRangeRecord,
+) !bool {
+    const table = findTableRecord(tables, record.table_id) orelse return false;
+    if (table.schema_json.len == 0) return false;
+    var parsed = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return false;
+    defer parsed.deinit(alloc);
+    if (parsed.storage_mode != .relational) return false;
+    const runtime = schema_mod.deriveRuntimeTableSchema(alloc, parsed) catch return false;
+    defer @import("../storage/schema.zig").freeSchema(alloc, runtime);
+    var declared = false;
+    for (runtime.relational_columns) |column| {
+        if (!secondaryIndexColumnNeedsRebuild(column)) continue;
+        if (column.index_generation != record.index_generation) continue;
+        if (!std.mem.eql(u8, column.name, record.index_name)) continue;
+        declared = true;
+        break;
+    }
+    if (!declared) return false;
+    for (ranges) |range| {
+        if (range.table_id != record.table_id) continue;
+        if (!std.mem.eql(u8, range.start_key, record.start_row_key)) continue;
+        if (!optionalBytesEqual(range.end_key, record.end_row_key)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn secondaryIndexRebuildRangeIdentityExists(
+    alloc: std.mem.Allocator,
+    manager: *table_manager.TableManager,
+    table_id: u64,
+    index_name: []const u8,
+    index_generation: u64,
+    start_row_key: []const u8,
+) bool {
+    const records = manager.listSecondaryIndexRebuildRanges(alloc) catch return false;
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, records);
+    for (records) |record| {
+        if (record.table_id != table_id) continue;
+        if (record.index_generation != index_generation) continue;
+        if (!std.mem.eql(u8, record.index_name, index_name)) continue;
+        if (!std.mem.eql(u8, record.start_row_key, start_row_key)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn deriveSecondaryIndexRebuildGroupId(
+    alloc: std.mem.Allocator,
+    manager: *table_manager.TableManager,
+    ranges: []const table_manager.RangeRecord,
+    table_id: u64,
+    index_name: []const u8,
+    index_generation: u64,
+    start_row_key: []const u8,
+) !u64 {
+    var attempt: u64 = 0;
+    while (attempt < 64) : (attempt += 1) {
+        var hasher = std.hash.Wyhash.init(0xf011_e916_2026_2001 +% attempt);
+        hasher.update("secondary-index-rebuild");
+        hasher.update(std.mem.asBytes(&table_id));
+        hasher.update(index_name);
+        hasher.update(std.mem.asBytes(&index_generation));
+        hasher.update(start_row_key);
+        const candidate = group_ids.dataGroupIdFromHash(hasher.final());
+        if (candidate == 0) continue;
+        if (rangeGroupIdExists(ranges, candidate)) continue;
+        if (foreignKeyReferenceGroupIdExists(alloc, manager, candidate)) continue;
+        if (uniqueConstraintGroupIdExists(alloc, manager, candidate)) continue;
+        if (secondaryIndexRebuildGroupIdExists(alloc, manager, candidate)) continue;
+        return candidate;
+    }
+    return error.SecondaryIndexRebuildRangeGroupCollision;
+}
+
+fn secondaryIndexRebuildGroupIdExists(
+    alloc: std.mem.Allocator,
+    manager: *table_manager.TableManager,
+    group_id: u64,
+) bool {
+    const records = manager.listSecondaryIndexRebuildRanges(alloc) catch return true;
+    defer manager.freeSecondaryIndexRebuildRanges(alloc, records);
+    for (records) |record| {
+        if (record.group_id == group_id) return true;
+    }
+    return false;
+}
+
 fn uniqueConstraintRangeRecordsEqual(a: table_manager.UniqueConstraintRangeRecord, b: table_manager.UniqueConstraintRangeRecord) bool {
     return a.group_id == b.group_id and
         a.table_id == b.table_id and
@@ -2187,6 +2386,23 @@ fn uniqueConstraintRangeRecordsEqual(a: table_manager.UniqueConstraintRangeRecor
         std.mem.eql(u8, a.start_encoded_value, b.start_encoded_value) and
         optionalBytesEqual(a.end_encoded_value, b.end_encoded_value) and
         std.mem.eql(u8, a.state, b.state) and
+        a.topology_epoch == b.topology_epoch;
+}
+
+fn secondaryIndexRebuildRangeRecordsEqual(a: table_manager.SecondaryIndexRebuildRangeRecord, b: table_manager.SecondaryIndexRebuildRangeRecord) bool {
+    return a.group_id == b.group_id and
+        a.table_id == b.table_id and
+        a.index_generation == b.index_generation and
+        std.mem.eql(u8, a.index_name, b.index_name) and
+        std.mem.eql(u8, a.start_row_key, b.start_row_key) and
+        optionalBytesEqual(a.end_row_key, b.end_row_key) and
+        std.mem.eql(u8, a.state, b.state) and
+        std.mem.eql(u8, a.lease_owner, b.lease_owner) and
+        a.lease_expires_at_ms == b.lease_expires_at_ms and
+        a.attempts == b.attempts and
+        a.completed_row_count == b.completed_row_count and
+        std.mem.eql(u8, a.progress_row_key, b.progress_row_key) and
+        std.mem.eql(u8, a.last_error, b.last_error) and
         a.topology_epoch == b.topology_epoch;
 }
 
@@ -2263,6 +2479,30 @@ fn findUniqueConstraintRangeByGroupId(
     records: []const table_manager.UniqueConstraintRangeRecord,
     group_id: u64,
 ) ?table_manager.UniqueConstraintRangeRecord {
+    for (records) |record| {
+        if (record.group_id == group_id) return record;
+    }
+    return null;
+}
+
+fn findSecondaryIndexRebuildRangeRecord(
+    records: []const table_manager.SecondaryIndexRebuildRangeRecord,
+    target: table_manager.SecondaryIndexRebuildRangeRecord,
+) ?table_manager.SecondaryIndexRebuildRangeRecord {
+    for (records) |record| {
+        if (record.table_id != target.table_id) continue;
+        if (record.index_generation != target.index_generation) continue;
+        if (!std.mem.eql(u8, record.index_name, target.index_name)) continue;
+        if (!std.mem.eql(u8, record.start_row_key, target.start_row_key)) continue;
+        return record;
+    }
+    return null;
+}
+
+fn findSecondaryIndexRebuildRangeByGroupId(
+    records: []const table_manager.SecondaryIndexRebuildRangeRecord,
+    group_id: u64,
+) ?table_manager.SecondaryIndexRebuildRangeRecord {
     for (records) |record| {
         if (record.group_id == group_id) return record;
     }
@@ -2639,7 +2879,7 @@ test "metadata reconciler derives foreign key reference owner ranges from table 
 
 test "metadata reconciler derives primary key and unique owner ranges from table schemas" {
     const schema =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"order_id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["tenant_id","order_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","order_id"]},"unique_constraints":[{"name":"orders_email_key","columns":["email"]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"order_id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["tenant_id","order_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","order_id"]},"unique_constraints":[{"name":"orders_email_key","columns":["email"]},{"name":"orders_email_pending_key","columns":["tenant_id","email"],"validation_state":"unvalidated"}]}
     ;
     const schema_without_owner_constraints =
         \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"order_id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["tenant_id","order_id"],"additionalProperties":false}}}}
@@ -2662,6 +2902,7 @@ test "metadata reconciler derives primary key and unique owner ranges from table
 
     var saw_primary = false;
     var saw_unique = false;
+    var saw_unvalidated_unique = false;
     for (create_plan.unique_constraint_range_upserts) |range| {
         try std.testing.expectEqual(@as(u64, 30), range.table_id);
         try std.testing.expectEqualStrings("", range.start_encoded_value);
@@ -2669,9 +2910,11 @@ test "metadata reconciler derives primary key and unique owner ranges from table
         try std.testing.expectEqualStrings(table_manager.unique_constraint_range_active, range.state);
         if (std.mem.eql(u8, range.constraint_name, relational_store.primary_key_constraint_name)) saw_primary = true;
         if (std.mem.eql(u8, range.constraint_name, "orders_email_key")) saw_unique = true;
+        if (std.mem.eql(u8, range.constraint_name, "orders_email_pending_key")) saw_unvalidated_unique = true;
     }
     try std.testing.expect(saw_primary);
     try std.testing.expect(saw_unique);
+    try std.testing.expect(!saw_unvalidated_unique);
 
     const derived = try manager.listUniqueConstraintRanges(std.testing.allocator);
     defer manager.freeUniqueConstraintRanges(std.testing.allocator, derived);
@@ -2686,6 +2929,74 @@ test "metadata reconciler derives primary key and unique owner ranges from table
     defer remove_plan.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), remove_plan.unique_constraint_range_upserts.len);
     try std.testing.expectEqual(@as(usize, 2), remove_plan.unique_constraint_range_removals.len);
+}
+
+test "metadata reconciler derives secondary index rebuild ranges from building relational indexes" {
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-lifecycle":"building","x-antfly-index-generation":77}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const ready_schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-generation":77}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const table = table_manager.TableRecord{ .table_id = 31, .name = "users", .schema_json = schema };
+    try manager.upsertTable(table);
+    try manager.upsertRange(.{ .group_id = 3101, .table_id = 31, .start_key = "", .end_key = "row:m" });
+    try manager.upsertRange(.{ .group_id = 3102, .table_id = 31, .start_key = "row:m", .end_key = null });
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    defer reconciler.deinit();
+
+    var create_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = &[_]table_manager.TableRecord{table},
+    });
+    defer create_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), create_plan.secondary_index_rebuild_range_upserts.len);
+    for (create_plan.secondary_index_rebuild_range_upserts) |range| {
+        try std.testing.expectEqual(@as(u64, 31), range.table_id);
+        try std.testing.expectEqualStrings("status", range.index_name);
+        try std.testing.expectEqual(@as(u64, 77), range.index_generation);
+        try std.testing.expectEqualStrings(table_manager.secondary_index_rebuild_declared, range.state);
+    }
+
+    const derived = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+    defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, derived);
+    try std.testing.expectEqual(@as(usize, 2), derived.len);
+
+    var current_building = derived[0];
+    current_building.state = table_manager.secondary_index_rebuild_building;
+    current_building.lease_owner = "node-a";
+    current_building.lease_expires_at_ms = 1234;
+    current_building.attempts = 2;
+    current_building.progress_row_key = "row:h";
+    var preserve_manager = table_manager.TableManager.init(std.testing.allocator);
+    defer preserve_manager.deinit();
+    try preserve_manager.upsertTable(table);
+    try preserve_manager.upsertRange(.{ .group_id = 3101, .table_id = 31, .start_key = "", .end_key = "row:m" });
+    try preserve_manager.upsertRange(.{ .group_id = 3102, .table_id = 31, .start_key = "row:m", .end_key = null });
+    var preserve_plan = try reconciler.computePlan(&preserve_manager, &.{}, &.{}, .{
+        .tables = &[_]table_manager.TableRecord{table},
+        .ranges = &[_]table_manager.RangeRecord{
+            .{ .group_id = 3101, .table_id = 31, .start_key = "", .end_key = "row:m" },
+            .{ .group_id = 3102, .table_id = 31, .start_key = "row:m", .end_key = null },
+        },
+        .secondary_index_rebuild_ranges = &[_]table_manager.SecondaryIndexRebuildRangeRecord{current_building},
+    });
+    defer preserve_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), preserve_plan.secondary_index_rebuild_range_upserts.len);
+
+    const ready_table = table_manager.TableRecord{ .table_id = 31, .name = "users", .schema_json = ready_schema };
+    try manager.upsertTable(ready_table);
+    var remove_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = &[_]table_manager.TableRecord{ready_table},
+        .secondary_index_rebuild_ranges = derived,
+    });
+    defer remove_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), remove_plan.secondary_index_rebuild_range_upserts.len);
+    try std.testing.expectEqual(@as(usize, 2), remove_plan.secondary_index_rebuild_range_removals.len);
 }
 
 test "metadata reconciler preserves split foreign key reference owner ranges for active schema foreign keys" {

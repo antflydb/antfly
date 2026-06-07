@@ -136,6 +136,7 @@ pub const AdminSource = struct {
         restore_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
+        apply_relational_sql_ddl: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
         upsert_node: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.NodeRecord) anyerror!void = null,
@@ -197,6 +198,11 @@ pub const AdminSource = struct {
     pub fn updateSchema(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const fn_ptr = self.vtable.update_schema orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, schema_json);
+    }
+
+    pub fn applyRelationalSqlDdl(self: AdminSource, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+        const fn_ptr = self.vtable.apply_relational_sql_ddl orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, sql);
     }
 
     pub fn updateForeignKeyValidationState(
@@ -331,6 +337,7 @@ pub const AdminSource = struct {
                 .restore_table = metadataServiceRestoreTable,
                 .drop_table = metadataServiceDropTable,
                 .update_schema = metadataServiceUpdateSchema,
+                .apply_relational_sql_ddl = metadataServiceApplyRelationalSqlDdl,
                 .create_index = metadataServiceCreateIndex,
                 .drop_index = metadataServiceDropIndex,
                 .upsert_node = metadataServiceUpsertNode,
@@ -366,6 +373,7 @@ pub const AdminSource = struct {
                 .restore_table = metadataHttpServiceRestoreTable,
                 .drop_table = metadataHttpServiceDropTable,
                 .update_schema = metadataHttpServiceUpdateSchema,
+                .apply_relational_sql_ddl = metadataHttpServiceApplyRelationalSqlDdl,
                 .create_index = metadataHttpServiceCreateIndex,
                 .drop_index = metadataHttpServiceDropIndex,
                 .upsert_node = metadataHttpServiceUpsertNode,
@@ -469,6 +477,14 @@ pub const AdminSource = struct {
         try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
         try svc.upsertTable(updated);
         try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceApplyRelationalSqlDdl(ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        var applied = try applyRelationalSqlDdlOnMetadataService(svc, alloc, sql);
+        errdefer applied.deinit(alloc);
+        try flushMetadataServiceMutation(svc);
+        return applied;
     }
 
     fn metadataServiceCreateIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -715,6 +731,14 @@ pub const AdminSource = struct {
         try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
         try svc.upsertTable(updated);
         try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceApplyRelationalSqlDdl(ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        var applied = try applyRelationalSqlDdlOnMetadataService(svc, alloc, sql);
+        errdefer applied.deinit(alloc);
+        try flushMetadataHttpServiceMutation(svc);
+        return applied;
     }
 
     fn metadataHttpServiceCreateIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -1759,6 +1783,53 @@ fn persistRestoreTableIntent(service_impl: anytype, alloc: std.mem.Allocator, ta
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
     _ = try workflow.createTableWithRanges(service_impl, spec.table, spec.ranges);
+}
+
+fn applyRelationalSqlDdlOnMetadataService(
+    service_impl: anytype,
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    var target = try tables_api.relationalSqlDdlTargetAlloc(alloc, sql);
+    defer target.deinit(alloc);
+
+    var snapshot = try service_impl.adminSnapshot();
+    defer service_impl.freeAdminSnapshot(&snapshot);
+
+    if (target.creates_table) {
+        if (findTableByName(&snapshot, target.table_name) != null) return error.TableAlreadyExists;
+        const base_table: metadata_table_manager.TableRecord = .{
+            .table_id = tables_api.deriveTableId(target.table_name),
+            .name = target.table_name,
+            .schema_json = "",
+            .indexes_json = "{}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+            .desired_replica_count = 3,
+            .min_ranges = 1,
+        };
+        var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, &base_table, sql);
+        errdefer applied.deinit(alloc);
+        applied.created_table = true;
+        try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
+
+        const ranges = try tables_api.deriveInitialRanges(alloc, applied.table);
+        defer {
+            for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
+            alloc.free(ranges);
+        }
+        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        _ = try workflow.createTableWithRanges(service_impl, applied.table, ranges);
+        return applied;
+    }
+
+    const table = findTableByName(&snapshot, target.table_name) orelse return error.TableNotFound;
+    var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, table, sql);
+    errdefer applied.deinit(alloc);
+    try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
+    try service_impl.upsertTable(applied.table);
+    return applied;
 }
 
 const ParsedGroupStatus = struct {

@@ -249,6 +249,14 @@ pub fn relationalArrayElementIndexPrefixAlloc(alloc: Allocator, column_path: []c
     return try list.toOwnedSlice(alloc);
 }
 
+pub fn relationalArrayElementIndexColumnPrefixAlloc(alloc: Allocator, column_path: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_array_element_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    return try list.toOwnedSlice(alloc);
+}
+
 pub fn relationalArrayValueIndexKeyAlloc(alloc: Allocator, column_path: []const u8, array_key: []const u8, doc_key: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
@@ -265,6 +273,14 @@ pub fn relationalArrayValueIndexPrefixAlloc(alloc: Allocator, column_path: []con
     try list.append(alloc, relational_array_value_index_namespace);
     try appendEncodedComponent(&list, alloc, column_path);
     try appendEncodedComponent(&list, alloc, array_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalArrayValueIndexColumnPrefixAlloc(alloc: Allocator, column_path: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_array_value_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
     return try list.toOwnedSlice(alloc);
 }
 
@@ -289,6 +305,14 @@ pub fn relationalJsonValueIndexPrefixAlloc(alloc: Allocator, column_path: []cons
     return try list.toOwnedSlice(alloc);
 }
 
+pub fn relationalJsonValueIndexColumnPrefixAlloc(alloc: Allocator, column_path: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_json_value_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    return try list.toOwnedSlice(alloc);
+}
+
 pub fn relationalJsonPathIndexKeyAlloc(alloc: Allocator, column_path: []const u8, json_path: []const u8, doc_key: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
@@ -305,6 +329,14 @@ pub fn relationalJsonPathIndexPrefixAlloc(alloc: Allocator, column_path: []const
     try list.append(alloc, relational_json_path_index_namespace);
     try appendEncodedComponent(&list, alloc, column_path);
     try appendEncodedComponent(&list, alloc, json_path);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalJsonPathIndexColumnPrefixAlloc(alloc: Allocator, column_path: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_json_path_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
     return try list.toOwnedSlice(alloc);
 }
 

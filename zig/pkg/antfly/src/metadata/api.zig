@@ -144,6 +144,37 @@ pub const ForeignKeySchemaControllerStatus = struct {
     last_deleted_stale_ref_rows: u64 = 0,
 };
 
+pub const UniqueConstraintSchemaControllerStatus = struct {
+    enabled: bool = false,
+    worker_id: []const u8 = "",
+    rounds_total: u64 = 0,
+    tables_scanned_total: u64 = 0,
+    tables_with_pending_constraints_total: u64 = 0,
+    tables_executed_total: u64 = 0,
+    terminal_valid_results_total: u64 = 0,
+    terminal_invalid_results_total: u64 = 0,
+    missing_unique_rows_total: u64 = 0,
+    duplicate_unique_rows_total: u64 = 0,
+    stale_unique_rows_total: u64 = 0,
+    repaired_unique_rows_total: u64 = 0,
+    deleted_stale_unique_rows_total: u64 = 0,
+    last_run_at_ms: u64 = 0,
+    last_tables_scanned: usize = 0,
+    last_tables_with_pending_constraints: usize = 0,
+    last_tables_executed: usize = 0,
+    last_terminal_valid_results: usize = 0,
+    last_terminal_invalid_results: usize = 0,
+    last_complete: bool = true,
+    last_valid: bool = true,
+    last_terminal_invalid_table_name: []const u8 = "",
+    last_terminal_invalid_constraint_name: []const u8 = "",
+    last_missing_unique_rows: u64 = 0,
+    last_duplicate_unique_rows: u64 = 0,
+    last_stale_unique_rows: u64 = 0,
+    last_repaired_unique_rows: u64 = 0,
+    last_deleted_stale_unique_rows: u64 = 0,
+};
+
 pub const MetadataStatus = struct {
     metadata_group_id: u64,
     metadata_epoch: u64 = 0,
@@ -173,6 +204,7 @@ pub const MetadataStatus = struct {
     metadata_raft_transport_pending_retries: usize = 0,
     metrics: raft_service.ManagedServiceMetrics,
     foreign_key_schema_controller: ForeignKeySchemaControllerStatus = .{},
+    unique_constraint_schema_controller: UniqueConstraintSchemaControllerStatus = .{},
     reconcile_lease_enabled: bool = false,
     reconcile_lease_owner_node_id: u64 = 0,
     reconcile_lease_expires_at_ms: u64 = 0,
@@ -217,6 +249,7 @@ pub const MetadataStatus = struct {
     projected_ranges: usize = 0,
     projected_foreign_key_ref_ranges: usize = 0,
     projected_unique_constraint_ranges: usize = 0,
+    projected_secondary_index_rebuild_ranges: usize = 0,
     projected_stores: usize = 0,
     projected_placement_intents: usize = 0,
     projected_snapshot_bootstrap_intents: usize = 0,
@@ -262,6 +295,7 @@ pub const AdminSnapshot = struct {
     ranges: []table_manager.RangeRecord,
     foreign_key_ref_ranges: []table_manager.ForeignKeyReferenceRangeRecord = &.{},
     unique_constraint_ranges: []table_manager.UniqueConstraintRangeRecord = &.{},
+    secondary_index_rebuild_ranges: []table_manager.SecondaryIndexRebuildRangeRecord = &.{},
     nodes: []table_manager.NodeRecord = &.{},
     stores: []table_manager.StoreRecord,
     placement_intents: []raft_reconciler.PlacementIntent,
@@ -300,6 +334,9 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
     }
     if (@hasDecl(SourceDeclType, "listProjectedUniqueConstraintRanges")) {
         snapshot.unique_constraint_ranges = try source.listProjectedUniqueConstraintRanges(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedSecondaryIndexRebuildRanges")) {
+        snapshot.secondary_index_rebuild_ranges = try source.listProjectedSecondaryIndexRebuildRanges(alloc);
     }
     if (@hasDecl(SourceDeclType, "listProjectedNodes")) {
         snapshot.nodes = try source.listProjectedNodes(alloc);
@@ -359,6 +396,9 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
     }
     if (@hasDecl(SourceDeclType, "freeProjectedUniqueConstraintRanges") and snapshot.unique_constraint_ranges.len > 0) {
         source.freeProjectedUniqueConstraintRanges(alloc, snapshot.unique_constraint_ranges);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedSecondaryIndexRebuildRanges") and snapshot.secondary_index_rebuild_ranges.len > 0) {
+        source.freeProjectedSecondaryIndexRebuildRanges(alloc, snapshot.secondary_index_rebuild_ranges);
     }
     if (@hasDecl(SourceDeclType, "freeProjectedNodes") and snapshot.nodes.len > 0) {
         source.freeProjectedNodes(alloc, snapshot.nodes);

@@ -84,6 +84,8 @@ pub const PlacementPlanner = struct {
         defer manager.freeForeignKeyReferenceRanges(self.alloc, foreign_key_ref_ranges);
         const unique_constraint_ranges = try manager.listUniqueConstraintRanges(self.alloc);
         defer manager.freeUniqueConstraintRanges(self.alloc, unique_constraint_ranges);
+        const secondary_index_rebuild_ranges = try manager.listSecondaryIndexRebuildRanges(self.alloc);
+        defer manager.freeSecondaryIndexRebuildRanges(self.alloc, secondary_index_rebuild_ranges);
         std.mem.sort(table_manager.RangeRecord, ranges, current_intents, struct {
             fn lessThan(current: []const raft_reconciler.PlacementIntent, a: table_manager.RangeRecord, b: table_manager.RangeRecord) bool {
                 const a_has_current = findCurrentIntent(current, a.group_id, null) != null;
@@ -102,6 +104,14 @@ pub const PlacementPlanner = struct {
         }.lessThan);
         std.mem.sort(table_manager.UniqueConstraintRangeRecord, unique_constraint_ranges, current_intents, struct {
             fn lessThan(current: []const raft_reconciler.PlacementIntent, a: table_manager.UniqueConstraintRangeRecord, b: table_manager.UniqueConstraintRangeRecord) bool {
+                const a_has_current = findCurrentIntent(current, a.group_id, null) != null;
+                const b_has_current = findCurrentIntent(current, b.group_id, null) != null;
+                if (a_has_current != b_has_current) return a_has_current;
+                return a.group_id < b.group_id;
+            }
+        }.lessThan);
+        std.mem.sort(table_manager.SecondaryIndexRebuildRangeRecord, secondary_index_rebuild_ranges, current_intents, struct {
+            fn lessThan(current: []const raft_reconciler.PlacementIntent, a: table_manager.SecondaryIndexRebuildRangeRecord, b: table_manager.SecondaryIndexRebuildRangeRecord) bool {
                 const a_has_current = findCurrentIntent(current, a.group_id, null) != null;
                 const b_has_current = findCurrentIntent(current, b.group_id, null) != null;
                 if (a_has_current != b_has_current) return a_has_current;
@@ -151,6 +161,21 @@ pub const PlacementPlanner = struct {
             );
         }
         for (unique_constraint_ranges) |range| {
+            const table = findTable(tables, range.table_id) orelse return error.UnknownTable;
+            try appendGroupPlacementIntents(
+                self.alloc,
+                &out,
+                &load_by_node,
+                &pair_by_nodes,
+                current_intents,
+                range.group_id,
+                candidate_node_ids,
+                candidate_domains,
+                table.placement_role,
+                table.desired_replica_count,
+            );
+        }
+        for (secondary_index_rebuild_ranges) |range| {
             const table = findTable(tables, range.table_id) orelse return error.UnknownTable;
             try appendGroupPlacementIntents(
                 self.alloc,
@@ -632,6 +657,31 @@ test "placement planner places unique constraint owner ranges" {
         try std.testing.expect(intent.store_id == 102 or intent.store_id == 103);
     }
     try std.testing.expectEqual(@as(usize, 2), unique_owner_intents);
+}
+
+test "placement planner places secondary index rebuild ranges" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 16, .name = "users", .desired_replica_count = 2 });
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 16,
+        .index_name = "users_status_idx",
+        .index_generation = 77,
+        .start_row_key = "",
+        .end_row_key = null,
+        .group_id = 16001,
+    });
+
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const intents = try planner.planAllIntents(&manager, &.{ 1, 2, 3 });
+    defer planner.freeIntents(std.testing.allocator, intents);
+
+    var rebuild_intents: usize = 0;
+    for (intents) |intent| {
+        if (intent.record.group_id == 16001) rebuild_intents += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), rebuild_intents);
 }
 
 test "placement planner spreads multiple ranges across candidate nodes" {
