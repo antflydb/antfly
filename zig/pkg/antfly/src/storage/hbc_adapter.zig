@@ -1517,6 +1517,13 @@ pub const HBCIndex = struct {
         };
     }
 
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const HBCIndex) ?u64 {
+        return switch (self.env_owner) {
+            .lsm => |handle| handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
+            .lmdb => null,
+        };
+    }
+
     pub fn refreshLsmMaintenanceDebtHint(self: *HBCIndex) void {
         switch (self.env_owner) {
             .lsm => |handle| handle.backend.refreshMaintenanceDebtHint(),

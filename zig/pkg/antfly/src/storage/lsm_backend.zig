@@ -2955,6 +2955,7 @@ pub const Backend = struct {
             if (obsolete.delete_after_ns < delete_after_ns) obsolete.delete_after_ns = delete_after_ns;
             self.allocator.free(path);
             self.obsolete_manifest_dirty = true;
+            self.notePotentialMaintenanceDebt();
             return;
         }
 
@@ -2963,6 +2964,7 @@ pub const Backend = struct {
             .delete_after_ns = delete_after_ns,
         });
         self.obsolete_manifest_dirty = true;
+        self.notePotentialMaintenanceDebt();
     }
 
     pub fn queueObsoleteRuns(self: *Backend, runs: std.ArrayListUnmanaged(Run)) !void {
@@ -3652,6 +3654,29 @@ pub const Backend = struct {
         return false;
     }
 
+    pub fn nextObsoleteReclaimDelayNsBestEffort(self: *Backend) ?u64 {
+        if (!self.mu.tryLock()) return null;
+        defer self.mu.unlock();
+        return self.nextObsoleteReclaimDelayNsLocked();
+    }
+
+    fn nextObsoleteReclaimDelayNsLocked(self: *Backend) ?u64 {
+        if (self.active_readers != 0 or self.obsolete_paths.items.len == 0) return null;
+        if (self.root_dir == null or self.storage == null or self.options.backend.read_only) return null;
+        if (self.bulkIngestActive()) return null;
+
+        const now_ns = self.nowNs();
+        var delay_ns: ?u64 = null;
+        var due_now = false;
+        for (self.obsolete_paths.items) |obsolete| {
+            const candidate = if (obsolete.delete_after_ns <= now_ns) 0 else obsolete.delete_after_ns - now_ns;
+            if (candidate == 0) due_now = true;
+            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        }
+        if (due_now) self.cached_maintenance_hint.store(1, .release);
+        return delay_ns;
+    }
+
     fn nowNs(self: *Backend) u64 {
         if (self.storage) |storage| return storage.nowNs();
         return 0;
@@ -3774,6 +3799,9 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     errors: u64 = 0,
     joined: bool = false,
 
+    const idle_obsolete_reclaim_poll_ns = 250 * std.time.ns_per_ms;
+    const idle_wake_poll_ns = 2 * std.time.ns_per_ms;
+
     const Stats = struct {
         wakeups: u64 = 0,
         maintenance_steps: u64 = 0,
@@ -3827,22 +3855,32 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     }
 
     fn run(self: *InternalFlushWorker) void {
+        var next_reclaim_delay_ns: ?u64 = null;
         while (true) {
-            const drain_then_stop = self.waitForWork();
+            const drain_then_stop = self.waitForWork(next_reclaim_delay_ns);
             if (drain_then_stop) {
-                self.drainMaintenance();
+                _ = self.drainMaintenance();
                 return;
             }
-            self.drainMaintenance();
+            next_reclaim_delay_ns = self.drainMaintenance();
         }
     }
 
-    fn waitForWork(self: *InternalFlushWorker) bool {
+    fn waitForWork(self: *InternalFlushWorker, initial_reclaim_delay_ns: ?u64) bool {
+        var reclaim_delay_ns = initial_reclaim_delay_ns;
         while (true) {
             lockWorkerMutex(&self.mutex);
             if (self.stop_requested or self.wake_requested) break;
             self.mutex.unlock();
-            sleepForTest(2 * std.time.ns_per_ms);
+
+            if (reclaim_delay_ns) |delay_ns| {
+                if (delay_ns == 0) return false;
+                const sleep_ns = @min(delay_ns, idle_obsolete_reclaim_poll_ns);
+                sleepForTest(sleep_ns);
+                reclaim_delay_ns = if (delay_ns <= sleep_ns) 0 else delay_ns - sleep_ns;
+            } else {
+                sleepForTest(idle_wake_poll_ns);
+            }
         }
         defer self.mutex.unlock();
         const drain_then_stop = self.stop_requested and self.drain_on_stop;
@@ -3851,19 +3889,20 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
         return drain_then_stop;
     }
 
-    fn drainMaintenance(self: *InternalFlushWorker) void {
+    fn drainMaintenance(self: *InternalFlushWorker) ?u64 {
         var steps: usize = 0;
         while (steps < 64) : (steps += 1) {
             const progressed = self.backend.runMaintenanceStep() catch |err| {
                 self.recordError(err);
-                return;
+                return null;
             };
-            if (!progressed) return;
+            if (!progressed) return self.backend.nextObsoleteReclaimDelayNsBestEffort();
             self.recordStep();
         }
         lockWorkerMutex(&self.mutex);
         self.wake_requested = true;
         self.mutex.unlock();
+        return null;
     }
 
     fn recordStep(self: *InternalFlushWorker) void {
@@ -11175,6 +11214,86 @@ test "lsm backend reader release reclaims expired clean obsolete paths" {
     try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
     try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
     try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+}
+
+test "lsm backend maintenance step reclaims expired clean obsolete paths" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-maintenance-clean-obsolete-gc";
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 999);
+    defer alloc.free(obsolete_path);
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .obsolete_retention_ns = 0,
+    });
+    defer backend.close();
+
+    try repository_mod.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
+    try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+    backend.manifest_dirty = false;
+
+    try std.testing.expectEqual(@as(usize, 1), backend.obsolete_paths.items.len);
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+}
+
+test "lsm backend internal worker reclaims idle obsolete paths after retention" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-worker-idle-obsolete-gc";
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 999);
+    defer alloc.free(obsolete_path);
+
+    var handle = try BackendHandle.openWithConfig(
+        alloc,
+        root_dir,
+        .{
+            .storage = backing.storage(),
+            // MemoryStorage advances time per nowNs call, so one tick is enough
+            // to exercise delayed worker reclamation without relying on many
+            // scheduler turns under the shared test suite.
+            .obsolete_retention_ns = 1,
+        },
+        .{ .internal_flush_worker = true },
+    );
+    defer handle.close();
+
+    const backend = handle.ptr();
+    try repository_mod.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
+    {
+        const locked = runtime_mod.lockBackend(Backend, backend);
+        defer runtime_mod.unlockBackend(Backend, backend, locked);
+        try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+        backend.manifest_dirty = false;
+    }
+
+    var reclaimed = false;
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        const bytes = backing.storage().readFileAlloc(alloc, obsolete_path, 1024) catch |err| switch (err) {
+            error.FileNotFound => {
+                reclaimed = true;
+                break;
+            },
+            else => return err,
+        };
+        alloc.free(bytes);
+        sleepForTest(5 * std.time.ns_per_ms);
+    }
+
+    const worker_stats = handle.stopInternalFlushWorkerForTest().?;
+    try std.testing.expect(reclaimed);
+    try std.testing.expect(worker_stats.maintenance_steps > 0);
+    try std.testing.expectEqual(@as(u64, 0), worker_stats.errors);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
 }
 
 test "lsm backend reloads persisted manifest and run files" {

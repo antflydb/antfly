@@ -152,6 +152,13 @@ pub const PrimaryStoreOwner = union(enum) {
         };
     }
 
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PrimaryStoreOwner) ?u64 {
+        return switch (self.*) {
+            .none, .mem => null,
+            .lsm => |owner| owner.handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
+        };
+    }
+
     pub fn refreshLsmMaintenanceDebtHint(self: *PrimaryStoreOwner) void {
         switch (self.*) {
             .none, .mem => {},

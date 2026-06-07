@@ -1724,6 +1724,7 @@ pub const DataServer = struct {
     lsm_maintenance_bulk_deferred: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_lock_deferred: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
+    lsm_maintenance_obsolete_reclaim_due_ns: std.atomic.Value(u64) = .init(0),
 
     const lsm_maintenance_worker_idle_sleep_ns = 250 * std.time.ns_per_ms;
     const lsm_maintenance_worker_retry_sleep_ns = 100 * std.time.ns_per_ms;
@@ -2216,7 +2217,20 @@ pub const DataServer = struct {
             _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
             return;
         }
-        if (self.write_source.lsmMaintenanceScoreBestEffort() == 0) return;
+        if (self.write_source.lsmMaintenanceScoreBestEffort() == 0) {
+            const obsolete_due_ns = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
+            if (obsolete_due_ns != 0 and now_ns < obsolete_due_ns) return;
+            if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                if (delay_ns > 0) {
+                    self.deferLsmObsoleteReclaim(now_ns, delay_ns);
+                    return;
+                }
+            } else {
+                self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
+                return;
+            }
+        }
+        self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
         self.lsm_maintenance_wake.store(true, .release);
         if (self.lsm_maintenance_thread == null) {
             self.lsm_maintenance_stop.store(false, .release);
@@ -2242,6 +2256,14 @@ pub const DataServer = struct {
         self.lsm_maintenance_next_eligible_ns.store(now_ns +| delay_ns, .release);
     }
 
+    fn deferLsmObsoleteReclaim(self: *DataServer, now_ns: u64, delay_ns: u64) void {
+        const due_ns = now_ns +| delay_ns;
+        const current = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
+        if (current == 0 or due_ns < current) {
+            self.lsm_maintenance_obsolete_reclaim_due_ns.store(due_ns, .release);
+        }
+    }
+
     fn lsmMaintenanceWorkerMain(self: *DataServer) void {
         while (!self.lsm_maintenance_stop.load(.acquire)) {
             const woke = self.lsm_maintenance_wake.swap(false, .acq_rel);
@@ -2250,10 +2272,27 @@ pub const DataServer = struct {
                 sleepLsmMaintenanceWorker();
                 continue;
             }
-            if (!woke and self.write_source.lsmMaintenanceScoreBestEffort() == 0) {
-                sleepLsmMaintenanceWorker();
-                continue;
+            if (!woke) {
+                const obsolete_due_ns = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
+                if (obsolete_due_ns != 0 and now_ns < obsolete_due_ns) {
+                    sleepLsmMaintenanceWorker();
+                    continue;
+                }
             }
+            if (!woke and self.write_source.lsmMaintenanceScoreBestEffort() == 0) {
+                if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                    if (delay_ns > 0) {
+                        self.deferLsmObsoleteReclaim(now_ns, delay_ns);
+                        sleepLsmMaintenanceWorker();
+                        continue;
+                    }
+                } else {
+                    self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
+                    sleepLsmMaintenanceWorker();
+                    continue;
+                }
+            }
+            self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
             if (self.resourcePressureDefersBackgroundMaintenance()) {
                 self.deferLsmMaintenance(now_ns, lsm_maintenance_worker_pressure_defer_ns);
                 _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
@@ -2290,13 +2329,19 @@ pub const DataServer = struct {
                     if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
                         _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
                         self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+                    } else if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                        if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
                     }
                     completed = true;
                     break;
                 }
             }
-            if (steps >= lsm_maintenance_worker_max_steps_per_wake and self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
-                self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+            if (steps >= lsm_maintenance_worker_max_steps_per_wake) {
+                if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+                    self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+                } else if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                    if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
+                }
             }
             if (completed) _ = self.lsm_maintenance_completed.fetchAdd(1, .monotonic);
             self.lsm_maintenance_active.store(false, .release);

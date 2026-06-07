@@ -1420,6 +1420,29 @@ pub const ProvisionedTableWriteCache = struct {
         return score;
     }
 
+    pub fn nextLsmMaintenanceWakeDelayNsLocked(self: *const ProvisionedTableWriteCache) ?u64 {
+        var delay_ns: ?u64 = null;
+        for (self.entries.items) |entry| {
+            if (entry.bulk_ingest_session_open) continue;
+            if (entry.db.hasActiveDenseBulkWork()) continue;
+            if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+                delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+            }
+        }
+        return delay_ns;
+    }
+
+    pub fn nextPrimaryLsmMaintenanceWakeDelayNsLocked(self: *const ProvisionedTableWriteCache) ?u64 {
+        var delay_ns: ?u64 = null;
+        for (self.entries.items) |entry| {
+            if (entry.bulk_ingest_session_open) continue;
+            if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+                delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+            }
+        }
+        return delay_ns;
+    }
+
     pub fn leasePrimaryLsmMaintenanceRoundBestEffortLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
         var best_entry: ?*Entry = null;
         var best_score: u64 = 0;
@@ -4106,6 +4129,18 @@ pub const ProvisionedTableWriteSource = struct {
             cache.maxLsmMaintenanceScoreLocked(),
             cache.maxPrimaryLsmMaintenanceScoreLocked(),
         ) else 0;
+    }
+
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *ProvisionedTableWriteSource) ?u64 {
+        if (!self.local_db_mutex.tryLock()) return null;
+        defer self.local_db_mutex.unlock();
+        const cache = self.write_cache orelse return null;
+
+        var delay_ns = cache.nextLsmMaintenanceWakeDelayNsLocked();
+        if (cache.nextPrimaryLsmMaintenanceWakeDelayNsLocked()) |candidate| {
+            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        }
+        return delay_ns;
     }
 
     pub fn hasActiveBulkIngestSession(self: *ProvisionedTableWriteSource) bool {

@@ -1719,6 +1719,24 @@ pub const IndexManager = struct {
         return self.lsmMaintenanceDebtHintUnlocked();
     }
 
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *IndexManager) ?u64 {
+        if (!self.catalog_mutex.tryLockShared()) return null;
+        defer self.catalog_mutex.unlockShared();
+
+        var delay_ns: ?u64 = null;
+        for (self.text_indexes.items) |*entry| {
+            if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+                delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+            }
+        }
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+                delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+            }
+        }
+        return delay_ns;
+    }
+
     pub fn refreshLsmMaintenanceDebtHint(self: *IndexManager) void {
         for (self.text_indexes.items) |*entry| {
             entry.persistent.refreshLsmMaintenanceDebtHint();

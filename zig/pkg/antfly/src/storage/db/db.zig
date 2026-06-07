@@ -3275,6 +3275,18 @@ pub const DB = struct {
         return self.core.primary_store_owner.lsmMaintenanceDebtHint();
     }
 
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *DB) ?u64 {
+        var delay_ns = self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort();
+        if (self.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        }
+        return delay_ns;
+    }
+
+    pub fn nextPrimaryLsmMaintenanceWakeDelayNsBestEffort(self: *DB) ?u64 {
+        return self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort();
+    }
+
     pub fn snapshotAsyncIndexingStats(self: *DB) types.AsyncIndexingStats {
         var async_stats = self.async_context.stats.snapshot();
         async_stats.bulk_coalescing = self.bulk_ingest_coalescer.stats.snapshot();
