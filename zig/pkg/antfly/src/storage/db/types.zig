@@ -923,6 +923,15 @@ pub const RelationalRowsExpressionKind = enum {
     mul,
     div,
     case,
+    cast,
+    json_extract,
+    array_length,
+};
+
+pub const RelationalRowsExpressionCastType = enum {
+    text,
+    numeric,
+    bool,
 };
 
 pub const RelationalRowsExpressionCondition = struct {
@@ -940,7 +949,10 @@ pub const RelationalRowsExpression = struct {
     kind: RelationalRowsExpressionKind,
     field: []const u8 = "",
     value_json: []const u8 = "",
+    json_path: []const u8 = "",
+    json_as_text: bool = false,
     operands: []const RelationalRowsExpression = &.{},
+    cast_type: ?RelationalRowsExpressionCastType = null,
     case_branches: []const RelationalRowsExpressionCaseBranch = &.{},
     case_else: []const RelationalRowsExpression = &.{},
 };
@@ -1087,6 +1099,7 @@ pub const RelationalRowsQueryRequest = struct {
 fn freeRelationalRowsExpression(alloc: Allocator, expression: RelationalRowsExpression) void {
     if (expression.field.len > 0) alloc.free(expression.field);
     if (expression.value_json.len > 0) alloc.free(expression.value_json);
+    if (expression.json_path.len > 0) alloc.free(expression.json_path);
     for (expression.operands) |operand| freeRelationalRowsExpression(alloc, operand);
     if (expression.operands.len > 0) alloc.free(expression.operands);
     for (expression.case_branches) |branch| {

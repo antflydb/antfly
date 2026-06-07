@@ -1623,6 +1623,12 @@ fn parseRowsQueryExpressionAlloc(
         .mul
     else if (std.mem.eql(u8, op.string, "div"))
         .div
+    else if (std.mem.eql(u8, op.string, "cast"))
+        .cast
+    else if (std.mem.eql(u8, op.string, "json_extract"))
+        .json_extract
+    else if (std.mem.eql(u8, op.string, "array_length"))
+        .array_length
     else
         return error.InvalidRowsRequest;
     if (expression_kind == .lower and args_value.array.items.len != 1) return error.InvalidRowsRequest;
@@ -1631,6 +1637,9 @@ fn parseRowsQueryExpressionAlloc(
     if (expression_kind == .sub and args_value.array.items.len != 2) return error.InvalidRowsRequest;
     if (expression_kind == .mul and args_value.array.items.len < 2) return error.InvalidRowsRequest;
     if (expression_kind == .div and args_value.array.items.len != 2) return error.InvalidRowsRequest;
+    if (expression_kind == .cast and args_value.array.items.len != 1) return error.InvalidRowsRequest;
+    if (expression_kind == .json_extract and args_value.array.items.len != 1) return error.InvalidRowsRequest;
+    if (expression_kind == .array_length and args_value.array.items.len != 1) return error.InvalidRowsRequest;
 
     const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, args_value.array.items.len);
     var initialized: usize = 0;
@@ -1642,9 +1651,45 @@ fn parseRowsQueryExpressionAlloc(
         operands[initialized] = try parseRowsQueryExpressionAlloc(alloc, schema, arg);
         initialized += 1;
     }
-    const expression: db_mod.types.RelationalRowsExpression = .{ .kind = expression_kind, .operands = operands };
+    const cast_type: ?db_mod.types.RelationalRowsExpressionCastType = if (expression_kind == .cast) blk: {
+        const target_value = value.object.get("to") orelse return error.InvalidRowsRequest;
+        if (target_value != .string) return error.InvalidRowsRequest;
+        break :blk parseRowsQueryExpressionCastType(target_value.string) orelse return error.InvalidRowsRequest;
+    } else null;
+    const json_path: []const u8 = if (expression_kind == .json_extract) blk: {
+        const path_value = value.object.get("path") orelse return error.InvalidRowsRequest;
+        break :blk try parseRowsQueryJsonPathAlloc(alloc, path_value);
+    } else "";
+    errdefer if (json_path.len > 0) alloc.free(json_path);
+    const json_as_text = if (expression_kind == .json_extract) blk: {
+        const as_text_value = value.object.get("as_text") orelse break :blk false;
+        if (as_text_value != .bool) return error.InvalidRowsRequest;
+        break :blk as_text_value.bool;
+    } else false;
+    if (expression_kind == .json_extract) {
+        const root = operands[0];
+        if (root.kind == .field) {
+            const column = findRelationalColumn(schema.relational_columns, root.field) orelse return error.InvalidRowsRequest;
+            if (column.field_type != .json) return error.InvalidRowsRequest;
+        }
+    }
+    if (expression_kind == .array_length) {
+        const root = operands[0];
+        if (root.kind == .field) {
+            const column = findRelationalColumn(schema.relational_columns, root.field) orelse return error.InvalidRowsRequest;
+            if (column.field_type != .array) return error.InvalidRowsRequest;
+        }
+    }
+    const expression: db_mod.types.RelationalRowsExpression = .{ .kind = expression_kind, .operands = operands, .cast_type = cast_type, .json_path = json_path, .json_as_text = json_as_text };
     if (expression_kind == .add or expression_kind == .sub or expression_kind == .mul or expression_kind == .div) try validateRowsQueryNumericExpression(alloc, schema, expression);
     return expression;
+}
+
+fn parseRowsQueryExpressionCastType(text: []const u8) ?db_mod.types.RelationalRowsExpressionCastType {
+    if (std.mem.eql(u8, text, "text")) return .text;
+    if (std.mem.eql(u8, text, "numeric")) return .numeric;
+    if (std.mem.eql(u8, text, "bool") or std.mem.eql(u8, text, "boolean")) return .bool;
+    return null;
 }
 
 fn parseRowsQueryCaseExpressionAlloc(
@@ -1751,6 +1796,9 @@ fn validateRowsQueryNumericExpression(
             if (expression.operands.len != 2) return error.InvalidRowsRequest;
             for (expression.operands) |operand| try validateRowsQueryNumericExpression(alloc, schema, operand);
         },
+        .cast => {
+            if (expression.operands.len != 1 or expression.cast_type != .numeric) return error.InvalidRowsRequest;
+        },
         .add => {
             if (expression.operands.len < 2) return error.InvalidRowsRequest;
             for (expression.operands) |operand| try validateRowsQueryNumericExpression(alloc, schema, operand);
@@ -1772,6 +1820,10 @@ fn validateRowsQueryNumericExpression(
             for (expression.case_branches) |branch| try validateRowsQueryNumericExpression(alloc, schema, branch.then);
             try validateRowsQueryNumericExpression(alloc, schema, expression.case_else[0]);
         },
+        .array_length => {
+            if (expression.operands.len != 1) return error.InvalidRowsRequest;
+        },
+        .json_extract => return error.InvalidRowsRequest,
         else => return error.InvalidRowsRequest,
     }
 }
@@ -2572,6 +2624,38 @@ fn expressionValueJsonAlloc(
             }
             break :blk try std.fmt.allocPrint(alloc, "{d}", .{result});
         },
+        .cast => blk: {
+            if (expression.operands.len != 1) return error.InvalidRowsRequest;
+            const cast_type = expression.cast_type orelse return error.InvalidRowsRequest;
+            const value_json = try expressionValueJsonAlloc(alloc, row, expression.operands[0]);
+            defer alloc.free(value_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+            defer parsed.deinit();
+            if (parsed.value == .null) break :blk try alloc.dupe(u8, "null");
+            break :blk try castExpressionValueJsonAlloc(alloc, parsed.value, cast_type);
+        },
+        .json_extract => blk: {
+            if (expression.operands.len != 1 or expression.json_path.len == 0) return error.InvalidRowsRequest;
+            const root_json = try expressionValueJsonAlloc(alloc, row, expression.operands[0]);
+            defer alloc.free(root_json);
+            var root = std.json.parseFromSlice(std.json.Value, alloc, root_json, .{}) catch return error.InvalidRowsRequest;
+            defer root.deinit();
+            const selected = jsonValueAtPath(root.value, expression.json_path) orelse break :blk try alloc.dupe(u8, "null");
+            if (!expression.json_as_text) break :blk try std.json.Stringify.valueAlloc(alloc, selected.*, .{});
+            break :blk try jsonExtractTextValueJsonAlloc(alloc, selected.*);
+        },
+        .array_length => blk: {
+            if (expression.operands.len != 1) return error.InvalidRowsRequest;
+            const value_json = try expressionValueJsonAlloc(alloc, row, expression.operands[0]);
+            defer alloc.free(value_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+            defer parsed.deinit();
+            switch (parsed.value) {
+                .null => break :blk try alloc.dupe(u8, "null"),
+                .array => |array| break :blk try std.fmt.allocPrint(alloc, "{d}", .{array.items.len}),
+                else => return error.InvalidRowsRequest,
+            }
+        },
         .case => blk: {
             if (expression.case_branches.len == 0 or expression.case_else.len != 1) return error.InvalidRowsRequest;
             for (expression.case_branches) |branch| {
@@ -2580,6 +2664,56 @@ fn expressionValueJsonAlloc(
                 }
             }
             break :blk try expressionValueJsonAlloc(alloc, row, expression.case_else[0]);
+        },
+    };
+}
+
+fn jsonExtractTextValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]u8 {
+    return switch (value) {
+        .null => try alloc.dupe(u8, "null"),
+        .string => |text| try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = text }, .{}),
+        else => blk: {
+            const text = try std.json.Stringify.valueAlloc(alloc, value, .{});
+            defer alloc.free(text);
+            break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = text }, .{});
+        },
+    };
+}
+
+fn castExpressionValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    cast_type: db_mod.types.RelationalRowsExpressionCastType,
+) ![]u8 {
+    return switch (cast_type) {
+        .text => blk: {
+            const text = try scalarJsonValueTextAlloc(alloc, value);
+            defer alloc.free(text);
+            break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = text }, .{});
+        },
+        .numeric => blk: {
+            const number = switch (value) {
+                .integer, .float, .number_string => try numericJsonValue(value),
+                .string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidRowsRequest,
+                else => return error.InvalidRowsRequest,
+            };
+            break :blk try std.fmt.allocPrint(alloc, "{d}", .{number});
+        },
+        .bool => blk: {
+            const enabled = switch (value) {
+                .bool => |enabled| enabled,
+                .string => |text| if (std.mem.eql(u8, text, "true"))
+                    true
+                else if (std.mem.eql(u8, text, "false"))
+                    false
+                else
+                    return error.InvalidRowsRequest,
+                else => return error.InvalidRowsRequest,
+            };
+            break :blk try alloc.dupe(u8, if (enabled) "true" else "false");
         },
     };
 }
@@ -2732,6 +2866,7 @@ fn freeRowsQueryCoalesceProjections(alloc: std.mem.Allocator, projections: []con
 fn freeRowsQueryExpression(alloc: std.mem.Allocator, expression: db_mod.types.RelationalRowsExpression) void {
     if (expression.field.len > 0) alloc.free(expression.field);
     if (expression.value_json.len > 0) alloc.free(expression.value_json);
+    if (expression.json_path.len > 0) alloc.free(expression.json_path);
     for (expression.operands) |operand| freeRowsQueryExpression(alloc, operand);
     if (expression.operands.len > 0) alloc.free(expression.operands);
     for (expression.case_branches) |branch| freeRowsQueryExpressionCaseBranch(alloc, branch);
@@ -4846,13 +4981,17 @@ test "relational rows query contract projects array lengths" {
 
     var request = try parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"select\":[\"id\"],\"array_length\":[{\"as\":\"tag_count\",\"field\":\"tags\"}],\"order_by\":[{\"field\":\"id\"}]}",
+        "{\"select\":[\"id\"],\"array_length\":[{\"as\":\"tag_count\",\"field\":\"tags\"}],\"expressions\":[{\"as\":\"tag_count_expr\",\"expr\":{\"op\":\"array_length\",\"args\":[{\"field\":\"tags\"}]}}],\"order_by\":[{\"field\":\"id\"}]}",
         schema,
     );
     defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), request.array_length.len);
     try std.testing.expectEqualStrings("tag_count", request.array_length[0].output);
     try std.testing.expectEqualStrings("tags", request.array_length[0].field);
+    try std.testing.expectEqual(@as(usize, 1), request.expressions.len);
+    try std.testing.expectEqualStrings("tag_count_expr", request.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, request.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("tags", request.expressions[0].expression.operands[0].field);
     try std.testing.expect(!request.select_all);
 
     const rows = [_][]const u8{
@@ -4862,12 +5001,17 @@ test "relational rows query contract projects array lengths" {
     var result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, request, rows[0..]);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 2), result.total);
-    try std.testing.expectEqualStrings("{\"id\":\"a\",\"tag_count\":2}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"id\":\"b\",\"tag_count\":0}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"tag_count\":2,\"tag_count_expr\":2}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"tag_count\":0,\"tag_count_expr\":0}", result.rows[1]);
 
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
         "{\"array_length\":[{\"as\":\"bad\",\"field\":\"id\"}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"expressions\":[{\"as\":\"bad\",\"expr\":{\"op\":\"array_length\",\"args\":[{\"field\":\"id\"}]}}]}",
         schema,
     ));
 }
@@ -4916,7 +5060,7 @@ test "relational rows query contract projects coalesce expressions" {
 
 test "relational rows query contract projects generic expression AST" {
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"display_name":{"type":"keyword"},"email":{"type":"keyword"},"score":{"type":"numeric"},"bonus":{"type":"numeric"},"penalty":{"type":"numeric"},"multiplier":{"type":"numeric"},"divisor":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"display_name":{"type":"keyword"},"email":{"type":"keyword"},"score":{"type":"numeric"},"bonus":{"type":"numeric"},"penalty":{"type":"numeric"},"multiplier":{"type":"numeric"},"divisor":{"type":"numeric"},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
     defer parsed.deinit(std.testing.allocator);
@@ -4925,11 +5069,11 @@ test "relational rows query contract projects generic expression AST" {
 
     var request = try parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"select\":[\"id\"],\"expressions\":[{\"as\":\"name_or_email\",\"expr\":{\"op\":\"coalesce\",\"args\":[{\"field\":\"display_name\"},{\"field\":\"email\"},{\"value\":\"unknown\"}]}},{\"as\":\"email_key\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"email\"}]}},{\"as\":\"label\",\"expr\":{\"op\":\"concat\",\"args\":[{\"field\":\"id\"},{\"value\":\"::\"},{\"field\":\"email\"}]}},{\"as\":\"email_without_b\",\"expr\":{\"op\":\"nullif\",\"args\":[{\"field\":\"email\"},{\"value\":\"b@example.test\"}]}},{\"as\":\"total_score\",\"expr\":{\"op\":\"add\",\"args\":[{\"field\":\"score\"},{\"field\":\"bonus\"}]}},{\"as\":\"net_score\",\"expr\":{\"op\":\"sub\",\"args\":[{\"op\":\"add\",\"args\":[{\"field\":\"score\"},{\"field\":\"bonus\"}]},{\"field\":\"penalty\"}]}},{\"as\":\"scaled_score\",\"expr\":{\"op\":\"mul\",\"args\":[{\"field\":\"score\"},{\"field\":\"multiplier\"}]}},{\"as\":\"score_ratio\",\"expr\":{\"op\":\"div\",\"args\":[{\"field\":\"score\"},{\"field\":\"divisor\"}]}},{\"as\":\"email_bucket\",\"expr\":{\"op\":\"case\",\"cases\":[{\"when\":{\"lhs\":{\"field\":\"email\"},\"op\":\"is_null\"},\"then\":{\"value\":\"missing\"}},{\"when\":{\"lhs\":{\"field\":\"email\"},\"op\":\"eq\",\"rhs\":{\"value\":\"b@example.test\"}},\"then\":{\"value\":\"blocked\"}}],\"else\":{\"value\":\"ok\"}}}]}",
+        "{\"select\":[\"id\"],\"expressions\":[{\"as\":\"name_or_email\",\"expr\":{\"op\":\"coalesce\",\"args\":[{\"field\":\"display_name\"},{\"field\":\"email\"},{\"value\":\"unknown\"}]}},{\"as\":\"email_key\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"email\"}]}},{\"as\":\"label\",\"expr\":{\"op\":\"concat\",\"args\":[{\"field\":\"id\"},{\"value\":\"::\"},{\"field\":\"email\"}]}},{\"as\":\"email_without_b\",\"expr\":{\"op\":\"nullif\",\"args\":[{\"field\":\"email\"},{\"value\":\"b@example.test\"}]}},{\"as\":\"total_score\",\"expr\":{\"op\":\"add\",\"args\":[{\"field\":\"score\"},{\"field\":\"bonus\"}]}},{\"as\":\"net_score\",\"expr\":{\"op\":\"sub\",\"args\":[{\"op\":\"add\",\"args\":[{\"field\":\"score\"},{\"field\":\"bonus\"}]},{\"field\":\"penalty\"}]}},{\"as\":\"scaled_score\",\"expr\":{\"op\":\"mul\",\"args\":[{\"field\":\"score\"},{\"field\":\"multiplier\"}]}},{\"as\":\"score_ratio\",\"expr\":{\"op\":\"div\",\"args\":[{\"field\":\"score\"},{\"field\":\"divisor\"}]}},{\"as\":\"email_bucket\",\"expr\":{\"op\":\"case\",\"cases\":[{\"when\":{\"lhs\":{\"field\":\"email\"},\"op\":\"is_null\"},\"then\":{\"value\":\"missing\"}},{\"when\":{\"lhs\":{\"field\":\"email\"},\"op\":\"eq\",\"rhs\":{\"value\":\"b@example.test\"}},\"then\":{\"value\":\"blocked\"}}],\"else\":{\"value\":\"ok\"}}},{\"as\":\"plan\",\"expr\":{\"op\":\"json_extract\",\"args\":[{\"field\":\"attrs\"}],\"path\":[\"billing\",\"plan\"],\"as_text\":true}},{\"as\":\"flags\",\"expr\":{\"op\":\"json_extract\",\"args\":[{\"field\":\"attrs\"}],\"path\":\"flags\"}}]}",
         schema,
     );
     defer request.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 9), request.expressions.len);
+    try std.testing.expectEqual(@as(usize, 11), request.expressions.len);
     try std.testing.expectEqualStrings("name_or_email", request.expressions[0].output);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, request.expressions[0].expression.kind);
     try std.testing.expectEqual(@as(usize, 3), request.expressions[0].expression.operands.len);
@@ -4958,18 +5102,25 @@ test "relational rows query contract projects generic expression AST" {
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, request.expressions[8].expression.case_branches[0].when.op);
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, request.expressions[8].expression.case_branches[1].when.op);
     try std.testing.expectEqual(@as(usize, 1), request.expressions[8].expression.case_else.len);
+    try std.testing.expectEqualStrings("plan", request.expressions[9].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, request.expressions[9].expression.kind);
+    try std.testing.expectEqualStrings("billing.plan", request.expressions[9].expression.json_path);
+    try std.testing.expect(request.expressions[9].expression.json_as_text);
+    try std.testing.expectEqualStrings("flags", request.expressions[10].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, request.expressions[10].expression.kind);
+    try std.testing.expect(!request.expressions[10].expression.json_as_text);
     try std.testing.expect(!request.select_all);
 
     const rows = [_][]const u8{
-        "{\"id\":\"a\",\"display_name\":\"Ada\",\"email\":\"ada@example.test\",\"score\":10,\"bonus\":5,\"penalty\":2,\"multiplier\":3,\"divisor\":5}",
-        "{\"id\":\"b\",\"display_name\":null,\"email\":\"b@example.test\",\"score\":3,\"bonus\":4,\"penalty\":1,\"multiplier\":2,\"divisor\":2}",
+        "{\"id\":\"a\",\"display_name\":\"Ada\",\"email\":\"ada@example.test\",\"score\":10,\"bonus\":5,\"penalty\":2,\"multiplier\":3,\"divisor\":5,\"attrs\":{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"active\"]}}",
+        "{\"id\":\"b\",\"display_name\":null,\"email\":\"b@example.test\",\"score\":3,\"bonus\":4,\"penalty\":1,\"multiplier\":2,\"divisor\":2,\"attrs\":{\"billing\":{\"plan\":\"free\"},\"flags\":[\"blocked\"]}}",
         "{\"id\":\"c\"}",
     };
     var result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, request, rows[0..]);
     defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("{\"id\":\"a\",\"name_or_email\":\"Ada\",\"email_key\":\"ada@example.test\",\"label\":\"a::ada@example.test\",\"email_without_b\":\"ada@example.test\",\"total_score\":15,\"net_score\":13,\"scaled_score\":30,\"score_ratio\":2,\"email_bucket\":\"ok\"}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"id\":\"b\",\"name_or_email\":\"b@example.test\",\"email_key\":\"b@example.test\",\"label\":\"b::b@example.test\",\"email_without_b\":null,\"total_score\":7,\"net_score\":6,\"scaled_score\":6,\"score_ratio\":1.5,\"email_bucket\":\"blocked\"}", result.rows[1]);
-    try std.testing.expectEqualStrings("{\"id\":\"c\",\"name_or_email\":\"unknown\",\"email_key\":null,\"label\":\"c::\",\"email_without_b\":null,\"total_score\":null,\"net_score\":null,\"scaled_score\":null,\"score_ratio\":null,\"email_bucket\":\"missing\"}", result.rows[2]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"name_or_email\":\"Ada\",\"email_key\":\"ada@example.test\",\"label\":\"a::ada@example.test\",\"email_without_b\":\"ada@example.test\",\"total_score\":15,\"net_score\":13,\"scaled_score\":30,\"score_ratio\":2,\"email_bucket\":\"ok\",\"plan\":\"pro\",\"flags\":[\"active\"]}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"name_or_email\":\"b@example.test\",\"email_key\":\"b@example.test\",\"label\":\"b::b@example.test\",\"email_without_b\":null,\"total_score\":7,\"net_score\":6,\"scaled_score\":6,\"score_ratio\":1.5,\"email_bucket\":\"blocked\",\"plan\":\"free\",\"flags\":[\"blocked\"]}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"name_or_email\":\"unknown\",\"email_key\":null,\"label\":\"c::\",\"email_without_b\":null,\"total_score\":null,\"net_score\":null,\"scaled_score\":null,\"score_ratio\":null,\"email_bucket\":\"missing\",\"plan\":null,\"flags\":null}", result.rows[2]);
 
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
@@ -5009,6 +5160,53 @@ test "relational rows query contract projects generic expression AST" {
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
         "{\"expressions\":[{\"as\":\"bad\",\"expr\":{\"op\":\"div\",\"args\":[{\"field\":\"score\"}]}}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"expressions\":[{\"as\":\"bad\",\"expr\":{\"op\":\"json_extract\",\"args\":[{\"field\":\"email\"}],\"path\":\"billing.plan\"}}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"expressions\":[{\"as\":\"bad\",\"expr\":{\"op\":\"json_extract\",\"args\":[{\"field\":\"attrs\"}],\"path\":[]}}]}",
+        schema,
+    ));
+}
+
+test "relational rows query contract projects cast expressions" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"score_text":{"type":"keyword"},"active":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    var request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\"],\"expressions\":[{\"as\":\"id_text\",\"expr\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"id\"}]}},{\"as\":\"score_number\",\"expr\":{\"op\":\"cast\",\"to\":\"numeric\",\"args\":[{\"field\":\"score_text\"}]}},{\"as\":\"active_bool\",\"expr\":{\"op\":\"cast\",\"to\":\"bool\",\"args\":[{\"value\":\"true\"}]}},{\"as\":\"active_text\",\"expr\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"active\"}]}}]}",
+        schema,
+    );
+    defer request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), request.expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.cast, request.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.text, request.expressions[0].expression.cast_type.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.numeric, request.expressions[1].expression.cast_type.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.bool, request.expressions[2].expression.cast_type.?);
+
+    const rows = [_][]const u8{
+        "{\"id\":\"a\",\"score_text\":\"42.5\",\"active\":true}",
+        "{\"id\":\"b\",\"score_text\":null,\"active\":false}",
+    };
+    var result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, request, rows[0..]);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"id_text\":\"a\",\"score_number\":42.5,\"active_bool\":true,\"active_text\":\"true\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"id_text\":\"b\",\"score_number\":null,\"active_bool\":true,\"active_text\":\"false\"}", result.rows[1]);
+
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"expressions\":[{\"as\":\"bad\",\"expr\":{\"op\":\"cast\",\"to\":\"timestamp\",\"args\":[{\"field\":\"id\"}]}}]}",
         schema,
     ));
 }
