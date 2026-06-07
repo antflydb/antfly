@@ -558,6 +558,21 @@ pub const NodeFilter = struct {
     filter_prefix: ?[]const u8 = null,
 };
 
+pub const GraphMetricStatus = struct {
+    state: []const u8,
+    published_generation: i64,
+    edge_generation: i64,
+    converged: bool,
+    iterations_completed: i64,
+    delta: f64,
+    computed_at_ms: i64,
+};
+
+pub const GraphMetricScore = struct {
+    node: []const u8,
+    score: f64,
+};
+
 /// Configuration for result fusion when combining multiple search indexes.
 pub const MergeConfig = struct {
     strategy: ?MergeStrategy = null,
@@ -780,6 +795,13 @@ pub const GraphQueryParams = struct {
     algorithm: ?[]const u8 = null,
     /// Parameters for the graph algorithm
     algorithm_params: ?std.json.Value = null,
+};
+
+pub const GraphMetricResult = struct {
+    index_name: []const u8,
+    metric: []const u8,
+    scores: []const GraphMetricScore,
+    status: GraphMetricStatus,
 };
 
 /// Configuration for an index

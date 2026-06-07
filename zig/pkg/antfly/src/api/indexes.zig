@@ -488,6 +488,12 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, escaped);
 }
 
+fn appendFloatValue(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: f64) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
 fn appendAlgebraicIndexStatsFields(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1238,6 +1244,29 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"result_nodes\":");
         try appendIntValue(alloc, out, item.algebraic_graph_traversal_result_node_count);
         try out.appendSlice(alloc, "}}");
+        if (@hasField(@TypeOf(item), "graph_metric_status") and item.graph_metric_status.len > 0) {
+            try out.appendSlice(alloc, ",\"metric_status\":{");
+            for (item.graph_metric_status, 0..) |status, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try appendJsonString(alloc, out, status.name);
+                try out.appendSlice(alloc, ":{\"state\":");
+                try appendJsonString(alloc, out, @tagName(status.state));
+                try out.appendSlice(alloc, ",\"published_generation\":");
+                try appendIntValue(alloc, out, status.published_generation);
+                try out.appendSlice(alloc, ",\"edge_generation\":");
+                try appendIntValue(alloc, out, status.edge_generation);
+                try out.appendSlice(alloc, ",\"converged\":");
+                try out.appendSlice(alloc, if (status.converged) "true" else "false");
+                try out.appendSlice(alloc, ",\"iterations_completed\":");
+                try appendIntValue(alloc, out, @as(u64, status.iterations_completed));
+                try out.appendSlice(alloc, ",\"delta\":");
+                try appendFloatValue(alloc, out, status.delta);
+                try out.appendSlice(alloc, ",\"computed_at_ms\":");
+                try appendIntValue(alloc, out, status.computed_at_ms);
+                try out.append(alloc, '}');
+            }
+            try out.append(alloc, '}');
+        }
         if (graph_source_status) |source| {
             try out.appendSlice(alloc, ",\"source_artifact\":{");
             try appendJsonString(alloc, out, "name");

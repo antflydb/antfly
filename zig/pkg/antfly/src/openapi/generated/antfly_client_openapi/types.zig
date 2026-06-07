@@ -2845,6 +2845,21 @@ pub const Pruner = struct {
     std_dev_threshold: ?f64 = null,
 };
 
+pub const GraphMetricScore = struct {
+    node: []const u8,
+    score: f64,
+};
+
+pub const GraphMetricStatus = struct {
+    state: []const u8,
+    published_generation: i64,
+    edge_generation: i64,
+    converged: bool,
+    iterations_completed: i64,
+    delta: f64,
+    computed_at_ms: i64,
+};
+
 pub const InferenceError = struct {
     /// Error message
     @"error": []const u8,
@@ -4098,6 +4113,13 @@ pub const GraphQueryParams = struct {
     algorithm: ?[]const u8 = null,
     /// Parameters for the graph algorithm
     algorithm_params: ?std.json.Value = null,
+};
+
+pub const GraphMetricResult = struct {
+    index_name: []const u8,
+    metric: []const u8,
+    scores: []const GraphMetricScore,
+    status: GraphMetricStatus,
 };
 
 /// A single embedding result
@@ -5856,6 +5878,8 @@ pub const QueryResult = struct {
     analyses: ?std.json.ArrayHashMap(AnalysesResult) = null,
     /// Results from declarative graph queries.
     graph_results: ?std.json.ArrayHashMap(GraphQueryResult) = null,
+    /// Results from direct graph metric reads.
+    graph_metric_results: ?std.json.ArrayHashMap(GraphMetricResult) = null,
     /// Detailed execution profile (present when `profile: true` in request).
     profile: ?std.json.Value = null,
     /// Duration of the query in milliseconds.

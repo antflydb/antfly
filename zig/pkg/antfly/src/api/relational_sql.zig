@@ -21,7 +21,7 @@ const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 
-pub const default_array_agg_max_items: u32 = 1024;
+pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
 
 pub const SqlValue = union(enum) {
     null,
@@ -115,6 +115,7 @@ pub const LoweredInsert = struct {
 pub const LoweredMutation = struct {
     table_name: []const u8,
     batch: relational_rows.OwnedRowsBatchRequest,
+    returning_expression_count: usize = 0,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
@@ -2743,6 +2744,7 @@ const Parser = struct {
 
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
         if (!self.atEnd()) return error.UnsupportedSqlShape;
+        const returning_expression_count = returning.expressions.len;
 
         const explicit_expected_version = if (updateWillLookupExistingRow(self.schema, returning))
             null
@@ -2767,6 +2769,7 @@ const Parser = struct {
         return .{
             .table_name = table_name,
             .batch = batch,
+            .returning_expression_count = returning_expression_count,
         };
     }
 
@@ -2788,6 +2791,7 @@ const Parser = struct {
 
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
         if (!self.atEnd()) return error.UnsupportedSqlShape;
+        const returning_expression_count = returning.expressions.len;
 
         const explicit_expected_version = if (returning.hasProjection())
             null
@@ -2804,6 +2808,7 @@ const Parser = struct {
         return .{
             .table_name = table_name,
             .batch = batch,
+            .returning_expression_count = returning_expression_count,
         };
     }
 
@@ -3295,6 +3300,9 @@ const Parser = struct {
         var field: ?[]const u8 = null;
         var field_transferred = false;
         errdefer if (!field_transferred) if (field) |owned| self.alloc.free(owned);
+        var expression: ?db_mod.types.RelationalRowsExpression = null;
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) if (expression) |owned| freeExpression(self.alloc, owned);
         var array_order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
         errdefer {
             freeOrderBy(self.alloc, array_order_by.items);
@@ -3304,59 +3312,110 @@ const Parser = struct {
             if (distinct) return error.UnsupportedSqlShape;
             field = null;
         } else {
-            const parsed_field = try self.parseFieldExpressionOwned();
-            if (relationalColumnForField(self.schema, parsed_field, null)) |column| {
-                if (op == .count) {
-                    if (column.field_type == .array or column.field_type == .json) {
-                        self.alloc.free(parsed_field);
+            if (self.peekAggregateExpressionInput()) {
+                const parsed_expression = try self.parseAggregateInputExpressionAlloc();
+                var parsed_expression_transferred = false;
+                errdefer if (!parsed_expression_transferred) freeExpression(self.alloc, parsed_expression);
+                try self.validateAggregateInputExpression(op, parsed_expression);
+                expression = parsed_expression;
+                parsed_expression_transferred = true;
+            } else {
+                const parsed_field = try self.parseFieldExpressionOwned();
+                var parsed_field_transferred = false;
+                errdefer if (!parsed_field_transferred) self.alloc.free(parsed_field);
+                if (relationalColumnForField(self.schema, parsed_field, null)) |column| {
+                    if (op == .count) {
+                        if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
+                    } else if (op == .array_agg) {
+                        if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
+                    } else if (column.field_type != .numeric) {
                         return error.InvalidSqlCatalog;
                     }
-                } else if (op == .array_agg) {
-                    if (column.field_type == .array or column.field_type == .json) {
-                        self.alloc.free(parsed_field);
-                        return error.InvalidSqlCatalog;
-                    }
-                } else if (column.field_type != .numeric) {
-                    self.alloc.free(parsed_field);
+                } else {
                     return error.InvalidSqlCatalog;
                 }
-            } else {
-                self.alloc.free(parsed_field);
-                return error.InvalidSqlCatalog;
+                field = parsed_field;
+                parsed_field_transferred = true;
             }
-            field = parsed_field;
         }
         if (op == .array_agg and self.matchKeyword("order")) {
             try self.expectKeyword("by");
             try self.parseOrderBy(&array_order_by);
         }
         try self.expect(.rparen);
-        const filter_predicates = try self.parseAggregateFilterPredicatesAlloc();
+        const filter = try self.parseAggregateFilterAlloc();
         var filter_transferred = false;
         errdefer if (!filter_transferred) {
-            freeRelationalChecks(self.alloc, filter_predicates);
-            if (filter_predicates.len > 0) self.alloc.free(filter_predicates);
+            freeRelationalChecks(self.alloc, filter.predicates);
+            if (filter.predicates.len > 0) self.alloc.free(filter.predicates);
+            freeExpressionConditions(self.alloc, filter.expressions);
+            if (filter.expressions.len > 0) self.alloc.free(filter.expressions);
         };
         const name = try self.parseAggregateAliasOrDefaultAlloc(op, field);
         var name_transferred = false;
         errdefer if (!name_transferred) self.alloc.free(name);
         field_transferred = true;
+        expression_transferred = true;
         filter_transferred = true;
         name_transferred = true;
         return .{
             .name = name,
             .op = op,
             .field = field,
+            .expression = expression,
             .distinct = distinct,
             .distinct_max_items = if (distinct) db_mod.types.default_relational_rows_aggregate_distinct_max_items else 0,
             .array_max_items = if (op == .array_agg) default_array_agg_max_items else 0,
             .array_order_by = try array_order_by.toOwnedSlice(self.alloc),
-            .filter_predicates = filter_predicates,
+            .filter_predicates = filter.predicates,
+            .filter_expressions = filter.expressions,
         };
     }
 
-    fn parseAggregateFilterPredicatesAlloc(self: *@This()) ![]const runtime_schema.RelationalCheck {
-        if (!self.matchKeyword("filter")) return &.{};
+    fn peekAggregateExpressionInput(self: *@This()) bool {
+        if (self.peekKeyword("lower") or self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("nullif")) return true;
+        if (self.peekKind(.identifier) and self.pos + 1 < self.tokens.len) {
+            return switch (self.tokens[self.pos + 1].kind) {
+                .plus, .minus, .star, .slash => true,
+                else => false,
+            };
+        }
+        return false;
+    }
+
+    fn parseAggregateInputExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
+        if (self.peekKeyword("lower") or self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("nullif")) {
+            return try self.parseRowExpressionOperandAlloc();
+        }
+
+        const field = try self.parseFieldExpressionOwned();
+        var field_transferred = false;
+        errdefer if (!field_transferred) self.alloc.free(field);
+        const column = relationalColumnForField(self.schema, field, null) orelse return error.InvalidSqlCatalog;
+        if (column.field_type != .numeric) return error.InvalidSqlCatalog;
+        if (self.peekArithmeticOperator() == null) return error.UnsupportedSqlShape;
+        field_transferred = true;
+        return try self.parseArithmeticExpressionRestAlloc(.{ .kind = .field, .field = field }, 0);
+    }
+
+    fn validateAggregateInputExpression(
+        self: *@This(),
+        op: db_mod.types.RelationalRowsAggregateOp,
+        expression: db_mod.types.RelationalRowsExpression,
+    ) !void {
+        switch (op) {
+            .count, .array_agg => {},
+            .sum, .avg, .min, .max => try self.validateNumericRowExpression(expression),
+        }
+    }
+
+    const AggregateFilter = struct {
+        predicates: []const runtime_schema.RelationalCheck = &.{},
+        expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
+    };
+
+    fn parseAggregateFilterAlloc(self: *@This()) !AggregateFilter {
+        if (!self.matchKeyword("filter")) return .{};
         try self.expect(.lparen);
         try self.expectKeyword("where");
 
@@ -3365,18 +3424,45 @@ const Parser = struct {
             freeRelationalChecks(self.alloc, predicates.items);
             predicates.deinit(self.alloc);
         }
+        var expressions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+        errdefer {
+            freeExpressionConditions(self.alloc, expressions.items);
+            expressions.deinit(self.alloc);
+        }
 
         while (true) {
-            const predicate = try self.parseScalarWherePredicateAlloc();
-            var predicate_transferred = false;
-            errdefer if (!predicate_transferred) freeRelationalCheck(self.alloc, predicate);
-            try predicates.append(self.alloc, predicate);
-            predicate_transferred = true;
+            if (self.peekAggregateExpressionFilter()) {
+                const condition = try self.parseCaseExpressionConditionAlloc();
+                var condition_transferred = false;
+                errdefer if (!condition_transferred) freeExpressionCondition(self.alloc, condition);
+                try expressions.append(self.alloc, condition);
+                condition_transferred = true;
+            } else {
+                const predicate = try self.parseScalarWherePredicateAlloc();
+                var predicate_transferred = false;
+                errdefer if (!predicate_transferred) freeRelationalCheck(self.alloc, predicate);
+                try predicates.append(self.alloc, predicate);
+                predicate_transferred = true;
+            }
             if (!self.matchKeyword("and")) break;
         }
-        if (predicates.items.len == 0) return error.UnsupportedSqlShape;
+        if (predicates.items.len == 0 and expressions.items.len == 0) return error.UnsupportedSqlShape;
         try self.expect(.rparen);
-        return try predicates.toOwnedSlice(self.alloc);
+        return .{
+            .predicates = try predicates.toOwnedSlice(self.alloc),
+            .expressions = try expressions.toOwnedSlice(self.alloc),
+        };
+    }
+
+    fn peekAggregateExpressionFilter(self: *@This()) bool {
+        if (self.peekKeyword("lower") or self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("nullif")) return true;
+        if (self.peekKind(.identifier) and self.pos + 1 < self.tokens.len) {
+            return switch (self.tokens[self.pos + 1].kind) {
+                .plus, .minus, .star, .slash => true,
+                else => false,
+            };
+        }
+        return false;
     }
 
     fn parseAggregateAliasOrDefaultAlloc(
@@ -4473,7 +4559,12 @@ const Parser = struct {
             try writer.writeAll("\"order_by\":[");
             for (source.order_by, 0..) |order, i| {
                 if (i != 0) try writer.writeByte(',');
-                try writer.print("{{\"field\":{f}", .{std.json.fmt(order.field, .{})});
+                if (order.expression) |expression| {
+                    try writer.writeAll("{\"expr\":");
+                    try writeRowExpressionJson(writer, expression);
+                } else {
+                    try writer.print("{{\"field\":{f}", .{std.json.fmt(order.field, .{})});
+                }
                 if (order.direction == .desc) try writer.writeAll(",\"direction\":\"desc\"");
                 try writer.writeByte('}');
             }
@@ -5021,7 +5112,10 @@ const Parser = struct {
         while (true) {
             var order = try self.parseOrderExpressionAlloc();
             var order_transferred = false;
-            errdefer if (!order_transferred) self.alloc.free(order.field);
+            errdefer if (!order_transferred) {
+                if (order.field.len > 0) self.alloc.free(order.field);
+                if (order.expression) |expression| freeExpression(self.alloc, expression);
+            };
             const direction: db_mod.types.RelationalRowsQueryOrderDirection = if (self.matchKeyword("desc"))
                 .desc
             else blk: {
@@ -5054,9 +5148,38 @@ const Parser = struct {
             return .{ .field = field, .null_test = null_test };
         }
 
+        if (self.peekKeyword("lower")) {
+            const expression = try self.parseLowerRowExpressionAlloc();
+            var expression_transferred = false;
+            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+            if (expression.operands.len == 1 and expression.operands[0].kind == .field) {
+                if (generatedLowerColumnForField(self.schema, expression.operands[0].field)) |generated| {
+                    const field = try self.alloc.dupe(u8, generated.name);
+                    freeExpression(self.alloc, expression);
+                    expression_transferred = true;
+                    return .{ .field = field };
+                }
+            }
+            expression_transferred = true;
+            return .{ .expression = expression };
+        }
+        if (self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("nullif")) {
+            const expression = try self.parseRowExpressionOperandAlloc();
+            return .{ .expression = expression };
+        }
+
         const field = try self.parseFieldExpressionOwned();
-        errdefer self.alloc.free(field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) self.alloc.free(field);
         if (relationalColumnForField(self.schema, field, null) == null) return error.InvalidSqlCatalog;
+        if (self.peekArithmeticOperator()) |_| {
+            const column = relationalColumnForField(self.schema, field, null) orelse return error.InvalidSqlCatalog;
+            if (column.field_type != .numeric) return error.InvalidSqlCatalog;
+            field_transferred = true;
+            const expression = try self.parseArithmeticExpressionRestAlloc(.{ .kind = .field, .field = field }, 0);
+            return .{ .expression = expression };
+        }
+        field_transferred = true;
         return .{ .field = field };
     }
 
@@ -8198,10 +8321,13 @@ fn freeLateralSubquery(alloc: std.mem.Allocator, value: Parser.LateralSubquery) 
 fn freeAggregateSpec(alloc: std.mem.Allocator, spec: db_mod.types.RelationalRowsAggregateSpec) void {
     alloc.free(spec.name);
     if (spec.field) |field| alloc.free(field);
+    if (spec.expression) |expression| freeExpression(alloc, expression);
     freeOrderBy(alloc, spec.array_order_by);
     if (spec.array_order_by.len > 0) alloc.free(spec.array_order_by);
     freeRelationalChecks(alloc, spec.filter_predicates);
     if (spec.filter_predicates.len > 0) alloc.free(spec.filter_predicates);
+    freeExpressionConditions(alloc, spec.filter_expressions);
+    if (spec.filter_expressions.len > 0) alloc.free(spec.filter_expressions);
 }
 
 fn freeAggregateSpecs(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsAggregateSpec) void {
@@ -8428,6 +8554,10 @@ fn freeExpressionCondition(alloc: std.mem.Allocator, value: db_mod.types.Relatio
     if (value.rhs.len > 0) alloc.free(value.rhs);
 }
 
+fn freeExpressionConditions(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionCondition) void {
+    for (values) |value| freeExpressionCondition(alloc, value);
+}
+
 fn freeExpressionProjection(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionProjection) void {
     alloc.free(value.output);
     freeExpression(alloc, value.expression);
@@ -8458,7 +8588,10 @@ fn freeWindowSpecs(alloc: std.mem.Allocator, values: []const db_mod.types.Relati
 }
 
 fn freeOrderBy(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsQueryOrder) void {
-    for (values) |value| alloc.free(value.field);
+    for (values) |value| {
+        if (value.field.len > 0) alloc.free(value.field);
+        if (value.expression) |expression| freeExpression(alloc, expression);
+    }
 }
 
 test "postgres sql adapter lowers create table ddl into typed schema plan" {
@@ -9768,13 +9901,13 @@ test "postgres sql adapter lowers filtered aggregate predicates" {
 
     var lowered = try lowerAggregateAlloc(
         alloc,
-        "SELECT customer, COUNT(*) FILTER (WHERE status = 'open') AS open_count, SUM(amount) FILTER (WHERE status = 'open' AND amount > 10) AS open_amount_sum FROM usage_records GROUP BY customer ORDER BY open_amount_sum DESC LIMIT 10",
+        "SELECT customer, COUNT(*) FILTER (WHERE status = 'open') AS open_count, SUM(amount) FILTER (WHERE status = 'open' AND amount > 10) AS open_amount_sum, COUNT(*) FILTER (WHERE lower(status) = 'open') AS open_lower_count FROM usage_records GROUP BY customer ORDER BY open_amount_sum DESC LIMIT 10",
         schema,
         &.{},
     );
     defer lowered.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 3), lowered.aggregate.aggregations.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[0].op);
     try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[0].filter_predicates.len);
     try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[0].filter_predicates[0].field);
@@ -9787,6 +9920,11 @@ test "postgres sql adapter lowers filtered aggregate predicates" {
     try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[1].filter_predicates[1].field);
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, lowered.aggregate.aggregations[1].filter_predicates[1].op);
     try std.testing.expectEqualStrings("10", lowered.aggregate.aggregations[1].filter_predicates[1].value_json.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[2].op);
+    try std.testing.expectEqual(@as(usize, 0), lowered.aggregate.aggregations[2].filter_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[2].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.aggregate.aggregations[2].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, lowered.aggregate.aggregations[2].filter_expressions[0].op);
 }
 
 test "postgres sql adapter lowers distinct aggregate specs" {
@@ -9825,6 +9963,36 @@ test "postgres sql adapter lowers distinct aggregate specs" {
         schema,
         &.{},
     ));
+}
+
+test "postgres sql adapter lowers aggregate expression inputs" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"}},"required":["id","status","customer","amount","discount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerAggregateAlloc(
+        alloc,
+        "SELECT customer, COUNT(DISTINCT lower(status)) AS status_count, SUM(amount - discount) AS net_amount FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[0].op);
+    try std.testing.expect(lowered.aggregate.aggregations[0].distinct);
+    try std.testing.expect(lowered.aggregate.aggregations[0].field == null);
+    try std.testing.expect(lowered.aggregate.aggregations[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.aggregate.aggregations[0].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[1].op);
+    try std.testing.expect(lowered.aggregate.aggregations[1].field == null);
+    try std.testing.expect(lowered.aggregate.aggregations[1].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.aggregate.aggregations[1].expression.?.kind);
 }
 
 test "postgres sql adapter lowers bounded array aggregate specs" {
@@ -10031,6 +10199,33 @@ test "postgres sql adapter lowers generated lower expressions for query pushdown
     try std.testing.expectEqualStrings("\"ada@example.test\"", lowered.query.predicates[0].value_json.?);
     try std.testing.expectEqual(@as(usize, 1), lowered.query.order_by.len);
     try std.testing.expectEqualStrings("email_key", lowered.query.order_by[0].field);
+}
+
+test "postgres sql adapter lowers scalar expression order keys" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM users ORDER BY lower(email) ASC, amount - discount DESC LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), lowered.query.order_by.len);
+    try std.testing.expectEqual(@as(usize, 0), lowered.query.order_by[0].field.len);
+    try std.testing.expect(lowered.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.query.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, lowered.query.order_by[0].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.query.order_by[1].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.query.order_by[1].direction);
 }
 
 test "postgres sql adapter lowers concat projection into expression AST" {
@@ -10580,12 +10775,37 @@ fn appCompatLimitValue(limit: ?u32) i64 {
     return if (limit) |value| @intCast(value) else -1;
 }
 
+fn expressionOrderCount(order_by: []const db_mod.types.RelationalRowsQueryOrder) usize {
+    var count: usize = 0;
+    for (order_by) |order| {
+        if (order.expression != null) count += 1;
+    }
+    return count;
+}
+
+fn aggregateFilterExpressionCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        count += aggregation.filter_expressions.len;
+    }
+    return count;
+}
+
+fn aggregateInputExpressionCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        if (aggregation.expression != null) count += 1;
+    }
+    return count;
+}
+
 fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table_name: []const u8, query: db_mod.types.RelationalRowsQueryRequest, ctes: usize) ![]u8 {
     const claim = if (query.row_claim) |claim_value| if (claim_value.skip_locked) "skip_locked" else "locked" else "none";
+    const order_expr = expressionOrderCount(query.order_by);
     if (query.limit) |limit| {
         return try std.fmt.allocPrint(
             alloc,
-            "{s}:table={s}:ctes={d}:pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:limit={d}:claim={s}",
+            "{s}:table={s}:ctes={d}:pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
             .{
                 family,
                 table_name,
@@ -10598,6 +10818,7 @@ fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table_nam
                 query.expressions.len,
                 query.field_aliases.len,
                 query.order_by.len,
+                order_expr,
                 limit,
                 claim,
             },
@@ -10605,7 +10826,7 @@ fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table_nam
     }
     return try std.fmt.allocPrint(
         alloc,
-        "{s}:table={s}:ctes={d}:pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:limit=none:claim={s}",
+        "{s}:table={s}:ctes={d}:pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit=none:claim={s}",
         .{
             family,
             table_name,
@@ -10618,6 +10839,7 @@ fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table_nam
             query.expressions.len,
             query.field_aliases.len,
             query.order_by.len,
+            order_expr,
             claim,
         },
     );
@@ -10802,13 +11024,15 @@ fn expectAppCompatCorpusEntry(
             try expectOptionalU32(entry.summary.limit, lowered.aggregate.limit);
             const fingerprint = try std.fmt.allocPrint(
                 alloc,
-                "aggregate:table={s}:source_pred={d}:source_json_eq={d}:group={d}:aggs={d}:having={d}:order={d}:limit={d}",
+                "aggregate:table={s}:source_pred={d}:source_json_eq={d}:group={d}:aggs={d}:agg_expr={d}:filter_expr={d}:having={d}:order={d}:limit={d}",
                 .{
                     lowered.table_name,
                     lowered.aggregate.source.predicates.len,
                     lowered.aggregate.source.json_path_eq.len,
                     lowered.aggregate.group_by.len,
                     lowered.aggregate.aggregations.len,
+                    aggregateInputExpressionCount(lowered.aggregate.aggregations),
+                    aggregateFilterExpressionCount(lowered.aggregate.aggregations),
                     lowered.aggregate.having_predicates.len,
                     lowered.aggregate.order_by.len,
                     appCompatLimitValue(lowered.aggregate.limit),
@@ -10924,8 +11148,8 @@ fn expectAppCompatCorpusEntry(
             const operations = if (lowered.batch.transforms.len == 0) 0 else lowered.batch.transforms[0].operations.len;
             const fingerprint = try std.fmt.allocPrint(
                 alloc,
-                "update:table={s}:transforms={d}:ops={d}:returning_rows={d}",
-                .{ lowered.table_name, lowered.batch.transforms.len, operations, lowered.batch.returning_rows.len },
+                "update:table={s}:transforms={d}:ops={d}:returning_rows={d}:returning_expr={d}",
+                .{ lowered.table_name, lowered.batch.transforms.len, operations, lowered.batch.returning_rows.len, lowered.returning_expression_count },
             );
             defer alloc.free(fingerprint);
             try expectAppCompatPlan(entry.plan, fingerprint);
@@ -10937,8 +11161,8 @@ fn expectAppCompatCorpusEntry(
             try expectOptionalUsize(entry.summary.returning, lowered.batch.returning_rows.len);
             const fingerprint = try std.fmt.allocPrint(
                 alloc,
-                "delete:table={s}:deletes={d}:returning_rows={d}",
-                .{ lowered.table_name, lowered.batch.deletes.len, lowered.batch.returning_rows.len },
+                "delete:table={s}:deletes={d}:returning_rows={d}:returning_expr={d}",
+                .{ lowered.table_name, lowered.batch.deletes.len, lowered.batch.returning_rows.len, lowered.returning_expression_count },
             );
             defer alloc.free(fingerprint);
             try expectAppCompatPlan(entry.plan, fingerprint);
@@ -11007,7 +11231,7 @@ fn expectAppCompatCorpusEntry(
 test "postgres sql adapter classifies application compatibility corpus" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"organization_id":{"type":"keyword"},"cloud_instance_id":{"type":"keyword"},"user_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"kind":{"type":"keyword"},"status":{"type":"keyword"},"metric_type":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"},"rating_status":{"type":"keyword"},"product_family":{"type":"keyword"},"amount":{"type":"numeric"},"quantity":{"type":"numeric"},"rated_quantity":{"type":"numeric"},"priority":{"type":"numeric"},"created_at":{"type":"numeric"},"updated_at_ns":{"type":"numeric"},"recorded_at":{"type":"numeric"},"expires_at":{"type":"numeric"},"billing_cycle_start":{"type":"numeric"},"bucket_start":{"type":"numeric"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"organization_id":{"type":"keyword"},"cloud_instance_id":{"type":"keyword"},"user_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"kind":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"metric_type":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"},"rating_status":{"type":"keyword"},"product_family":{"type":"keyword"},"amount":{"type":"numeric"},"quantity":{"type":"numeric"},"rated_quantity":{"type":"numeric"},"priority":{"type":"numeric"},"created_at":{"type":"numeric"},"updated_at_ns":{"type":"numeric"},"recorded_at":{"type":"numeric"},"expires_at":{"type":"numeric"},"billing_cycle_start":{"type":"numeric"},"bucket_start":{"type":"numeric"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -11106,24 +11330,24 @@ test "postgres sql adapter classifies application compatibility corpus" {
             .name = "single table json query",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .predicates = 1, .json_path_eq = 1, .select = 1, .order_by = 1, .limit = 10 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:json_eq=1:or=0:not=0:select=1:expr=1:alias=0:order=1:limit=10:claim=none",
+            .plan = "query:table=usage_records:ctes=0:pred=1:json_eq=1:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=0:limit=10:claim=none",
             .sql = "SELECT id, metadata->>'source' AS source FROM usage_records WHERE organization_id = $1 AND metadata->>'source' = $2 ORDER BY created_at DESC LIMIT 10",
             .params = &.{ .{ .string = "org_1" }, .{ .string = "meter" } },
         },
         .{
             .name = "single table expression query",
             .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 0, .order_by = 1, .limit = 20 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:json_eq=0:or=0:not=0:select=0:expr=5:alias=0:order=1:limit=20:claim=none",
-            .sql = "SELECT id AS usage_id, CASE WHEN status = 'blocked' THEN 'needs_review' ELSE lower(status) END AS status_label, CAST(amount AS text) AS amount_text, amount + quantity AS total_amount, array_length(tags, 1) AS tag_count FROM usage_records WHERE status = $1 ORDER BY created_at DESC LIMIT 20",
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 0, .order_by = 2, .limit = 20 },
+            .plan = "query:table=usage_records:ctes=0:pred=1:json_eq=0:or=0:not=0:select=0:expr=5:alias=0:order=2:order_expr=1:limit=20:claim=none",
+            .sql = "SELECT id AS usage_id, CASE WHEN status = 'blocked' THEN 'needs_review' ELSE lower(status) END AS status_label, CAST(amount AS text) AS amount_text, amount + quantity AS total_amount, array_length(tags, 1) AS tag_count FROM usage_records WHERE status = $1 ORDER BY lower(status) ASC, created_at DESC LIMIT 20",
             .params = &.{.{ .string = "ready" }},
         },
         .{
             .name = "grouped aggregate",
             .family = .aggregate,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .group_by = 1, .aggregations = 2, .having = 1, .order_by = 1, .limit = 5 },
-            .plan = "aggregate:table=usage_records:source_pred=1:source_json_eq=0:group=1:aggs=2:having=1:order=1:limit=5",
-            .sql = "SELECT organization_id, COUNT(*) AS record_count, SUM(quantity) AS quantity_sum FROM usage_records WHERE metric_type = $1 GROUP BY organization_id HAVING quantity_sum > 0 ORDER BY quantity_sum DESC LIMIT 5",
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .group_by = 1, .aggregations = 3, .having = 1, .order_by = 1, .limit = 5 },
+            .plan = "aggregate:table=usage_records:source_pred=1:source_json_eq=0:group=1:aggs=3:agg_expr=1:filter_expr=1:having=1:order=1:limit=5",
+            .sql = "SELECT organization_id, COUNT(*) AS record_count, SUM(quantity) AS quantity_sum, COUNT(DISTINCT lower(status)) FILTER (WHERE lower(status) = 'active') AS active_status_count FROM usage_records WHERE metric_type = $1 GROUP BY organization_id HAVING quantity_sum > 0 ORDER BY quantity_sum DESC LIMIT 5",
             .params = &.{.{ .string = "tokens" }},
         },
         .{
@@ -11155,19 +11379,26 @@ test "postgres sql adapter classifies application compatibility corpus" {
             .sql = "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET quantity = excluded.quantity RETURNING id, quantity, CAST(quantity AS text) AS quantity_text",
         },
         .{
+            .name = "conflict default update",
+            .family = .insert,
+            .summary = .{ .table_name = "usage_records", .returning = 1 },
+            .plan = "insert:table=usage_records:writes=0:transforms=1:deletes=0:returning_rows=1:returning_expr=0",
+            .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'open') ON CONFLICT (id) DO UPDATE SET status = DEFAULT RETURNING id, status",
+        },
+        .{
             .name = "point update",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1",
-            .sql = "UPDATE usage_records SET status = $1 WHERE id = $2 RETURNING id, status",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1",
+            .sql = "UPDATE usage_records SET status = $1 WHERE id = $2 RETURNING id, status, LOWER(status) AS status_key",
             .params = &.{ .{ .string = "processing" }, .{ .string = "u1" } },
         },
         .{
             .name = "point delete",
             .family = .delete,
             .summary = .{ .table_name = "usage_records", .returning = 1 },
-            .plan = "delete:table=usage_records:deletes=1:returning_rows=1",
-            .sql = "DELETE FROM usage_records WHERE id = $1 RETURNING id",
+            .plan = "delete:table=usage_records:deletes=1:returning_rows=1:returning_expr=1",
+            .sql = "DELETE FROM usage_records WHERE id = $1 RETURNING id, LOWER(status) AS status_key",
             .params = &.{.{ .string = "u1" }},
         },
         .{
@@ -11752,6 +11983,42 @@ test "postgres sql adapter lowers excluded explicit default values" {
     try std.testing.expectEqualStrings("\"active\"", lowered.batch.transforms[0].operations[0].value_json.?);
     try std.testing.expectEqual(@as(u64, 14), lowered.batch.predicates[0].expected_version);
     try std.testing.expectEqualStrings("{\"status\":\"active\"}", lowered.batch.returning_rows[0]);
+}
+
+test "postgres sql adapter lowers conflict update explicit default values" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","default":"active"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"existing\"}", .version = 15 };
+
+    var lowered = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'pending') ON CONFLICT (id) DO UPDATE SET status = DEFAULT RETURNING status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), lowered.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqualStrings("status", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"active\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 15), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"status\":\"active\"}", lowered.batch.returning_rows[0]);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'pending') ON CONFLICT (id) DO UPDATE SET id = DEFAULT RETURNING id",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
 }
 
 test "postgres sql adapter lowers cross-column excluded conflict values" {

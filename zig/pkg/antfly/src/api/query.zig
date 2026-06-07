@@ -173,6 +173,7 @@ fn isPureDenseRequest(req: db_mod.types.SearchRequest) bool {
         req.full_text == null and
         req.sparse_queries.len == 0 and
         req.graph_queries.len == 0 and
+        req.graph_metric_queries.len == 0 and
         req.sparse == null and
         req.merge_config == null;
 }
@@ -865,6 +866,20 @@ test "query parser accepts graph searches" {
     }
 }
 
+test "query parser accepts direct graph metric reads" {
+    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":25,"metric_freshness":"fresh"}}
+    );
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_metric_queries.len);
+    try std.testing.expectEqualStrings("pagerank", owned.req.graph_metric_queries[0].name);
+    try std.testing.expectEqualStrings("graph_idx", owned.req.graph_metric_queries[0].query.index_name);
+    try std.testing.expectEqualStrings("pagerank", owned.req.graph_metric_queries[0].query.metric_name);
+    try std.testing.expectEqual(@as(u32, 25), owned.req.graph_metric_queries[0].query.top_k);
+    try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, owned.req.graph_metric_queries[0].query.freshness);
+}
+
 test "query parser accepts graph pattern searches" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"graph_searches":{"pattern_walk":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"pattern":[{"alias":"a"},{"alias":"b","edge":{"types":["links"],"direction":"out","min_hops":1,"max_hops":2}}],"return_aliases":["b"],"include_documents":true}},"limit":10}
@@ -904,6 +919,46 @@ test "query encoder emits antfly-style response envelope" {
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"responses\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_id\":\"doc:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"table\":\"docs\"") != null);
+}
+
+test "query encoder emits graph metric results" {
+    const alloc = std.testing.allocator;
+    var scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    scores[0] = .{
+        .node = try alloc.dupe(u8, "doc:b"),
+        .score = 0.75,
+    };
+    var metric_results = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    metric_results[0] = .{
+        .name = try alloc.dupe(u8, "pagerank"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 3,
+            .edge_generation = 3,
+            .converged = true,
+            .iterations_completed = 12,
+            .delta = 0.00001,
+            .computed_at_ms = 1780000000000,
+        },
+    };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = metric_results,
+    };
+    defer result.deinit();
+
+    var encoded = try encodeQueryResponses(alloc, "docs", .{}, .{}, result);
+    defer encoded.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"graph_metric_results\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"pagerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"state\":\"fresh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"node\":\"doc:b\"") != null);
 }
 
 test "query encoder does not expose internal doc ordinals" {

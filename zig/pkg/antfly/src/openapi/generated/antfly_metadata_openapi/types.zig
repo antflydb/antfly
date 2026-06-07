@@ -2270,6 +2270,8 @@ pub const QueryResult = struct {
     analyses: ?std.json.ArrayHashMap(AnalysesResult) = null,
     /// Results from declarative graph queries.
     graph_results: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQueryResult) = null,
+    /// Results from direct graph metric reads.
+    graph_metric_results: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphMetricResult) = null,
     /// Detailed execution profile (present when `profile: true` in request).
     profile: ?std.json.Value = null,
     /// Duration of the query in milliseconds.

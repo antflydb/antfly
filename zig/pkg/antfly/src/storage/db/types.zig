@@ -832,7 +832,8 @@ pub const RelationalRowsQueryOrderNullTest = enum {
 };
 
 pub const RelationalRowsQueryOrder = struct {
-    field: []const u8,
+    field: []const u8 = "",
+    expression: ?RelationalRowsExpression = null,
     direction: RelationalRowsQueryOrderDirection = .asc,
     null_test: ?RelationalRowsQueryOrderNullTest = null,
 };
@@ -1085,7 +1086,10 @@ pub const RelationalRowsQueryRequest = struct {
             freeRelationalRowsExpression(alloc, projection.expression);
         }
         if (self.expressions.len > 0) alloc.free(self.expressions);
-        for (self.order_by) |order| alloc.free(order.field);
+        for (self.order_by) |order| {
+            if (order.field.len > 0) alloc.free(order.field);
+            if (order.expression) |expression| freeRelationalRowsExpression(alloc, expression);
+        }
         if (self.order_by.len > 0) alloc.free(self.order_by);
         if (self.row_claim) |claim| if (claim.owner_id.len > 0) alloc.free(claim.owner_id);
         if (self.doc_key_range) |range| {
@@ -1103,14 +1107,18 @@ fn freeRelationalRowsExpression(alloc: Allocator, expression: RelationalRowsExpr
     for (expression.operands) |operand| freeRelationalRowsExpression(alloc, operand);
     if (expression.operands.len > 0) alloc.free(expression.operands);
     for (expression.case_branches) |branch| {
-        freeRelationalRowsExpression(alloc, branch.when.lhs);
-        for (branch.when.rhs) |rhs| freeRelationalRowsExpression(alloc, rhs);
-        if (branch.when.rhs.len > 0) alloc.free(branch.when.rhs);
+        freeRelationalRowsExpressionCondition(alloc, branch.when);
         freeRelationalRowsExpression(alloc, branch.then);
     }
     if (expression.case_branches.len > 0) alloc.free(expression.case_branches);
     for (expression.case_else) |fallback| freeRelationalRowsExpression(alloc, fallback);
     if (expression.case_else.len > 0) alloc.free(expression.case_else);
+}
+
+fn freeRelationalRowsExpressionCondition(alloc: Allocator, condition: RelationalRowsExpressionCondition) void {
+    freeRelationalRowsExpression(alloc, condition.lhs);
+    for (condition.rhs) |rhs| freeRelationalRowsExpression(alloc, rhs);
+    if (condition.rhs.len > 0) alloc.free(condition.rhs);
 }
 
 pub const RelationalRowsCte = struct {
@@ -1179,6 +1187,29 @@ pub const RelationalRowsWindowRequest = struct {
     order_by: []const RelationalRowsQueryOrder = &.{},
     limit: ?u32 = null,
     offset: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.source.deinit(alloc);
+        for (self.windows) |window| {
+            alloc.free(window.output);
+            for (window.partition_by) |field| alloc.free(field);
+            if (window.partition_by.len > 0) alloc.free(window.partition_by);
+            for (window.order_by) |order| {
+                if (order.field.len > 0) alloc.free(order.field);
+                if (order.expression) |expression| freeRelationalRowsExpression(alloc, expression);
+            }
+            if (window.order_by.len > 0) alloc.free(window.order_by);
+        }
+        if (self.windows.len > 0) alloc.free(self.windows);
+        for (self.select) |field| alloc.free(field);
+        if (self.select.len > 0) alloc.free(self.select);
+        for (self.order_by) |order| {
+            if (order.field.len > 0) alloc.free(order.field);
+            if (order.expression) |expression| freeRelationalRowsExpression(alloc, expression);
+        }
+        if (self.order_by.len > 0) alloc.free(self.order_by);
+        self.* = undefined;
+    }
 };
 
 pub const RelationalRowsWindowPlan = struct {
@@ -1207,16 +1238,19 @@ pub const RelationalRowsAggregateOp = enum {
 };
 
 pub const default_relational_rows_aggregate_distinct_max_items: u32 = 65536;
+pub const default_relational_rows_array_agg_max_items: u32 = 1024;
 
 pub const RelationalRowsAggregateSpec = struct {
     name: []const u8,
     op: RelationalRowsAggregateOp,
     field: ?[]const u8 = null,
+    expression: ?RelationalRowsExpression = null,
     distinct: bool = false,
     distinct_max_items: u32 = default_relational_rows_aggregate_distinct_max_items,
     array_max_items: u32 = 0,
     array_order_by: []const RelationalRowsQueryOrder = &.{},
     filter_predicates: []const schema_mod.RelationalCheck = &.{},
+    filter_expressions: []const RelationalRowsExpressionCondition = &.{},
 };
 
 pub const RelationalRowsAggregateRequest = struct {
@@ -1227,6 +1261,41 @@ pub const RelationalRowsAggregateRequest = struct {
     order_by: []const RelationalRowsQueryOrder = &.{},
     limit: ?u32 = null,
     offset: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.source.deinit(alloc);
+        for (self.group_by) |field| alloc.free(field);
+        if (self.group_by.len > 0) alloc.free(self.group_by);
+        for (self.aggregations) |aggregation| {
+            alloc.free(aggregation.name);
+            if (aggregation.field) |field| alloc.free(field);
+            if (aggregation.expression) |expression| freeRelationalRowsExpression(alloc, expression);
+            for (aggregation.array_order_by) |order| {
+                if (order.field.len > 0) alloc.free(order.field);
+                if (order.expression) |expression| freeRelationalRowsExpression(alloc, expression);
+            }
+            if (aggregation.array_order_by.len > 0) alloc.free(aggregation.array_order_by);
+            for (aggregation.filter_predicates) |predicate| {
+                alloc.free(predicate.field);
+                if (predicate.value_json) |value_json| alloc.free(value_json);
+            }
+            if (aggregation.filter_predicates.len > 0) alloc.free(aggregation.filter_predicates);
+            for (aggregation.filter_expressions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (aggregation.filter_expressions.len > 0) alloc.free(aggregation.filter_expressions);
+        }
+        if (self.aggregations.len > 0) alloc.free(self.aggregations);
+        for (self.having_predicates) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+        if (self.having_predicates.len > 0) alloc.free(self.having_predicates);
+        for (self.order_by) |order| {
+            if (order.field.len > 0) alloc.free(order.field);
+            if (order.expression) |expression| freeRelationalRowsExpression(alloc, expression);
+        }
+        if (self.order_by.len > 0) alloc.free(self.order_by);
+        self.* = undefined;
+    }
 };
 
 pub const RelationalRowsAggregatePlan = struct {
@@ -1275,6 +1344,27 @@ pub const RelationalRowsJoinRequest = struct {
     order_by: []const RelationalRowsQueryOrder = &.{},
     limit: ?u32 = null,
     offset: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.left.deinit(alloc);
+        self.right.deinit(alloc);
+        for (self.on) |join_on| {
+            alloc.free(join_on.left_field);
+            alloc.free(join_on.right_field);
+        }
+        if (self.on.len > 0) alloc.free(self.on);
+        for (self.select) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        }
+        if (self.select.len > 0) alloc.free(self.select);
+        for (self.order_by) |order| {
+            if (order.field.len > 0) alloc.free(order.field);
+            if (order.expression) |expression| freeRelationalRowsExpression(alloc, expression);
+        }
+        if (self.order_by.len > 0) alloc.free(self.order_by);
+        self.* = undefined;
+    }
 };
 
 pub const RelationalRowsJoinPlan = struct {
@@ -1295,6 +1385,27 @@ pub const RelationalRowsLateralRequest = struct {
     order_by: []const RelationalRowsQueryOrder = &.{},
     limit: ?u32 = null,
     offset: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.left.deinit(alloc);
+        self.right.deinit(alloc);
+        for (self.correlations) |correlation| {
+            alloc.free(correlation.left_field);
+            alloc.free(correlation.right_field);
+        }
+        if (self.correlations.len > 0) alloc.free(self.correlations);
+        for (self.select) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        }
+        if (self.select.len > 0) alloc.free(self.select);
+        for (self.order_by) |order| {
+            if (order.field.len > 0) alloc.free(order.field);
+            if (order.expression) |expression| freeRelationalRowsExpression(alloc, expression);
+        }
+        if (self.order_by.len > 0) alloc.free(self.order_by);
+        self.* = undefined;
+    }
 };
 
 pub const RelationalRowsLateralPlan = struct {
@@ -1530,6 +1641,7 @@ pub const SearchRequest = struct {
     dense_queries: []const NamedDenseQuery = &.{},
     sparse_queries: []const NamedSparseQuery = &.{},
     graph_queries: []const NamedGraphQuery = &.{},
+    graph_metric_queries: []const NamedGraphMetricQuery = &.{},
     merge_config: ?MergeConfig = null,
     reranker: ?reranking_mod.Config = null,
     reranker_query_text: []const u8 = "",
@@ -1603,6 +1715,23 @@ pub const RowClaimRequest = struct {
 pub const NamedGraphQuery = struct {
     name: []const u8,
     query: graph_query_mod.GraphQuery,
+};
+
+pub const GraphMetricFreshness = enum {
+    published,
+    fresh,
+};
+
+pub const GraphMetricQuery = struct {
+    index_name: []const u8,
+    metric_name: []const u8,
+    top_k: u32 = 10,
+    freshness: GraphMetricFreshness = .published,
+};
+
+pub const NamedGraphMetricQuery = struct {
+    name: []const u8,
+    query: GraphMetricQuery,
 };
 
 pub const NamedFullTextQuery = struct {
@@ -1713,12 +1842,43 @@ pub const SearchResult = struct {
     total_hits_relation: TotalHitsRelation = .exact,
     identity_read_generation: ?u64 = null,
     graph_results: []GraphSearchResult = &.{},
+    graph_metric_results: []GraphMetricResult = &.{},
 
     pub fn deinit(self: *SearchResult) void {
         for (self.hits) |*hit| hit.deinit(self.alloc);
         if (self.hits.len > 0) self.alloc.free(self.hits);
         for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
+        for (self.graph_metric_results) |*metric_result| metric_result.deinit(self.alloc);
+        if (self.graph_metric_results.len > 0) self.alloc.free(self.graph_metric_results);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricScore = struct {
+    node: []u8,
+    score: f64,
+
+    pub fn deinit(self: *GraphMetricScore, alloc: Allocator) void {
+        alloc.free(self.node);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricResult = struct {
+    name: []u8,
+    index_name: []u8,
+    metric_name: []u8,
+    scores: []GraphMetricScore,
+    status: GraphMetricStatus,
+
+    pub fn deinit(self: *GraphMetricResult, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        for (self.scores) |*score| score.deinit(alloc);
+        if (self.scores.len > 0) alloc.free(self.scores);
+        self.status.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1744,6 +1904,27 @@ pub const GraphSearchResult = struct {
         self.* = undefined;
     }
 };
+
+pub const GraphMetricStatus = struct {
+    name: []u8,
+    state: graph_mod.GraphIndex.GraphMetricState = .not_ready,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    converged: bool = false,
+    iterations_completed: u32 = 0,
+    delta: f64 = 0.0,
+    computed_at_ms: u64 = 0,
+
+    pub fn deinit(self: *GraphMetricStatus, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+pub fn freeGraphMetricStatuses(alloc: Allocator, statuses: []GraphMetricStatus) void {
+    for (statuses) |*status| status.deinit(alloc);
+    if (statuses.len > 0) alloc.free(statuses);
+}
 
 pub const GraphPatternBinding = struct {
     alias: []u8,
@@ -2111,6 +2292,7 @@ pub const DBIndexStats = struct {
     algebraic_graph_traversal_rejected_count: u64 = 0,
     algebraic_graph_traversal_fallback_count: u64 = 0,
     algebraic_graph_traversal_result_node_count: u64 = 0,
+    graph_metric_status: []GraphMetricStatus = &.{},
     algebraic_observed_query_shape_count: u64 = 0,
     algebraic_recommendation_count: u64 = 0,
     algebraic_adaptive_candidate_count: u64 = 0,
