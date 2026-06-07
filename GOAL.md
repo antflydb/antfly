@@ -25,6 +25,7 @@ Recent observed runs:
 | `antfly-e24a9140-cohere-1m` | 1286.462s | 712.267s | 574.195s | 238.953 | 16.5ms | 0.9899 | Current PR shape; better query than clean rollback, not best load. |
 | `antfly-status-lsm-sparse-1m-20260607` | 1257.437s | 639.579s | 617.858s | 191.571 | 21.6ms | 0.9899 | Latest instrumented run. Insert is close to the best observed, but optimize/query start with heavy primary LSM debt. |
 | `antfly-primary-maint-fallback-1m-20260607` | Aborted | - | - | - | - | - | Primary-only maintenance fallback did not keep up at 1M scale; aborted around 500k uploaded with 1024 total runs, 1022 L0 runs, 16.4 MiB manifest, 5.2 GiB data root, and 894 L0 run-debt. |
+| `antfly-live-write-counters-1m-20260606` | Aborted | 597.728s | Aborted | - | - | - | Upload was fast, but optimize stalled around 887.5k indexed after primary LSM reached 1267 total / 1263 L0 at optimize start. Data root was 36G when stopped. |
 
 The 50k sanity case on `e24a9140` was healthy:
 
@@ -62,6 +63,12 @@ The 50k sanity case on `e24a9140` was healthy:
   - At optimize end: 23 L0 runs, 153 flush-output runs, 153 immutable flushes, 394 manifest writes, 279.7 MiB cumulative manifest bytes, 0 sorted ingest runs, 7 direct-bulk attempts/0 successes, and 1 write-pressure compaction.
   - Load improved versus the broken-counter rerun but remained slower than the primary-maintenance-fallback best 50k load. Query shape was good: 1519 QPS, 2.8ms serial p99, recall 0.9813.
   - This points to mutable flush/run-publication and manifest churn, not successful sorted ingest, dense HBC search, or aggressive foreground write-pressure work.
+- The 1M live-counter run made the policy failure clearer:
+  - Upload completed in 597.728s, but optimize started with dense catch-up at 437.5k/1M indexed and the primary table at 1267 total runs, 1263 L0 runs, 41.1 MiB current manifest, 30.9 GiB cumulative manifest bytes, and 235 MiB retained WAL.
+  - At optimize start, live write counters showed 2065 flush-output runs, 2120 immutable rotations, 1837 manifest writes, 0 sorted-ingest successes, 69 direct-bulk attempts/0 successes, only 8 write-pressure events, 12 write-pressure compaction steps, and 3 overloads.
+  - During optimize, L0 eventually dropped to 763, but dense catch-up stalled around 887.5k indexed with current manifest still about 103 MiB and data root at 36 GiB. The run was stopped rather than waiting indefinitely on a non-progressing state.
+  - Load/midload/optimize samples are saved under `/private/tmp/antfly-1m-live-counters-*.sample.txt`. They show catch-up replay hot in LSM merge/current-scan reads and later in `BoundWriteTxn.commit -> finalizeDeferredRunWork -> enforceWritePressure -> compactPlanAt -> StreamingRunFileWriter`, with status sampling also visible in `lsmStorageStatsFromDb` maintenance-score/stat snapshots.
+  - The practical takeaway is that faster upload is not enough. It front-loads L0/manifest debt that catch-up and query readiness then pay back at much higher latency.
 
 ## Tradeoffs Already Tried
 
