@@ -783,13 +783,42 @@ pub const IndexWriter = struct {
             if (std.mem.eql(u8, fi.name, segment_mod.doc_ordinals_field)) continue;
             for (fi.sections) |*si| {
                 if (si.section_type != .inverted_text) continue;
-                const sec_data = reader.data[@intCast(si.offset)..][0..@intCast(si.length)];
+                const offset: usize = @intCast(si.offset);
+                if (offset > reader.data.len or si.length > reader.data.len - offset) continue;
+                const sec_data = reader.data[offset..][0..@intCast(si.length)];
                 const inv = inverted.InvertedIndexReader.init(alloc, sec_data) catch continue;
                 const gop = try global_field_lens.getOrPut(alloc, fi.name);
                 if (!gop.found_existing) gop.value_ptr.* = 0;
                 gop.value_ptr.* += inv.total_field_len;
             }
         }
+    }
+
+    test "global field lens ignores invalid inverted section slice" {
+        var sections = [_]segment_mod.SegmentReader.SectionInfo{.{
+            .section_type = .inverted_text,
+            .offset = 60,
+            .length = 8,
+        }};
+        var fields = [_]segment_mod.SegmentReader.FieldInfo{.{
+            .name = "content",
+            .sections = sections[0..],
+        }};
+        const data = [_]u8{0} ** 64;
+        const reader = segment_mod.SegmentReader{
+            .alloc = std.testing.allocator,
+            .data = &data,
+            .stored_offset = data.len - 40,
+            .index_offset = data.len - 40,
+            .doc_count = 0,
+            .num_fields = 1,
+            .fields = fields[0..],
+        };
+        var field_lens = std.StringHashMapUnmanaged(u64).empty;
+        defer field_lens.deinit(std.testing.allocator);
+
+        try IndexWriter.addSegmentFieldLens(std.testing.allocator, &field_lens, &reader);
+        try std.testing.expectEqual(@as(usize, 0), field_lens.count());
     }
 
     /// Like addSegment() but with an explicit segment ID (for recovery).

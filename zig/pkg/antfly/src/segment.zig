@@ -641,6 +641,7 @@ pub const SegmentReader = struct {
                 switch (section.section_type) {
                     .inverted_text => {
                         stats.inverted_text_bytes +|= length;
+                        if (offset > self.data.len or length > self.data.len - offset) continue;
                         const section_data = self.data[offset..][0..@intCast(length)];
                         if (inverted.InvertedIndexReader.init(self.alloc, section_data)) |reader| {
                             const inverted_layout = if (detailed_inverted)
@@ -1555,6 +1556,32 @@ test "segment roundtrip" {
     const doc1 = (try reader.storedDocDecompressed(1)) orelse return error.TestExpectedEqual;
     defer alloc.free(doc1.data);
     try std.testing.expectEqualStrings("doc-2", doc1.id);
+}
+
+test "segment layout stats ignores invalid inverted section slice" {
+    var sections = [_]SegmentReader.SectionInfo{.{
+        .section_type = .inverted_text,
+        .offset = 60,
+        .length = 8,
+    }};
+    var fields = [_]SegmentReader.FieldInfo{.{
+        .name = "content",
+        .sections = sections[0..],
+    }};
+    const data = [_]u8{0} ** 64;
+    const reader = SegmentReader{
+        .alloc = std.testing.allocator,
+        .data = &data,
+        .stored_offset = data.len - footer_size,
+        .index_offset = data.len - footer_size,
+        .doc_count = 0,
+        .num_fields = 1,
+        .fields = fields[0..],
+    };
+
+    const stats = reader.layoutStatsWithInvertedDetails(true);
+    try std.testing.expectEqual(@as(u64, 8), stats.inverted_text_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.inverted_postings_bytes);
 }
 
 test "segment merge" {
