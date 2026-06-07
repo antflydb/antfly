@@ -123,8 +123,8 @@ The 50k sanity case on `e24a9140` was healthy:
 - A foreground compaction step at every auto-bulk/dense catch-up finish as a default policy.
   It can control L0 run count, but the 1M run showed it slows insert and lets dense catch-up fall farther behind. Keep this only as an explicit offline/drain experiment, not as normal online behavior.
 
-- Running hard L0 pressure directly from the active-bulk immutable flush publication path.
-  The 1M result was directionally promising, but the implementation crashed in compaction output-run ownership during optimize. Do not re-enable this path until the `PersistedOutputRunBuilder` ownership/concurrency bug is fixed and covered by a focused regression test.
+- Running hard L0 pressure directly from active-bulk run publication as a default policy.
+  The 1M result was directionally promising, but the first implementation crashed in compaction output-run ownership during optimize. The `PersistedOutputRunBuilder` ownership bug is fixed and the active-bulk pressure path is now behind `write_pressure_during_bulk_ingest` / `ANTFLY_LSM_WRITE_PRESSURE_DURING_BULK`; keep it default-off until 50k and 1M benchmarks prove the insert/query tradeoff.
 
 ## Working Theory
 
@@ -178,7 +178,7 @@ Every benchmark result can answer: how many primary runs existed at query start,
   - max input bytes,
   - max elapsed time,
   - target L0 run count or manifest-size threshold.
-- Do not run compaction from the active-bulk immutable flush publication path until compaction output-run ownership is audited and regression-tested.
+- Benchmark the default-off active-bulk write-pressure gate at immutable flush and sorted/direct ingest run publication points. The gate preserves manifest deferral and only relaxes L0 write-pressure while a bulk session is active.
 
 Success condition:
 1M load reaches query phase with bounded primary run count and no multi-second readonly open.

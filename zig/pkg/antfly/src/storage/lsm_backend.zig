@@ -108,6 +108,7 @@ pub const Options = struct {
     l0_hard_limit_bytes: u64 = 0,
     write_pressure_max_compaction_steps: usize = 8,
     write_pressure_reject_on_overload: bool = false,
+    write_pressure_during_bulk_ingest: bool = false,
     foreground_soft_compaction: bool = false,
     defer_flush_on_commit: bool = false,
     max_deferred_immutable_memtables: usize = 8,
@@ -152,6 +153,16 @@ pub const Options = struct {
     // Aggregate active clone cap; 0 leaves aggregate admission uncapped.
     bulk_ingest_current_scan_clone_total_max_bytes: u64 = 256 * 1024 * 1024,
 };
+
+fn writePressureDuringBulkIngestEnvEnabled() bool {
+    const raw = platform.env.getenv("ANTFLY_LSM_WRITE_PRESSURE_DURING_BULK") orelse return false;
+    if (raw.len == 0) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(raw, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(raw, "no")) return false;
+    if (std.ascii.eqlIgnoreCase(raw, "off")) return false;
+    return true;
+}
 
 pub const IoRuntime = storage_io.RuntimeKind;
 pub const Storage = storage_io.Storage;
@@ -2013,6 +2024,9 @@ pub const Backend = struct {
         compaction_mod.sortRuns(self.runs.items);
         if (self.bulkIngestActive()) {
             self.markManifestDirty();
+            if (self.writePressureDuringBulkIngestEnabled()) {
+                try self.enforceWritePressure();
+            }
             return true;
         }
         try self.enforceWritePressure();
@@ -2084,6 +2098,9 @@ pub const Backend = struct {
         compaction_mod.sortRuns(self.runs.items);
         if (self.bulkIngestActive()) {
             self.markManifestDirty();
+            if (self.writePressureDuringBulkIngestEnabled()) {
+                try self.enforceWritePressure();
+            }
             return true;
         }
         try self.enforceWritePressure();
@@ -2240,6 +2257,9 @@ pub const Backend = struct {
         if (self.root_dir != null) {
             if (self.bulkIngestActive()) {
                 self.markManifestDirty();
+                if (self.writePressureDuringBulkIngestEnabled()) {
+                    try self.enforceWritePressure();
+                }
             } else {
                 try self.persistManifest();
             }
@@ -2268,6 +2288,9 @@ pub const Backend = struct {
         if (self.root_dir != null) {
             if (self.bulkIngestActive()) {
                 self.markManifestDirty();
+                if (self.writePressureDuringBulkIngestEnabled()) {
+                    try self.enforceWritePressure();
+                }
             } else {
                 try self.persistManifest();
             }
@@ -2311,6 +2334,9 @@ pub const Backend = struct {
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
 
         compaction_mod.sortRuns(self.runs.items);
+        if (self.bulkIngestActive() and self.writePressureDuringBulkIngestEnabled()) {
+            try self.enforceWritePressure();
+        }
     }
 
     pub fn shouldDirectIngestBulkState(self: *const Backend, state: *const State) bool {
@@ -3336,7 +3362,7 @@ pub const Backend = struct {
     }
 
     fn enforceWritePressure(self: *Backend) anyerror!void {
-        if (self.bulkIngestActive()) return;
+        if (self.bulkIngestActive() and !self.writePressureDuringBulkIngestEnabled()) return;
         if (self.write_pressure_enforcing) return;
         self.write_pressure_enforcing = true;
         defer self.write_pressure_enforcing = false;
@@ -3423,6 +3449,10 @@ pub const Backend = struct {
 
     pub fn bulkIngestActive(self: *const Backend) bool {
         return self.active_bulk_ingest_batches != 0;
+    }
+
+    fn writePressureDuringBulkIngestEnabled(self: *const Backend) bool {
+        return self.options.write_pressure_during_bulk_ingest or writePressureDuringBulkIngestEnvEnabled();
     }
 
     pub fn beginBulkIngestSession(self: *Backend) !void {
@@ -7437,6 +7467,42 @@ test "lsm backend hard L0 pressure applies bounded step after publish not inside
     try std.testing.expect(backend.snapshotWriteStats().write_pressure_compactions > 0);
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "bulk:0"));
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "normal:0"));
+}
+
+test "lsm backend opt-in hard L0 pressure applies during active bulk flush" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 2,
+        .write_pressure_max_compaction_steps = 1,
+        .write_pressure_during_bulk_ingest = true,
+    });
+    defer backend.close();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "bulk:{d}", .{i});
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.appendPut(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+
+    try std.testing.expect(backend.bulkIngestActive());
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 5);
+    try std.testing.expect(backend.compaction_stats.compactions > 0);
+    try std.testing.expect(backend.snapshotWriteStats().write_pressure_compactions > 0);
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "bulk:0"));
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "bulk:4"));
 }
 
 test "lsm backend bulk publish checkpoints wal without requiring compaction" {
