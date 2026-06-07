@@ -98,8 +98,6 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: lts/*
-          cache: 'pnpm'
-          cache-dependency-path: ts/pnpm-lock.yaml
 
       - name: Configure pnpm cache
         run: pnpm config set store-dir "$PNPM_STORE_PATH"
@@ -109,14 +107,6 @@ jobs:
 
       - name: Build
         run: pnpm build
-
-      - name: Cache Playwright Browsers
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('ts/pnpm-lock.yaml') }}
-          restore-keys: |
-            playwright-${{ runner.os }}-
 
       - name: Install Playwright OS Dependencies
         working-directory: ts/apps/antfarm
