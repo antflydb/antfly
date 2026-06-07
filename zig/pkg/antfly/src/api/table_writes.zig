@@ -1411,6 +1411,30 @@ pub const ProvisionedTableWriteCache = struct {
         return score;
     }
 
+    pub fn maxPrimaryLsmMaintenanceScoreLocked(self: *const ProvisionedTableWriteCache) u64 {
+        var score: u64 = 0;
+        for (self.entries.items) |entry| {
+            if (entry.bulk_ingest_session_open) continue;
+            score = @max(score, entry.db.primaryLsmMaintenanceDebtHint());
+        }
+        return score;
+    }
+
+    pub fn leasePrimaryLsmMaintenanceRoundBestEffortLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
+        var best_entry: ?*Entry = null;
+        var best_score: u64 = 0;
+        for (self.entries.items) |entry| {
+            if (entry.bulk_ingest_session_open) continue;
+            const score = entry.db.primaryLsmMaintenanceDebtHint();
+            if (score > best_score) {
+                best_score = score;
+                best_entry = entry;
+            }
+        }
+        if (best_score == 0) return null;
+        return self.leaseEntryLocked(best_entry.?);
+    }
+
     fn bulkIngestSessionActiveForTable(self: *const ProvisionedTableWriteCache, table_name: []const u8) bool {
         return self.findActiveBulkIngestSession(table_name) != null;
     }
@@ -3890,17 +3914,25 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn runLsmMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !bool {
         if (!self.local_db_mutex.tryLock()) return false;
+        var primary_only = false;
         var leased = blk: {
             defer self.local_db_mutex.unlock();
             const cache = self.write_cache orelse return false;
-            if (cache.maxLsmMaintenanceScoreLocked() == 0) return false;
-            break :blk cache.leaseLsmMaintenanceRoundBestEffortLocked() orelse return false;
+            if (cache.maxLsmMaintenanceScoreLocked() != 0) {
+                if (cache.leaseLsmMaintenanceRoundBestEffortLocked()) |lease| break :blk lease;
+            }
+            if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return false;
+            primary_only = true;
+            break :blk cache.leasePrimaryLsmMaintenanceRoundBestEffortLocked() orelse return false;
         };
         defer {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
             leased.deinit(release_alloc);
         }
-        return try leased.db.runLsmMaintenanceStepBestEffort();
+        return if (primary_only)
+            try leased.db.runPrimaryLsmMaintenanceStepBestEffort()
+        else
+            try leased.db.runLsmMaintenanceStepBestEffort();
     }
 
     pub fn finishExpiredAutoBulkIngestBestEffort(self: *ProvisionedTableWriteSource) bool {
@@ -4061,13 +4093,19 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn lsmMaintenanceScore(self: *ProvisionedTableWriteSource) u64 {
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
-        return if (self.write_cache) |cache| cache.maxLsmMaintenanceScoreLocked() else 0;
+        return if (self.write_cache) |cache| @max(
+            cache.maxLsmMaintenanceScoreLocked(),
+            cache.maxPrimaryLsmMaintenanceScoreLocked(),
+        ) else 0;
     }
 
     pub fn lsmMaintenanceScoreBestEffort(self: *ProvisionedTableWriteSource) u64 {
         if (!self.local_db_mutex.tryLock()) return 0;
         defer self.local_db_mutex.unlock();
-        return if (self.write_cache) |cache| cache.maxLsmMaintenanceScoreLocked() else 0;
+        return if (self.write_cache) |cache| @max(
+            cache.maxLsmMaintenanceScoreLocked(),
+            cache.maxPrimaryLsmMaintenanceScoreLocked(),
+        ) else 0;
     }
 
     pub fn hasActiveBulkIngestSession(self: *ProvisionedTableWriteSource) bool {

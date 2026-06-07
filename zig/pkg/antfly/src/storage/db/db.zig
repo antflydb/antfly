@@ -3271,6 +3271,10 @@ pub const DB = struct {
         );
     }
 
+    pub fn primaryLsmMaintenanceDebtHint(self: *DB) u64 {
+        return self.core.primary_store_owner.lsmMaintenanceDebtHint();
+    }
+
     pub fn snapshotAsyncIndexingStats(self: *DB) types.AsyncIndexingStats {
         var async_stats = self.async_context.stats.snapshot();
         async_stats.bulk_coalescing = self.bulk_ingest_coalescer.stats.snapshot();
@@ -3453,6 +3457,17 @@ pub const DB = struct {
         if (primary_score > 0) {
             self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         }
+        return false;
+    }
+
+    pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
+        if (!self.core.tryLockApplyExclusive()) return false;
+        defer self.core.unlockApply();
+
+        const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
+        if (primary_score == 0) return false;
+        if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
+        self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         return false;
     }
 
