@@ -901,7 +901,17 @@ fn erfApprox(x: f32) f32 {
 fn getData(ct: CT) []f32 {
     const buf = toBuf(ct);
     if (buf.view_strides != null) {
-        materializeViewData(buf) catch |err| std.debug.panic("failed to materialize tensor view: {s}", .{@errorName(err)});
+        materializeViewData(buf) catch |err| {
+            std.log.warn("failed to materialize tensor view: {s}", .{@errorName(err)});
+            releaseOwnedDenseData(buf);
+            if (buf.view_strides) |strides| buf.allocator.free(strides);
+            buf.view_strides = null;
+            buf.view_base_offset = 0;
+            releaseLogicalShape(buf);
+            buf.data = &.{};
+            buf.owned = false;
+            buf.shared_data_refcount = null;
+        };
     }
     return buf.data;
 }
@@ -45666,6 +45676,28 @@ test "sdpaOp preserves 4d logical shape from query input" {
     defer freeTensor(&compute, out_ct);
 
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 4 }, tensorStoredShape(out_ct).?);
+}
+
+test "invalid lazy view materialization does not panic" {
+    const allocator = std.testing.allocator;
+    var data = [_]f32{ 1.0, 2.0 };
+    var buf = Buf{
+        .data = data[0..],
+        .allocator = allocator,
+        .owned = false,
+    };
+    buf.inline_logical_shape[0] = 2;
+    buf.inline_logical_shape[1] = 2;
+    buf.logical_shape = buf.inline_logical_shape[0..2];
+    buf.logical_shape_inline = true;
+    buf.view_strides = try allocator.dupe(usize, &.{ 3, 3 });
+    buf.view_base_offset = 1;
+
+    const out = getData(@ptrCast(&buf));
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+    try std.testing.expect(buf.view_strides == null);
+    try std.testing.expect(buf.logical_shape == null);
+    try std.testing.expect(!buf.owned);
 }
 
 fn expectApproxEqSlice(expected: []const f32, actual: []const f32, tolerance: f32) !void {

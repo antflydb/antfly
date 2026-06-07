@@ -16,16 +16,19 @@
 
 from __future__ import annotations
 
+import json
 import time
+
+import requests
 
 from helpers import wait_until
 
 
-def _hit_ids(result: dict) -> list[str]:
+def _hit_ids(result: dict, response_index: int = 0) -> list[str]:
     responses = result.get("responses", [])
-    if not responses:
+    if len(responses) <= response_index:
         return []
-    return [hit.get("_id") for hit in responses[0].get("hits", {}).get("hits", [])]
+    return [hit.get("_id") for hit in responses[response_index].get("hits", {}).get("hits", [])]
 
 
 def _query_hit_ids(stateful_api, table_name: str, payload: dict) -> list[str] | None:
@@ -34,6 +37,18 @@ def _query_hit_ids(stateful_api, table_name: str, payload: dict) -> list[str] | 
     except Exception:
         return None
     return _hit_ids(result)
+
+
+def _post_ndjson_multiquery(stateful_api, path: str, payloads: list[dict]) -> dict:
+    body = "\n".join(json.dumps(payload, separators=(",", ":")) for payload in payloads) + "\n"
+    response = requests.post(
+        f"{stateful_api.url}{path}",
+        data=body,
+        headers={"Content-Type": "application/x-ndjson"},
+        timeout=30,
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
 
 
 def test_bleve_query_string_full_text_and_filter(stateful_api):
@@ -112,6 +127,60 @@ def test_bleve_query_string_full_text_and_filter(stateful_api):
     assert filtered_result is not None
     assert filtered_result[:2] == ["doc:a", "doc:b"]
     assert "doc:c" not in filtered_result
+
+    table_multiquery = wait_until(
+        lambda: (
+            result
+            if len((result := _post_ndjson_multiquery(
+                stateful_api,
+                f"/tables/{table_name}/query",
+                [
+                    {
+                        "fields": ["title"],
+                        "limit": 5,
+                    },
+                    {
+                        "fields": ["status"],
+                        "limit": 5,
+                    },
+                ],
+            )).get("responses", [])) == 2
+            and len(result["responses"][0].get("hits", {}).get("hits", [])) > 0
+            and len(result["responses"][1].get("hits", {}).get("hits", [])) > 0
+            else None
+        ),
+        timeout_s=30.0,
+        interval_s=0.5,
+    )
+    assert table_multiquery is not None
+
+    global_multiquery = wait_until(
+        lambda: (
+            result
+            if len((result := _post_ndjson_multiquery(
+                stateful_api,
+                "/query",
+                [
+                    {
+                        "table": table_name,
+                        "fields": ["body"],
+                        "limit": 5,
+                    },
+                    {
+                        "table": table_name,
+                        "fields": ["status"],
+                        "limit": 5,
+                    },
+                ],
+            )).get("responses", [])) == 2
+            and len(result["responses"][0].get("hits", {}).get("hits", [])) > 0
+            and len(result["responses"][1].get("hits", {}).get("hits", [])) > 0
+            else None
+        ),
+        timeout_s=30.0,
+        interval_s=0.5,
+    )
+    assert global_multiquery is not None
 
 
 def test_direct_full_text_match_and_prefix(stateful_api):

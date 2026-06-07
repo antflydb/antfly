@@ -1540,7 +1540,7 @@ fn embedWithEntryParts(
     }
 
     if (isAntflyProvider(entry.provider) and (entry.multimodal or partsContainMedia(parts))) {
-        if (entry.antfly_provider != null) {
+        if (entry.antfly_provider == null) {
             return error.UnsupportedEmbeddingProvider;
         }
         waitForEntryPacer(entry);
@@ -3010,6 +3010,73 @@ test "managed embedder routes antfly with api_url to antfly endpoint" {
     const vector = try managed.embedQuery(std.testing.allocator, "semantic_idx", "alpha concept");
     defer std.testing.allocator.free(vector);
     try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, vector);
+}
+
+test "managed embedder sends antfly media parts when local provider is configured" {
+    const Local = struct {
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+
+    const FakeApp = struct {
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/api/embed"));
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"image_url\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "data:image/png;base64,aaa") != null);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"data":[{"embedding":[0.25,0.5,0.75]}]}
+                ),
+            };
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeApp.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    var local = Local{};
+    const provider = AntflyProvider{
+        .ptr = &local,
+        .embed_dense_texts = Local.dense,
+        .embed_sparse_texts = Local.sparse,
+    };
+
+    const indexes_json = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"semantic_idx":{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"antfly","model":"remote-model","api_url":"{s}","multimodal":true}}}}}}
+    , .{base_uri});
+    defer std.testing.allocator.free(indexes_json);
+
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, indexes_json, provider);
+    defer managed.deinit();
+
+    const parts = [_]template_mod.ContentPart{
+        .{ .text = "caption" },
+        .{ .media_url = "data:image/png;base64,aaa" },
+    };
+    const vector = try embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3);
+    defer std.testing.allocator.free(vector);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5, 0.75 }, vector);
 }
 
 test "managed embedder preserves antfly api_url path for shared antfly endpoint" {
