@@ -74,11 +74,16 @@ pub const RowsQueryOrderDirection = db_mod.types.RelationalRowsQueryOrderDirecti
 pub const RowsQueryOrderNullTest = db_mod.types.RelationalRowsQueryOrderNullTest;
 pub const RowsQueryOrder = db_mod.types.RelationalRowsQueryOrder;
 pub const OwnedRowsQueryRequest = db_mod.types.RelationalRowsQueryRequest;
+pub const OwnedRowsQueryPlan = db_mod.types.RelationalRowsQueryPlan;
 pub const OwnedRowsQueryResult = db_mod.types.RelationalRowsQueryResult;
 pub const OwnedRowsAggregateRequest = db_mod.types.RelationalRowsAggregateRequest;
+pub const OwnedRowsAggregatePlan = db_mod.types.RelationalRowsAggregatePlan;
 pub const OwnedRowsWindowRequest = db_mod.types.RelationalRowsWindowRequest;
+pub const OwnedRowsWindowPlan = db_mod.types.RelationalRowsWindowPlan;
 pub const OwnedRowsJoinRequest = db_mod.types.RelationalRowsJoinRequest;
+pub const OwnedRowsJoinPlan = db_mod.types.RelationalRowsJoinPlan;
 pub const OwnedRowsLateralRequest = db_mod.types.RelationalRowsLateralRequest;
+pub const OwnedRowsLateralPlan = db_mod.types.RelationalRowsLateralPlan;
 pub const OwnedRowsMutationSourceResult = db_mod.types.RelationalRowsMutationSourceResult;
 
 pub const OwnedRowsMutationSourceRequest = struct {
@@ -791,6 +796,108 @@ pub fn parseRowsLateralRequest(
     };
 }
 
+pub fn parseRowsQueryPlanRequest(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    schema: runtime_schema.TableSchema,
+) !OwnedRowsQueryPlan {
+    var parsed = try parseRowsPlanEnvelope(alloc, body, schema);
+    defer parsed.deinit();
+
+    const ctes = try parseRowsCtesAlloc(alloc, schema, parsed.value.object.get("ctes"));
+    errdefer freeRowsCtes(alloc, ctes);
+    var query = try parseRowsQueryRequestFromValue(alloc, schema, parsed.value.object.get("query") orelse return error.InvalidRowsRequest);
+    errdefer query.deinit(alloc);
+    try validateRowsQuerySourceCteReference(ctes, query);
+
+    return .{
+        .ctes = ctes,
+        .query = query,
+    };
+}
+
+pub fn parseRowsAggregatePlanRequest(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    schema: runtime_schema.TableSchema,
+) !OwnedRowsAggregatePlan {
+    var parsed = try parseRowsPlanEnvelope(alloc, body, schema);
+    defer parsed.deinit();
+
+    const ctes = try parseRowsCtesAlloc(alloc, schema, parsed.value.object.get("ctes"));
+    errdefer freeRowsCtes(alloc, ctes);
+    var aggregate = try parseRowsAggregateRequestFromValue(alloc, schema, parsed.value.object.get("aggregate") orelse return error.InvalidRowsRequest);
+    errdefer aggregate.deinit(alloc);
+    try validateRowsQuerySourceCteReference(ctes, aggregate.source);
+
+    return .{
+        .ctes = ctes,
+        .aggregate = aggregate,
+    };
+}
+
+pub fn parseRowsWindowPlanRequest(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    schema: runtime_schema.TableSchema,
+) !OwnedRowsWindowPlan {
+    var parsed = try parseRowsPlanEnvelope(alloc, body, schema);
+    defer parsed.deinit();
+
+    const ctes = try parseRowsCtesAlloc(alloc, schema, parsed.value.object.get("ctes"));
+    errdefer freeRowsCtes(alloc, ctes);
+    var window = try parseRowsWindowRequestFromValue(alloc, schema, parsed.value.object.get("window") orelse return error.InvalidRowsRequest);
+    errdefer window.deinit(alloc);
+    try validateRowsQuerySourceCteReference(ctes, window.source);
+
+    return .{
+        .ctes = ctes,
+        .window = window,
+    };
+}
+
+pub fn parseRowsJoinPlanRequest(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    schema: runtime_schema.TableSchema,
+) !OwnedRowsJoinPlan {
+    var parsed = try parseRowsPlanEnvelope(alloc, body, schema);
+    defer parsed.deinit();
+
+    const ctes = try parseRowsCtesAlloc(alloc, schema, parsed.value.object.get("ctes"));
+    errdefer freeRowsCtes(alloc, ctes);
+    var join = try parseRowsJoinRequestFromValue(alloc, schema, parsed.value.object.get("join") orelse return error.InvalidRowsRequest);
+    errdefer join.deinit(alloc);
+    try validateRowsQuerySourceCteReference(ctes, join.left);
+    try validateRowsQuerySourceCteReference(ctes, join.right);
+
+    return .{
+        .ctes = ctes,
+        .join = join,
+    };
+}
+
+pub fn parseRowsLateralPlanRequest(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    schema: runtime_schema.TableSchema,
+) !OwnedRowsLateralPlan {
+    var parsed = try parseRowsPlanEnvelope(alloc, body, schema);
+    defer parsed.deinit();
+
+    const ctes = try parseRowsCtesAlloc(alloc, schema, parsed.value.object.get("ctes"));
+    errdefer freeRowsCtes(alloc, ctes);
+    var lateral = try parseRowsLateralRequestFromValue(alloc, schema, parsed.value.object.get("lateral") orelse return error.InvalidRowsRequest);
+    errdefer lateral.deinit(alloc);
+    try validateRowsQuerySourceCteReference(ctes, lateral.left);
+    try validateRowsQuerySourceCteReference(ctes, lateral.right);
+
+    return .{
+        .ctes = ctes,
+        .lateral = lateral,
+    };
+}
+
 pub fn encodeRowsMutationSourceResponseAlloc(
     alloc: std.mem.Allocator,
     result: OwnedRowsMutationSourceResult,
@@ -1494,6 +1601,133 @@ fn parseRowsLateralCorrelationsAlloc(
         initialized += 1;
     }
     return out;
+}
+
+fn parseRowsPlanEnvelope(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    schema: runtime_schema.TableSchema,
+) !std.json.Parsed(std.json.Value) {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidRowsRequest;
+    if (body.len == 0) return error.InvalidRowsRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{
+        .allocate = .alloc_always,
+    }) catch return error.InvalidRowsRequest;
+    errdefer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    return parsed;
+}
+
+fn parseRowsCtesAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    maybe_ctes: ?std.json.Value,
+) ![]const db_mod.types.RelationalRowsCte {
+    const ctes_value = maybe_ctes orelse return &.{};
+    if (ctes_value != .array) return error.InvalidRowsRequest;
+    const out = try alloc.alloc(db_mod.types.RelationalRowsCte, ctes_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        alloc.free(out);
+    }
+
+    for (ctes_value.array.items) |item| {
+        if (item != .object) return error.InvalidRowsRequest;
+        const name_value = item.object.get("name") orelse return error.InvalidRowsRequest;
+        const query_value = item.object.get("query") orelse return error.InvalidRowsRequest;
+        if (name_value != .string or name_value.string.len == 0) return error.InvalidRowsRequest;
+        if (rowsCteNameExists(out[0..initialized], name_value.string)) return error.InvalidRowsRequest;
+
+        const name = try alloc.dupe(u8, name_value.string);
+        var name_transferred = false;
+        errdefer if (!name_transferred) alloc.free(name);
+        var query = try parseRowsQueryRequestFromValue(alloc, schema, query_value);
+        errdefer query.deinit(alloc);
+        if (query.row_claim != null or query.doc_key_range != null) return error.InvalidRowsRequest;
+        if (query.source_cte.len != 0 and !rowsCteNameExists(out[0..initialized], query.source_cte)) return error.InvalidRowsRequest;
+
+        out[initialized] = .{
+            .name = name,
+            .query = query,
+        };
+        name_transferred = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn rowsCteNameExists(ctes: []const db_mod.types.RelationalRowsCte, name: []const u8) bool {
+    for (ctes) |cte| {
+        if (std.mem.eql(u8, cte.name, name)) return true;
+    }
+    return false;
+}
+
+fn validateRowsQuerySourceCteReference(
+    ctes: []const db_mod.types.RelationalRowsCte,
+    query: OwnedRowsQueryRequest,
+) !void {
+    if (query.source_cte.len == 0) return;
+    if (!rowsCteNameExists(ctes, query.source_cte)) return error.InvalidRowsRequest;
+}
+
+fn parseRowsQueryRequestFromValue(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    value: std.json.Value,
+) !OwnedRowsQueryRequest {
+    if (value != .object) return error.InvalidRowsRequest;
+    const json = try jsonValueStringifyAlloc(alloc, value);
+    defer alloc.free(json);
+    return try parseRowsQueryRequest(alloc, json, schema);
+}
+
+fn parseRowsAggregateRequestFromValue(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    value: std.json.Value,
+) !OwnedRowsAggregateRequest {
+    if (value != .object) return error.InvalidRowsRequest;
+    const json = try jsonValueStringifyAlloc(alloc, value);
+    defer alloc.free(json);
+    return try parseRowsAggregateRequest(alloc, json, schema);
+}
+
+fn parseRowsWindowRequestFromValue(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    value: std.json.Value,
+) !OwnedRowsWindowRequest {
+    if (value != .object) return error.InvalidRowsRequest;
+    const json = try jsonValueStringifyAlloc(alloc, value);
+    defer alloc.free(json);
+    return try parseRowsWindowRequest(alloc, json, schema);
+}
+
+fn parseRowsJoinRequestFromValue(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    value: std.json.Value,
+) !OwnedRowsJoinRequest {
+    if (value != .object) return error.InvalidRowsRequest;
+    const json = try jsonValueStringifyAlloc(alloc, value);
+    defer alloc.free(json);
+    return try parseRowsJoinRequest(alloc, json, schema);
+}
+
+fn parseRowsLateralRequestFromValue(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    value: std.json.Value,
+) !OwnedRowsLateralRequest {
+    if (value != .object) return error.InvalidRowsRequest;
+    const json = try jsonValueStringifyAlloc(alloc, value);
+    defer alloc.free(json);
+    return try parseRowsLateralRequest(alloc, json, schema);
 }
 
 fn parseRowsQueryPredicatesAlloc(
@@ -3688,6 +3922,14 @@ fn freeRowsLateralCorrelations(alloc: std.mem.Allocator, correlations: []const d
     if (correlations.len > 0) alloc.free(correlations);
 }
 
+fn freeRowsCtes(alloc: std.mem.Allocator, ctes: []const db_mod.types.RelationalRowsCte) void {
+    for (ctes) |cte| {
+        var owned = cte;
+        owned.deinit(alloc);
+    }
+    if (ctes.len > 0) alloc.free(ctes);
+}
+
 fn freeRowsQueryExpressionProjections(alloc: std.mem.Allocator, projections: []const db_mod.types.RelationalRowsExpressionProjection) void {
     for (projections) |projection| {
         alloc.free(projection.output);
@@ -5785,6 +6027,59 @@ test "relational rows lateral contract accepts bounded correlated plans" {
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsLateralRequest(
         std.testing.allocator,
         "{\"left\":{},\"right\":{},\"correlations\":[{\"left_field\":\"id\",\"right_field\":\"customer_id\"}]}",
+        schema,
+    ));
+}
+
+test "relational rows cte plan contract accepts ordered typed subplans" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["id","tenant","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["tenant","id"]}}
+    ;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed.deinit(std.testing.allocator);
+    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(std.testing.allocator, parsed);
+    defer runtime_schema.freeSchema(std.testing.allocator, schema);
+
+    var query_plan = try parseRowsQueryPlanRequest(
+        std.testing.allocator,
+        "{\"ctes\":[{\"name\":\"open_rows\",\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"},\"select\":[\"id\",\"tenant\",\"amount\"]}},{\"name\":\"expensive_open_rows\",\"query\":{\"source_cte\":\"open_rows\",\"where\":{\"field\":\"amount\",\"op\":\"gt\",\"value\":10},\"select\":[\"id\",\"amount\"]}}],\"query\":{\"source_cte\":\"expensive_open_rows\",\"select\":[\"id\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}],\"limit\":2}}",
+        schema,
+    );
+    defer query_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), query_plan.ctes.len);
+    try std.testing.expectEqualStrings("open_rows", query_plan.ctes[0].name);
+    try std.testing.expectEqualStrings("", query_plan.ctes[0].query.source_cte);
+    try std.testing.expectEqualStrings("expensive_open_rows", query_plan.ctes[1].name);
+    try std.testing.expectEqualStrings("open_rows", query_plan.ctes[1].query.source_cte);
+    try std.testing.expectEqualStrings("expensive_open_rows", query_plan.query.source_cte);
+    try std.testing.expectEqual(@as(u32, 2), query_plan.query.limit.?);
+
+    var aggregate_plan = try parseRowsAggregatePlanRequest(
+        std.testing.allocator,
+        "{\"ctes\":[{\"name\":\"open_rows\",\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}}}],\"aggregate\":{\"source\":{\"source_cte\":\"open_rows\"},\"group_by\":[\"tenant\"],\"aggregations\":[{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}]}}",
+        schema,
+    );
+    defer aggregate_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), aggregate_plan.ctes.len);
+    try std.testing.expectEqualStrings("open_rows", aggregate_plan.aggregate.source.source_cte);
+
+    var window_plan = try parseRowsWindowPlanRequest(
+        std.testing.allocator,
+        "{\"ctes\":[{\"name\":\"open_rows\",\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}}}],\"window\":{\"source\":{\"source_cte\":\"open_rows\"},\"windows\":[{\"as\":\"row_num\",\"function\":\"row_number\",\"partition_by\":[\"tenant\"],\"order_by\":[{\"field\":\"created_at\"}]}],\"select\":[\"tenant\",\"id\"]}}",
+        schema,
+    );
+    defer window_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), window_plan.ctes.len);
+    try std.testing.expectEqualStrings("open_rows", window_plan.window.source.source_cte);
+
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryPlanRequest(
+        std.testing.allocator,
+        "{\"ctes\":[{\"name\":\"early\",\"query\":{\"source_cte\":\"later\"}},{\"name\":\"later\",\"query\":{\"select\":[\"id\"]}}],\"query\":{\"source_cte\":\"early\"}}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsWindowPlanRequest(
+        std.testing.allocator,
+        "{\"ctes\":[{\"name\":\"open_rows\",\"query\":{\"row_claim\":{\"transaction_id\":\"00000000000000000000000000000000\"}}}],\"window\":{\"source\":{\"source_cte\":\"open_rows\"},\"windows\":[{\"as\":\"row_num\",\"function\":\"row_number\",\"order_by\":[{\"field\":\"created_at\"}]}]}}",
         schema,
     ));
 }
