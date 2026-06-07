@@ -58,6 +58,11 @@ pub const Routes = struct {
     pub const batch_suffix = "/batch";
     pub const rows_batch_suffix = "/rows:batch";
     pub const rows_get_suffix = "/rows:get";
+    pub const rows_query_suffix = "/rows:query";
+    pub const rows_aggregate_suffix = "/rows:aggregate";
+    pub const rows_window_suffix = "/rows:window";
+    pub const rows_join_suffix = "/rows:join";
+    pub const rows_lateral_suffix = "/rows:lateral";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const restore_suffix = "/restore";
@@ -414,6 +419,34 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, rows_get_suffix)) return null;
         const table_name = path[tables_prefix.len .. path.len - rows_get_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableRowsQuery(path: []const u8) ?TableRows {
+        return matchTableRowsAction(path, rows_query_suffix);
+    }
+
+    pub fn matchTableRowsAggregate(path: []const u8) ?TableRows {
+        return matchTableRowsAction(path, rows_aggregate_suffix);
+    }
+
+    pub fn matchTableRowsWindow(path: []const u8) ?TableRows {
+        return matchTableRowsAction(path, rows_window_suffix);
+    }
+
+    pub fn matchTableRowsJoin(path: []const u8) ?TableRows {
+        return matchTableRowsAction(path, rows_join_suffix);
+    }
+
+    pub fn matchTableRowsLateral(path: []const u8) ?TableRows {
+        return matchTableRowsAction(path, rows_lateral_suffix);
+    }
+
+    fn matchTableRowsAction(path: []const u8, suffix: []const u8) ?TableRows {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
     }

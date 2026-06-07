@@ -224,6 +224,61 @@ pub fn parseRowsGetBody(allocator: std.mem.Allocator, body: []const u8) !std.jso
     return std.json.parseFromSlice(types.RowsGetRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Execute a typed relational row query plan
+pub const RowsQueryPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsQuery.
+pub fn parseRowsQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
+    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row aggregate plan
+pub const RowsAggregatePathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsAggregate.
+pub fn parseRowsAggregateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
+    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row window plan
+pub const RowsWindowPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsWindow.
+pub fn parseRowsWindowBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
+    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row join plan
+pub const RowsJoinPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsJoin.
+pub fn parseRowsJoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
+    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row lateral plan
+pub const RowsLateralPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsLateral.
+pub fn parseRowsLateralBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
+    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 pub const LinearMergePathParams = struct {
     /// Name of the table
@@ -556,6 +611,11 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:batch", .operation_id = "rowsBatchWrite" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:get", .operation_id = "rowsGet" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows:query", .operation_id = "rowsQuery" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows:aggregate", .operation_id = "rowsAggregate" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows:window", .operation_id = "rowsWindow" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows:join", .operation_id = "rowsJoin" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows:lateral", .operation_id = "rowsLateral" },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge" },
     .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable" },
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable" },
@@ -628,6 +688,11 @@ pub const routes = [_]Route{
 //   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsBatchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsGet(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsQuery(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsAggregate(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsWindow(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsJoin(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsLateral(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

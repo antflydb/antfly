@@ -487,6 +487,61 @@ pub const Client = struct {
         return ApiResponse(types.RowsGetResultSet).fromResponse(self.allocator, &resp);
     }
 
+    /// Execute a typed relational row query plan
+    /// POST /db/v1/tables/{tableName}/rows:query
+    pub fn rowsQuery(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(types.RowsQueryResultSet) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:query", .{ self.base_url, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RowsQueryResultSet).fromResponse(self.allocator, &resp);
+    }
+
+    /// Execute a typed relational row aggregate plan
+    /// POST /db/v1/tables/{tableName}/rows:aggregate
+    pub fn rowsAggregate(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(types.RowsAggregateResultSet) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:aggregate", .{ self.base_url, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RowsAggregateResultSet).fromResponse(self.allocator, &resp);
+    }
+
+    /// Execute a typed relational row window plan
+    /// POST /db/v1/tables/{tableName}/rows:window
+    pub fn rowsWindow(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:window", .{ self.base_url, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RowsStreamResultSet).fromResponse(self.allocator, &resp);
+    }
+
+    /// Execute a typed relational row join plan
+    /// POST /db/v1/tables/{tableName}/rows:join
+    pub fn rowsJoin(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:join", .{ self.base_url, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RowsStreamResultSet).fromResponse(self.allocator, &resp);
+    }
+
+    /// Execute a typed relational row lateral plan
+    /// POST /db/v1/tables/{tableName}/rows:lateral
+    pub fn rowsLateral(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:lateral", .{ self.base_url, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RowsStreamResultSet).fromResponse(self.allocator, &resp);
+    }
+
     /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
     /// POST /db/v1/tables/{tableName}/merge
     pub fn linearMerge(self: *@This(), table_name: []const u8, body: types.LinearMergeRequest) !ApiResponse(types.LinearMergeResult) {

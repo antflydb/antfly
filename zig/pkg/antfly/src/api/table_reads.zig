@@ -30,6 +30,7 @@ const asset_producer_runtime = @import("../asset_producer_runtime.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const storage_schema = @import("../storage/schema.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
@@ -1208,6 +1209,46 @@ pub const TableReadSource = struct {
             encoded_value: []const u8,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?[]u8 = null,
+        rows_query_plan: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
+        rows_aggregate_plan: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsAggregatePlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsAggregateResult = null,
+        rows_window_plan: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsWindowPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsWindowResult = null,
+        rows_join_plan: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsJoinPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsJoinResult = null,
+        rows_lateral_plan: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsLateralPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsJoinResult = null,
         scan_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1361,6 +1402,66 @@ pub const TableReadSource = struct {
     ) !?db_mod.RuntimePreflightSummary {
         const fn_ptr = self.vtable.preflight_query orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, req, consistency, max_work);
+    }
+
+    pub fn rowsQueryPlan(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const fn_ptr = self.vtable.rows_query_plan orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    pub fn rowsAggregatePlan(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsAggregatePlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsAggregateResult {
+        const fn_ptr = self.vtable.rows_aggregate_plan orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    pub fn rowsWindowPlan(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsWindowPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsWindowResult {
+        const fn_ptr = self.vtable.rows_window_plan orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    pub fn rowsJoinPlan(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsJoinPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsJoinResult {
+        const fn_ptr = self.vtable.rows_join_plan orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    pub fn rowsLateralPlan(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsLateralPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsJoinResult {
+        const fn_ptr = self.vtable.rows_lateral_plan orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, plan, consistency);
     }
 
     pub fn preflightQueryGroupLocal(
@@ -1803,6 +1904,11 @@ pub const BoundTableReadSource = struct {
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
                 .relational_unique_owner_lookup = relationalUniqueOwnerLookup,
+                .rows_query_plan = rowsQueryPlan,
+                .rows_aggregate_plan = rowsAggregatePlan,
+                .rows_window_plan = rowsWindowPlan,
+                .rows_join_plan = rowsJoinPlan,
+                .rows_lateral_plan = rowsLateralPlan,
                 .scan_group_local = scanGroupLocal,
                 .query_group_local = queryGroupLocal,
                 .search_result_group_local = searchResultGroupLocal,
@@ -2020,6 +2126,80 @@ pub const BoundTableReadSource = struct {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         return try lookupRelationalUniqueOwnerInDb(alloc, self.db, self.reads.group_id, self.reads.reads, constraint_name, encoded_value, consistency);
+    }
+
+    fn prepareRelationalRowsFullTableRead(self: *BoundTableReadSource, consistency: raft_mod.ReadConsistency) !void {
+        try self.reads.reads.prepareScanWithConsistency(self.reads.group_id, "", "", .{}, consistency);
+    }
+
+    fn rowsQueryPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try self.prepareRelationalRowsFullTableRead(consistency);
+        return try self.db.queryRelationalRowsPlan(alloc, runtime_schema, plan);
+    }
+
+    fn rowsAggregatePlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsAggregatePlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsAggregateResult {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try self.prepareRelationalRowsFullTableRead(consistency);
+        return try self.db.aggregateRelationalRowsPlan(alloc, runtime_schema, plan);
+    }
+
+    fn rowsWindowPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsWindowPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsWindowResult {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try self.prepareRelationalRowsFullTableRead(consistency);
+        return try self.db.windowRelationalRowsPlan(alloc, runtime_schema, plan);
+    }
+
+    fn rowsJoinPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsJoinPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsJoinResult {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try self.prepareRelationalRowsFullTableRead(consistency);
+        return try self.db.joinRelationalRowsPlan(alloc, runtime_schema, plan);
+    }
+
+    fn rowsLateralPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsLateralPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsJoinResult {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try self.prepareRelationalRowsFullTableRead(consistency);
+        return try self.db.lateralRelationalRowsPlan(alloc, runtime_schema, plan);
     }
 
     fn scanGroupLocal(

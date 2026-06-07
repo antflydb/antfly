@@ -980,6 +980,7 @@ pub const RelationalRowsQueryRequest = struct {
     json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
     or_predicates: []const RelationalRowsPredicateGroup = &.{},
     not_predicates: []const RelationalRowsPredicateGroup = &.{},
+    expression_predicates: []const RelationalRowsExpressionCondition = &.{},
     select: []const []const u8 = &.{},
     json_extract: []const RelationalRowsJsonExtractProjection = &.{},
     array_length: []const RelationalRowsArrayLengthProjection = &.{},
@@ -1052,6 +1053,8 @@ pub const RelationalRowsQueryRequest = struct {
             if (group.predicates.len > 0) alloc.free(group.predicates);
         }
         if (self.not_predicates.len > 0) alloc.free(self.not_predicates);
+        for (self.expression_predicates) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (self.expression_predicates.len > 0) alloc.free(self.expression_predicates);
         for (self.select) |field| alloc.free(field);
         if (self.select.len > 0) alloc.free(self.select);
         for (self.json_extract) |projection| {

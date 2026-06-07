@@ -225,6 +225,61 @@ pub fn parseRowsGetBody(allocator: std.mem.Allocator, body: []const u8) !std.jso
     return std.json.parseFromSlice(types.RowsGetRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Execute a typed relational row query plan
+pub const RowsQueryPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsQuery.
+pub fn parseRowsQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
+    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row aggregate plan
+pub const RowsAggregatePathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsAggregate.
+pub fn parseRowsAggregateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
+    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row window plan
+pub const RowsWindowPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsWindow.
+pub fn parseRowsWindowBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
+    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row join plan
+pub const RowsJoinPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsJoin.
+pub fn parseRowsJoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
+    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row lateral plan
+pub const RowsLateralPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsLateral.
+pub fn parseRowsLateralBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
+    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 pub const LinearMergePathParams = struct {
     /// Name of the table
@@ -370,6 +425,11 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:batch", .operation_id = "rowsBatchWrite" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:get", .operation_id = "rowsGet" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows:query", .operation_id = "rowsQuery" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows:aggregate", .operation_id = "rowsAggregate" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows:window", .operation_id = "rowsWindow" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows:join", .operation_id = "rowsJoin" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows:lateral", .operation_id = "rowsLateral" },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge" },
     .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable" },
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable" },
@@ -427,6 +487,11 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "batchWrite")) @compileError("ServerRouter: Impl missing required method 'batchWrite'");
         if (!@hasDecl(Impl, "rowsBatchWrite")) @compileError("ServerRouter: Impl missing required method 'rowsBatchWrite'");
         if (!@hasDecl(Impl, "rowsGet")) @compileError("ServerRouter: Impl missing required method 'rowsGet'");
+        if (!@hasDecl(Impl, "rowsQuery")) @compileError("ServerRouter: Impl missing required method 'rowsQuery'");
+        if (!@hasDecl(Impl, "rowsAggregate")) @compileError("ServerRouter: Impl missing required method 'rowsAggregate'");
+        if (!@hasDecl(Impl, "rowsWindow")) @compileError("ServerRouter: Impl missing required method 'rowsWindow'");
+        if (!@hasDecl(Impl, "rowsJoin")) @compileError("ServerRouter: Impl missing required method 'rowsJoin'");
+        if (!@hasDecl(Impl, "rowsLateral")) @compileError("ServerRouter: Impl missing required method 'rowsLateral'");
         if (!@hasDecl(Impl, "linearMerge")) @compileError("ServerRouter: Impl missing required method 'linearMerge'");
         if (!@hasDecl(Impl, "backupTable")) @compileError("ServerRouter: Impl missing required method 'backupTable'");
         if (!@hasDecl(Impl, "restoreTable")) @compileError("ServerRouter: Impl missing required method 'restoreTable'");
@@ -485,6 +550,11 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/batch", batchWrite);
             try server.post("/tables/:tableName/rows:batch", rowsBatchWrite);
             try server.post("/tables/:tableName/rows:get", rowsGet);
+            try server.post("/tables/:tableName/rows:query", rowsQuery);
+            try server.post("/tables/:tableName/rows:aggregate", rowsAggregate);
+            try server.post("/tables/:tableName/rows:window", rowsWindow);
+            try server.post("/tables/:tableName/rows:join", rowsJoin);
+            try server.post("/tables/:tableName/rows:lateral", rowsLateral);
             try server.post("/tables/:tableName/merge", linearMerge);
             try server.post("/tables/:tableName/backup", backupTable);
             try server.post("/tables/:tableName/restore", restoreTable);
@@ -764,6 +834,46 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.rowsGet(ctx, table_name);
         }
 
+        /// Execute a typed relational row query plan
+        /// POST /tables/{tableName}/rows:query
+        fn rowsQuery(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.rowsQuery(ctx, table_name);
+        }
+
+        /// Execute a typed relational row aggregate plan
+        /// POST /tables/{tableName}/rows:aggregate
+        fn rowsAggregate(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.rowsAggregate(ctx, table_name);
+        }
+
+        /// Execute a typed relational row window plan
+        /// POST /tables/{tableName}/rows:window
+        fn rowsWindow(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.rowsWindow(ctx, table_name);
+        }
+
+        /// Execute a typed relational row join plan
+        /// POST /tables/{tableName}/rows:join
+        fn rowsJoin(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.rowsJoin(ctx, table_name);
+        }
+
+        /// Execute a typed relational row lateral plan
+        /// POST /tables/{tableName}/rows:lateral
+        fn rowsLateral(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.rowsLateral(ctx, table_name);
+        }
+
         /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
         /// POST /tables/{tableName}/merge
         fn linearMerge(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -889,6 +999,11 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsBatchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsGet(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsQuery(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsAggregate(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsWindow(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsJoin(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsLateral(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

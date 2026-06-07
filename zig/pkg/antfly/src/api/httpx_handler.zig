@@ -1702,6 +1702,66 @@ pub const AntflyApiHandler = struct {
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
+    pub fn rowsQuery(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicTableRowsQuery(table_name, body_data, authenticated_identity);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn rowsAggregate(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicTableRowsAggregate(table_name, body_data, authenticated_identity);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn rowsWindow(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicTableRowsWindow(table_name, body_data, authenticated_identity);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn rowsJoin(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicTableRowsJoin(table_name, body_data, authenticated_identity);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn rowsLateral(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicTableRowsLateral(table_name, body_data, authenticated_identity);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
     pub fn linearMerge(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);

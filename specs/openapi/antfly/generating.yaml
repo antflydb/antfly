@@ -298,7 +298,7 @@ components:
         Available tool names for the chat and retrieval agents.
         - add_filter: Add search filters (field constraints)
         - ask_clarification: Ask user for clarification
-        - search: Execute semantic searches (legacy, use semantic_search for retrieval)
+        - search: Execute semantic searches (prefer semantic_search for retrieval)
         - websearch: Search the web (requires websearch_config)
         - fetch: Fetch URL content (subject to security controls)
         - semantic_search: Execute semantic/vector search against an index

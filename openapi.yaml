@@ -3567,6 +3567,196 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/rows:query:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Execute a typed relational row query plan
+      tags:
+        - data_operations
+      operationId: rowsQuery
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RowsPlanRequest'
+      responses:
+        '200':
+          description: Row query response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowsQueryResultSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/rows:aggregate:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Execute a typed relational row aggregate plan
+      tags:
+        - data_operations
+      operationId: rowsAggregate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RowsPlanRequest'
+      responses:
+        '200':
+          description: Row aggregate response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowsAggregateResultSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/rows:window:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Execute a typed relational row window plan
+      tags:
+        - data_operations
+      operationId: rowsWindow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RowsPlanRequest'
+      responses:
+        '200':
+          description: Row window response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowsStreamResultSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/rows:join:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Execute a typed relational row join plan
+      tags:
+        - data_operations
+      operationId: rowsJoin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RowsPlanRequest'
+      responses:
+        '200':
+          description: Row join response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowsStreamResultSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/rows:lateral:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Execute a typed relational row lateral plan
+      tags:
+        - data_operations
+      operationId: rowsLateral
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RowsPlanRequest'
+      responses:
+        '200':
+          description: Row lateral response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowsStreamResultSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/merge:
     parameters:
       - name: tableName
@@ -7200,6 +7390,49 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/RowsGetResult'
+    RowsPlanRequest:
+      anyOf:
+        - type: object
+          additionalProperties: true
+      description: >
+        Typed relational row plan envelope. The top-level operation-specific
+
+        field is one of `query`, `aggregate`, `window`, `join`, or `lateral`;
+
+        `ctes` is optional and contains ordered named row-query subplans.
+    RowsQueryResultSet:
+      type: object
+      properties:
+        total:
+          type: integer
+          format: int64
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    RowsAggregateResultSet:
+      type: object
+      properties:
+        total_groups:
+          type: integer
+          format: int64
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    RowsStreamResultSet:
+      type: object
+      properties:
+        total_rows:
+          type: integer
+          format: int64
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
     MultiBatchRequest:
       type: object
       description: >
@@ -13435,7 +13668,7 @@ components:
 
         - ask_clarification: Ask user for clarification
 
-        - search: Execute semantic searches (legacy, use semantic_search for retrieval)
+        - search: Execute semantic searches (prefer semantic_search for retrieval)
 
         - websearch: Search the web (requires websearch_config)
 
@@ -17155,6 +17388,12 @@ components:
             $ref: '#/components/schemas/Error'
     Conflict:
       description: Request conflicts with the current resource state
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Forbidden
       content:
         application/json:
           schema:

@@ -466,6 +466,9 @@ pub fn parseRowsQueryRequest(
     const not_predicates = try parseRowsQueryNotPredicateGroupsAlloc(alloc, schema, parsed.value.object.get("where"));
     errdefer freeRowsQueryPredicateGroups(alloc, not_predicates);
 
+    const expression_predicates = try parseRowsQueryExpressionPredicatesAlloc(alloc, schema, parsed.value.object.get("expression_where"));
+    errdefer freeRowsQueryExpressionConditions(alloc, expression_predicates);
+
     const array_any = try parseRowsQueryArrayAnyPredicatesAlloc(alloc, schema, parsed.value.object.get("where"));
     errdefer freeRowsQueryArrayAnyPredicates(alloc, array_any);
 
@@ -535,6 +538,7 @@ pub fn parseRowsQueryRequest(
         .json_path_exists = json_path_exists,
         .or_predicates = or_predicates,
         .not_predicates = not_predicates,
+        .expression_predicates = expression_predicates,
         .select = select_parsed.fields,
         .json_extract = json_extract,
         .array_length = array_length,
@@ -1014,6 +1018,45 @@ pub fn encodeRowsQueryResponseAlloc(alloc: std.mem.Allocator, result: OwnedRowsQ
     return try out.toOwnedSlice();
 }
 
+fn encodeRowsResultWithTotalFieldAlloc(
+    alloc: std.mem.Allocator,
+    total_field: []const u8,
+    total: u32,
+    rows: []const []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{{{f}:{d},\"rows\":[", .{ std.json.fmt(total_field, .{}), total });
+    for (rows, 0..) |row, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.writeAll(row);
+    }
+    try writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+pub fn encodeRowsAggregateResponseAlloc(
+    alloc: std.mem.Allocator,
+    result: db_mod.types.RelationalRowsAggregateResult,
+) ![]u8 {
+    return try encodeRowsResultWithTotalFieldAlloc(alloc, "total_groups", result.total_groups, result.rows);
+}
+
+pub fn encodeRowsWindowResponseAlloc(
+    alloc: std.mem.Allocator,
+    result: db_mod.types.RelationalRowsWindowResult,
+) ![]u8 {
+    return try encodeRowsResultWithTotalFieldAlloc(alloc, "total_rows", result.total_rows, result.rows);
+}
+
+pub fn encodeRowsJoinResponseAlloc(
+    alloc: std.mem.Allocator,
+    result: db_mod.types.RelationalRowsJoinResult,
+) ![]u8 {
+    return try encodeRowsResultWithTotalFieldAlloc(alloc, "total_rows", result.total_rows, result.rows);
+}
+
 pub fn encodeRowsGetResponseAlloc(
     alloc: std.mem.Allocator,
     rows: []const RowLookupResult,
@@ -1271,6 +1314,14 @@ fn parseRowsAggregateFilterExpressionsAlloc(
         initialized += 1;
     }
     return out;
+}
+
+fn parseRowsQueryExpressionPredicatesAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    maybe_expressions: ?std.json.Value,
+) ![]const db_mod.types.RelationalRowsExpressionCondition {
+    return try parseRowsAggregateFilterExpressionsAlloc(alloc, schema, maybe_expressions);
 }
 
 fn parseRowsAggregateOutputPredicatesAlloc(
@@ -2733,6 +2784,10 @@ fn validateRowsQueryNumericExpression(
                 else => return error.InvalidRowsRequest,
             }
         },
+        .coalesce => {
+            if (expression.operands.len == 0) return error.InvalidRowsRequest;
+            for (expression.operands) |operand| try validateRowsQueryNumericExpression(alloc, schema, operand);
+        },
         .nullif => {
             if (expression.operands.len != 2) return error.InvalidRowsRequest;
             for (expression.operands) |operand| try validateRowsQueryNumericExpression(alloc, schema, operand);
@@ -3006,6 +3061,9 @@ fn queryRequestPredicatesPass(
     if (!try queryPredicatesPass(alloc, row, request.predicates)) return false;
     if (!try queryOrPredicateGroupsPass(alloc, row, request.or_predicates)) return false;
     if (!try queryNotPredicateGroupsPass(alloc, row, request.not_predicates)) return false;
+    for (request.expression_predicates) |condition| {
+        if (!try expressionConditionMatches(alloc, row, condition)) return false;
+    }
     for (request.array_any) |predicate| {
         if (!try queryArrayAnyPredicatePasses(alloc, row, predicate)) return false;
     }
@@ -5875,7 +5933,7 @@ test "relational rows query contract filters orders paginates and projects rows"
 
 test "relational rows aggregate contract accepts typed expression inputs and filters" {
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["id","customer","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"},"created_at":{"type":"numeric"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id","customer","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
     defer parsed.deinit(std.testing.allocator);
@@ -5884,7 +5942,7 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
 
     var request = try parseRowsAggregateRequest(
         std.testing.allocator,
-        "{\"source\":{\"where\":{\"field\":\"created_at\",\"op\":\"gte\",\"value\":10}},\"group_by\":[\"customer\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"status_count\",\"op\":\"count\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]},\"distinct\":true},{\"name\":\"net_amount\",\"op\":\"sum\",\"expr\":{\"op\":\"sub\",\"args\":[{\"field\":\"amount\"},{\"field\":\"discount\"}]},\"filter\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"},\"filter_expressions\":[{\"lhs\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]},\"op\":\"eq\",\"rhs\":{\"value\":\"open\"}}]},{\"name\":\"statuses\",\"op\":\"array_agg\",\"field\":\"status\",\"array_max_items\":4,\"array_order_by\":[{\"field\":\"created_at\",\"direction\":\"desc\"}]}],\"having\":{\"field\":\"net_amount\",\"op\":\"gt\",\"value\":0},\"order_by\":[{\"field\":\"net_amount\",\"direction\":\"desc\"}],\"limit\":5}",
+        "{\"source\":{\"where\":{\"field\":\"created_at\",\"op\":\"gte\",\"value\":10}},\"group_by\":[\"customer\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"status_count\",\"op\":\"count\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]},\"distinct\":true},{\"name\":\"net_amount\",\"op\":\"sum\",\"expr\":{\"op\":\"sub\",\"args\":[{\"field\":\"amount\"},{\"field\":\"discount\"}]},\"filter\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"},\"filter_expressions\":[{\"lhs\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]},\"op\":\"eq\",\"rhs\":{\"value\":\"open\"}}]},{\"name\":\"amount_total\",\"op\":\"sum\",\"expr\":{\"op\":\"coalesce\",\"args\":[{\"field\":\"amount\"},{\"value\":0}]}},{\"name\":\"tag_total\",\"op\":\"sum\",\"expr\":{\"op\":\"array_length\",\"args\":[{\"field\":\"tags\"}]}},{\"name\":\"statuses\",\"op\":\"array_agg\",\"field\":\"status\",\"array_max_items\":4,\"array_order_by\":[{\"field\":\"created_at\",\"direction\":\"desc\"}]}],\"having\":{\"field\":\"net_amount\",\"op\":\"gt\",\"value\":0},\"order_by\":[{\"field\":\"net_amount\",\"direction\":\"desc\"}],\"limit\":5}",
         schema,
     );
     defer request.deinit(std.testing.allocator);
@@ -5893,7 +5951,7 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
     try std.testing.expectEqualStrings("created_at", request.source.predicates[0].field);
     try std.testing.expectEqual(@as(usize, 1), request.group_by.len);
     try std.testing.expectEqualStrings("customer", request.group_by[0]);
-    try std.testing.expectEqual(@as(usize, 4), request.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 6), request.aggregations.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, request.aggregations[0].op);
     try std.testing.expect(request.aggregations[0].field == null);
     try std.testing.expect(request.aggregations[0].expression == null);
@@ -5903,9 +5961,13 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, request.aggregations[2].expression.?.kind);
     try std.testing.expectEqual(@as(usize, 1), request.aggregations[2].filter_predicates.len);
     try std.testing.expectEqual(@as(usize, 1), request.aggregations[2].filter_expressions.len);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.array_agg, request.aggregations[3].op);
-    try std.testing.expectEqual(@as(u32, 4), request.aggregations[3].array_max_items);
-    try std.testing.expectEqual(@as(usize, 1), request.aggregations[3].array_order_by.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, request.aggregations[3].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, request.aggregations[3].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, request.aggregations[4].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, request.aggregations[4].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.array_agg, request.aggregations[5].op);
+    try std.testing.expectEqual(@as(u32, 4), request.aggregations[5].array_max_items);
+    try std.testing.expectEqual(@as(usize, 1), request.aggregations[5].array_order_by.len);
     try std.testing.expectEqual(@as(usize, 1), request.having_predicates.len);
     try std.testing.expectEqualStrings("net_amount", request.having_predicates[0].field);
     try std.testing.expectEqual(@as(usize, 1), request.order_by.len);
@@ -6206,6 +6268,53 @@ test "relational rows query contract supports shorthand equality and validates f
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"Beta\"}", expression_order_result.rows[1]);
     try std.testing.expectEqualStrings("{\"id\":\"c\",\"status\":\"beta\"}", expression_order_result.rows[2]);
 
+    var expression_where_request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\"],\"expression_where\":[{\"lhs\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]},\"op\":\"eq\",\"rhs\":{\"value\":\"beta\"}}],\"order_by\":[{\"field\":\"id\"}]}",
+        schema,
+    );
+    defer expression_where_request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), expression_where_request.expression_predicates.len);
+    var expression_where_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, expression_where_request, expression_order_rows[0..]);
+    defer expression_where_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), expression_where_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", expression_where_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", expression_where_result.rows[1]);
+
+    const arithmetic_rows = [_][]const u8{
+        "{\"id\":\"a\",\"status\":\"ready\",\"rank\":1}",
+        "{\"id\":\"b\",\"status\":\"ready\",\"rank\":3}",
+        "{\"id\":\"c\",\"status\":\"ready\",\"rank\":6}",
+    };
+    var arithmetic_expression_where_request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\"],\"expression_where\":[{\"lhs\":{\"op\":\"mul\",\"args\":[{\"field\":\"rank\"},{\"value\":2}]},\"op\":\"gt\",\"rhs\":{\"value\":5}}],\"order_by\":[{\"field\":\"id\"}]}",
+        schema,
+    );
+    defer arithmetic_expression_where_request.deinit(std.testing.allocator);
+    var arithmetic_expression_where_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, arithmetic_expression_where_request, arithmetic_rows[0..]);
+    defer arithmetic_expression_where_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), arithmetic_expression_where_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", arithmetic_expression_where_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", arithmetic_expression_where_result.rows[1]);
+
+    const coalesce_rows = [_][]const u8{
+        "{\"id\":\"a\",\"rank\":1}",
+        "{\"id\":\"b\",\"status\":\"ready\",\"rank\":2}",
+        "{\"id\":\"c\",\"status\":null,\"rank\":3}",
+    };
+    var coalesce_expression_where_request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\"],\"expression_where\":[{\"lhs\":{\"op\":\"coalesce\",\"args\":[{\"field\":\"status\"},{\"value\":\"missing\"}]},\"op\":\"eq\",\"rhs\":{\"value\":\"missing\"}}],\"order_by\":[{\"field\":\"id\"}]}",
+        schema,
+    );
+    defer coalesce_expression_where_request.deinit(std.testing.allocator);
+    var coalesce_expression_where_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, coalesce_expression_where_request, coalesce_rows[0..]);
+    defer coalesce_expression_where_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), coalesce_expression_where_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", coalesce_expression_where_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", coalesce_expression_where_result.rows[1]);
+
     var ranged_request = try parseRowsQueryRequest(
         std.testing.allocator,
         "{\"doc_key_range\":{\"start\":\"row:b\",\"end\":\"row:d\"},\"limit\":10}",
@@ -6282,6 +6391,17 @@ test "relational rows query contract projects array lengths" {
     try std.testing.expectEqual(@as(u32, 2), result.total);
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"tag_count\":2,\"tag_count_expr\":2}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"b\",\"tag_count\":0,\"tag_count_expr\":0}", result.rows[1]);
+
+    var expression_where_request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\"],\"expression_where\":[{\"lhs\":{\"op\":\"array_length\",\"args\":[{\"field\":\"tags\"}]},\"op\":\"gt\",\"rhs\":{\"value\":0}}],\"order_by\":[{\"field\":\"id\"}]}",
+        schema,
+    );
+    defer expression_where_request.deinit(std.testing.allocator);
+    var expression_where_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, expression_where_request, rows[0..]);
+    defer expression_where_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), expression_where_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", expression_where_result.rows[0]);
 
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,

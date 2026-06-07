@@ -3548,6 +3548,31 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST) {
+            if (routes.Routes.matchTableRowsQuery(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsQuery(rows_route.table_name, req.body, authenticated_identity);
+            }
+        }
+        if (req.method == .POST) {
+            if (routes.Routes.matchTableRowsAggregate(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsAggregate(rows_route.table_name, req.body, authenticated_identity);
+            }
+        }
+        if (req.method == .POST) {
+            if (routes.Routes.matchTableRowsWindow(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsWindow(rows_route.table_name, req.body, authenticated_identity);
+            }
+        }
+        if (req.method == .POST) {
+            if (routes.Routes.matchTableRowsJoin(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsJoin(rows_route.table_name, req.body, authenticated_identity);
+            }
+        }
+        if (req.method == .POST) {
+            if (routes.Routes.matchTableRowsLateral(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsLateral(rows_route.table_name, req.body, authenticated_identity);
+            }
+        }
+        if (req.method == .POST) {
             if (routes.Routes.matchTableBatch(uri_parts.path)) |batch_route| {
                 return try self.handlePublicTableBatch(batch_route.table_name, req.body);
             }
@@ -5730,6 +5755,799 @@ pub const ApiHttpServer = struct {
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
 
+    pub fn handlePublicTableRowsQuery(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var plan = relational_rows_api.parseRowsQueryPlanRequest(self.alloc, body, schema) catch return try textResponse(self.alloc, 400, "invalid rows query request");
+        defer plan.deinit(self.alloc);
+        self.applyRowsQueryPlanRowFilter(table_name, authenticated_identity, schema, &plan) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+            else => return err,
+        };
+
+        var result = (source.rowsQueryPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows query request"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows query plan unavailable"),
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            else => {
+                std.log.err("public table rows query failed table={s} err={}", .{ table_name, err });
+                return try textResponse(self.alloc, 500, "rows query failed");
+            },
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        const response_body = try relational_rows_api.encodeRowsQueryResponseAlloc(self.alloc, result);
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    pub fn handlePublicTableRowsAggregate(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var plan = relational_rows_api.parseRowsAggregatePlanRequest(self.alloc, body, schema) catch return try textResponse(self.alloc, 400, "invalid rows aggregate request");
+        defer plan.deinit(self.alloc);
+        self.applyRowsAggregatePlanRowFilter(table_name, authenticated_identity, schema, &plan) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+            else => return err,
+        };
+
+        var result = (source.rowsAggregatePlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.ResourceBudgetExceeded => return try textResponse(self.alloc, 400, "invalid rows aggregate request"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows aggregate plan unavailable"),
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            else => {
+                std.log.err("public table rows aggregate failed table={s} err={}", .{ table_name, err });
+                return try textResponse(self.alloc, 500, "rows aggregate failed");
+            },
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        const response_body = try relational_rows_api.encodeRowsAggregateResponseAlloc(self.alloc, result);
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    pub fn handlePublicTableRowsWindow(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var plan = relational_rows_api.parseRowsWindowPlanRequest(self.alloc, body, schema) catch return try textResponse(self.alloc, 400, "invalid rows window request");
+        defer plan.deinit(self.alloc);
+        self.applyRowsWindowPlanRowFilter(table_name, authenticated_identity, schema, &plan) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+            else => return err,
+        };
+
+        var result = (source.rowsWindowPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows window request"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows window plan unavailable"),
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            else => {
+                std.log.err("public table rows window failed table={s} err={}", .{ table_name, err });
+                return try textResponse(self.alloc, 500, "rows window failed");
+            },
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        const response_body = try relational_rows_api.encodeRowsWindowResponseAlloc(self.alloc, result);
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    pub fn handlePublicTableRowsJoin(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var plan = relational_rows_api.parseRowsJoinPlanRequest(self.alloc, body, schema) catch return try textResponse(self.alloc, 400, "invalid rows join request");
+        defer plan.deinit(self.alloc);
+        self.applyRowsJoinPlanRowFilter(table_name, authenticated_identity, schema, &plan) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+            else => return err,
+        };
+
+        var result = (source.rowsJoinPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows join request"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows join plan unavailable"),
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            else => {
+                std.log.err("public table rows join failed table={s} err={}", .{ table_name, err });
+                return try textResponse(self.alloc, 500, "rows join failed");
+            },
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        const response_body = try relational_rows_api.encodeRowsJoinResponseAlloc(self.alloc, result);
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    pub fn handlePublicTableRowsLateral(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var plan = relational_rows_api.parseRowsLateralPlanRequest(self.alloc, body, schema) catch return try textResponse(self.alloc, 400, "invalid rows lateral request");
+        defer plan.deinit(self.alloc);
+        self.applyRowsLateralPlanRowFilter(table_name, authenticated_identity, schema, &plan) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+            else => return err,
+        };
+
+        var result = (source.rowsLateralPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows lateral request"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows lateral plan unavailable"),
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            else => {
+                std.log.err("public table rows lateral failed table={s} err={}", .{ table_name, err });
+                return try textResponse(self.alloc, 500, "rows lateral failed");
+            },
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        const response_body = try relational_rows_api.encodeRowsJoinResponseAlloc(self.alloc, result);
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    const RowsAuthFilterPlan = struct {
+        predicates: []const runtime_schema_mod.RelationalCheck = &.{},
+        array_any: []const db_mod.types.RelationalRowsArrayAnyPredicate = &.{},
+        in_predicates: []const db_mod.types.RelationalRowsInPredicate = &.{},
+        json_contains: []const db_mod.types.RelationalRowsJsonContainsPredicate = &.{},
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            freeRowsAuthPredicates(alloc, self.predicates);
+            if (self.predicates.len > 0) alloc.free(self.predicates);
+            for (self.array_any) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (self.array_any.len > 0) alloc.free(self.array_any);
+            for (self.in_predicates) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.values_json);
+            }
+            if (self.in_predicates.len > 0) alloc.free(self.in_predicates);
+            for (self.json_contains) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (self.json_contains.len > 0) alloc.free(self.json_contains);
+            self.* = undefined;
+        }
+
+        fn empty(self: @This()) bool {
+            return self.predicates.len == 0 and self.array_any.len == 0 and self.in_predicates.len == 0 and self.json_contains.len == 0;
+        }
+    };
+
+    fn applyRowsQueryPlanRowFilter(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        schema: runtime_schema_mod.TableSchema,
+        plan: *relational_rows_api.OwnedRowsQueryPlan,
+    ) !void {
+        var filter = try self.rowsAuthFilterPlanForIdentity(table_name, authenticated_identity, schema);
+        defer if (filter) |*value| value.deinit(self.alloc);
+        const active = filter orelse return;
+        for (@constCast(plan.ctes)) |*cte| try self.applyRowsAuthFilterToQuery(schema, active, &cte.query);
+        try self.applyRowsAuthFilterToQuery(schema, active, &plan.query);
+    }
+
+    fn applyRowsAggregatePlanRowFilter(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        schema: runtime_schema_mod.TableSchema,
+        plan: *relational_rows_api.OwnedRowsAggregatePlan,
+    ) !void {
+        var filter = try self.rowsAuthFilterPlanForIdentity(table_name, authenticated_identity, schema);
+        defer if (filter) |*value| value.deinit(self.alloc);
+        const active = filter orelse return;
+        for (@constCast(plan.ctes)) |*cte| try self.applyRowsAuthFilterToQuery(schema, active, &cte.query);
+        try self.applyRowsAuthFilterToQuery(schema, active, &plan.aggregate.source);
+    }
+
+    fn applyRowsWindowPlanRowFilter(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        schema: runtime_schema_mod.TableSchema,
+        plan: *relational_rows_api.OwnedRowsWindowPlan,
+    ) !void {
+        var filter = try self.rowsAuthFilterPlanForIdentity(table_name, authenticated_identity, schema);
+        defer if (filter) |*value| value.deinit(self.alloc);
+        const active = filter orelse return;
+        for (@constCast(plan.ctes)) |*cte| try self.applyRowsAuthFilterToQuery(schema, active, &cte.query);
+        try self.applyRowsAuthFilterToQuery(schema, active, &plan.window.source);
+    }
+
+    fn applyRowsJoinPlanRowFilter(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        schema: runtime_schema_mod.TableSchema,
+        plan: *relational_rows_api.OwnedRowsJoinPlan,
+    ) !void {
+        var filter = try self.rowsAuthFilterPlanForIdentity(table_name, authenticated_identity, schema);
+        defer if (filter) |*value| value.deinit(self.alloc);
+        const active = filter orelse return;
+        for (@constCast(plan.ctes)) |*cte| try self.applyRowsAuthFilterToQuery(schema, active, &cte.query);
+        try self.applyRowsAuthFilterToQuery(schema, active, &plan.join.left);
+        try self.applyRowsAuthFilterToQuery(schema, active, &plan.join.right);
+    }
+
+    fn applyRowsLateralPlanRowFilter(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        schema: runtime_schema_mod.TableSchema,
+        plan: *relational_rows_api.OwnedRowsLateralPlan,
+    ) !void {
+        var filter = try self.rowsAuthFilterPlanForIdentity(table_name, authenticated_identity, schema);
+        defer if (filter) |*value| value.deinit(self.alloc);
+        const active = filter orelse return;
+        for (@constCast(plan.ctes)) |*cte| try self.applyRowsAuthFilterToQuery(schema, active, &cte.query);
+        try self.applyRowsAuthFilterToQuery(schema, active, &plan.lateral.left);
+        try self.applyRowsAuthFilterToQuery(schema, active, &plan.lateral.right);
+    }
+
+    fn rowsAuthFilterPlanForIdentity(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        schema: runtime_schema_mod.TableSchema,
+    ) !?RowsAuthFilterPlan {
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        const json = row_filter_json orelse return null;
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, json, .{
+            .allocate = .alloc_always,
+        }) catch return error.InvalidRowsFilter;
+        defer parsed.deinit();
+        var filter = try self.rowsAuthFilterPlanFromValue(schema, parsed.value);
+        errdefer filter.deinit(self.alloc);
+        return filter;
+    }
+
+    fn rowsAuthFilterPlanFromValue(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        value: std.json.Value,
+    ) !RowsAuthFilterPlan {
+        var filter = RowsAuthFilterBuilder{};
+        errdefer filter.deinit(self.alloc);
+        try self.appendRowsAuthFilterValue(schema, value, &filter);
+        return try filter.toOwnedPlan(self.alloc);
+    }
+
+    const RowsAuthFilterBuilder = struct {
+        predicates: std.ArrayListUnmanaged(runtime_schema_mod.RelationalCheck) = .empty,
+        array_any: std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayAnyPredicate) = .empty,
+        in_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate) = .empty,
+        json_contains: std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonContainsPredicate) = .empty,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            freeRowsAuthPredicates(alloc, self.predicates.items);
+            self.predicates.deinit(alloc);
+            for (self.array_any.items) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            self.array_any.deinit(alloc);
+            for (self.in_predicates.items) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.values_json);
+            }
+            self.in_predicates.deinit(alloc);
+            for (self.json_contains.items) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            self.json_contains.deinit(alloc);
+            self.* = undefined;
+        }
+
+        fn toOwnedPlan(self: *@This(), alloc: std.mem.Allocator) !RowsAuthFilterPlan {
+            return .{
+                .predicates = try self.predicates.toOwnedSlice(alloc),
+                .array_any = try self.array_any.toOwnedSlice(alloc),
+                .in_predicates = try self.in_predicates.toOwnedSlice(alloc),
+                .json_contains = try self.json_contains.toOwnedSlice(alloc),
+            };
+        }
+    };
+
+    fn appendRowsAuthFilterValue(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        value: std.json.Value,
+        filter: *RowsAuthFilterBuilder,
+    ) !void {
+        if (value != .object) return error.InvalidRowsFilter;
+        if (value.object.get("match_all") != null) return;
+        if (value.object.get("match_none") != null) return error.UnsupportedRowsFilter;
+        if (value.object.get("doc_id") != null) return error.UnsupportedRowsFilter;
+        if (value.object.get("disjuncts") != null) return error.UnsupportedRowsFilter;
+
+        if (value.object.get("conjuncts")) |conjuncts| {
+            if (conjuncts != .array) return error.InvalidRowsFilter;
+            for (conjuncts.array.items) |item| try self.appendRowsAuthFilterValue(schema, item, filter);
+            return;
+        }
+        if (value.object.get("bool")) |bool_query| {
+            if (bool_query != .object) return error.InvalidRowsFilter;
+            if (bool_query.object.get("should") != null or bool_query.object.get("must_not") != null) return error.UnsupportedRowsFilter;
+            var saw_supported = false;
+            if (bool_query.object.get("must")) |must| {
+                if (must != .array or must.array.items.len == 0) return error.InvalidRowsFilter;
+                saw_supported = true;
+                for (must.array.items) |item| try self.appendRowsAuthFilterValue(schema, item, filter);
+            }
+            if (bool_query.object.get("filter")) |must_filter| {
+                if (must_filter != .array or must_filter.array.items.len == 0) return error.InvalidRowsFilter;
+                saw_supported = true;
+                for (must_filter.array.items) |item| try self.appendRowsAuthFilterValue(schema, item, filter);
+            }
+            if (!saw_supported) return error.InvalidRowsFilter;
+            return;
+        }
+
+        if (value.object.get("term")) |term| return try self.appendRowsAuthTermFilter(schema, term, filter);
+        if (value.object.get("terms")) |terms| return try self.appendRowsAuthTermsFilter(schema, terms, filter);
+        if (value.object.get("array_any")) |array_any| return try self.appendRowsAuthArrayAnyFilter(schema, array_any, filter);
+        if (value.object.get("json_contains")) |json_contains| return try self.appendRowsAuthJsonContainsFilter(schema, json_contains, filter);
+        if (value.object.get("numeric_range")) |range_query| return try self.appendRowsAuthNumericRangeFilter(schema, range_query, filter);
+        if (value.object.get("date_range")) |range_query| return try self.appendRowsAuthDateRangeFilter(schema, range_query, filter);
+
+        if (value.object.get("match") != null or
+            value.object.get("prefix") != null or
+            value.object.get("wildcard") != null or
+            value.object.get("regexp") != null or
+            value.object.get("fuzzy") != null)
+        {
+            return error.UnsupportedRowsFilter;
+        }
+        return error.InvalidRowsFilter;
+    }
+
+    fn appendRowsAuthTermFilter(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        term: std.json.Value,
+        filter: *RowsAuthFilterBuilder,
+    ) !void {
+        if (term != .object or term.object.count() != 1) return error.InvalidRowsFilter;
+        var it = term.object.iterator();
+        const entry = it.next() orelse return error.InvalidRowsFilter;
+        if (entry.value_ptr.* != .string) return error.UnsupportedRowsFilter;
+        const column = rowsAuthRelationalColumn(schema, entry.key_ptr.*) orelse return error.UnsupportedRowsFilter;
+        const value_json = try self.rowsAuthTermValueJson(column, entry.value_ptr.string);
+        var value_transferred = false;
+        errdefer if (!value_transferred) self.alloc.free(value_json);
+        const field = try self.alloc.dupe(u8, entry.key_ptr.*);
+        errdefer self.alloc.free(field);
+        try filter.predicates.append(self.alloc, .{
+            .name = "",
+            .field = field,
+            .op = .eq,
+            .value_json = value_json,
+        });
+        value_transferred = true;
+    }
+
+    fn appendRowsAuthTermsFilter(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        terms: std.json.Value,
+        filter: *RowsAuthFilterBuilder,
+    ) !void {
+        if (terms != .object or terms.object.count() != 1) return error.InvalidRowsFilter;
+        var it = terms.object.iterator();
+        const entry = it.next() orelse return error.InvalidRowsFilter;
+        if (entry.value_ptr.* != .array or entry.value_ptr.array.items.len == 0) return error.InvalidRowsFilter;
+        const column = rowsAuthRelationalColumn(schema, entry.key_ptr.*) orelse return error.UnsupportedRowsFilter;
+
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeByte('[');
+        for (entry.value_ptr.array.items, 0..) |item, i| {
+            if (item != .string) return error.UnsupportedRowsFilter;
+            const value_json = try self.rowsAuthTermValueJson(column, item.string);
+            defer self.alloc.free(value_json);
+            if (i != 0) try writer.writeByte(',');
+            try writer.writeAll(value_json);
+        }
+        try writer.writeByte(']');
+        const values_json = try out.toOwnedSlice();
+        var values_transferred = false;
+        errdefer if (!values_transferred) self.alloc.free(values_json);
+        const field = try self.alloc.dupe(u8, entry.key_ptr.*);
+        errdefer self.alloc.free(field);
+        try filter.in_predicates.append(self.alloc, .{
+            .field = field,
+            .values_json = values_json,
+        });
+        values_transferred = true;
+    }
+
+    fn appendRowsAuthArrayAnyFilter(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        array_any: std.json.Value,
+        filter: *RowsAuthFilterBuilder,
+    ) !void {
+        const parsed = try rowsAuthFieldJsonValue(array_any);
+        const column = rowsAuthRelationalColumn(schema, parsed.field) orelse return error.UnsupportedRowsFilter;
+        if (column.field_type != .array) return error.UnsupportedRowsFilter;
+        const field = try self.alloc.dupe(u8, parsed.field);
+        errdefer self.alloc.free(field);
+        const value_json = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{});
+        errdefer self.alloc.free(value_json);
+        try filter.array_any.append(self.alloc, .{
+            .field = field,
+            .value_json = value_json,
+        });
+    }
+
+    fn appendRowsAuthJsonContainsFilter(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        json_contains: std.json.Value,
+        filter: *RowsAuthFilterBuilder,
+    ) !void {
+        const parsed = try rowsAuthFieldJsonValue(json_contains);
+        const column = rowsAuthRelationalColumn(schema, parsed.field) orelse return error.UnsupportedRowsFilter;
+        if (column.field_type != .json) return error.UnsupportedRowsFilter;
+        const field = try self.alloc.dupe(u8, parsed.field);
+        errdefer self.alloc.free(field);
+        const value_json = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{});
+        errdefer self.alloc.free(value_json);
+        try filter.json_contains.append(self.alloc, .{
+            .field = field,
+            .value_json = value_json,
+        });
+    }
+
+    fn appendRowsAuthNumericRangeFilter(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        range_query: std.json.Value,
+        filter: *RowsAuthFilterBuilder,
+    ) !void {
+        if (range_query != .object) return error.InvalidRowsFilter;
+        const field_value = range_query.object.get("field") orelse return error.InvalidRowsFilter;
+        if (field_value != .string) return error.InvalidRowsFilter;
+        const column = rowsAuthRelationalColumn(schema, field_value.string) orelse return error.UnsupportedRowsFilter;
+        if (column.field_type != .numeric) return error.UnsupportedRowsFilter;
+        const inclusive_min = rowsAuthOptionalBool(range_query.object.get("inclusive_min")) orelse true;
+        const inclusive_max = rowsAuthOptionalBool(range_query.object.get("inclusive_max")) orelse false;
+        var appended = false;
+        if (range_query.object.get("min")) |min| {
+            try self.appendRowsAuthRangePredicate(filter, field_value.string, if (inclusive_min) .gte else .gt, min);
+            appended = true;
+        }
+        if (range_query.object.get("max")) |max| {
+            try self.appendRowsAuthRangePredicate(filter, field_value.string, if (inclusive_max) .lte else .lt, max);
+            appended = true;
+        }
+        if (!appended) return error.InvalidRowsFilter;
+    }
+
+    fn appendRowsAuthDateRangeFilter(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        range_query: std.json.Value,
+        filter: *RowsAuthFilterBuilder,
+    ) !void {
+        if (range_query != .object) return error.InvalidRowsFilter;
+        const field_value = range_query.object.get("field") orelse return error.InvalidRowsFilter;
+        if (field_value != .string) return error.InvalidRowsFilter;
+        const column = rowsAuthRelationalColumn(schema, field_value.string) orelse return error.UnsupportedRowsFilter;
+        if (column.field_type != .datetime and column.field_type != .numeric) return error.UnsupportedRowsFilter;
+        const inclusive_start = rowsAuthOptionalBool(range_query.object.get("inclusive_start")) orelse true;
+        const inclusive_end = rowsAuthOptionalBool(range_query.object.get("inclusive_end")) orelse false;
+        var appended = false;
+        if (range_query.object.get("start_ns")) |start| {
+            try self.appendRowsAuthRangePredicate(filter, field_value.string, if (inclusive_start) .gte else .gt, start);
+            appended = true;
+        }
+        if (range_query.object.get("end_ns")) |end| {
+            try self.appendRowsAuthRangePredicate(filter, field_value.string, if (inclusive_end) .lte else .lt, end);
+            appended = true;
+        }
+        if (!appended) return error.InvalidRowsFilter;
+    }
+
+    fn appendRowsAuthRangePredicate(
+        self: *ApiHttpServer,
+        filter: *RowsAuthFilterBuilder,
+        field_name: []const u8,
+        op: runtime_schema_mod.RelationalCheckOp,
+        value: std.json.Value,
+    ) !void {
+        if (value != .integer and value != .float) return error.InvalidRowsFilter;
+        const field = try self.alloc.dupe(u8, field_name);
+        errdefer self.alloc.free(field);
+        const value_json = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
+        errdefer self.alloc.free(value_json);
+        try filter.predicates.append(self.alloc, .{
+            .name = "",
+            .field = field,
+            .op = op,
+            .value_json = value_json,
+        });
+    }
+
+    fn rowsAuthTermValueJson(
+        self: *ApiHttpServer,
+        column: runtime_schema_mod.RelationalColumn,
+        term: []const u8,
+    ) ![]u8 {
+        return switch (column.field_type) {
+            .keyword, .text, .link, .html, .search_as_you_type, .blob => try std.json.Stringify.valueAlloc(self.alloc, std.json.Value{ .string = term }, .{}),
+            .boolean => if (std.mem.eql(u8, term, "true"))
+                try self.alloc.dupe(u8, "true")
+            else if (std.mem.eql(u8, term, "false"))
+                try self.alloc.dupe(u8, "false")
+            else
+                error.UnsupportedRowsFilter,
+            .numeric, .datetime => rowsAuthNumericTermValueJson(self.alloc, term),
+            else => error.UnsupportedRowsFilter,
+        };
+    }
+
+    fn rowsAuthNumericTermValueJson(alloc: std.mem.Allocator, term: []const u8) ![]u8 {
+        if (std.fmt.parseInt(i64, term, 10)) |integer| {
+            return try std.fmt.allocPrint(alloc, "{d}", .{integer});
+        } else |_| {}
+        if (std.fmt.parseFloat(f64, term)) |number| {
+            if (!std.math.isFinite(number)) return error.UnsupportedRowsFilter;
+            return try std.fmt.allocPrint(alloc, "{d}", .{number});
+        } else |_| {}
+        return error.UnsupportedRowsFilter;
+    }
+
+    const RowsAuthFieldJsonValue = struct {
+        field: []const u8,
+        value: std.json.Value,
+    };
+
+    fn rowsAuthFieldJsonValue(value: std.json.Value) !RowsAuthFieldJsonValue {
+        if (value != .object) return error.InvalidRowsFilter;
+        const field_value = value.object.get("field") orelse value.object.get("path");
+        if (field_value) |field| {
+            if (field != .string) return error.InvalidRowsFilter;
+            const raw_value = value.object.get("value") orelse return error.InvalidRowsFilter;
+            return .{ .field = field.string, .value = raw_value };
+        }
+        if (value.object.count() != 1) return error.InvalidRowsFilter;
+        var it = value.object.iterator();
+        const entry = it.next() orelse return error.InvalidRowsFilter;
+        return .{ .field = entry.key_ptr.*, .value = entry.value_ptr.* };
+    }
+
+    fn rowsAuthOptionalBool(value: ?std.json.Value) ?bool {
+        const unwrapped = value orelse return null;
+        return switch (unwrapped) {
+            .bool => |boolean| boolean,
+            else => null,
+        };
+    }
+
+    fn rowsAuthRelationalColumn(schema: runtime_schema_mod.TableSchema, field: []const u8) ?runtime_schema_mod.RelationalColumn {
+        for (schema.relational_columns) |column| {
+            if (std.mem.eql(u8, column.path, field) or std.mem.eql(u8, column.name, field)) return column;
+        }
+        return null;
+    }
+
+    fn applyRowsAuthFilterToQuery(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        filter: RowsAuthFilterPlan,
+        query: *relational_rows_api.OwnedRowsQueryRequest,
+    ) !void {
+        _ = schema;
+        if (filter.empty()) return;
+        if (query.source_cte.len != 0) return;
+        try self.appendRowsAuthPredicatesToQuery(filter.predicates, query);
+        try self.appendRowsAuthArrayAnyToQuery(filter.array_any, query);
+        try self.appendRowsAuthInPredicatesToQuery(filter.in_predicates, query);
+        try self.appendRowsAuthJsonContainsToQuery(filter.json_contains, query);
+    }
+
+    fn appendRowsAuthPredicatesToQuery(
+        self: *ApiHttpServer,
+        predicates: []const runtime_schema_mod.RelationalCheck,
+        query: *relational_rows_api.OwnedRowsQueryRequest,
+    ) !void {
+        if (predicates.len == 0) return;
+        const combined = try self.alloc.alloc(runtime_schema_mod.RelationalCheck, query.predicates.len + predicates.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (combined[query.predicates.len..initialized]) |predicate| {
+                self.alloc.free(predicate.field);
+                if (predicate.value_json) |value_json| self.alloc.free(value_json);
+            }
+            self.alloc.free(combined);
+        }
+        for (query.predicates) |predicate| {
+            combined[initialized] = predicate;
+            initialized += 1;
+        }
+        for (predicates) |predicate| {
+            combined[initialized] = try cloneRowsAuthPredicate(self.alloc, predicate);
+            initialized += 1;
+        }
+        if (query.predicates.len > 0) self.alloc.free(@constCast(query.predicates));
+        query.predicates = combined;
+    }
+
+    fn appendRowsAuthArrayAnyToQuery(
+        self: *ApiHttpServer,
+        predicates: []const db_mod.types.RelationalRowsArrayAnyPredicate,
+        query: *relational_rows_api.OwnedRowsQueryRequest,
+    ) !void {
+        if (predicates.len == 0) return;
+        const combined = try self.alloc.alloc(db_mod.types.RelationalRowsArrayAnyPredicate, query.array_any.len + predicates.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (combined[query.array_any.len..initialized]) |predicate| {
+                self.alloc.free(predicate.field);
+                self.alloc.free(predicate.value_json);
+            }
+            self.alloc.free(combined);
+        }
+        for (query.array_any) |predicate| {
+            combined[initialized] = predicate;
+            initialized += 1;
+        }
+        for (predicates) |predicate| {
+            combined[initialized] = .{
+                .field = try self.alloc.dupe(u8, predicate.field),
+                .value_json = try self.alloc.dupe(u8, predicate.value_json),
+            };
+            initialized += 1;
+        }
+        if (query.array_any.len > 0) self.alloc.free(@constCast(query.array_any));
+        query.array_any = combined;
+    }
+
+    fn appendRowsAuthInPredicatesToQuery(
+        self: *ApiHttpServer,
+        predicates: []const db_mod.types.RelationalRowsInPredicate,
+        query: *relational_rows_api.OwnedRowsQueryRequest,
+    ) !void {
+        if (predicates.len == 0) return;
+        const combined = try self.alloc.alloc(db_mod.types.RelationalRowsInPredicate, query.in_predicates.len + predicates.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (combined[query.in_predicates.len..initialized]) |predicate| {
+                self.alloc.free(predicate.field);
+                self.alloc.free(predicate.values_json);
+            }
+            self.alloc.free(combined);
+        }
+        for (query.in_predicates) |predicate| {
+            combined[initialized] = predicate;
+            initialized += 1;
+        }
+        for (predicates) |predicate| {
+            combined[initialized] = .{
+                .field = try self.alloc.dupe(u8, predicate.field),
+                .values_json = try self.alloc.dupe(u8, predicate.values_json),
+                .negated = predicate.negated,
+            };
+            initialized += 1;
+        }
+        if (query.in_predicates.len > 0) self.alloc.free(@constCast(query.in_predicates));
+        query.in_predicates = combined;
+    }
+
+    fn appendRowsAuthJsonContainsToQuery(
+        self: *ApiHttpServer,
+        predicates: []const db_mod.types.RelationalRowsJsonContainsPredicate,
+        query: *relational_rows_api.OwnedRowsQueryRequest,
+    ) !void {
+        if (predicates.len == 0) return;
+        const combined = try self.alloc.alloc(db_mod.types.RelationalRowsJsonContainsPredicate, query.json_contains.len + predicates.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (combined[query.json_contains.len..initialized]) |predicate| {
+                self.alloc.free(predicate.field);
+                self.alloc.free(predicate.value_json);
+            }
+            self.alloc.free(combined);
+        }
+        for (query.json_contains) |predicate| {
+            combined[initialized] = predicate;
+            initialized += 1;
+        }
+        for (predicates) |predicate| {
+            combined[initialized] = .{
+                .field = try self.alloc.dupe(u8, predicate.field),
+                .value_json = try self.alloc.dupe(u8, predicate.value_json),
+            };
+            initialized += 1;
+        }
+        if (query.json_contains.len > 0) self.alloc.free(@constCast(query.json_contains));
+        query.json_contains = combined;
+    }
+
+    fn cloneRowsAuthPredicate(alloc: std.mem.Allocator, predicate: runtime_schema_mod.RelationalCheck) !runtime_schema_mod.RelationalCheck {
+        const field = try alloc.dupe(u8, predicate.field);
+        errdefer alloc.free(field);
+        const value_json = if (predicate.value_json) |value| try alloc.dupe(u8, value) else null;
+        return .{
+            .name = "",
+            .field = field,
+            .op = predicate.op,
+            .value_json = value_json,
+            .validation_state = predicate.validation_state,
+        };
+    }
+
+    fn freeRowsAuthPredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema_mod.RelationalCheck) void {
+        for (predicates) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+    }
+
     fn runtimeSchemaForPublicRows(self: *ApiHttpServer, table_name: []const u8) !runtime_schema_mod.TableSchema {
         var snapshot = (try self.source.adminSnapshot()) orelse return error.TableNotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -6459,6 +7277,31 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
         .permission_type = .read,
     };
     if (routes.Routes.matchTableRowsGet(path)) |rows| return .{
+        .resource_type = .table,
+        .resource = rows.table_name,
+        .permission_type = .read,
+    };
+    if (routes.Routes.matchTableRowsQuery(path)) |rows| return .{
+        .resource_type = .table,
+        .resource = rows.table_name,
+        .permission_type = .read,
+    };
+    if (routes.Routes.matchTableRowsAggregate(path)) |rows| return .{
+        .resource_type = .table,
+        .resource = rows.table_name,
+        .permission_type = .read,
+    };
+    if (routes.Routes.matchTableRowsWindow(path)) |rows| return .{
+        .resource_type = .table,
+        .resource = rows.table_name,
+        .permission_type = .read,
+    };
+    if (routes.Routes.matchTableRowsJoin(path)) |rows| return .{
+        .resource_type = .table,
+        .resource = rows.table_name,
+        .permission_type = .read,
+    };
+    if (routes.Routes.matchTableRowsLateral(path)) |rows| return .{
         .resource_type = .table,
         .resource = rows.table_name,
         .permission_type = .read,
@@ -11887,6 +12730,194 @@ test "api http server resolves relational rows by unique selector" {
     const missing = parsed_missing.value.object.get("rows").?.array.items[0].object;
     try std.testing.expect(!missing.get("found").?.bool);
     try std.testing.expect(missing.get("physical_key").? == .null);
+}
+
+test "api http server executes public relational row plan endpoints" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"name":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rows-plan-endpoints", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    var read_source = table_reads.BoundTableReadSource.init("records", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var write_source = table_writes.BoundTableWriteSource.init("records", &db);
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "records",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+
+    var insert_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:batch",
+        .content_type = "application/json",
+        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"kind\":\"customer\",\"tenant\":\"t1\",\"id\":\"c1\",\"name\":\"Alice\"}},{\"op\":\"insert\",\"row\":{\"kind\":\"customer\",\"tenant\":\"t1\",\"id\":\"c2\",\"name\":\"Bob\"}},{\"op\":\"insert\",\"row\":{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o1\",\"customer_id\":\"c1\",\"status\":\"open\",\"amount\":10,\"created_at\":10}},{\"op\":\"insert\",\"row\":{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o2\",\"customer_id\":\"c1\",\"status\":\"open\",\"amount\":20,\"created_at\":20}},{\"op\":\"insert\",\"row\":{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o3\",\"customer_id\":\"c2\",\"status\":\"closed\",\"amount\":30,\"created_at\":30}}]}",
+    });
+    defer insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), insert_resp.status);
+
+    var query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:query",
+        .content_type = "application/json",
+        .body = "{\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]},\"select\":[\"id\",\"amount\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}}",
+    });
+    defer query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), query_resp.status);
+    var parsed_query = try std.json.parseFromSlice(std.json.Value, alloc, query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_query.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_query.value.object.get("total").?.integer);
+    try std.testing.expectEqualStrings("o2", parsed_query.value.object.get("rows").?.array.items[0].object.get("id").?.string);
+
+    var aggregate_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:aggregate",
+        .content_type = "application/json",
+        .body = "{\"ctes\":[{\"name\":\"open_orders\",\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}}}],\"aggregate\":{\"source\":{\"source_cte\":\"open_orders\"},\"group_by\":[\"customer_id\"],\"aggregations\":[{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}]}}",
+    });
+    defer aggregate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), aggregate_resp.status);
+    var parsed_aggregate = try std.json.parseFromSlice(std.json.Value, alloc, aggregate_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_aggregate.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_aggregate.value.object.get("total_groups").?.integer);
+    try std.testing.expectEqual(@as(i64, 30), parsed_aggregate.value.object.get("rows").?.array.items[0].object.get("amount_sum").?.integer);
+
+    var window_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:window",
+        .content_type = "application/json",
+        .body = "{\"window\":{\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}},\"windows\":[{\"as\":\"row_num\",\"function\":\"row_number\",\"partition_by\":[\"customer_id\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}],\"select\":[\"id\",\"amount\"]}}",
+    });
+    defer window_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), window_resp.status);
+    var parsed_window = try std.json.parseFromSlice(std.json.Value, alloc, window_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_window.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_window.value.object.get("total_rows").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed_window.value.object.get("rows").?.array.items[0].object.get("row_num").?.integer);
+
+    var join_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:join",
+        .content_type = "application/json",
+        .body = "{\"join\":{\"left\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}},\"right\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"customer\"}},\"on\":[{\"left_field\":\"customer_id\",\"right_field\":\"id\"}],\"select\":[{\"as\":\"order_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"customer_name\",\"side\":\"right\",\"field\":\"name\"},{\"as\":\"amount\",\"side\":\"left\",\"field\":\"amount\"}],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}}",
+    });
+    defer join_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), join_resp.status);
+    var parsed_join = try std.json.parseFromSlice(std.json.Value, alloc, join_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_join.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_join.value.object.get("total_rows").?.integer);
+    try std.testing.expectEqualStrings("Alice", parsed_join.value.object.get("rows").?.array.items[0].object.get("customer_name").?.string);
+
+    var lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:lateral",
+        .content_type = "application/json",
+        .body = "{\"lateral\":{\"left\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"customer\"},\"order_by\":[{\"field\":\"id\"}]},\"right\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}],\"limit\":1},\"correlations\":[{\"left_field\":\"id\",\"right_field\":\"customer_id\"}],\"select\":[{\"as\":\"customer_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"latest_order_id\",\"side\":\"right\",\"field\":\"id\"},{\"as\":\"latest_amount\",\"side\":\"right\",\"field\":\"amount\"}]}}",
+    });
+    defer lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), lateral_resp.status);
+    var parsed_lateral = try std.json.parseFromSlice(std.json.Value, alloc, lateral_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_lateral.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_lateral.value.object.get("total_rows").?.integer);
+    try std.testing.expectEqualStrings("o2", parsed_lateral.value.object.get("rows").?.array.items[0].object.get("latest_order_id").?.string);
+
+    var cross_tenant_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:batch",
+        .content_type = "application/json",
+        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"kind\":\"customer\",\"tenant\":\"t2\",\"id\":\"c9\",\"name\":\"Mallory\"}},{\"op\":\"insert\",\"row\":{\"kind\":\"order\",\"tenant\":\"t2\",\"id\":\"o9\",\"customer_id\":\"c9\",\"status\":\"open\",\"amount\":999,\"created_at\":99}}]}",
+    });
+    defer cross_tenant_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), cross_tenant_resp.status);
+
+    var row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
+    row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "records", "{\"term\":{\"tenant\":\"t1\"}}");
+    var identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "tenant_reader"),
+        .row_filter = row_filters,
+    };
+    defer identity.deinit(alloc);
+
+    var filtered_query_resp = try server.handlePublicTableRowsQuery("records", "{\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]},\"select\":[\"tenant\",\"id\",\"amount\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}}", identity);
+    defer filtered_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), filtered_query_resp.status);
+    var parsed_filtered_query = try std.json.parseFromSlice(std.json.Value, alloc, filtered_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_filtered_query.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_filtered_query.value.object.get("total").?.integer);
+    try std.testing.expectEqualStrings("t1", parsed_filtered_query.value.object.get("rows").?.array.items[0].object.get("tenant").?.string);
+
+    var filtered_aggregate_resp = try server.handlePublicTableRowsAggregate("records", "{\"ctes\":[{\"name\":\"open_orders\",\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}}}],\"aggregate\":{\"source\":{\"source_cte\":\"open_orders\"},\"group_by\":[\"customer_id\"],\"aggregations\":[{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}]}}", identity);
+    defer filtered_aggregate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), filtered_aggregate_resp.status);
+    var parsed_filtered_aggregate = try std.json.parseFromSlice(std.json.Value, alloc, filtered_aggregate_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_filtered_aggregate.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_filtered_aggregate.value.object.get("total_groups").?.integer);
+    try std.testing.expectEqual(@as(i64, 30), parsed_filtered_aggregate.value.object.get("rows").?.array.items[0].object.get("amount_sum").?.integer);
+
+    var filtered_join_resp = try server.handlePublicTableRowsJoin("records", "{\"join\":{\"left\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}},\"right\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"customer\"}},\"on\":[{\"left_field\":\"customer_id\",\"right_field\":\"id\"}],\"select\":[{\"as\":\"tenant\",\"side\":\"left\",\"field\":\"tenant\"},{\"as\":\"order_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"customer_name\",\"side\":\"right\",\"field\":\"name\"}]}}", identity);
+    defer filtered_join_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), filtered_join_resp.status);
+    var parsed_filtered_join = try std.json.parseFromSlice(std.json.Value, alloc, filtered_join_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_filtered_join.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_filtered_join.value.object.get("total_rows").?.integer);
+    try std.testing.expectEqualStrings("t1", parsed_filtered_join.value.object.get("rows").?.array.items[0].object.get("tenant").?.string);
+
+    var unsupported_row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
+    unsupported_row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "records", "{\"disjuncts\":[{\"term\":{\"tenant\":\"t1\"}},{\"term\":{\"tenant\":\"t2\"}}]}");
+    var unsupported_identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "unsupported_reader"),
+        .row_filter = unsupported_row_filters,
+    };
+    defer unsupported_identity.deinit(alloc);
+
+    var unsupported_resp = try server.handlePublicTableRowsQuery("records", "{\"query\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"}}}", unsupported_identity);
+    defer unsupported_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), unsupported_resp.status);
 }
 
 test "api http server serves public transaction commit route" {

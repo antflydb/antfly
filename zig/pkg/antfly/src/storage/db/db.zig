@@ -16839,7 +16839,7 @@ pub const DB = struct {
         row_json: []const u8,
         req: types.RelationalRowsQueryRequest,
     ) !bool {
-        if (req.predicates.len == 0 and req.array_any.len == 0 and req.array_contains.len == 0 and req.array_eq.len == 0 and req.in_predicates.len == 0 and req.json_contains.len == 0 and req.json_path_eq.len == 0 and req.json_path_exists.len == 0 and req.or_predicates.len == 0 and req.not_predicates.len == 0) return true;
+        if (req.predicates.len == 0 and req.array_any.len == 0 and req.array_contains.len == 0 and req.array_eq.len == 0 and req.in_predicates.len == 0 and req.json_contains.len == 0 and req.json_path_eq.len == 0 and req.json_path_exists.len == 0 and req.or_predicates.len == 0 and req.not_predicates.len == 0 and req.expression_predicates.len == 0) return true;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -16848,6 +16848,9 @@ pub const DB = struct {
         }
         if (!(try relationalRowsQueryOrPredicateGroupsPass(alloc, parsed.value, req.or_predicates))) return false;
         if (!(try relationalRowsQueryNotPredicateGroupsPass(alloc, parsed.value, req.not_predicates))) return false;
+        for (req.expression_predicates) |condition| {
+            if (!(try relationalRowsExpressionConditionMatches(alloc, parsed.value, condition))) return false;
+        }
         for (req.array_any) |predicate| {
             if (!(try relationalRowsQueryArrayAnyPredicatePasses(alloc, parsed.value, predicate))) return false;
         }

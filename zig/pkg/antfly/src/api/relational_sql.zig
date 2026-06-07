@@ -2084,6 +2084,11 @@ const Parser = struct {
             freePredicateGroups(self.alloc, not_predicates.items);
             not_predicates.deinit(self.alloc);
         }
+        var expression_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+        errdefer {
+            freeExpressionConditions(self.alloc, expression_predicates.items);
+            expression_predicates.deinit(self.alloc);
+        }
         var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
         errdefer {
             freeOrderBy(self.alloc, order_by.items);
@@ -2096,7 +2101,7 @@ const Parser = struct {
 
         while (!self.atEnd()) {
             if (self.matchKeyword("where")) {
-                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates);
+                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates, &expression_predicates);
             } else if (self.matchKeyword("order")) {
                 try self.expectKeyword("by");
                 try self.parseOrderBy(&order_by);
@@ -2132,6 +2137,7 @@ const Parser = struct {
                 .json_path_exists = try json_path_exists.toOwnedSlice(self.alloc),
                 .or_predicates = try or_predicates.toOwnedSlice(self.alloc),
                 .not_predicates = try not_predicates.toOwnedSlice(self.alloc),
+                .expression_predicates = try expression_predicates.toOwnedSlice(self.alloc),
                 .select = select.fields,
                 .json_extract = select.json_extract,
                 .array_length = select.array_length,
@@ -2205,6 +2211,11 @@ const Parser = struct {
             freePredicateGroups(self.alloc, not_predicates.items);
             not_predicates.deinit(self.alloc);
         }
+        var expression_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+        errdefer {
+            freeExpressionConditions(self.alloc, expression_predicates.items);
+            expression_predicates.deinit(self.alloc);
+        }
         var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
         errdefer {
             freeOrderBy(self.alloc, order_by.items);
@@ -2215,7 +2226,7 @@ const Parser = struct {
         var offset: u32 = 0;
         while (!self.atEnd()) {
             if (self.matchKeyword("where")) {
-                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates);
+                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates, &expression_predicates);
             } else if (self.matchKeyword("order")) {
                 try self.expectKeyword("by");
                 try self.parseWindowOutputOrderBy(&order_by, select.fields, select.windows);
@@ -2248,6 +2259,7 @@ const Parser = struct {
                         .json_path_exists = try json_path_exists.toOwnedSlice(self.alloc),
                         .or_predicates = try or_predicates.toOwnedSlice(self.alloc),
                         .not_predicates = try not_predicates.toOwnedSlice(self.alloc),
+                        .expression_predicates = try expression_predicates.toOwnedSlice(self.alloc),
                         .select_all = true,
                     },
                     .windows = select.windows,
@@ -2321,6 +2333,11 @@ const Parser = struct {
             freePredicateGroups(self.alloc, not_predicates.items);
             not_predicates.deinit(self.alloc);
         }
+        var expression_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+        errdefer {
+            freeExpressionConditions(self.alloc, expression_predicates.items);
+            expression_predicates.deinit(self.alloc);
+        }
         var group_by = std.ArrayListUnmanaged([]const u8).empty;
         errdefer {
             for (group_by.items) |field| self.alloc.free(field);
@@ -2341,7 +2358,7 @@ const Parser = struct {
         var offset: u32 = 0;
         while (!self.atEnd()) {
             if (self.matchKeyword("where")) {
-                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates);
+                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates, &expression_predicates);
             } else if (self.matchKeyword("group")) {
                 try self.expectKeyword("by");
                 try self.parseGroupBy(&group_by);
@@ -2378,6 +2395,7 @@ const Parser = struct {
                     .json_path_exists = try json_path_exists.toOwnedSlice(self.alloc),
                     .or_predicates = try or_predicates.toOwnedSlice(self.alloc),
                     .not_predicates = try not_predicates.toOwnedSlice(self.alloc),
+                    .expression_predicates = try expression_predicates.toOwnedSlice(self.alloc),
                     .select_all = true,
                 },
                 .group_by = try group_by.toOwnedSlice(self.alloc),
@@ -2943,6 +2961,11 @@ const Parser = struct {
             freePredicateGroups(self.alloc, not_predicates.items);
             not_predicates.deinit(self.alloc);
         }
+        var expression_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+        errdefer {
+            freeExpressionConditions(self.alloc, expression_predicates.items);
+            expression_predicates.deinit(self.alloc);
+        }
         var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
         errdefer {
             freeOrderBy(self.alloc, order_by.items);
@@ -2963,7 +2986,7 @@ const Parser = struct {
             if (self.matchKeyword("where")) {
                 if (saw_where or saw_returning) return error.UnsupportedSqlShape;
                 saw_where = true;
-                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates);
+                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates, &expression_predicates);
             } else if (self.matchKeyword("order")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
                 try self.expectKeyword("by");
@@ -3006,6 +3029,7 @@ const Parser = struct {
                 .json_path_exists = try json_path_exists.toOwnedSlice(self.alloc),
                 .or_predicates = try or_predicates.toOwnedSlice(self.alloc),
                 .not_predicates = try not_predicates.toOwnedSlice(self.alloc),
+                .expression_predicates = try expression_predicates.toOwnedSlice(self.alloc),
                 .select_all = true,
                 .order_by = try order_by.toOwnedSlice(self.alloc),
                 .row_claim = row_claim,
@@ -3023,6 +3047,7 @@ const Parser = struct {
         json_path_exists = .empty;
         or_predicates = .empty;
         not_predicates = .empty;
+        expression_predicates = .empty;
         order_by = .empty;
         row_claim.owner_id = "";
         returning = .{};
@@ -3373,7 +3398,12 @@ const Parser = struct {
     }
 
     fn peekAggregateExpressionInput(self: *@This()) bool {
-        if (self.peekKeyword("lower") or self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("nullif")) return true;
+        if (self.peekKeyword("array_length") or
+            self.peekKeyword("case") or
+            self.peekKeyword("cast") or
+            self.peekKeyword("coalesce") or
+            self.peekKeyword("lower") or
+            self.peekKeyword("nullif")) return true;
         if (self.peekKind(.identifier) and self.pos + 1 < self.tokens.len) {
             return switch (self.tokens[self.pos + 1].kind) {
                 .plus, .minus, .star, .slash => true,
@@ -3384,8 +3414,14 @@ const Parser = struct {
     }
 
     fn parseAggregateInputExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        if (self.peekKeyword("lower") or self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("nullif")) {
-            return try self.parseRowExpressionOperandAlloc();
+        if (self.peekKeyword("array_length") or
+            self.peekKeyword("case") or
+            self.peekKeyword("cast") or
+            self.peekKeyword("coalesce") or
+            self.peekKeyword("lower") or
+            self.peekKeyword("nullif"))
+        {
+            return try self.parseRowExpressionAlloc();
         }
 
         const field = try self.parseFieldExpressionOwned();
@@ -4031,7 +4067,7 @@ const Parser = struct {
             return;
         }
         if (self.peekKind(.identifier) and self.pos + 1 < self.tokens.len and (self.tokens[self.pos + 1].kind == .plus or self.tokens[self.pos + 1].kind == .minus)) {
-            try self.parseIncrementAssignment(field, column, increment);
+            try self.parseConflictIncrementAssignment(field, column, insert_columns, insert_values, increment);
             return;
         }
 
@@ -4066,6 +4102,40 @@ const Parser = struct {
             }
         }
         return try self.parseSqlColumnValueAlloc(column);
+    }
+
+    fn parseConflictIncrementAssignment(
+        self: *@This(),
+        field: []const u8,
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+        insert_values: []const []const u8,
+        increment: *std.ArrayListUnmanaged(FieldJsonValue),
+    ) !void {
+        if (column.field_type != .numeric) return error.InvalidSqlCatalog;
+        const source = try self.parseIdentifierOwned();
+        defer self.alloc.free(source);
+        if (!std.mem.eql(u8, source, field)) return error.UnsupportedSqlShape;
+        const negated = if (self.match(.plus) != null)
+            false
+        else if (self.match(.minus) != null)
+            true
+        else
+            return error.UnsupportedSqlShape;
+        const raw_value_json = try self.parseConflictValueJsonAlloc(column, insert_columns, insert_values);
+        defer self.alloc.free(raw_value_json);
+        const value_json = try self.normalizedIncrementJsonAlloc(raw_value_json, negated);
+        var value_transferred = false;
+        errdefer if (!value_transferred) self.alloc.free(value_json);
+        const owned_field = try self.alloc.dupe(u8, field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) self.alloc.free(owned_field);
+        try increment.append(self.alloc, .{
+            .field = owned_field,
+            .value_json = value_json,
+        });
+        field_transferred = true;
+        value_transferred = true;
     }
 
     fn parseIncrementAssignment(
@@ -4723,6 +4793,7 @@ const Parser = struct {
         in_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate),
         or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
         not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+        expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
     ) !void {
         if (self.whereHasTopLevelOr()) {
             try self.parseScalarOrWhere(or_predicates);
@@ -4731,11 +4802,47 @@ const Parser = struct {
         while (true) {
             if (self.canParseScalarNotWhere()) {
                 try self.parseScalarNotWhere(not_predicates);
+            } else if (self.canParseExpressionWhereCondition()) {
+                const condition = try self.parseCaseExpressionConditionAlloc();
+                var condition_transferred = false;
+                errdefer if (!condition_transferred) freeExpressionCondition(self.alloc, condition);
+                try expression_predicates.append(self.alloc, condition);
+                condition_transferred = true;
             } else {
                 try self.parseWhereAtom(predicates, json_contains, json_path_eq, json_path_exists, array_contains, array_eq, in_predicates, false);
             }
             if (!self.matchKeyword("and")) break;
         }
+    }
+
+    fn canParseExpressionWhereCondition(self: *@This()) bool {
+        if (self.peekKeyword("array_length") or
+            self.peekKeyword("case") or
+            self.peekKeyword("cast") or
+            self.peekKeyword("coalesce") or
+            self.peekKeyword("nullif")) return true;
+        if (self.peekKeyword("lower")) return !self.lowerCallHasGeneratedColumn();
+        if (self.peekKind(.identifier) and
+            !self.peekKeyword("null") and
+            !self.peekKeyword("true") and
+            !self.peekKeyword("false") and
+            self.pos + 1 < self.tokens.len)
+        {
+            return switch (self.tokens[self.pos + 1].kind) {
+                .plus, .minus, .star, .slash => true,
+                else => false,
+            };
+        }
+        return false;
+    }
+
+    fn lowerCallHasGeneratedColumn(self: *@This()) bool {
+        if (!self.peekKeyword("lower") or self.pos + 3 >= self.tokens.len) return false;
+        if (self.tokens[self.pos + 1].kind != .lparen) return false;
+        const field = self.tokens[self.pos + 2];
+        if (field.kind != .identifier) return false;
+        if (self.tokens[self.pos + 3].kind != .rparen) return false;
+        return generatedLowerColumnForField(self.schema, field.text) != null;
     }
 
     fn canParseScalarNotWhere(self: *@This()) bool {
@@ -5163,8 +5270,8 @@ const Parser = struct {
             expression_transferred = true;
             return .{ .expression = expression };
         }
-        if (self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("nullif")) {
-            const expression = try self.parseRowExpressionOperandAlloc();
+        if (self.peekKeyword("array_length") or self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("coalesce") or self.peekKeyword("nullif")) {
+            const expression = try self.parseRowExpressionAlloc();
             return .{ .expression = expression };
         }
 
@@ -5932,6 +6039,10 @@ const Parser = struct {
                     else => return error.UnsupportedSqlShape,
                 }
             },
+            .coalesce => {
+                if (expression.operands.len == 0) return error.UnsupportedSqlShape;
+                for (expression.operands) |operand| try self.validateNumericRowExpression(operand);
+            },
             .nullif => {
                 if (expression.operands.len != 2) return error.UnsupportedSqlShape;
                 for (expression.operands) |operand| try self.validateNumericRowExpression(operand);
@@ -5959,6 +6070,9 @@ const Parser = struct {
             },
             .cast => {
                 if (expression.operands.len != 1 or expression.cast_type != .numeric) return error.UnsupportedSqlShape;
+            },
+            .array_length => {
+                if (expression.operands.len != 1) return error.UnsupportedSqlShape;
             },
             else => return error.UnsupportedSqlShape,
         }
@@ -6101,6 +6215,20 @@ const Parser = struct {
         };
     }
 
+    fn parseRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
+        var expression = try self.parseRowExpressionOperandAlloc();
+        var expression_owned = true;
+        errdefer if (expression_owned) freeExpression(self.alloc, expression);
+        if (self.peekArithmeticOperator()) |_| {
+            try self.validateNumericRowExpression(expression);
+            expression_owned = false;
+            expression = try self.parseArithmeticExpressionRestAlloc(expression, 0);
+            expression_owned = true;
+        }
+        expression_owned = false;
+        return expression;
+    }
+
     fn parseRowExpressionOperandAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
         if (self.peekKeyword("cast")) {
             return try self.parseCastRowExpressionAlloc();
@@ -6111,8 +6239,14 @@ const Parser = struct {
         if (self.peekKeyword("lower")) {
             return try self.parseLowerRowExpressionAlloc();
         }
+        if (self.peekKeyword("coalesce")) {
+            return try self.parseCoalesceRowExpressionAlloc();
+        }
         if (self.peekKeyword("nullif")) {
             return try self.parseNullifRowExpressionAlloc();
+        }
+        if (self.peekKeyword("array_length")) {
+            return try self.parseArrayLengthRowExpressionAlloc();
         }
         if (self.peekKind(.identifier) and
             !self.peekKeyword("null") and
@@ -6214,7 +6348,7 @@ const Parser = struct {
     }
 
     fn parseCaseExpressionConditionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpressionCondition {
-        const lhs = try self.parseRowExpressionOperandAlloc();
+        const lhs = try self.parseRowExpressionAlloc();
         var lhs_transferred = false;
         errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
 
@@ -6230,7 +6364,7 @@ const Parser = struct {
                 const out = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
                 var out_transferred = false;
                 errdefer if (!out_transferred) self.alloc.free(out);
-                out[0] = try self.parseRowExpressionOperandAlloc();
+                out[0] = try self.parseRowExpressionAlloc();
                 out_transferred = true;
                 break :blk out;
             },
@@ -6269,6 +6403,32 @@ const Parser = struct {
         };
     }
 
+    fn parseCoalesceRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
+        try self.expectKeyword("coalesce");
+        try self.expect(.lparen);
+
+        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+        errdefer {
+            for (operands.items) |operand| freeExpression(self.alloc, operand);
+            operands.deinit(self.alloc);
+        }
+        while (true) {
+            const operand = try self.parseRowExpressionAlloc();
+            var operand_transferred = false;
+            errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
+            try operands.append(self.alloc, operand);
+            operand_transferred = true;
+            if (self.match(.comma) == null) break;
+        }
+        if (operands.items.len == 0) return error.UnsupportedSqlShape;
+        try self.expect(.rparen);
+
+        return .{
+            .kind = .coalesce,
+            .operands = try operands.toOwnedSlice(self.alloc),
+        };
+    }
+
     fn parseNullifRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
         try self.expectKeyword("nullif");
         try self.expect(.lparen);
@@ -6288,6 +6448,32 @@ const Parser = struct {
         rhs_transferred = true;
         return .{
             .kind = .nullif,
+            .operands = operands,
+        };
+    }
+
+    fn parseArrayLengthRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
+        try self.expectKeyword("array_length");
+        try self.expect(.lparen);
+        const field = try self.parseIdentifierOwned();
+        var field_transferred = false;
+        errdefer if (!field_transferred) self.alloc.free(field);
+        const column = relationalColumnForField(self.schema, field, .array) orelse return error.InvalidSqlCatalog;
+        _ = column;
+        try self.expect(.comma);
+        const dimension = try self.parseU32Value();
+        if (dimension != 1) return error.UnsupportedSqlShape;
+        try self.expect(.rparen);
+
+        const operands = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+        var operands_transferred = false;
+        errdefer if (!operands_transferred) self.alloc.free(operands);
+        operands[0] = .{ .kind = .field, .field = field };
+
+        field_transferred = true;
+        operands_transferred = true;
+        return .{
+            .kind = .array_length,
             .operands = operands,
         };
     }
@@ -9968,7 +10154,7 @@ test "postgres sql adapter lowers distinct aggregate specs" {
 test "postgres sql adapter lowers aggregate expression inputs" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"}},"required":["id","status","customer","amount","discount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id","status","customer","amount","discount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -9977,13 +10163,13 @@ test "postgres sql adapter lowers aggregate expression inputs" {
 
     var lowered = try lowerAggregateAlloc(
         alloc,
-        "SELECT customer, COUNT(DISTINCT lower(status)) AS status_count, SUM(amount - discount) AS net_amount FROM usage_records GROUP BY customer",
+        "SELECT customer, COUNT(DISTINCT lower(status)) AS status_count, SUM(amount - discount) AS net_amount, COUNT(DISTINCT coalesce(status, 'missing')) AS status_bucket_count, SUM(coalesce(amount, 0)) AS amount_total, SUM(array_length(tags, 1)) AS tag_total FROM usage_records GROUP BY customer",
         schema,
         &.{},
     );
     defer lowered.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 5), lowered.aggregate.aggregations.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[0].op);
     try std.testing.expect(lowered.aggregate.aggregations[0].distinct);
     try std.testing.expect(lowered.aggregate.aggregations[0].field == null);
@@ -9993,6 +10179,15 @@ test "postgres sql adapter lowers aggregate expression inputs" {
     try std.testing.expect(lowered.aggregate.aggregations[1].field == null);
     try std.testing.expect(lowered.aggregate.aggregations[1].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.aggregate.aggregations[1].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[2].op);
+    try std.testing.expect(lowered.aggregate.aggregations[2].distinct);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, lowered.aggregate.aggregations[2].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[3].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, lowered.aggregate.aggregations[3].expression.?.kind);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[3].expression.?.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[4].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, lowered.aggregate.aggregations[4].expression.?.kind);
+    try std.testing.expectEqualStrings("tags", lowered.aggregate.aggregations[4].expression.?.operands[0].field);
 }
 
 test "postgres sql adapter lowers bounded array aggregate specs" {
@@ -10204,7 +10399,7 @@ test "postgres sql adapter lowers generated lower expressions for query pushdown
 test "postgres sql adapter lowers scalar expression order keys" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -10213,19 +10408,23 @@ test "postgres sql adapter lowers scalar expression order keys" {
 
     var lowered = try lowerSelectAlloc(
         alloc,
-        "SELECT id FROM users ORDER BY lower(email) ASC, amount - discount DESC LIMIT 10",
+        "SELECT id FROM users ORDER BY lower(email) ASC, amount - discount DESC, coalesce(status, 'pending') ASC, array_length(tags, 1) DESC LIMIT 10",
         schema,
         &.{},
     );
     defer lowered.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), lowered.query.order_by.len);
+    try std.testing.expectEqual(@as(usize, 4), lowered.query.order_by.len);
     try std.testing.expectEqual(@as(usize, 0), lowered.query.order_by[0].field.len);
     try std.testing.expect(lowered.query.order_by[0].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.query.order_by[0].expression.?.kind);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, lowered.query.order_by[0].direction);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.query.order_by[1].expression.?.kind);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.query.order_by[1].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, lowered.query.order_by[2].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, lowered.query.order_by[2].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, lowered.query.order_by[3].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.query.order_by[3].direction);
 }
 
 test "postgres sql adapter lowers concat projection into expression AST" {
@@ -10438,7 +10637,7 @@ test "postgres sql adapter ignores harmless identifier casts" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.query.order_by[0].direction);
 }
 
-test "postgres sql adapter rejects lower predicate without generated column" {
+test "postgres sql adapter lowers lower predicate without generated column into expression predicate" {
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -10448,12 +10647,111 @@ test "postgres sql adapter rejects lower predicate without generated column" {
     const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
     defer runtime_schema.freeSchema(alloc, schema);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
+    var lowered = try lowerSelectAlloc(
         alloc,
         "SELECT id FROM users WHERE lower(email) = $1",
         schema,
         &.{.{ .string = "ada@example.test" }},
-    ));
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("email", lowered.query.expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, lowered.query.expression_predicates[0].op);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.expression_predicates[0].rhs.len);
+    try std.testing.expectEqualStrings("\"ada@example.test\"", lowered.query.expression_predicates[0].rhs[0].value_json);
+}
+
+test "postgres sql adapter lowers arithmetic predicate into expression predicate" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"quantity":{"type":"numeric"},"discount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE amount * quantity - discount > $1 ORDER BY id ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 10 }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.expression_predicates.len);
+    const condition = lowered.query.expression_predicates[0];
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, condition.op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, condition.lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mul, condition.lhs.operands[0].kind);
+    try std.testing.expectEqualStrings("amount", condition.lhs.operands[0].operands[0].field);
+    try std.testing.expectEqualStrings("quantity", condition.lhs.operands[0].operands[1].field);
+    try std.testing.expectEqualStrings("discount", condition.lhs.operands[1].field);
+    try std.testing.expectEqual(@as(usize, 1), condition.rhs.len);
+    try std.testing.expectEqualStrings("10", condition.rhs[0].value_json);
+}
+
+test "postgres sql adapter lowers coalesce predicate into expression predicate" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE coalesce(status, 'pending') = $1 ORDER BY id ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "active" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.expression_predicates.len);
+    const condition = lowered.query.expression_predicates[0];
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, condition.op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, condition.lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), condition.lhs.operands.len);
+    try std.testing.expectEqualStrings("status", condition.lhs.operands[0].field);
+    try std.testing.expectEqualStrings("\"pending\"", condition.lhs.operands[1].value_json);
+    try std.testing.expectEqual(@as(usize, 1), condition.rhs.len);
+    try std.testing.expectEqualStrings("\"active\"", condition.rhs[0].value_json);
+}
+
+test "postgres sql adapter lowers array_length predicate into expression predicate" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE array_length(tags, 1) > $1 ORDER BY id ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 0 }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.expression_predicates.len);
+    const condition = lowered.query.expression_predicates[0];
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, condition.op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, condition.lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), condition.lhs.operands.len);
+    try std.testing.expectEqualStrings("tags", condition.lhs.operands[0].field);
+    try std.testing.expectEqual(@as(usize, 1), condition.rhs.len);
+    try std.testing.expectEqualStrings("0", condition.rhs[0].value_json);
 }
 
 test "postgres sql adapter lowers insert values returning into row batch" {
@@ -10805,12 +11103,13 @@ fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table_nam
     if (query.limit) |limit| {
         return try std.fmt.allocPrint(
             alloc,
-            "{s}:table={s}:ctes={d}:pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
+            "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
             .{
                 family,
                 table_name,
                 ctes,
                 query.predicates.len,
+                query.expression_predicates.len,
                 query.json_path_eq.len,
                 query.or_predicates.len,
                 query.not_predicates.len,
@@ -10826,12 +11125,13 @@ fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table_nam
     }
     return try std.fmt.allocPrint(
         alloc,
-        "{s}:table={s}:ctes={d}:pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit=none:claim={s}",
+        "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit=none:claim={s}",
         .{
             family,
             table_name,
             ctes,
             query.predicates.len,
+            query.expression_predicates.len,
             query.json_path_eq.len,
             query.or_predicates.len,
             query.not_predicates.len,
@@ -11330,24 +11630,56 @@ test "postgres sql adapter classifies application compatibility corpus" {
             .name = "single table json query",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .predicates = 1, .json_path_eq = 1, .select = 1, .order_by = 1, .limit = 10 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:json_eq=1:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=0:limit=10:claim=none",
+            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=1:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=0:limit=10:claim=none",
             .sql = "SELECT id, metadata->>'source' AS source FROM usage_records WHERE organization_id = $1 AND metadata->>'source' = $2 ORDER BY created_at DESC LIMIT 10",
             .params = &.{ .{ .string = "org_1" }, .{ .string = "meter" } },
         },
         .{
             .name = "single table expression query",
             .family = .query,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 0, .order_by = 2, .limit = 20 },
-            .plan = "query:table=usage_records:ctes=0:pred=1:json_eq=0:or=0:not=0:select=0:expr=5:alias=0:order=2:order_expr=1:limit=20:claim=none",
-            .sql = "SELECT id AS usage_id, CASE WHEN status = 'blocked' THEN 'needs_review' ELSE lower(status) END AS status_label, CAST(amount AS text) AS amount_text, amount + quantity AS total_amount, array_length(tags, 1) AS tag_count FROM usage_records WHERE status = $1 ORDER BY lower(status) ASC, created_at DESC LIMIT 20",
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 0, .order_by = 4, .limit = 20 },
+            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=5:alias=0:order=4:order_expr=3:limit=20:claim=none",
+            .sql = "SELECT id AS usage_id, CASE WHEN status = 'blocked' THEN 'needs_review' ELSE lower(status) END AS status_label, CAST(amount AS text) AS amount_text, amount + quantity AS total_amount, array_length(tags, 1) AS tag_count FROM usage_records WHERE status = $1 ORDER BY lower(status) ASC, coalesce(status, 'pending') ASC, array_length(tags, 1) DESC, created_at DESC LIMIT 20",
             .params = &.{.{ .string = "ready" }},
+        },
+        .{
+            .name = "single table expression predicate query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE lower(email) = $1 ORDER BY id ASC LIMIT 5",
+            .params = &.{.{ .string = "ada@example.test" }},
+        },
+        .{
+            .name = "single table arithmetic predicate query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE amount * quantity > $1 ORDER BY id ASC LIMIT 5",
+            .params = &.{.{ .integer = 10 }},
+        },
+        .{
+            .name = "single table coalesce predicate query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE coalesce(status, 'pending') = $1 ORDER BY id ASC LIMIT 5",
+            .params = &.{.{ .string = "active" }},
+        },
+        .{
+            .name = "single table array length predicate query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE array_length(tags, 1) > $1 ORDER BY id ASC LIMIT 5",
+            .params = &.{.{ .integer = 0 }},
         },
         .{
             .name = "grouped aggregate",
             .family = .aggregate,
-            .summary = .{ .table_name = "usage_records", .predicates = 1, .group_by = 1, .aggregations = 3, .having = 1, .order_by = 1, .limit = 5 },
-            .plan = "aggregate:table=usage_records:source_pred=1:source_json_eq=0:group=1:aggs=3:agg_expr=1:filter_expr=1:having=1:order=1:limit=5",
-            .sql = "SELECT organization_id, COUNT(*) AS record_count, SUM(quantity) AS quantity_sum, COUNT(DISTINCT lower(status)) FILTER (WHERE lower(status) = 'active') AS active_status_count FROM usage_records WHERE metric_type = $1 GROUP BY organization_id HAVING quantity_sum > 0 ORDER BY quantity_sum DESC LIMIT 5",
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .group_by = 1, .aggregations = 5, .having = 1, .order_by = 1, .limit = 5 },
+            .plan = "aggregate:table=usage_records:source_pred=1:source_json_eq=0:group=1:aggs=5:agg_expr=3:filter_expr=1:having=1:order=1:limit=5",
+            .sql = "SELECT organization_id, COUNT(*) AS record_count, SUM(quantity) AS quantity_sum, COUNT(DISTINCT lower(status)) FILTER (WHERE lower(status) = 'active') AS active_status_count, SUM(coalesce(amount, 0)) AS amount_total, SUM(array_length(tags, 1)) AS tag_total FROM usage_records WHERE metric_type = $1 GROUP BY organization_id HAVING quantity_sum > 0 ORDER BY quantity_sum DESC LIMIT 5",
             .params = &.{.{ .string = "tokens" }},
         },
         .{
@@ -11376,7 +11708,7 @@ test "postgres sql adapter classifies application compatibility corpus" {
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .returning = 1 },
             .plan = "insert:table=usage_records:writes=0:transforms=1:deletes=0:returning_rows=1:returning_expr=1",
-            .sql = "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET quantity = excluded.quantity RETURNING id, quantity, CAST(quantity AS text) AS quantity_text",
+            .sql = "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET quantity = quantity + excluded.quantity RETURNING id, quantity, CAST(quantity AS text) AS quantity_text",
         },
         .{
             .name = "conflict default update",
@@ -12116,6 +12448,34 @@ test "postgres sql adapter lowers on conflict arithmetic update" {
         .float => |value| try std.testing.expectEqual(@as(f64, 8), value),
         else => return error.TestUnexpectedResult,
     }
+
+    var excluded_delta = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 4) ON CONFLICT (email) DO UPDATE SET amount = amount + excluded.amount RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer excluded_delta.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), excluded_delta.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.inc, excluded_delta.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", excluded_delta.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("4", excluded_delta.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":9}", excluded_delta.batch.returning_rows[0]);
+
+    var excluded_negative_delta = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 2) ON CONFLICT (email) DO UPDATE SET amount = amount - excluded.amount RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer excluded_negative_delta.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), excluded_negative_delta.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.inc, excluded_negative_delta.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", excluded_negative_delta.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("-2", excluded_negative_delta.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":3}", excluded_negative_delta.batch.returning_rows[0]);
 }
 
 test "postgres sql adapter lowers on conflict jsonb concat update" {

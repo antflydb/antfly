@@ -560,6 +560,24 @@ pub const RowUniqueSelector = struct {
     values: std.json.Value,
 };
 
+/// Typed relational row plan envelope. The top-level operation-specific field is one of `query`, `aggregate`, `window`, `join`, or `lateral`; `ctes` is optional and contains ordered named row-query subplans.
+pub const RowsPlanRequest = std.json.Value;
+
+pub const RowsQueryResultSet = struct {
+    total: ?i64 = null,
+    rows: ?[]const std.json.Value = null,
+};
+
+pub const RowsAggregateResultSet = struct {
+    total_groups: ?i64 = null,
+    rows: ?[]const std.json.Value = null,
+};
+
+pub const RowsStreamResultSet = struct {
+    total_rows: ?i64 = null,
+    rows: ?[]const std.json.Value = null,
+};
+
 /// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
 pub const TransactionReadItem = struct {
     /// Table name the key belongs to

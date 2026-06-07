@@ -584,6 +584,24 @@ pub const RowUniqueSelector = struct {
     values: std.json.Value,
 };
 
+/// Typed relational row plan envelope. The top-level operation-specific field is one of `query`, `aggregate`, `window`, `join`, or `lateral`; `ctes` is optional and contains ordered named row-query subplans.
+pub const RowsPlanRequest = std.json.Value;
+
+pub const RowsQueryResultSet = struct {
+    total: ?i64 = null,
+    rows: ?[]const std.json.Value = null,
+};
+
+pub const RowsAggregateResultSet = struct {
+    total_groups: ?i64 = null,
+    rows: ?[]const std.json.Value = null,
+};
+
+pub const RowsStreamResultSet = struct {
+    total_rows: ?i64 = null,
+    rows: ?[]const std.json.Value = null,
+};
+
 /// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
 pub const TransactionReadItem = struct {
     /// Table name the key belongs to
@@ -2259,7 +2277,7 @@ pub const AlgebraicIndexStats = struct {
     active_progress_target_rows: ?i64 = null,
 };
 
-/// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - search: Execute semantic searches (legacy, use semantic_search for retrieval) - websearch: Search the web (requires websearch_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search
+/// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - search: Execute semantic searches (prefer semantic_search for retrieval) - websearch: Search the web (requires websearch_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search
 pub const ChatToolName = enum {
     add_filter,
     ask_clarification,

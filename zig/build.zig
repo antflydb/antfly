@@ -3738,6 +3738,7 @@ pub fn build(b: *std.Build) void {
             "relational rows query contract supports scalar or",
             "postgres sql adapter",
             "api http server resolves relational rows by unique selector",
+            "api http server executes public relational row plan endpoints",
             "relational unique owner lookup requires one active owner range",
             "catalog source resolves groups by key and span",
         },
