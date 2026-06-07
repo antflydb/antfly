@@ -24,6 +24,7 @@ Recent observed runs:
 | `antfly-knownbest-clean-1m-44924e58` | 1278.402s | 675.368s | 603.035s | 43.033 | 80.7ms | 0.9797 | Clean rollback run; poor query shape. |
 | `antfly-e24a9140-cohere-1m` | 1286.462s | 712.267s | 574.195s | 238.953 | 16.5ms | 0.9899 | Current PR shape; better query than clean rollback, not best load. |
 | `antfly-status-lsm-sparse-1m-20260607` | 1257.437s | 639.579s | 617.858s | 191.571 | 21.6ms | 0.9899 | Latest instrumented run. Insert is close to the best observed, but optimize/query start with heavy primary LSM debt. |
+| `antfly-primary-maint-fallback-1m-20260607` | Aborted | - | - | - | - | - | Primary-only maintenance fallback did not keep up at 1M scale; aborted around 500k uploaded with 1024 total runs, 1022 L0 runs, 16.4 MiB manifest, 5.2 GiB data root, and 894 L0 run-debt. |
 
 The 50k sanity case on `e24a9140` was healthy:
 
@@ -42,6 +43,8 @@ The 50k sanity case on `e24a9140` was healthy:
 - Table status now exposes a richer `storage_status.lsm` snapshot for benchmark artifacts: total/L0/lower-level run shape, compactable and overlapping L0 pressure, configured L0 limits, write-stall debt, overflow debt, obsolete path count, current manifest bytes, active bulk/readers, dirty manifest flags, maintenance score, and maintenance debt hint.
 - Full `/metrics` scraping can perturb runs because metrics collection may walk LSM maintenance stats. Use sparse sampling or targeted artifacts during benchmarks.
 - The current VDBBench adapter defaults to `/db/v1`; Antfly v0.1 used `/api/v1`.
+- The current branch has provisioned auto-bulk disabled for weak-sync table writes (`autoBulkIngestBatchOps` and `autoBulkIngestGroupBatchOps` return 0). Do not attribute current-run primary L0 growth to auto-bulk finish cadence without re-enabling that path in a controlled experiment.
+- Older full `/metrics` snapshots from previous branch shapes showed `sorted_ingest_runs_total = 0`; direct sorted bulk ingest was not the observed source of the primary run explosion in those runs. The large counters were mutable rotations/flushes and manifest writes.
 - Latest 1M instrumented run:
   - Upload finished in 639.579s, but optimize took 617.858s because dense catch-up entered optimize at only 487.5k indexed documents.
   - At optimize start, primary table shape was 806 total runs, 802 L0 runs, 71.9 MiB manifest, and 969 MiB retained WAL.
@@ -51,6 +54,7 @@ The 50k sanity case on `e24a9140` was healthy:
   - Optimize-phase sample: physical footprint about 7.7 GiB, with hot work split between dense catch-up primary reads (`BoundWriteTxn.get`/`getManySorted`) and compaction merging/writing persisted runs.
 - Idle live-writer runtime status publishing no longer refreshes full LSM maintenance stats just to populate startup WAL-retention fields. Active startup catch-up still reports retention, and explicit table status still exposes rich LSM shape. The 50k sanity run improved from 28.550s load / 22.356s insert / 6.194s optimize to 25.678s load / 15.425s insert / 10.253s optimize; final table status drained to 5 total runs, 4 L0 runs, 1.33 MiB manifest, and maintenance score 0.
 - Background LSM maintenance can now lease active dense-bulk writer DBs for primary-only maintenance. The normal generic maintenance path still avoids dense index maintenance during active dense bulk work, but primary LSM compaction no longer has to wait for dense catch-up to finish. The 50k sanity run with this fallback finished in 25.091s load / 16.620s insert / 8.471s optimize, and final table status drained to 1 total run, 0 L0 runs, 2.1 MiB manifest, and a 1.2 GiB data root.
+- The primary-only maintenance fallback is not enough by itself. The 1M run after that change was aborted around 500k uploaded because the primary table had already reached 1024 total runs, 1022 L0 runs, a 16.4 MiB manifest, a 5.2 GiB data root, and 894 L0 run-debt. This points back to primary run publication and compaction budgeting, not just background maintenance eligibility.
 
 ## Tradeoffs Already Tried
 
@@ -90,7 +94,9 @@ The root cause is compaction shape and run publication policy.
 
 The old global LSM defaults were sized for tiny stores: `level_target_bytes_base = 1 MiB`, multiplier `8`. Large document stores then descend through too many levels, causing unnecessary rewrite amplification.
 
-The current end-to-end issue is sharper: auto-bulk/dense ingest flushes primary table data and can leave too many primary L0/table runs behind. Background maintenance exists, but the load/readiness path can reach query execution with a large primary manifest and many table runs. Query workers then pay read/open costs even if dense HBC itself is ready.
+The current end-to-end issue is sharper: primary table writes can publish too many L0/table runs during serial upload while dense indexing is still catching up from the primary replay stream. Background maintenance exists, but the load/readiness path can reach query execution with a large primary manifest and many table runs. Query workers then pay read/open costs even if dense HBC itself is ready.
+
+The latest 1M abort suggests faster upload can make this worse by publishing L0 runs faster than maintenance can compact them. The next fix should reduce primary run publication frequency or make publication budget-aware, rather than only increasing maintenance cadence.
 
 ## Constraints
 
@@ -118,9 +124,15 @@ The current end-to-end issue is sharper: auto-bulk/dense ingest flushes primary 
 Success condition:
 Every benchmark result can answer: how many primary runs existed at query start, how large was the primary manifest, and how long did readonly open spend on storage.
 
-### 2. Fix Primary Run Publication Policy
+### 2. Fix Primary Run Publication And Maintenance Policy
 
-- Audit auto-bulk finish options for primary table writes.
+- Audit the primary mutable flush and immutable flush path under VDBBench-sized writes:
+  - flush threshold bytes,
+  - deferred immutable memtable limit,
+  - read-snapshot mutable rotations,
+  - foreground write-pressure compaction budget,
+  - background maintenance wake/admission behavior while dense catch-up is active.
+- Treat auto-bulk and `BulkIngestCoalescer` as separate experiments. The current branch has provisioned auto-bulk disabled for weak-sync writes, and the DB coalescer is not staging current table writes in this path.
 - Avoid creating hundreds or thousands of primary L0 runs during serial HTTP upload.
 - Prefer storage-owned policy over API/index-specific optimize calls.
 - Evaluate a bounded foreground drain at safe publication points:
