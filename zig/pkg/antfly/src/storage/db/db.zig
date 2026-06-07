@@ -14828,15 +14828,23 @@ pub const DB = struct {
             self.* = undefined;
         }
 
-        fn acceptDistinctValue(self: *@This(), alloc: Allocator, value: std.json.Value) !bool {
+        fn acceptDistinctValue(
+            self: *@This(),
+            alloc: Allocator,
+            value: std.json.Value,
+            max_items: u32,
+        ) !bool {
+            if (max_items == 0) return error.InvalidQueryRequest;
             const key = try relationalRowsAggregateDistinctKeyJsonAlloc(alloc, value);
             var key_transferred = false;
             errdefer if (!key_transferred) alloc.free(key);
-            const gop = try self.distinct_seen.getOrPut(alloc, key);
-            if (gop.found_existing) {
+            if (self.distinct_seen.contains(key)) {
                 alloc.free(key);
                 return false;
             }
+            if (self.distinct_seen.count() >= @as(usize, max_items)) return error.ResourceBudgetExceeded;
+            const gop = try self.distinct_seen.getOrPut(alloc, key);
+            if (gop.found_existing) unreachable;
             gop.key_ptr.* = key;
             gop.value_ptr.* = {};
             key_transferred = true;
@@ -14913,7 +14921,7 @@ pub const DB = struct {
                         if (spec.field) |field| {
                             const value = relationalRowsJsonValueAtPath(row, field) orelse continue;
                             if (value.* == .null) continue;
-                            if (spec.distinct and !(try self.metrics[i].acceptDistinctValue(alloc, value.*))) continue;
+                            if (spec.distinct and !(try self.metrics[i].acceptDistinctValue(alloc, value.*, spec.distinct_max_items))) continue;
                         } else if (spec.distinct) {
                             return error.InvalidQueryRequest;
                         }
@@ -14924,7 +14932,7 @@ pub const DB = struct {
                         const value = relationalRowsJsonValueAtPath(row, field) orelse continue;
                         if (value.* == .null) continue;
                         const number = jsonNumberAsF64(value.*) orelse return error.InvalidQueryRequest;
-                        if (spec.distinct and !(try self.metrics[i].acceptDistinctValue(alloc, value.*))) continue;
+                        if (spec.distinct and !(try self.metrics[i].acceptDistinctValue(alloc, value.*, spec.distinct_max_items))) continue;
                         self.metrics[i].count += 1;
                         self.metrics[i].sum += number;
                         self.metrics[i].min = if (self.metrics[i].min) |current| @min(current, number) else number;
@@ -14933,7 +14941,7 @@ pub const DB = struct {
                     .array_agg => {
                         const field = spec.field orelse return error.InvalidQueryRequest;
                         const value = relationalRowsJsonValueAtPath(row, field) orelse continue;
-                        if (spec.distinct and !(try self.metrics[i].acceptDistinctValue(alloc, value.*))) continue;
+                        if (spec.distinct and !(try self.metrics[i].acceptDistinctValue(alloc, value.*, spec.distinct_max_items))) continue;
                         const ordinal = self.metrics[i].array_seen;
                         self.metrics[i].array_seen += 1;
                         try self.metrics[i].appendArrayValue(alloc, row, value.*, spec.array_max_items, spec.array_order_by, ordinal);
@@ -59444,6 +59452,14 @@ test "relational rows aggregate supports distinct metric state" {
     try std.testing.expectEqual(@as(u32, 1), filtered.total_groups);
     try std.testing.expectEqual(@as(usize, 1), filtered.rows.len);
     try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"row_count\":3,\"status_count\":2,\"amount_sum\":40,\"distinct_amount_sum\":30,\"first_statuses\":[\"open\",\"open\"],\"distinct_statuses\":[\"open\",\"closed\"],\"amount_ordered_statuses\":[\"closed\",\"open\"]}", filtered.rows[0]);
+
+    const limited_distinct = [_]types.RelationalRowsAggregateSpec{
+        .{ .name = "status_count", .op = .count, .field = "status", .distinct = true, .distinct_max_items = 1 },
+    };
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.aggregateRelationalRows(alloc, runtime_schema, .{
+        .group_by = group_by[0..],
+        .aggregations = limited_distinct[0..],
+    }));
 }
 
 test "relational rows join composes typed row-query streams" {

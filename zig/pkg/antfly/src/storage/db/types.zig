@@ -1049,11 +1049,14 @@ pub const RelationalRowsAggregateOp = enum {
     array_agg,
 };
 
+pub const default_relational_rows_aggregate_distinct_max_items: u32 = 65536;
+
 pub const RelationalRowsAggregateSpec = struct {
     name: []const u8,
     op: RelationalRowsAggregateOp,
     field: ?[]const u8 = null,
     distinct: bool = false,
+    distinct_max_items: u32 = default_relational_rows_aggregate_distinct_max_items,
     array_max_items: u32 = 0,
     array_order_by: []const RelationalRowsQueryOrder = &.{},
     filter_predicates: []const schema_mod.RelationalCheck = &.{},

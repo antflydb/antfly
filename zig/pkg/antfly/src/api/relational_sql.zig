@@ -1142,6 +1142,7 @@ const Parser = struct {
             .op = op,
             .field = field,
             .distinct = distinct,
+            .distinct_max_items = if (distinct) db_mod.types.default_relational_rows_aggregate_distinct_max_items else 0,
             .array_max_items = if (op == .array_agg) default_array_agg_max_items else 0,
             .array_order_by = try array_order_by.toOwnedSlice(self.alloc),
             .filter_predicates = filter_predicates,
@@ -4023,9 +4024,11 @@ test "postgres sql adapter lowers distinct aggregate specs" {
     try std.testing.expectEqual(@as(usize, 2), lowered.aggregate.aggregations.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[0].op);
     try std.testing.expect(lowered.aggregate.aggregations[0].distinct);
+    try std.testing.expectEqual(db_mod.types.default_relational_rows_aggregate_distinct_max_items, lowered.aggregate.aggregations[0].distinct_max_items);
     try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[0].field.?);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[1].op);
     try std.testing.expect(lowered.aggregate.aggregations[1].distinct);
+    try std.testing.expectEqual(db_mod.types.default_relational_rows_aggregate_distinct_max_items, lowered.aggregate.aggregations[1].distinct_max_items);
     try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[1].field.?);
     try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[1].filter_predicates.len);
     try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[1].filter_predicates[0].field);
@@ -4060,6 +4063,7 @@ test "postgres sql adapter lowers bounded array aggregate specs" {
     try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.array_agg, lowered.aggregate.aggregations[0].op);
     try std.testing.expect(lowered.aggregate.aggregations[0].distinct);
+    try std.testing.expectEqual(db_mod.types.default_relational_rows_aggregate_distinct_max_items, lowered.aggregate.aggregations[0].distinct_max_items);
     try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[0].field.?);
     try std.testing.expectEqual(default_array_agg_max_items, lowered.aggregate.aggregations[0].array_max_items);
     try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[0].array_order_by.len);
