@@ -163,6 +163,27 @@ memtable on top of the fix helps further but trades memory; the shape change is
 the free win. Full-workload runs (`--workload-set all`) showed no regression on
 the sorted-load, overwrite, or hot-overwrite paths.
 
+### Large-scale / large-vector validation (2026-06-06)
+
+Re-run on real disk (`--storage native`) at multi-GiB datasets and embedding
+sizes up to 1536 dimensions, using the dense profile shape (L1 base 256 MiB,
+multiplier 10, 128 MiB memtable). Peak RSS stayed memtable-bounded (~1.7 GiB)
+and identical between baseline and shaped — dataset size does not move
+steady-state memory.
+
+| dataset            | value (vector) | stock WA | shaped WA | stock level | shaped level | stock compaction I/O | shaped compaction I/O |
+| ------------------ | -------------- | -------- | --------- | ----------- | ------------ | -------------------- | --------------------- |
+| 2 GiB (500k x 4K)  | 1024-dim       | 6.05x    | 3.37x     | 5           | 2            | 9.8 GB               | 4.6 GB                |
+| 3 GiB (1M x 3K)    | 768-dim        | 6.55x    | 3.94x     | 5           | 3            | 16.2 GB              | 8.6 GB                |
+| 3 GiB (500k x 6K)  | 1536-dim       | 6.59x    | 3.95x     | 5           | 3            | 16.3 GB              | 8.6 GB                |
+
+The fix matters more at scale: with the stock 1 MiB base, write amplification
+climbs to ~6.6x as shards deepen to five levels, while the shaped tree stays at
+two-to-three levels and ~3.4-4.0x. Above ~2.5 GiB a dense shard picks up one
+extra level (256 MiB * 10 = 2.56 GiB L2 target); bumping the dense multiplier to
+12 would keep those shards at L2 if needed, but 256 MiB x 10 is kept as the
+default to avoid oversized compactions on the more common mid-size shards.
+
 ### Decision
 
 `db/config.zig` now pins the leveled shape on the document-data profiles:
