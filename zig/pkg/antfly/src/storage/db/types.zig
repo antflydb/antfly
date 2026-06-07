@@ -1124,11 +1124,27 @@ fn freeRelationalRowsExpressionCondition(alloc: Allocator, condition: Relational
 pub const RelationalRowsCte = struct {
     name: []const u8,
     query: RelationalRowsQueryRequest = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.name);
+        self.query.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 pub const RelationalRowsQueryPlan = struct {
     ctes: []const RelationalRowsCte = &.{},
     query: RelationalRowsQueryRequest = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        self.query.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 pub const RelationalRowsQueryResult = struct {
@@ -1215,6 +1231,16 @@ pub const RelationalRowsWindowRequest = struct {
 pub const RelationalRowsWindowPlan = struct {
     ctes: []const RelationalRowsCte = &.{},
     window: RelationalRowsWindowRequest = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        self.window.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 pub const RelationalRowsWindowResult = struct {
@@ -1301,6 +1327,16 @@ pub const RelationalRowsAggregateRequest = struct {
 pub const RelationalRowsAggregatePlan = struct {
     ctes: []const RelationalRowsCte = &.{},
     aggregate: RelationalRowsAggregateRequest = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        self.aggregate.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 pub const RelationalRowsAggregateResult = struct {
@@ -1370,6 +1406,16 @@ pub const RelationalRowsJoinRequest = struct {
 pub const RelationalRowsJoinPlan = struct {
     ctes: []const RelationalRowsCte = &.{},
     join: RelationalRowsJoinRequest = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        self.join.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 pub const RelationalRowsLateralCorrelation = struct {
@@ -1411,6 +1457,16 @@ pub const RelationalRowsLateralRequest = struct {
 pub const RelationalRowsLateralPlan = struct {
     ctes: []const RelationalRowsCte = &.{},
     lateral: RelationalRowsLateralRequest = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        self.lateral.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 pub const RelationalRowsJoinResult = struct {
