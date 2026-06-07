@@ -632,6 +632,8 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rerankers");
         const model = try self.model_manager.loadFromDir(model_path);
+        model.lockRerankingSession();
+        defer model.unlockRerankingSession();
         var pipeline = model.rerankingPipeline(allocator);
         return try pipeline.rerank(query, documents);
     }
@@ -1741,6 +1743,8 @@ pub const Node = struct {
         const model = self.model_manager.loadFromDir(model_path) catch |err|
             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
 
+        model.lockRerankingSession();
+        defer model.unlockRerankingSession();
         var pipeline = model.rerankingPipeline(ctx.allocator);
         const scores = pipeline.rerank(body.query, body.prompts) catch |err|
             return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
@@ -1799,6 +1803,8 @@ pub const Node = struct {
             defer ctx.allocator.free(flat_texts);
             for (parsed_docs.items, 0..) |doc, idx| flat_texts[idx] = doc.text;
 
+            model.lockRerankingSession();
+            defer model.unlockRerankingSession();
             var pipeline = model.rerankingPipeline(ctx.allocator);
             const scores = pipeline.rerank(body.query, flat_texts) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
@@ -1852,9 +1858,13 @@ pub const Node = struct {
 
         for (parsed_docs.items, 0..) |doc, idx| {
             if (doc.images.len == 0) {
-                var text_pipeline = model.rerankingPipeline(ctx.allocator);
-                const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                model.lockRerankingSession();
+                const text_scores = blk: {
+                    defer model.unlockRerankingSession();
+                    var text_pipeline = model.rerankingPipeline(ctx.allocator);
+                    break :blk text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
+                        return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                };
                 defer ctx.allocator.free(text_scores);
                 scores[idx] = text_scores[0];
                 continue;

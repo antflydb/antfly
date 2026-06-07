@@ -5006,10 +5006,34 @@ pub const ApiHttpServer = struct {
         if (row_filter_json) |value| {
             injectRowFilterIntoSearchRequest(alloc, &query_req.req, value) catch return error.InvalidQueryRequest;
         }
-        return (source.query(alloc, table_name, query_req.req, .read_index) catch |err| {
-            std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
-            return err;
-        }) orelse error.TableNotFound;
+        return (try queryWithTransientReadRetry(alloc, source, table_name, query_req.req, .read_index)) orelse error.TableNotFound;
+    }
+
+    fn queryWithTransientReadRetry(
+        alloc: std.mem.Allocator,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?query_api.QueryResponse {
+        const retry_timeout_ns = 5 * std.time.ns_per_s;
+        const retry_poll_ns = 25 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        var attempts: u32 = 0;
+        while (true) : (attempts += 1) {
+            return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
+                error.EndOfStream => {
+                    std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
+                    if (platform_time.monotonicNs() -| start_ns >= retry_timeout_ns) return err;
+                    sleepNs(retry_poll_ns);
+                    continue;
+                },
+                else => {
+                    std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
+                    return err;
+                },
+            };
+        }
     }
 
     fn stringifyJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -12203,6 +12227,90 @@ test "api http server maps public query doc identity mismatch to unavailable" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+}
+
+test "api http server retries transient query EndOfStream before returning 500" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeReads = struct {
+        attempts: u32 = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.attempts += 1;
+            if (self.attempts == 1) return error.EndOfStream;
+            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[]}") };
+        }
+    };
+
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
+    defer server.deinit();
+
+    var resp = try server.handlePublicTableQuery("docs",
+        \\{"query":{"match_all":{}}}
+    , null);
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"responses\"") != null);
 }
 
 test "api http server serves internal group transaction routes" {
