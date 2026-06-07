@@ -30,6 +30,7 @@ The 50k sanity case on `e24a9140` was healthy:
 | Case | Load | Insert | Optimize | QPS | Serial p99 | Recall |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `Performance1536D50K`, `k=100` | 31.086s | 16.431s | 14.655s | 1294.794 | 3.1ms | 0.9811 |
+| `Performance1536D50K` after idle status snapshot fix, `k=100` | 25.678s | 15.425s | 10.253s | 1273.643 | 3.0ms | 0.9813 |
 
 ## What We Know
 
@@ -47,6 +48,7 @@ The 50k sanity case on `e24a9140` was healthy:
   - A post-run table status sample still showed 653 total runs, 648 L0 runs, 91.9 MiB manifest, and a 23 GiB data root.
   - Load-phase sample: physical footprint about 5.2 GiB, with hot work in L0 overlap planning, persisted-run merge cursors, compaction output writes, and status snapshot work walking L0 overlap stats.
   - Optimize-phase sample: physical footprint about 7.7 GiB, with hot work split between dense catch-up primary reads (`BoundWriteTxn.get`/`getManySorted`) and compaction merging/writing persisted runs.
+- Idle live-writer runtime status publishing no longer refreshes full LSM maintenance stats just to populate startup WAL-retention fields. Active startup catch-up still reports retention, and explicit table status still exposes rich LSM shape. The 50k sanity run improved from 28.550s load / 22.356s insert / 6.194s optimize to 25.678s load / 15.425s insert / 10.253s optimize; final table status drained to 5 total runs, 4 L0 runs, 1.33 MiB manifest, and maintenance score 0.
 
 ## Tradeoffs Already Tried
 

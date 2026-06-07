@@ -8443,10 +8443,8 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
             owned.deinit(alloc);
         }
     }
-    if (phase != .idle) {
-        cached_startup = try cachedStartupCatchUpStats(snapshot_cache, alloc, table_name, group_id);
-    }
     if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
+        cached_startup = cached_status.stats.async_indexing.startup;
         switch (mode) {
             .best_effort => {
                 status = cached_status;
@@ -8610,6 +8608,7 @@ fn startupCatchUpStatsForPhase(
         .{};
     stats.active = phase != .idle;
     stats.phase = phase;
+    if (phase == .idle) return stats;
     if (db) |managed_db| {
         const maintenance = managed_db.snapshotLsmMaintenanceStats();
         stats.wal_retention_known = true;
@@ -17428,6 +17427,7 @@ test "runtime status snapshot with idle phase refreshes live stats after startup
                 .startup = .{
                     .active = true,
                     .phase = .artifact_rebuild,
+                    .wal_retention_known = true,
                     .wal_retained_segments = 7,
                     .wal_retained_bytes = 456,
                 },
@@ -17480,8 +17480,9 @@ test "runtime status snapshot with idle phase refreshes live stats after startup
     try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.doc_count);
     try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.idle, statuses.items[0].stats.async_indexing.startup.phase);
     try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
-    try std.testing.expect(statuses.items[0].stats.async_indexing.startup.wal_retained_segments > 0);
-    try std.testing.expect(statuses.items[0].stats.async_indexing.startup.wal_retained_bytes > 0);
+    try std.testing.expect(statuses.items[0].stats.async_indexing.startup.wal_retention_known);
+    try std.testing.expectEqual(@as(u64, 7), statuses.items[0].stats.async_indexing.startup.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 456), statuses.items[0].stats.async_indexing.startup.wal_retained_bytes);
 }
 
 test "provisioned table write source startup snapshot builds synthetic status from object-form indexes json" {
