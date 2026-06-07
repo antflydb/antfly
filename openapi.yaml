@@ -6614,6 +6614,9 @@ components:
         obsolete_path_count:
           type: integer
           format: uint64
+        current_manifest_bytes:
+          type: integer
+          format: uint64
         wal_retained_bytes:
           type: integer
           format: uint64

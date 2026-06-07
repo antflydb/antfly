@@ -443,6 +443,7 @@ pub const LsmStorageStatus = struct {
     level_overflow_run_count: ?i64 = null,
     level_overflow_bytes: ?i64 = null,
     obsolete_path_count: ?i64 = null,
+    current_manifest_bytes: ?i64 = null,
     wal_retained_bytes: ?i64 = null,
     compaction_backlog_bytes: ?i64 = null,
     active_readers: ?i64 = null,

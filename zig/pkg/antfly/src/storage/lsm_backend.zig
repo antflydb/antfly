@@ -347,6 +347,7 @@ pub const Backend = struct {
         level_overflow_runs: u64 = 0,
         level_overflow_bytes: u64 = 0,
         obsolete_paths: u64 = 0,
+        current_manifest_bytes: u64 = 0,
         active_readers: u64 = 0,
         active_bulk_ingest_batches: u64 = 0,
         wal_retained_segments: u64 = 0,
@@ -430,6 +431,7 @@ pub const Backend = struct {
         dst.level_overflow_runs +|= src.level_overflow_runs;
         dst.level_overflow_bytes +|= src.level_overflow_bytes;
         dst.obsolete_paths +|= src.obsolete_paths;
+        dst.current_manifest_bytes +|= src.current_manifest_bytes;
         dst.active_readers +|= src.active_readers;
         dst.active_bulk_ingest_batches +|= src.active_bulk_ingest_batches;
         dst.wal_retained_segments +|= src.wal_retained_segments;
@@ -780,6 +782,7 @@ pub const Backend = struct {
     storage_owner: ?*storage_io.NativeStorage = null,
     storage: ?storage_io.Storage = null,
     manifest_backing: ?[]u8 = null,
+    current_manifest_bytes: u64 = 0,
     next_run_id: u64 = 1,
     active_readers: usize = 0,
     active_mutable_value_readers: usize = 0,
@@ -943,6 +946,7 @@ pub const Backend = struct {
         self.open_stats.loaded_manifest = loaded_manifest;
         self.open_stats.loaded_runs = @intCast(self.runs.items.len);
         self.open_stats.obsolete_paths = @intCast(self.obsolete_paths.items.len);
+        self.current_manifest_bytes = if (self.manifest_backing) |raw| @intCast(raw.len) else 0;
     }
 
     pub fn recordOpenReplayComplete(self: *Backend) void {
@@ -1004,6 +1008,7 @@ pub const Backend = struct {
             .immutable_memtables = @intCast(self.activeImmutableMemtableCount()),
             .total_runs = @intCast(self.runs.items.len),
             .obsolete_paths = @intCast(self.obsolete_paths.items.len),
+            .current_manifest_bytes = self.current_manifest_bytes,
             .active_readers = @intCast(self.active_readers),
             .active_bulk_ingest_batches = @intCast(self.active_bulk_ingest_batches),
             .soft_limit_l0_runs = @intCast(self.effectiveL0SoftLimitRuns()),
@@ -2338,6 +2343,7 @@ pub const Backend = struct {
         self.write_stats.manifest_writes += 1;
         self.write_stats.manifest_bytes += bytes;
         self.write_stats.manifest_ns += self.writeStatsElapsedNs(start_ns);
+        self.current_manifest_bytes = bytes;
         try self.maybeCheckpointWalAfterManifestPublish();
         self.manifest_dirty = false;
     }
@@ -11168,6 +11174,9 @@ test "lsm backend reloads persisted manifest and run files over memory storage" 
         try delete_txn.delete(.{ .name = "docs" }, "doc:b");
         try delete_txn.put(.{}, "meta:lsn", "7");
         try delete_txn.commit();
+
+        const maintenance = backend.snapshotMaintenanceStats();
+        try std.testing.expect(maintenance.current_manifest_bytes > 0);
     }
 
     {
@@ -11181,6 +11190,7 @@ test "lsm backend reloads persisted manifest and run files over memory storage" 
         try std.testing.expectEqual(Backend.OpenPhase.ready, open_stats.phase);
         try std.testing.expect(open_stats.loaded_manifest);
         try std.testing.expect(open_stats.loaded_runs > 0);
+        try std.testing.expect(reopened.snapshotMaintenanceStats().current_manifest_bytes > 0);
 
         var runtime = try reopened.runtimeNamespaceStore(std.testing.allocator);
         defer runtime.deinit();

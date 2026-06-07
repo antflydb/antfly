@@ -64,6 +64,7 @@ pub const LsmStorageStatus = struct {
     level_overflow_run_count: u64 = 0,
     level_overflow_bytes: u64 = 0,
     obsolete_path_count: u64 = 0,
+    current_manifest_bytes: u64 = 0,
     wal_retained_bytes: u64 = 0,
     compaction_backlog_bytes: u64 = 0,
     active_readers: u64 = 0,
@@ -101,6 +102,7 @@ pub fn lsmStorageStatusFromStats(stats: table_reads.LsmStorageStats) LsmStorageS
         .level_overflow_run_count = maintenance.level_overflow_runs,
         .level_overflow_bytes = maintenance.level_overflow_bytes,
         .obsolete_path_count = maintenance.obsolete_paths,
+        .current_manifest_bytes = maintenance.current_manifest_bytes,
         .wal_retained_bytes = maintenance.wal_retained_bytes,
         .compaction_backlog_bytes = maintenance.compaction_scheduler_remembered_pending_bytes,
         .active_readers = maintenance.active_readers,
@@ -136,6 +138,7 @@ fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStora
         .level_overflow_run_count = u64ToI64(status.level_overflow_run_count),
         .level_overflow_bytes = u64ToI64(status.level_overflow_bytes),
         .obsolete_path_count = u64ToI64(status.obsolete_path_count),
+        .current_manifest_bytes = u64ToI64(status.current_manifest_bytes),
         .wal_retained_bytes = u64ToI64(status.wal_retained_bytes),
         .compaction_backlog_bytes = u64ToI64(status.compaction_backlog_bytes),
         .active_readers = u64ToI64(status.active_readers),
@@ -1986,6 +1989,7 @@ test "metadata.table status encoder honors storage status overrides" {
             .level_overflow_run_count = 13,
             .level_overflow_bytes = 14,
             .obsolete_path_count = 15,
+            .current_manifest_bytes = 16,
             .wal_retained_bytes = 55,
             .compaction_backlog_bytes = 10,
             .active_readers = 2,
@@ -2010,6 +2014,7 @@ test "metadata.table status encoder honors storage status overrides" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_stall_l0_run_debt\":8") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"level_overflow_run_count\":13") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_path_count\":15") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_manifest_bytes\":16") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":55") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_backlog_bytes\":10") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_readers\":2") != null);

@@ -36,7 +36,7 @@ The 50k sanity case on `e24a9140` was healthy:
 - The latest 1M run ended with about 1319 primary table run files and a 26G data root.
 - A previous clean 1M run had an 88M primary table manifest and slow query-worker readonly opens around 6.8s.
 - HBC/dense index state was comparatively small and usually looked ready or nearly drained when query shape was poor.
-- Table status now exposes a richer `storage_status.lsm` snapshot for benchmark artifacts: total/L0/lower-level run shape, compactable and overlapping L0 pressure, configured L0 limits, write-stall debt, overflow debt, obsolete path count, active bulk/readers, dirty manifest flags, maintenance score, and maintenance debt hint.
+- Table status now exposes a richer `storage_status.lsm` snapshot for benchmark artifacts: total/L0/lower-level run shape, compactable and overlapping L0 pressure, configured L0 limits, write-stall debt, overflow debt, obsolete path count, current manifest bytes, active bulk/readers, dirty manifest flags, maintenance score, and maintenance debt hint.
 - Full `/metrics` scraping can perturb runs because metrics collection may walk LSM maintenance stats. Use sparse sampling or targeted artifacts during benchmarks.
 - The current VDBBench adapter defaults to `/db/v1`; Antfly v0.1 used `/api/v1`.
 
@@ -99,7 +99,7 @@ The current end-to-end issue is sharper: auto-bulk/dense ingest flushes primary 
 ### 1. Make The Debt Visible
 
 - Add or expose source/primary LSM run count, L0 count, manifest size, and maintenance score in benchmark artifacts without requiring expensive full metrics scraping.
-  Current status: table status exposes the LSM run/pressure shape and score fields; current manifest file size is still missing.
+  Current status: table status exposes the LSM run/pressure shape, current manifest bytes, and score fields.
 - Break down readonly DB open profiling inside `openCoreResourcesFromPrimaryStore`, especially manifest load, range/shard/schema reads, and index manager open.
 - Save final primary and dense index LSM shape summaries after VDBBench load.
 
