@@ -123,25 +123,18 @@ jobs:
         timeout-minutes: 10
         run: |
           set -euxo pipefail
-          time pnpm exec playwright install-deps chromium firefox
+          time pnpm exec playwright install-deps chromium
 
-      - name: Install Playwright Chromium Headless Shell
-        working-directory: ts/apps/antfarm
+      # ARC hangs extracting Playwright-managed browser archives, so use apt-installed Chrome.
+      - name: Install Google Chrome
+        working-directory: .
         timeout-minutes: 10
         run: |
           set -euxo pipefail
-          time pnpm exec playwright install --only-shell chromium
-        env:
-          DEBUG: pw:install
-
-      - name: Install Playwright Firefox
-        working-directory: ts/apps/antfarm
-        timeout-minutes: 10
-        run: |
-          set -euxo pipefail
-          time pnpm exec playwright install firefox
-        env:
-          DEBUG: pw:install
+          chrome_deb="${RUNNER_TEMP}/google-chrome-stable_current_amd64.deb"
+          curl -fsSL -o "$chrome_deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y "$chrome_deb"
+          google-chrome --version
 
       - name: Preview server
         working-directory: ts/apps/antfarm
@@ -153,8 +146,9 @@ jobs:
 
       - name: Run Playwright tests
         working-directory: ts/apps/antfarm
-        run: pnpm exec playwright test --project=chromium --project=firefox --reporter=list
+        run: pnpm exec playwright test --project=chromium --reporter=list
         env:
+          ANTFARM_PLAYWRIGHT_USE_SYSTEM_CHROME: "1"
           BASE_URL: http://localhost:4173
 
       - uses: actions/upload-artifact@v6
