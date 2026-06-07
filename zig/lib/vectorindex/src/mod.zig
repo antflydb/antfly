@@ -25,6 +25,7 @@ pub const hbc_runtime = @import("hbc_runtime.zig");
 pub const hbc = @import("hbc.zig");
 pub const hbc_index = @import("hbc_index.zig");
 pub const spfresh_index = @import("spfresh_index.zig");
+pub const spfresh_shape = @import("spfresh_shape.zig");
 pub const hbc_transfer = @import("hbc_transfer.zig");
 pub const hbc_debug = @import("hbc_debug.zig");
 

@@ -5307,6 +5307,36 @@ pub fn build(b: *std.Build) void {
     const hbc_write_bench_step = b.step("hbc-write-bench", "Benchmark HBC bulk build and online batched write amplification");
     hbc_write_bench_step.dependOn(&run_hbc_write_bench.step);
 
+    // SPFresh-style posting-shape prototype benchmark (lib/vectorindex/spfresh_shape).
+    const spfresh_shape_mod = b.createModule(.{
+        .root_source_file = b.path("lib/vectorindex/src/spfresh_shape.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    spfresh_shape_mod.addImport("antfly_vector", vector_mod);
+    const spfresh_shape_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/vectors/spfresh_shape_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    spfresh_shape_bench_mod.addImport("antfly_spfresh_shape", spfresh_shape_mod);
+    const spfresh_shape_bench = b.addExecutable(.{
+        .name = "spfresh_shape_bench",
+        .root_module = spfresh_shape_bench_mod,
+    });
+    const run_spfresh_shape_bench = b.addRunArtifact(spfresh_shape_bench);
+    if (b.args) |args| {
+        run_spfresh_shape_bench.addArgs(args);
+    } else {
+        run_spfresh_shape_bench.addArgs(&.{
+            "--vectors", "100000", "--dim", "128", "--postings", "1024",
+            "--queries", "200",    "--nprobe", "16", "--overwrite-fraction", "0.5",
+        });
+    }
+    const spfresh_shape_bench_step = b.step("spfresh-shape-bench", "Benchmark the SPFresh-style posting shape: io/mem/cpu/qps/recall across build, overwrite, repair, query");
+    spfresh_shape_bench_step.dependOn(&run_spfresh_shape_bench.step);
+
     const run_hbc_write_guardrail = b.addRunArtifact(hbc_write_bench);
     if (b.args) |args| {
         run_hbc_write_guardrail.addArgs(args);

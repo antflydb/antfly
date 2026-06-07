@@ -557,3 +557,103 @@ that policy on write-heavy workloads and then deciding whether split/merge or
 targeted boundary reassignment needs to change. Replacing HBC as the centroid
 directory should remain a separate, well-scoped optimization rather than a full
 index rewrite.
+
+## Experimental prototype: base+delta posting shape (2026-06-07)
+
+To put numbers behind the maintenance-policy question before touching the live
+HBC, a standalone prototype of the target posting shape was built and
+benchmarked in isolation:
+
+- `lib/vectorindex/src/spfresh_shape.zig` — the shape itself.
+- `bench/vectors/spfresh_shape_bench.zig` — `zig build spfresh-shape-bench`.
+
+### What the prototype implements
+
+- **Posting contents** = immutable **base** blob + append-only **delta/tail**.
+  Inserts/overwrites append `put` records; deletes and replacements append
+  `del`/`put` records (later record wins). A **fold** rewrites the base from
+  base+deltas, drops dead records, and clears the tail.
+- **Centroid directory**: `posting_id -> centroid / count / generation / dirty`,
+  refreshed **only by fold** (lazy). Between folds the centroid is stale.
+- **Assignment map**: `vector_id -> posting_id` (cross-posting replacement when a
+  re-embedded vector routes elsewhere: tombstone old, put new).
+- **Routing/query**: route to `nprobe` candidate postings by centroid, then
+  **overlay base+deltas at query time** so contents are always exact even while
+  centroids/folds lag, then exact-rerank.
+
+Deliberately held constant / out of scope for this cut: payload is raw f32 (not
+RaBitQ) so the experiment isolates the *shape*, not quantization; routing is a
+flat centroid scan; **split/merge is not implemented** (see findings).
+
+### Design choices
+
+- **IO is logical block bytes** moved by the store (writes/appends/reads/folds).
+  This is the right granularity for write-amplification and is free of
+  filesystem timing noise; memory uses `getrusage` peak RSS, CPU uses wall-ns
+  plus distance-op counts, QPS/recall come from the query path with brute-force
+  ground truth.
+- **Fold trigger is per-posting and LSM-style**: fold a posting only when its
+  delta tail reaches `fold_ratio`% of its base (`repairTriggered`), not a blind
+  global budget. The first naive "fold the dirtiest N every chunk" budget caused
+  the same over-compaction blow-up the disk LSM has (write amp 16.9x), which is
+  why the trigger is ratio-based.
+
+### Results
+
+Workload: 50k x 128-dim, 512 postings, realistic **drift** overwrites
+(re-embed near the original), overwrite-fraction 1.0, nprobe 16, k 10.
+
+| policy                | write amp (total) | overwrite ops/s | query qps | recall@10 | query read (100q) | max posting (avg 98) |
+| --------------------- | ----------------- | --------------- | --------- | --------- | ----------------- | -------------------- |
+| `none` (never fold)   | 1.02x             | 87k             | 130       | 1.000     | 250 MB            | 816                  |
+| `interleave` r=100%   | 2.19x             | 88k             | 96        | 1.000     | 1463 MB           | **3607**             |
+| `full` (drain once)   | 1.53x             | 86k             | 127       | 0.996     | 308 MB            | 816                  |
+
+`interleave` fold-ratio sweep (write-amp control): 50% -> 3.1x, 100% -> 2.2x,
+200% -> 1.6x total write amp (higher ratio folds less, larger tails).
+
+### Findings
+
+1. **Append-only deltas give ~1.0x write amplification for inserts *and*
+   overwrites.** This is the core win over eager HBC, where one logical write
+   fans out into many node/range/quantized rewrites. One overwrite ≈ one append.
+2. **Recall is robust to centroid staleness (>=0.996 across every policy)**
+   because the query overlays base+deltas, so posting *contents* are always
+   exact; only routing uses the (possibly stale) centroid, and when write-routing
+   and query-routing share the same centroid snapshot, recall barely moves. The
+   measurable cost of deferring maintenance is query **read amplification**
+   (re-scanning fat delta tails), not recall.
+3. **Fold is pure performance, not correctness.** It compacts the delta tail to
+   bound query read-amp, at a one-time rewrite (1.53x total vs 1.02x for never
+   folding). A ratio-triggered background drain is the lever.
+4. **Repeated centroid refresh *during* writes, without split/merge, is
+   unstable.** `interleave` drove the largest posting from 816 to **3607**
+   members (4.4x imbalance) via a feedback loop: fold -> centroid moves toward
+   the member mean -> attracts more assignments -> grows -> fold again. Query
+   cost exploded (members scanned 2.5k -> 16.8k; read 250 MB -> 1463 MB) even
+   though recall stayed 1.0. `full` (fold once, no re-routing of existing
+   members) keeps the partition balanced.
+
+### Conclusion / next steps
+
+The base+delta+overlay shape delivers the write-amp and recall properties we
+wanted, cheaply and measurably. But the experiment shows **fold alone is not a
+sufficient maintenance model** — local **split/merge + bounded reassignment**
+are required before enabling aggressive interleaved maintenance; otherwise
+centroid-refresh feedback concentrates load. Recommended sequence:
+
+1. Land base+delta postings + query-time overlay (the free write-amp/recall win).
+2. Fold as an **infrequent, ratio-triggered background drain** (start near
+   `full`-like behavior), not per-chunk.
+3. Implement bounded **split/merge** keyed on posting size, then re-run this
+   bench with interleaved maintenance and confirm `max_posting_members` stays
+   bounded — that is the gate for turning on continuous maintenance.
+
+Reproduce:
+
+```sh
+zig build spfresh-shape-bench -- --vectors 50000 --dim 128 --postings 512 \
+  --queries 100 --nprobe 16 --overwrite-fraction 1.0 --repair full
+# policies: --repair {none|full|interleave}  --fold-ratio <pct>
+# workload: --overwrite-mode {drift|teleport}  --overwrite-sigma <f>
+```
