@@ -862,6 +862,21 @@ fn aggregateEnrichmentStats(dst: *db_mod.types.EnrichmentStats, src: db_mod.type
     dst.worker_failed = dst.worker_failed or src.worker_failed;
     dst.skip_by_hash_count += src.skip_by_hash_count;
     dst.codec_decode_failures += src.codec_decode_failures;
+    dst.embed_batches_started += src.embed_batches_started;
+    dst.embed_batches_completed += src.embed_batches_completed;
+    dst.embed_items_started += src.embed_items_started;
+    dst.embed_items_completed += src.embed_items_completed;
+    dst.active_embed_batch_items += src.active_embed_batch_items;
+    dst.active_embed_batch_bytes += src.active_embed_batch_bytes;
+    dst.active_embed_batch_max_bytes = @max(dst.active_embed_batch_max_bytes, src.active_embed_batch_max_bytes);
+    dst.active_embed_batch_started_ms = @max(dst.active_embed_batch_started_ms, src.active_embed_batch_started_ms);
+    if (src.last_embed_batch_ns >= dst.last_embed_batch_ns) {
+        dst.last_embed_batch_items = src.last_embed_batch_items;
+        dst.last_embed_batch_bytes = src.last_embed_batch_bytes;
+        dst.last_embed_batch_max_bytes = src.last_embed_batch_max_bytes;
+        dst.last_embed_batch_ns = src.last_embed_batch_ns;
+    }
+    dst.total_embed_ns += src.total_embed_ns;
     dst.dense_artifact_bytes_written += src.dense_artifact_bytes_written;
     dst.sparse_artifact_bytes_written += src.sparse_artifact_bytes_written;
     dst.chunk_artifact_bytes_written += src.chunk_artifact_bytes_written;
