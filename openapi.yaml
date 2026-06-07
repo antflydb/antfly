@@ -6572,6 +6572,48 @@ components:
         l0_bytes:
           type: integer
           format: uint64
+        lower_level_run_count:
+          type: integer
+          format: uint64
+        lower_level_bytes:
+          type: integer
+          format: uint64
+        max_level:
+          type: integer
+          format: uint64
+        compactable_l0_run_count:
+          type: integer
+          format: uint64
+        overlapping_l0_run_count:
+          type: integer
+          format: uint64
+        soft_limit_l0_run_count:
+          type: integer
+          format: uint64
+        hard_limit_l0_run_count:
+          type: integer
+          format: uint64
+        write_stall_l0_run_debt:
+          type: integer
+          format: uint64
+        soft_limit_l0_bytes:
+          type: integer
+          format: uint64
+        hard_limit_l0_bytes:
+          type: integer
+          format: uint64
+        write_stall_l0_byte_debt:
+          type: integer
+          format: uint64
+        level_overflow_run_count:
+          type: integer
+          format: uint64
+        level_overflow_bytes:
+          type: integer
+          format: uint64
+        obsolete_path_count:
+          type: integer
+          format: uint64
         wal_retained_bytes:
           type: integer
           format: uint64
@@ -6579,6 +6621,19 @@ components:
           type: integer
           format: uint64
         active_readers:
+          type: integer
+          format: uint64
+        active_bulk_ingest_batches:
+          type: integer
+          format: uint64
+        manifest_dirty:
+          type: boolean
+        obsolete_manifest_dirty:
+          type: boolean
+        maintenance_score:
+          type: integer
+          format: uint64
+        maintenance_debt_hint:
           type: integer
           format: uint64
     StorageStatus:

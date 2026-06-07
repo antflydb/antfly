@@ -112,6 +112,8 @@ pub const BackgroundTextStatsResponse = struct {
 pub const LsmStorageStats = struct {
     maintenance: lsm_backend.Backend.MaintenanceStats,
     write: lsm_backend.Backend.WriteStats,
+    maintenance_score: u64 = 0,
+    maintenance_debt_hint: u64 = 0,
 };
 
 pub const ParsedTextStatsHttpResponse = union(enum) {
@@ -1809,6 +1811,8 @@ pub const BoundTableReadSource = struct {
         return .{
             .maintenance = self.db.snapshotLsmMaintenanceStats(),
             .write = self.db.snapshotLsmWriteStats(),
+            .maintenance_score = self.db.lsmMaintenanceScore(),
+            .maintenance_debt_hint = self.db.lsmMaintenanceDebtHint(),
         };
     }
 

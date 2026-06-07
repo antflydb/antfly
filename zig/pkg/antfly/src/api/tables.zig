@@ -29,6 +29,7 @@ const algebraic_mod = @import("../storage/db/algebraic/mod.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const full_text_indexes = @import("full_text_indexes.zig");
 const json_helpers = @import("json_helpers.zig");
+const table_reads = @import("table_reads.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
 pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
@@ -49,9 +50,28 @@ pub const LsmStorageStatus = struct {
     run_bytes: u64 = 0,
     l0_run_count: u64 = 0,
     l0_bytes: u64 = 0,
+    lower_level_run_count: u64 = 0,
+    lower_level_bytes: u64 = 0,
+    max_level: u64 = 0,
+    compactable_l0_run_count: u64 = 0,
+    overlapping_l0_run_count: u64 = 0,
+    soft_limit_l0_run_count: u64 = 0,
+    hard_limit_l0_run_count: u64 = 0,
+    write_stall_l0_run_debt: u64 = 0,
+    soft_limit_l0_bytes: u64 = 0,
+    hard_limit_l0_bytes: u64 = 0,
+    write_stall_l0_byte_debt: u64 = 0,
+    level_overflow_run_count: u64 = 0,
+    level_overflow_bytes: u64 = 0,
+    obsolete_path_count: u64 = 0,
     wal_retained_bytes: u64 = 0,
     compaction_backlog_bytes: u64 = 0,
     active_readers: u64 = 0,
+    active_bulk_ingest_batches: u64 = 0,
+    manifest_dirty: bool = false,
+    obsolete_manifest_dirty: bool = false,
+    maintenance_score: u64 = 0,
+    maintenance_debt_hint: u64 = 0,
 };
 
 pub const TableStorageStatus = struct {
@@ -60,16 +80,40 @@ pub const TableStorageStatus = struct {
     lsm: ?LsmStorageStatus = null,
 };
 
-pub fn lsmStorageStatusFromMaintenanceStats(maintenance: lsm_backend.Backend.MaintenanceStats) LsmStorageStatus {
+pub fn lsmStorageStatusFromStats(stats: table_reads.LsmStorageStats) LsmStorageStatus {
+    const maintenance = stats.maintenance;
     return .{
         .run_count = maintenance.total_runs,
         .run_bytes = maintenance.total_run_bytes,
         .l0_run_count = maintenance.l0_runs,
         .l0_bytes = maintenance.l0_bytes,
+        .lower_level_run_count = maintenance.lower_level_runs,
+        .lower_level_bytes = maintenance.lower_level_bytes,
+        .max_level = maintenance.max_level,
+        .compactable_l0_run_count = maintenance.compactable_l0_runs,
+        .overlapping_l0_run_count = maintenance.overlapping_l0_runs,
+        .soft_limit_l0_run_count = maintenance.soft_limit_l0_runs,
+        .hard_limit_l0_run_count = maintenance.hard_limit_l0_runs,
+        .write_stall_l0_run_debt = maintenance.write_stall_l0_run_debt,
+        .soft_limit_l0_bytes = maintenance.soft_limit_l0_bytes,
+        .hard_limit_l0_bytes = maintenance.hard_limit_l0_bytes,
+        .write_stall_l0_byte_debt = maintenance.write_stall_l0_byte_debt,
+        .level_overflow_run_count = maintenance.level_overflow_runs,
+        .level_overflow_bytes = maintenance.level_overflow_bytes,
+        .obsolete_path_count = maintenance.obsolete_paths,
         .wal_retained_bytes = maintenance.wal_retained_bytes,
         .compaction_backlog_bytes = maintenance.compaction_scheduler_remembered_pending_bytes,
         .active_readers = maintenance.active_readers,
+        .active_bulk_ingest_batches = maintenance.active_bulk_ingest_batches,
+        .manifest_dirty = maintenance.manifest_dirty,
+        .obsolete_manifest_dirty = maintenance.obsolete_manifest_dirty,
+        .maintenance_score = stats.maintenance_score,
+        .maintenance_debt_hint = stats.maintenance_debt_hint,
     };
+}
+
+pub fn lsmStorageStatusFromMaintenanceStats(maintenance: lsm_backend.Backend.MaintenanceStats) LsmStorageStatus {
+    return lsmStorageStatusFromStats(.{ .maintenance = maintenance, .write = .{} });
 }
 
 fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStorageStatus {
@@ -78,9 +122,28 @@ fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStora
         .run_bytes = u64ToI64(status.run_bytes),
         .l0_run_count = u64ToI64(status.l0_run_count),
         .l0_bytes = u64ToI64(status.l0_bytes),
+        .lower_level_run_count = u64ToI64(status.lower_level_run_count),
+        .lower_level_bytes = u64ToI64(status.lower_level_bytes),
+        .max_level = u64ToI64(status.max_level),
+        .compactable_l0_run_count = u64ToI64(status.compactable_l0_run_count),
+        .overlapping_l0_run_count = u64ToI64(status.overlapping_l0_run_count),
+        .soft_limit_l0_run_count = u64ToI64(status.soft_limit_l0_run_count),
+        .hard_limit_l0_run_count = u64ToI64(status.hard_limit_l0_run_count),
+        .write_stall_l0_run_debt = u64ToI64(status.write_stall_l0_run_debt),
+        .soft_limit_l0_bytes = u64ToI64(status.soft_limit_l0_bytes),
+        .hard_limit_l0_bytes = u64ToI64(status.hard_limit_l0_bytes),
+        .write_stall_l0_byte_debt = u64ToI64(status.write_stall_l0_byte_debt),
+        .level_overflow_run_count = u64ToI64(status.level_overflow_run_count),
+        .level_overflow_bytes = u64ToI64(status.level_overflow_bytes),
+        .obsolete_path_count = u64ToI64(status.obsolete_path_count),
         .wal_retained_bytes = u64ToI64(status.wal_retained_bytes),
         .compaction_backlog_bytes = u64ToI64(status.compaction_backlog_bytes),
         .active_readers = u64ToI64(status.active_readers),
+        .active_bulk_ingest_batches = u64ToI64(status.active_bulk_ingest_batches),
+        .manifest_dirty = status.manifest_dirty,
+        .obsolete_manifest_dirty = status.obsolete_manifest_dirty,
+        .maintenance_score = u64ToI64(status.maintenance_score),
+        .maintenance_debt_hint = u64ToI64(status.maintenance_debt_hint),
     };
 }
 
@@ -1909,9 +1972,28 @@ test "metadata.table status encoder honors storage status overrides" {
             .run_bytes = 44,
             .l0_run_count = 1,
             .l0_bytes = 33,
+            .lower_level_run_count = 2,
+            .lower_level_bytes = 11,
+            .max_level = 3,
+            .compactable_l0_run_count = 4,
+            .overlapping_l0_run_count = 5,
+            .soft_limit_l0_run_count = 6,
+            .hard_limit_l0_run_count = 7,
+            .write_stall_l0_run_debt = 8,
+            .soft_limit_l0_bytes = 9,
+            .hard_limit_l0_bytes = 10,
+            .write_stall_l0_byte_debt = 12,
+            .level_overflow_run_count = 13,
+            .level_overflow_bytes = 14,
+            .obsolete_path_count = 15,
             .wal_retained_bytes = 55,
             .compaction_backlog_bytes = 10,
             .active_readers = 2,
+            .active_bulk_ingest_batches = 1,
+            .manifest_dirty = true,
+            .obsolete_manifest_dirty = true,
+            .maintenance_score = 99,
+            .maintenance_debt_hint = 88,
         },
     }};
 
@@ -1920,9 +2002,22 @@ test "metadata.table status encoder honors storage status overrides" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true,\"lsm\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"run_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"l0_bytes\":33") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lower_level_run_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"max_level\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compactable_l0_run_count\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"overlapping_l0_run_count\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"hard_limit_l0_run_count\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_stall_l0_run_debt\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"level_overflow_run_count\":13") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_path_count\":15") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":55") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_backlog_bytes\":10") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_readers\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_bulk_ingest_batches\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"manifest_dirty\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_manifest_dirty\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"maintenance_score\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"maintenance_debt_hint\":88") != null);
 }
 
 test "metadata.table status encoder canonicalizes embeddings indexes without inline names" {
