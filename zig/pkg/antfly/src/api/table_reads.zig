@@ -109,12 +109,7 @@ pub const BackgroundTextStatsResponse = struct {
     }
 };
 
-pub const LsmStorageStats = struct {
-    maintenance: lsm_backend.Backend.MaintenanceStats,
-    write: lsm_backend.Backend.WriteStats,
-    maintenance_score: u64 = 0,
-    maintenance_debt_hint: u64 = 0,
-};
+pub const LsmStorageStats = runtime_status.LsmStorageStats;
 
 pub const ParsedTextStatsHttpResponse = union(enum) {
     fields: TextStatsResponse,

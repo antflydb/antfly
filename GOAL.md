@@ -33,6 +33,7 @@ The 50k sanity case on `e24a9140` was healthy:
 | `Performance1536D50K`, `k=100` | 31.086s | 16.431s | 14.655s | 1294.794 | 3.1ms | 0.9811 |
 | `Performance1536D50K` after idle status snapshot fix, `k=100` | 25.678s | 15.425s | 10.253s | 1273.643 | 3.0ms | 0.9813 |
 | `Performance1536D50K` after primary-maintenance fallback, `k=100` | 25.091s | 16.620s | 8.471s | 1254.047 | 3.0ms | 0.9813 |
+| `Performance1536D50K` with live LSM write counters, `k=100` | 30.231s | 15.450s | 14.781s | 1519.410 | 2.8ms | 0.9813 |
 
 ## What We Know
 
@@ -55,6 +56,12 @@ The 50k sanity case on `e24a9140` was healthy:
 - Idle live-writer runtime status publishing no longer refreshes full LSM maintenance stats just to populate startup WAL-retention fields. Active startup catch-up still reports retention, and explicit table status still exposes rich LSM shape. The 50k sanity run improved from 28.550s load / 22.356s insert / 6.194s optimize to 25.678s load / 15.425s insert / 10.253s optimize; final table status drained to 5 total runs, 4 L0 runs, 1.33 MiB manifest, and maintenance score 0.
 - Background LSM maintenance can now lease active dense-bulk writer DBs for primary-only maintenance. The normal generic maintenance path still avoids dense index maintenance during active dense bulk work, but primary LSM compaction no longer has to wait for dense catch-up to finish. The 50k sanity run with this fallback finished in 25.091s load / 16.620s insert / 8.471s optimize, and final table status drained to 1 total run, 0 L0 runs, 2.1 MiB manifest, and a 1.2 GiB data root.
 - The primary-only maintenance fallback is not enough by itself. The 1M run after that change was aborted around 500k uploaded because the primary table had already reached 1024 total runs, 1022 L0 runs, a 16.4 MiB manifest, a 5.2 GiB data root, and 894 L0 run-debt. This points back to primary run publication and compaction budgeting, not just background maintenance eligibility.
+- Table status now reports live in-memory LSM write counters when the local writer DB is leased; warm-open status DBs still provide persisted maintenance shape as a fallback. The first attempt to expose write counters through warm status DBs showed all write counters as zero because those counters are runtime-only and are not persisted in manifests.
+- The latest 50k live-counter run shows:
+  - At optimize start: 132 L0 runs, 140 flush-output runs, 147 immutable rotations, 354 manifest writes, 228.6 MiB cumulative manifest bytes, 0 sorted ingest runs, 3 direct-bulk attempts/0 successes, and only 1 write-pressure event.
+  - At optimize end: 23 L0 runs, 153 flush-output runs, 153 immutable flushes, 394 manifest writes, 279.7 MiB cumulative manifest bytes, 0 sorted ingest runs, 7 direct-bulk attempts/0 successes, and 1 write-pressure compaction.
+  - Load improved versus the broken-counter rerun but remained slower than the primary-maintenance-fallback best 50k load. Query shape was good: 1519 QPS, 2.8ms serial p99, recall 0.9813.
+  - This points to mutable flush/run-publication and manifest churn, not successful sorted ingest, dense HBC search, or aggressive foreground write-pressure work.
 
 ## Tradeoffs Already Tried
 
@@ -117,7 +124,7 @@ The latest 1M abort suggests faster upload can make this worse by publishing L0 
 ### 1. Make The Debt Visible
 
 - Add or expose source/primary LSM run count, L0 count, manifest size, and maintenance score in benchmark artifacts without requiring expensive full metrics scraping.
-  Current status: table status exposes the LSM run/pressure shape, current manifest bytes, and score fields.
+  Current status: table status exposes the LSM run/pressure shape, current manifest bytes, score fields, and live write counters when a writer DB is leased.
 - Break down readonly DB open profiling inside `openCoreResourcesFromPrimaryStore`, especially manifest load, range/shard/schema reads, and index manager open.
 - Save final primary and dense index LSM shape summaries after VDBBench load.
 

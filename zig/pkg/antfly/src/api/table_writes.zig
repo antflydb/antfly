@@ -4173,6 +4173,7 @@ pub const ProvisionedTableWriteSource = struct {
                         errdefer status.deinit(alloc);
                         owned.db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
                         self.markManagedWriterRuntimeStatus(&status);
+                        status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
                         if (status.created_at_millis == 0) {
                             status.created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0;
                         }
@@ -4183,6 +4184,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .group_id = group_id,
                     .created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0,
                     .stats = try owned.db.runtimeStatusStatsConsistent(alloc),
+                    .lsm_storage_stats = lsmStorageStatsFromDb(owned.db),
                 };
                 self.markManagedWriterRuntimeStatus(&status);
                 break :blk status;
@@ -4205,6 +4207,7 @@ pub const ProvisionedTableWriteSource = struct {
                 defer owned.deinit(release_alloc);
                 owned.db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
                 self.markManagedWriterRuntimeStatus(status);
+                status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
                 if (status.created_at_millis == 0) {
                     status.created_at_millis = (owned.db.getGroupCreatedAtMillis(std.heap.page_allocator, group_id) catch null) orelse 0;
                 }
@@ -4220,6 +4223,15 @@ pub const ProvisionedTableWriteSource = struct {
             .updated_at_ns = platform_time.monotonicNs(),
             .source = if (self.startup_catch_up_active.load(.monotonic)) .startup_catch_up else .live_writer_publish,
             .freshness = .fresh,
+        };
+    }
+
+    fn lsmStorageStatsFromDb(db: *db_mod.DB) runtime_status.LsmStorageStats {
+        return .{
+            .maintenance = db.snapshotLsmMaintenanceStats(),
+            .write = db.snapshotLsmWriteStats(),
+            .maintenance_score = db.lsmMaintenanceScore(),
+            .maintenance_debt_hint = db.lsmMaintenanceDebtHint(),
         };
     }
 

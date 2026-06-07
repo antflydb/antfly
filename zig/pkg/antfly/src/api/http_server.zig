@@ -38,6 +38,7 @@ const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const table_catalog = @import("table_catalog.zig");
 const tables_api = @import("tables.zig");
 const table_reads = @import("table_reads.zig");
@@ -1415,8 +1416,25 @@ pub const ApiHttpServer = struct {
         return .{
             .table_name = table_name,
             .empty = doc_count == 0,
-            .lsm = try self.bestEffortLsmStorageStatus(table_name),
+            .lsm = liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items) orelse try self.bestEffortLsmStorageStatus(table_name),
         };
+    }
+
+    fn liveLsmStorageStatusFromRuntimeStatuses(
+        statuses: []const runtime_status.LocalTableRuntimeStatus,
+    ) ?tables_api.LsmStorageStatus {
+        var saw_lsm_stats = false;
+        var aggregate = runtime_status.LsmStorageStats{};
+        for (statuses) |status| {
+            const stats = status.lsm_storage_stats orelse continue;
+            saw_lsm_stats = true;
+            lsm_backend.Backend.accumulateMaintenanceStats(&aggregate.maintenance, stats.maintenance);
+            lsm_backend.Backend.accumulateWriteStats(&aggregate.write, stats.write);
+            aggregate.maintenance_score = @max(aggregate.maintenance_score, stats.maintenance_score);
+            aggregate.maintenance_debt_hint = @max(aggregate.maintenance_debt_hint, stats.maintenance_debt_hint);
+        }
+        if (!saw_lsm_stats) return null;
+        return tables_api.lsmStorageStatusFromStats(aggregate);
     }
 
     fn bestEffortLsmStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.LsmStorageStatus {

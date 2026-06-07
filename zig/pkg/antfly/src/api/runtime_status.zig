@@ -15,6 +15,7 @@
 const std = @import("std");
 const platform_time = @import("../platform/time.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 
 pub const RuntimeStatusSource = enum {
     unknown,
@@ -62,6 +63,7 @@ pub const LocalTableRuntimeStatus = struct {
     disk_bytes: u64 = 0,
     created_at_millis: u64 = 0,
     stats: db_mod.types.DBStats,
+    lsm_storage_stats: ?LsmStorageStats = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         db_mod.types.freeDBStats(alloc, self.stats);
@@ -75,12 +77,20 @@ pub const LocalTableRuntimeStatus = struct {
             .disk_bytes = self.disk_bytes,
             .created_at_millis = self.created_at_millis,
             .stats = try cloneDBStats(alloc, self.stats),
+            .lsm_storage_stats = self.lsm_storage_stats,
         };
     }
 
     pub fn withMetadataDefaults(self: *@This(), source: RuntimeStatusSource, now_ns: u64) void {
         self.metadata = self.metadata.withDefaults(source, now_ns);
     }
+};
+
+pub const LsmStorageStats = struct {
+    maintenance: lsm_backend.Backend.MaintenanceStats = .{},
+    write: lsm_backend.Backend.WriteStats = .{},
+    maintenance_score: u64 = 0,
+    maintenance_debt_hint: u64 = 0,
 };
 
 pub fn statusHasRuntimeFacts(status: LocalTableRuntimeStatus) bool {
