@@ -3732,6 +3732,7 @@ pub fn build(b: *std.Build) void {
             "relational rows window contract",
             "relational rows join contract",
             "relational rows lateral contract",
+            "relational rows cte plan contract",
             "relational rows query contract projects coalesce",
             "relational rows query contract projects generic expression",
             "relational rows query contract supports scalar or",
