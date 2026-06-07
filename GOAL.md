@@ -23,6 +23,7 @@ Recent observed runs:
 | `antfly-memory-guard-rerun` | 950.735s | 628.441s | 322.295s | 185.869 | 23.0ms | 0.9899 | Best load so far, but left heavy LSM debt. |
 | `antfly-knownbest-clean-1m-44924e58` | 1278.402s | 675.368s | 603.035s | 43.033 | 80.7ms | 0.9797 | Clean rollback run; poor query shape. |
 | `antfly-e24a9140-cohere-1m` | 1286.462s | 712.267s | 574.195s | 238.953 | 16.5ms | 0.9899 | Current PR shape; better query than clean rollback, not best load. |
+| `antfly-status-lsm-sparse-1m-20260607` | 1257.437s | 639.579s | 617.858s | 191.571 | 21.6ms | 0.9899 | Latest instrumented run. Insert is close to the best observed, but optimize/query start with heavy primary LSM debt. |
 
 The 50k sanity case on `e24a9140` was healthy:
 
@@ -33,12 +34,19 @@ The 50k sanity case on `e24a9140` was healthy:
 ## What We Know
 
 - The biggest remaining failure mode is primary table LSM run debt, not dense HBC search logic.
-- The latest 1M run ended with about 1319 primary table run files and a 26G data root.
+- An earlier 1M run ended with about 1319 primary table run files and a 26G data root.
 - A previous clean 1M run had an 88M primary table manifest and slow query-worker readonly opens around 6.8s.
 - HBC/dense index state was comparatively small and usually looked ready or nearly drained when query shape was poor.
 - Table status now exposes a richer `storage_status.lsm` snapshot for benchmark artifacts: total/L0/lower-level run shape, compactable and overlapping L0 pressure, configured L0 limits, write-stall debt, overflow debt, obsolete path count, current manifest bytes, active bulk/readers, dirty manifest flags, maintenance score, and maintenance debt hint.
 - Full `/metrics` scraping can perturb runs because metrics collection may walk LSM maintenance stats. Use sparse sampling or targeted artifacts during benchmarks.
 - The current VDBBench adapter defaults to `/db/v1`; Antfly v0.1 used `/api/v1`.
+- Latest 1M instrumented run:
+  - Upload finished in 639.579s, but optimize took 617.858s because dense catch-up entered optimize at only 487.5k indexed documents.
+  - At optimize start, primary table shape was 806 total runs, 802 L0 runs, 71.9 MiB manifest, and 969 MiB retained WAL.
+  - At optimize end/query start, primary table shape was 717 total runs, 712 L0 runs, 92.1 MiB manifest, 139 MiB retained WAL, and 584 L0 run-debt.
+  - A post-run table status sample still showed 653 total runs, 648 L0 runs, 91.9 MiB manifest, and a 23 GiB data root.
+  - Load-phase sample: physical footprint about 5.2 GiB, with hot work in L0 overlap planning, persisted-run merge cursors, compaction output writes, and status snapshot work walking L0 overlap stats.
+  - Optimize-phase sample: physical footprint about 7.7 GiB, with hot work split between dense catch-up primary reads (`BoundWriteTxn.get`/`getManySorted`) and compaction merging/writing persisted runs.
 
 ## Tradeoffs Already Tried
 
