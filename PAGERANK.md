@@ -84,6 +84,8 @@ is all edges in the graph index, but users need a first-class way to restrict
 the metric to specific edge families because PageRank over mixed semantic edges
 can be misleading:
 
+For v1, support `mode: "all"` and typed edge include lists:
+
 ```json
 {
   "edge_filter": {
@@ -91,6 +93,27 @@ can be misleading:
   }
 }
 ```
+
+Typed include lists should be implemented only against the graph index's
+existing edge type or edge family metadata. V1 should not add a separate
+predicate engine for graph metric filtering.
+
+Long-term, edge scope can grow into labels and field predicates:
+
+```json
+{
+  "edge_filter": {
+    "types": ["mentions", "cites"],
+    "labels": ["references"],
+    "where": [
+      { "field": "confidence", "op": ">=", "value": 0.8 }
+    ]
+  }
+}
+```
+
+Arbitrary predicates should wait until the core materialization and generation
+contract is stable.
 
 ## SQL DDL
 
@@ -142,10 +165,59 @@ Direct top-k metric reads should also be supported:
 }
 ```
 
+Direct metric endpoints should always include metric status in their responses.
+Graph traversal and graph search responses should include metric status only
+when requested:
+
+```json
+{
+  "graph": {
+    "index": "knowledge_graph",
+    "traverse": { "max_depth": 2 },
+    "return": ["id", "pagerank"],
+    "include_metric_status": true
+  }
+}
+```
+
+Metric status is a map keyed by metric name. That keeps responses easy to join
+against requested metric fields when a query includes multiple metrics.
+
+Response shape:
+
+```json
+{
+  "metric_status": {
+    "pagerank": {
+      "state": "stale",
+      "published_generation": 42,
+      "edge_generation": 43,
+      "converged": true,
+      "iterations_completed": 31,
+      "computed_at_ms": 1780000000000
+    },
+    "authority": {
+      "state": "stale",
+      "published_generation": 8,
+      "edge_generation": 11,
+      "converged": false,
+      "iterations_completed": 50,
+      "computed_at_ms": 1779999900000
+    }
+  }
+}
+```
+
 By default, queries read the last published complete generation. If a metric has
-never been published, metric projections may return `null`, but ordering or
-filtering by that metric must fail with `MetricNotReady`. This is more explicit
-than silently producing unstable ordering.
+never been published, behavior depends on how the metric is used:
+
+- Projecting a metric field returns `null`.
+- Ordering by a metric fails with `MetricNotReady`.
+- Filtering by a metric fails with `MetricNotReady`.
+- Direct top-k metric reads fail with `MetricNotReady`.
+
+Projection can tolerate missing derived data; ranking and filtering cannot
+because they imply meaningful score semantics.
 
 Useful query freshness modes:
 
@@ -160,6 +232,12 @@ Initial modes:
 - `published`: read the last complete generation, even if stale.
 - `fresh`: require the published generation to match the current edge
   generation; fail with `MetricNotReady` or `MetricStale` otherwise.
+
+Use two distinct freshness errors:
+
+- `MetricNotReady`: no published generation exists.
+- `MetricStale`: a published generation exists, but the caller requested
+  `fresh` and it does not match the current edge generation.
 
 Avoid blocking query execution for a rebuild in the first implementation.
 
@@ -210,16 +288,45 @@ generation converges or reaches the configured iteration cap.
 
 For the first version, clean up old generations immediately after publishing a
 new generation, while preserving snapshot safety. The implementation must not
-delete a generation that an active query snapshot can still read. If storage
-snapshots already make this safe, immediate cleanup is sufficient.
+delete a generation that an active query snapshot can still read.
+
+If graph metric reads run inside a stable read transaction or storage snapshot,
+delete old generation rows immediately after the publish pointer flips. Existing
+readers keep their snapshot; new readers resolve the new published generation.
+
+If graph metric reads are not snapshot-safe, use a small deferred cleanup queue
+instead of adding a full reader-epoch system in v1:
+
+```text
+graph_metric_cleanup:<index>:<metric>:<generation> -> eligible_after_ms
+```
+
+Maintenance deletes queued generations after `eligible_after_ms`. Use an
+internal v1 constant:
+
+```text
+default_deferred_cleanup_ms = 60_000
+```
+
+Do not expose the deferred cleanup delay as user-facing config in v1.
 
 Future versions can add retention controls for debugging or rollback:
 
 ```json
 {
-  "retained_generations": 2
+  "retention": {
+    "mode": "count",
+    "retained_generations": 2
+  }
 }
 ```
+
+Do not expose retention as a first-version user-facing option. Keep v1
+latest-only. If this becomes useful later, prefer a retention object with modes:
+
+- `latest`: keep only the latest published generation.
+- `count`: keep the last N published generations.
+- `duration`: keep generations for a time window.
 
 ## Write Path
 
@@ -353,6 +460,9 @@ Metric values should be returned as nullable floats. Missing scores can occur
 for nodes introduced after the last publish. Ordering should treat missing
 scores explicitly, with the default being `nulls_last`.
 
+Before the first publish, direct metric ranking paths should not try to rank all
+nodes as missing. They should fail with `MetricNotReady`.
+
 ## Progress and Recovery
 
 Jobs should persist enough state to recover after restart:
@@ -403,16 +513,33 @@ non-convergence.
    prior generation, stale reads, and ordering by score.
 9. Add distributed phased jobs after the local implementation is stable.
 
-## Open Questions
+## Resolved Design Defaults
 
-- What exact schema shape should represent `edge_filter` for graph indexes that
-  already have typed edge families, labels, or predicates?
-- Should metric projections return `null` before first publish, or should every
-  metric read path consistently fail with `MetricNotReady` until the first
-  generation is available?
-- What storage snapshot or reader-tracking primitive should guard immediate old
-  generation cleanup?
-- Should future versions expose `retained_generations` or `retention_ms`, and
-  should that be user-facing or debug-only?
-- Should `fresh` failure use `MetricNotReady`, `MetricStale`, or a shared
-  freshness error with structured status details?
+- Graph metrics are owned by graph indexes.
+- PageRank is the only v1 metric kind.
+- Edge scope defaults to all edges in the graph index.
+- The resolved metric config always records `edge_filter`.
+- V1 supports `mode: "all"` and typed edge include lists.
+- Metric projections return `null` before first publish.
+- Ordering, filtering, and top-k metric reads fail with `MetricNotReady` before
+  first publish.
+- `metric_freshness: "published"` reads the latest complete generation, stale or
+  fresh.
+- `metric_freshness: "fresh"` requires the published generation to match the
+  current edge generation.
+- `fresh` with no published generation fails with `MetricNotReady`.
+- `fresh` with an older published generation fails with `MetricStale`.
+- Fixed-iteration non-converged PageRank publishes by default with
+  `converged: false`.
+- Invalid score output fails the job and preserves the prior generation.
+- V1 keeps only the latest published generation, subject to snapshot safety.
+- Old generation cleanup happens immediately when graph metric reads are
+  snapshot-safe.
+- If reads are not snapshot-safe, old generation cleanup uses a deferred cleanup
+  queue keyed by eligible cleanup time.
+- The v1 deferred cleanup fallback uses an internal 60 second delay.
+- Direct graph metric endpoints always return metric status.
+- Graph traversal and graph search return metric status only when
+  `include_metric_status` is set.
+- `metric_status` is a map keyed by metric name.
+- Retention controls are future debug/admin options, not v1 user-facing config.
