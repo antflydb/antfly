@@ -332,6 +332,9 @@ pub const ModelManifest = struct {
 
 /// ONNX file candidates in priority order.
 const onnx_candidates = [_][]const u8{
+    "text_model.onnx",
+    "text_model_f16.onnx",
+    "text_model_i8.onnx",
     "model.onnx",
     "model_f16.onnx",
     "model_i8.onnx",
@@ -343,9 +346,6 @@ const onnx_candidates = [_][]const u8{
     "decoder_model_merged_quantized.onnx",
     "decoder_model_merged_q4.onnx",
     "decoder_model_merged_q4f16.onnx",
-    "text_model.onnx",
-    "text_model_f16.onnx",
-    "text_model_i8.onnx",
     "encoder.onnx",
 };
 
@@ -634,6 +634,11 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         }
     }
 
+    if (hasRerankPathHint(model_dir_path) and (manifest.model_type == .embedder or manifest.model_type == .classifier)) {
+        manifest.model_type = .reranker;
+        return;
+    }
+
     if (inferModelTypeFromTasks(manifest.tasks)) |task_model_type| {
         manifest.model_type = task_model_type;
         return;
@@ -666,10 +671,10 @@ fn inferModelTypeFromTasks(tasks: []const []const u8) ?ModelType {
         if (std.mem.eql(u8, task, "recognize") or std.mem.eql(u8, task, "extract")) return .recognizer;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "classify")) return .classifier;
+        if (std.mem.eql(u8, task, "rerank")) return .reranker;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "rerank")) return .reranker;
+        if (std.mem.eql(u8, task, "classify")) return .classifier;
     }
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "read")) return .reader;
@@ -714,6 +719,14 @@ fn hasGlinerPathHint(model_dir_path: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, model_dir_path, "/\\");
     while (it.next()) |component| {
         if (containsAsciiIgnoreCase(component, "gliner")) return true;
+    }
+    return false;
+}
+
+fn hasRerankPathHint(model_dir_path: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, model_dir_path, "/\\");
+    while (it.next()) |component| {
+        if (containsAsciiIgnoreCase(component, "rerank")) return true;
     }
     return false;
 }
@@ -1738,6 +1751,15 @@ test "inferModelTypeFromPath detects classifier directory" {
     try std.testing.expectEqual(@as(?ModelType, .classifier), inferModelTypeFromPath("/tmp/models/classifiers/cross-encoder/nli-distilroberta-base"));
 }
 
+test "rerank model name overrides sequence classifier config" {
+    var manifest = ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .classifier,
+    };
+    applyImplicitModelTypeHints(&manifest, "/tmp/models/mixedbread-ai/mxbai-rerank-base-v1");
+    try std.testing.expectEqual(ModelType.reranker, manifest.model_type);
+}
+
 test "inferModelTypeFromPath detects recognizer directory" {
     try std.testing.expectEqual(@as(?ModelType, .recognizer), inferModelTypeFromPath("C:\\models\\recognizers\\fastino\\gliner2-base-v1"));
 }
@@ -2126,6 +2148,33 @@ test "manifest discovers clip onnx variants and prefers f16 over i8" {
     try std.testing.expect(std.mem.endsWith(u8, manifest.visual_model_path.?, "/visual_model_f16.onnx"));
     try std.testing.expect(std.mem.endsWith(u8, manifest.text_projection_path.?, "/text_projection.onnx"));
     try std.testing.expect(std.mem.endsWith(u8, manifest.visual_projection_path.?, "/visual_projection.onnx"));
+}
+
+test "manifest prefers split clip text model over combined model" {
+    const allocator = std.testing.allocator;
+    const model_dir = try testScratchDir(allocator, "manifest-clip-text-model-before-combined");
+    defer {
+        compat.cwd().deleteTree(compat.io(), model_dir) catch {};
+        allocator.free(model_dir);
+    }
+
+    const files = [_][]const u8{
+        "model.onnx",
+        "text_model.onnx",
+        "vision_model.onnx",
+    };
+    for (files) |file_name| {
+        const path = try std.fs.path.join(allocator, &.{ model_dir, file_name });
+        defer allocator.free(path);
+        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+    }
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+    try std.testing.expect(manifest.onnx_path != null);
+    try std.testing.expect(manifest.visual_model_path != null);
+    try std.testing.expect(std.mem.endsWith(u8, manifest.onnx_path.?, "/text_model.onnx"));
+    try std.testing.expect(std.mem.endsWith(u8, manifest.visual_model_path.?, "/vision_model.onnx"));
 }
 
 test "manifest discovers clip i8 onnx fallback variants" {

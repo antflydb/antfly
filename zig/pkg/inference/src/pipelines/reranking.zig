@@ -117,7 +117,7 @@ pub const RerankingPipeline = struct {
         var run = try self.runTextEncoder(all_ids, all_mask, all_type_ids, batch, max_len, true);
         defer run.deinit();
 
-        return try self.extractScores(run.output(), batch);
+        return try self.extractScores(try run.output(), batch);
     }
 
     fn rerankLateInteraction(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) ![]f32 {
@@ -136,7 +136,7 @@ pub const RerankingPipeline = struct {
         var query_run = try self.runTextEncoder(query_encoded.ids, query_encoded.attention_mask, query_type_ids, 1, max_len, false);
         defer query_run.deinit();
 
-        const query_output = query_run.output();
+        const query_output = try query_run.output();
         if (query_output.shape.len != 3) return error.UnexpectedOutputShape;
         const hidden: usize = @intCast(query_output.shape[2]);
 
@@ -162,7 +162,7 @@ pub const RerankingPipeline = struct {
 
             var doc_run = try self.runTextEncoder(doc_ids, doc_mask, doc_type_ids, chunk_len, max_len, false);
             defer doc_run.deinit();
-            const doc_output = doc_run.output();
+            const doc_output = try doc_run.output();
             if (doc_output.shape.len != 3) return error.UnexpectedOutputShape;
 
             const query_hidden = query_output.asFloat32();
@@ -265,8 +265,8 @@ pub const RerankingPipeline = struct {
             self.allocator.free(self.outputs);
         }
 
-        fn output(self: *const TextRun) *const Tensor {
-            if (self.outputs.len == 0) @panic("TextRun.output called without outputs");
+        fn output(self: *const TextRun) !*const Tensor {
+            if (self.outputs.len == 0) return error.MissingModelOutput;
             return &self.outputs[0];
         }
     };
@@ -350,6 +350,15 @@ pub const RerankingPipeline = struct {
         }
     }
 };
+
+test "reranking text run reports missing model output instead of panicking" {
+    const run = RerankingPipeline.TextRun{
+        .allocator = std.testing.allocator,
+        .outputs = &.{},
+    };
+
+    try std.testing.expectError(error.MissingModelOutput, run.output());
+}
 
 pub fn lateInteractionScore(
     query_hidden: []const f32,
