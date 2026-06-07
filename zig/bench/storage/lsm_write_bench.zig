@@ -87,6 +87,7 @@ const WorkloadSet = enum {
     all,
     hot_overwrite,
     l0_pressure,
+    ingest_compact,
 };
 
 const KeySet = struct {
@@ -628,6 +629,18 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
 
+                if (cfg.workload_set == .ingest_compact) {
+                    var scenario = try Scenario.init(alloc, cfg, sample_index, storage_mode, batch_mode, "ingest_compact");
+                    defer scenario.deinit();
+
+                    try runTimed(out, &stdout_writer, &scenario, "ingest_compact", random_keys.len, struct {
+                        fn run(ctx: *Scenario, local_keys: []const []u8, local_value: []const u8) !void {
+                            try benchIngestCompact(ctx, local_keys, local_value);
+                        }
+                    }.run, random_keys, value);
+                    continue;
+                }
+
                 {
                     const hot_len = @min(cfg.hot_keys, keys.keys.len);
                     var scenario = try Scenario.init(alloc, cfg, sample_index, storage_mode, batch_mode, "hot_overwrite");
@@ -922,6 +935,21 @@ fn benchHotOverwriteNoReaders(scenario: *Scenario, keys: []const []u8, value: []
     try scenario.finalizeWrites(session_active);
 }
 
+fn benchIngestCompact(scenario: *Scenario, keys: []const []u8, value: []const u8) !void {
+    // Random-order ingest using the configured flush thresholds, then drain all
+    // pending compaction work so the measured region captures the full
+    // end-to-end write amplification (flush outputs + every compaction rewrite)
+    // and the final on-disk shape (max level, run bytes).
+    try benchLoad(scenario, keys, value, false);
+    var guard: usize = 0;
+    const guard_limit: usize = 1_000_000;
+    while (try scenario.backend.runMaintenanceStep()) {
+        guard += 1;
+        if (guard >= guard_limit) break;
+    }
+    try scenario.finalizeWrites(false);
+}
+
 fn benchMaintenance(scenario: *Scenario) !void {
     var steps: usize = 0;
     while (steps < scenario.cfg.hot_maintenance_steps) : (steps += 1) {
@@ -1145,6 +1173,7 @@ fn logicalValueWriteBytes(workload: []const u8, ops: usize, value_size: usize) u
         std.mem.eql(u8, workload, "load_random") or
         std.mem.eql(u8, workload, "load_base") or
         std.mem.eql(u8, workload, "load_l0_runs") or
+        std.mem.eql(u8, workload, "ingest_compact") or
         std.mem.eql(u8, workload, "overwrite_strided") or
         std.mem.eql(u8, workload, "overwrite_hotset"))
     {
