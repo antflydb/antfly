@@ -1393,6 +1393,17 @@ pub const ProvisionedTableWriteCache = struct {
         return self.leaseEntryLocked(best_entry.?);
     }
 
+    fn leaseLsmObsoleteReclaimDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
+        for (self.entries.items) |entry| {
+            if (entry.bulk_ingest_session_open) continue;
+            if (entry.db.hasActiveDenseBulkWork()) continue;
+            if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                if (delay_ns == 0) return self.leaseEntryLocked(entry);
+            }
+        }
+        return null;
+    }
+
     pub fn leaseLsmMaintenanceRoundLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
         return self.leaseLsmMaintenanceEntryLocked(false);
     }
@@ -3944,6 +3955,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (cache.maxLsmMaintenanceScoreLocked() != 0) {
                 if (cache.leaseLsmMaintenanceRoundBestEffortLocked()) |lease| break :blk lease;
             }
+            if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
             if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return false;
             primary_only = true;
             break :blk cache.leasePrimaryLsmMaintenanceRoundBestEffortLocked() orelse return false;

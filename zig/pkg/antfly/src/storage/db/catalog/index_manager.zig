@@ -2135,7 +2135,8 @@ pub const IndexManager = struct {
         var best_score: u64 = 0;
 
         for (self.text_indexes.items, 0..) |*entry, i| {
-            const score = entry.persistent.lsmMaintenanceDebtHint();
+            const raw_score = entry.persistent.lsmMaintenanceDebtHint();
+            const score = if (raw_score != 0) raw_score else if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| if (delay_ns == 0) @as(u64, 1) else @as(u64, 0) else @as(u64, 0);
             if (score > best_score) {
                 best_score = score;
                 best_kind = .text;
@@ -2143,7 +2144,8 @@ pub const IndexManager = struct {
             }
         }
         for (self.dense_indexes.items, 0..) |*entry, i| {
-            const score = entry.index.lsmMaintenanceDebtHint();
+            const raw_score = entry.index.lsmMaintenanceDebtHint();
+            const score = if (raw_score != 0) raw_score else if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| if (delay_ns == 0) @as(u64, 1) else @as(u64, 0) else @as(u64, 0);
             if (score > best_score) {
                 best_score = score;
                 best_kind = .dense;

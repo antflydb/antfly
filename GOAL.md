@@ -46,6 +46,11 @@ The 50k sanity case on `e24a9140` was healthy:
 - An earlier 1M run ended with about 1319 primary table run files and a 26G data root.
 - A previous clean 1M run had an 88M primary table manifest and slow query-worker readonly opens around 6.8s.
 - HBC/dense index state was comparatively small and usually looked ready or nearly drained when query shape was poor.
+- `hbc-write-bench --inspect-root` now reports active table bytes, obsolete table bytes, due/future obsolete counts using the storage clock, manifest bytes, and embedded bloom-filter bytes for existing LSM roots.
+- Corrected root inspection changed the 50k disk diagnosis: `/private/tmp/antfly-vdbbench-obsolete-due-fix-50k-20260607` is now 368M with zero obsolete primary or dense paths after the retention/shutdown cleanup path.
+- The old 1M reclaim-deadline root is still 17G because it has due obsolete files that cannot be reclaimed by reopening that root: primary has 4.19G active table runs plus 8.29G due obsolete files; dense has 257M active table runs plus 4.36G due obsolete files.
+- That same 1M primary manifest is 269.5M, of which 269.48M is embedded bloom filters. The dense manifest is 8.39M, also almost entirely bloom filters. The old root fails reopen because the primary manifest exceeds the current 128M manifest read cap; raising the cap would be a recovery workaround, not the underlying memory/disk fix.
+- The dense HBC index does not directly store raw vectors in the dense LSM for this workload; vector values are served through the external loader path, while the dense LSM stores HBC nodes, quantized payloads, metadata, and vec-id mappings.
 - Table status now exposes a richer `storage_status.lsm` snapshot for benchmark artifacts: total/L0/lower-level run shape, compactable and overlapping L0 pressure, configured L0 limits, write-stall debt, overflow debt, obsolete path count, current manifest bytes, active bulk/readers, dirty manifest flags, maintenance score, and maintenance debt hint.
 - Full `/metrics` scraping can perturb runs because metrics collection may walk LSM maintenance stats. Use sparse sampling or targeted artifacts during benchmarks.
 - The current VDBBench adapter defaults to `/db/v1`; Antfly v0.1 used `/api/v1`.
@@ -158,6 +163,7 @@ The latest 1M abort suggests faster upload can make this worse by publishing L0 
   Current status: table status exposes the LSM run/pressure shape, current manifest bytes, score fields, and live write counters when a writer DB is leased.
 - Break down readonly DB open profiling inside `openCoreResourcesFromPrimaryStore`, especially manifest load, range/shard/schema reads, and index manager open.
 - Save final primary and dense index LSM shape summaries after VDBBench load.
+- Track manifest bloom-filter bytes separately from manifest metadata. Evaluate reducing bloom bits, lazy-loading table filters, or moving filters out of the manifest before increasing the manifest read cap as a default.
 
 Success condition:
 Every benchmark result can answer: how many primary runs existed at query start, how large was the primary manifest, and how long did readonly open spend on storage.

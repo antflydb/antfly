@@ -121,10 +121,32 @@ pub const Run = struct {
 
     pub fn ensureBloomFilter(self: *Run, allocator: Allocator) !bloom.OwnedFilter {
         if (self.bloom_filter) |filter| return filter;
-        const encoded = self.encoded_bloom_filter orelse return error.RunBloomFilterUnavailable;
-        self.bloom_filter = try bloom.OwnedFilter.decodeAlloc(allocator, encoded);
-        self.owns_bloom_filter = true;
-        return self.bloom_filter.?;
+        if (self.encoded_bloom_filter) |encoded| {
+            self.bloom_filter = try bloom.OwnedFilter.decodeAlloc(allocator, encoded);
+            self.owns_bloom_filter = true;
+            return self.bloom_filter.?;
+        }
+        var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
+        defer native.deinit();
+        return try self.ensureBloomFilterWithStorage(allocator, native.storage());
+    }
+
+    pub fn ensureBloomFilterWithOptionalStorage(self: *Run, allocator: Allocator, storage: ?storage_io.Storage) !bloom.OwnedFilter {
+        if (storage) |concrete| return try self.ensureBloomFilterWithStorage(allocator, concrete);
+        return try self.ensureBloomFilter(allocator);
+    }
+
+    pub fn ensureBloomFilterWithStorage(self: *Run, allocator: Allocator, storage: storage_io.Storage) !bloom.OwnedFilter {
+        if (self.bloom_filter) |filter| return filter;
+        if (self.encoded_bloom_filter) |encoded| {
+            self.bloom_filter = try bloom.OwnedFilter.decodeAlloc(allocator, encoded);
+            self.owns_bloom_filter = true;
+            return self.bloom_filter.?;
+        }
+        if (self.table_index) |index| return index.filter;
+        const path = self.path orelse return error.RunBloomFilterUnavailable;
+        self.table_index = try loadRunTableIndexAllocWithStorage(storage, allocator, path);
+        return self.table_index.?.filter;
     }
 };
 
@@ -256,8 +278,6 @@ pub fn loadManifestIfPresentWithStorage(
     next_run_id.* = decoded.next_run_id;
     try runs.ensureTotalCapacity(allocator, decoded.runs.len);
     for (decoded.runs) |*meta| {
-        if (meta.bloom_filter.len == 0) return error.MissingRunBloomFilter;
-
         try runs.append(allocator, .{
             .id = meta.id,
             .level = meta.level,
@@ -270,7 +290,7 @@ pub fn loadManifestIfPresentWithStorage(
             .largest_key = @constCast(meta.largest_key),
             .entry_count = meta.entry_count,
             .bloom_filter = null,
-            .encoded_bloom_filter = @constCast(meta.bloom_filter),
+            .encoded_bloom_filter = null,
             .owns_metadata = false,
             .state = null,
         });
@@ -441,11 +461,6 @@ pub fn persistManifestWithStorageCount(
     var metas = try allocator.alloc(lsm_manifest.RunMeta, runs.len);
     defer allocator.free(metas);
     for (runs, 0..) |run, i| {
-        const encoded_filter = if (run.encoded_bloom_filter) |raw|
-            try allocator.dupe(u8, raw)
-        else
-            try run.bloom_filter.?.encodeAlloc(allocator);
-        errdefer allocator.free(encoded_filter);
         metas[i] = .{
             .id = run.id,
             .level = run.level,
@@ -457,10 +472,8 @@ pub fn persistManifestWithStorageCount(
             .largest_namespace_name = run.largest_namespace_name,
             .largest_key = run.largest_key,
             .entry_count = run.entry_count,
-            .bloom_filter = encoded_filter,
         };
     }
-    defer for (metas) |meta| allocator.free(meta.bloom_filter);
 
     var obsolete_metas = try allocator.alloc(lsm_manifest.ObsoletePathMeta, obsolete_paths.len);
     defer allocator.free(obsolete_metas);
@@ -991,6 +1004,41 @@ const WrittenTableFile = struct {
     size_bytes: u64,
     compression_stats: lsm_table_file.CompressionStats,
 };
+
+test "repository manifest persist omits run bloom filters" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const encoded_filter = try allocator.alloc(u8, 1024 * 1024);
+    @memset(encoded_filter, 0xaa);
+
+    var run = Run{
+        .id = 1,
+        .level = 0,
+        .size_bytes = 4096,
+        .path = try allocator.dupe(u8, "/repository-manifest-small/runs/1.tbl"),
+        .smallest_namespace_name = try allocator.dupe(u8, "docs"),
+        .smallest_key = try allocator.dupe(u8, "doc:a"),
+        .largest_namespace_name = try allocator.dupe(u8, "docs"),
+        .largest_key = try allocator.dupe(u8, "doc:z"),
+        .entry_count = 128,
+        .bloom_filter = null,
+        .encoded_bloom_filter = encoded_filter,
+        .state = null,
+    };
+    defer run.deinit(allocator);
+
+    var runs = [_]Run{run};
+    const written = try persistManifestWithStorageCount(storage.storage(), allocator, "/repository-manifest-small", 2, &runs, &.{});
+    try std.testing.expect(written < 512);
+
+    const manifest_path = try joinPath(allocator, "/repository-manifest-small", "manifest.bin");
+    defer allocator.free(manifest_path);
+    const raw = try storage.storage().readFileAlloc(allocator, manifest_path, 1024);
+    defer allocator.free(raw);
+    try std.testing.expect(raw.len < 512);
+}
 
 test "repository streams state run publication through table builder accounting" {
     const allocator = std.testing.allocator;

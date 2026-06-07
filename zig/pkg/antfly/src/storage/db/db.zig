@@ -3462,7 +3462,8 @@ pub const DB = struct {
         defer self.core.unlockApply();
 
         const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
-        if (primary_score > 0) {
+        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        if (primary_score > 0 or primary_reclaim_due) {
             if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
         }
         if (try self.core.index_manager.runLsmMaintenanceStepBestEffort()) return true;
@@ -3477,7 +3478,8 @@ pub const DB = struct {
         defer self.core.unlockApply();
 
         const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
-        if (primary_score == 0) return false;
+        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        if (primary_score == 0 and !primary_reclaim_due) return false;
         if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
         self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         return false;

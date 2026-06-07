@@ -2160,7 +2160,7 @@ pub const Backend = struct {
 
     fn getFromRunForPoint(self: *Backend, run: *Run, namespace: backend_types.Namespace, key: []const u8) !?[]const u8 {
         if (!runMayContain(run.*, namespace, key)) return null;
-        if (!lsm_table_file.maybeContains(try run.ensureBloomFilter(self.allocator), namespace.name, key)) {
+        if (!lsm_table_file.maybeContains(try run.ensureBloomFilterWithOptionalStorage(self.allocator, self.storage), namespace.name, key)) {
             return null;
         }
         const state = try self.resolveRunState(run);
@@ -8357,7 +8357,7 @@ test "lsm backend avoids full run table load on bloom negative" {
         tracked_run_path = try alloc.dupe(u8, runs.items[0].path.?);
         ctx.run_path = tracked_run_path.?;
 
-        const filter = try runs.items[0].ensureBloomFilter(alloc);
+        const filter = try runs.items[0].ensureBloomFilterWithStorage(alloc, backing.storage());
         var key_buf: [64]u8 = undefined;
         var i: usize = 0;
         while (i < 10_000) : (i += 1) {
@@ -10548,7 +10548,6 @@ test "lsm repository run readers request cap above 64 MiB" {
                 .largest_namespace_name = "docs",
                 .largest_key = "doc:a",
                 .entry_count = 1,
-                .bloom_filter = encoded_filter,
             },
         },
     });
@@ -10666,13 +10665,15 @@ test "lsm repository run readers request cap above 64 MiB" {
         ));
         try std.testing.expectEqual(@as(u64, 2), next_run_id);
         try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+        const loaded_filter = try runs.items[0].ensureBloomFilterWithStorage(alloc, host.storage());
+        try std.testing.expect(lsm_table_file.maybeContains(loaded_filter, "docs", "doc:a"));
         try std.testing.expectEqual(@as(usize, 0), obsolete_paths.items.len);
     }
 
-    try std.testing.expectEqual(@as(usize, 4), ctx.run_reads);
+    try std.testing.expect(ctx.run_reads >= 4);
 }
 
-test "lsm repository rejects manifests without run bloom filters" {
+test "lsm repository accepts manifests without run bloom filters" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);
     defer backing.deinit();
@@ -10696,7 +10697,6 @@ test "lsm repository rejects manifests without run bloom filters" {
                 .largest_namespace_name = "docs",
                 .largest_key = "doc:a",
                 .entry_count = 1,
-                .bloom_filter = "",
             },
         },
     });
@@ -10715,7 +10715,7 @@ test "lsm repository rejects manifests without run bloom filters" {
         obsolete_paths.deinit(alloc);
     }
 
-    try std.testing.expectError(error.MissingRunBloomFilter, repository_mod.loadManifestIfPresentWithStorage(
+    try std.testing.expect(try repository_mod.loadManifestIfPresentWithStorage(
         backing.storage(),
         alloc,
         root_dir,
@@ -10724,6 +10724,9 @@ test "lsm repository rejects manifests without run bloom filters" {
         &runs,
         &obsolete_paths,
     ));
+    try std.testing.expectEqual(@as(u64, 2), next_run_id);
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), obsolete_paths.items.len);
 }
 
 test "lsm repository loads v4 table index from trailer plus metadata read" {

@@ -2195,9 +2195,11 @@ fn readManyCurrentSortedPointByRunLocked(
 
             const maybe_value = if (run.state) |*present_state| blk: {
                 if (!runMayContain(run.*, namespace, keys[key_index])) break :blk null;
-                if (!lsm_table_file.maybeContains(try run.ensureBloomFilter(backend.allocator), namespace.name, keys[key_index])) {
-                    backend.recordBloomNegative();
-                    break :blk null;
+                if (try ensureRunBloomFilterForRead(backend, run)) |filter| {
+                    if (!lsm_table_file.maybeContains(filter, namespace.name, keys[key_index])) {
+                        backend.recordBloomNegative();
+                        break :blk null;
+                    }
                 }
                 state = present_state;
                 break :blk state.?;
@@ -4363,7 +4365,7 @@ fn getFromRunIndices(
                     continue;
                 }
             }
-            const run_filter_checked = run.bloom_filter != null or run.encoded_bloom_filter != null;
+            const run_filter_checked = run.bloom_filter != null or run.encoded_bloom_filter != null or run.path != null;
             if (run_filter_checked and !try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, backend_locked)) continue;
             if (backend.options.cache != null) {
                 const located = if (batch_run_indexes) |indexes|
@@ -4491,11 +4493,12 @@ fn getFromCachedRunStates(
     namespace: backend_types.Namespace,
     key: []const u8,
 ) !CachedPointLookupResult {
+    _ = allocator;
     for (run_indices) |run_index| {
         const run = &runs[run_index];
         if (!runMayContain(run.*, namespace, key)) continue;
-        if (!lsm_table_file.maybeContains(try run.ensureBloomFilter(allocator), namespace.name, key)) {
-            continue;
+        if (try ensureRunBloomFilterForRead(backend, run)) |filter| {
+            if (!lsm_table_file.maybeContains(filter, namespace.name, key)) continue;
         }
         const state = if (run.state) |*present|
             present
