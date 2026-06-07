@@ -56,6 +56,15 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 32 * 1024 * 1024,
     .bulk_ingest_flush_threshold_bytes_multiplier = 8,
     .local_block_cache_enabled = false,
+    // Leveled shape: keep the tree shallow for typical shard sizes. The stock
+    // 1 MiB L1 base forces document/embedding shards (hundreds of MiB to multiple
+    // GiB) down through 5+ levels, so every key is rewritten by compaction 5+
+    // times. A 128 MiB L1 base with a 10x fan-out lands a ~1 GiB shard at L2 and
+    // a ~10 GiB shard at L3, cutting compaction write amplification roughly in
+    // half at zero extra memory (the memtable size is unchanged). See
+    // src/storage/lsm/WRITES.md "Level sizing and write amplification".
+    .level_target_bytes_base = 128 * 1024 * 1024,
+    .level_target_bytes_multiplier = 10,
     .l0_soft_limit_runs = 32,
     .l0_hard_limit_runs = 128,
     .l0_soft_limit_bytes = 512 * 1024 * 1024,
@@ -71,6 +80,9 @@ pub const text_main_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 16 * 1024 * 1024,
     .bulk_ingest_flush_threshold_bytes_multiplier = 4,
     .local_block_cache_enabled = false,
+    // Shallow leveled shape (see primary_lsm_options_default for rationale).
+    .level_target_bytes_base = 128 * 1024 * 1024,
+    .level_target_bytes_multiplier = 10,
     .l0_soft_limit_runs = 32,
     .l0_hard_limit_runs = 128,
     .l0_soft_limit_bytes = 256 * 1024 * 1024,
@@ -86,6 +98,9 @@ pub const text_wal_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 16 * 1024 * 1024,
     .bulk_ingest_flush_threshold_bytes_multiplier = 4,
     .local_block_cache_enabled = false,
+    // Shallow leveled shape (see primary_lsm_options_default for rationale).
+    .level_target_bytes_base = 128 * 1024 * 1024,
+    .level_target_bytes_multiplier = 10,
     .l0_soft_limit_runs = 32,
     .l0_hard_limit_runs = 128,
     .l0_soft_limit_bytes = 256 * 1024 * 1024,
@@ -103,6 +118,11 @@ pub const dense_hbc_lsm_options_default = lsm_backend_mod.Options{
     .local_block_cache_enabled = false,
     .compact_threshold_runs = 8,
     .l0_overlap_compact_threshold_runs = 2,
+    // Shallow leveled shape. Dense HBC payloads (quantized vectors + graph) are
+    // larger per shard and use a 128 MiB memtable, so the L1 base is set to
+    // 256 MiB (see primary_lsm_options_default for rationale).
+    .level_target_bytes_base = 256 * 1024 * 1024,
+    .level_target_bytes_multiplier = 10,
     .l0_soft_limit_runs = 32,
     .l0_hard_limit_runs = 128,
     .l0_soft_limit_bytes = 1024 * 1024 * 1024,
@@ -125,6 +145,9 @@ pub const graph_reverse_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 16 * 1024 * 1024,
     .bulk_ingest_flush_threshold_bytes_multiplier = 4,
     .local_block_cache_enabled = false,
+    // Shallow leveled shape (see primary_lsm_options_default for rationale).
+    .level_target_bytes_base = 128 * 1024 * 1024,
+    .level_target_bytes_multiplier = 10,
     .l0_soft_limit_runs = 32,
     .l0_hard_limit_runs = 128,
     .l0_soft_limit_bytes = 256 * 1024 * 1024,
@@ -377,6 +400,8 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(index_wal_soft_limit_bytes, opts.text_main_lsm_options.wal_soft_limit_bytes);
     try std.testing.expectEqual(index_wal_hard_limit_bytes, opts.text_main_lsm_options.wal_hard_limit_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.text_main_lsm_options.table_prefix_extractor), .first_separator), opts.text_main_lsm_options.table_prefix_extractor);
+    try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), opts.text_main_lsm_options.level_target_bytes_base);
+    try std.testing.expectEqual(@as(usize, 10), opts.text_main_lsm_options.level_target_bytes_multiplier);
     try std.testing.expectEqual(index_wal_soft_limit_segments, opts.text_wal_lsm_options.wal_soft_limit_segments);
     try std.testing.expectEqual(index_wal_hard_limit_segments, opts.text_wal_lsm_options.wal_hard_limit_segments);
     try std.testing.expectEqual(@as(@TypeOf(opts.text_wal_lsm_options.table_prefix_extractor), .first_separator), opts.text_wal_lsm_options.table_prefix_extractor);
@@ -394,6 +419,8 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(index_wal_soft_limit_bytes, opts.dense_lsm_options.wal_soft_limit_bytes);
     try std.testing.expectEqual(index_wal_hard_limit_bytes, opts.dense_lsm_options.wal_hard_limit_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.dense_lsm_options.table_prefix_extractor), .none), opts.dense_lsm_options.table_prefix_extractor);
+    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), opts.dense_lsm_options.level_target_bytes_base);
+    try std.testing.expectEqual(@as(usize, 10), opts.dense_lsm_options.level_target_bytes_multiplier);
     try std.testing.expectEqual(false, opts.dense_lsm_options.direct_bulk_ingest);
     try std.testing.expect(opts.dense_lsm_options.obsolete_retention_ns > 0);
     try std.testing.expectEqual(sparse_mod.SparseBackend.lsm, opts.sparse_backend);
@@ -407,6 +434,8 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(@TypeOf(opts.graph_reverse_lsm_options.table_prefix_extractor), .first_separator), opts.graph_reverse_lsm_options.table_prefix_extractor);
     const primary_opts = primary_lsm_options_default;
     try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), primary_opts.flush_threshold_bytes);
+    try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), primary_opts.level_target_bytes_base);
+    try std.testing.expectEqual(@as(usize, 10), primary_opts.level_target_bytes_multiplier);
     try std.testing.expectEqual(@as(usize, 32), primary_opts.l0_soft_limit_runs);
     try std.testing.expectEqual(primary_wal_soft_limit_segments, primary_opts.wal_soft_limit_segments);
     try std.testing.expectEqual(primary_wal_hard_limit_segments, primary_opts.wal_hard_limit_segments);

@@ -124,6 +124,58 @@ The durable write path should look closer to Lucene/Tantivy/Pebble:
 - HBC supports both online mutation and offline bulk construction.
 - Large loads publish sorted table files and HBC nodes once, instead of repeatedly growing and compacting online state.
 
+## Level sizing and write amplification
+
+Leveled compaction rewrites each key once per level it descends through, so the
+number of levels a shard's data spans is the dominant lever on compaction write
+amplification. Level `L`'s byte target is `level_target_bytes_base *
+level_target_bytes_multiplier^(L-1)`, so a shard's data settles at the shallowest
+level whose target is at least the shard size, and write amplification is
+approximately that level number plus one (the flush).
+
+The stock `Options` defaults (`level_target_bytes_base = 1 MiB`,
+`level_target_bytes_multiplier = 8`) were tuned for tiny stores. For
+document/embedding shards — hundreds of MiB to several GiB — a 1 MiB L1 base
+forces the data down through five or more levels, so every key is rewritten by
+compaction five-plus times. None of the `db/config.zig` document-data profiles
+overrode this, so the production docstore, text, graph, and dense indexes all
+inherited the deep tree.
+
+### Experiment (2026-06-06)
+
+Measured with `zig build lsm-write-bench -- --workload-set ingest_compact`, which
+does a random-order keyed-value load (incompressible, embedding-like values) at
+the profile's flush threshold, then drains all compaction so the timed region
+captures the full end-to-end write amplification and final on-disk shape. Dataset
+500k x 1536 B = 732 MiB logical, host storage.
+
+| L1 base | multiplier | memtable | write amp | ops/sec | max level | peak RSS |
+| ------- | ---------- | -------- | --------- | ------- | --------- | -------- |
+| 1 MiB   | 8 (stock)  | 16 MiB   | 8.23x     | 4,758   | 5         | 6.8 GiB  |
+| 128 MiB | 10         | 16 MiB   | 5.44x     | 8,849   | 2         | 4.6 GiB  |
+| 128 MiB | 10         | 64 MiB   | 3.24x     | 10,731  | 2         | n/a      |
+
+The shape fix alone (L1 base 1 MiB -> 128 MiB, multiplier 8 -> 10) cut write
+amplification by a third, nearly doubled ingest throughput, and *lowered* peak
+memory (shallower trees produce less transient compaction churn) — all without
+changing the memtable size, so steady-state RAM is unchanged. Enlarging the
+memtable on top of the fix helps further but trades memory; the shape change is
+the free win. Full-workload runs (`--workload-set all`) showed no regression on
+the sorted-load, overwrite, or hot-overwrite paths.
+
+### Decision
+
+`db/config.zig` now pins the leveled shape on the document-data profiles:
+
+- `primary`, `text_main`, `text_wal`, `graph_reverse`/`sparse`: L1 base 128 MiB,
+  multiplier 10. A ~1 GiB shard lands at L2, ~10 GiB at L3.
+- `dense_hbc`: L1 base 256 MiB, multiplier 10 (larger per-record payloads and a
+  128 MiB memtable).
+
+The global `Options` defaults are intentionally left small so tiny internal
+stores (raft apply log, WAL index, derived queues) keep shallow trees without a
+giant single-run L1; only the document-data profiles opt into the larger base.
+
 ## Implementation Roadmap
 
 Current status:
