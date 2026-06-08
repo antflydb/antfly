@@ -353,7 +353,6 @@ pub fn persistRunFileWithStorageAccounted(
     if (run.owns_bloom_filter) {
         if (run.bloom_filter) |*filter| filter.deinit(allocator);
     }
-    if (run.owns_metadata) {}
     run.size_bytes = persisted.size_bytes;
     run.compression_stats = persisted.compression_stats;
     run.bloom_filter = persisted.filter;
