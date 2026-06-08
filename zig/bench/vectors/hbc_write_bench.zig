@@ -26,6 +26,7 @@ const vec = antfly.vector;
 
 const Config = struct {
     inspect_root: ?[]const u8 = null,
+    inspect_maintenance_steps: usize = 0,
     samples: usize = 3,
     vectors: usize = 10_000,
     dims: usize = 128,
@@ -359,6 +360,9 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     if (cfg.inspect_root) |root| {
+        if (cfg.inspect_maintenance_steps > 0) {
+            try runRootMaintenance(allocator, root, cfg.inspect_maintenance_steps);
+        }
         try inspectRoot(out, allocator, root);
         try stdout_writer.flush();
         return;
@@ -947,6 +951,25 @@ fn inspectRoot(writer: anytype, allocator: Allocator, root_dir: []const u8) !voi
     );
 }
 
+fn runRootMaintenance(allocator: Allocator, root_dir: []const u8, max_steps: usize) !void {
+    var native = try lsm_backend.storage_io.NativeStorage.init(allocator, .threaded);
+    defer native.deinit();
+
+    var backend = try lsm_backend.Backend.open(allocator, root_dir, .{
+        .backend = .{ .create_if_missing = false },
+        .storage = native.storage(),
+    });
+    defer {
+        backend.options.backend.read_only = true;
+        backend.close();
+    }
+
+    var steps: usize = 0;
+    while (steps < max_steps) : (steps += 1) {
+        if (!try backend.runMaintenanceStep()) break;
+    }
+}
+
 fn analyzeRunTable(
     allocator: Allocator,
     storage: lsm_backend.Storage,
@@ -1104,6 +1127,8 @@ fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
         } else if (std.mem.eql(u8, arg, "--inspect-root")) {
             const value = args.next() orelse return error.InvalidArgument;
             cfg.inspect_root = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, arg, "--maintenance-steps")) {
+            cfg.inspect_maintenance_steps = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--vectors")) {
             cfg.vectors = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--dims")) {

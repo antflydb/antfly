@@ -1404,6 +1404,16 @@ pub const ProvisionedTableWriteCache = struct {
         return null;
     }
 
+    fn leasePrimaryLsmObsoleteReclaimDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
+        for (self.entries.items) |entry| {
+            if (entry.bulk_ingest_session_open) continue;
+            if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                if (delay_ns == 0) return self.leaseEntryLocked(entry);
+            }
+        }
+        return null;
+    }
+
     pub fn leaseLsmMaintenanceRoundLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
         return self.leaseLsmMaintenanceEntryLocked(false);
     }
@@ -1426,7 +1436,14 @@ pub const ProvisionedTableWriteCache = struct {
         var score: u64 = 0;
         for (self.entries.items) |entry| {
             if (entry.bulk_ingest_session_open) continue;
-            score = @max(score, entry.db.primaryLsmMaintenanceDebtHint());
+            const raw_score = entry.db.primaryLsmMaintenanceDebtHint();
+            const reclaim_score: u64 = if (raw_score == 0) blk: {
+                if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                    break :blk if (delay_ns == 0) @as(u64, 1) else @as(u64, 0);
+                }
+                break :blk 0;
+            } else 0;
+            score = @max(score, @max(raw_score, reclaim_score));
         }
         return score;
     }
@@ -3954,6 +3971,10 @@ pub const ProvisionedTableWriteSource = struct {
                 if (cache.leaseLsmMaintenanceRoundBestEffortLocked()) |lease| break :blk lease;
             }
             if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
+            if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| {
+                primary_only = true;
+                break :blk lease;
+            }
             if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return false;
             primary_only = true;
             break :blk cache.leasePrimaryLsmMaintenanceRoundBestEffortLocked() orelse return false;

@@ -3426,8 +3426,12 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
 
-        const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
-        const index_score = self.core.index_manager.lsmMaintenanceScore();
+        const primary_raw_score = self.core.primary_store_owner.lsmMaintenanceScore();
+        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        const primary_score = if (primary_raw_score != 0 or !primary_reclaim_due) primary_raw_score else 1;
+        const index_raw_score = self.core.index_manager.lsmMaintenanceScore();
+        const index_reclaim_due = if (self.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        const index_score = if (index_raw_score != 0 or !index_reclaim_due) index_raw_score else 1;
         if (primary_score == 0 and index_score == 0) {
             self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
             self.core.index_manager.refreshLsmMaintenanceDebtHint();

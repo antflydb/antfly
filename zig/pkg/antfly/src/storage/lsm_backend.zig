@@ -1377,6 +1377,12 @@ pub const Backend = struct {
         const before_compactions = self.compaction_stats.compactions;
         const before_manifest_writes = self.write_stats.manifest_writes;
 
+        if (self.root_dir != null and self.hasReclaimableObsoletePathsLocked()) {
+            try self.persistManifest();
+            _ = self.refreshCachedMaintenanceHintLocked();
+            return self.write_stats.manifest_writes != before_manifest_writes;
+        }
+
         if (self.shouldFlushMutable() or try self.shouldFlushMutableForWalPressureLocked()) {
             try self.rotateMutableToImmutable();
         }
@@ -3605,6 +3611,11 @@ pub const Backend = struct {
 
     fn finalizeDeferredRunWork(self: *Backend, options: DeferredRunWorkOptions) !void {
         if (self.options.backend.read_only) return;
+        if (self.root_dir != null and self.hasReclaimableObsoletePathsLocked()) {
+            try self.persistManifest();
+            _ = self.refreshCachedMaintenanceHintLocked();
+            if (!options.force_soft_compaction and !self.options.foreground_soft_compaction) return;
+        }
         try self.enforceWritePressure();
         if (!self.bulkIngestActive() and (options.force_soft_compaction or self.options.foreground_soft_compaction)) {
             try self.maybeCompactRuns();
@@ -11423,6 +11434,86 @@ test "lsm backend maintenance step reclaims expired clean obsolete paths" {
 
     try std.testing.expectEqual(@as(usize, 1), backend.obsolete_paths.items.len);
     try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+}
+
+test "lsm backend maintenance step prioritizes due obsolete reclaim before compaction" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-maintenance-obsolete-before-compaction";
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .l0_soft_limit_runs = 100,
+        .obsolete_retention_ns = 0,
+    });
+    defer backend.close();
+
+    var key_buf: [16]u8 = undefined;
+    for (0..4) |i| {
+        var txn = try backend.beginWrite();
+        const key = try std.fmt.bufPrint(&key_buf, "k:{d}", .{i});
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+        try backend.sync(true);
+    }
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 1);
+
+    backend.options.l0_soft_limit_runs = 1;
+
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 999);
+    defer alloc.free(obsolete_path);
+    try repository_mod.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
+    try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+    backend.manifest_dirty = false;
+
+    const before_compactions = backend.compaction_stats.compactions;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(before_compactions, backend.compaction_stats.compactions);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+}
+
+test "lsm backend finalization prioritizes due obsolete reclaim before compaction" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-finalize-obsolete-before-compaction";
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .l0_soft_limit_runs = 100,
+        .obsolete_retention_ns = 0,
+    });
+    defer backend.close();
+
+    var key_buf: [16]u8 = undefined;
+    for (0..4) |i| {
+        var txn = try backend.beginWrite();
+        const key = try std.fmt.bufPrint(&key_buf, "k:{d}", .{i});
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+        try backend.sync(true);
+    }
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 1);
+
+    backend.options.l0_soft_limit_runs = 1;
+
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 1000);
+    defer alloc.free(obsolete_path);
+    try repository_mod.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
+    try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+    backend.manifest_dirty = false;
+
+    const before_compactions = backend.compaction_stats.compactions;
+    try backend.finalizeDeferredStorageWork();
+    try std.testing.expectEqual(before_compactions, backend.compaction_stats.compactions);
     try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
     try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
 }
