@@ -1515,16 +1515,9 @@ fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Alloc
 }
 
 fn parseInferenceVariantsFile(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8) !void {
-    if (c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_variants.json")) |variants_bytes| {
-        defer allocator.free(variants_bytes);
-        try parseInferenceVariantsJson(manifest, allocator, model_dir_path, variants_bytes);
-        return;
-    } else |_| {}
-
-    if (c_file.readFileFromDir(allocator, model_dir_path, "termite_variants.json")) |variants_bytes| {
-        defer allocator.free(variants_bytes);
-        try parseInferenceVariantsJson(manifest, allocator, model_dir_path, variants_bytes);
-    } else |err| return err;
+    const variants_bytes = try c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_variants.json");
+    defer allocator.free(variants_bytes);
+    try parseInferenceVariantsJson(manifest, allocator, model_dir_path, variants_bytes);
 }
 
 fn parseGliner2InferenceVariantsJson(
@@ -2252,9 +2245,9 @@ test "manifest parses clipclap variants gguf pair" {
     try std.testing.expect(manifest.hasInput("audio"));
 }
 
-test "manifest loads legacy termite clipclap variants before first gguf fallback" {
+test "manifest loads canonical antfly clipclap variants before first gguf fallback" {
     const allocator = std.testing.allocator;
-    const dir_path = try testScratchDir(allocator, "manifest-clipclap-legacy-variants");
+    const dir_path = try testScratchDir(allocator, "manifest-clipclap-canonical-variants");
     defer {
         compat.cwd().deleteTree(compat.io(), dir_path) catch {};
         allocator.free(dir_path);
@@ -2280,7 +2273,7 @@ test "manifest loads legacy termite clipclap variants before first gguf fallback
         .data = "{\"model_type\":\"clipclap\",\"text_config\":{\"max_position_embeddings\":77}}",
     });
 
-    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "termite_variants.json" });
+    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
     defer allocator.free(variants_path);
     try compat.cwd().writeFile(compat.io(), .{
         .sub_path = variants_path,
