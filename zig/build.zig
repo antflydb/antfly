@@ -3498,6 +3498,7 @@ pub fn build(b: *std.Build) void {
     const api_table_writes_docid_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
+            "api auto bulk ingest does not open sessions for normal online writes",
             "provisioned table write source rejects stale doc identity namespace before write",
             "bound table write source backs up and restores a local table",
             "provisioned table restore rejects mismatched doc identity namespace",

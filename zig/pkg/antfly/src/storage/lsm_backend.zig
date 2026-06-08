@@ -3453,6 +3453,17 @@ pub const Backend = struct {
         return self.active_bulk_ingest_batches != 0;
     }
 
+    pub fn shouldDrainMutableBeforeDirectBulkIngest(self: *const Backend, incoming: *const ActiveMemTable) bool {
+        if (self.mutable.entries.items.len == 0) return false;
+        if (self.active_bulk_ingest_batches <= 1) return false;
+        if (self.activeImmutableMemtableCount() != 0) return false;
+        const byte_threshold = self.effectiveFlushThresholdBytes();
+        if (byte_threshold > 0) {
+            return estimateStateBytes(&self.mutable) +| estimateStateBytes(incoming) >= byte_threshold;
+        }
+        return self.mutable.entries.items.len + incoming.entries.items.len >= self.effectiveFlushThreshold();
+    }
+
     fn writePressureDuringBulkIngestEnabled(self: *const Backend) bool {
         return self.options.write_pressure_during_bulk_ingest or writePressureDuringBulkIngestEnvEnabled();
     }
@@ -6008,6 +6019,51 @@ test "lsm backend direct-ingests threshold-sized bulk batches" {
     try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings("D", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:d"));
+}
+
+test "lsm backend direct bulk ingest drains existing mutable before threshold batch" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 4,
+    });
+    defer backend.close();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.put(.{ .name = "docs" }, "doc:b", "B");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:c", "C");
+        try txn.put(.{ .name = "docs" }, "doc:d", "D");
+        try txn.put(.{ .name = "docs" }, "doc:e", "E");
+        try txn.put(.{ .name = "docs" }, "doc:f", "F");
+        try txn.commit();
+    }
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
+    try std.testing.expectEqual(@as(u64, 0), stats.flushes);
+    try std.testing.expectEqual(@as(u64, 2), stats.sorted_ingest_runs);
+    try std.testing.expectEqual(@as(u64, 2), stats.direct_bulk_ingest_attempts);
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_fallback_below_threshold);
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+    try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("F", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:f"));
 }
 
 test "lsm backend direct bulk ingest cursor hides older overlapping l0 values" {

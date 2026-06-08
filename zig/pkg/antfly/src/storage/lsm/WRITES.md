@@ -135,7 +135,8 @@ Current status:
 - Native 100k baselines are checked in under `bench/baselines/` for LSM writes, HBC writes, and full-text segment writes.
 - Derived dense replay now threads `.bulk_ingest` into the HBC insert choice: empty indexes use the HBC bulk builder, and replay batches whose vector IDs were newly allocated skip per-vector existence probes.
 - HBC leaf-write coalescing is implemented behind `BatchInsertOptions.coalesce_leaf_writes`. It reduces bytes but can be slower than the absent-id path, so production only enables it for bulk replay batches where vector IDs are known-new.
-- LSM bulk-ingest exit now keeps the elevated mutable threshold instead of flushing at every `.bulk_ingest` transaction boundary. An explicit backend bulk-ingest session can now span many API/replay batches so direct-ingested runs keep one manifest publication for the whole ingest window.
+- Online DB writes now split from true bulk ingest. Normal API/VectorDBBench writes use ordinary storage write mode; provisioned API writes no longer open automatic long-lived bulk sessions for normal upload. Flush, L0 pressure, and maintenance remain storage-owned. A 50k run with an automatic per-batch `.bulk_ingest` hint improved final query shape but regressed insert; a 1M follow-up reached a 17G root before completion and timed out inserts in foreground `enforceWritePressure` compaction. That hint is not the known-best online-write default.
+- LSM bulk-ingest exit keeps the elevated mutable threshold instead of flushing at every `.bulk_ingest` transaction boundary. Explicit backend bulk-ingest sessions remain available for rebuild/import paths that can publish true bulk state, not for ordinary random API upload.
 - Bulk-ingest sessions have two finish modes: the default compacts on session close for normal backend use, while `finishBulkIngestSessionWithOptions(.{ .compact = false })` flushes remaining mutable state, publishes the manifest once, and leaves compaction to a later maintenance window.
 - Dense derived replay now opens an LSM bulk-ingest session around each index catch-up window. It closes with `.compact = false` and a deferred-L0 guardrail, so normal replay gets the one-manifest behavior from the benchmark while still compacting if L0 run count grows past the safety limit.
 - Dense replay batching now allows larger 16k-record/embedding windows before flushing, reducing the number of direct-ingested sorted runs produced during catch-up.
@@ -567,9 +568,10 @@ should keep `active_hbc_quant_value_bytes` close to
 
 ### 2026-04-16 Dense Catch-Up Window And Cleanup
 
-The Go path does not rely on an empty-index HBC bulk builder for normal ingest.
-It relies on a larger Pebble write batch plus writer cache, so repeated HBC node
-and quantized updates coalesce before publication. The Zig async derived worker
+The Go path does not rely on an empty-index HBC bulk builder or API-owned bulk
+session for normal ingest. It relies on Pebble batches/memtables plus writer
+cache behavior, so repeated HBC node and quantized updates can coalesce before
+table publication while Pebble owns flush, compaction, L0 pressure, and stalls. The Zig async derived worker
 was still opening and closing the HBC bulk session around each flushed replay
 batch, even though the replay batcher could apply several batches in one
 catch-up pass.

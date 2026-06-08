@@ -64,9 +64,9 @@ const auto_bulk_ingest_max_window_ops: usize = 25_000;
 const auto_bulk_ingest_max_hbc_leaf_splits_per_publish: usize = 256;
 const provisioned_write_coalesce_max_waiters: usize = 64;
 const provisioned_write_coalesce_max_ops: usize = 10_000;
-// Client-side bulk loads often arrive as serial HTTP chunks. Finish implicit
-// dense bulk ingest windows on max ops or idle, not elapsed open time, so an
-// active upload does not start HBC replay/publish work mid-stream.
+// Explicit cache bulk sessions are reserved for rebuild/import paths. Normal
+// API uploads no longer start these windows automatically; DB/storage owns
+// online write batching and L0 maintenance for ordinary write traffic.
 const auto_bulk_ingest_max_idle_ns: u64 = 2 * std.time.ns_per_s;
 const auto_bulk_ingest_finish_options: backend_types.BulkIngestFinishOptions = .{
     .compact = false,
@@ -363,12 +363,12 @@ pub const ProvisionedTableWriteCache = struct {
         fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
             if (self.bulk_ingest_session_open) {
                 if (self.auto_bulk_ingest_session_open) {
-                    self.db.finishDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
+                    self.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
                         std.log.warn("auto bulk ingest finish failed before cached db close table={s} err={s}", .{
                             self.table_name,
                             @errorName(err),
                         });
-                        self.db.abortDenseAutoBulkIngestSession();
+                        self.db.abortPrimaryStoreAutoBulkIngestSession();
                     };
                 } else {
                     self.db.abortBulkIngestSession();
@@ -1222,7 +1222,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name) or !entry.bulk_ingest_session_open) continue;
             if (entry.auto_bulk_ingest_session_open) {
-                try entry.db.finishDenseAutoBulkIngestSessionWithOptions(options);
+                try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options);
             } else {
                 try entry.db.finishBulkIngestSessionWithOptions(options);
             }
@@ -1242,7 +1242,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name) or !entry.bulk_ingest_session_open) continue;
             if (entry.auto_bulk_ingest_session_open) {
-                entry.db.abortDenseAutoBulkIngestSession();
+                entry.db.abortPrimaryStoreAutoBulkIngestSession();
             } else {
                 entry.db.abortBulkIngestSession();
             }
@@ -1262,7 +1262,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (!entry.bulk_ingest_session_open) {
-                try entry.db.beginDenseAutoBulkIngestSession();
+                try entry.db.beginPrimaryStoreAutoBulkIngestSession();
                 entry.bulk_ingest_session_open = true;
             }
             entry.auto_bulk_ingest_session_open = true;
@@ -1289,7 +1289,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (!entry.auto_bulk_ingest_session_open or !entry.auto_bulk_ingest_finish_requested) return false;
             if (entry.active_leases > 1) return false;
-            try entry.db.rollDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
+            try entry.db.rollPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
             entry.auto_bulk_ingest_session_open = true;
             entry.auto_bulk_ingest_ops = 0;
             entry.auto_bulk_ingest_started_ns = now_ns;
@@ -1303,7 +1303,7 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn finishAutoBulkIngestLocked(self: *ProvisionedTableWriteCache, group_id: u64, table_name: []const u8) !void {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name) or !entry.auto_bulk_ingest_session_open) continue;
-            try entry.db.finishDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
+            try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
             entry.bulk_ingest_session_open = false;
             entry.auto_bulk_ingest_session_open = false;
             entry.auto_bulk_ingest_ops = 0;
@@ -1334,7 +1334,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (!idle_expired and entry.auto_bulk_ingest_finish_requested) {
                 continue;
             } else {
-                entry.db.finishDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
+                entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
                     if (first_err == null) first_err = err;
                     continue;
                 };
@@ -3542,7 +3542,7 @@ pub const ProvisionedTableWriteSource = struct {
         entry: *ProvisionedTableWriteCache.Entry,
     ) !void {
         if (!entry.auto_bulk_ingest_session_open) return;
-        try entry.db.finishDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
+        try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
         entry.bulk_ingest_session_open = false;
         entry.auto_bulk_ingest_session_open = false;
         entry.auto_bulk_ingest_ops = 0;
@@ -5597,7 +5597,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group.group_id);
         defer alloc.free(path);
-        const group_auto_bulk_ops = autoBulkIngestGroupBatchOps(group, req.sync_level);
+        const group_auto_bulk_ops = autoBulkIngestGroupBatchOps(group, req);
         const auto_bulk_now_ns = platform_time.monotonicNs();
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(
@@ -9259,20 +9259,45 @@ fn shouldDrainCachedManagedDbAfterBatch(sync_level: db_mod.types.SyncLevel) bool
     return false;
 }
 
+// Provisioned API writes no longer open automatic bulk-ingest sessions.
+// Large write-only online batches are passed to the DB normally; storage
+// owns mutable flush, L0 pressure, and maintenance scheduling. Explicit
+// cache bulk sessions remain for true rebuild/import paths.
 fn autoBulkIngestBatchOps(req: db_mod.types.BatchRequest) usize {
     _ = req;
-    // Weak-sync writes are already durable in the primary store plus replay
-    // journal. Opening a foreground HBC bulk session here suppresses dense
-    // replay notifications for the entire active upload, so indexing only
-    // becomes query-visible after the writer goes idle. Let the background
-    // derived executor own dense bulk sessions and publish bounded windows.
     return 0;
 }
 
-fn autoBulkIngestGroupBatchOps(group: GroupBatch, sync_level: db_mod.types.SyncLevel) usize {
+fn autoBulkIngestGroupBatchOps(group: GroupBatch, req: db_mod.types.BatchRequest) usize {
     _ = group;
-    _ = sync_level;
+    _ = req;
     return 0;
+}
+
+test "api auto bulk ingest does not open sessions for normal online writes" {
+    var writes: [auto_bulk_ingest_min_batch_ops]db_mod.types.BatchWrite = undefined;
+    try std.testing.expectEqual(@as(usize, 0), autoBulkIngestBatchOps(.{
+        .writes = writes[0..],
+        .sync_level = .write,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), autoBulkIngestBatchOps(.{
+        .writes = writes[0..],
+        .sync_level = .propose,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), autoBulkIngestBatchOps(.{
+        .writes = writes[0..],
+        .sync_level = .full_index,
+    }));
+
+    var group = GroupBatch{ .group_id = 7001 };
+    defer group.deinit(std.testing.allocator);
+    try group.writes.ensureTotalCapacity(std.testing.allocator, auto_bulk_ingest_min_batch_ops);
+    for (0..auto_bulk_ingest_min_batch_ops) |_| {
+        group.writes.appendAssumeCapacity(.{ .key = "doc:bulk", .value = "{}" });
+    }
+    try std.testing.expectEqual(@as(usize, 0), autoBulkIngestGroupBatchOps(group, .{
+        .sync_level = .write,
+    }));
 }
 
 test "weak sync levels do not drain managed db after batch" {

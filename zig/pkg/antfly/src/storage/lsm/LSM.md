@@ -721,6 +721,24 @@ primitives, bulk-ingest modes, and now a bounded node-round maintenance
 scheduler, but it still lacks Pebble's dedicated foreground WAL, immutable
 memtable queue, background worker pool, and mature stall policy.
 
+The intended boundary is now explicit:
+
+- Normal API/VectorDBBench upload is an online write path. The API submits
+  batches as ordinary storage writes and does not open a long-lived API-owned
+  bulk session. Flush, L0 pressure, compaction, stalls, and maintenance
+  scheduling remain storage-owned.
+- True bulk ingest is an external/sorted-ingest or rebuild/import primitive. It
+  is appropriate when the caller can build sorted, final-state table/index data
+  before publication, similar to RocksDB `IngestExternalFile` or Pebble
+  `DB.Ingest`. It is not the default shape for random online POST batches or
+  rewrite-heavy HBC mutation streams. A per-batch `.bulk_ingest` experiment for
+  normal VDBBench upload made insert callers pay foreground pressure compaction
+  and still grew the root aggressively, so it is explicitly not the online
+  design target.
+- Dense/HBC index maintenance should be owned by the derived/index storage
+  workers. The API must not need to optimize or compact an index to make normal
+  writes query-visible.
+
 Current symptoms:
 
 - Successful 50k dense runs can report `compaction_ms=0` while producing tens
@@ -866,12 +884,11 @@ Design target:
 Status: first backend slice implemented
 
 The latest 1M public guardrail showed a specific remaining architectural bug:
-dense query-visible publish is still coupled to LSM cleanup. The public
-auto-bulk path asks for `compact = false`, but it also passes `flush = true`
-and `max_deferred_l0_runs = 64`. In the LSM backend, that path still drains all
-mutable/immutable state and then loops in `compactDeferredL0RunsToLimit()` under
-the backend lock until L0 is below the requested limit. Samples from the failed
-1M run showed the hot stack in:
+normal online writes were being shaped like an API-owned bulk session. That made
+query-visible publish and storage cleanup too easy to couple: an upload could
+accumulate many small primary or HBC L0 runs behind a long-lived session, then
+pay the bill in finish/optimize or dense catch-up. Earlier failed runs showed
+hot stacks like:
 
 - `IndexManager.finishDenseBulkIngestEntryWithOptions`
 - `HBCIndex.finishBulkIngestSessionWithOptions`

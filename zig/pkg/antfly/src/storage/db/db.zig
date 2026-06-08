@@ -3131,14 +3131,11 @@ pub const DB = struct {
     }
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
-        beginExternalDenseBulkSessionTracked(self.async_context);
-        errdefer finishExternalDenseBulkSessionTracked(self.async_context);
         lockApply(self);
         defer self.core.unlockApply();
         const resources = self.core.batchExecutionResources();
         try resources.store.beginBulkIngestSession();
         errdefer resources.store.abortBulkIngestSession();
-        try resources.index_manager.beginDenseBulkIngestSessions();
         try self.configureBulkIngestIdentityAllNewLocked();
         errdefer self.clearBulkIngestIdentityAllNewLocked();
         self.bulk_ingest_coalescer.begin();
@@ -3146,31 +3143,21 @@ pub const DB = struct {
 
     pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
-        var external_session_tracked = true;
-        defer if (external_session_tracked) finishExternalDenseBulkSessionTracked(self.async_context);
-        {
-            lockApply(self);
-            defer self.core.unlockApply();
-            const resources = self.core.batchExecutionResources();
-            var first_err: ?anyerror = null;
-            resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
-                first_err = err;
-            };
-            resources.index_manager.finishDenseBulkIngestSessionsWithOptions(options) catch |err| {
-                if (first_err == null) first_err = err;
-            };
+        lockApply(self);
+        defer self.core.unlockApply();
+        const resources = self.core.batchExecutionResources();
+        resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
             self.bulk_ingest_coalescer.clear(self.alloc);
             self.clearBulkIngestIdentityAllNewLocked();
-            if (first_err) |err| return err;
-        }
-        finishExternalDenseBulkSessionTracked(self.async_context);
-        external_session_tracked = false;
-        flushDeferredExternalBulkExecutorNotificationOrTarget(
-            self.async_context,
-            self.executor,
-            self.core.nextDerivedSequence(),
-        );
-        if (self.async_context.query_visibility_hook) |hook| hook.notify(.publish);
+            return err;
+        };
+        self.bulk_ingest_coalescer.clear(self.alloc);
+        self.clearBulkIngestIdentityAllNewLocked();
+    }
+
+    pub fn rollPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        try self.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options);
+        try self.beginPrimaryStoreAutoBulkIngestSession();
     }
 
     pub fn finishDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
@@ -3228,16 +3215,11 @@ pub const DB = struct {
 
     pub fn abortPrimaryStoreAutoBulkIngestSession(self: *DB) void {
         lockApply(self);
-        {
-            defer self.core.unlockApply();
-            const resources = self.core.batchExecutionResources();
-            self.bulk_ingest_coalescer.clear(self.alloc);
-            self.clearBulkIngestIdentityAllNewLocked();
-            resources.index_manager.abortDenseBulkIngestSessions();
-            resources.store.abortBulkIngestSession();
-        }
-        finishExternalDenseBulkSessionTracked(self.async_context);
-        flushDeferredExternalBulkExecutorNotification(self.async_context, self.executor);
+        defer self.core.unlockApply();
+        const resources = self.core.batchExecutionResources();
+        self.bulk_ingest_coalescer.clear(self.alloc);
+        self.clearBulkIngestIdentityAllNewLocked();
+        resources.store.abortBulkIngestSession();
     }
 
     pub fn abortBulkIngestSession(self: *DB) void {
@@ -39207,6 +39189,42 @@ test "db query_readonly reopen does not backfill pending external dense artifact
     defer types.freeDBStats(alloc, reopened_stats);
     try std.testing.expectEqual(@as(u64, 0), reopened_stats.indexes[0].doc_count);
     try std.testing.expect(reopened_stats.indexes[0].replay_target_sequence > reopened_stats.indexes[0].replay_applied_sequence);
+}
+
+test "db primary auto bulk leaves dense replay active while session is open" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try db.beginPrimaryStoreAutoBulkIngestSession();
+    errdefer db.abortPrimaryStoreAutoBulkIngestSession();
+    try std.testing.expectEqual(@as(u32, 0), db.async_context.active_external_dense_bulk_sessions.load(.acquire));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1.0,0.0,0.0]}}" }},
+        .sync_level = .write,
+    });
+
+    const target_sequence = db.core.nextDerivedSequence();
+    try db.executor.waitForAll(target_sequence);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].doc_count);
+    try std.testing.expectEqual(target_sequence, stats.indexes[0].replay_applied_sequence);
+
+    try db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{ .compact = false });
 }
 
 test "db dense auto bulk finish wakes weak-sync replay and publishes visibility after catch-up" {
