@@ -3314,6 +3314,7 @@ pub fn build(b: *std.Build) void {
             "api table reads reject stale doc identity before multigroup fanout",
             "distributed table reads reject stale doc identity before multigroup fanout",
             "api public table query rejects only top-level internal fields",
+            "single embeddings index encoder scopes isolated enrichment failure to one index",
             "api query contract rejects doc identity control fields when with relaxes schema",
             "api query contract public parser rejects internal shard doc identity controls",
             "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
@@ -3516,6 +3517,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
+            "parseRemoteSearchResult preserves fused index scores",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

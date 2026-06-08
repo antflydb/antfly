@@ -587,6 +587,38 @@ pub const Node = struct {
         return try pipeline.embed(texts);
     }
 
+    pub fn embedDenseJsonInputDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        input: std.json.Value,
+    ) ![][]f32 {
+        try self.request_queue.acquire();
+        defer self.releaseSlot();
+        self.metrics.incRequest("embed.local");
+        defer self.metrics.decActive();
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+
+        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
+        const model = try self.model_manager.loadFromDir(model_path);
+        if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+
+        var inputs = try parseDenseEmbedInputs(self, allocator, &model.manifest, input);
+        defer inputs.deinit(allocator);
+        if (inputs.total_count == 0) return error.EmptyEmbeddingResponse;
+
+        try model.ensureEmbeddingAssets(
+            inputs.texts.items.len > 0,
+            inputs.images.items.len > 0,
+            inputs.audio.items.len > 0,
+        );
+
+        var pipeline = model.embeddingPipeline(allocator);
+        return try embedDenseInputs(allocator, &pipeline, &inputs);
+    }
+
     pub fn embedSparseTextsDirect(
         self: *Node,
         allocator: std.mem.Allocator,

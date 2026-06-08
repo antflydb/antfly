@@ -442,6 +442,19 @@ fn clearPublishedGeneratedArtifacts(runtime: *EnrichmentRuntime) void {
     runtime.published_generated_artifacts.clearAndFree(runtime.alloc);
 }
 
+fn clearIsolatedFailedIndexes(runtime: *EnrichmentRuntime) void {
+    var it = runtime.isolated_failed_indexes.iterator();
+    while (it.next()) |entry| runtime.alloc.free(@constCast(entry.key_ptr.*));
+    runtime.isolated_failed_indexes.clearAndFree(runtime.alloc);
+}
+
+fn markIsolatedFailedIndex(runtime: *EnrichmentRuntime, index_name: []const u8) void {
+    if (runtime.isolated_failed_indexes.contains(index_name)) return;
+    const owned_key = runtime.alloc.dupe(u8, index_name) catch return;
+    errdefer runtime.alloc.free(owned_key);
+    runtime.isolated_failed_indexes.put(runtime.alloc, owned_key, {}) catch return;
+}
+
 fn generatedArtifactAlreadyPublished(runtime: *EnrichmentRuntime, artifact_key: []const u8) bool {
     return runtime.published_generated_artifacts.contains(artifact_key);
 }
@@ -819,6 +832,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
     published_generated_artifacts: std.StringHashMapUnmanaged(void) = .empty,
+    isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn init(
         alloc: Allocator,
@@ -864,6 +878,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn deinit(self: *@This()) void {
         clearPublishedGeneratedArtifacts(self);
+        clearIsolatedFailedIndexes(self);
         if (self.owns_store) self.store.deinit();
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.deinit(self.alloc);
         if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.deinit(self.alloc);
@@ -881,6 +896,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn notifySequence(self: *@This(), sequence: u64) void {
+        if (sequence > self.target_sequence) clearIsolatedFailedIndexes(self);
         self.target_sequence = @max(self.target_sequence, sequence);
     }
 
@@ -891,6 +907,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.applied_sequence = next_applied;
         }
         clearPublishedGeneratedArtifacts(self);
+        clearIsolatedFailedIndexes(self);
         self.target_sequence = @max(self.target_sequence, @max(target_sequence, next_applied));
     }
 
@@ -933,6 +950,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.retrying = false;
             self.worker_failed = false;
             clearPublishedGeneratedArtifacts(self);
+            clearIsolatedFailedIndexes(self);
         }
     }
 
@@ -945,6 +963,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.applied_sequence = sequence;
         self.target_sequence = @max(self.target_sequence, sequence);
         clearPublishedGeneratedArtifacts(self);
+        clearIsolatedFailedIndexes(self);
     }
 
     pub fn stats(self: *@This()) types.EnrichmentStats {
@@ -984,6 +1003,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .chunk_artifact_bytes_written = self.chunk_artifact_bytes_written,
             .artifact_bytes_written = self.dense_artifact_bytes_written + self.sparse_artifact_bytes_written + self.chunk_artifact_bytes_written,
         };
+    }
+
+    pub fn indexHasIsolatedFailure(self: *@This(), index_name: []const u8) bool {
+        return self.isolated_failed_indexes.contains(index_name);
     }
 } else struct {
     alloc: Allocator,
@@ -1030,6 +1053,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     chunk_artifact_bytes_written: u64 = 0,
     last_error_name: ?[]const u8 = null,
     published_generated_artifacts: std.StringHashMapUnmanaged(void) = .empty,
+    isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
     status_hook: ?StatusHook = null,
     future: ?Io.Future(void) = null,
 
@@ -1096,6 +1120,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         }
         self.future = null;
         clearPublishedGeneratedArtifacts(self);
+        clearIsolatedFailedIndexes(self);
         self.ownership.deinit(self.alloc);
         if (self.owns_store) self.store.deinit();
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.deinit(self.alloc);
@@ -1137,6 +1162,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             if (sequence > self.target_sequence) self.last_error_name = null;
             self.retrying = false;
             self.worker_failed = false;
+            if (sequence > self.target_sequence) clearIsolatedFailedIndexes(self);
             self.target_sequence = @max(self.target_sequence, sequence);
             return;
         };
@@ -1145,6 +1171,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (sequence > self.target_sequence) self.last_error_name = null;
         self.retrying = false;
         self.worker_failed = false;
+        if (sequence > self.target_sequence) clearIsolatedFailedIndexes(self);
         self.target_sequence = @max(self.target_sequence, sequence);
         self.cond.broadcast(io);
         self.mutex.unlock(io);
@@ -1162,6 +1189,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.retrying = false;
         self.worker_failed = false;
         clearPublishedGeneratedArtifacts(self);
+        clearIsolatedFailedIndexes(self);
         self.cond.broadcast(io);
         self.mutex.unlock(io);
 
@@ -1198,6 +1226,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.retrying = false;
         self.worker_failed = false;
         clearPublishedGeneratedArtifacts(self);
+        clearIsolatedFailedIndexes(self);
         status = runtimeStatusSnapshot(self);
         self.cond.broadcast(io);
         self.mutex.unlock(io);
@@ -1253,6 +1282,13 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         };
     }
 
+    pub fn indexHasIsolatedFailure(self: *EnrichmentRuntime, index_name: []const u8) bool {
+        const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
+        if (maybe_io) |io| self.mutex.lockUncancelable(io);
+        defer if (maybe_io) |io| self.mutex.unlock(io);
+        return self.isolated_failed_indexes.contains(index_name);
+    }
+
     fn recordError(self: *EnrichmentRuntime, io: Io, err: anyerror) void {
         std.log.err("enrichment worker failed: {s}", .{@errorName(err)});
         var status: enrichment_state.RuntimeStatus = .{};
@@ -1296,6 +1332,63 @@ fn handleWorkerLoopError(runtime: *EnrichmentRuntime, io: Io, err: anyerror) voi
         return;
     }
     runtime.recordError(io, err);
+}
+
+fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, err: anyerror) void {
+    std.log.warn("enrichment request failed index={s} artifact={s}: {s}", .{ request.index_name, requestEmbeddingName(request), @errorName(err) });
+    if (runtime.io_impl) |io_impl| {
+        const io = io_impl.io();
+        runtime.mutex.lockUncancelable(io);
+        runtime.error_count += 1;
+        runtime.fatal_error_count += 1;
+        runtime.retrying = false;
+        runtime.worker_failed = false;
+        markIsolatedFailedIndex(runtime, request.index_name);
+        runtime.mutex.unlock(io);
+    } else {
+        runtime.error_count += 1;
+        runtime.fatal_error_count += 1;
+        runtime.retrying = false;
+        runtime.worker_failed = false;
+        markIsolatedFailedIndex(runtime, request.index_name);
+    }
+    runtime.notifyStatusHook();
+}
+
+test "isolated enrichment request error does not mark worker failed" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    runtime.retrying = true;
+    runtime.worker_failed = true;
+
+    recordIsolatedRequestError(&runtime, .{
+        .kind = .dense_embedding,
+        .index_name = "bad_visual",
+        .embedding_name = "clipclap",
+        .doc_key = "doc:1",
+        .source_field = "image_url",
+    }, error.UnsupportedEmbeddingProvider);
+
+    try std.testing.expectEqual(@as(u64, 1), runtime.error_count);
+    try std.testing.expectEqual(@as(u64, 1), runtime.fatal_error_count);
+    try std.testing.expect(!runtime.retrying);
+    try std.testing.expect(!runtime.worker_failed);
+    try std.testing.expect(runtime.indexHasIsolatedFailure("bad_visual"));
+    try std.testing.expect(!runtime.indexHasIsolatedFailure("healthy_text"));
+    clearIsolatedFailedIndexes(&runtime);
 }
 
 fn workerMain(runtime: *EnrichmentRuntime) void {
@@ -1453,10 +1546,26 @@ fn processPendingDocumentGroup(
             continue;
         }
         switch (request.kind) {
-            .asset => try processAsset(runtime, request, window),
-            .chunk_text => try processChunkText(runtime, request, chunk_cache, window),
-            .dense_embedding => try processDenseEmbedding(runtime, request, chunk_cache, window),
-            .sparse_embedding => try processSparseEmbedding(runtime, request, chunk_cache, window),
+            .asset => processAsset(runtime, request, window) catch |err| {
+                if (isRetryableEnrichmentError(err)) return err;
+                recordIsolatedRequestError(runtime, request, err);
+                continue;
+            },
+            .chunk_text => processChunkText(runtime, request, chunk_cache, window) catch |err| {
+                if (isRetryableEnrichmentError(err)) return err;
+                recordIsolatedRequestError(runtime, request, err);
+                continue;
+            },
+            .dense_embedding => processDenseEmbedding(runtime, request, chunk_cache, window) catch |err| {
+                if (isRetryableEnrichmentError(err)) return err;
+                recordIsolatedRequestError(runtime, request, err);
+                continue;
+            },
+            .sparse_embedding => processSparseEmbedding(runtime, request, chunk_cache, window) catch |err| {
+                if (isRetryableEnrichmentError(err)) return err;
+                recordIsolatedRequestError(runtime, request, err);
+                continue;
+            },
         }
     }
 }
@@ -2288,7 +2397,11 @@ fn processPlainDenseWindow(
             }
         }
 
-        try flushPlainDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, items.items, window);
+        flushPlainDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, items.items, window) catch |err| {
+            if (isRetryableEnrichmentError(err)) return err;
+            for (items.items) |item| recordIsolatedRequestError(runtime, item.request, err);
+            continue;
+        };
     }
 }
 
@@ -2395,7 +2508,11 @@ fn processChunkedDenseWindow(
         }
         if (chunk_items.items.len == 0) continue;
 
-        const vectors = try embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, chunk_texts.items, seed.expected_dims);
+        const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, chunk_texts.items, seed.expected_dims) catch |err| {
+            if (isRetryableEnrichmentError(err)) return err;
+            for (chunk_items.items) |item| recordIsolatedRequestError(runtime, item.request, err);
+            continue;
+        };
         errdefer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
         if (vectors.len != chunk_items.items.len) return error.InvalidEmbeddingResponse;
 

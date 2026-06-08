@@ -8166,6 +8166,9 @@ pub const DB = struct {
 
         const target_sequence = self.core.nextDerivedSequence();
         for (runtime_stats.indexes) |*item| {
+            if (self.enrichment_runtime) |runtime| {
+                item.enrichment_failed = runtime.indexHasIsolatedFailure(item.name);
+            }
             const dense_catch_up = item.kind == .dense_vector and runtime_stats.async_indexing.dense_catch_up.active;
             if (!dense_catch_up) if (self.executor.appliedSequence(item.name)) |live_applied| {
                 item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);

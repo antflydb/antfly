@@ -177,6 +177,11 @@ pub const Provider = struct {
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
         var values = std.json.Array.init(alloc);
         defer values.deinit();
+        var encoded_buffers = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (encoded_buffers.items) |buf| alloc.free(buf);
+            encoded_buffers.deinit(alloc);
+        }
 
         for (parts) |part| {
             switch (part) {
@@ -201,11 +206,16 @@ pub const Provider = struct {
                 .binary => |binary_part| {
                     const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
                     const encoded = try alloc.alloc(u8, encoded_len);
-                    defer alloc.free(encoded);
+                    errdefer alloc.free(encoded);
                     _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
+                    try encoded_buffers.append(alloc, encoded);
 
                     var obj = std.json.ObjectMap.empty;
-                    errdefer obj.deinit(alloc);
+                    errdefer {
+                        obj.deinit(alloc);
+                        _ = encoded_buffers.pop();
+                        alloc.free(encoded);
+                    }
                     try obj.put(alloc, "type", .{ .string = "media" });
                     try obj.put(alloc, "data", .{ .string = encoded });
                     try obj.put(alloc, "mime_type", .{ .string = binary_part.mime_type });
@@ -433,6 +443,68 @@ test "antfly embed request omits nullable generated fields" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"encoding_format\":\"float\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"dimensions\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "null") == null);
+}
+
+test "antfly embed parts preserves binary base64 until request serialization" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Assert = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqual(httpx.Method.POST, req.method);
+            try std.testing.expectEqualStrings("/embed", req.path);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"media\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"data\":\"AQID\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"mime_type\":\"image/png\"") != null);
+        }
+    };
+
+    var ts = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/embed", .assert_request = Assert.request, .respond = .{
+            .body = "{\"data\":[{\"embedding\":[0.25,0.5,0.75]}]}",
+            .content_type = "application/json",
+        } },
+    });
+    defer ts.deinit();
+
+    var group = std.Io.Group.init;
+    var result_ok: bool = false;
+    var result_dim: usize = 0;
+    var result_err: anyerror = error.None;
+
+    const Fiber = struct {
+        fn run(a: std.mem.Allocator, test_io: std.Io, base: []const u8, ok_out: *bool, dim_out: *usize, err_out: *anyerror) std.Io.Cancelable!void {
+            var client = httpx.Client.initWithConfig(a, test_io, .{ .keep_alive = false });
+            defer client.deinit();
+
+            var provider = Provider.init(a, &client, base);
+            defer provider.deinit();
+
+            var result = provider.embedParts(a, "clipclap", &.{
+                .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{ 1, 2, 3 } } },
+            }) catch |e| {
+                err_out.* = e;
+                return;
+            };
+            defer result.deinit();
+
+            ok_out.* = true;
+            dim_out.* = result.dimension;
+        }
+    };
+
+    group.concurrent(io, Fiber.run, .{ alloc, io, ts.baseUrl(), &result_ok, &result_dim, &result_err }) catch return;
+
+    try ts.handleOne();
+    group.await(io) catch {};
+
+    if (!result_ok) {
+        std.debug.print("embed parts fiber error: {}\n", .{result_err});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(usize, 3), result_dim);
 }
 
 test "antfly generate round trip" {
