@@ -256,7 +256,8 @@ fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iter
 fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const ref = args.next() orelse {
         std.debug.print("usage: antfly inference pull <model-ref> [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>] [--projector <auto|none|Q8_0|filename>]\n", .{});
-        std.debug.print("       antfly inference pull <https-url-to-tabular_model.json> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{});
+        std.debug.print("       antfly inference pull hf:<owner>/<repo> --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{});
+        std.debug.print("       antfly inference pull <https-url-to-tabular-artifact> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{});
         std.debug.print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
         std.debug.print("CLIP/CLAP v0.2 example: antfly inference pull antflydb/clipclap:gguf:Q4_K\n", .{});
         return;
@@ -267,7 +268,7 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     try argv.append(alloc, ref);
     while (args.next()) |arg| try argv.append(alloc, arg);
 
-    if (inference.tabular.cli.isHttpUrl(ref)) {
+    if (inference.tabular.cli.isHttpUrl(ref) or isPredictorPull(argv.items)) {
         return try inference.tabular.cli.pullMain(alloc, io, argv.items, defaultMlDir(alloc));
     }
 
@@ -313,6 +314,17 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     try reg.pull(io, ref, token, tasks_csv, capabilities_csv, projector_selection);
 
     std.debug.print("done.\n", .{});
+}
+
+fn isPredictorPull(args: []const []const u8) bool {
+    if (args.len == 0 or !inference.tabular.cli.isHuggingFaceRef(args[0])) return false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--type") and i + 1 < args.len) {
+            return std.mem.eql(u8, args[i + 1], "predictor") or std.mem.eql(u8, args[i + 1], "predictors");
+        }
+    }
+    return false;
 }
 
 fn collectArgs(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) ![]const []const u8 {

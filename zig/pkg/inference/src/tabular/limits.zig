@@ -18,3 +18,8 @@
 /// projecting it into the typed IR, so every ingestion path uses the same
 /// conservative cap. This is not a predictor engine limit.
 pub const max_model_json_bytes: usize = 256 * 1024 * 1024;
+
+/// Source artifacts that are converted into `tabular_model.json` are also
+/// buffered today. Keep a separate cap so ONNX-ML/XGBoost/LightGBM pulls do not
+/// inherit a misleading JSON-specific limit name.
+pub const max_model_artifact_bytes: usize = 512 * 1024 * 1024;

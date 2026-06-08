@@ -245,13 +245,14 @@ fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
 fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, args: []const []const u8) !void {
     if (args.len == 0) {
         print("usage: {s} pull <owner/name|hf:owner/name>[:gguf|:gguf:Q4_K_M|:mmproj] [--token <hf-token>] [--models-dir <dir>] [--tasks <task1,task2>] [--capabilities <cap1,cap2>] [--projector <auto|none|Q8_0|filename>]\n", .{usage_name});
-        print("       {s} pull <https-url-to-tabular_model.json> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{usage_name});
+        print("       {s} pull hf:<owner>/<repo> --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{usage_name});
+        print("       {s} pull <https-url-to-tabular-artifact> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{usage_name});
         print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
         print("CLIP/CLAP v0.2 example: {s} pull antflydb/clipclap:gguf:Q4_K\n", .{usage_name});
         return;
     }
     const ref = args[0];
-    if (inference.tabular.cli.isHttpUrl(ref)) {
+    if (inference.tabular.cli.isHttpUrl(ref) or isPredictorPull(args)) {
         try inference.tabular.cli.pullMain(allocator, io, args, defaultMlDir(allocator));
         return;
     }
@@ -296,6 +297,17 @@ fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, a
     try reg.pull(io, ref, token, tasks_csv, capabilities_csv, projector_selection);
 
     print("done.\n", .{});
+}
+
+fn isPredictorPull(args: []const []const u8) bool {
+    if (args.len == 0 or !inference.tabular.cli.isHuggingFaceRef(args[0])) return false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--type") and i + 1 < args.len) {
+            return std.mem.eql(u8, args[i + 1], "predictor") or std.mem.eql(u8, args[i + 1], "predictors");
+        }
+    }
+    return false;
 }
 
 pub fn printVersion() void {

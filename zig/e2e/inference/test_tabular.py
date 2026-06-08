@@ -32,6 +32,7 @@ import json
 import os
 import subprocess
 import threading
+from urllib.parse import unquote
 
 import numpy as np
 import pytest
@@ -206,6 +207,54 @@ def _serve_directory(directory):
         thread.join(timeout=5)
 
 
+@contextmanager
+def _serve_fake_hf(files, owner="acme", repo="stump-model"):
+    payloads = {
+        name: data if isinstance(data, bytes) else data.encode("utf-8")
+        for name, data in files.items()
+    }
+
+    class FakeHuggingFaceHandler(QuietSimpleHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            path = unquote(self.path)
+            api_path = f"/api/models/{owner}/{repo}"
+            resolve_prefix = f"/{owner}/{repo}/resolve/main/"
+            if path == api_path:
+                body = json.dumps({
+                    "siblings": [
+                        {"rfilename": name, "size": len(data)}
+                        for name, data in payloads.items()
+                    ]
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path.startswith(resolve_prefix):
+                filename = path[len(resolve_prefix):]
+                data = payloads.get(filename)
+                if data is not None:
+                    self.send_response(200)
+                    self.send_header("content-type", "application/octet-stream")
+                    self.send_header("content-length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+            self.send_error(404)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeHuggingFaceHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", owner, repo
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def _local_cli_models():
     if os.environ.get("ANTFLY_INFERENCE_URL"):
         pytest.skip("CLI model pull tests require the local e2e server models directory")
@@ -223,6 +272,32 @@ def _write_hosted_ir(tmp_path, name, payload):
     model.setdefault("metadata", {})["name"] = name
     (hosted_dir / "tabular_model.json").write_text(json.dumps(model), encoding="utf-8")
     return hosted_dir
+
+
+def _write_onnx_linear_regressor(model_path):
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    node = helper.make_node(
+        "LinearRegressor",
+        ["X"],
+        ["Y"],
+        domain="ai.onnx.ml",
+        coefficients=[1.0, 2.0],
+        intercepts=[0.5],
+        post_transform="NONE",
+    )
+    graph = helper.make_graph(
+        [node],
+        "linear-regressor",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [None, 2])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, 1])],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("ai.onnx.ml", 3)],
+    )
+    onnx.save(model, model_path)
 
 
 def test_pull_url_then_predict(api, tmp_path):
@@ -250,6 +325,129 @@ def test_pull_url_then_predict(api, tmp_path):
     preds = pr.json()["predictions"]
     assert abs(preds[0][0] - (-1.0)) < 1e-4
     assert abs(preds[1][0] - 1.0) < 1e-4
+
+
+def test_pull_hf_tabular_ir_then_predict(api, tmp_path):
+    command, model_root = _local_cli_models()
+    model = json.loads(json.dumps(STUMP_IR))
+    model["metadata"]["name"] = "ignored-source-name"
+
+    with _serve_fake_hf({"tabular_model.json": json.dumps(model)}) as (origin, owner, repo):
+        env = {**os.environ, "ANTFLY_INFERENCE_HF_BASE_URL": origin}
+        subprocess.run(
+            [
+                *command,
+                "pull",
+                f"hf:{owner}/{repo}",
+                "--type",
+                "predictor",
+                "--ml-dir",
+                str(model_root),
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            check=True,
+        )
+
+    pr = _predict(api, repo, [[0.1], [0.9]])
+    assert pr.status_code == 200, pr.text
+    preds = pr.json()["predictions"]
+    assert abs(preds[0][0] - (-1.0)) < 1e-4
+    assert abs(preds[1][0] - 1.0) < 1e-4
+
+
+@pytest.mark.parametrize(
+    ("repo", "filename", "payload"),
+    [
+        ("xgb-stump", "model.json", lambda: json.dumps(XGBOOST_STUMP_JSON)),
+        ("lgb-stump", "model.txt", lambda: LIGHTGBM_STUMP_TEXT),
+    ],
+)
+def test_pull_hf_tree_model_then_predict(api, repo, filename, payload):
+    command, model_root = _local_cli_models()
+
+    with _serve_fake_hf({filename: payload()}, repo=repo) as (origin, owner, repo):
+        env = {**os.environ, "ANTFLY_INFERENCE_HF_BASE_URL": origin}
+        subprocess.run(
+            [
+                *command,
+                "pull",
+                f"hf:{owner}/{repo}",
+                "--type",
+                "predictor",
+                "--ml-dir",
+                str(model_root),
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            check=True,
+        )
+
+    pr = _predict(api, repo, [[0.1], [0.9]])
+    assert pr.status_code == 200, pr.text
+    preds = pr.json()["predictions"]
+    assert abs(preds[0][0] - (-1.0)) < 1e-4
+    assert abs(preds[1][0] - 1.0) < 1e-4
+
+
+def test_pull_hf_onnx_ml_then_predict(api, tmp_path):
+    command, model_root = _local_cli_models()
+    repo = "onnx-linear"
+    model_path = tmp_path / "linear.onnx"
+    _write_onnx_linear_regressor(model_path)
+
+    with _serve_fake_hf({"model.onnx": model_path.read_bytes()}, repo=repo) as (origin, owner, repo):
+        env = {**os.environ, "ANTFLY_INFERENCE_HF_BASE_URL": origin}
+        subprocess.run(
+            [
+                *command,
+                "pull",
+                f"hf:{owner}/{repo}",
+                "--type",
+                "predictor",
+                "--ml-dir",
+                str(model_root),
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            check=True,
+        )
+
+    pr = _predict(api, repo, [[2.0, 3.0], [-1.0, 4.0]])
+    assert pr.status_code == 200, pr.text
+    preds = pr.json()["predictions"]
+    assert abs(preds[0][0] - 8.5) < 1e-4
+    assert abs(preds[1][0] - 7.5) < 1e-4
+
+
+def test_pull_hf_pickle_only_rejected(tmp_path):
+    command, model_root = _local_cli_models()
+    repo = "pickle-only"
+
+    with _serve_fake_hf({"model.pkl": b"\x80\x04not safe"}, repo=repo) as (origin, owner, repo):
+        env = {**os.environ, "ANTFLY_INFERENCE_HF_BASE_URL": origin}
+        result = subprocess.run(
+            [
+                *command,
+                "pull",
+                f"hf:{owner}/{repo}",
+                "--type",
+                "predictor",
+                "--ml-dir",
+                str(model_root),
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "UnsupportedArtifact" in combined
+    assert "Pickle" in combined or "pickle" in combined
+    assert not (model_root / repo / "tabular_model.json").exists()
 
 
 def test_pull_url_does_not_accept_models_dir_alias(tmp_path):
@@ -377,30 +575,8 @@ def test_convert_tree_model_predicts(api, framework, tmp_path):
 
 def test_convert_onnx_linear_regressor_predicts(api, tmp_path):
     command, model_root = _local_cli_models()
-    onnx = pytest.importorskip("onnx")
-    from onnx import TensorProto, helper
-
     model_path = tmp_path / "linear.onnx"
-    node = helper.make_node(
-        "LinearRegressor",
-        ["X"],
-        ["Y"],
-        domain="ai.onnx.ml",
-        coefficients=[1.0, 2.0],
-        intercepts=[0.5],
-        post_transform="NONE",
-    )
-    graph = helper.make_graph(
-        [node],
-        "linear-regressor",
-        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [None, 2])],
-        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, 1])],
-    )
-    model = helper.make_model(
-        graph,
-        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("ai.onnx.ml", 3)],
-    )
-    onnx.save(model, model_path)
+    _write_onnx_linear_regressor(model_path)
 
     model_name = "e2e-onnx-linear"
     subprocess.run(

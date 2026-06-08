@@ -95,15 +95,29 @@ antfly inference pull https://example.com/models/iris/tabular_model.json \
   --name iris-classifier
 ```
 
+Install predictors from Hugging Face repos with `--type predictor`:
+
+```sh
+antfly inference pull hf:author/repo --type predictor
+antfly inference pull hf:author/repo --type predictor --name iris-classifier
+antfly inference pull hf:author/repo --type predictor --file nested/model.onnx --framework onnx
+```
+
+The Hugging Face pull path installs safe Zig-native formats only:
+`tabular_model.json`, ONNX-ML `.onnx`, XGBoost JSON, and LightGBM text.
+Pickle, joblib, cloudpickle, and skops artifacts are detected but not loaded;
+export them to ONNX-ML or a native tree format before serving them in Antfly
+Inference.
+
 Use `--ml-dir <dir>` or `ANTFLY_INFERENCE_ML_DIR` to override the ML predictor
 root. `--models-dir` / `ANTFLY_INFERENCE_MODELS_DIR` remains reserved for the
 AI model bundle catalog used by `/ai/v1/*`.
 
-Limits: max batch 10 000 rows, max model JSON 256 MB. The JSON cap applies to
-the buffered CLI pull, local conversion input, discovery scan, and lazy-load
-paths; it is an ingestion guard for the current in-memory parser, not a tree
-engine constraint. Names are restricted to `[A-Za-z0-9_-]+`. The HTTP API does
-not accept model uploads; conversion and pulling are CLI responsibilities.
+Limits: max batch 10 000 rows, max installed model JSON 256 MB, max source
+artifact 512 MB for CLI conversion or Hugging Face predictor pulls. These caps
+are ingestion guards for the current buffered parsers, not tree engine
+constraints. Names are restricted to `[A-Za-z0-9_-]+`. The HTTP API does not
+accept model uploads; conversion and pulling are CLI responsibilities.
 
 ## In-process use from antfly DB
 
