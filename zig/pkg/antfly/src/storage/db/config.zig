@@ -58,6 +58,7 @@ pub const PrimaryBackend = union(enum) {
 
 pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 32 * 1024 * 1024,
+    .read_snapshot_rotate_mutable_bytes = 32 * 1024 * 1024,
     .bulk_ingest_flush_threshold_bytes_multiplier = 8,
     .local_block_cache_enabled = false,
     .l0_soft_limit_runs = 32,
@@ -75,6 +76,7 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
 
 pub const text_main_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 16 * 1024 * 1024,
+    .read_snapshot_rotate_mutable_bytes = 16 * 1024 * 1024,
     .bulk_ingest_flush_threshold_bytes_multiplier = 4,
     .local_block_cache_enabled = false,
     .l0_soft_limit_runs = 32,
@@ -92,6 +94,7 @@ pub const text_main_lsm_options_default = lsm_backend_mod.Options{
 
 pub const text_wal_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 16 * 1024 * 1024,
+    .read_snapshot_rotate_mutable_bytes = 16 * 1024 * 1024,
     .bulk_ingest_flush_threshold_bytes_multiplier = 4,
     .local_block_cache_enabled = false,
     .l0_soft_limit_runs = 32,
@@ -109,6 +112,7 @@ pub const text_wal_lsm_options_default = lsm_backend_mod.Options{
 
 pub const dense_hbc_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 128 * 1024 * 1024,
+    .read_snapshot_rotate_mutable_bytes = 128 * 1024 * 1024,
     .bulk_ingest_flush_threshold_bytes_multiplier = 4,
     .local_block_cache_enabled = false,
     .compact_threshold_runs = 8,
@@ -135,6 +139,7 @@ pub const dense_hbc_lsm_options_default = lsm_backend_mod.Options{
 
 pub const graph_reverse_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 16 * 1024 * 1024,
+    .read_snapshot_rotate_mutable_bytes = 16 * 1024 * 1024,
     .bulk_ingest_flush_threshold_bytes_multiplier = 4,
     .local_block_cache_enabled = false,
     .l0_soft_limit_runs = 32,
@@ -386,6 +391,8 @@ test "index lsm profiles preserve current flush profiles" {
     const opts = IndexBackendOptions{};
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), opts.text_main_lsm_options.flush_threshold_bytes);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), opts.text_wal_lsm_options.flush_threshold_bytes);
+    try std.testing.expectEqual(opts.text_main_lsm_options.flush_threshold_bytes, opts.text_main_lsm_options.read_snapshot_rotate_mutable_bytes);
+    try std.testing.expectEqual(opts.text_wal_lsm_options.flush_threshold_bytes, opts.text_wal_lsm_options.read_snapshot_rotate_mutable_bytes);
     try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), opts.text_main_lsm_options.level_target_bytes_base);
     try std.testing.expectEqual(@as(usize, 10), opts.text_main_lsm_options.level_target_bytes_multiplier);
     try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), opts.text_wal_lsm_options.level_target_bytes_base);
@@ -400,6 +407,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(@TypeOf(opts.text_wal_lsm_options.table_prefix_extractor), .first_separator), opts.text_wal_lsm_options.table_prefix_extractor);
     try std.testing.expectEqual(@as(usize, 8), opts.dense_lsm_options.flush_threshold);
     try std.testing.expectEqual(@as(u64, 128 * 1024 * 1024), opts.dense_lsm_options.flush_threshold_bytes);
+    try std.testing.expectEqual(opts.dense_lsm_options.flush_threshold_bytes, opts.dense_lsm_options.read_snapshot_rotate_mutable_bytes);
     try std.testing.expectEqual(@as(usize, 4), opts.dense_lsm_options.bulk_ingest_flush_threshold_bytes_multiplier);
     try std.testing.expectEqual(@as(usize, 8), opts.dense_lsm_options.compact_threshold_runs);
     try std.testing.expectEqual(@as(usize, 2), opts.dense_lsm_options.l0_overlap_compact_threshold_runs);
@@ -418,12 +426,14 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expect(opts.dense_lsm_options.obsolete_retention_ns > 0);
     try std.testing.expectEqual(sparse_mod.SparseBackend.lsm, opts.sparse_backend);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), opts.sparse_lsm_options.flush_threshold_bytes);
+    try std.testing.expectEqual(opts.sparse_lsm_options.flush_threshold_bytes, opts.sparse_lsm_options.read_snapshot_rotate_mutable_bytes);
     try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), opts.sparse_lsm_options.level_target_bytes_base);
     try std.testing.expectEqual(@as(usize, 10), opts.sparse_lsm_options.level_target_bytes_multiplier);
     try std.testing.expectEqual(index_wal_soft_limit_segments, opts.sparse_lsm_options.wal_soft_limit_segments);
     try std.testing.expectEqual(index_wal_hard_limit_segments, opts.sparse_lsm_options.wal_hard_limit_segments);
     try std.testing.expectEqual(@as(@TypeOf(opts.sparse_lsm_options.table_prefix_extractor), .first_separator), opts.sparse_lsm_options.table_prefix_extractor);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), opts.graph_reverse_lsm_options.flush_threshold_bytes);
+    try std.testing.expectEqual(opts.graph_reverse_lsm_options.flush_threshold_bytes, opts.graph_reverse_lsm_options.read_snapshot_rotate_mutable_bytes);
     try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), opts.graph_reverse_lsm_options.level_target_bytes_base);
     try std.testing.expectEqual(@as(usize, 10), opts.graph_reverse_lsm_options.level_target_bytes_multiplier);
     try std.testing.expectEqual(index_wal_soft_limit_segments, opts.graph_reverse_lsm_options.wal_soft_limit_segments);
@@ -431,6 +441,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(@TypeOf(opts.graph_reverse_lsm_options.table_prefix_extractor), .first_separator), opts.graph_reverse_lsm_options.table_prefix_extractor);
     const primary_opts = primary_lsm_options_default;
     try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), primary_opts.flush_threshold_bytes);
+    try std.testing.expectEqual(primary_opts.flush_threshold_bytes, primary_opts.read_snapshot_rotate_mutable_bytes);
     try std.testing.expectEqual(@as(usize, 32), primary_opts.l0_soft_limit_runs);
     try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), primary_opts.level_target_bytes_base);
     try std.testing.expectEqual(@as(usize, 10), primary_opts.level_target_bytes_multiplier);

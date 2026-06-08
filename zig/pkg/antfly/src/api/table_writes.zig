@@ -3449,19 +3449,17 @@ pub const ProvisionedTableWriteSource = struct {
             .publish_consistent => {
                 if (db) |managed_db| {
                     if (self.runtime_status_cache) |snapshot_cache| {
-                        publishRuntimeStatusSnapshotConsistent(self, snapshot_cache.alloc, table_name, group_id, managed_db) catch |err| {
-                            std.log.warn("managed runtime status consistent publish failed table={s} group_id={} err={s}", .{
+                        publishRuntimeStatusSnapshot(self, snapshot_cache.alloc, table_name, group_id, managed_db) catch |err| {
+                            std.log.warn("managed runtime status publish failed table={s} group_id={} err={s}", .{
                                 table_name,
                                 group_id,
                                 @errorName(err),
                             });
-                            lockAtomic(&self.local_db_mutex);
-                            self.markWriteCacheDirty(table_name);
-                            self.local_db_mutex.unlock();
-                            return;
                         };
                         self.invalidateReadCache(table_name);
-                        self.clearDirtyWriteTable(table_name);
+                        lockAtomic(&self.local_db_mutex);
+                        self.markWriteCacheDirty(table_name);
+                        self.local_db_mutex.unlock();
                         self.notifyLocalChange(table_name, .data);
                         return;
                     }
@@ -5597,8 +5595,6 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group.group_id);
         defer alloc.free(path);
-        const group_auto_bulk_ops = autoBulkIngestGroupBatchOps(group, req);
-        const auto_bulk_now_ns = platform_time.monotonicNs();
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(
                 alloc,
@@ -5607,37 +5603,11 @@ pub const ProvisionedTableWriteSource = struct {
                 group.group_id,
                 table_name,
                 .default_async,
-                if (group_auto_bulk_ops > 0) auto_bulk_now_ns else null,
-                if (group_auto_bulk_ops > 0) auto_bulk_now_ns else null,
+                null,
+                null,
             );
             defer cached.deinit(alloc);
             try applyGroupBatchWithSchemaJson(alloc, cached.db, cached.schema_json, group, req);
-            lockAtomic(&self.local_db_mutex);
-            defer self.local_db_mutex.unlock();
-            if (group_auto_bulk_ops > 0) {
-                const record_now_ns = platform_time.monotonicNs();
-                cache.recordAutoBulkIngestOpsLocked(group.group_id, table_name, group_auto_bulk_ops, record_now_ns) catch |err| {
-                    std.log.err("provisioned batch auto bulk accounting failed table={s} group_id={} ops={} err={s}", .{
-                        table_name,
-                        group.group_id,
-                        group_auto_bulk_ops,
-                        @errorName(err),
-                    });
-                    return err;
-                };
-                const rolled = try cache.rollRequestedAutoBulkIngestLocked(group.group_id, table_name, platform_time.monotonicNs());
-                if (rolled) {
-                    self.local_db_mutex.unlock();
-                    publishRuntimeStatusSnapshot(self, alloc, table_name, group.group_id, cached.db) catch |err| {
-                        std.log.warn("auto bulk roll runtime status publish failed table={s} group_id={} err={s}", .{
-                            table_name,
-                            group.group_id,
-                            @errorName(err),
-                        });
-                    };
-                    lockAtomic(&self.local_db_mutex);
-                }
-            }
         } else {
             var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime);
             defer db.close();
@@ -5894,8 +5864,6 @@ pub const ProvisionedTableWriteSource = struct {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const apply_req = req;
-        const auto_bulk_ops = autoBulkIngestBatchOps(apply_req);
-        const auto_bulk_now_ns = platform_time.monotonicNs();
         self.beginGroupOperation(table_name, group_id);
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
@@ -5918,8 +5886,8 @@ pub const ProvisionedTableWriteSource = struct {
                 group_id,
                 table_name,
                 .default_async,
-                if (auto_bulk_ops > 0) auto_bulk_now_ns else null,
-                if (auto_bulk_ops > 0) auto_bulk_now_ns else null,
+                null,
+                null,
             );
             defer cached.deinit(alloc);
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
@@ -5928,22 +5896,6 @@ pub const ProvisionedTableWriteSource = struct {
             {
                 lockAtomic(&self.local_db_mutex);
                 defer self.local_db_mutex.unlock();
-                if (auto_bulk_ops > 0) {
-                    const record_now_ns = platform_time.monotonicNs();
-                    try cache.recordAutoBulkIngestOpsLocked(group_id, table_name, auto_bulk_ops, record_now_ns);
-                    const rolled = try cache.rollRequestedAutoBulkIngestLocked(group_id, table_name, platform_time.monotonicNs());
-                    if (rolled) {
-                        self.local_db_mutex.unlock();
-                        publishRuntimeStatusSnapshot(self, alloc, table_name, group_id, cached.db) catch |err| {
-                            std.log.warn("auto bulk roll runtime status publish failed table={s} group_id={} err={s}", .{
-                                table_name,
-                                group_id,
-                                @errorName(err),
-                            });
-                        };
-                        lockAtomic(&self.local_db_mutex);
-                    }
-                }
                 self.markWriteCacheDirty(table_name);
             }
             self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
@@ -9257,47 +9209,6 @@ fn shouldDrainManagedDbAfterBatch(sync_level: db_mod.types.SyncLevel) bool {
 fn shouldDrainCachedManagedDbAfterBatch(sync_level: db_mod.types.SyncLevel) bool {
     _ = sync_level;
     return false;
-}
-
-// Provisioned API writes no longer open automatic bulk-ingest sessions.
-// Large write-only online batches are passed to the DB normally; storage
-// owns mutable flush, L0 pressure, and maintenance scheduling. Explicit
-// cache bulk sessions remain for true rebuild/import paths.
-fn autoBulkIngestBatchOps(req: db_mod.types.BatchRequest) usize {
-    _ = req;
-    return 0;
-}
-
-fn autoBulkIngestGroupBatchOps(group: GroupBatch, req: db_mod.types.BatchRequest) usize {
-    _ = group;
-    _ = req;
-    return 0;
-}
-
-test "api auto bulk ingest does not open sessions for normal online writes" {
-    var writes: [auto_bulk_ingest_min_batch_ops]db_mod.types.BatchWrite = undefined;
-    try std.testing.expectEqual(@as(usize, 0), autoBulkIngestBatchOps(.{
-        .writes = writes[0..],
-        .sync_level = .write,
-    }));
-    try std.testing.expectEqual(@as(usize, 0), autoBulkIngestBatchOps(.{
-        .writes = writes[0..],
-        .sync_level = .propose,
-    }));
-    try std.testing.expectEqual(@as(usize, 0), autoBulkIngestBatchOps(.{
-        .writes = writes[0..],
-        .sync_level = .full_index,
-    }));
-
-    var group = GroupBatch{ .group_id = 7001 };
-    defer group.deinit(std.testing.allocator);
-    try group.writes.ensureTotalCapacity(std.testing.allocator, auto_bulk_ingest_min_batch_ops);
-    for (0..auto_bulk_ingest_min_batch_ops) |_| {
-        group.writes.appendAssumeCapacity(.{ .key = "doc:bulk", .value = "{}" });
-    }
-    try std.testing.expectEqual(@as(usize, 0), autoBulkIngestGroupBatchOps(group, .{
-        .sync_level = .write,
-    }));
 }
 
 test "weak sync levels do not drain managed db after batch" {
@@ -16071,6 +15982,59 @@ test "provisioned table write source visibility hook publishes owner db status" 
     defer retained.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), retained.items.len);
     try std.testing.expectEqual(@as(u64, 1), retained.items[0].stats.doc_count);
+}
+
+test "provisioned table write source consistent visibility hook does not block on busy apply lock" {
+    const alloc = std.testing.allocator;
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-consistent-hook-busy", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    var db = try openManagedDbWithIndexesJson(
+        alloc,
+        path,
+        "{\"search_idx\":{\"type\":\"full_text\",\"config\":{}}}",
+    );
+    defer db.close();
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
+    source.runtime_status_cache = &snapshot_cache;
+
+    db.core.lockApplyExclusive();
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(&source, "docs", 7001, &db, .publish_consistent);
+    db.core.unlockApplyExclusive();
+
+    try std.testing.expect(source.isWriteCacheDirtyForTable("docs"));
+    var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
+    defer published.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), published.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, published.items[0].metadata.source);
 }
 
 test "provisioned table write source promotes synthetic placeholder when publishing live db status" {

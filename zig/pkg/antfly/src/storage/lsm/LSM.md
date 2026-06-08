@@ -93,8 +93,12 @@ slow storage IO.
 - Each backend may have at most one immutable flush publisher active at a time.
   Compaction concurrency is controlled by the compaction scheduler and
   ResourceManager budgets.
-- Soft pressure schedules or accelerates background maintenance. Hard pressure
-  can delay writes or require one bounded writer-assist step.
+- Soft pressure schedules or accelerates background maintenance. Detached
+  maintenance jobs drain a bounded batch of steps per wake so normal ingest can
+  catch up in the storage lane before hard pressure reaches HTTP writers. When
+  no external maintenance waker is configured, debt notes from writes, snapshots,
+  and obsolete-file tracking enter the same detached admission path directly.
+  Hard pressure can delay writes or require one bounded writer-assist step.
 - Metrics must make pressure explicit: mutable bytes, immutable bytes, L0
   runs/bytes, compaction grants/denials, WAL retention/checkpoint lag, and
   maintenance job queue state.
@@ -110,6 +114,10 @@ Status is an observability plane, not a repair mechanism.
 - Writers and background workers publish status snapshots as they make progress.
   Missing or stale cached data should be reported as missing/stale, not repaired
   by probing live state from the request path.
+- Dense/index visibility hooks must not block worker completion on full status
+  refreshes. If the apply lock is busy, publish a bounded best-effort snapshot,
+  mark the table dirty, and let a later explicit status path refresh
+  consistently.
 
 ### Acceptance Criteria
 
@@ -609,9 +617,11 @@ Large-ingest guardrails:
    - [x] Detached maintenance slice: backends with a detached background
      executor now enqueue one `.maintenance` job when post-write flush/compaction
      debt is visible and no immutable flush job is already responsible for the
-     same work. The job runs a bounded maintenance step off the foreground path,
+     same work. The job drains a bounded batch of maintenance steps off the foreground path,
      so soft L0 debt can make progress without waiting for a later writer to
-     call maintenance explicitly.
+     call maintenance explicitly. Backends without an external maintenance waker
+     now route `notePotentialMaintenanceDebt()` through this same detached
+     admission path.
    - [x] Continuation slice: a detached maintenance job that makes progress now
      clears its in-flight bit and re-enters the same admission path while score
      remains nonzero. Background LSM work therefore drains visible debt as a

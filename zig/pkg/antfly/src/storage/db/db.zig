@@ -8038,12 +8038,13 @@ pub const DB = struct {
 
     fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
         if (index_manager.textIndex(index_name)) |entry| {
-            const text_snapshot = entry.snapshot();
-            const term_count = textIndexTermCount(entry);
+            // Applied-sequence persistence runs outside the DB apply lock; keep this
+            // snapshot cheap and avoid walking full-text segment internals here.
+            const text_snapshot = entry.acquireSnapshot();
+            defer text_snapshot.release();
             return .{
                 .kind = .full_text,
                 .doc_count = text_snapshot.global_doc_count,
-                .term_count = term_count,
                 .updated_at_ns = platform_time.monotonicNs(),
             };
         }
@@ -8250,7 +8251,8 @@ pub const DB = struct {
             switch (item.kind) {
                 .full_text => {
                     if (self.core.textIndex(item.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         item.doc_count = text_snapshot.global_doc_count;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
@@ -8512,7 +8514,8 @@ pub const DB = struct {
             switch (cfg.kind) {
                 .full_text => {
                     if (self.core.textIndex(cfg.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         item.doc_count = text_snapshot.global_doc_count;
                         item.term_count = textIndexTermCount(entry);
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
@@ -8756,7 +8759,8 @@ pub const DB = struct {
                 for (configs) |cfg| {
                     if (cfg.kind != .full_text) continue;
                     if (self.core.textIndex(cfg.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         total += text_snapshot.term_doc_freq_cache_hits;
                     }
                 }
@@ -8767,7 +8771,8 @@ pub const DB = struct {
                 for (configs) |cfg| {
                     if (cfg.kind != .full_text) continue;
                     if (self.core.textIndex(cfg.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         total += text_snapshot.term_doc_freq_cache_misses;
                     }
                 }
@@ -18886,8 +18891,10 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
         finishDenseCatchUpSessionTracked(ctx, index_ref.name);
         return;
     }
-    errdefer finishDenseCatchUpSessionTracked(ctx, index_ref.name);
-    errdefer ctx.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
+    var catch_up_tracked = true;
+    errdefer if (catch_up_tracked) finishDenseCatchUpSessionTracked(ctx, index_ref.name);
+    var bulk_session_finished = false;
+    errdefer if (!bulk_session_finished) ctx.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     const before_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
 
@@ -18904,20 +18911,16 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     finish_options.progress_fn = noteDenseBulkFinishProgress;
     const finalize_start_ns = monotonicTimeNs();
     try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, finish_options);
+    bulk_session_finished = true;
     const finalize_ns = elapsedSince(finalize_start_ns);
     setDenseCatchUpPhase(ctx, .applied_sequence_flush);
-    var published_visibility = false;
-    if (ctx.applied_sequence_mutex.tryLock()) {
-        defer ctx.applied_sequence_mutex.unlock();
-        published_visibility = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name);
-    } else {
-        _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
-    }
-    if (!published_visibility) {
-        if (ctx.query_visibility_hook) |hook| hook.notify(.publish_consistent);
-    }
+    var seq_lock = lockAtomicWithBackoffProfiled(
+        &ctx.applied_sequence_mutex,
+        &ctx.stats.applied_sequence_mutex,
+    );
+    defer seq_lock.unlock();
+    const published_visibility = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name);
     try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
-    finishDenseCatchUpSessionTracked(ctx, index_ref.name);
     const after_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
     const finish_ns = elapsedSince(finish_start_ns);
 
@@ -18942,6 +18945,11 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     };
     if (ctx.index_manager.resource_manager) |manager| {
         manager.noteDenseReplayWindowResult(dense_window_result);
+    }
+    finishDenseCatchUpSessionTracked(ctx, index_ref.name);
+    catch_up_tracked = false;
+    if (!published_visibility) {
+        if (ctx.query_visibility_hook) |hook| hook.notify(.publish_consistent);
     }
 }
 
@@ -39296,6 +39304,10 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     defer types.freeDBStats(alloc, stats);
     try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_applied_sequence);
     try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_target_sequence);
+
+    const persisted_status = (try db.loadIndexStatusSnapshot(alloc, "dense_idx")).?;
+    try std.testing.expectEqual(@as(u64, 4), persisted_status.doc_count);
+    try std.testing.expectEqual(@as(u64, 4), try db.core.loadAppliedSequence(alloc, "dense_idx"));
 }
 
 test "db dense auto bulk finish wakes current replay target if deferred wake is absent" {

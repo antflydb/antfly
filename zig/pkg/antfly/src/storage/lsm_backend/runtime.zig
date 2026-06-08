@@ -111,6 +111,15 @@ fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
 
+fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
+    const BackendType = @TypeOf(backend.*);
+    if (@hasDecl(BackendType, "notePotentialMaintenanceDebtLocked")) {
+        backend.notePotentialMaintenanceDebtLocked();
+    } else if (@hasDecl(BackendType, "notePotentialMaintenanceDebt")) {
+        backend.notePotentialMaintenanceDebt();
+    }
+}
+
 fn recordCursorBlockReadahead(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorBlockReadahead")) backend.recordCursorBlockReadahead();
 }
@@ -2768,12 +2777,44 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             };
         }
     };
+    const MutableSnapshot = union(enum) {
+        none,
+        borrowed: *const State,
+        owned: *State,
+
+        fn ptr(self: *@This()) ?*const State {
+            return switch (self.*) {
+                .none => null,
+                .borrowed => |state| state,
+                .owned => |state| state,
+            };
+        }
+
+        fn ownedPtr(self: *@This()) ?*State {
+            return switch (self.*) {
+                .owned => |state| state,
+                else => null,
+            };
+        }
+
+        fn deinitOwned(self: *@This(), allocator: Allocator) void {
+            switch (self.*) {
+                .owned => |state| {
+                    state.deinit(allocator);
+                    allocator.destroy(state);
+                },
+                else => {},
+            }
+            self.* = .none;
+        }
+    };
+
     return struct {
         allocator: Allocator,
         metadata_allocator: Allocator,
         backend: *BackendType,
         namespace: backend_types.Namespace,
-        mutable_snapshot: ?State = null,
+        mutable_snapshot: MutableSnapshot = .none,
         mutable_snapshot_is_bulk_current_scan_clone: bool = false,
         immutable_memtables: []const *const State = &.{},
         runs: []Run = &.{},
@@ -2792,22 +2833,37 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             errdefer metadata_allocator.free(levels);
             backend.retainReader();
             errdefer releaseReadReader(BackendType, backend);
+            var mutable_snapshot: MutableSnapshot = .none;
             var mutable_snapshot_is_bulk_current_scan_clone = false;
-            var mutable_snapshot = if (@hasDecl(BackendType, "cloneCurrentScanMutableStateForBulkIngest")) blk: {
-                const snapshot = try backend.cloneCurrentScanMutableStateForBulkIngest();
-                mutable_snapshot_is_bulk_current_scan_clone = snapshot != null;
-                break :blk snapshot;
-            } else null;
-            errdefer if (mutable_snapshot) |*snapshot| {
-                if (mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
-                    backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
+            var bulk_current_scan_clone_denied = false;
+            if (@hasDecl(BackendType, "cloneCurrentScanMutableStateForBulkIngest")) {
+                if (try backend.cloneCurrentScanMutableStateForBulkIngest()) |snapshot| {
+                    const owned = try backend.allocator.create(State);
+                    errdefer backend.allocator.destroy(owned);
+                    owned.* = snapshot;
+                    mutable_snapshot = .{ .owned = owned };
+                    mutable_snapshot_is_bulk_current_scan_clone = true;
+                } else if (@hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
+                    bulk_current_scan_clone_denied = true;
                 }
-                snapshot.deinit(backend.allocator);
-            };
-            if (mutable_snapshot == null and @hasDecl(BackendType, "prepareCurrentScanSnapshot")) {
-                try backend.prepareCurrentScanSnapshot();
-            } else if (mutable_snapshot == null and @hasDecl(BackendType, "prepareReadSnapshot")) {
-                try backend.prepareReadSnapshot();
+            }
+            errdefer {
+                if (mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
+                    if (mutable_snapshot.ownedPtr()) |snapshot| backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
+                }
+                mutable_snapshot.deinitOwned(backend.allocator);
+            }
+            if (mutable_snapshot.ptr() == null) {
+                if (bulk_current_scan_clone_denied and @hasDecl(BackendType, "prepareCurrentScanSnapshot")) {
+                    try backend.prepareCurrentScanSnapshot();
+                } else if (@hasDecl(BackendType, "prepareReadSnapshot")) {
+                    try backend.prepareReadSnapshot();
+                }
+                const read_snapshot = try snapshotReadMutable(BackendType, backend, .current_scan);
+                mutable_snapshot = if (read_snapshot.owned)
+                    .{ .owned = @constCast(read_snapshot.state) }
+                else
+                    .{ .borrowed = read_snapshot.state };
             }
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
@@ -2837,20 +2893,18 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             {
                 const locked = lockBackend(BackendType, backend);
                 defer unlockBackend(BackendType, backend, locked);
-                if (self.mutable_snapshot) |*snapshot| {
-                    if (self.mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
-                        backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
-                    }
+                if (self.mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
+                    if (self.mutable_snapshot.ownedPtr()) |snapshot| backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
                 }
                 releaseReadReader(BackendType, backend);
             }
-            if (self.mutable_snapshot) |*snapshot| snapshot.deinit(self.allocator);
+            self.mutable_snapshot.deinitOwned(self.allocator);
             self.* = undefined;
         }
 
         pub fn openCursor(self: *@This()) !LocalCursor {
             const cursor_alloc = runtimeScratchAllocator(self.allocator);
-            if (self.mutable_snapshot) |*snapshot| {
+            if (self.mutable_snapshot.ptr()) |snapshot| {
                 return .{ .snapshot = try SnapshotCursor.init(cursor_alloc, self.backend, snapshot, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.namespace, false) };
             }
             return .{ .active = try ActiveCursor.init(cursor_alloc, self.backend, &self.backend.mutable, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.namespace, false) };
@@ -3056,7 +3110,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
-                if ((mutated or direct_ingested_bulk_appends) and @hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
+                if (mutated or direct_ingested_bulk_appends) notePotentialMaintenanceDebtLocked(self.backend);
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 if (!self.batch_options.defer_commit_flush) {
                     try self.backend.maybeFlushMutable();
@@ -3210,7 +3264,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             }
             self.mutable.deinit(self.allocator);
             self.mutable = .{};
-            if (@hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
+            notePotentialMaintenanceDebtLocked(self.backend);
             return true;
         }
 
@@ -5635,7 +5689,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
-                if (mutated and @hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
+                if (mutated) notePotentialMaintenanceDebtLocked(self.backend);
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 if (!self.batch_options.defer_commit_flush) {
                     try self.backend.maybeFlushMutable();
@@ -5718,7 +5772,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             }
             self.mutable.deinit(self.allocator);
             self.mutable = .{};
-            if (@hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
+            notePotentialMaintenanceDebtLocked(self.backend);
             return true;
         }
 

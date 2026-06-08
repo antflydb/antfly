@@ -51,6 +51,7 @@ const CounterU64 = platform.atomic.Value(u64);
 pub const MutableSnapshotReason = enum(u8) {
     bound_read_txn,
     namespace_read_txn,
+    current_scan,
     other,
 };
 
@@ -75,6 +76,7 @@ pub fn mutableSnapshotReasonName(reason: MutableSnapshotReason) []const u8 {
     return switch (reason) {
         .bound_read_txn => "bound_read_txn",
         .namespace_read_txn => "namespace_read_txn",
+        .current_scan => "current_scan",
         .other => "other",
     };
 }
@@ -112,6 +114,7 @@ pub const Options = struct {
     foreground_soft_compaction: bool = false,
     defer_flush_on_commit: bool = false,
     max_deferred_immutable_memtables: usize = 8,
+    background_maintenance_max_steps: usize = 64,
     direct_bulk_ingest: bool = true,
     level_target_runs_base: usize = 32,
     level_target_runs_multiplier: usize = 4,
@@ -1146,7 +1149,22 @@ pub const Backend = struct {
 
     pub fn notePotentialMaintenanceDebt(self: *Backend) void {
         self.cached_maintenance_hint.store(1, .release);
-        self.wakeMaintenanceWorker();
+        if (self.options.maintenance_waker != null) {
+            self.wakeMaintenanceWorker();
+            return;
+        }
+        if (!self.mu.tryLock()) return;
+        defer self.mu.unlock();
+        self.scheduleMaintenanceJobIfNeededLocked();
+    }
+
+    pub fn notePotentialMaintenanceDebtLocked(self: *Backend) void {
+        self.cached_maintenance_hint.store(1, .release);
+        if (self.options.maintenance_waker != null) {
+            self.wakeMaintenanceWorker();
+            return;
+        }
+        self.scheduleMaintenanceJobIfNeededLocked();
     }
 
     fn wakeMaintenanceWorker(self: *Backend) void {
@@ -1416,7 +1434,7 @@ pub const Backend = struct {
         self.read_snapshot_mutable_rotation_bytes_total +|= mutable_bytes;
         self.read_snapshot_mutable_rotation_peak_bytes = @max(self.read_snapshot_mutable_rotation_peak_bytes, mutable_bytes);
         if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
-        self.notePotentialMaintenanceDebt();
+        self.notePotentialMaintenanceDebtLocked();
     }
 
     pub fn prepareCurrentScanSnapshot(self: *Backend) !void {
@@ -1427,7 +1445,7 @@ pub const Backend = struct {
         self.read_snapshot_mutable_rotation_bytes_total +|= mutable_bytes;
         self.read_snapshot_mutable_rotation_peak_bytes = @max(self.read_snapshot_mutable_rotation_peak_bytes, mutable_bytes);
         if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
-        self.notePotentialMaintenanceDebt();
+        self.notePotentialMaintenanceDebtLocked();
     }
 
     pub fn prepareMutableForWrite(self: *Backend) !void {
@@ -1435,7 +1453,7 @@ pub const Backend = struct {
         if (self.mutable.entries.items.len == 0) return;
         try self.rotateMutableToImmutable();
         if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
-        self.notePotentialMaintenanceDebt();
+        self.notePotentialMaintenanceDebtLocked();
     }
 
     pub fn snapshotMutableState(self: *Backend) !*const State {
@@ -1969,7 +1987,7 @@ pub const Backend = struct {
         if (self.immutable_flush_job_in_flight or self.immutable_flush_build_in_flight) return;
         if (self.activeImmutableMemtableCount() > 0) return;
         if (!self.background_executor.canRunDetached()) return;
-        if (self.maintenanceScoreLocked() == 0) return;
+        if (self.maintenanceScoreLocked() == 0 and !self.hasReclaimableObsoletePathsLocked()) return;
 
         self.maintenance_job_in_flight = true;
         self.background_executor.submit(.maintenance, self, runMaintenanceJob, deinitMaintenanceJob) catch |err| {
@@ -1981,16 +1999,23 @@ pub const Backend = struct {
 
     fn runMaintenanceJob(ptr: *anyopaque) !void {
         const self: *Backend = @ptrCast(@alignCast(ptr));
+        errdefer self.clearMaintenanceJobInFlight(false);
+
+        const max_steps = @max(@as(usize, 1), self.options.background_maintenance_max_steps);
+        var steps: usize = 0;
+        while (steps < max_steps and !self.closing.load(.acquire)) : (steps += 1) {
+            const progressed = try self.runMaintenanceStep();
+            if (!progressed) break;
+        }
+
+        self.clearMaintenanceJobInFlight(true);
+    }
+
+    fn clearMaintenanceJobInFlight(self: *Backend, maybe_reschedule: bool) void {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
-        errdefer self.maintenance_job_in_flight = false;
-        if (self.closing.load(.acquire)) {
-            self.maintenance_job_in_flight = false;
-            return;
-        }
-        const progressed = try self.runMaintenanceStepLocked();
         self.maintenance_job_in_flight = false;
-        if (progressed and !self.closing.load(.acquire)) self.scheduleMaintenanceJobIfNeededLocked();
+        if (maybe_reschedule and !self.closing.load(.acquire)) self.scheduleMaintenanceJobIfNeededLocked();
     }
 
     fn deinitMaintenanceJob(_: *anyopaque) void {}
@@ -2955,7 +2980,7 @@ pub const Backend = struct {
             if (obsolete.delete_after_ns < delete_after_ns) obsolete.delete_after_ns = delete_after_ns;
             self.allocator.free(path);
             self.obsolete_manifest_dirty = true;
-            self.notePotentialMaintenanceDebt();
+            self.notePotentialMaintenanceDebtLocked();
             return;
         }
 
@@ -2964,7 +2989,7 @@ pub const Backend = struct {
             .delete_after_ns = delete_after_ns,
         });
         self.obsolete_manifest_dirty = true;
-        self.notePotentialMaintenanceDebt();
+        self.notePotentialMaintenanceDebtLocked();
     }
 
     pub fn queueObsoleteRuns(self: *Backend, runs: std.ArrayListUnmanaged(Run)) !void {
@@ -5147,6 +5172,71 @@ test "lsm backend schedules detached maintenance job for compaction debt" {
     try std.testing.expectEqualStrings("b", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
 }
 
+test "lsm backend note potential maintenance debt schedules detached job" {
+    const FakeLane = struct {
+        submitted_job: ?background_runtime_mod.Job = null,
+
+        fn lane(self: *@This()) background_runtime_mod.DurableJobLane {
+            return .{
+                .ptr = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.submitted_job == null);
+            self.submitted_job = job;
+        }
+
+        fn drainOwner(_: *anyopaque, _: u64) void {}
+
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+
+        const vtable = background_runtime_mod.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drainOwner,
+            .close_owner = drainOwner,
+            .poll = poll,
+        };
+    };
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-background-maintenance-note-debt-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1,
+        .l0_hard_limit_runs = 100,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:a", "a");
+        try txn.commit();
+    }
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:b", "b");
+        try txn.commit();
+    }
+    try backend.flushAllImmutableMemtables();
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expect(backend.maintenanceScore() > 0);
+
+    var lane = FakeLane{};
+    backend.background_executor = BackgroundExecutor.initLane(lane.lane(), 783);
+    try std.testing.expect(lane.submitted_job == null);
+    backend.notePotentialMaintenanceDebt();
+    try std.testing.expect(lane.submitted_job != null);
+    try std.testing.expect(backend.maintenance_job_in_flight);
+}
+
 test "lsm backend detached maintenance jobs reschedule while debt remains" {
     const FakeLane = struct {
         submitted_jobs: [16]background_runtime_mod.Job = undefined,
@@ -5202,6 +5292,7 @@ test "lsm backend detached maintenance jobs reschedule while debt remains" {
         .compact_threshold_runs = 100,
         .l0_soft_limit_runs = 1,
         .l0_hard_limit_runs = 100,
+        .background_maintenance_max_steps = 1,
         .background_executor = &executor,
     });
     defer backend.close();
@@ -9683,7 +9774,7 @@ test "lsm backend current probe getManySorted reuses source layout across chunks
     try std.testing.expectEqualStrings("value-159", values[159].?);
 }
 
-test "lsm backend current scan freezes mutable generation without cloning it" {
+test "lsm backend current scan reuses cached mutable read snapshot under rotation threshold" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
     defer backend.close();
 
@@ -9704,9 +9795,11 @@ test "lsm backend current scan freezes mutable generation without cloning it" {
     defer scan.abort();
 
     const after_open = backend.snapshotMaintenanceStats();
-    try std.testing.expectEqual(before_writes.immutable_rotations + 1, backend.snapshotWriteStats().immutable_rotations);
-    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls, after_open.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(before_writes.immutable_rotations, backend.snapshotWriteStats().immutable_rotations);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls + 1, after_open.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls + 1, after_open.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls);
+    try std.testing.expect(backend.mutable_read_snapshot != null);
 
     var cursor = try scan.openCursor();
     defer cursor.close();
@@ -9722,7 +9815,40 @@ test "lsm backend current scan freezes mutable generation without cloning it" {
     try std.testing.expect(saw_a);
 }
 
-test "lsm backend current scan helpers do not clone mutable writer generation" {
+test "lsm backend current scan rotates mutable above read snapshot cap" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1024,
+        .read_snapshot_rotate_mutable_bytes = 1,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "A");
+        try write.commit();
+    }
+
+    const before_maintenance = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
+
+    var scan = try runtime.beginCurrentScan();
+    defer scan.abort();
+
+    const after_open = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(before_writes.immutable_rotations + 1, backend.snapshotWriteStats().immutable_rotations);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls, after_open.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(before_maintenance.read_snapshot_mutable_rotations + 1, after_open.read_snapshot_mutable_rotations);
+
+    var cursor = try scan.openCursor();
+    defer cursor.close();
+    try std.testing.expectEqualStrings("doc:a", (try cursor.seekAtOrAfter("doc:")).?.key);
+}
+
+test "lsm backend current scan helpers reuse cached mutable read snapshot" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
     defer backend.close();
 
@@ -9769,7 +9895,8 @@ test "lsm backend current scan helpers do not clone mutable writer generation" {
     try std.testing.expectEqual(@as(usize, 2), range.len);
 
     const after = backend.snapshotMaintenanceStats();
-    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(before.mutable_snapshot_clone_calls + 1, after.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(before.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls + 1, after.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls);
 }
 
 test "lsm backend current scan keeps frozen mutable values across later writes" {
