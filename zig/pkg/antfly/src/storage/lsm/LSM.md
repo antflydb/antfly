@@ -475,7 +475,7 @@ Large-ingest guardrails:
 
 1. [x] Split point lookup into a bloom/range precheck phase followed by a read
    phase for surviving runs.
-   - [x] First slice: point reads now consult the manifest-carried run bloom
+   - [x] First slice: point reads now consult the SSTable-carried run bloom
      before loading a persisted run table index/block from `getFromRunIndices`.
    - [x] Persisted path-backed point reads now run a precheck pass over
      candidate runs using run bounds, run bloom, and table filter metadata
@@ -1667,8 +1667,8 @@ Implemented in this pass:
 - New table files now load indexes via:
   - one fixed-size footer trailer read
   - one contiguous metadata read
-- Bloom-negative reads now require and use manifest-carried `encoded_bloom_filter` bytes, avoiding whole-table I/O on common negative probes after reopen.
-- Once a manifest bloom has been decoded for a live run, later read snapshots now borrow that decoded filter instead of re-decoding it per transaction.
+- Bloom-negative reads now materialize run bloom filters from SSTable table indexes, avoiding whole-table I/O on common negative probes after reopen without bloating the manifest.
+- Once an SSTable bloom has been materialized for a live run, later read snapshots now borrow that decoded filter instead of re-decoding it per transaction.
 - Added a backend-local `TableIndex` cache for no-shared-cache readers, and point reads now use `footer metadata + one data block read` instead of loading the full table on first access after reopen.
 - Added a small backend-local run-block cache for no-shared-cache readers so repeated point reads in the same backend can reuse the previously fetched data block without additional file I/O.
 - Added a new v5 table format that stores per-block upper-bound metadata in the footer bundle. Point reads now use that metadata to jump directly to a single candidate data block instead of binary-searching across entry offsets and potentially touching multiple blocks.
