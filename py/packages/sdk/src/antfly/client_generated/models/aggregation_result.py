@@ -20,6 +20,10 @@ class AggregationResult:
     """
     Attributes:
         value (float | Unset): Single value for metric aggregations (sum, avg, min, max, count, cardinality)
+        approximate (bool | Unset): For cardinality aggregations, whether the value is an approximate estimate from a
+            HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations.
+        relative_error (float | Unset): For an approximate cardinality value, the relative standard error of the
+            estimate (e.g. 0.0081 for ~0.8%). Present only when approximate is true.
         count (int | Unset): Document count for stats aggregations
         min_ (float | Unset): Minimum value for stats aggregations
         max_ (float | Unset): Maximum value for stats aggregations
@@ -32,6 +36,8 @@ class AggregationResult:
     """
 
     value: float | Unset = UNSET
+    approximate: bool | Unset = UNSET
+    relative_error: float | Unset = UNSET
     count: int | Unset = UNSET
     min_: float | Unset = UNSET
     max_: float | Unset = UNSET
@@ -45,6 +51,10 @@ class AggregationResult:
 
     def to_dict(self) -> dict[str, Any]:
         value = self.value
+
+        approximate = self.approximate
+
+        relative_error = self.relative_error
 
         count = self.count
 
@@ -74,6 +84,10 @@ class AggregationResult:
         field_dict.update({})
         if value is not UNSET:
             field_dict["value"] = value
+        if approximate is not UNSET:
+            field_dict["approximate"] = approximate
+        if relative_error is not UNSET:
+            field_dict["relative_error"] = relative_error
         if count is not UNSET:
             field_dict["count"] = count
         if min_ is not UNSET:
@@ -102,6 +116,10 @@ class AggregationResult:
         d = dict(src_dict)
         value = d.pop("value", UNSET)
 
+        approximate = d.pop("approximate", UNSET)
+
+        relative_error = d.pop("relative_error", UNSET)
+
         count = d.pop("count", UNSET)
 
         min_ = d.pop("min", UNSET)
@@ -129,6 +147,8 @@ class AggregationResult:
 
         aggregation_result = cls(
             value=value,
+            approximate=approximate,
+            relative_error=relative_error,
             count=count,
             min_=min_,
             max_=max_,

@@ -30,6 +30,18 @@ pub fn parseMultiBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) 
     return std.json.parseFromSlice(types.MultiBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Execute a graph metric operational action
+pub const ExecuteGraphMetricActionPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the graph index
+    index_name: []const u8,
+    /// Name of the configured graph metric
+    metric_name: []const u8,
+    /// Operational action to apply to the graph metric materialization
+    action: []const u8,
+};
+
 /// Parse the JSON request body for commitTransaction.
 pub fn parseCommitTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
     return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -213,6 +225,17 @@ pub fn parseRowsBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !
     return std.json.parseFromSlice(types.RowsBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Stage typed relational update/delete operations from a claimed row source
+pub const RowsMutationSourcePathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsMutationSource.
+pub fn parseRowsMutationSourceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsMutationSourceRequest) {
+    return std.json.parseFromSlice(types.RowsMutationSourceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Lookup relational rows by structured row identity
 pub const RowsGetPathParams = struct {
     /// Name of the relational table
@@ -231,8 +254,8 @@ pub const RowsQueryPathParams = struct {
 };
 
 /// Parse the JSON request body for rowsQuery.
-pub fn parseRowsQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
-    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseRowsQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsQueryPlanRequest) {
+    return std.json.parseFromSlice(types.RowsQueryPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Execute a typed relational row aggregate plan
@@ -242,8 +265,8 @@ pub const RowsAggregatePathParams = struct {
 };
 
 /// Parse the JSON request body for rowsAggregate.
-pub fn parseRowsAggregateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
-    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseRowsAggregateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsAggregatePlanRequest) {
+    return std.json.parseFromSlice(types.RowsAggregatePlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Execute a typed relational row window plan
@@ -253,8 +276,8 @@ pub const RowsWindowPathParams = struct {
 };
 
 /// Parse the JSON request body for rowsWindow.
-pub fn parseRowsWindowBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
-    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseRowsWindowBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsWindowPlanRequest) {
+    return std.json.parseFromSlice(types.RowsWindowPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Execute a typed relational row join plan
@@ -264,8 +287,8 @@ pub const RowsJoinPathParams = struct {
 };
 
 /// Parse the JSON request body for rowsJoin.
-pub fn parseRowsJoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
-    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseRowsJoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsJoinPlanRequest) {
+    return std.json.parseFromSlice(types.RowsJoinPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Execute a typed relational row lateral plan
@@ -275,8 +298,8 @@ pub const RowsLateralPathParams = struct {
 };
 
 /// Parse the JSON request body for rowsLateral.
-pub fn parseRowsLateralBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
-    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseRowsLateralBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsLateralPlanRequest) {
+    return std.json.parseFromSlice(types.RowsLateralPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
@@ -583,6 +606,7 @@ pub const routes = [_]Route{
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
     .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite" },
+    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction" },
     .{ .method = "POST", .path = "/transactions/commit", .operation_id = "commitTransaction" },
     .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions" },
     .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions" },
@@ -610,6 +634,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable" },
     .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:batch", .operation_id = "rowsBatchWrite" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows:mutation-source", .operation_id = "rowsMutationSource" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:get", .operation_id = "rowsGet" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:query", .operation_id = "rowsQuery" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:aggregate", .operation_id = "rowsAggregate" },
@@ -660,6 +685,7 @@ pub const routes = [_]Route{
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn multiBatchWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
 //   fn commitTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response
@@ -687,6 +713,7 @@ pub const routes = [_]Route{
 //   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsBatchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsMutationSource(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsGet(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsQuery(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsAggregate(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

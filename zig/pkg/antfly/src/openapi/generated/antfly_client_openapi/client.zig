@@ -153,6 +153,15 @@ pub const Client = struct {
         return ApiResponse(types.MultiBatchResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Execute a graph metric operational action
+    /// POST /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}
+    pub fn executeGraphMetricAction(self: *@This(), table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !ApiResponse(types.GraphMetricActionResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/graph-metrics/{s}:{s}", .{ self.base_url, table_name, index_name, metric_name, action });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Commit an OCC transaction
     /// POST /db/v1/transactions/commit
     pub fn commitTransaction(self: *@This(), body: types.TransactionCommitRequest) !ApiResponse(types.TransactionCommitResponse) {
@@ -476,6 +485,17 @@ pub const Client = struct {
         return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Stage typed relational update/delete operations from a claimed row source
+    /// POST /db/v1/tables/{tableName}/rows:mutation-source
+    pub fn rowsMutationSource(self: *@This(), table_name: []const u8, body: types.RowsMutationSourceRequest) !ApiResponse(types.RowsMutationSourceResultSet) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:mutation-source", .{ self.base_url, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RowsMutationSourceResultSet).fromResponse(self.allocator, &resp);
+    }
+
     /// Lookup relational rows by structured row identity
     /// POST /db/v1/tables/{tableName}/rows:get
     pub fn rowsGet(self: *@This(), table_name: []const u8, body: types.RowsGetRequest) !ApiResponse(types.RowsGetResultSet) {
@@ -489,7 +509,7 @@ pub const Client = struct {
 
     /// Execute a typed relational row query plan
     /// POST /db/v1/tables/{tableName}/rows:query
-    pub fn rowsQuery(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(types.RowsQueryResultSet) {
+    pub fn rowsQuery(self: *@This(), table_name: []const u8, body: types.RowsQueryPlanRequest) !ApiResponse(types.RowsQueryResultSet) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:query", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
@@ -500,7 +520,7 @@ pub const Client = struct {
 
     /// Execute a typed relational row aggregate plan
     /// POST /db/v1/tables/{tableName}/rows:aggregate
-    pub fn rowsAggregate(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(types.RowsAggregateResultSet) {
+    pub fn rowsAggregate(self: *@This(), table_name: []const u8, body: types.RowsAggregatePlanRequest) !ApiResponse(types.RowsAggregateResultSet) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:aggregate", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
@@ -511,7 +531,7 @@ pub const Client = struct {
 
     /// Execute a typed relational row window plan
     /// POST /db/v1/tables/{tableName}/rows:window
-    pub fn rowsWindow(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
+    pub fn rowsWindow(self: *@This(), table_name: []const u8, body: types.RowsWindowPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:window", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
@@ -522,7 +542,7 @@ pub const Client = struct {
 
     /// Execute a typed relational row join plan
     /// POST /db/v1/tables/{tableName}/rows:join
-    pub fn rowsJoin(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
+    pub fn rowsJoin(self: *@This(), table_name: []const u8, body: types.RowsJoinPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:join", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
@@ -533,7 +553,7 @@ pub const Client = struct {
 
     /// Execute a typed relational row lateral plan
     /// POST /db/v1/tables/{tableName}/rows:lateral
-    pub fn rowsLateral(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
+    pub fn rowsLateral(self: *@This(), table_name: []const u8, body: types.RowsLateralPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:lateral", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);

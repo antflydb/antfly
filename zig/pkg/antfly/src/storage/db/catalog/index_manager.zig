@@ -2485,9 +2485,10 @@ pub const IndexManager = struct {
                 if (cfg.refresh != .background) continue;
                 var status = try entry.index.graphMetricStatus(cfg.name);
                 defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
                 switch (status.state) {
                     .not_ready, .stale, .failed => {
-                        var published = try entry.index.runPageRankMetric(cfg.name);
+                        var published = try entry.index.runGraphMetric(cfg.name);
                         published.deinit(entry.index.alloc);
                         total_steps += 1;
                     },
@@ -2496,6 +2497,33 @@ pub const IndexManager = struct {
             }
         }
         return total_steps;
+    }
+
+    pub fn refreshGraphMetric(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetric(metric_name);
+    }
+
+    pub fn rebuildGraphMetric(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.deleteGraphMetricMaterialization(metric_name);
+        return try entry.index.runGraphMetric(metric_name);
+    }
+
+    pub fn deleteGraphMetricMaterialization(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.deleteGraphMetricMaterialization(metric_name);
+        return try entry.index.graphMetricStatus(metric_name);
+    }
+
+    pub fn pauseGraphMetricMaintenance(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.pauseGraphMetricMaintenance(metric_name);
+    }
+
+    pub fn resumeGraphMetricMaintenance(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.resumeGraphMetricMaintenance(metric_name);
     }
 
     pub const DensePostingMaintenanceOptions = struct {
@@ -12481,6 +12509,8 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
         initialized += 1;
     }
 
+    graph_mod.validateGraphMetricEdgeFilters(configs, metric_configs) catch return error.InvalidIndexConfig;
+
     return .{
         .edge_type_configs = configs,
         .metric_configs = metric_configs,
@@ -12517,9 +12547,21 @@ fn parseGraphMetricConfigs(alloc: Allocator, root: std.json.Value) ![]graph_mod.
         const kind = if (metric_obj.get("kind")) |value| blk: {
             if (value != .string) return error.InvalidIndexConfig;
             if (std.mem.eql(u8, value.string, "pagerank")) break :blk graph_mod.GraphMetricKind.pagerank;
+            if (std.mem.eql(u8, value.string, "degree")) break :blk graph_mod.GraphMetricKind.degree;
+            if (std.mem.eql(u8, value.string, "eigenvector")) break :blk graph_mod.GraphMetricKind.eigenvector;
+            if (std.mem.eql(u8, value.string, "hits_authority")) break :blk graph_mod.GraphMetricKind.hits_authority;
+            if (std.mem.eql(u8, value.string, "hits_hub")) break :blk graph_mod.GraphMetricKind.hits_hub;
             return error.InvalidIndexConfig;
         } else if (std.mem.eql(u8, name, "pagerank"))
             graph_mod.GraphMetricKind.pagerank
+        else if (std.mem.eql(u8, name, "degree"))
+            graph_mod.GraphMetricKind.degree
+        else if (std.mem.eql(u8, name, "eigenvector"))
+            graph_mod.GraphMetricKind.eigenvector
+        else if (std.mem.eql(u8, name, "hits_authority"))
+            graph_mod.GraphMetricKind.hits_authority
+        else if (std.mem.eql(u8, name, "hits_hub"))
+            graph_mod.GraphMetricKind.hits_hub
         else
             return error.InvalidIndexConfig;
 
@@ -12836,6 +12878,83 @@ test "graph config declares algebraic provenance semiring traversal law" {
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"algebraic_planning":{"bounded_traversal":{"law":"min_plus_semiring"}}}
     ));
+}
+
+test "graph config validates metric edge filters against declared edge types" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{
+        \\  "edge_types":[{"name":"cites"},{"name":"mentions"}],
+        \\  "metrics":{"pagerank":{"enabled":true,"edge_filter":{"types":["cites"]}}}
+        \\}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cfg.metric_configs.len);
+    try std.testing.expectEqual(graph_mod.GraphMetricEdgeFilterMode.types, cfg.metric_configs[0].edge_filter.mode);
+    try std.testing.expectEqualStrings("cites", cfg.metric_configs[0].edge_filter.types[0]);
+
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{
+        \\  "edge_types":[{"name":"cites"}],
+        \\  "metrics":{"pagerank":{"enabled":true,"edge_filter":{"types":["related"]}}}
+        \\}
+    ));
+
+    var untyped = try parseGraphConfig(alloc,
+        \\{
+        \\  "metrics":{"pagerank":{"enabled":true,"edge_filter":{"types":["related"]}}}
+        \\}
+    );
+    defer untyped.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), untyped.edge_type_configs.len);
+}
+
+test "graph config parses eigenvector graph metric" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{
+        \\  "metrics":{"eigenvector":{"enabled":true,"max_iterations":25,"tolerance":0.00001}}
+        \\}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cfg.metric_configs.len);
+    try std.testing.expectEqual(graph_mod.GraphMetricKind.eigenvector, cfg.metric_configs[0].kind);
+    try std.testing.expectEqualStrings("eigenvector", cfg.metric_configs[0].name);
+    try std.testing.expectEqual(@as(u32, 25), cfg.metric_configs[0].max_iterations);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.00001), cfg.metric_configs[0].tolerance, 0.0000001);
+
+    var alias = try parseGraphConfig(alloc,
+        \\{
+        \\  "metrics":{"authority_score":{"enabled":true,"kind":"eigenvector"}}
+        \\}
+    );
+    defer alias.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), alias.metric_configs.len);
+    try std.testing.expectEqual(graph_mod.GraphMetricKind.eigenvector, alias.metric_configs[0].kind);
+    try std.testing.expectEqualStrings("authority_score", alias.metric_configs[0].name);
+}
+
+test "graph config parses hits graph metrics" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{
+        \\  "metrics":{
+        \\    "hits_authority":{"enabled":true,"max_iterations":30},
+        \\    "hits_hub":{"enabled":true,"kind":"hits_hub","tolerance":0.00001},
+        \\    "custom_authority":{"enabled":true,"kind":"hits_authority"}
+        \\  }
+        \\}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), cfg.metric_configs.len);
+    try std.testing.expectEqual(graph_mod.GraphMetricKind.hits_authority, cfg.metric_configs[0].kind);
+    try std.testing.expectEqualStrings("hits_authority", cfg.metric_configs[0].name);
+    try std.testing.expectEqual(@as(u32, 30), cfg.metric_configs[0].max_iterations);
+    try std.testing.expectEqual(graph_mod.GraphMetricKind.hits_hub, cfg.metric_configs[1].kind);
+    try std.testing.expectEqualStrings("hits_hub", cfg.metric_configs[1].name);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.00001), cfg.metric_configs[1].tolerance, 0.0000001);
+    try std.testing.expectEqual(graph_mod.GraphMetricKind.hits_authority, cfg.metric_configs[2].kind);
+    try std.testing.expectEqualStrings("custom_authority", cfg.metric_configs[2].name);
 }
 
 test "graph config parses artifact source and shorthand asset enrichment" {

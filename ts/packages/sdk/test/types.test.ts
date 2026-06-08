@@ -13,6 +13,36 @@ import type {
   NumericRangeQuery,
   QueryRequest,
   QueryStringQuery,
+  RowOperation,
+  RowsArrayUpdateTransform,
+  RowsAggregateHaving,
+  RowsAggregateHavingPredicate,
+  RowsAggregatePlanRequest,
+  RowsAggregateRequest,
+  RowsArrayLengthProjection,
+  RowsBatchRequest,
+  RowsCoalesceOperand,
+  RowsCoalesceProjection,
+  RowsConflictTarget,
+  RowsDocKeyRange,
+  RowsExpression,
+  RowsExpressionAssignmentMap,
+  RowsExpressionCaseBranch,
+  RowsFieldPatch,
+  RowsFieldAliasProjection,
+  RowsJoinRequest,
+  RowsJoinPlanRequest,
+  RowsJsonExtractProjection,
+  RowsJsonSetTransform,
+  RowsLateralRequest,
+  RowsLateralPlanRequest,
+  RowsMutationSourceRequest,
+  RowsMutationSourceResultSet,
+  RowsNumericIncrement,
+  RowsOnConflict,
+  RowsQueryRequest,
+  RowsRowClaim,
+  RowsUniquePredicateGroup,
   TermQuery,
 } from "../src/types.js";
 
@@ -342,5 +372,212 @@ describe("Antfly Query Type Integration", () => {
       expect(query.order_by).toBeDefined();
       expect(query.count).toBe(true);
     });
+  });
+});
+
+describe("Relational row plan type integration", () => {
+  it("should create a CTE-backed typed join plan", () => {
+    const join: RowsJoinRequest = {
+      left: { source_cte: "open_orders", select: ["tenant_id", "order_id"] },
+      right: {
+        where: { field: "kind", op: "eq", value: "customer" },
+        expression_any: [{ field: "status", op: "eq", value: "active" }],
+        select: ["tenant_id", "customer_id"],
+      },
+      on: [{ left_field: "tenant_id", right_field: "tenant_id" }],
+      join_type: "left",
+      select: [
+        { as: "order_id", side: "left", field: "order_id" },
+        { as: "customer_id", side: "right", field: "customer_id" },
+      ],
+      order_by: [{ field: "order_id", direction: "asc" }],
+      limit: 25,
+    };
+    const plan: RowsJoinPlanRequest = {
+      ctes: [
+        {
+          name: "open_orders",
+          query: { where: { field: "status", op: "eq", value: "open" } },
+        },
+      ],
+      join,
+    };
+
+    expect(plan.ctes?.[0]?.name).toBe("open_orders");
+    expect(plan.join?.left.source_cte).toBe("open_orders");
+    expect(plan.join?.select?.[1]?.side).toBe("right");
+  });
+
+  it("should create a bounded lateral row plan", () => {
+    const lateral: RowsLateralRequest = {
+      left: { source_cte: "tenants", select: ["tenant_id"] },
+      right: {
+        where: { field: "kind", op: "eq", value: "event" },
+        order_by: [{ field: "created_at", direction: "desc" }],
+        limit: 3,
+      },
+      correlations: [{ left_field: "tenant_id", right_field: "tenant_id" }],
+      select: [
+        { as: "tenant_id", side: "left", field: "tenant_id" },
+        { as: "event_id", side: "right", field: "id" },
+      ],
+    };
+    const plan: RowsLateralPlanRequest = {
+      ctes: [{ name: "tenants", query: { select: ["tenant_id"] } }],
+      lateral,
+    };
+
+    expect(plan.lateral?.right.limit).toBe(3);
+    expect(plan.lateral?.correlations[0]?.right_field).toBe("tenant_id");
+  });
+
+  it("should create an aggregate plan with typed having predicates", () => {
+    const predicate: RowsAggregateHavingPredicate = {
+      field: "amount_sum",
+      op: "gt",
+      value: 100,
+    };
+    const having: RowsAggregateHaving = { all: [predicate] };
+    const aggregate: RowsAggregateRequest = {
+      source: { where: { field: "status", op: "eq", value: "open" } },
+      group_by: ["customer_id"],
+      aggregations: [{ name: "amount_sum", op: "sum", field: "amount" }],
+      having,
+      order_by: [{ field: "amount_sum", direction: "desc" }],
+      limit: 10,
+    };
+    const plan: RowsAggregatePlanRequest = { aggregate };
+
+    expect(plan.aggregate.having?.all[0]?.field).toBe("amount_sum");
+    expectTypeOf(plan.aggregate.having?.all[0]?.op).toMatchTypeOf<
+      | "is_null"
+      | "is_not_null"
+      | "is_distinct"
+      | "is_not_distinct"
+      | "eq"
+      | "ne"
+      | "gt"
+      | "gte"
+      | "lt"
+      | "lte"
+      | undefined
+    >();
+  });
+
+  it("should create a row query with typed compact projections", () => {
+    const jsonExtract: RowsJsonExtractProjection = {
+      as: "plan",
+      field: "metadata",
+      path: ["billing", "plan"],
+      as_text: true,
+    };
+    const arrayLength: RowsArrayLengthProjection = { as: "tag_count", field: "tags" };
+    const coalesceOperand: RowsCoalesceOperand = { field: "display_name" };
+    const coalesce: RowsCoalesceProjection = {
+      as: "name_or_email",
+      operands: [coalesceOperand, { field: "email" }, { value: "unknown" }],
+    };
+    const alias: RowsFieldAliasProjection = { as: "raw_id", field: "id" };
+    const query: RowsQueryRequest = {
+      select: ["id"],
+      json_extract: [jsonExtract],
+      array_length: [arrayLength],
+      coalesce: [coalesce],
+      field_aliases: [alias],
+    };
+
+    expect(query.json_extract?.[0]?.as_text).toBe(true);
+    expect(query.array_length?.[0]?.field).toBe("tags");
+    expect(query.coalesce?.[0]?.operands[2]?.value).toBe("unknown");
+    expect(query.field_aliases?.[0]?.as).toBe("raw_id");
+  });
+
+  it("should create a claimed mutation-source request and result", () => {
+    const caseBranch: RowsExpressionCaseBranch = {
+      when: { lhs: { field: "status" }, op: "eq", rhs: { value: "ready" } },
+      then: { value: "claimed:ready" },
+    };
+    const statusExpr: RowsExpression = { field: "status" };
+    const caseExpr: RowsExpression = { op: "case", cases: [caseBranch], else: statusExpr };
+    const rowClaim: RowsRowClaim = {
+      mode: "for_update",
+      owner_id: "worker:1",
+      transaction_id: "00112233445566778899aabbccddeeff",
+      skip_locked: true,
+      lease_ms: 45000,
+    };
+    const range: RowsDocKeyRange = { start: "row:a", end: "row:z" };
+    const request: RowsMutationSourceRequest = {
+      op: "update",
+      source: {
+        where: { field: "status", op: "eq", value: "ready" },
+        row_claim: rowClaim,
+        order_by: [{ field: "created_at", direction: "asc" }],
+        limit: 5,
+      },
+      patch_expr: {
+        status: caseExpr,
+      },
+      returning: ["id", "status"],
+      returning_expressions: [{ as: "status_label", expr: statusExpr }],
+    };
+    const result: RowsMutationSourceResultSet = {
+      matched: 2,
+      staged: 1,
+      returning: [{ id: "r1", status: "claimed:ready" }],
+    };
+
+    expect(request.source.row_claim?.skip_locked).toBe(true);
+    expect(range.end).toBe("row:z");
+    expect(result.returning?.[0]?.status).toBe("claimed:ready");
+  });
+
+  it("should create row batch operations with typed conflict and transform plans", () => {
+    const patch: RowsFieldPatch = { status: "active" };
+    const increment: RowsNumericIncrement = { amount: 2.5 };
+    const patchExpr: RowsExpressionAssignmentMap = {
+      status_key: { op: "lower", args: [{ field: "status", source: "proposed" }] },
+    };
+    const jsonSet: RowsJsonSetTransform = {
+      field: "metadata",
+      path: ["billing", "plan"],
+      value: "pro",
+    };
+    const arrayUpdate: RowsArrayUpdateTransform = {
+      field: "tags",
+      op: "add_to_set",
+      value: "paid",
+    };
+    const partialTarget: RowsUniquePredicateGroup = {
+      all: [{ field: "status", op: "eq", value: "active" }],
+    };
+    const target: RowsConflictTarget = {
+      unique: { name: "usage_records_active_email_key", where: partialTarget },
+    };
+    const onConflict: RowsOnConflict = {
+      target,
+      action: "update",
+      patch,
+      increment,
+      patch_expr: patchExpr,
+      json_set: [jsonSet],
+      array_update: [arrayUpdate],
+      where_expression: {
+        lhs: { field: "status", source: "proposed" },
+        op: "is_not_null",
+      },
+    };
+    const op: RowOperation = {
+      op: "insert",
+      row: { id: "u2", email: "ada@example.test", status: "active" },
+      on_conflict: onConflict,
+      returning: ["id", "status"],
+      returning_expressions: [{ as: "status_label", expr: { field: "status" } }],
+    };
+    const batch: RowsBatchRequest = { operations: [op] };
+
+    expect(batch.operations[0]?.on_conflict?.target.unique?.where?.all[0]?.field).toBe("status");
+    expect(batch.operations[0]?.on_conflict?.json_set?.[0]?.path).toEqual(["billing", "plan"]);
+    expect(batch.operations[0]?.on_conflict?.array_update?.[0]?.op).toBe("add_to_set");
   });
 });

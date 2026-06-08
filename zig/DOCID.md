@@ -390,7 +390,7 @@ the canonical internal identity, but query-time sets should remain adaptive:
 const ResolvedDocSet = union(enum) {
     all,
     none,
-    doc_keys: []const []const u8,       // tiny sets and compatibility fallback
+    doc_keys: []const []const u8,       // tiny or public-ID-backed sets
     ordinals: []const DocOrdinal,       // small resolved ordinal sets
     ordinal_bitmap: RoaringBitmap,      // large dense or reusable sets
 };
@@ -1044,9 +1044,9 @@ Status as of 2026-05-19:
   referenced documents have ordinal coverage. DB vector/sparse filter bridging
   now uses this boundary directly for resolvable algebraic filter JSON, so
   ordinal-backed filters can flow into vector constraints without first
-  materializing public document IDs. The existing public-doc-ID bridge remains
-  the compatibility fallback for binding-heavy or mixed-coverage cases that
-  cannot be safely combined as document sets yet.
+  materializing public document IDs. The public-doc-ID bridge remains the
+  explicit path for binding-heavy or mixed-coverage cases that cannot be safely
+  combined as document sets yet.
 - Algebraic scalar doc-fact postings and adaptive path-dictionary promotion now
   write ordinal posting rows alongside the existing document-key posting rows
   when identity coverage is available. Scalar term/bool filters and

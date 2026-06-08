@@ -9180,6 +9180,111 @@ pub const DB = struct {
         return try self.core.index_manager.runGraphMetricMaintenance();
     }
 
+    pub fn refreshGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.refreshGraphMetric(index_name, metric_name);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn rebuildGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.rebuildGraphMetric(index_name, metric_name);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn deleteGraphMetricMaterialization(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.deleteGraphMetricMaterialization(index_name, metric_name);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn pauseGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.pauseGraphMetricMaintenance(index_name, metric_name);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn resumeGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.resumeGraphMetricMaintenance(index_name, metric_name);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    fn cloneGraphMetricStatusFromGraph(
+        alloc: Allocator,
+        source: graph_mod.GraphIndex.GraphMetricStatus,
+    ) !types.GraphMetricStatus {
+        const name = try alloc.dupe(u8, source.name);
+        var name_moved = false;
+        errdefer if (!name_moved) alloc.free(name);
+        var edge_filter = try source.edge_filter.cloneAlloc(alloc);
+        var edge_filter_moved = false;
+        errdefer if (!edge_filter_moved) edge_filter.deinit(alloc);
+        const recent_events = if (source.recent_events.len > 0)
+            try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, source.recent_events)
+        else
+            @constCast((&[_]graph_mod.GraphIndex.GraphMetricEvent{})[0..]);
+        var recent_events_moved = false;
+        errdefer if (!recent_events_moved and recent_events.len > 0) alloc.free(recent_events);
+        const last_error = if (source.last_error.len > 0) try alloc.dupe(u8, source.last_error) else "";
+        var last_error_moved = false;
+        errdefer if (!last_error_moved and last_error.len > 0) alloc.free(last_error);
+        const build_worker_id = if (source.build_worker_id.len > 0) try alloc.dupe(u8, source.build_worker_id) else "";
+        var build_worker_id_moved = false;
+        errdefer if (!build_worker_id_moved and build_worker_id.len > 0) alloc.free(build_worker_id);
+        const build_cursor = if (source.build_cursor.len > 0) try alloc.dupe(u8, source.build_cursor) else "";
+        var build_cursor_moved = false;
+        errdefer if (!build_cursor_moved and build_cursor.len > 0) alloc.free(build_cursor);
+        const out = types.GraphMetricStatus{
+            .name = name,
+            .state = source.state,
+            .phase = source.phase,
+            .edge_filter = edge_filter,
+            .metadata_version = source.metadata_version,
+            .maintenance_paused = source.maintenance_paused,
+            .build_queued = source.build_queued,
+            .published_generation = source.published_generation,
+            .edge_generation = source.edge_generation,
+            .target_edge_generation = source.target_edge_generation,
+            .queued_generation = source.queued_generation,
+            .building_generation = source.building_generation,
+            .build_job_id = source.build_job_id,
+            .build_started_at_ms = source.build_started_at_ms,
+            .build_iteration = source.build_iteration,
+            .build_lease_expires_at_ms = source.build_lease_expires_at_ms,
+            .build_worker_id = build_worker_id,
+            .build_cursor = build_cursor,
+            .build_completed_units = source.build_completed_units,
+            .build_total_units = source.build_total_units,
+            .retry_count = source.retry_count,
+            .last_error = last_error,
+            .progress = source.progress,
+            .converged = source.converged,
+            .iterations_completed = source.iterations_completed,
+            .delta = source.delta,
+            .computed_at_ms = source.computed_at_ms,
+            .last_event = source.last_event,
+            .recent_events = recent_events,
+        };
+        name_moved = true;
+        edge_filter_moved = true;
+        recent_events_moved = true;
+        last_error_moved = true;
+        build_worker_id_moved = true;
+        build_cursor_moved = true;
+        return out;
+    }
+
     pub fn runDensePostingMaintenanceForIdle(self: *DB) !usize {
         lockApply(self);
         defer self.core.unlockApply();
@@ -10407,16 +10512,64 @@ pub const DB = struct {
         for (graph_index.metric_configs, 0..) |cfg, i| {
             var status = try graph_index.graphMetricStatus(cfg.name);
             defer status.deinit(graph_index.alloc);
+            const name = try alloc.dupe(u8, status.name);
+            var name_moved = false;
+            errdefer if (!name_moved) alloc.free(name);
+            var edge_filter = try status.edge_filter.cloneAlloc(alloc);
+            var edge_filter_moved = false;
+            errdefer if (!edge_filter_moved) edge_filter.deinit(alloc);
+            const recent_events = if (status.recent_events.len > 0)
+                try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, status.recent_events)
+            else
+                @constCast((&[_]graph_mod.GraphIndex.GraphMetricEvent{})[0..]);
+            var recent_events_moved = false;
+            errdefer if (!recent_events_moved and recent_events.len > 0) alloc.free(recent_events);
+            const last_error = if (status.last_error.len > 0) try alloc.dupe(u8, status.last_error) else "";
+            var last_error_moved = false;
+            errdefer if (!last_error_moved and last_error.len > 0) alloc.free(last_error);
+            const build_worker_id = if (status.build_worker_id.len > 0) try alloc.dupe(u8, status.build_worker_id) else "";
+            var build_worker_id_moved = false;
+            errdefer if (!build_worker_id_moved and build_worker_id.len > 0) alloc.free(build_worker_id);
+            const build_cursor = if (status.build_cursor.len > 0) try alloc.dupe(u8, status.build_cursor) else "";
+            var build_cursor_moved = false;
+            errdefer if (!build_cursor_moved and build_cursor.len > 0) alloc.free(build_cursor);
             statuses[i] = .{
-                .name = try alloc.dupe(u8, status.name),
+                .name = name,
                 .state = status.state,
+                .phase = status.phase,
+                .edge_filter = edge_filter,
+                .metadata_version = status.metadata_version,
+                .maintenance_paused = status.maintenance_paused,
+                .build_queued = status.build_queued,
                 .published_generation = status.published_generation,
                 .edge_generation = status.edge_generation,
+                .target_edge_generation = status.target_edge_generation,
+                .queued_generation = status.queued_generation,
+                .building_generation = status.building_generation,
+                .build_job_id = status.build_job_id,
+                .build_started_at_ms = status.build_started_at_ms,
+                .build_iteration = status.build_iteration,
+                .build_lease_expires_at_ms = status.build_lease_expires_at_ms,
+                .build_worker_id = build_worker_id,
+                .build_cursor = build_cursor,
+                .build_completed_units = status.build_completed_units,
+                .build_total_units = status.build_total_units,
+                .retry_count = status.retry_count,
+                .last_error = last_error,
+                .progress = status.progress,
                 .converged = status.converged,
                 .iterations_completed = status.iterations_completed,
                 .delta = status.delta,
                 .computed_at_ms = status.computed_at_ms,
+                .last_event = status.last_event,
+                .recent_events = recent_events,
             };
+            name_moved = true;
+            edge_filter_moved = true;
+            recent_events_moved = true;
+            last_error_moved = true;
+            build_worker_id_moved = true;
+            build_cursor_moved = true;
             initialized += 1;
         }
         item.graph_metric_status = statuses;
@@ -14405,8 +14558,9 @@ pub const DB = struct {
         const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
         if (claim.mode != .for_update) return error.InvalidQueryRequest;
         if (req.source.source_cte.len != 0) return error.UnsupportedQueryRequest;
-        if (req.kind == .update and req.operations.len == 0) return error.InvalidQueryRequest;
-        if (req.kind == .delete and req.operations.len != 0) return error.InvalidQueryRequest;
+        if (req.source.doc_key_range != null) return error.UnsupportedQueryRequest;
+        if (req.kind == .update and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0) return error.InvalidQueryRequest;
+        if (req.kind == .delete and (req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0)) return error.InvalidQueryRequest;
 
         lockApplyShared(self);
         var apply_shared_held = true;
@@ -14442,7 +14596,10 @@ pub const DB = struct {
         _ = try self.applyRelationalRowsClaimToSelectedCandidatesAlloc(alloc, rows.items, &selected_indexes, claim, req.source.limit);
 
         var transforms = std.ArrayListUnmanaged(types.DocumentTransform).empty;
-        defer transforms.deinit(alloc);
+        defer {
+            for (transforms.items) |transform| relationalRowsFreeTransformOps(alloc, transform.operations);
+            transforms.deinit(alloc);
+        }
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer deletes.deinit(alloc);
         var predicates = std.ArrayListUnmanaged(types.TransactionVersionPredicate).empty;
@@ -14463,14 +14620,18 @@ pub const DB = struct {
 
             switch (req.kind) {
                 .update => {
+                    const operations = try relationalRowsMutationSourceOperationsAlloc(alloc, runtime_schema, row.json, req);
+                    var operations_transferred = false;
+                    errdefer if (!operations_transferred) relationalRowsFreeTransformOps(alloc, operations);
                     try transforms.append(alloc, .{
                         .key = row.doc_key,
-                        .operations = req.operations,
+                        .operations = operations,
                     });
-                    if (req.returning_all or req.returning.len > 0) {
+                    operations_transferred = true;
+                    if (req.returning_all or req.returning.len > 0 or req.returning_expressions.len > 0) {
                         const planned = (try transform_mod.resolveDocumentTransform(alloc, row.json, .{
                             .key = row.doc_key,
-                            .operations = req.operations,
+                            .operations = operations,
                         })) orelse return error.InvalidQueryRequest;
                         defer alloc.free(planned);
                         const projected = try relationalRowsMutationReturningJsonAlloc(alloc, planned, req);
@@ -14482,7 +14643,7 @@ pub const DB = struct {
                 },
                 .delete => {
                     try deletes.append(alloc, row.doc_key);
-                    if (req.returning_all or req.returning.len > 0) {
+                    if (req.returning_all or req.returning.len > 0 or req.returning_expressions.len > 0) {
                         const projected = try relationalRowsMutationReturningJsonAlloc(alloc, row.json, req);
                         var projected_transferred = false;
                         errdefer if (!projected_transferred) alloc.free(projected);
@@ -14721,7 +14882,15 @@ pub const DB = struct {
         const first_window = req.windows[0];
         if (first_window.order_by.len == 0) return error.InvalidQueryRequest;
         for (req.windows) |window| {
-            if (window.function != .row_number or window.output.len == 0) return error.InvalidQueryRequest;
+            if (window.output.len == 0) return error.InvalidQueryRequest;
+            switch (window.function) {
+                .row_number, .rank, .dense_rank => {
+                    if (window.value_expression != null or window.offset != 1 or window.default_json.len > 0) return error.InvalidQueryRequest;
+                },
+                .lag, .lead => {
+                    if (window.value_expression == null or window.offset == 0) return error.InvalidQueryRequest;
+                },
+            }
             if (!relationalRowsWindowSpecsShareOrder(first_window, window)) return error.UnsupportedQueryRequest;
         }
 
@@ -14743,32 +14912,56 @@ pub const DB = struct {
         var source_rows = try self.queryRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes, source);
         defer source_rows.deinit(alloc);
 
+        const partition_keys = try alloc.alloc([]u8, source_rows.rows.len);
+        var partition_keys_initialized: usize = 0;
+        defer {
+            for (partition_keys[0..partition_keys_initialized]) |key| alloc.free(key);
+            alloc.free(partition_keys);
+        }
+        const order_keys = try alloc.alloc([]RelationalRowsQueryOrderKey, source_rows.rows.len);
+        var order_keys_initialized: usize = 0;
+        defer {
+            for (order_keys[0..order_keys_initialized]) |keys| freeRelationalRowsQueryOrderKeySlice(alloc, keys);
+            alloc.free(order_keys);
+        }
+        for (source_rows.rows, 0..) |row_json, i| {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidQueryRequest;
+            partition_keys[i] = try relationalRowsWindowPartitionKeyJsonAlloc(alloc, parsed.value, first_window.partition_by);
+            partition_keys_initialized += 1;
+            order_keys[i] = try relationalRowsQueryOrderKeysAlloc(alloc, parsed.value, first_window.order_by);
+            order_keys_initialized += 1;
+        }
+
         var rows = std.ArrayListUnmanaged([]const u8).empty;
         errdefer {
             for (rows.items) |row| alloc.free(@constCast(row));
             rows.deinit(alloc);
         }
 
-        var previous_partition_key: ?[]u8 = null;
-        defer if (previous_partition_key) |key| alloc.free(key);
-        var row_number: u64 = 0;
+        var window_counters: RelationalRowsWindowCounterValues = .{};
 
-        for (source_rows.rows) |row_json| {
+        for (source_rows.rows, 0..) |row_json, i| {
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidQueryRequest;
 
-            const partition_key = try relationalRowsWindowPartitionKeyJsonAlloc(alloc, parsed.value, first_window.partition_by);
-            defer alloc.free(partition_key);
-            if (previous_partition_key == null or !std.mem.eql(u8, previous_partition_key.?, partition_key)) {
-                if (previous_partition_key) |old| alloc.free(old);
-                previous_partition_key = try alloc.dupe(u8, partition_key);
-                row_number = 1;
+            if (i == 0 or !std.mem.eql(u8, partition_keys[i - 1], partition_keys[i])) {
+                window_counters = .{
+                    .row_number = 1,
+                    .rank = 1,
+                    .dense_rank = 1,
+                };
             } else {
-                row_number += 1;
+                window_counters.row_number += 1;
+                if (!relationalRowsQueryOrderKeysEqual(order_keys[i - 1], order_keys[i])) {
+                    window_counters.rank = window_counters.row_number;
+                    window_counters.dense_rank += 1;
+                }
             }
 
-            const out = try relationalRowsWindowResultRowJsonAlloc(alloc, parsed.value, req, row_number);
+            const out = try relationalRowsWindowResultRowJsonAlloc(alloc, parsed.value, source_rows.rows, partition_keys, i, req, window_counters);
             var out_transferred = false;
             errdefer if (!out_transferred) alloc.free(out);
             try rows.append(alloc, out);
@@ -14884,11 +15077,20 @@ pub const DB = struct {
         return try out.toOwnedSlice();
     }
 
+    const RelationalRowsWindowCounterValues = struct {
+        row_number: u64 = 0,
+        rank: u64 = 0,
+        dense_rank: u64 = 0,
+    };
+
     fn relationalRowsWindowResultRowJsonAlloc(
         alloc: Allocator,
         row: std.json.Value,
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        row_index: usize,
         req: types.RelationalRowsWindowRequest,
-        row_number: u64,
+        counters: RelationalRowsWindowCounterValues,
     ) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
@@ -14917,10 +15119,78 @@ pub const DB = struct {
         for (req.windows) |window| {
             if (!first) try writer.writeByte(',');
             first = false;
-            try writer.print("{f}:{d}", .{ std.json.fmt(window.output, .{}), row_number });
+            try writer.print("{f}:", .{std.json.fmt(window.output, .{})});
+            switch (window.function) {
+                .row_number, .rank, .dense_rank => {
+                    const value = switch (window.function) {
+                        .row_number => counters.row_number,
+                        .rank => counters.rank,
+                        .dense_rank => counters.dense_rank,
+                        else => unreachable,
+                    };
+                    try writer.print("{d}", .{value});
+                },
+                .lag, .lead => try writeRelationalRowsWindowOffsetValue(
+                    alloc,
+                    writer,
+                    source_rows,
+                    partition_keys,
+                    row_index,
+                    window,
+                ),
+            }
         }
         try writer.writeByte('}');
         return try out.toOwnedSlice();
+    }
+
+    fn writeRelationalRowsWindowOffsetValue(
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        row_index: usize,
+        window: types.RelationalRowsWindowSpec,
+    ) !void {
+        const target_index: ?usize = switch (window.function) {
+            .lag => if (row_index >= window.offset) row_index - window.offset else null,
+            .lead => blk: {
+                const remaining = source_rows.len - row_index - 1;
+                if (window.offset > remaining) break :blk null;
+                const target = row_index + window.offset;
+                break :blk if (target < source_rows.len) target else null;
+            },
+            else => return error.InvalidQueryRequest,
+        };
+        const target = target_index orelse {
+            try writeRelationalRowsWindowDefaultValue(alloc, writer, window.default_json);
+            return;
+        };
+        if (!std.mem.eql(u8, partition_keys[row_index], partition_keys[target])) {
+            try writeRelationalRowsWindowDefaultValue(alloc, writer, window.default_json);
+            return;
+        }
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, source_rows[target], .{}) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+        const expression = window.value_expression orelse return error.InvalidQueryRequest;
+        const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression);
+        defer alloc.free(value_json);
+        try writer.writeAll(value_json);
+    }
+
+    fn writeRelationalRowsWindowDefaultValue(
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        default_json: []const u8,
+    ) !void {
+        if (default_json.len == 0) {
+            try writer.writeAll("null");
+            return;
+        }
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, default_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        try std.json.Stringify.value(parsed.value, .{}, writer);
     }
 
     fn projectRelationalRowsQueryCandidateAlloc(
@@ -14997,14 +15267,206 @@ pub const DB = struct {
         return try out.toOwnedSlice();
     }
 
+    fn relationalRowsMutationSourceOperationsAlloc(
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        row_json: []const u8,
+        req: types.RelationalRowsMutationSourceRequest,
+    ) ![]types.TransformOp {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+
+        var operations = std.ArrayListUnmanaged(types.TransformOp).empty;
+        errdefer {
+            relationalRowsFreeTransformOpPayloads(alloc, operations.items);
+            operations.deinit(alloc);
+        }
+
+        try relationalRowsAppendClonedTransformOpsAlloc(alloc, &operations, req.operations);
+        try relationalRowsAppendExpressionAssignmentOpsAlloc(alloc, runtime_schema, parsed.value, &operations, req.patch_expressions, .set);
+        try relationalRowsAppendExpressionAssignmentOpsAlloc(alloc, runtime_schema, parsed.value, &operations, req.increment_expressions, .inc);
+        try relationalRowsAppendOnUpdateOpsAlloc(alloc, runtime_schema, &operations);
+        try relationalRowsAppendGeneratedColumnOpsAlloc(alloc, runtime_schema, row_json, &operations);
+
+        return try operations.toOwnedSlice(alloc);
+    }
+
+    fn relationalRowsAppendClonedTransformOpsAlloc(
+        alloc: Allocator,
+        operations: *std.ArrayListUnmanaged(types.TransformOp),
+        source: []const types.TransformOp,
+    ) !void {
+        for (source) |op| {
+            const path = try alloc.dupe(u8, op.path);
+            var path_transferred = false;
+            errdefer if (!path_transferred) alloc.free(path);
+            const value_json: ?[]const u8 = if (op.value_json) |value| try alloc.dupe(u8, value) else null;
+            var value_transferred = false;
+            errdefer if (!value_transferred) if (value_json) |value| alloc.free(@constCast(value));
+            try operations.append(alloc, .{
+                .op = op.op,
+                .path = path,
+                .value_json = value_json,
+            });
+            path_transferred = true;
+            value_transferred = true;
+        }
+    }
+
+    fn relationalRowsAppendExpressionAssignmentOpsAlloc(
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        row: std.json.Value,
+        operations: *std.ArrayListUnmanaged(types.TransformOp),
+        assignments: []const types.RelationalRowsExpressionAssignment,
+        op: types.TransformOpType,
+    ) !void {
+        for (assignments) |assignment| {
+            const column = relationalRowsFindColumn(runtime_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
+            if (op == .inc and column.field_type != .numeric) return error.InvalidQueryRequest;
+            const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, null, assignment.expression);
+            var value_transferred = false;
+            errdefer if (!value_transferred) alloc.free(value_json);
+            if (op == .inc) try relationalRowsValidateIncrementValueJson(alloc, value_json);
+            const path = try alloc.dupe(u8, column.path);
+            var path_transferred = false;
+            errdefer if (!path_transferred) alloc.free(path);
+            try operations.append(alloc, .{
+                .op = op,
+                .path = path,
+                .value_json = value_json,
+            });
+            path_transferred = true;
+            value_transferred = true;
+        }
+    }
+
+    fn relationalRowsFindColumn(columns: []const schema_mod.RelationalColumn, name: []const u8) ?schema_mod.RelationalColumn {
+        for (columns) |column| {
+            if (std.mem.eql(u8, column.path, name) or std.mem.eql(u8, column.name, name)) return column;
+        }
+        return null;
+    }
+
+    fn relationalRowsAppendOnUpdateOpsAlloc(
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        operations: *std.ArrayListUnmanaged(types.TransformOp),
+    ) !void {
+        for (runtime_schema.relational_columns) |column| {
+            const on_update = column.on_update_value orelse continue;
+            if (on_update.kind != .now_ns) return error.InvalidQueryRequest;
+            const value_json = try std.fmt.allocPrint(alloc, "{d}", .{currentTimeNs()});
+            var value_transferred = false;
+            errdefer if (!value_transferred) alloc.free(value_json);
+            const path = try alloc.dupe(u8, column.path);
+            var path_transferred = false;
+            errdefer if (!path_transferred) alloc.free(path);
+            try operations.append(alloc, .{
+                .op = .set,
+                .path = path,
+                .value_json = value_json,
+            });
+            path_transferred = true;
+            value_transferred = true;
+        }
+    }
+
+    fn relationalRowsAppendGeneratedColumnOpsAlloc(
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        row_json: []const u8,
+        operations: *std.ArrayListUnmanaged(types.TransformOp),
+    ) !void {
+        var generated_count: usize = 0;
+        for (runtime_schema.relational_columns) |column| {
+            if (column.generated != null) generated_count += 1;
+        }
+        if (generated_count == 0) return;
+
+        const planned_json = (try transform_mod.resolveDocumentTransform(alloc, row_json, .{
+            .key = "",
+            .operations = operations.items,
+        })) orelse return error.InvalidQueryRequest;
+        defer alloc.free(planned_json);
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, planned_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+
+        for (runtime_schema.relational_columns) |column| {
+            const generated = column.generated orelse continue;
+            const value_json = try relationalRowsGeneratedColumnValueJsonAlloc(alloc, parsed.value, generated);
+            var value_transferred = false;
+            errdefer if (!value_transferred) alloc.free(value_json);
+            const path = try alloc.dupe(u8, column.path);
+            var path_transferred = false;
+            errdefer if (!path_transferred) alloc.free(path);
+            try operations.append(alloc, .{
+                .op = .set,
+                .path = path,
+                .value_json = value_json,
+            });
+            path_transferred = true;
+            value_transferred = true;
+        }
+    }
+
+    fn relationalRowsGeneratedColumnValueJsonAlloc(
+        alloc: Allocator,
+        row: std.json.Value,
+        generated: schema_mod.RelationalGeneratedValue,
+    ) ![]u8 {
+        return switch (generated.op) {
+            .lower => blk: {
+                const field = generated.field orelse return error.InvalidQueryRequest;
+                const selected = relationalRowsJsonValueAtPath(row, field) orelse return error.InvalidQueryRequest;
+                if (selected.* != .string) return error.InvalidQueryRequest;
+                const lowered = try std.ascii.allocLowerString(alloc, selected.string);
+                defer alloc.free(lowered);
+                break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = lowered }, .{});
+            },
+            .concat => blk: {
+                var joined = std.ArrayListUnmanaged(u8).empty;
+                defer joined.deinit(alloc);
+                for (generated.fields, 0..) |field, i| {
+                    if (i != 0) try joined.appendSlice(alloc, generated.separator);
+                    const selected = relationalRowsJsonValueAtPath(row, field) orelse return error.InvalidQueryRequest;
+                    const text = try relationalRowsScalarJsonValueTextAlloc(alloc, selected.*);
+                    defer alloc.free(text);
+                    try joined.appendSlice(alloc, text);
+                }
+                break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = joined.items }, .{});
+            },
+        };
+    }
+
+    fn relationalRowsValidateIncrementValueJson(alloc: Allocator, value_json: []const u8) !void {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .integer, .float, .number_string => {},
+            else => return error.InvalidQueryRequest,
+        }
+    }
+
+    fn relationalRowsFreeTransformOps(alloc: Allocator, operations: []const types.TransformOp) void {
+        relationalRowsFreeTransformOpPayloads(alloc, operations);
+        if (operations.len > 0) alloc.free(@constCast(operations));
+    }
+
+    fn relationalRowsFreeTransformOpPayloads(alloc: Allocator, operations: []const types.TransformOp) void {
+        for (operations) |op| {
+            alloc.free(@constCast(op.path));
+            if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+        }
+    }
+
     fn relationalRowsMutationReturningJsonAlloc(
         alloc: Allocator,
         row_json: []const u8,
         req: types.RelationalRowsMutationSourceRequest,
     ) ![]u8 {
-        if (req.returning_all) return try alloc.dupe(u8, row_json);
-        if (req.returning.len == 0) return try alloc.dupe(u8, "{}");
-
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -15013,15 +15475,36 @@ pub const DB = struct {
         errdefer out.deinit();
         const writer = &out.writer;
         try writer.writeByte('{');
+        var wrote = false;
+        if (req.returning_all) {
+            var fields = parsed.value.object.iterator();
+            while (fields.next()) |entry| {
+                if (wrote) try writer.writeByte(',');
+                wrote = true;
+                try writer.print("{f}:", .{std.json.fmt(entry.key_ptr.*, .{})});
+                try std.json.Stringify.value(entry.value_ptr.*, .{}, writer);
+            }
+        }
         for (req.returning, 0..) |field, i| {
             if (field.len == 0) return error.InvalidQueryRequest;
-            if (i > 0) try writer.writeByte(',');
+            _ = i;
+            if (wrote) try writer.writeByte(',');
+            wrote = true;
             try writer.print("{f}:", .{std.json.fmt(field, .{})});
             if (relationalRowsJsonValueAtPath(parsed.value, field)) |selected| {
                 try std.json.Stringify.value(selected.*, .{}, writer);
             } else {
                 try writer.writeAll("null");
             }
+        }
+        for (req.returning_expressions) |projection| {
+            if (projection.output.len == 0) return error.InvalidQueryRequest;
+            if (wrote) try writer.writeByte(',');
+            wrote = true;
+            try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
+            const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, projection.expression);
+            defer alloc.free(value_json);
+            try writer.writeAll(value_json);
         }
         try writer.writeByte('}');
         return try out.toOwnedSlice();
@@ -16365,7 +16848,7 @@ pub const DB = struct {
         generation: ?u64,
     ) !?doc_set.ResolvedDocSet {
         const column = relationalColumnForField(runtime_schema, predicate.field) orelse return null;
-        if (predicate.op == .is_null or predicate.op == .is_not_null or predicate.op == .ne) return null;
+        if (predicate.op == .is_null or predicate.op == .is_not_null or predicate.op == .is_distinct or predicate.op == .is_not_distinct or predicate.op == .ne) return null;
         const value_json = predicate.value_json orelse return null;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return null;
         defer parsed.deinit();
@@ -16737,7 +17220,7 @@ pub const DB = struct {
                     null,
                 else => null,
             },
-            .is_null, .is_not_null, .ne => null,
+            .is_null, .is_not_null, .is_distinct, .is_not_distinct, .ne => null,
         };
     }
 
@@ -16839,7 +17322,7 @@ pub const DB = struct {
         row_json: []const u8,
         req: types.RelationalRowsQueryRequest,
     ) !bool {
-        if (req.predicates.len == 0 and req.array_any.len == 0 and req.array_contains.len == 0 and req.array_eq.len == 0 and req.in_predicates.len == 0 and req.json_contains.len == 0 and req.json_path_eq.len == 0 and req.json_path_exists.len == 0 and req.or_predicates.len == 0 and req.not_predicates.len == 0 and req.expression_predicates.len == 0) return true;
+        if (req.predicates.len == 0 and req.array_any.len == 0 and req.array_contains.len == 0 and req.array_eq.len == 0 and req.in_predicates.len == 0 and req.json_contains.len == 0 and req.json_path_eq.len == 0 and req.json_path_exists.len == 0 and req.text_patterns.len == 0 and req.or_predicates.len == 0 and req.not_predicates.len == 0 and req.expression_predicates.len == 0 and req.expression_or_predicates.len == 0 and req.expression_not_predicates.len == 0 and req.expression_array_contains.len == 0) return true;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -16850,6 +17333,11 @@ pub const DB = struct {
         if (!(try relationalRowsQueryNotPredicateGroupsPass(alloc, parsed.value, req.not_predicates))) return false;
         for (req.expression_predicates) |condition| {
             if (!(try relationalRowsExpressionConditionMatches(alloc, parsed.value, condition))) return false;
+        }
+        if (!(try relationalRowsQueryExpressionOrPredicateGroupsPass(alloc, parsed.value, req.expression_or_predicates))) return false;
+        if (!(try relationalRowsQueryExpressionNotPredicateGroupsPass(alloc, parsed.value, req.expression_not_predicates))) return false;
+        for (req.expression_array_contains) |predicate| {
+            if (!(try relationalRowsQueryExpressionArrayContainsPredicatePasses(alloc, parsed.value, predicate))) return false;
         }
         for (req.array_any) |predicate| {
             if (!(try relationalRowsQueryArrayAnyPredicatePasses(alloc, parsed.value, predicate))) return false;
@@ -16872,7 +17360,65 @@ pub const DB = struct {
         for (req.json_path_exists) |predicate| {
             if (!relationalRowsQueryJsonPathExistsPredicatePasses(parsed.value, predicate)) return false;
         }
+        for (req.text_patterns) |predicate| {
+            if (!relationalRowsQueryTextPatternPredicatePasses(parsed.value, predicate)) return false;
+        }
         return true;
+    }
+
+    fn relationalRowsQueryTextPatternPredicatePasses(
+        row: std.json.Value,
+        predicate: types.RelationalRowsTextPatternPredicate,
+    ) bool {
+        const actual = relationalRowsJsonValueAtPath(row, predicate.field) orelse return predicate.negated;
+        if (actual.* != .string) return predicate.negated;
+        const matched = relationalRowsSqlLikePatternMatches(actual.string, predicate.pattern, predicate.case_insensitive);
+        return if (predicate.negated) !matched else matched;
+    }
+
+    fn relationalRowsSqlLikePatternMatches(text: []const u8, pattern: []const u8, case_insensitive: bool) bool {
+        return relationalRowsSqlLikePatternMatchesFrom(text, pattern, case_insensitive, 0, 0);
+    }
+
+    fn relationalRowsSqlLikePatternMatchesFrom(
+        text: []const u8,
+        pattern: []const u8,
+        case_insensitive: bool,
+        text_index: usize,
+        pattern_index: usize,
+    ) bool {
+        var ti = text_index;
+        var pi = pattern_index;
+        while (pi < pattern.len) {
+            const token = pattern[pi];
+            if (token == '%') {
+                while (pi < pattern.len and pattern[pi] == '%') pi += 1;
+                if (pi == pattern.len) return true;
+                var next_ti = ti;
+                while (next_ti <= text.len) : (next_ti += 1) {
+                    if (relationalRowsSqlLikePatternMatchesFrom(text, pattern, case_insensitive, next_ti, pi)) return true;
+                }
+                return false;
+            }
+            if (ti >= text.len) return false;
+            if (token == '_') {
+                ti += 1;
+                pi += 1;
+                continue;
+            }
+            if (token == '\\' and pi + 1 < pattern.len) {
+                pi += 1;
+            }
+            if (!relationalRowsSqlLikeBytesEqual(text[ti], pattern[pi], case_insensitive)) return false;
+            ti += 1;
+            pi += 1;
+        }
+        return ti == text.len;
+    }
+
+    fn relationalRowsSqlLikeBytesEqual(lhs: u8, rhs: u8, case_insensitive: bool) bool {
+        if (!case_insensitive) return lhs == rhs;
+        return std.ascii.toLower(lhs) == std.ascii.toLower(rhs);
     }
 
     fn relationalRowsQueryPredicatePasses(
@@ -16884,6 +17430,14 @@ pub const DB = struct {
         return switch (predicate.op) {
             .is_null => value == null or value.?.* == .null,
             .is_not_null => value != null and value.?.* != .null,
+            .is_distinct, .is_not_distinct => blk: {
+                const expected_json = predicate.value_json orelse return error.InvalidQueryRequest;
+                var expected = std.json.parseFromSlice(std.json.Value, alloc, expected_json, .{}) catch return error.InvalidQueryRequest;
+                defer expected.deinit();
+                const actual: std.json.Value = if (value) |selected| selected.* else .null;
+                const not_distinct = relationalRowsJsonValuesNotDistinct(actual, expected.value) orelse return error.InvalidQueryRequest;
+                break :blk if (predicate.op == .is_not_distinct) not_distinct else !not_distinct;
+            },
             .eq, .ne, .gt, .gte, .lt, .lte => blk: {
                 const expected_json = predicate.value_json orelse return error.InvalidQueryRequest;
                 var expected = std.json.parseFromSlice(std.json.Value, alloc, expected_json, .{}) catch return error.InvalidQueryRequest;
@@ -16931,6 +17485,43 @@ pub const DB = struct {
             var group_passes = true;
             for (group.predicates) |predicate| {
                 if (!(try relationalRowsQueryPredicatePasses(alloc, row, predicate))) {
+                    group_passes = false;
+                    break;
+                }
+            }
+            if (group_passes) return false;
+        }
+        return true;
+    }
+
+    fn relationalRowsQueryExpressionOrPredicateGroupsPass(
+        alloc: Allocator,
+        row: std.json.Value,
+        groups: []const types.RelationalRowsExpressionPredicateGroup,
+    ) !bool {
+        if (groups.len == 0) return true;
+        for (groups) |group| {
+            var group_passes = true;
+            for (group.conditions) |condition| {
+                if (!(try relationalRowsExpressionConditionMatches(alloc, row, condition))) {
+                    group_passes = false;
+                    break;
+                }
+            }
+            if (group_passes) return true;
+        }
+        return false;
+    }
+
+    fn relationalRowsQueryExpressionNotPredicateGroupsPass(
+        alloc: Allocator,
+        row: std.json.Value,
+        groups: []const types.RelationalRowsExpressionPredicateGroup,
+    ) !bool {
+        for (groups) |group| {
+            var group_passes = true;
+            for (group.conditions) |condition| {
+                if (!(try relationalRowsExpressionConditionMatches(alloc, row, condition))) {
                     group_passes = false;
                     break;
                 }
@@ -17051,15 +17642,32 @@ pub const DB = struct {
         row: std.json.Value,
         expression: types.RelationalRowsExpression,
     ) anyerror![]u8 {
+        return try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, null, expression);
+    }
+
+    fn relationalRowsExpressionValueJsonWithSourcesAlloc(
+        alloc: Allocator,
+        row: std.json.Value,
+        proposed_row: ?std.json.Value,
+        expression: types.RelationalRowsExpression,
+    ) anyerror![]u8 {
         return switch (expression.kind) {
             .field => blk: {
-                const selected = relationalRowsJsonValueAtPath(row, expression.field) orelse return try alloc.dupe(u8, "null");
+                const source_row = switch (expression.field_source) {
+                    .row, .existing => row,
+                    .proposed => proposed_row orelse return error.InvalidQueryRequest,
+                };
+                const selected = relationalRowsJsonValueAtPath(source_row, expression.field) orelse return try alloc.dupe(u8, "null");
                 break :blk try std.json.Stringify.valueAlloc(alloc, selected.*, .{});
             },
             .value => try alloc.dupe(u8, expression.value_json),
+            .now => if (expression.value_json.len > 0)
+                try alloc.dupe(u8, expression.value_json)
+            else
+                try std.fmt.allocPrint(alloc, "{d}", .{currentTimeNs()}),
             .coalesce => blk: {
                 for (expression.operands) |operand| {
-                    const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, operand);
+                    const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, operand);
                     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch {
                         alloc.free(value_json);
                         return error.InvalidQueryRequest;
@@ -17073,18 +17681,21 @@ pub const DB = struct {
                 }
                 break :blk try alloc.dupe(u8, "null");
             },
-            .lower => blk: {
+            .lower, .upper => blk: {
                 if (expression.operands.len != 1) return error.InvalidQueryRequest;
-                const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, expression.operands[0]);
+                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
                 defer alloc.free(value_json);
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
                 defer parsed.deinit();
                 switch (parsed.value) {
                     .null => break :blk try alloc.dupe(u8, "null"),
                     .string => |text| {
-                        const lowered = try std.ascii.allocLowerString(alloc, text);
-                        defer alloc.free(lowered);
-                        break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = lowered }, .{});
+                        const transformed = if (expression.kind == .lower)
+                            try std.ascii.allocLowerString(alloc, text)
+                        else
+                            try std.ascii.allocUpperString(alloc, text);
+                        defer alloc.free(transformed);
+                        break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = transformed }, .{});
                     },
                     else => return error.InvalidQueryRequest,
                 }
@@ -17094,7 +17705,7 @@ pub const DB = struct {
                 var joined = std.ArrayListUnmanaged(u8).empty;
                 defer joined.deinit(alloc);
                 for (expression.operands) |operand| {
-                    const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, operand);
+                    const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, operand);
                     defer alloc.free(value_json);
                     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
                     defer parsed.deinit();
@@ -17107,10 +17718,10 @@ pub const DB = struct {
             },
             .nullif => blk: {
                 if (expression.operands.len != 2) return error.InvalidQueryRequest;
-                const lhs_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, expression.operands[0]);
+                const lhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
                 var lhs_transferred = false;
                 errdefer if (!lhs_transferred) alloc.free(lhs_json);
-                const rhs_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, expression.operands[1]);
+                const rhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[1]);
                 defer alloc.free(rhs_json);
                 var lhs = std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{}) catch return error.InvalidQueryRequest;
                 defer lhs.deinit();
@@ -17127,14 +17738,14 @@ pub const DB = struct {
             .add, .sub, .mul, .div => blk: {
                 if ((expression.kind == .add or expression.kind == .mul) and expression.operands.len < 2) return error.InvalidQueryRequest;
                 if ((expression.kind == .sub or expression.kind == .div) and expression.operands.len != 2) return error.InvalidQueryRequest;
-                const first_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, expression.operands[0]);
+                const first_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
                 defer alloc.free(first_json);
                 var first = std.json.parseFromSlice(std.json.Value, alloc, first_json, .{}) catch return error.InvalidQueryRequest;
                 defer first.deinit();
                 if (first.value == .null) break :blk try alloc.dupe(u8, "null");
                 var result = jsonNumberAsF64(first.value) orelse return error.InvalidQueryRequest;
                 for (expression.operands[1..]) |operand| {
-                    const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, operand);
+                    const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, operand);
                     defer alloc.free(value_json);
                     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
                     defer parsed.deinit();
@@ -17153,7 +17764,7 @@ pub const DB = struct {
             .cast => blk: {
                 if (expression.operands.len != 1) return error.InvalidQueryRequest;
                 const cast_type = expression.cast_type orelse return error.InvalidQueryRequest;
-                const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, expression.operands[0]);
+                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
                 defer alloc.free(value_json);
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
                 defer parsed.deinit();
@@ -17162,7 +17773,7 @@ pub const DB = struct {
             },
             .json_extract => blk: {
                 if (expression.operands.len != 1 or expression.json_path.len == 0) return error.InvalidQueryRequest;
-                const root_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, expression.operands[0]);
+                const root_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
                 defer alloc.free(root_json);
                 var root = std.json.parseFromSlice(std.json.Value, alloc, root_json, .{}) catch return error.InvalidQueryRequest;
                 defer root.deinit();
@@ -17172,7 +17783,7 @@ pub const DB = struct {
             },
             .array_length => blk: {
                 if (expression.operands.len != 1) return error.InvalidQueryRequest;
-                const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, expression.operands[0]);
+                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
                 defer alloc.free(value_json);
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
                 defer parsed.deinit();
@@ -17182,16 +17793,67 @@ pub const DB = struct {
                     else => return error.InvalidQueryRequest,
                 }
             },
+            .string_to_array => blk: {
+                if (expression.operands.len != 2) return error.InvalidQueryRequest;
+                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
+                defer alloc.free(value_json);
+                const delimiter_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[1]);
+                defer alloc.free(delimiter_json);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+                defer parsed.deinit();
+                var delimiter = std.json.parseFromSlice(std.json.Value, alloc, delimiter_json, .{}) catch return error.InvalidQueryRequest;
+                defer delimiter.deinit();
+                if (parsed.value == .null or delimiter.value == .null) break :blk try alloc.dupe(u8, "null");
+                if (parsed.value != .string or delimiter.value != .string or delimiter.value.string.len == 0) return error.InvalidQueryRequest;
+                break :blk try relationalRowsStringToArrayValueJsonAlloc(alloc, parsed.value.string, delimiter.value.string);
+            },
             .case => blk: {
                 if (expression.case_branches.len == 0 or expression.case_else.len != 1) return error.InvalidQueryRequest;
                 for (expression.case_branches) |branch| {
-                    if (try relationalRowsExpressionConditionMatches(alloc, row, branch.when)) {
-                        break :blk try relationalRowsExpressionValueJsonAlloc(alloc, row, branch.then);
+                    if (try relationalRowsExpressionConditionMatchesWithSources(alloc, row, proposed_row, branch.when)) {
+                        break :blk try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, branch.then);
                     }
                 }
-                break :blk try relationalRowsExpressionValueJsonAlloc(alloc, row, expression.case_else[0]);
+                break :blk try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.case_else[0]);
             },
         };
+    }
+
+    fn relationalRowsStringToArrayValueJsonAlloc(
+        alloc: Allocator,
+        text: []const u8,
+        delimiter: []const u8,
+    ) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeByte('[');
+        var parts = std.mem.splitSequence(u8, text, delimiter);
+        var first = true;
+        while (parts.next()) |part| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{f}", .{std.json.fmt(part, .{})});
+        }
+        try writer.writeByte(']');
+        return try out.toOwnedSlice();
+    }
+
+    fn relationalRowsQueryExpressionArrayContainsPredicatePasses(
+        alloc: Allocator,
+        row: std.json.Value,
+        predicate: types.RelationalRowsExpressionArrayContainsPredicate,
+    ) !bool {
+        const actual_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, predicate.expression);
+        defer alloc.free(actual_json);
+        var actual = std.json.parseFromSlice(std.json.Value, alloc, actual_json, .{}) catch return error.InvalidQueryRequest;
+        defer actual.deinit();
+        if (actual.value == .null) return false;
+        if (actual.value != .array) return error.InvalidQueryRequest;
+        var wanted = std.json.parseFromSlice(std.json.Value, alloc, predicate.value_json, .{}) catch return error.InvalidQueryRequest;
+        defer wanted.deinit();
+        if (wanted.value != .array) return error.InvalidQueryRequest;
+        return relational_store_mod.jsonValueContains(actual.value, wanted.value);
     }
 
     fn relationalRowsExpressionConditionMatches(
@@ -17199,23 +17861,48 @@ pub const DB = struct {
         row: std.json.Value,
         condition: types.RelationalRowsExpressionCondition,
     ) anyerror!bool {
-        const lhs_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, condition.lhs);
+        return try relationalRowsExpressionConditionMatchesWithSources(alloc, row, null, condition);
+    }
+
+    fn relationalRowsExpressionConditionMatchesWithSources(
+        alloc: Allocator,
+        row: std.json.Value,
+        proposed_row: ?std.json.Value,
+        condition: types.RelationalRowsExpressionCondition,
+    ) anyerror!bool {
+        const lhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, condition.lhs);
         defer alloc.free(lhs_json);
         var lhs = std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{}) catch return error.InvalidQueryRequest;
         defer lhs.deinit();
         return switch (condition.op) {
             .is_null => lhs.value == .null,
             .is_not_null => lhs.value != .null,
-            .eq, .ne, .gt, .gte, .lt, .lte => blk: {
+            .is_distinct, .is_not_distinct => blk: {
                 if (condition.rhs.len != 1) return error.InvalidQueryRequest;
-                const rhs_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, condition.rhs[0]);
+                const rhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, condition.rhs[0]);
+                defer alloc.free(rhs_json);
+                var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidQueryRequest;
+                defer rhs.deinit();
+                const not_distinct = relationalRowsJsonValuesNotDistinct(lhs.value, rhs.value) orelse return error.InvalidQueryRequest;
+                break :blk if (condition.op == .is_not_distinct) not_distinct else !not_distinct;
+            },
+            .eq, .ne => blk: {
+                if (condition.rhs.len != 1) return error.InvalidQueryRequest;
+                const rhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, condition.rhs[0]);
+                defer alloc.free(rhs_json);
+                var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidQueryRequest;
+                defer rhs.deinit();
+                const equal = relational_store_mod.jsonValuesEqualExact(lhs.value, rhs.value);
+                break :blk if (condition.op == .eq) equal else !equal;
+            },
+            .gt, .gte, .lt, .lte => blk: {
+                if (condition.rhs.len != 1) return error.InvalidQueryRequest;
+                const rhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, condition.rhs[0]);
                 defer alloc.free(rhs_json);
                 var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidQueryRequest;
                 defer rhs.deinit();
                 const comparison = compareRelationalRowsJsonScalars(lhs.value, rhs.value) orelse return error.InvalidQueryRequest;
                 break :blk switch (condition.op) {
-                    .eq => comparison == .eq,
-                    .ne => comparison != .eq,
                     .gt => comparison == .gt,
                     .gte => comparison == .gt or comparison == .eq,
                     .lt => comparison == .lt,
@@ -17417,6 +18104,14 @@ pub const DB = struct {
         };
     }
 
+    fn relationalRowsQueryOrderKeysEqual(lhs: []const RelationalRowsQueryOrderKey, rhs: []const RelationalRowsQueryOrderKey) bool {
+        if (lhs.len != rhs.len) return false;
+        for (lhs, rhs) |left, right| {
+            if (compareRelationalRowsQueryOrderKeys(left, right) != .eq) return false;
+        }
+        return true;
+    }
+
     fn relationalRowsQueryOrderKeyRank(key: RelationalRowsQueryOrderKey) u8 {
         return switch (key) {
             .bool => 0,
@@ -17428,6 +18123,11 @@ pub const DB = struct {
     }
 
     const RelationalRowsScalarComparison = enum { lt, eq, gt };
+
+    fn relationalRowsJsonValuesNotDistinct(actual: std.json.Value, expected: std.json.Value) ?bool {
+        const comparison = compareRelationalRowsJsonScalars(actual, expected) orelse return null;
+        return comparison == .eq;
+    }
 
     fn compareRelationalRowsJsonScalars(actual: std.json.Value, expected: std.json.Value) ?RelationalRowsScalarComparison {
         if (jsonNumberAsF64(actual)) |left| {
@@ -17630,6 +18330,7 @@ pub const DB = struct {
         if (execution_req.full_text_queries.len > 0 or execution_req.dense_queries.len > 0 or execution_req.sparse_queries.len > 0 or execution_req.merge_config != null) {
             var composed = try self.searchComposed(alloc, execution_req, exec_ctx);
             errdefer composed.deinit();
+            try self.applyGraphMetricRerank(&composed, execution_req);
             try externalizeSearchResultArtifactIds(alloc, &composed);
             return composed;
         }
@@ -17676,6 +18377,8 @@ pub const DB = struct {
             base.graph_metric_results = try self.executeGraphMetricQueries(alloc, execution_req.graph_metric_queries);
         }
 
+        try self.applyGraphMetricRerank(&base, execution_req);
+
         if (execution_req.graph_queries.len == 0) {
             try externalizeSearchResultArtifactIds(alloc, &base);
             return base;
@@ -17705,6 +18408,77 @@ pub const DB = struct {
             initialized += 1;
         }
         return results;
+    }
+
+    fn applyGraphMetricRerank(
+        self: *DB,
+        result: *types.SearchResult,
+        req: types.SearchRequest,
+    ) !void {
+        const rerank = req.graph_metric_rerank orelse return;
+        if (req.count_only) return error.UnsupportedQueryRequest;
+
+        const entry = self.core.graphIndex(rerank.index_name) orelse return error.IndexNotFound;
+        var status = try entry.index.graphMetricStatus(rerank.metric_name);
+        defer status.deinit(entry.index.alloc);
+
+        if (status.published_generation == 0) return error.MetricNotReady;
+        if (rerank.freshness == .fresh and status.state != .fresh) return error.MetricStale;
+
+        var result_status = try cloneGraphMetricStatusFromGraph(result.alloc, status);
+        var result_status_moved = false;
+        errdefer if (!result_status_moved) result_status.deinit(result.alloc);
+
+        for (result.hits) |*hit| {
+            const metric_score_opt = try entry.index.graphMetricScore(rerank.metric_name, hit.id);
+            const metric_score = metric_score_opt orelse rerank.missing_score;
+            const base_score: f64 = if (hit.score) |score| @floatCast(score) else 0.0;
+            const final_score = rerank.base_weight * base_score + rerank.weight * metric_score;
+            const clamped_final_score = clampF64ToF32(final_score);
+            const detail_index_name = try result.alloc.dupe(u8, rerank.index_name);
+            errdefer result.alloc.free(detail_index_name);
+            const detail_metric_name = try result.alloc.dupe(u8, rerank.metric_name);
+            errdefer result.alloc.free(detail_metric_name);
+            var score_details = types.GraphMetricRerankScoreDetails{
+                .index_name = detail_index_name,
+                .metric_name = detail_metric_name,
+                .base_score = base_score,
+                .base_weight = rerank.base_weight,
+                .metric_score = metric_score_opt,
+                .metric_score_used = metric_score,
+                .metric_weight = rerank.weight,
+                .missing_score_used = metric_score_opt == null,
+                .final_score = clamped_final_score,
+                .published_generation = status.published_generation,
+            };
+            var score_details_moved = false;
+            errdefer if (!score_details_moved) score_details.deinit(result.alloc);
+
+            if (hit.score_details) |*old_details| old_details.deinit(result.alloc);
+            hit.score_details = score_details;
+            score_details_moved = true;
+            hit.score = clamped_final_score;
+        }
+
+        std.mem.sort(types.SearchHit, result.hits, {}, struct {
+            fn lessThan(_: void, a: types.SearchHit, b: types.SearchHit) bool {
+                const a_score = a.score orelse 0.0;
+                const b_score = b.score orelse 0.0;
+                if (a_score == b_score) return std.mem.lessThan(u8, a.id, b.id);
+                return a_score > b_score;
+            }
+        }.lessThan);
+
+        if (result.graph_metric_rerank_status) |*old_status| old_status.deinit(result.alloc);
+        result.graph_metric_rerank_status = result_status;
+        result_status_moved = true;
+    }
+
+    fn clampF64ToF32(value: f64) f32 {
+        const max = std.math.floatMax(f32);
+        if (value > max) return max;
+        if (value < -max) return -max;
+        return @floatCast(value);
     }
 
     fn executeGraphMetricQuery(
@@ -17739,21 +18513,72 @@ pub const DB = struct {
             initialized_scores += 1;
         }
 
+        const status_name = try alloc.dupe(u8, status.name);
+        var status_name_moved = false;
+        errdefer if (!status_name_moved) alloc.free(status_name);
+        var status_edge_filter = try status.edge_filter.cloneAlloc(alloc);
+        var status_edge_filter_moved = false;
+        errdefer if (!status_edge_filter_moved) status_edge_filter.deinit(alloc);
+        const status_recent_events = if (status.recent_events.len > 0)
+            try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, status.recent_events)
+        else
+            @constCast((&[_]graph_mod.GraphIndex.GraphMetricEvent{})[0..]);
+        var status_recent_events_moved = false;
+        errdefer if (!status_recent_events_moved and status_recent_events.len > 0) alloc.free(status_recent_events);
+        const status_last_error = if (status.last_error.len > 0) try alloc.dupe(u8, status.last_error) else "";
+        var status_last_error_moved = false;
+        errdefer if (!status_last_error_moved and status_last_error.len > 0) alloc.free(status_last_error);
+        const status_build_worker_id = if (status.build_worker_id.len > 0) try alloc.dupe(u8, status.build_worker_id) else "";
+        var status_build_worker_id_moved = false;
+        errdefer if (!status_build_worker_id_moved and status_build_worker_id.len > 0) alloc.free(status_build_worker_id);
+        const status_build_cursor = if (status.build_cursor.len > 0) try alloc.dupe(u8, status.build_cursor) else "";
+        var status_build_cursor_moved = false;
+        errdefer if (!status_build_cursor_moved and status_build_cursor.len > 0) alloc.free(status_build_cursor);
+        var result_status = types.GraphMetricStatus{
+            .name = status_name,
+            .state = status.state,
+            .phase = status.phase,
+            .edge_filter = status_edge_filter,
+            .metadata_version = status.metadata_version,
+            .maintenance_paused = status.maintenance_paused,
+            .build_queued = status.build_queued,
+            .published_generation = status.published_generation,
+            .edge_generation = status.edge_generation,
+            .target_edge_generation = status.target_edge_generation,
+            .queued_generation = status.queued_generation,
+            .building_generation = status.building_generation,
+            .build_job_id = status.build_job_id,
+            .build_started_at_ms = status.build_started_at_ms,
+            .build_iteration = status.build_iteration,
+            .build_lease_expires_at_ms = status.build_lease_expires_at_ms,
+            .build_worker_id = status_build_worker_id,
+            .build_cursor = status_build_cursor,
+            .build_completed_units = status.build_completed_units,
+            .build_total_units = status.build_total_units,
+            .retry_count = status.retry_count,
+            .last_error = status_last_error,
+            .progress = status.progress,
+            .converged = status.converged,
+            .iterations_completed = status.iterations_completed,
+            .delta = status.delta,
+            .computed_at_ms = status.computed_at_ms,
+            .last_event = status.last_event,
+            .recent_events = status_recent_events,
+        };
+        status_name_moved = true;
+        status_edge_filter_moved = true;
+        status_recent_events_moved = true;
+        status_last_error_moved = true;
+        status_build_worker_id_moved = true;
+        status_build_cursor_moved = true;
+        errdefer result_status.deinit(alloc);
+
         return .{
             .name = try alloc.dupe(u8, named.name),
             .index_name = try alloc.dupe(u8, named.query.index_name),
             .metric_name = try alloc.dupe(u8, named.query.metric_name),
             .scores = scores,
-            .status = .{
-                .name = try alloc.dupe(u8, status.name),
-                .state = status.state,
-                .published_generation = status.published_generation,
-                .edge_generation = status.edge_generation,
-                .converged = status.converged,
-                .iterations_completed = status.iterations_completed,
-                .delta = status.delta,
-                .computed_at_ms = status.computed_at_ms,
-            },
+            .status = result_status,
         };
     }
 
@@ -38382,7 +39207,7 @@ test "db runUntilIdle publishes configured graph pagerank metrics" {
     try db.addIndex(.{
         .name = "graph_idx",
         .kind = .graph,
-        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"max_iterations\":40,\"tolerance\":0.000001,\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"max_iterations\":40,\"tolerance\":0.000001,\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}},\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}},\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"max_iterations\":20,\"tolerance\":0.000001,\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"max_iterations\":20,\"tolerance\":0.000001,\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"max_iterations\":20,\"tolerance\":0.000001,\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
     });
 
     try db.batch(.{
@@ -38401,6 +39226,18 @@ test "db runUntilIdle publishes configured graph pagerank metrics" {
         var status = try graph_entry.index.graphMetricStatus("pagerank");
         defer status.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, status.state);
+        var degree_status = try graph_entry.index.graphMetricStatus("degree");
+        defer degree_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, degree_status.state);
+        var eigenvector_status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer eigenvector_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, eigenvector_status.state);
+        var authority_status = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, authority_status.state);
+        var hub_status = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, hub_status.state);
     }
 
     try db.runUntilIdle();
@@ -38412,6 +39249,23 @@ test "db runUntilIdle publishes configured graph pagerank metrics" {
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
         try std.testing.expect(status.published_generation > 0);
         try std.testing.expect(status.converged or status.iterations_completed == 40);
+        var degree_status = try graph_entry.index.graphMetricStatus("degree");
+        defer degree_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, degree_status.state);
+        try std.testing.expect(degree_status.converged);
+        try std.testing.expectEqual(@as(u32, 1), degree_status.iterations_completed);
+        var eigenvector_status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer eigenvector_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, eigenvector_status.state);
+        try std.testing.expect(eigenvector_status.converged or eigenvector_status.iterations_completed == 20);
+        var authority_status = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, authority_status.state);
+        try std.testing.expect(authority_status.converged or authority_status.iterations_completed == 20);
+        var hub_status = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub_status.state);
+        try std.testing.expect(hub_status.converged or hub_status.iterations_completed == 20);
 
         const top = try graph_entry.index.graphMetricTopK("pagerank", 10);
         defer {
@@ -38420,6 +39274,40 @@ test "db runUntilIdle publishes configured graph pagerank metrics" {
         }
         try std.testing.expectEqual(@as(usize, 4), top.len);
         for (top) |score| try std.testing.expect(!std.mem.eql(u8, score.node, "doc:x"));
+
+        const degree_top = try graph_entry.index.graphMetricTopK("degree", 10);
+        defer {
+            for (degree_top) |*score| score.deinit(alloc);
+            alloc.free(degree_top);
+        }
+        try std.testing.expectEqual(@as(usize, 4), degree_top.len);
+        try std.testing.expectEqualStrings("doc:b", degree_top[0].node);
+        try std.testing.expectApproxEqAbs(@as(f64, 3.0), degree_top[0].score, 0.001);
+        for (degree_top) |score| try std.testing.expect(!std.mem.eql(u8, score.node, "doc:x"));
+
+        const eigenvector_top = try graph_entry.index.graphMetricTopK("eigenvector", 10);
+        defer {
+            for (eigenvector_top) |*score| score.deinit(alloc);
+            alloc.free(eigenvector_top);
+        }
+        try std.testing.expectEqual(@as(usize, 4), eigenvector_top.len);
+        for (eigenvector_top) |score| try std.testing.expect(!std.mem.eql(u8, score.node, "doc:x"));
+
+        const authority_top = try graph_entry.index.graphMetricTopK("hits_authority", 10);
+        defer {
+            for (authority_top) |*score| score.deinit(alloc);
+            alloc.free(authority_top);
+        }
+        try std.testing.expectEqual(@as(usize, 4), authority_top.len);
+        for (authority_top) |score| try std.testing.expect(!std.mem.eql(u8, score.node, "doc:x"));
+
+        const hub_top = try graph_entry.index.graphMetricTopK("hits_hub", 10);
+        defer {
+            for (hub_top) |*score| score.deinit(alloc);
+            alloc.free(hub_top);
+        }
+        try std.testing.expectEqual(@as(usize, 4), hub_top.len);
+        for (hub_top) |score| try std.testing.expect(!std.mem.eql(u8, score.node, "doc:x"));
     }
 
     var metric_result = try db.search(alloc, .{
@@ -38439,6 +39327,630 @@ test "db runUntilIdle publishes configured graph pagerank metrics" {
     try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
     try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+
+    var degree_metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer degree_metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), degree_metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(@as(usize, 1), degree_metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:b", degree_metric_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), degree_metric_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric manual refresh rebuild and delete operate on configured metric" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runUntilIdle();
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("manual_degree");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, status.state);
+    }
+
+    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer refreshed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
+    try std.testing.expect(refreshed.published_generation > 0);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("manual_degree");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, status.state);
+    }
+
+    var rebuilt = try db.rebuildGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer rebuilt.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, rebuilt.state);
+    try std.testing.expect(rebuilt.published_generation >= refreshed.published_generation);
+
+    const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+    const top = try graph_entry.index.graphMetricTopK("manual_degree", 1);
+    defer {
+        for (top) |*score| score.deinit(alloc);
+        alloc.free(top);
+    }
+    try std.testing.expectEqual(@as(usize, 1), top.len);
+    try std.testing.expectEqualStrings("doc:b", top[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), top[0].score, 0.001);
+
+    var deleted = try db.deleteGraphMetricMaterialization(alloc, "graph_idx", "manual_degree");
+    defer deleted.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, deleted.state);
+    try std.testing.expectEqual(@as(u64, 0), deleted.published_generation);
+    try std.testing.expect(!deleted.maintenance_paused);
+
+    try std.testing.expectError(error.MetricNotReady, graph_entry.index.graphMetricTopK("manual_degree", 1));
+
+    var refreshed_after_delete = try db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer refreshed_after_delete.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed_after_delete.state);
+}
+
+test "db graph metric freshness distinguishes published stale scores from fresh requirement" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer refreshed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "manual_degree",
+                .top_k = 10,
+                .freshness = .published,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(refreshed.published_generation, published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+    for (published_result.graph_metric_results[0].scores) |score| {
+        try std.testing.expect(!std.mem.eql(u8, score.node, "doc:c"));
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), score.score, 0.001);
+    }
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "manual_degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    }));
+}
+
+test "db graph metric rerank applies published metric scores to search hits" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"store\":true}",
+    });
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer refreshed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "manual_degree",
+            .freshness = .fresh,
+            .weight = 1.0,
+        },
+        .limit = 3,
+        .include_stored = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 3), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), result.hits[0].score orelse return error.TestUnexpectedResult, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), result.hits[1].score orelse return error.TestUnexpectedResult, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), result.hits[2].score orelse return error.TestUnexpectedResult, 0.001);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.runUntilIdle();
+
+    var stale_ok = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "manual_degree",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+        .limit = 4,
+        .include_stored = false,
+    });
+    defer stale_ok.deinit();
+    try std.testing.expectEqualStrings("doc:b", stale_ok.hits[0].id);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), stale_ok.hits[0].score orelse return error.TestUnexpectedResult, 0.001);
+
+    var explicit_expression = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "manual_degree",
+            .freshness = .published,
+            .base_weight = 0.0,
+            .weight = 2.0,
+            .missing_score = -10.0,
+        },
+        .limit = 4,
+        .include_stored = false,
+    });
+    defer explicit_expression.deinit();
+    try std.testing.expectEqualStrings("doc:b", explicit_expression.hits[0].id);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), explicit_expression.hits[0].score orelse return error.TestUnexpectedResult, 0.001);
+    const top_details = explicit_expression.hits[0].score_details orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("graph_idx", top_details.index_name);
+    try std.testing.expectEqualStrings("manual_degree", top_details.metric_name);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), top_details.base_score, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), top_details.base_weight, 0.001);
+    try std.testing.expect(top_details.metric_score != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), top_details.metric_score.?, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), top_details.metric_score_used, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), top_details.metric_weight, 0.001);
+    try std.testing.expect(!top_details.missing_score_used);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), top_details.final_score, 0.001);
+    try std.testing.expectEqual(refreshed.published_generation, top_details.published_generation);
+    try std.testing.expectEqualStrings("doc:d", explicit_expression.hits[3].id);
+    try std.testing.expectApproxEqAbs(@as(f32, -20.0), explicit_expression.hits[3].score orelse return error.TestUnexpectedResult, 0.001);
+    const missing_details = explicit_expression.hits[3].score_details orelse return error.TestUnexpectedResult;
+    try std.testing.expect(missing_details.metric_score == null);
+    try std.testing.expect(missing_details.missing_score_used);
+    try std.testing.expectApproxEqAbs(@as(f64, -10.0), missing_details.metric_score_used, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, -20.0), missing_details.final_score, 0.001);
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "manual_degree",
+            .freshness = .fresh,
+            .weight = 1.0,
+        },
+        .limit = 4,
+        .include_stored = false,
+    }));
+}
+
+test "db graph query metric not ready semantics distinguish projection from ranking" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const published_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "manual_degree",
+        .freshness = .published,
+    }};
+    const base_query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{ .edge_types = &.{"cites"}, .direction = .out, .max_depth = 1 },
+        .metrics = &published_metric_reads,
+        .include_metric_status = true,
+    };
+    var projection_result = try db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = base_query }},
+        .limit = 0,
+    });
+    defer projection_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), projection_result.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), projection_result.graph_results[0].nodes.len);
+    try std.testing.expectEqualStrings("doc:b", projection_result.graph_results[0].nodes[0].key);
+    try std.testing.expectEqual(@as(usize, 1), projection_result.graph_results[0].nodes[0].metrics.len);
+    try std.testing.expectEqualStrings("manual_degree", projection_result.graph_results[0].nodes[0].metrics[0].name);
+    try std.testing.expect(projection_result.graph_results[0].nodes[0].metrics[0].score == null);
+    try std.testing.expectEqual(@as(usize, 1), projection_result.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, projection_result.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(@as(u64, 0), projection_result.graph_results[0].metric_status[0].published_generation);
+
+    const fresh_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "manual_degree",
+        .freshness = .fresh,
+    }};
+    var fresh_projection_query = base_query;
+    fresh_projection_query.metrics = &fresh_metric_reads;
+    try std.testing.expectError(error.MetricNotReady, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_projection_query }},
+        .limit = 0,
+    }));
+
+    const published_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "manual_degree",
+        .freshness = .published,
+    }};
+    var order_query = base_query;
+    order_query.order_by = &published_metric_orders;
+    try std.testing.expectError(error.MetricNotReady, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = order_query }},
+        .limit = 0,
+    }));
+
+    const published_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
+        .name = "manual_degree",
+        .op = .gte,
+        .value = 0.5,
+        .freshness = .published,
+    }};
+    var filter_query = base_query;
+    filter_query.where_metric = &published_metric_filters;
+    try std.testing.expectError(error.MetricNotReady, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = filter_query }},
+        .limit = 0,
+    }));
+}
+
+test "db graph query metric freshness distinguishes stale projection from fresh ordering and filtering" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer refreshed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const published_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "manual_degree",
+        .freshness = .published,
+    }};
+    const published_query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{ .edge_types = &.{"cites"}, .direction = .out, .max_depth = 1 },
+        .metrics = &published_metric_reads,
+        .include_metric_status = true,
+    };
+    var published_result = try db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = published_query }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_results[0].nodes.len);
+    try std.testing.expectEqualStrings("doc:b", published_result.graph_results[0].nodes[0].key);
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_results[0].nodes[0].metrics.len);
+    try std.testing.expectEqualStrings("manual_degree", published_result.graph_results[0].nodes[0].metrics[0].name);
+    try std.testing.expect(published_result.graph_results[0].nodes[0].metrics[0].score != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), published_result.graph_results[0].nodes[0].metrics[0].score.?, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, published_result.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(refreshed.published_generation, published_result.graph_results[0].metric_status[0].published_generation);
+
+    const fresh_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "manual_degree",
+        .freshness = .fresh,
+    }};
+    var fresh_projection_query = published_query;
+    fresh_projection_query.metrics = &fresh_metric_reads;
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_projection_query }},
+        .limit = 0,
+    }));
+
+    const fresh_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "manual_degree",
+        .freshness = .fresh,
+    }};
+    var fresh_order_query = published_query;
+    fresh_order_query.order_by = &fresh_metric_orders;
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_order_query }},
+        .limit = 0,
+    }));
+
+    const fresh_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
+        .name = "manual_degree",
+        .op = .gte,
+        .value = 0.5,
+        .freshness = .fresh,
+    }};
+    var fresh_filter_query = published_query;
+    fresh_filter_query.where_metric = &fresh_metric_filters;
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_filter_query }},
+        .limit = 0,
+    }));
+}
+
+test "db graph metric pause and resume controls background maintenance" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runUntilIdle();
+
+    var initial = try db.refreshGraphMetric(alloc, "graph_idx", "degree");
+    defer initial.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, initial.state);
+    try std.testing.expect(!initial.maintenance_paused);
+    const first_generation = initial.published_generation;
+    try std.testing.expect(first_generation > 0);
+
+    var paused = try db.pauseGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    defer paused.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, paused.state);
+    try std.testing.expect(paused.maintenance_paused);
+    try std.testing.expectEqual(first_generation, paused.published_generation);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runUntilIdle();
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expect(status.maintenance_paused);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, status.state);
+        try std.testing.expectEqual(first_generation, status.published_generation);
+
+        const top = try graph_entry.index.graphMetricTopK("degree", 10);
+        defer {
+            for (top) |*score| score.deinit(alloc);
+            alloc.free(top);
+        }
+        try std.testing.expectEqual(@as(usize, 2), top.len);
+        for (top) |score| try std.testing.expect(!std.mem.eql(u8, score.node, "doc:c"));
+    }
+
+    var refreshed_while_paused = try db.refreshGraphMetric(alloc, "graph_idx", "degree");
+    defer refreshed_while_paused.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed_while_paused.state);
+    try std.testing.expect(refreshed_while_paused.maintenance_paused);
+    try std.testing.expect(refreshed_while_paused.published_generation > first_generation);
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const top = try graph_entry.index.graphMetricTopK("degree", 1);
+        defer {
+            for (top) |*score| score.deinit(alloc);
+            alloc.free(top);
+        }
+        try std.testing.expectEqual(@as(usize, 1), top.len);
+        try std.testing.expectEqualStrings("doc:b", top[0].node);
+        try std.testing.expectApproxEqAbs(@as(f64, 2.0), top[0].score, 0.001);
+    }
+
+    var resumed = try db.resumeGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, resumed.state);
+    try std.testing.expect(!resumed.maintenance_paused);
+
+    const resumed_generation = resumed.published_generation;
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runUntilIdle();
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expect(!status.maintenance_paused);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
+        try std.testing.expect(status.published_generation > resumed_generation);
+
+        const top = try graph_entry.index.graphMetricTopK("degree", 1);
+        defer {
+            for (top) |*score| score.deinit(alloc);
+            alloc.free(top);
+        }
+        try std.testing.expectEqual(@as(usize, 1), top.len);
+        try std.testing.expectEqualStrings("doc:b", top[0].node);
+        try std.testing.expectApproxEqAbs(@as(f64, 3.0), top[0].score, 0.001);
+    }
 }
 
 test "db runUntilIdle drains lazy dense posting maintenance" {
@@ -59496,6 +61008,7 @@ test "relational rows window plan computes row_number over ordered partitions" {
             .{ .key = "row:3", .value = "{\"tenant\":\"t1\",\"id\":\"c\",\"status\":\"closed\",\"amount\":20}" },
             .{ .key = "row:4", .value = "{\"tenant\":\"t2\",\"id\":\"d\",\"status\":\"open\",\"amount\":40}" },
             .{ .key = "row:5", .value = "{\"tenant\":\"t2\",\"id\":\"e\",\"status\":\"open\",\"amount\":5}" },
+            .{ .key = "row:6", .value = "{\"tenant\":\"t1\",\"id\":\"f\",\"status\":\"open\",\"amount\":30}" },
         },
         .sync_level = .write,
     });
@@ -59508,12 +61021,41 @@ test "relational rows window plan computes row_number over ordered partitions" {
         .field = "amount",
         .direction = .desc,
     }};
-    const windows = [_]types.RelationalRowsWindowSpec{.{
-        .output = "row_num",
-        .function = .row_number,
-        .partition_by = partition_by[0..],
-        .order_by = window_order[0..],
-    }};
+    const windows = [_]types.RelationalRowsWindowSpec{
+        .{
+            .output = "row_num",
+            .function = .row_number,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+        },
+        .{
+            .output = "rank",
+            .function = .rank,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+        },
+        .{
+            .output = "dense_rank",
+            .function = .dense_rank,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+        },
+        .{
+            .output = "prev_amount",
+            .function = .lag,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .value_expression = .{ .kind = .field, .field = "amount" },
+            .default_json = "0",
+        },
+        .{
+            .output = "next_amount",
+            .function = .lead,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .value_expression = .{ .kind = .field, .field = "amount" },
+        },
+    };
     const select = [_][]const u8{ "tenant", "id", "amount" };
 
     var result = try db.windowRelationalRowsPlan(alloc, runtime_schema, .{
@@ -59529,12 +61071,13 @@ test "relational rows window plan computes row_number over ordered partitions" {
     });
     defer result.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u32, 4), result.total_rows);
-    try std.testing.expectEqual(@as(usize, 4), result.rows.len);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"a\",\"amount\":30,\"row_num\":1}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"row_num\":2}", result.rows[1]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"d\",\"amount\":40,\"row_num\":1}", result.rows[2]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"e\",\"amount\":5,\"row_num\":2}", result.rows[3]);
+    try std.testing.expectEqual(@as(u32, 5), result.total_rows);
+    try std.testing.expectEqual(@as(usize, 5), result.rows.len);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"a\",\"amount\":30,\"row_num\":1,\"rank\":1,\"dense_rank\":1,\"prev_amount\":0,\"next_amount\":30}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"row_num\":2,\"rank\":1,\"dense_rank\":1,\"prev_amount\":30,\"next_amount\":10}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"row_num\":3,\"rank\":3,\"dense_rank\":2,\"prev_amount\":30,\"next_amount\":null}", result.rows[2]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"d\",\"amount\":40,\"row_num\":1,\"rank\":1,\"dense_rank\":1,\"prev_amount\":0,\"next_amount\":5}", result.rows[3]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"e\",\"amount\":5,\"row_num\":2,\"rank\":2,\"dense_rank\":2,\"prev_amount\":40,\"next_amount\":null}", result.rows[4]);
 
     const ctes = [_]types.RelationalRowsCte{.{
         .name = "open_usage",
@@ -59556,10 +61099,10 @@ test "relational rows window plan computes row_number over ordered partitions" {
     });
     defer paged.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u32, 4), paged.total_rows);
+    try std.testing.expectEqual(@as(u32, 5), paged.total_rows);
     try std.testing.expectEqual(@as(usize, 2), paged.rows.len);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"row_num\":2}", paged.rows[0]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"d\",\"amount\":40,\"row_num\":1}", paged.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"row_num\":2,\"rank\":1,\"dense_rank\":1,\"prev_amount\":30,\"next_amount\":10}", paged.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"row_num\":3,\"rank\":3,\"dense_rank\":2,\"prev_amount\":30,\"next_amount\":null}", paged.rows[1]);
 
     const amount_expr = types.RelationalRowsExpression{ .kind = .field, .field = "amount" };
     const id_expr = types.RelationalRowsExpression{ .kind = .field, .field = "id" };
@@ -60291,12 +61834,27 @@ test "relational rows mutation source updates claimed base rows transactionally"
         .field = "rank",
         .direction = .asc,
     }};
-    const operations = [_]types.TransformOp{.{
-        .op = .set,
-        .path = "status",
-        .value_json = "\"claimed\"",
+    const patch_operands = [_]types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "status", .field_source = .existing },
+        .{ .kind = .value, .value_json = "\"-claimed\"" },
+    };
+    const patch_expressions = [_]types.RelationalRowsExpressionAssignment{.{
+        .field = "status",
+        .expression = .{ .kind = .concat, .operands = patch_operands[0..] },
     }};
-    const returning = [_][]const u8{ "id", "status" };
+    const increment_expressions = [_]types.RelationalRowsExpressionAssignment{.{
+        .field = "rank",
+        .expression = .{ .kind = .field, .field = "rank", .field_source = .existing },
+    }};
+    const returning_operands = [_]types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "rank" },
+        .{ .kind = .value, .value_json = "1" },
+    };
+    const returning_expressions = [_]types.RelationalRowsExpressionProjection{.{
+        .output = "next_rank",
+        .expression = .{ .kind = .add, .operands = returning_operands[0..] },
+    }};
+    const returning = [_][]const u8{ "id", "status", "rank" };
 
     var mutation = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
         .kind = .update,
@@ -60311,16 +61869,18 @@ test "relational rows mutation source updates claimed base rows transactionally"
             },
             .limit = 2,
         },
-        .operations = operations[0..],
+        .patch_expressions = patch_expressions[0..],
+        .increment_expressions = increment_expressions[0..],
         .returning = returning[0..],
+        .returning_expressions = returning_expressions[0..],
     });
     defer mutation.deinit(alloc);
 
     try std.testing.expectEqual(@as(u32, 3), mutation.matched);
     try std.testing.expectEqual(@as(u32, 2), mutation.staged);
     try std.testing.expectEqual(@as(usize, 2), mutation.returning_rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"free1\",\"status\":\"claimed\"}", mutation.returning_rows[0]);
-    try std.testing.expectEqualStrings("{\"id\":\"free2\",\"status\":\"claimed\"}", mutation.returning_rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"free1\",\"status\":\"ready-claimed\",\"rank\":4,\"next_rank\":5}", mutation.returning_rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"free2\",\"status\":\"ready-claimed\",\"rank\":6,\"next_rank\":7}", mutation.returning_rows[1]);
 
     try db.commitTransaction(mutation_txn, 2_010);
 
@@ -60333,8 +61893,8 @@ test "relational rows mutation source updates claimed base rows transactionally"
     defer rows.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 3), rows.total);
     try std.testing.expectEqualStrings("{\"id\":\"locked\",\"status\":\"ready\"}", rows.rows[0]);
-    try std.testing.expectEqualStrings("{\"id\":\"free1\",\"status\":\"claimed\"}", rows.rows[1]);
-    try std.testing.expectEqualStrings("{\"id\":\"free2\",\"status\":\"claimed\"}", rows.rows[2]);
+    try std.testing.expectEqualStrings("{\"id\":\"free1\",\"status\":\"ready-claimed\"}", rows.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"free2\",\"status\":\"ready-claimed\"}", rows.rows[2]);
 
     try std.testing.expectError(error.InvalidQueryRequest, db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
         .kind = .delete,

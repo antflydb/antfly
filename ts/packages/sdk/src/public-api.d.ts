@@ -123,6 +123,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the graph index */
+                indexName: string;
+                /** @description Name of the configured graph metric */
+                metricName: string;
+                /** @description Operational action to apply to the graph metric materialization */
+                action: "refresh" | "rebuild" | "delete" | "pause" | "resume";
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a graph metric operational action
+         * @description Refresh, rebuild, delete, pause, or resume maintenance for a configured
+         *     graph metric. The metric configuration remains owned by the graph index.
+         *     `delete` clears materialized metric state and maintenance controls; a
+         *     later refresh or rebuild can publish a new generation.
+         */
+        post: operations["executeGraphMetricAction"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/transactions/commit": {
         parameters: {
             query?: never;
@@ -806,6 +838,190 @@ export interface paths {
         put?: never;
         /** Perform batch inserts and deletes on a table */
         post: operations["batchWrite"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows:batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Perform structured relational row writes by row identity
+         * @description Relational row batch endpoint for tables with a declared `primary_key`.
+         *     Callers address rows by structured primary-key identity or declared
+         *     unique-key identity instead of physical document keys. The server
+         *     derives the storage-owned physical row key from the canonical typed
+         *     primary-key tuple, or resolves a unique selector through durable
+         *     unique-owner rows, then executes through the normal batch/2PC path.
+         */
+        post: operations["rowsBatchWrite"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows:mutation-source": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stage typed relational update/delete operations from a claimed row source
+         * @description Transaction-staging endpoint for bounded multi-row relational
+         *     update/delete operations. The source is a typed base row query with a
+         *     `row_claim` and transaction id; the server claims selected rows,
+         *     records committed-version predicates, stages update/delete intents into
+         *     the existing transaction, and returns optional projections from the
+         *     planned final image or deleted row image.
+         */
+        post: operations["rowsMutationSource"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows:get": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Lookup relational rows by structured row identity
+         * @description Point lookup endpoint for relational tables with a declared
+         *     `primary_key`. The request uses structured primary-key selectors or
+         *     declared unique-key selectors. Unique selectors resolve through durable
+         *     unique-owner rows; a missing unique owner returns `found: false`
+         *     without scanning. Responses include row JSON, version, and optional
+         *     diagnostic physical keys.
+         */
+        post: operations["rowsGet"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows:query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Execute a typed relational row query plan */
+        post: operations["rowsQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows:aggregate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Execute a typed relational row aggregate plan */
+        post: operations["rowsAggregate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows:window": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Execute a typed relational row window plan */
+        post: operations["rowsWindow"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows:join": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Execute a typed relational row join plan */
+        post: operations["rowsJoin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows:lateral": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Execute a typed relational row lateral plan */
+        post: operations["rowsLateral"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2087,6 +2303,15 @@ export interface components {
          * @enum {string}
          */
         AggregationType: "sum" | "avg" | "min" | "max" | "count" | "sumsquares" | "stats" | "cardinality" | "terms" | "range" | "date_range" | "histogram" | "date_histogram" | "geohash_grid" | "geo_distance" | "significant_terms";
+        /**
+         * @description Exact-vs-approximate selection for a cardinality aggregation:
+         *     - auto: use a materialized HyperLogLog sketch when one applies and is
+         *       current, else an exact distinct scan (default).
+         *     - exact: always compute an exact distinct count.
+         *     - approximate: require a matching sketch; error if none applies.
+         * @enum {string}
+         */
+        CardinalityMode: "auto" | "exact" | "approximate";
         AggregationRange: {
             /** @description Name of the range bucket */
             name: string;
@@ -2164,6 +2389,8 @@ export interface components {
             type: components["schemas"]["AggregationType"];
             /** @description Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation. */
             field?: string;
+            /** @description Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types. */
+            mode?: components["schemas"]["CardinalityMode"];
             /** @description Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order. */
             fields?: string[];
             /**
@@ -2248,6 +2475,13 @@ export interface components {
              * @description Single value for metric aggregations (sum, avg, min, max, count, cardinality)
              */
             value?: number;
+            /** @description For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations. */
+            approximate?: boolean;
+            /**
+             * Format: float
+             * @description For an approximate cardinality value, the relative standard error of the estimate (e.g. 0.0081 for ~0.8%). Present only when approximate is true.
+             */
+            relative_error?: number;
             /** @description Document count for stats aggregations */
             count?: number;
             /**
@@ -2295,6 +2529,9 @@ export interface components {
             config: components["schemas"]["IndexConfig"];
             status: components["schemas"]["IndexStats"];
         };
+        GraphMetricActionResponse: {
+            status: components["schemas"]["GraphMetricStatus"];
+        };
         /** @description Compact LSM backend operational status. Detailed low-level counters are available through metrics. */
         LsmStorageStatus: {
             /** Format: uint64 */
@@ -2329,7 +2566,7 @@ export interface components {
          * @description MongoDB-style update operator
          * @enum {string}
          */
-        TransformOpType: "$set" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$pop" | "$mul" | "$min" | "$max" | "$currentDate" | "$rename";
+        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$pop" | "$mul" | "$min" | "$max" | "$currentDate" | "$rename";
         TransformOp: {
             op: components["schemas"]["TransformOpType"];
             /**
@@ -2337,7 +2574,7 @@ export interface components {
              * @example $.views
              */
             path: string;
-            /** @description Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set, etc.) */
+            /** @description Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.) */
             value?: unknown;
         };
         /**
@@ -2587,6 +2824,566 @@ export interface components {
             deleted?: number;
             /** @description Number of documents successfully transformed */
             transformed?: number;
+        };
+        /**
+         * @description Structured primary-key identity. Keys are the declared
+         *     `primary_key.columns`; values are JSON scalar values coerced with the
+         *     table's relational column types.
+         * @example {
+         *       "tenant_id": "t1",
+         *       "order_id": "o9"
+         *     }
+         */
+        RowPrimarySelector: {
+            [key: string]: unknown;
+        };
+        /**
+         * @description Structured unique-key selector. The server encodes `values` with the
+         *     same relational tuple encoder used by storage, routes to the durable
+         *     unique-owner range, and reads the owner row to resolve the physical row
+         *     identity. This is a point lookup, not a query scan.
+         */
+        RowUniqueSelector: {
+            /** @description Unique constraint name. */
+            name: string;
+            /** @description Values for the declared unique-constraint columns. */
+            values: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * @description Structured row selector. `primary` addresses declared primary-key
+         *     tables directly. `unique` addresses a declared unique constraint through
+         *     durable unique-owner rows.
+         */
+        RowSelector: {
+            primary?: components["schemas"]["RowPrimarySelector"];
+            unique?: components["schemas"]["RowUniqueSelector"];
+        };
+        /**
+         * @description Full relational row document. Keys are declared relational columns and
+         *     values are JSON values coerced through the table schema before storage.
+         */
+        RowsRowDocument: {
+            [key: string]: unknown;
+        };
+        /**
+         * @description Static field patch for top-level relational columns. Primary-key fields
+         *     are rejected by the server.
+         */
+        RowsFieldPatch: {
+            [key: string]: unknown;
+        };
+        /** @description Numeric increment map keyed by declared numeric columns. */
+        RowsNumericIncrement: {
+            [key: string]: number;
+        };
+        /** @description Field-to-expression assignment map over the shared row-expression AST. */
+        RowsExpressionAssignmentMap: {
+            [key: string]: components["schemas"]["RowsExpression"];
+        };
+        /** @description JSON path assignment for a declared `json` column. */
+        RowsJsonSetTransform: {
+            /** @description Declared `json` column to update. */
+            field: string;
+            /** @description Non-empty path under the JSON column. */
+            path: string[];
+            /** @description JSON value to write at the path. */
+            value: unknown;
+        };
+        /** @description Array transform for a declared `array` column. */
+        RowsArrayUpdateTransform: {
+            /** @description Declared `array` column to update. */
+            field: string;
+            /** @enum {string} */
+            op: "append" | "remove" | "add_to_set";
+            /** @description JSON value to append, remove, or add if absent. */
+            value: unknown;
+        };
+        /** @description Predicate atom that must match a partial unique constraint definition. */
+        RowsUniquePredicate: {
+            field: string;
+            /** @enum {string} */
+            op: "is_null" | "is_not_null" | "eq" | "ne";
+            /** @description Predicate comparison value. Omit for null-test operators. */
+            value?: unknown;
+        };
+        /** @description Conjunction of partial-unique predicate atoms. */
+        RowsUniquePredicateGroup: {
+            all: components["schemas"]["RowsUniquePredicate"][];
+        };
+        /** @description Declared unique constraint target for `ON CONFLICT`. */
+        RowsConflictUniqueTarget: {
+            /** @description Unique constraint name. */
+            name: string;
+            where?: components["schemas"]["RowsUniquePredicateGroup"];
+        };
+        /** @description Primary-key or named unique constraint conflict target. */
+        RowsConflictTarget: {
+            /** @description Set to `true` to target the declared primary key. */
+            primary?: boolean;
+            unique?: components["schemas"]["RowsConflictUniqueTarget"];
+        };
+        /**
+         * @description Typed conflict action for insert operations. `nothing` skips the insert
+         *     when the target already exists. `update` applies the same typed update
+         *     operators as ordinary row updates, with expression sources allowed to
+         *     reference `existing` and `proposed` row images.
+         */
+        RowsOnConflict: {
+            target: components["schemas"]["RowsConflictTarget"];
+            /** @enum {string} */
+            action: "update" | "nothing";
+            patch?: components["schemas"]["RowsFieldPatch"];
+            increment?: components["schemas"]["RowsNumericIncrement"];
+            patch_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            increment_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            json_set?: components["schemas"]["RowsJsonSetTransform"][];
+            array_update?: components["schemas"]["RowsArrayUpdateTransform"][];
+            where_expression?: components["schemas"]["RowsExpressionCondition"];
+        };
+        /**
+         * @description Structured relational row mutation. `insert` fails if the primary
+         *     identity already exists, `upsert` overwrites or creates, `update`
+         *     applies a non-upsert patch by primary or unique identity, and `delete`
+         *     removes by primary or unique identity. `update.patch` cannot change
+         *     primary-key components. Missing unique selectors fail the write request
+         *     rather than falling back to scans.
+         */
+        RowOperation: {
+            /** @enum {string} */
+            op: "insert" | "upsert" | "update" | "delete";
+            /** @description Full row document for insert/upsert. Must include primary-key columns. */
+            row?: components["schemas"]["RowsRowDocument"];
+            where?: components["schemas"]["RowSelector"];
+            /** @description Top-level field patch for update operations. */
+            patch?: components["schemas"]["RowsFieldPatch"];
+            increment?: components["schemas"]["RowsNumericIncrement"];
+            patch_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            increment_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            json_set?: components["schemas"]["RowsJsonSetTransform"][];
+            array_update?: components["schemas"]["RowsArrayUpdateTransform"][];
+            on_conflict?: components["schemas"]["RowsOnConflict"];
+            where_expression?: components["schemas"]["RowsExpressionCondition"];
+            /** @description Fields to return from the committed mutation image. `*` returns the full row and cannot be combined with expression projections. */
+            returning?: string[];
+            /** @description Typed row-expression projections from the committed mutation image. */
+            returning_expressions?: components["schemas"]["RowsExpressionProjection"][];
+            /**
+             * Format: int64
+             * @description Optional optimistic-concurrency predicate for update/delete. The predicate applies to the physical row resolved from primary or unique identity.
+             */
+            expected_version?: number;
+        };
+        RowsBatchRequest: {
+            operations: components["schemas"]["RowOperation"][];
+            sync_level?: components["schemas"]["SyncLevel"];
+        };
+        /**
+         * @description Typed relational mutation-source plan. The `source` is a lockable base
+         *     row-query request with `row_claim.transaction_id` and no
+         *     `source_cte` or `doc_key_range`; update/delete intents are staged into
+         *     that transaction using committed-version predicates from the selected
+         *     preimages. Claims over physical ranges, CTEs, joins, aggregates,
+         *     windows, and lateral outputs are rejected until those stages expose an
+         *     explicit lockable base-row contract.
+         */
+        RowsMutationSourceRequest: {
+            /** @enum {string} */
+            op: "update" | "delete";
+            source: components["schemas"]["RowsQueryRequest"];
+            /** @description Top-level static field patch for update operations. */
+            patch?: components["schemas"]["RowsFieldPatch"];
+            /** @description Numeric increments for update operations. */
+            increment?: components["schemas"]["RowsNumericIncrement"];
+            /** @description Field-to-expression assignments evaluated over the selected row image. */
+            patch_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            /** @description Field-to-expression numeric deltas evaluated over the selected row image. */
+            increment_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            /** @description JSON path transforms for update operations. */
+            json_set?: components["schemas"]["RowsJsonSetTransform"][];
+            /** @description Array transforms for update operations. */
+            array_update?: components["schemas"]["RowsArrayUpdateTransform"][];
+            /** @description Fields to return from the final update image or deleted row image. `*` returns the full row. */
+            returning?: string[];
+            /** @description Typed row-expression projections over the final update image or deleted row image. */
+            returning_expressions?: components["schemas"]["RowsExpressionProjection"][];
+        };
+        RowsMutationSourceResultSet: {
+            /**
+             * Format: int64
+             * @description Number of source rows that matched before lock/limit selection.
+             */
+            matched?: number;
+            /**
+             * Format: int64
+             * @description Number of rows staged into the claimed transaction.
+             */
+            staged?: number;
+            /** @description Optional returning rows from the staged mutation. */
+            returning?: {
+                [key: string]: unknown;
+            }[];
+        };
+        RowsGetRequest: {
+            keys: components["schemas"]["RowSelector"][];
+            /**
+             * @description Include the diagnostic storage-owned physical key in each result.
+             * @default false
+             */
+            include_physical_key?: boolean;
+        };
+        RowsGetResult: {
+            identity?: components["schemas"]["RowSelector"];
+            found?: boolean;
+            row?: {
+                [key: string]: unknown;
+            };
+            /** Format: uint64 */
+            version?: number;
+            /** @description Diagnostic storage-owned physical key. Null when a unique selector did not resolve. Do not persist as public row identity. */
+            physical_key?: string | null;
+        };
+        RowsGetResultSet: {
+            rows?: components["schemas"]["RowsGetResult"][];
+        };
+        /** @description Ordered row-stream key. `field` names an output/base field; `expression` carries a typed row-expression AST for computed ordering. */
+        RowsQueryOrder: {
+            field?: string;
+            expression?: components["schemas"]["RowsExpression"];
+            /** @enum {string} */
+            direction: "asc" | "desc";
+        };
+        /**
+         * @description Lockable base-row claim metadata. Public row-plan endpoints reject this
+         *     field; it is only accepted by `rows:mutation-source` lockable base-row
+         *     sources and internal/coordinator execution paths. `transaction_id` is
+         *     the canonical field name; `txn_id` is accepted as an adapter alias.
+         */
+        RowsRowClaim: {
+            /**
+             * @default for_update
+             * @enum {string}
+             */
+            mode?: "for_update";
+            /** @default false */
+            skip_locked?: boolean;
+            /**
+             * Format: int64
+             * @default 30000
+             */
+            lease_ms?: number;
+            owner_id?: string;
+            /** @description Canonical 16-byte transaction id encoded as 32 hex characters. */
+            transaction_id?: string;
+            /** @description Alias for `transaction_id`. */
+            txn_id?: string;
+        };
+        /**
+         * @description Internal physical range selector used after durable range ownership
+         *     routing. Public REST/SDK endpoints reject this field; it is not stable
+         *     public row identity. At least one of `start` or `end` must be present,
+         *     and a bounded range must have `start < end`.
+         */
+        RowsDocKeyRange: {
+            /** @description Inclusive physical row-key lower bound. */
+            start?: string;
+            /** @description Exclusive physical row-key upper bound. */
+            end?: string;
+        };
+        /**
+         * @description Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+         *     `{ "value": ... }`, or an operator node such as
+         *     `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators
+         *     include `now`, `coalesce`, `lower`, `upper`, `concat`, `nullif`, numeric
+         *     `add`/`sub`/`mul`/`div`, `cast`, `json_extract`, `array_length`,
+         *     `string_to_array`, and searched `case` with `cases` and `else`.
+         *     Mutation expressions may set `source` to `existing` or `proposed`; query
+         *     expressions use the default row source.
+         */
+        RowsExpression: {
+            field?: string;
+            /** @enum {string} */
+            source?: "row" | "existing" | "proposed";
+            /** @description Literal JSON value for a value node. */
+            value?: unknown;
+            /** @enum {string} */
+            op?: "now" | "coalesce" | "lower" | "upper" | "concat" | "nullif" | "add" | "sub" | "mul" | "div" | "cast" | "json_extract" | "array_length" | "string_to_array" | "case";
+            /** @description Operand expressions for operator nodes. */
+            args?: components["schemas"]["RowsExpression"][];
+            /**
+             * @description Cast target for `cast`.
+             * @enum {string}
+             */
+            to?: "text" | "numeric" | "bool" | "boolean";
+            /** @description Structured JSON path for `json_extract`. */
+            path?: unknown;
+            /** @description Return JSON path extraction as text. */
+            as_text?: boolean;
+            /** @description Searched case branches, each with `when` and `then`. */
+            cases?: components["schemas"]["RowsExpressionCaseBranch"][];
+            /** @description Fallback expression for searched `case`. */
+            else?: components["schemas"]["RowsExpression"];
+        } & {
+            [key: string]: unknown;
+        };
+        RowsExpressionCaseBranch: {
+            when: components["schemas"]["RowsExpressionCondition"];
+            then: components["schemas"]["RowsExpression"];
+        };
+        /** @description Computed expression predicate over the shared row-expression AST. */
+        RowsExpressionCondition: {
+            lhs: components["schemas"]["RowsExpression"];
+            /** @enum {string} */
+            op: "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte";
+            rhs?: components["schemas"]["RowsExpression"];
+        };
+        RowsExpressionConditionGroup: {
+            all: components["schemas"]["RowsExpressionCondition"][];
+        };
+        RowsExpressionArrayContainsPredicate: {
+            expr: components["schemas"]["RowsExpression"];
+            value: unknown[];
+        };
+        RowsExpressionProjection: {
+            as: string;
+            expr: components["schemas"]["RowsExpression"];
+        };
+        /** @description Compact JSON path projection over a declared `json` column. */
+        RowsJsonExtractProjection: {
+            /** @description Output field name. */
+            as: string;
+            /** @description Declared `json` column to read. */
+            field: string;
+            /** @description Non-empty JSON path, encoded as a dot path string or array of path components. */
+            path: unknown;
+            /**
+             * @description Return the extracted value as text, matching SQL `->>` behavior.
+             * @default false
+             */
+            as_text?: boolean;
+        };
+        /** @description Compact array-length projection over a declared `array` column. */
+        RowsArrayLengthProjection: {
+            /** @description Output field name. */
+            as: string;
+            /** @description Declared `array` column to measure. */
+            field: string;
+        };
+        /** @description Compact COALESCE operand. Exactly one of `field` or `value` is accepted by the server. */
+        RowsCoalesceOperand: {
+            /** @description Declared column to read. */
+            field?: string;
+            /** @description Literal JSON fallback value. */
+            value?: unknown;
+        };
+        /** @description Compact COALESCE projection. */
+        RowsCoalesceProjection: {
+            /** @description Output field name. */
+            as: string;
+            operands: components["schemas"]["RowsCoalesceOperand"][];
+        };
+        /** @description Compact field alias projection over a declared column. */
+        RowsFieldAliasProjection: {
+            /** @description Output field name. */
+            as: string;
+            /** @description Declared column to project. */
+            field: string;
+        };
+        /**
+         * @description Typed relational row-query plan. Predicate and expression arrays carry
+         *     Antfly row-expression AST nodes; SQL syntax is adapter sugar over this
+         *     native request shape.
+         */
+        RowsQueryRequest: {
+            /** @description Optional ordered CTE name to read instead of the base table. */
+            source_cte?: string;
+            /** @description Typed scalar, array, JSON, text-pattern, OR, and NOT predicates. */
+            where?: {
+                [key: string]: unknown;
+            };
+            /** @description All computed expression predicates that must pass. */
+            expression_where?: components["schemas"]["RowsExpressionCondition"][];
+            /** @description OR groups of computed expression predicates. */
+            expression_any?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description NOT groups of computed expression predicates. */
+            expression_not?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description Computed array-containment predicates. */
+            expression_array_contains?: components["schemas"]["RowsExpressionArrayContainsPredicate"][];
+            select?: string[];
+            json_extract?: components["schemas"]["RowsJsonExtractProjection"][];
+            array_length?: components["schemas"]["RowsArrayLengthProjection"][];
+            coalesce?: components["schemas"]["RowsCoalesceProjection"][];
+            field_aliases?: components["schemas"]["RowsFieldAliasProjection"][];
+            /** @description Typed row-expression projections. */
+            expressions?: components["schemas"]["RowsExpressionProjection"][];
+            order_by?: components["schemas"]["RowsQueryOrder"][];
+            /** Format: int64 */
+            limit?: number;
+            /** Format: int64 */
+            offset?: number;
+            row_claim?: components["schemas"]["RowsRowClaim"];
+            doc_key_range?: components["schemas"]["RowsDocKeyRange"];
+        };
+        /** @description Ordered named row-query subplan. Later CTEs and final plan stages can reference earlier names through `source_cte`. */
+        RowsCte: {
+            name: string;
+            query: components["schemas"]["RowsQueryRequest"];
+        };
+        RowsAggregateSpec: {
+            name: string;
+            op: string;
+            field?: string;
+            expression?: components["schemas"]["RowsExpression"];
+            distinct?: boolean;
+            filter?: {
+                [key: string]: unknown;
+            };
+            filter_expressions?: components["schemas"]["RowsExpressionCondition"][];
+        };
+        /** @description Predicate over aggregate output fields, evaluated after grouping. */
+        RowsAggregateHavingPredicate: {
+            /** @description Aggregate output field name, usually an aggregation `name` or group key. */
+            field: string;
+            /** @enum {string} */
+            op: "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte";
+            /** @description Comparison value. Omit for `is_null` and `is_not_null`. */
+            value?: unknown;
+        };
+        /** @description Conjunction of aggregate-output predicates for HAVING. */
+        RowsAggregateHaving: {
+            all: components["schemas"]["RowsAggregateHavingPredicate"][];
+        };
+        RowsAggregateRequest: {
+            source: components["schemas"]["RowsQueryRequest"];
+            group_by?: string[];
+            aggregations?: components["schemas"]["RowsAggregateSpec"][];
+            having?: components["schemas"]["RowsAggregateHaving"];
+            order_by?: components["schemas"]["RowsQueryOrder"][];
+            /** Format: int64 */
+            limit?: number;
+            /** Format: int64 */
+            offset?: number;
+        };
+        RowsWindowSpec: {
+            as: string;
+            function: string;
+            partition_by?: string[];
+            order_by: components["schemas"]["RowsQueryOrder"][];
+            field?: string;
+            expression?: components["schemas"]["RowsExpression"];
+            /** Format: int64 */
+            offset?: number;
+            default?: unknown;
+        };
+        RowsWindowRequest: {
+            source: components["schemas"]["RowsQueryRequest"];
+            windows: components["schemas"]["RowsWindowSpec"][];
+            select?: string[];
+            order_by?: components["schemas"]["RowsQueryOrder"][];
+            /** Format: int64 */
+            limit?: number;
+            /** Format: int64 */
+            offset?: number;
+        };
+        RowsJoinOn: {
+            left_field: string;
+            right_field: string;
+        };
+        RowsJoinProjection: {
+            as: string;
+            /** @enum {string} */
+            side: "left" | "right";
+            field: string;
+        };
+        /** @description Typed equality join plan. Each side is a full row-query request and can read an ordered CTE through `source_cte`. */
+        RowsJoinRequest: {
+            left: components["schemas"]["RowsQueryRequest"];
+            right: components["schemas"]["RowsQueryRequest"];
+            on: components["schemas"]["RowsJoinOn"][];
+            /** @enum {string} */
+            join_type?: "inner" | "left";
+            select?: components["schemas"]["RowsJoinProjection"][];
+            order_by?: components["schemas"]["RowsQueryOrder"][];
+            /** Format: int64 */
+            limit?: number;
+            /** Format: int64 */
+            offset?: number;
+        };
+        RowsLateralCorrelation: {
+            left_field: string;
+            right_field: string;
+        };
+        /** @description Typed bounded lateral plan. The right side must include a limit and can read an ordered CTE through `source_cte`. */
+        RowsLateralRequest: {
+            left: components["schemas"]["RowsQueryRequest"];
+            right: components["schemas"]["RowsQueryRequest"];
+            correlations: components["schemas"]["RowsLateralCorrelation"][];
+            select?: components["schemas"]["RowsJoinProjection"][];
+            order_by?: components["schemas"]["RowsQueryOrder"][];
+            /** Format: int64 */
+            limit?: number;
+            /** Format: int64 */
+            offset?: number;
+        };
+        /**
+         * @description Generic typed relational row plan envelope. Public operation endpoints
+         *     use the operation-specific envelope schemas below and accept exactly one
+         *     top-level operation field plus optional ordered `ctes`.
+         */
+        RowsPlanRequest: {
+            ctes?: components["schemas"]["RowsCte"][];
+            query?: components["schemas"]["RowsQueryRequest"];
+            aggregate?: components["schemas"]["RowsAggregateRequest"];
+            window?: components["schemas"]["RowsWindowRequest"];
+            join?: components["schemas"]["RowsJoinRequest"];
+            lateral?: components["schemas"]["RowsLateralRequest"];
+        };
+        /** @description Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes`. */
+        RowsQueryPlanRequest: {
+            ctes?: components["schemas"]["RowsCte"][];
+            query: components["schemas"]["RowsQueryRequest"];
+        };
+        /** @description Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered `ctes`. */
+        RowsAggregatePlanRequest: {
+            ctes?: components["schemas"]["RowsCte"][];
+            aggregate: components["schemas"]["RowsAggregateRequest"];
+        };
+        /** @description Typed row-window plan envelope. Accepts exactly `window` plus optional ordered `ctes`. */
+        RowsWindowPlanRequest: {
+            ctes?: components["schemas"]["RowsCte"][];
+            window: components["schemas"]["RowsWindowRequest"];
+        };
+        /** @description Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`. */
+        RowsJoinPlanRequest: {
+            ctes?: components["schemas"]["RowsCte"][];
+            join: components["schemas"]["RowsJoinRequest"];
+        };
+        /** @description Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes`. */
+        RowsLateralPlanRequest: {
+            ctes?: components["schemas"]["RowsCte"][];
+            lateral: components["schemas"]["RowsLateralRequest"];
+        };
+        RowsQueryResultSet: {
+            /** Format: int64 */
+            total?: number;
+            rows?: {
+                [key: string]: unknown;
+            }[];
+        };
+        RowsAggregateResultSet: {
+            /** Format: int64 */
+            total_groups?: number;
+            rows?: {
+                [key: string]: unknown;
+            }[];
+        };
+        RowsStreamResultSet: {
+            /** Format: int64 */
+            total_rows?: number;
+            rows?: {
+                [key: string]: unknown;
+            }[];
         };
         /**
          * @description Cross-table batch operations in a single atomic transaction.
@@ -3979,6 +4776,12 @@ export interface components {
              *     ```
              */
             reranker?: components["schemas"]["RerankerConfig"];
+            /**
+             * @description Optional graph metric score feature to blend into ordinary search hit ranking.
+             *     The metric must have a published generation. With `metric_freshness: fresh`,
+             *     the request fails if graph writes have made the published generation stale.
+             */
+            graph_metric_rerank?: components["schemas"]["GraphMetricRerank"];
             analyses?: components["schemas"]["Analyses"];
             /**
              * @description Declarative graph queries to execute after full-text/vector searches.
@@ -4262,6 +5065,22 @@ export interface components {
             reranker?: components["schemas"]["RerankerProfile"];
             /** @description Result merge statistics (present for hybrid search). */
             merge?: components["schemas"]["MergeProfile"];
+            /** @description Graph metric freshness and generation details for metric-aware query work. */
+            graph_metrics?: components["schemas"]["GraphMetricProfile"][];
+        };
+        GraphMetricProfile: {
+            /** @description Name of the graph query or graph metric query that used the metric. */
+            query_name: string;
+            /** @description Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`. */
+            source: string;
+            /** @description Graph index that owns the metric. */
+            index_name: string;
+            /** @description Graph metric name within the index. */
+            metric_name: string;
+            /** @description Effective freshness mode requested for this metric use. */
+            freshness: string;
+            /** @description Published generation and freshness status observed by the query. */
+            status: components["schemas"]["GraphMetricStatus"];
         };
         /** @description Shard-level execution statistics. */
         ShardsProfile: {
@@ -4378,6 +5197,54 @@ export interface components {
             pca?: number[];
             tsne?: number[];
         };
+        /** @description Optional score provenance for ranking features that changed the final hit score. */
+        QueryScoreDetails: {
+            /** @description Score contribution from an explicit graph_metric_rerank request. */
+            graph_metric_rerank?: components["schemas"]["GraphMetricRerankScoreDetails"];
+        };
+        GraphMetricRerankScoreDetails: {
+            /** @description Graph index that provided the metric score. */
+            index_name: string;
+            /** @description Graph metric used as a score feature. */
+            metric_name: string;
+            /**
+             * Format: double
+             * @description Hit score before graph metric rerank composition.
+             */
+            base_score: number;
+            /**
+             * Format: double
+             * @description Weight applied to the base score.
+             */
+            base_weight: number;
+            /**
+             * Format: double
+             * @description Published metric score for this hit, or null when the hit was missing from the metric generation.
+             */
+            metric_score?: number | null;
+            /**
+             * Format: double
+             * @description Metric feature value used in the formula after applying missing_score fallback if needed.
+             */
+            metric_score_used: number;
+            /**
+             * Format: double
+             * @description Weight applied to the metric score feature.
+             */
+            metric_weight: number;
+            /** @description True when metric_score was missing and the request's missing_score fallback was used. */
+            missing_score_used: boolean;
+            /**
+             * Format: double
+             * @description Final hit score after graph metric rerank composition.
+             */
+            final_score: number;
+            /**
+             * Format: int64
+             * @description Published graph metric score generation used for this hit.
+             */
+            published_generation: number;
+        };
         /** @description A single query result hit */
         QueryHit: {
             /** @description ID of the record. */
@@ -4391,6 +5258,8 @@ export interface components {
             _index_scores?: {
                 [key: string]: unknown;
             };
+            /** @description Optional explain-style score provenance for score features applied to this hit. */
+            _score_details?: components["schemas"]["QueryScoreDetails"];
             _source?: {
                 [key: string]: unknown;
             };
@@ -4435,6 +5304,10 @@ export interface components {
             /** @description Results from declarative graph queries. */
             graph_results?: {
                 [key: string]: components["schemas"]["GraphQueryResult"];
+            };
+            /** @description Results from direct graph metric reads. */
+            graph_metric_results?: {
+                [key: string]: components["schemas"]["GraphMetricResult"];
             };
             /** @description Detailed execution profile (present when `profile: true` in request). */
             profile?: components["schemas"]["QueryProfile"];
@@ -6218,7 +7091,7 @@ export interface components {
          * @description Field type annotations for schema fields
          * @enum {string}
          */
-        "AntflyType-2": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type";
+        "AntflyType-2": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type" | "json";
         /** @description Field mapping to apply when a dynamic template matches */
         TemplateFieldMapping: {
             type?: components["schemas"]["AntflyType-2"];
@@ -6279,6 +7152,57 @@ export interface components {
             match_mapping_type?: "string" | "number" | "boolean" | "date" | "object";
             mapping?: components["schemas"]["TemplateFieldMapping"];
         };
+        /** @description Parent side of a relational foreign-key constraint. */
+        ForeignKeyReference: {
+            /** @description Referenced relational table name. */
+            table?: string;
+            /** @description Referenced parent columns. Use ["_id"] for the document-key primary key, or an ordered column tuple backed by a declared unique constraint. */
+            columns?: string[];
+        };
+        /** @description Relational foreign-key constraint. */
+        ForeignKey: {
+            /** @description Constraint name, unique within the table schema. */
+            name?: string;
+            /** @description Child columns. A single scalar column is supported for ["_id"] references; ordered scalar tuples are supported when references.columns names a unique constraint column tuple. */
+            columns?: string[];
+            references?: components["schemas"]["ForeignKeyReference"];
+            /**
+             * @description Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
+             * @enum {string}
+             */
+            on_delete?: "restrict" | "no_action" | "set_null" | "cascade";
+            /**
+             * @description Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
+             * @enum {string}
+             */
+            on_update?: "restrict" | "no_action" | "set_null" | "cascade";
+            /** @description Constraint timing. Canonical values are "immediate" and "deferred"; SQL-shaped aliases such as "INITIALLY DEFERRED" and combined deferrability clauses are accepted and normalized by schema parsing. */
+            timing?: string;
+            /** @description Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility. */
+            deferrable?: boolean | string;
+            /**
+             * @description Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
+             * @enum {string}
+             */
+            match?: "simple" | "full";
+            /**
+             * @description Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
+             * @enum {string}
+             */
+            validation_state?: "enforced" | "unvalidated";
+        };
+        /** @description Relational primary-key constraint. */
+        PrimaryKey: {
+            /** @description Primary-key columns. One or more ordered required non-json relational columns are supported. */
+            columns?: string[];
+        };
+        /** @description Relational unique constraint. */
+        UniqueConstraint: {
+            /** @description Constraint name, unique within the table schema. */
+            name?: string;
+            /** @description Unique columns. One or more ordered non-json relational columns are supported. */
+            columns?: string[];
+        };
         /** @description Schema definition for a table with multiple document types */
         TableSchema: {
             /**
@@ -6286,6 +7210,18 @@ export interface components {
              * @description Version of the schema. Used for migrations.
              */
             version?: number;
+            /**
+             * @description Storage profile for the table.
+             *     - "document" (default): schemaless JSON documents with optional,
+             *       soft schema validation. All indexes are derived from the document.
+             *     - "relational": required closed schema with typed columns. Documents
+             *       must match a declared type; declared scalar properties are stored
+             *       as typed columns for columnar predicate pushdown and aggregation.
+             *       A field typed "json" stores a subtree that is still indexed like a
+             *       document. Implies enforce_types and closed document types.
+             * @enum {string}
+             */
+            storage_mode?: "document" | "relational";
             /** @description Default type to use from the document_types. */
             default_type?: string;
             /**
@@ -6313,6 +7249,37 @@ export interface components {
              *     evaluated in order to determine how those fields should be indexed.
              */
             dynamic_templates?: components["schemas"]["DynamicTemplate"][];
+            /**
+             * @description Relational-mode referential constraints. Supported targets are a
+             *     parent table's `_id` document key or a same-table declared unique
+             *     parent column tuple with `on_delete: "restrict"` /
+             *     `on_delete: "no_action"` or bounded local nullable-column
+             *     `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`.
+             *     `on_update: "restrict"` and `on_update: "no_action"` are accepted
+             *     as parent-key update checks, and mutating `set_null`/`cascade`
+             *     update actions are supported where owner topology is configured.
+             *     `match: "simple"` is the default; `full` is accepted for composite
+             *     nullable references, and `partial` is rejected until row-subset
+             *     parent matching is implemented.
+             *     Cross-table unique targets require routed parent-table unique participants.
+             *     Unsupported shapes are rejected during schema validation.
+             */
+            foreign_keys?: components["schemas"]["ForeignKey"][];
+            /**
+             * @description Relational-mode primary key over one or more ordered declared
+             *     non-json relational columns. Every component must be required and
+             *     present on every row. When omitted, `_id` remains the document-key
+             *     primary identity. `_id` cannot be mixed into a declared composite
+             *     primary-key tuple.
+             */
+            primary_key?: components["schemas"]["PrimaryKey"];
+            /**
+             * @description Relational-mode unique constraints over one or more ordered declared
+             *     non-json relational columns. Present scalar tuples are enforced by
+             *     committed integrity rows; rows with any absent nullable component do
+             *     not create unique rows.
+             */
+            unique_constraints?: components["schemas"]["UniqueConstraint"][];
         };
         /**
          * Format: double
@@ -6710,11 +7677,116 @@ export interface components {
         };
         /** @description Statistics for an index */
         IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
+        GraphMetricEdgeFilterStatus: {
+            /** @enum {string} */
+            mode: "all" | "types";
+            types?: string[];
+        };
+        GraphMetricEvent: {
+            /** Format: int64 */
+            sequence: number;
+            /** @enum {string} */
+            kind: "publish" | "delete" | "pause" | "resume" | "failed";
+            /** Format: int64 */
+            at_ms: number;
+            /** Format: int64 */
+            target_edge_generation: number;
+            /** Format: int64 */
+            published_generation: number;
+            /** Format: int64 */
+            score_count: number;
+        };
+        GraphMetricStatus: {
+            state: string;
+            /** @enum {string} */
+            phase: "idle" | "computing" | "publishing" | "complete" | "prepare_generation" | "scan_edges_and_out_degree" | "initialize_ranks" | "iterate_contributions" | "reduce_ranks" | "check_convergence" | "publish_generation" | "cleanup_old_generations";
+            edge_filter?: components["schemas"]["GraphMetricEdgeFilterStatus"];
+            /**
+             * Format: int64
+             * @description Version of the published graph metric metadata schema. Legacy unversioned materializations report 0.
+             */
+            metadata_version?: number;
+            maintenance_paused?: boolean;
+            /** @description Whether a local or distributed build is queued after the currently published or building generation. */
+            build_queued: boolean;
+            /** Format: int64 */
+            published_generation: number;
+            /** Format: int64 */
+            edge_generation: number;
+            /** Format: int64 */
+            target_edge_generation: number;
+            /**
+             * Format: int64
+             * @description Pending edge generation waiting to build, or 0 when no build is queued.
+             */
+            queued_generation?: number;
+            /**
+             * Format: int64
+             * @description Edge generation currently held by an active build lease, or 0 when idle.
+             */
+            building_generation?: number;
+            /**
+             * Format: int64
+             * @description Durable identifier for the active graph metric build job, or 0 when idle.
+             */
+            build_job_id?: number;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds when the active graph metric build started, or 0 when idle.
+             */
+            build_started_at_ms?: number;
+            /**
+             * Format: int64
+             * @description Iteration number reported by the active build lease, or 0 when idle or not iterative.
+             */
+            build_iteration?: number;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds when the active build lease expires, or 0 when idle.
+             */
+            build_lease_expires_at_ms?: number;
+            /** @description Worker id that owns the active build lease. Local builds use `local`. */
+            build_worker_id?: string;
+            /** @description Opaque resumable cursor for the active build phase. Empty or omitted when idle or when the phase has no cursor. */
+            build_cursor?: string;
+            /**
+             * Format: int64
+             * @description Completed work units for the active graph metric build, or 0 when idle or unknown.
+             */
+            build_completed_units?: number;
+            /**
+             * Format: int64
+             * @description Estimated total work units for the active graph metric build, or 0 when idle or unknown.
+             */
+            build_total_units?: number;
+            /**
+             * Format: int64
+             * @description Number of consecutive failed build attempts for the current target generation, or 0 when no failure applies.
+             */
+            retry_count?: number;
+            /** @description Last build error for the current failed target generation. */
+            last_error?: string;
+            /**
+             * Format: double
+             * @description Build progress for the target edge generation, from 0.0 to 1.0
+             */
+            progress: number;
+            converged: boolean;
+            /** Format: int64 */
+            iterations_completed: number;
+            /** Format: double */
+            delta: number;
+            /** Format: int64 */
+            computed_at_ms: number;
+            last_event?: components["schemas"]["GraphMetricEvent"];
+            /** @description Recent graph metric events, newest first. */
+            recent_events?: components["schemas"]["GraphMetricEvent"][];
+        };
         /**
          * @description Available tool names for the chat and retrieval agents.
          *     - add_filter: Add search filters (field constraints)
          *     - ask_clarification: Ask user for clarification
-         *     - search: Execute semantic searches (legacy, use semantic_search for retrieval)
+         *     - search: Execute semantic searches (prefer semantic_search for retrieval)
          *     - websearch: Search the web (requires websearch_config)
          *     - fetch: Fetch URL content (subject to security controls)
          *     - semantic_search: Execute semantic/vector search against an index
@@ -7628,6 +8700,36 @@ export interface components {
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        GraphMetricRerank: {
+            /** @description Graph index that owns the published metric. */
+            index: string;
+            /** @description Graph metric name to blend into the search hit score. */
+            metric: string;
+            /**
+             * Format: double
+             * @description Multiplier applied to the existing hit score before adding the graph metric feature.
+             * @default 1
+             */
+            base_weight?: number;
+            /**
+             * Format: double
+             * @description Multiplier applied to the graph metric score before it is added to the existing hit score.
+             * @default 1
+             */
+            weight?: number;
+            /**
+             * Format: double
+             * @description Metric feature value to use for hits that do not have a score in the published metric generation.
+             * @default 0
+             */
+            missing_score?: number;
+            /**
+             * @description Whether stale published generations are acceptable or the metric must be fresh.
+             * @default published
+             * @enum {string}
+             */
+            metric_freshness?: "published" | "fresh";
+        };
         /**
          * @description Type of graph query to execute
          * @enum {string}
@@ -7735,6 +8837,20 @@ export interface components {
             /** @description Edge to traverse to reach this step (null for first step) */
             edge?: components["schemas"]["PatternEdgeStep"];
         };
+        GraphMetricOrder: {
+            metric: string;
+            /** @enum {string} */
+            direction?: "asc" | "desc";
+            /** @enum {string} */
+            nulls?: "first" | "last" | "nulls_first" | "nulls_last";
+        };
+        GraphMetricFilter: {
+            metric: string;
+            /** @enum {string} */
+            op: ">" | ">=" | "<" | "<=" | "=" | "==" | "!=";
+            /** Format: double */
+            value: number;
+        };
         /** @description Declarative graph query to execute after full-text/vector searches */
         GraphQuery: {
             type: components["schemas"]["GraphQueryType"];
@@ -7756,6 +8872,19 @@ export interface components {
             include_edges?: boolean;
             /** @description Which fields to return from documents */
             fields?: string[];
+            /** @description Graph metric names to project onto result nodes */
+            metrics?: string[];
+            /** @description Sort graph result nodes by graph metric scores */
+            order_by?: components["schemas"]["GraphMetricOrder"][];
+            /** @description Filter graph result nodes by graph metric scores */
+            where_metric?: components["schemas"]["GraphMetricFilter"][];
+            /**
+             * @description Freshness mode for projected, ordered, and filtered graph metrics
+             * @enum {string}
+             */
+            metric_freshness?: "published" | "fresh";
+            /** @description Include graph metric status metadata in the graph result */
+            include_metric_status?: boolean;
         };
         /**
          * @description Configuration for pruning search results based on score quality.
@@ -7824,6 +8953,10 @@ export interface components {
             path_edges?: components["schemas"]["PathEdge"][];
             /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
             provenance?: string[];
+            /** @description Projected graph metric scores keyed by metric name. Values are numbers or null when a requested metric has no score for the node. */
+            metrics?: {
+                [key: string]: unknown;
+            };
             /** @description Connected edges (when include_edges=true) */
             edges?: components["schemas"]["Edge"][];
         };
@@ -7852,6 +8985,21 @@ export interface components {
              * @description Query execution time
              */
             took?: number;
+            /** @description Graph metric status metadata keyed by metric name */
+            metric_status?: {
+                [key: string]: components["schemas"]["GraphMetricStatus"];
+            };
+        };
+        GraphMetricScore: {
+            node: string;
+            /** Format: double */
+            score: number;
+        };
+        GraphMetricResult: {
+            index_name: string;
+            metric: string;
+            scores: components["schemas"]["GraphMetricScore"][];
+            status: components["schemas"]["GraphMetricStatus"];
         };
         /**
          * @description Standalone evaluation request for POST /eval endpoint.
@@ -9163,6 +10311,15 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Forbidden */
+        Forbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description Unsupported request media or content encoding */
         UnsupportedMediaType: {
             headers: {
@@ -9397,6 +10554,47 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    executeGraphMetricAction: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the graph index */
+                indexName: string;
+                /** @description Name of the configured graph metric */
+                metricName: string;
+                /** @description Operational action to apply to the graph metric materialization */
+                action: "refresh" | "rebuild" | "delete" | "pause" | "resume";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Updated graph metric status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphMetricActionResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Graph metric actions are unavailable for this runtime */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -10206,6 +11404,253 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsBatchWrite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsBatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Row batch operation successful */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsMutationSource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsMutationSourceRequest"];
+            };
+        };
+        responses: {
+            /** @description Rows staged into the claimed transaction */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsMutationSourceResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsGet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsGetRequest"];
+            };
+        };
+        responses: {
+            /** @description Row lookup response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsGetResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsQuery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsQueryPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Row query response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsQueryResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsAggregate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsAggregatePlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Row aggregate response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsAggregateResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsWindow: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsWindowPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Row window response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsStreamResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsJoin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsJoinPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Row join response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsStreamResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsLateral: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsLateralPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Row lateral response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsStreamResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
         };
     };
     linearMerge: {

@@ -452,6 +452,8 @@ fn deriveRuntimeRelationalChecks(alloc: std.mem.Allocator, schema: ParsedTableSc
             .op = switch (check.op) {
                 .is_null => .is_null,
                 .is_not_null => .is_not_null,
+                .is_distinct => .is_distinct,
+                .is_not_distinct => .is_not_distinct,
                 .eq => .eq,
                 .ne => .ne,
                 .gt => .gt,

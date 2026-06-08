@@ -301,6 +301,8 @@ pub const UniquePredicate = struct {
 pub const RelationalCheckOp = enum {
     is_null,
     is_not_null,
+    is_distinct,
+    is_not_distinct,
     eq,
     ne,
     gt,
@@ -2236,7 +2238,7 @@ fn validateRelationalChecks(schema: TableSchema) !void {
         if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
         switch (check.op) {
             .is_null, .is_not_null => if (check.value_json != null) return error.InvalidSchemaUpdateRequest,
-            .eq, .ne => if (check.value_json == null) return error.InvalidSchemaUpdateRequest,
+            .is_distinct, .is_not_distinct, .eq, .ne => if (check.value_json == null) return error.InvalidSchemaUpdateRequest,
             .gt, .gte, .lt, .lte => {
                 if (check.value_json == null) return error.InvalidSchemaUpdateRequest;
                 const field_type = property.field_type orelse return error.InvalidSchemaUpdateRequest;
@@ -3580,6 +3582,8 @@ fn parseRelationalChecks(alloc: std.mem.Allocator, value: std.json.Value) ![]Rel
 fn parseRelationalCheckOp(op_text: []const u8) !RelationalCheckOp {
     if (enumTokenEql(op_text, "is_null")) return .is_null;
     if (enumTokenEql(op_text, "is_not_null")) return .is_not_null;
+    if (enumTokenEql(op_text, "is_distinct")) return .is_distinct;
+    if (enumTokenEql(op_text, "is_not_distinct")) return .is_not_distinct;
     if (enumTokenEql(op_text, "eq")) return .eq;
     if (enumTokenEql(op_text, "ne")) return .ne;
     if (enumTokenEql(op_text, "gt")) return .gt;

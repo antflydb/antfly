@@ -290,9 +290,9 @@ The dashboard surface (Antfarm, built on `@antfly/components`) exposes:
 - **Warehouse Bridge**: Cloud Run job (scheduled) + Pub/Sub subscriber
   (for real-time CDC). Workload identity into BigQuery; Snowflake via
   private Secret Manager-stored key pair.
-- **Networking**: Antfly is internal-only; the retrieval agent sits behind
-  colony searchaf for customer-facing traffic, or behind the customer's
-  own IAP for in-tenant deployments.
+- **Networking**: Antfly is internal-only; the retrieval agent sits behind the
+  customer-facing search tier, or behind the customer's own IAP for in-tenant
+  deployments.
 - **Tenancy**: one Antfly cluster per tenant for strong isolation, or one
   shared cluster with per-tenant tables + row-level auth (see
   `work-log/planned/row-level-auth.md`).

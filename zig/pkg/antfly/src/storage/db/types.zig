@@ -916,7 +916,9 @@ pub const RelationalRowsExpressionKind = enum {
     field,
     value,
     coalesce,
+    now,
     lower,
+    upper,
     concat,
     nullif,
     add,
@@ -927,6 +929,13 @@ pub const RelationalRowsExpressionKind = enum {
     cast,
     json_extract,
     array_length,
+    string_to_array,
+};
+
+pub const RelationalRowsExpressionFieldSource = enum {
+    row,
+    existing,
+    proposed,
 };
 
 pub const RelationalRowsExpressionCastType = enum {
@@ -941,6 +950,15 @@ pub const RelationalRowsExpressionCondition = struct {
     rhs: []const RelationalRowsExpression = &.{},
 };
 
+pub const RelationalRowsExpressionPredicateGroup = struct {
+    conditions: []const RelationalRowsExpressionCondition = &.{},
+};
+
+pub const RelationalRowsExpressionArrayContainsPredicate = struct {
+    expression: RelationalRowsExpression,
+    value_json: []const u8,
+};
+
 pub const RelationalRowsExpressionCaseBranch = struct {
     when: RelationalRowsExpressionCondition,
     then: RelationalRowsExpression,
@@ -949,6 +967,7 @@ pub const RelationalRowsExpressionCaseBranch = struct {
 pub const RelationalRowsExpression = struct {
     kind: RelationalRowsExpressionKind,
     field: []const u8 = "",
+    field_source: RelationalRowsExpressionFieldSource = .row,
     value_json: []const u8 = "",
     json_path: []const u8 = "",
     json_as_text: bool = false,
@@ -961,6 +980,18 @@ pub const RelationalRowsExpression = struct {
 pub const RelationalRowsExpressionProjection = struct {
     output: []const u8,
     expression: RelationalRowsExpression,
+};
+
+pub const RelationalRowsExpressionAssignment = struct {
+    field: []const u8,
+    expression: RelationalRowsExpression,
+};
+
+pub const RelationalRowsTextPatternPredicate = struct {
+    field: []const u8,
+    pattern: []const u8,
+    case_insensitive: bool = false,
+    negated: bool = false,
 };
 
 pub const RelationalRowsDocKeyRange = struct {
@@ -978,9 +1009,13 @@ pub const RelationalRowsQueryRequest = struct {
     json_contains: []const RelationalRowsJsonContainsPredicate = &.{},
     json_path_eq: []const RelationalRowsJsonPathEqPredicate = &.{},
     json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
+    text_patterns: []const RelationalRowsTextPatternPredicate = &.{},
     or_predicates: []const RelationalRowsPredicateGroup = &.{},
     not_predicates: []const RelationalRowsPredicateGroup = &.{},
     expression_predicates: []const RelationalRowsExpressionCondition = &.{},
+    expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
     select: []const []const u8 = &.{},
     json_extract: []const RelationalRowsJsonExtractProjection = &.{},
     array_length: []const RelationalRowsArrayLengthProjection = &.{},
@@ -1037,6 +1072,11 @@ pub const RelationalRowsQueryRequest = struct {
             alloc.free(predicate.path);
         }
         if (self.json_path_exists.len > 0) alloc.free(self.json_path_exists);
+        for (self.text_patterns) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.pattern);
+        }
+        if (self.text_patterns.len > 0) alloc.free(self.text_patterns);
         for (self.or_predicates) |group| {
             for (group.predicates) |predicate| {
                 alloc.free(predicate.field);
@@ -1055,6 +1095,21 @@ pub const RelationalRowsQueryRequest = struct {
         if (self.not_predicates.len > 0) alloc.free(self.not_predicates);
         for (self.expression_predicates) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
         if (self.expression_predicates.len > 0) alloc.free(self.expression_predicates);
+        for (self.expression_or_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.expression_or_predicates.len > 0) alloc.free(self.expression_or_predicates);
+        for (self.expression_not_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.expression_not_predicates.len > 0) alloc.free(self.expression_not_predicates);
+        for (self.expression_array_contains) |predicate| {
+            freeRelationalRowsExpression(alloc, predicate.expression);
+            alloc.free(predicate.value_json);
+        }
+        if (self.expression_array_contains.len > 0) alloc.free(self.expression_array_contains);
         for (self.select) |field| alloc.free(field);
         if (self.select.len > 0) alloc.free(self.select);
         for (self.json_extract) |projection| {
@@ -1170,6 +1225,8 @@ pub const RelationalRowsMutationSourceRequest = struct {
     kind: RelationalRowsMutationKind,
     source: RelationalRowsQueryRequest = .{},
     operations: []const TransformOp = &.{},
+    patch_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    increment_expressions: []const RelationalRowsExpressionAssignment = &.{},
     returning: []const []const u8 = &.{},
     returning_expressions: []const RelationalRowsExpressionProjection = &.{},
     returning_all: bool = false,
@@ -1189,6 +1246,10 @@ pub const RelationalRowsMutationSourceResult = struct {
 
 pub const RelationalRowsWindowFunction = enum {
     row_number,
+    rank,
+    dense_rank,
+    lag,
+    lead,
 };
 
 pub const RelationalRowsWindowSpec = struct {
@@ -1196,6 +1257,9 @@ pub const RelationalRowsWindowSpec = struct {
     function: RelationalRowsWindowFunction,
     partition_by: []const []const u8 = &.{},
     order_by: []const RelationalRowsQueryOrder = &.{},
+    value_expression: ?RelationalRowsExpression = null,
+    offset: u32 = 1,
+    default_json: []const u8 = "",
 };
 
 pub const RelationalRowsWindowRequest = struct {
@@ -1218,6 +1282,8 @@ pub const RelationalRowsWindowRequest = struct {
                 if (order.expression) |expression| freeRelationalRowsExpression(alloc, expression);
             }
             if (window.order_by.len > 0) alloc.free(window.order_by);
+            if (window.value_expression) |expression| freeRelationalRowsExpression(alloc, expression);
+            if (window.default_json.len > 0) alloc.free(window.default_json);
         }
         if (self.windows.len > 0) alloc.free(self.windows);
         for (self.select) |field| alloc.free(field);
@@ -1701,6 +1767,7 @@ pub const SearchRequest = struct {
     sparse_queries: []const NamedSparseQuery = &.{},
     graph_queries: []const NamedGraphQuery = &.{},
     graph_metric_queries: []const NamedGraphMetricQuery = &.{},
+    graph_metric_rerank: ?GraphMetricRerank = null,
     merge_config: ?MergeConfig = null,
     reranker: ?reranking_mod.Config = null,
     reranker_query_text: []const u8 = "",
@@ -1793,6 +1860,15 @@ pub const NamedGraphMetricQuery = struct {
     query: GraphMetricQuery,
 };
 
+pub const GraphMetricRerank = struct {
+    index_name: []const u8,
+    metric_name: []const u8,
+    freshness: GraphMetricFreshness = .published,
+    base_weight: f64 = 1.0,
+    weight: f64 = 1.0,
+    missing_score: f64 = 0.0,
+};
+
 pub const NamedFullTextQuery = struct {
     name: []const u8,
     index_name: []const u8,
@@ -1818,10 +1894,49 @@ pub const MergeConfig = struct {
     weights: []const fusion_mod.NamedWeight = &.{},
 };
 
+pub const GraphMetricRerankScoreDetails = struct {
+    index_name: []u8,
+    metric_name: []u8,
+    base_score: f64 = 0.0,
+    base_weight: f64 = 1.0,
+    metric_score: ?f64 = null,
+    metric_score_used: f64 = 0.0,
+    metric_weight: f64 = 1.0,
+    missing_score_used: bool = false,
+    final_score: f64 = 0.0,
+    published_generation: u64 = 0,
+
+    pub fn clone(self: GraphMetricRerankScoreDetails, alloc: Allocator) !GraphMetricRerankScoreDetails {
+        const index_name = try alloc.dupe(u8, self.index_name);
+        errdefer alloc.free(index_name);
+        const metric_name = try alloc.dupe(u8, self.metric_name);
+        errdefer alloc.free(metric_name);
+        return .{
+            .index_name = index_name,
+            .metric_name = metric_name,
+            .base_score = self.base_score,
+            .base_weight = self.base_weight,
+            .metric_score = self.metric_score,
+            .metric_score_used = self.metric_score_used,
+            .metric_weight = self.metric_weight,
+            .missing_score_used = self.missing_score_used,
+            .final_score = self.final_score,
+            .published_generation = self.published_generation,
+        };
+    }
+
+    pub fn deinit(self: *GraphMetricRerankScoreDetails, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        self.* = undefined;
+    }
+};
+
 pub const SearchHit = struct {
     id: []u8,
     doc_ordinal: ?u32 = null,
     score: ?f32 = null,
+    score_details: ?GraphMetricRerankScoreDetails = null,
     stored_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
     chunk_hits: []ChunkHit = &.{},
@@ -1831,12 +1946,14 @@ pub const SearchHit = struct {
             .id = try alloc.dupe(u8, self.id),
             .doc_ordinal = self.doc_ordinal,
             .score = self.score,
+            .score_details = if (self.score_details) |details| try details.clone(alloc) else null,
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
             .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
             .chunk_hits = &.{},
         };
         errdefer {
             alloc.free(cloned.id);
+            if (cloned.score_details) |*details| details.deinit(alloc);
             if (cloned.stored_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         }
@@ -1858,6 +1975,7 @@ pub const SearchHit = struct {
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.score_details) |*details| details.deinit(alloc);
         if (self.stored_data) |data| alloc.free(data);
         if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         for (self.chunk_hits) |*chunk| chunk.deinit(alloc);
@@ -1902,6 +2020,7 @@ pub const SearchResult = struct {
     identity_read_generation: ?u64 = null,
     graph_results: []GraphSearchResult = &.{},
     graph_metric_results: []GraphMetricResult = &.{},
+    graph_metric_rerank_status: ?GraphMetricStatus = null,
 
     pub fn deinit(self: *SearchResult) void {
         for (self.hits) |*hit| hit.deinit(self.alloc);
@@ -1910,6 +2029,7 @@ pub const SearchResult = struct {
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
         for (self.graph_metric_results) |*metric_result| metric_result.deinit(self.alloc);
         if (self.graph_metric_results.len > 0) self.alloc.free(self.graph_metric_results);
+        if (self.graph_metric_rerank_status) |*status| status.deinit(self.alloc);
         self.* = undefined;
     }
 };
@@ -1949,6 +2069,7 @@ pub const GraphSearchResult = struct {
     matches: []GraphPatternMatch = &.{},
     hits: []SearchHit,
     total_hits: u32,
+    metric_status: []GraphMetricStatus = &.{},
 
     pub fn deinit(self: *GraphSearchResult, alloc: Allocator) void {
         alloc.free(self.name);
@@ -1960,6 +2081,7 @@ pub const GraphSearchResult = struct {
         if (self.matches.len > 0) alloc.free(self.matches);
         for (self.hits) |*hit| hit.deinit(alloc);
         if (self.hits.len > 0) alloc.free(self.hits);
+        freeGraphMetricStatuses(alloc, self.metric_status);
         self.* = undefined;
     }
 };
@@ -1967,15 +2089,41 @@ pub const GraphSearchResult = struct {
 pub const GraphMetricStatus = struct {
     name: []u8,
     state: graph_mod.GraphIndex.GraphMetricState = .not_ready,
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    edge_filter: graph_mod.GraphMetricEdgeFilter = .{},
+    metadata_version: u32 = 0,
+    maintenance_paused: bool = false,
+    build_queued: bool = false,
     published_generation: u64 = 0,
     edge_generation: u64 = 0,
+    target_edge_generation: u64 = 0,
+    queued_generation: u64 = 0,
+    building_generation: u64 = 0,
+    build_job_id: u64 = 0,
+    build_started_at_ms: u64 = 0,
+    build_iteration: u32 = 0,
+    build_lease_expires_at_ms: u64 = 0,
+    build_worker_id: []const u8 = "",
+    build_cursor: []const u8 = "",
+    build_completed_units: u64 = 0,
+    build_total_units: u64 = 0,
+    retry_count: u64 = 0,
+    last_error: []const u8 = "",
+    progress: f64 = 0.0,
     converged: bool = false,
     iterations_completed: u32 = 0,
     delta: f64 = 0.0,
     computed_at_ms: u64 = 0,
+    last_event: ?graph_mod.GraphIndex.GraphMetricEvent = null,
+    recent_events: []graph_mod.GraphIndex.GraphMetricEvent = &.{},
 
     pub fn deinit(self: *GraphMetricStatus, alloc: Allocator) void {
         alloc.free(self.name);
+        self.edge_filter.deinit(alloc);
+        if (self.build_worker_id.len > 0) alloc.free(self.build_worker_id);
+        if (self.build_cursor.len > 0) alloc.free(self.build_cursor);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        if (self.recent_events.len > 0) alloc.free(self.recent_events);
         self.* = undefined;
     }
 };

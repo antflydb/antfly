@@ -182,6 +182,8 @@ pub const RelationalCheckOp = enum(u8) {
     gte = 5,
     lt = 6,
     lte = 7,
+    is_distinct = 8,
+    is_not_distinct = 9,
 };
 
 pub const RelationalCheck = struct {

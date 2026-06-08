@@ -89,7 +89,7 @@ and unique-constraint model remain future work.
 - References to arbitrary non-unique parent columns.
 - Alternate FK encodings for this initial feature set. The routed FK-ref
   keyspace is the durable production encoding; future changes should use
-  explicit catalog/schema migrations instead of compatibility fallbacks.
+  explicit catalog/schema migrations instead of alternate encodings.
 
 ## Composite Primary Keys
 
@@ -544,7 +544,7 @@ internal range-owned state:
 - large-operation planning for hot parent keys with many child refs;
 - one production FK-ref layout for this new feature set: routed ownership is the
   durable encoding, and future format changes must be explicit catalog/schema
-  migrations rather than hidden fallback paths.
+  migrations.
 
 Parent-key ownership can create hot spots for high-fanout parents. That is an
 expected property of exact FK enforcement, not a reason to fall back to table
@@ -677,7 +677,7 @@ For cross-shard or cross-table writes:
   existence is considered;
 - hosted restrict parent deletes require the exact FK-ref owner range for the
   deleted parent key. Missing, transitional, or incomplete owner topology fails
-  before prepare; no broad child-table fallback is used for this new feature
+  before prepare; broad child-table fanout is not used for this new feature
   set;
 - FK-ref owner or child participants receive parent-delete validation
   instructions and reject prepare when committed reverse-reference rows or
@@ -1160,8 +1160,8 @@ configurable follow-up budget before yielding. The production execution model is
 request-independent controller ownership plus durable owner-routed action
 schedules/jobs. Further hardening should concentrate on additional
 failure-injection evidence for recursive/high-fanout cascades and operator
-policy for permanent failures, not on adding compatibility fanout or
-request-polling fallback paths.
+policy for permanent failures, not on adding broad fanout or request-polling
+paths.
 
 DB runtime stats expose cumulative `foreign_keys` counters for child-write
 rejects, parent-delete rejects, validation/dry-run/repair runs, scanned child
@@ -1434,7 +1434,7 @@ Work:
   HTTP client methods for those state transitions are the control-plane shape.
   Public/admin orchestration must drive these typed lifecycle transitions and
   observe data-movement progress; raw upsert/remove metadata changes are not a
-  compatibility interface for this new feature set;
+  supported control-plane interface for this feature set;
 - make parent-delete explain use the same FK-ref owner resolver rather than
   child-table range fanout. Hosted/provisioned explain now reads the parent row,
   resolves configured FK-ref owner ranges, scans bounded owner prefixes, reports
@@ -1602,10 +1602,9 @@ Ongoing hardening:
 
 - keep expanding failure-injection coverage for durable `set_null` / `cascade`
   schedule and action-job recovery across participant retries, topology
-  transitions, process restarts, and lease handoff. The production shape is
-  already exact owner-routed scheduling plus idempotent, cursor-backed action
-  pages; future work should prove more interleavings, not add broad fanout
-  fallback paths.
+transitions, process restarts, and lease handoff. The production shape is
+already exact owner-routed scheduling plus idempotent, cursor-backed action
+pages; future work should prove more interleavings, not add broad fanout paths.
 
 Repair may rebuild missing/corrupt secondary metadata, but it must not silently
 mutate user rows. Orphaned child rows should be reported for explicit operator
@@ -1869,9 +1868,8 @@ Implemented:
   FK columns or delete child rows, and update derived indexes and local reverse
   refs through the normal relational write participant.
 - missing, transitional, or incomplete FK-ref owner topology fails before
-  prepare. There is no broad child-range fallback for hosted distributed
-  `set_null`; exact owner routing is the production contract for this new
-  feature set.
+  prepare. Hosted distributed `set_null` uses exact owner routing as the
+  production contract for this new feature set.
 
 Ongoing hardening:
 

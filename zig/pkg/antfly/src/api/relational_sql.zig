@@ -1477,8 +1477,16 @@ const Parser = struct {
         errdefer if (!field_transferred) self.alloc.free(field);
         const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
             if (self.matchKeyword("not")) {
+                if (self.matchKeyword("distinct")) {
+                    try self.expectKeyword("from");
+                    break :blk .is_not_distinct;
+                }
                 try self.expectKeyword("null");
                 break :blk .is_not_null;
+            }
+            if (self.matchKeyword("distinct")) {
+                try self.expectKeyword("from");
+                break :blk .is_distinct;
             }
             try self.expectKeyword("null");
             break :blk .is_null;
@@ -2074,6 +2082,11 @@ const Parser = struct {
             freeInPredicates(self.alloc, in_predicates.items);
             in_predicates.deinit(self.alloc);
         }
+        var text_patterns = std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate).empty;
+        errdefer {
+            freeTextPatterns(self.alloc, text_patterns.items);
+            text_patterns.deinit(self.alloc);
+        }
         var or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
         errdefer {
             freePredicateGroups(self.alloc, or_predicates.items);
@@ -2089,6 +2102,21 @@ const Parser = struct {
             freeExpressionConditions(self.alloc, expression_predicates.items);
             expression_predicates.deinit(self.alloc);
         }
+        var expression_or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        errdefer {
+            freeExpressionPredicateGroups(self.alloc, expression_or_predicates.items);
+            expression_or_predicates.deinit(self.alloc);
+        }
+        var expression_not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        errdefer {
+            freeExpressionPredicateGroups(self.alloc, expression_not_predicates.items);
+            expression_not_predicates.deinit(self.alloc);
+        }
+        var expression_array_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate).empty;
+        errdefer {
+            freeExpressionArrayContains(self.alloc, expression_array_contains.items);
+            expression_array_contains.deinit(self.alloc);
+        }
         var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
         errdefer {
             freeOrderBy(self.alloc, order_by.items);
@@ -2101,7 +2129,7 @@ const Parser = struct {
 
         while (!self.atEnd()) {
             if (self.matchKeyword("where")) {
-                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates, &expression_predicates);
+                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &text_patterns, &or_predicates, &not_predicates, &expression_predicates, &expression_or_predicates, &expression_not_predicates, &expression_array_contains);
             } else if (self.matchKeyword("order")) {
                 try self.expectKeyword("by");
                 try self.parseOrderBy(&order_by);
@@ -2135,9 +2163,13 @@ const Parser = struct {
                 .json_contains = try json_contains.toOwnedSlice(self.alloc),
                 .json_path_eq = try json_path_eq.toOwnedSlice(self.alloc),
                 .json_path_exists = try json_path_exists.toOwnedSlice(self.alloc),
+                .text_patterns = try text_patterns.toOwnedSlice(self.alloc),
                 .or_predicates = try or_predicates.toOwnedSlice(self.alloc),
                 .not_predicates = try not_predicates.toOwnedSlice(self.alloc),
                 .expression_predicates = try expression_predicates.toOwnedSlice(self.alloc),
+                .expression_or_predicates = try expression_or_predicates.toOwnedSlice(self.alloc),
+                .expression_not_predicates = try expression_not_predicates.toOwnedSlice(self.alloc),
+                .expression_array_contains = try expression_array_contains.toOwnedSlice(self.alloc),
                 .select = select.fields,
                 .json_extract = select.json_extract,
                 .array_length = select.array_length,
@@ -2201,6 +2233,11 @@ const Parser = struct {
             freeInPredicates(self.alloc, in_predicates.items);
             in_predicates.deinit(self.alloc);
         }
+        var text_patterns = std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate).empty;
+        errdefer {
+            freeTextPatterns(self.alloc, text_patterns.items);
+            text_patterns.deinit(self.alloc);
+        }
         var or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
         errdefer {
             freePredicateGroups(self.alloc, or_predicates.items);
@@ -2216,6 +2253,21 @@ const Parser = struct {
             freeExpressionConditions(self.alloc, expression_predicates.items);
             expression_predicates.deinit(self.alloc);
         }
+        var expression_or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        errdefer {
+            freeExpressionPredicateGroups(self.alloc, expression_or_predicates.items);
+            expression_or_predicates.deinit(self.alloc);
+        }
+        var expression_not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        errdefer {
+            freeExpressionPredicateGroups(self.alloc, expression_not_predicates.items);
+            expression_not_predicates.deinit(self.alloc);
+        }
+        var expression_array_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate).empty;
+        errdefer {
+            freeExpressionArrayContains(self.alloc, expression_array_contains.items);
+            expression_array_contains.deinit(self.alloc);
+        }
         var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
         errdefer {
             freeOrderBy(self.alloc, order_by.items);
@@ -2226,7 +2278,7 @@ const Parser = struct {
         var offset: u32 = 0;
         while (!self.atEnd()) {
             if (self.matchKeyword("where")) {
-                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates, &expression_predicates);
+                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &text_patterns, &or_predicates, &not_predicates, &expression_predicates, &expression_or_predicates, &expression_not_predicates, &expression_array_contains);
             } else if (self.matchKeyword("order")) {
                 try self.expectKeyword("by");
                 try self.parseWindowOutputOrderBy(&order_by, select.fields, select.windows);
@@ -2257,9 +2309,13 @@ const Parser = struct {
                         .json_contains = try json_contains.toOwnedSlice(self.alloc),
                         .json_path_eq = try json_path_eq.toOwnedSlice(self.alloc),
                         .json_path_exists = try json_path_exists.toOwnedSlice(self.alloc),
+                        .text_patterns = try text_patterns.toOwnedSlice(self.alloc),
                         .or_predicates = try or_predicates.toOwnedSlice(self.alloc),
                         .not_predicates = try not_predicates.toOwnedSlice(self.alloc),
                         .expression_predicates = try expression_predicates.toOwnedSlice(self.alloc),
+                        .expression_or_predicates = try expression_or_predicates.toOwnedSlice(self.alloc),
+                        .expression_not_predicates = try expression_not_predicates.toOwnedSlice(self.alloc),
+                        .expression_array_contains = try expression_array_contains.toOwnedSlice(self.alloc),
                         .select_all = true,
                     },
                     .windows = select.windows,
@@ -2323,6 +2379,11 @@ const Parser = struct {
             freeInPredicates(self.alloc, in_predicates.items);
             in_predicates.deinit(self.alloc);
         }
+        var text_patterns = std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate).empty;
+        errdefer {
+            freeTextPatterns(self.alloc, text_patterns.items);
+            text_patterns.deinit(self.alloc);
+        }
         var or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
         errdefer {
             freePredicateGroups(self.alloc, or_predicates.items);
@@ -2337,6 +2398,21 @@ const Parser = struct {
         errdefer {
             freeExpressionConditions(self.alloc, expression_predicates.items);
             expression_predicates.deinit(self.alloc);
+        }
+        var expression_or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        errdefer {
+            freeExpressionPredicateGroups(self.alloc, expression_or_predicates.items);
+            expression_or_predicates.deinit(self.alloc);
+        }
+        var expression_not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        errdefer {
+            freeExpressionPredicateGroups(self.alloc, expression_not_predicates.items);
+            expression_not_predicates.deinit(self.alloc);
+        }
+        var expression_array_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate).empty;
+        errdefer {
+            freeExpressionArrayContains(self.alloc, expression_array_contains.items);
+            expression_array_contains.deinit(self.alloc);
         }
         var group_by = std.ArrayListUnmanaged([]const u8).empty;
         errdefer {
@@ -2358,7 +2434,7 @@ const Parser = struct {
         var offset: u32 = 0;
         while (!self.atEnd()) {
             if (self.matchKeyword("where")) {
-                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates, &expression_predicates);
+                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &text_patterns, &or_predicates, &not_predicates, &expression_predicates, &expression_or_predicates, &expression_not_predicates, &expression_array_contains);
             } else if (self.matchKeyword("group")) {
                 try self.expectKeyword("by");
                 try self.parseGroupBy(&group_by);
@@ -2393,9 +2469,13 @@ const Parser = struct {
                     .json_contains = try json_contains.toOwnedSlice(self.alloc),
                     .json_path_eq = try json_path_eq.toOwnedSlice(self.alloc),
                     .json_path_exists = try json_path_exists.toOwnedSlice(self.alloc),
+                    .text_patterns = try text_patterns.toOwnedSlice(self.alloc),
                     .or_predicates = try or_predicates.toOwnedSlice(self.alloc),
                     .not_predicates = try not_predicates.toOwnedSlice(self.alloc),
                     .expression_predicates = try expression_predicates.toOwnedSlice(self.alloc),
+                    .expression_or_predicates = try expression_or_predicates.toOwnedSlice(self.alloc),
+                    .expression_not_predicates = try expression_not_predicates.toOwnedSlice(self.alloc),
+                    .expression_array_contains = try expression_array_contains.toOwnedSlice(self.alloc),
                     .select_all = true,
                 },
                 .group_by = try group_by.toOwnedSlice(self.alloc),
@@ -2729,10 +2809,20 @@ const Parser = struct {
             freeFieldJsonValues(self.alloc, patch.items);
             patch.deinit(self.alloc);
         }
+        var patch_expr = std.ArrayListUnmanaged(FieldExpressionValue).empty;
+        errdefer {
+            freeFieldExpressionValues(self.alloc, patch_expr.items);
+            patch_expr.deinit(self.alloc);
+        }
         var increment = std.ArrayListUnmanaged(FieldJsonValue).empty;
         errdefer {
             freeFieldJsonValues(self.alloc, increment.items);
             increment.deinit(self.alloc);
+        }
+        var increment_expr = std.ArrayListUnmanaged(FieldExpressionValue).empty;
+        errdefer {
+            freeFieldExpressionValues(self.alloc, increment_expr.items);
+            increment_expr.deinit(self.alloc);
         }
         var json_set = std.ArrayListUnmanaged(JsonSetValue).empty;
         errdefer {
@@ -2841,10 +2931,20 @@ const Parser = struct {
             freeFieldJsonValues(self.alloc, patch.items);
             patch.deinit(self.alloc);
         }
+        var patch_expr = std.ArrayListUnmanaged(FieldExpressionValue).empty;
+        errdefer {
+            freeFieldExpressionValues(self.alloc, patch_expr.items);
+            patch_expr.deinit(self.alloc);
+        }
         var increment = std.ArrayListUnmanaged(FieldJsonValue).empty;
         errdefer {
             freeFieldJsonValues(self.alloc, increment.items);
             increment.deinit(self.alloc);
+        }
+        var increment_expr = std.ArrayListUnmanaged(FieldExpressionValue).empty;
+        errdefer {
+            freeFieldExpressionValues(self.alloc, increment_expr.items);
+            increment_expr.deinit(self.alloc);
         }
         var json_set = std.ArrayListUnmanaged(JsonSetValue).empty;
         errdefer {
@@ -2857,23 +2957,27 @@ const Parser = struct {
             array_update.deinit(self.alloc);
         }
         while (true) {
-            try self.parseUpdateAssignment(&patch, &increment, &json_set, &array_update);
+            try self.parseConflictUpdateAssignment(&.{}, &.{}, &patch, &patch_expr, &increment, &increment_expr, &json_set, &array_update);
             if (self.match(.comma) == null) break;
         }
-        if (patch.items.len == 0 and increment.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
+        if (patch.items.len == 0 and patch_expr.items.len == 0 and increment.items.len == 0 and increment_expr.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
 
         var source = try self.parseMutationSourceQueryTail();
         defer source.deinit(self.alloc);
 
-        const body_json = try self.mutationSourceBodyJsonAlloc("update", source.query, patch.items, increment.items, json_set.items, array_update.items, source.returning);
+        const body_json = try self.mutationSourceBodyJsonAlloc("update", source.query, patch.items, patch_expr.items, increment.items, increment_expr.items, json_set.items, array_update.items, source.returning);
         defer self.alloc.free(body_json);
         var mutation = try relational_rows.parseRowsMutationSourceRequest(self.alloc, body_json, self.schema);
         errdefer mutation.deinit(self.alloc);
 
         freeFieldJsonValues(self.alloc, patch.items);
         patch.deinit(self.alloc);
+        freeFieldExpressionValues(self.alloc, patch_expr.items);
+        patch_expr.deinit(self.alloc);
         freeFieldJsonValues(self.alloc, increment.items);
         increment.deinit(self.alloc);
+        freeFieldExpressionValues(self.alloc, increment_expr.items);
+        increment_expr.deinit(self.alloc);
         freeJsonSetValues(self.alloc, json_set.items);
         json_set.deinit(self.alloc);
         freeArrayTransformValues(self.alloc, array_update.items);
@@ -2894,7 +2998,7 @@ const Parser = struct {
         var source = try self.parseMutationSourceQueryTail();
         defer source.deinit(self.alloc);
 
-        const body_json = try self.mutationSourceBodyJsonAlloc("delete", source.query, &.{}, &.{}, &.{}, &.{}, source.returning);
+        const body_json = try self.mutationSourceBodyJsonAlloc("delete", source.query, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, source.returning);
         defer self.alloc.free(body_json);
         var mutation = try relational_rows.parseRowsMutationSourceRequest(self.alloc, body_json, self.schema);
         errdefer mutation.deinit(self.alloc);
@@ -2951,6 +3055,11 @@ const Parser = struct {
             freeInPredicates(self.alloc, in_predicates.items);
             in_predicates.deinit(self.alloc);
         }
+        var text_patterns = std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate).empty;
+        errdefer {
+            freeTextPatterns(self.alloc, text_patterns.items);
+            text_patterns.deinit(self.alloc);
+        }
         var or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
         errdefer {
             freePredicateGroups(self.alloc, or_predicates.items);
@@ -2965,6 +3074,21 @@ const Parser = struct {
         errdefer {
             freeExpressionConditions(self.alloc, expression_predicates.items);
             expression_predicates.deinit(self.alloc);
+        }
+        var expression_or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        errdefer {
+            freeExpressionPredicateGroups(self.alloc, expression_or_predicates.items);
+            expression_or_predicates.deinit(self.alloc);
+        }
+        var expression_not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        errdefer {
+            freeExpressionPredicateGroups(self.alloc, expression_not_predicates.items);
+            expression_not_predicates.deinit(self.alloc);
+        }
+        var expression_array_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate).empty;
+        errdefer {
+            freeExpressionArrayContains(self.alloc, expression_array_contains.items);
+            expression_array_contains.deinit(self.alloc);
         }
         var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
         errdefer {
@@ -2986,7 +3110,7 @@ const Parser = struct {
             if (self.matchKeyword("where")) {
                 if (saw_where or saw_returning) return error.UnsupportedSqlShape;
                 saw_where = true;
-                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &or_predicates, &not_predicates, &expression_predicates);
+                try self.parseWhere(&predicates, &json_contains, &json_path_eq, &json_path_exists, &array_contains, &array_eq, &in_predicates, &text_patterns, &or_predicates, &not_predicates, &expression_predicates, &expression_or_predicates, &expression_not_predicates, &expression_array_contains);
             } else if (self.matchKeyword("order")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
                 try self.expectKeyword("by");
@@ -3027,9 +3151,13 @@ const Parser = struct {
                 .json_contains = try json_contains.toOwnedSlice(self.alloc),
                 .json_path_eq = try json_path_eq.toOwnedSlice(self.alloc),
                 .json_path_exists = try json_path_exists.toOwnedSlice(self.alloc),
+                .text_patterns = try text_patterns.toOwnedSlice(self.alloc),
                 .or_predicates = try or_predicates.toOwnedSlice(self.alloc),
                 .not_predicates = try not_predicates.toOwnedSlice(self.alloc),
                 .expression_predicates = try expression_predicates.toOwnedSlice(self.alloc),
+                .expression_or_predicates = try expression_or_predicates.toOwnedSlice(self.alloc),
+                .expression_not_predicates = try expression_not_predicates.toOwnedSlice(self.alloc),
+                .expression_array_contains = try expression_array_contains.toOwnedSlice(self.alloc),
                 .select_all = true,
                 .order_by = try order_by.toOwnedSlice(self.alloc),
                 .row_claim = row_claim,
@@ -3045,9 +3173,13 @@ const Parser = struct {
         json_contains = .empty;
         json_path_eq = .empty;
         json_path_exists = .empty;
+        text_patterns = .empty;
         or_predicates = .empty;
         not_predicates = .empty;
         expression_predicates = .empty;
+        expression_or_predicates = .empty;
+        expression_not_predicates = .empty;
+        expression_array_contains = .empty;
         order_by = .empty;
         row_claim.owner_id = "";
         returning = .{};
@@ -3170,8 +3302,8 @@ const Parser = struct {
         }
 
         while (true) {
-            if (self.peekKeyword("row_number")) {
-                const spec = try self.parseRowNumberWindowSpecAlloc();
+            if (self.peekWindowFunction()) {
+                const spec = try self.parseWindowSpecAlloc();
                 var spec_transferred = false;
                 errdefer if (!spec_transferred) freeWindowSpec(self.alloc, spec);
                 try windows.append(self.alloc, spec);
@@ -3196,9 +3328,34 @@ const Parser = struct {
         };
     }
 
-    fn parseRowNumberWindowSpecAlloc(self: *@This()) !db_mod.types.RelationalRowsWindowSpec {
-        try self.expectKeyword("row_number");
+    fn parseWindowSpecAlloc(self: *@This()) !db_mod.types.RelationalRowsWindowSpec {
+        const function = try self.parseWindowFunction();
         try self.expect(.lparen);
+        const value_expression: ?db_mod.types.RelationalRowsExpression = switch (function) {
+            .row_number, .rank, .dense_rank => null,
+            .lag, .lead => try self.parseRowExpressionAlloc(),
+        };
+        var value_expression_transferred = false;
+        errdefer if (!value_expression_transferred) if (value_expression) |expression| freeExpression(self.alloc, expression);
+
+        const offset: u32 = switch (function) {
+            .row_number, .rank, .dense_rank => 1,
+            .lag, .lead => if (self.match(.comma) != null) blk: {
+                const parsed_offset = try self.parseU32Value();
+                if (parsed_offset == 0) return error.UnsupportedSqlShape;
+                break :blk parsed_offset;
+            } else 1,
+        };
+
+        const default_json: []const u8 = switch (function) {
+            .row_number, .rank, .dense_rank => &.{},
+            .lag, .lead => if (self.match(.comma) != null)
+                try self.parseJsonValueAlloc()
+            else
+                &.{},
+        };
+        var default_transferred = false;
+        errdefer if (!default_transferred) if (default_json.len > 0) self.alloc.free(default_json);
         try self.expect(.rparen);
         try self.expectKeyword("over");
         try self.expect(.lparen);
@@ -3226,7 +3383,7 @@ const Parser = struct {
         const output = if (self.matchKeyword("as"))
             try self.parseIdentifierOwned()
         else
-            try self.alloc.dupe(u8, "row_number");
+            try self.alloc.dupe(u8, windowFunctionName(function));
         var output_transferred = false;
         errdefer if (!output_transferred) self.alloc.free(output);
 
@@ -3243,11 +3400,39 @@ const Parser = struct {
         output_transferred = true;
         partition_transferred = true;
         order_transferred = true;
+        value_expression_transferred = true;
+        default_transferred = true;
         return .{
             .output = output,
-            .function = .row_number,
+            .function = function,
             .partition_by = owned_partition_by,
             .order_by = owned_order_by,
+            .value_expression = value_expression,
+            .offset = offset,
+            .default_json = default_json,
+        };
+    }
+
+    fn peekWindowFunction(self: *@This()) bool {
+        return self.peekKeyword("row_number") or self.peekKeyword("rank") or self.peekKeyword("dense_rank") or self.peekKeyword("lag") or self.peekKeyword("lead");
+    }
+
+    fn parseWindowFunction(self: *@This()) !db_mod.types.RelationalRowsWindowFunction {
+        if (self.matchKeyword("row_number")) return .row_number;
+        if (self.matchKeyword("rank")) return .rank;
+        if (self.matchKeyword("dense_rank")) return .dense_rank;
+        if (self.matchKeyword("lag")) return .lag;
+        if (self.matchKeyword("lead")) return .lead;
+        return error.UnsupportedSqlShape;
+    }
+
+    fn windowFunctionName(function: db_mod.types.RelationalRowsWindowFunction) []const u8 {
+        return switch (function) {
+            .row_number => "row_number",
+            .rank => "rank",
+            .dense_rank => "dense_rank",
+            .lag => "lag",
+            .lead => "lead",
         };
     }
 
@@ -3402,7 +3587,9 @@ const Parser = struct {
             self.peekKeyword("case") or
             self.peekKeyword("cast") or
             self.peekKeyword("coalesce") or
+            self.peekKeyword("string_to_array") or
             self.peekKeyword("lower") or
+            self.peekKeyword("upper") or
             self.peekKeyword("nullif")) return true;
         if (self.peekKind(.identifier) and self.pos + 1 < self.tokens.len) {
             return switch (self.tokens[self.pos + 1].kind) {
@@ -3418,7 +3605,9 @@ const Parser = struct {
             self.peekKeyword("case") or
             self.peekKeyword("cast") or
             self.peekKeyword("coalesce") or
+            self.peekKeyword("string_to_array") or
             self.peekKeyword("lower") or
+            self.peekKeyword("upper") or
             self.peekKeyword("nullif"))
         {
             return try self.parseRowExpressionAlloc();
@@ -3491,7 +3680,7 @@ const Parser = struct {
     }
 
     fn peekAggregateExpressionFilter(self: *@This()) bool {
-        if (self.peekKeyword("lower") or self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("nullif")) return true;
+        if (self.peekKeyword("lower") or self.peekKeyword("upper") or self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("nullif")) return true;
         if (self.peekKind(.identifier) and self.pos + 1 < self.tokens.len) {
             return switch (self.tokens[self.pos + 1].kind) {
                 .plus, .minus, .star, .slash => true,
@@ -3730,7 +3919,12 @@ const Parser = struct {
             const column = relationalColumnForField(self.schema, source.field, null) orelse return error.InvalidSqlCatalog;
             const target = if (side == .left) left_predicates else right_predicates;
             const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
-                if (self.matchKeyword("not")) {
+                const not = self.matchKeyword("not");
+                if (self.matchKeyword("distinct")) {
+                    try self.expectKeyword("from");
+                    break :blk if (not) .is_not_distinct else .is_distinct;
+                }
+                if (not) {
                     try self.expectKeyword("null");
                     break :blk .is_not_null;
                 }
@@ -3836,6 +4030,11 @@ const Parser = struct {
         value_json: []const u8,
     };
 
+    const FieldExpressionValue = struct {
+        field: []const u8,
+        expression: db_mod.types.RelationalRowsExpression,
+    };
+
     const FieldPredicate = struct {
         field: []const u8,
         op: runtime_schema.UniquePredicateOp,
@@ -3873,9 +4072,12 @@ const Parser = struct {
         target: ConflictTarget,
         action: ConflictAction,
         patch: []const FieldJsonValue = &.{},
+        patch_expr: []const FieldExpressionValue = &.{},
         increment: []const FieldJsonValue = &.{},
+        increment_expr: []const FieldExpressionValue = &.{},
         json_set: []const JsonSetValue = &.{},
         array_update: []const ArrayTransformValue = &.{},
+        where_expression: ?db_mod.types.RelationalRowsExpressionCondition = null,
     };
 
     fn parseConflictClause(self: *@This(), insert_columns: []const []const u8, insert_values: []const []const u8) !ConflictClause {
@@ -3898,10 +4100,20 @@ const Parser = struct {
             freeFieldJsonValues(self.alloc, patch.items);
             patch.deinit(self.alloc);
         }
+        var patch_expr = std.ArrayListUnmanaged(FieldExpressionValue).empty;
+        errdefer {
+            freeFieldExpressionValues(self.alloc, patch_expr.items);
+            patch_expr.deinit(self.alloc);
+        }
         var increment = std.ArrayListUnmanaged(FieldJsonValue).empty;
         errdefer {
             freeFieldJsonValues(self.alloc, increment.items);
             increment.deinit(self.alloc);
+        }
+        var increment_expr = std.ArrayListUnmanaged(FieldExpressionValue).empty;
+        errdefer {
+            freeFieldExpressionValues(self.alloc, increment_expr.items);
+            increment_expr.deinit(self.alloc);
         }
         var json_set = std.ArrayListUnmanaged(JsonSetValue).empty;
         errdefer {
@@ -3913,19 +4125,28 @@ const Parser = struct {
             freeArrayTransformValues(self.alloc, array_update.items);
             array_update.deinit(self.alloc);
         }
+        var where_expression: ?db_mod.types.RelationalRowsExpressionCondition = null;
+        errdefer if (where_expression) |condition| freeExpressionCondition(self.alloc, condition);
         while (true) {
-            try self.parseConflictUpdateAssignment(insert_columns, insert_values, &patch, &increment, &json_set, &array_update);
+            try self.parseConflictUpdateAssignment(insert_columns, insert_values, &patch, &patch_expr, &increment, &increment_expr, &json_set, &array_update);
             if (self.match(.comma) == null) break;
         }
-        if (patch.items.len == 0 and increment.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
+        if (patch.items.len == 0 and patch_expr.items.len == 0 and increment.items.len == 0 and increment_expr.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
+        if (self.matchKeyword("where")) {
+            if (self.schema.relational_columns.len == 0) return error.InvalidSqlCatalog;
+            where_expression = try self.parseConflictExpressionConditionAlloc(self.schema.relational_columns[0], insert_columns);
+        }
 
         return .{
             .target = target,
             .action = .update,
             .patch = try patch.toOwnedSlice(self.alloc),
+            .patch_expr = try patch_expr.toOwnedSlice(self.alloc),
             .increment = try increment.toOwnedSlice(self.alloc),
+            .increment_expr = try increment_expr.toOwnedSlice(self.alloc),
             .json_set = try json_set.toOwnedSlice(self.alloc),
             .array_update = try array_update.toOwnedSlice(self.alloc),
+            .where_expression = where_expression,
         };
     }
 
@@ -3998,7 +4219,9 @@ const Parser = struct {
         insert_columns: []const []const u8,
         insert_values: []const []const u8,
         patch: *std.ArrayListUnmanaged(FieldJsonValue),
+        patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
         increment: *std.ArrayListUnmanaged(FieldJsonValue),
+        increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
         json_set: *std.ArrayListUnmanaged(JsonSetValue),
         array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
     ) !void {
@@ -4067,7 +4290,19 @@ const Parser = struct {
             return;
         }
         if (self.peekKind(.identifier) and self.pos + 1 < self.tokens.len and (self.tokens[self.pos + 1].kind == .plus or self.tokens[self.pos + 1].kind == .minus)) {
-            try self.parseConflictIncrementAssignment(field, column, insert_columns, insert_values, increment);
+            try self.parseConflictIncrementAssignment(field, column, insert_columns, insert_values, increment, increment_expr);
+            return;
+        }
+        if (self.canParseConflictAssignmentExpression(insert_columns)) {
+            const expression = try self.parseConflictAssignmentExpressionAlloc(column, insert_columns);
+            var expression_transferred = false;
+            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+            try patch_expr.append(self.alloc, .{
+                .field = field,
+                .expression = expression,
+            });
+            field_transferred = true;
+            expression_transferred = true;
             return;
         }
 
@@ -4088,20 +4323,528 @@ const Parser = struct {
         insert_columns: []const []const u8,
         insert_values: []const []const u8,
     ) ![]const u8 {
+        if (self.peekKeyword("coalesce")) {
+            return try self.parseConflictCoalesceValueJsonAlloc(column, insert_columns, insert_values);
+        }
         if (self.peekKind(.identifier) and self.pos < self.tokens.len) {
             const token = self.tokens[self.pos];
             if (std.mem.startsWith(u8, token.text, "excluded.")) {
                 self.pos += 1;
-                const source = token.text["excluded.".len..];
-                const source_column = relationalColumnForField(self.schema, source, null) orelse return error.InvalidSqlCatalog;
-                if (source_column.field_type != column.field_type) return error.UnsupportedSqlShape;
-                for (insert_columns, insert_values) |insert_column, insert_value| {
-                    if (std.mem.eql(u8, insert_column, source)) return try self.alloc.dupe(u8, insert_value);
-                }
-                return error.UnsupportedSqlShape;
+                return try self.conflictExcludedValueJsonAlloc(column, token.text["excluded.".len..], insert_columns, insert_values);
             }
         }
         return try self.parseSqlColumnValueAlloc(column);
+    }
+
+    fn canParseConflictAssignmentExpression(
+        self: *@This(),
+        insert_columns: []const []const u8,
+    ) bool {
+        if (self.peekKeyword("case") or
+            self.peekKeyword("cast") or
+            self.peekKeyword("coalesce") or
+            self.peekKeyword("lower") or
+            self.peekKeyword("upper") or
+            self.peekKeyword("nullif") or
+            self.peekKeyword("array_length"))
+        {
+            return true;
+        }
+        if (!self.peekKind(.identifier) or
+            self.peekKeyword("default") or
+            self.peekKeyword("null") or
+            self.peekKeyword("true") or
+            self.peekKeyword("false"))
+        {
+            return false;
+        }
+        const token = self.tokens[self.pos];
+        if (std.mem.startsWith(u8, token.text, "excluded.")) {
+            const source = token.text["excluded.".len..];
+            for (insert_columns) |insert_column| {
+                if (std.mem.eql(u8, insert_column, source)) return true;
+            }
+            return false;
+        }
+        return relationalColumnForField(self.schema, token.text, null) != null;
+    }
+
+    fn conflictExcludedValueJsonAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        source: []const u8,
+        insert_columns: []const []const u8,
+        insert_values: []const []const u8,
+    ) ![]const u8 {
+        const source_column = relationalColumnForField(self.schema, source, null) orelse return error.InvalidSqlCatalog;
+        if (source_column.field_type != column.field_type) return error.UnsupportedSqlShape;
+        for (insert_columns, insert_values) |insert_column, insert_value| {
+            if (std.mem.eql(u8, insert_column, source)) return try self.alloc.dupe(u8, insert_value);
+        }
+        return error.UnsupportedSqlShape;
+    }
+
+    fn parseConflictCoalesceValueJsonAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+        insert_values: []const []const u8,
+    ) ![]const u8 {
+        try self.expectKeyword("coalesce");
+        try self.expect(.lparen);
+
+        var selected: ?[]const u8 = null;
+        errdefer if (selected) |value| self.alloc.free(value);
+        var operands: usize = 0;
+        while (true) {
+            const value_json = try self.parseConflictCoalesceOperandJsonAlloc(column, insert_columns, insert_values);
+            var value_transferred = false;
+            defer if (!value_transferred) self.alloc.free(value_json);
+            operands += 1;
+            if (selected == null and !std.mem.eql(u8, value_json, "null")) {
+                selected = value_json;
+                value_transferred = true;
+            }
+            if (self.match(.comma) == null) break;
+        }
+        if (operands == 0) return error.UnsupportedSqlShape;
+        try self.expect(.rparen);
+
+        if (selected) |value| {
+            selected = null;
+            return value;
+        }
+        return try self.alloc.dupe(u8, "null");
+    }
+
+    fn parseConflictCoalesceOperandJsonAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+        insert_values: []const []const u8,
+    ) ![]const u8 {
+        if (self.peekKind(.identifier) and self.pos < self.tokens.len) {
+            const token = self.tokens[self.pos];
+            if (std.mem.startsWith(u8, token.text, "excluded.")) {
+                self.pos += 1;
+                return try self.conflictExcludedValueJsonAlloc(column, token.text["excluded.".len..], insert_columns, insert_values);
+            }
+        }
+        return try self.parseSqlColumnValueAlloc(column);
+    }
+
+    fn parseConflictAssignmentExpressionAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+    ) !db_mod.types.RelationalRowsExpression {
+        var expression = try self.parseConflictExpressionAlloc(column, insert_columns);
+        var expression_owned = true;
+        errdefer if (expression_owned) freeExpression(self.alloc, expression);
+        if (self.peekArithmeticOperator()) |_| {
+            try self.validateNumericRowExpression(expression);
+            expression_owned = false;
+            expression = try self.parseConflictArithmeticExpressionRestAlloc(expression, column, insert_columns, 0);
+            expression_owned = true;
+        }
+        expression_owned = false;
+        return expression;
+    }
+
+    fn parseConflictExpressionAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression {
+        return try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, column.field_type);
+    }
+
+    fn parseConflictUntypedExpressionAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression {
+        return try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, null);
+    }
+
+    fn parseConflictExpressionWithExpectedAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+        expected_type: ?runtime_schema.AntflyType,
+    ) anyerror!db_mod.types.RelationalRowsExpression {
+        if (self.peekKeyword("cast")) return try self.parseConflictCastExpressionAlloc(column, insert_columns);
+        if (self.peekKeyword("case")) return try self.parseConflictCaseExpressionAlloc(column, insert_columns);
+        if (self.peekKeyword("lower") or self.peekKeyword("upper")) return try self.parseConflictCaseFoldExpressionAlloc(insert_columns);
+        if (self.peekKeyword("coalesce")) return try self.parseConflictCoalesceExpressionAlloc(column, insert_columns, expected_type);
+        if (self.peekKeyword("nullif")) return try self.parseConflictNullifExpressionAlloc(column, insert_columns);
+        if (self.peekKeyword("array_length")) return try self.parseConflictArrayLengthExpressionAlloc(insert_columns);
+        return try self.parseConflictExpressionOperandAlloc(column, insert_columns, expected_type);
+    }
+
+    fn parseConflictExpressionOperandAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+        expected_type: ?runtime_schema.AntflyType,
+    ) !db_mod.types.RelationalRowsExpression {
+        if (self.peekKeyword("cast") or
+            self.peekKeyword("case") or
+            self.peekKeyword("lower") or
+            self.peekKeyword("upper") or
+            self.peekKeyword("coalesce") or
+            self.peekKeyword("nullif") or
+            self.peekKeyword("array_length"))
+        {
+            return try self.parseConflictExpressionAlloc(column, insert_columns);
+        }
+        if (self.peekKind(.identifier) and
+            !self.peekKeyword("null") and
+            !self.peekKeyword("true") and
+            !self.peekKeyword("false"))
+        {
+            return try self.parseConflictFieldExpressionAlloc(insert_columns, expected_type);
+        }
+        const value_json = try self.parseJsonValueAlloc();
+        errdefer self.alloc.free(value_json);
+        return .{ .kind = .value, .value_json = value_json };
+    }
+
+    fn parseConflictFieldExpressionAlloc(
+        self: *@This(),
+        insert_columns: []const []const u8,
+        expected_type: ?runtime_schema.AntflyType,
+    ) !db_mod.types.RelationalRowsExpression {
+        const token = self.match(.identifier) orelse return error.UnsupportedSqlShape;
+        const source: db_mod.types.RelationalRowsExpressionFieldSource = if (std.mem.startsWith(u8, token.text, "excluded.")) {
+            const field = token.text["excluded.".len..];
+            const source_column = relationalColumnForField(self.schema, field, null) orelse return error.InvalidSqlCatalog;
+            if (expected_type) |field_type| if (source_column.field_type != field_type) return error.UnsupportedSqlShape;
+            var found = false;
+            for (insert_columns) |insert_column| {
+                if (std.mem.eql(u8, insert_column, field)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnsupportedSqlShape;
+            return .{
+                .kind = .field,
+                .field = try self.alloc.dupe(u8, field),
+                .field_source = .proposed,
+            };
+        } else blk: {
+            const source_column = relationalColumnForField(self.schema, token.text, null) orelse return error.InvalidSqlCatalog;
+            if (expected_type) |field_type| if (source_column.field_type != field_type) return error.UnsupportedSqlShape;
+            break :blk .existing;
+        };
+        return .{
+            .kind = .field,
+            .field = try self.alloc.dupe(u8, token.text),
+            .field_source = source,
+        };
+    }
+
+    fn parseConflictCastExpressionAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression {
+        try self.expectKeyword("cast");
+        try self.expect(.lparen);
+        const operand = try self.parseConflictUntypedExpressionAlloc(column, insert_columns);
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
+        try self.expectKeyword("as");
+        const cast_type = try self.parseExpressionCastType();
+        try self.expect(.rparen);
+
+        const operands = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+        var operands_transferred = false;
+        errdefer if (!operands_transferred) self.alloc.free(operands);
+        operands[0] = operand;
+
+        operand_transferred = true;
+        operands_transferred = true;
+        return .{
+            .kind = .cast,
+            .operands = operands,
+            .cast_type = cast_type,
+        };
+    }
+
+    fn parseConflictCaseExpressionAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression {
+        try self.expectKeyword("case");
+
+        var branches = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCaseBranch).empty;
+        errdefer {
+            for (branches.items) |branch| freeExpressionCaseBranch(self.alloc, branch);
+            branches.deinit(self.alloc);
+        }
+
+        while (self.matchKeyword("when")) {
+            const condition = try self.parseConflictExpressionConditionAlloc(column, insert_columns);
+            var condition_transferred = false;
+            errdefer if (!condition_transferred) freeExpressionCondition(self.alloc, condition);
+            try self.expectKeyword("then");
+            const then_expression = try self.parseConflictExpressionAlloc(column, insert_columns);
+            var then_transferred = false;
+            errdefer if (!then_transferred) freeExpression(self.alloc, then_expression);
+            try branches.append(self.alloc, .{ .when = condition, .then = then_expression });
+            condition_transferred = true;
+            then_transferred = true;
+        }
+        if (branches.items.len == 0) return error.UnsupportedSqlShape;
+
+        try self.expectKeyword("else");
+        const else_expression = try self.parseConflictExpressionAlloc(column, insert_columns);
+        var else_transferred = false;
+        errdefer if (!else_transferred) freeExpression(self.alloc, else_expression);
+        try self.expectKeyword("end");
+
+        const owned_branches = try branches.toOwnedSlice(self.alloc);
+        var branches_transferred = false;
+        errdefer if (!branches_transferred) {
+            for (owned_branches) |branch| freeExpressionCaseBranch(self.alloc, branch);
+            self.alloc.free(owned_branches);
+        };
+        const fallback = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+        var fallback_transferred = false;
+        errdefer if (!fallback_transferred) self.alloc.free(fallback);
+        fallback[0] = else_expression;
+
+        branches_transferred = true;
+        fallback_transferred = true;
+        else_transferred = true;
+        return .{
+            .kind = .case,
+            .case_branches = owned_branches,
+            .case_else = fallback,
+        };
+    }
+
+    fn parseConflictExpressionConditionAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpressionCondition {
+        const lhs = try self.parseConflictUntypedExpressionAlloc(column, insert_columns);
+        var lhs_transferred = false;
+        errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
+
+        const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
+            const not = self.matchKeyword("not");
+            if (self.matchKeyword("distinct")) {
+                try self.expectKeyword("from");
+                break :blk if (not) .is_not_distinct else .is_distinct;
+            }
+            try self.expectKeyword("null");
+            break :blk if (not) .is_not_null else .is_null;
+        } else try self.parseComparisonOp();
+
+        const rhs = switch (op) {
+            .is_null, .is_not_null => &.{},
+            else => blk: {
+                const out = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+                var out_transferred = false;
+                errdefer if (!out_transferred) self.alloc.free(out);
+                out[0] = try self.parseConflictUntypedExpressionAlloc(column, insert_columns);
+                out_transferred = true;
+                break :blk out;
+            },
+        };
+
+        lhs_transferred = true;
+        return .{
+            .lhs = lhs,
+            .op = op,
+            .rhs = rhs,
+        };
+    }
+
+    fn parseConflictCaseFoldExpressionAlloc(
+        self: *@This(),
+        insert_columns: []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression {
+        const kind: db_mod.types.RelationalRowsExpressionKind = if (self.matchKeyword("lower"))
+            .lower
+        else if (self.matchKeyword("upper"))
+            .upper
+        else
+            return error.UnsupportedSqlShape;
+        try self.expect(.lparen);
+        const field = try self.parseConflictFieldExpressionAlloc(insert_columns, null);
+        var field_transferred = false;
+        errdefer if (!field_transferred) freeExpression(self.alloc, field);
+        const source_column = relationalColumnForField(self.schema, field.field, null) orelse return error.InvalidSqlCatalog;
+        if (source_column.field_type != .keyword and source_column.field_type != .text and source_column.field_type != .link) return error.InvalidSqlCatalog;
+        try self.expect(.rparen);
+
+        const operands = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+        var operands_transferred = false;
+        errdefer if (!operands_transferred) self.alloc.free(operands);
+        operands[0] = field;
+        field_transferred = true;
+        operands_transferred = true;
+        return .{
+            .kind = kind,
+            .operands = operands,
+        };
+    }
+
+    fn parseConflictNullifExpressionAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression {
+        try self.expectKeyword("nullif");
+        try self.expect(.lparen);
+        const lhs = try self.parseConflictExpressionAlloc(column, insert_columns);
+        var lhs_transferred = false;
+        errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
+        try self.expect(.comma);
+        const rhs = try self.parseConflictExpressionAlloc(column, insert_columns);
+        var rhs_transferred = false;
+        errdefer if (!rhs_transferred) freeExpression(self.alloc, rhs);
+        try self.expect(.rparen);
+
+        const operands = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 2);
+        var operands_transferred = false;
+        errdefer if (!operands_transferred) self.alloc.free(operands);
+        operands[0] = lhs;
+        operands[1] = rhs;
+        lhs_transferred = true;
+        rhs_transferred = true;
+        operands_transferred = true;
+        return .{
+            .kind = .nullif,
+            .operands = operands,
+        };
+    }
+
+    fn parseConflictArrayLengthExpressionAlloc(
+        self: *@This(),
+        insert_columns: []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression {
+        try self.expectKeyword("array_length");
+        try self.expect(.lparen);
+        const field = try self.parseConflictFieldExpressionAlloc(insert_columns, .array);
+        var field_transferred = false;
+        errdefer if (!field_transferred) freeExpression(self.alloc, field);
+        try self.expect(.comma);
+        const dimension = try self.parseU32Value();
+        if (dimension != 1) return error.UnsupportedSqlShape;
+        try self.expect(.rparen);
+
+        const operands = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+        var operands_transferred = false;
+        errdefer if (!operands_transferred) self.alloc.free(operands);
+        operands[0] = field;
+        field_transferred = true;
+        operands_transferred = true;
+        return .{
+            .kind = .array_length,
+            .operands = operands,
+        };
+    }
+
+    fn parseConflictArithmeticExpressionRestAlloc(
+        self: *@This(),
+        lhs: db_mod.types.RelationalRowsExpression,
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+        min_precedence: u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression {
+        var current = lhs;
+        var current_owned = true;
+        errdefer if (current_owned) freeExpression(self.alloc, current);
+
+        while (self.peekArithmeticOperator()) |op| {
+            if (op.precedence < min_precedence) break;
+            _ = self.match(op.token) orelse unreachable;
+            var rhs = try self.parseConflictExpressionAlloc(column, insert_columns);
+            var rhs_owned = true;
+            errdefer if (rhs_owned) freeExpression(self.alloc, rhs);
+            try self.validateNumericRowExpression(rhs);
+
+            while (self.peekArithmeticOperator()) |next_op| {
+                if (next_op.precedence <= op.precedence) break;
+                rhs_owned = false;
+                rhs = try self.parseConflictArithmeticExpressionRestAlloc(rhs, column, insert_columns, next_op.precedence);
+                rhs_owned = true;
+            }
+
+            const operands = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 2);
+            var operands_owned = true;
+            errdefer if (operands_owned) self.alloc.free(operands);
+            operands[0] = current;
+            operands[1] = rhs;
+            current_owned = false;
+            rhs_owned = false;
+            operands_owned = false;
+            current = .{
+                .kind = op.kind,
+                .operands = operands,
+            };
+            current_owned = true;
+        }
+
+        current_owned = false;
+        return current;
+    }
+
+    fn parseConflictCoalesceExpressionAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+        expected_type: ?runtime_schema.AntflyType,
+    ) !db_mod.types.RelationalRowsExpression {
+        try self.expectKeyword("coalesce");
+        try self.expect(.lparen);
+
+        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+        errdefer {
+            for (operands.items) |operand| freeExpression(self.alloc, operand);
+            operands.deinit(self.alloc);
+        }
+        while (true) {
+            const operand = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, expected_type);
+            var operand_transferred = false;
+            errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
+            try operands.append(self.alloc, operand);
+            operand_transferred = true;
+            if (self.match(.comma) == null) break;
+        }
+        if (operands.items.len == 0) return error.UnsupportedSqlShape;
+        try self.expect(.rparen);
+
+        return .{
+            .kind = .coalesce,
+            .operands = try operands.toOwnedSlice(self.alloc),
+        };
+    }
+
+    fn negateNumericExpressionAlloc(
+        self: *@This(),
+        expression: db_mod.types.RelationalRowsExpression,
+    ) !db_mod.types.RelationalRowsExpression {
+        const operands = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 2);
+        var operands_transferred = false;
+        errdefer if (!operands_transferred) self.alloc.free(operands);
+        operands[0] = .{ .kind = .value, .value_json = try self.alloc.dupe(u8, "-1") };
+        var first_transferred = false;
+        errdefer if (!first_transferred) freeExpression(self.alloc, operands[0]);
+        operands[1] = expression;
+        first_transferred = true;
+        operands_transferred = true;
+        return .{
+            .kind = .mul,
+            .operands = operands,
+        };
     }
 
     fn parseConflictIncrementAssignment(
@@ -4111,6 +4854,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         insert_values: []const []const u8,
         increment: *std.ArrayListUnmanaged(FieldJsonValue),
+        increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
     ) !void {
         if (column.field_type != .numeric) return error.InvalidSqlCatalog;
         const source = try self.parseIdentifierOwned();
@@ -4122,6 +4866,26 @@ const Parser = struct {
             true
         else
             return error.UnsupportedSqlShape;
+        if (self.peekKeyword("coalesce")) {
+            const expression = try self.parseConflictCoalesceExpressionAlloc(column, insert_columns, column.field_type);
+            var expression_transferred = false;
+            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+            const owned_field = try self.alloc.dupe(u8, field);
+            var field_transferred = false;
+            errdefer if (!field_transferred) self.alloc.free(owned_field);
+            const final_expression = if (negated) try self.negateNumericExpressionAlloc(expression) else expression;
+            var final_expression_transferred = !negated;
+            errdefer if (!final_expression_transferred) freeExpression(self.alloc, final_expression);
+            if (negated) expression_transferred = true;
+            try increment_expr.append(self.alloc, .{
+                .field = owned_field,
+                .expression = final_expression,
+            });
+            field_transferred = true;
+            final_expression_transferred = true;
+            return;
+        }
+
         const raw_value_json = try self.parseConflictValueJsonAlloc(column, insert_columns, insert_values);
         defer self.alloc.free(raw_value_json);
         const value_json = try self.normalizedIncrementJsonAlloc(raw_value_json, negated);
@@ -4494,7 +5258,9 @@ const Parser = struct {
         op: []const u8,
         source: db_mod.types.RelationalRowsQueryRequest,
         patch: []const FieldJsonValue,
+        patch_expr: []const FieldExpressionValue,
         increment: []const FieldJsonValue,
+        increment_expr: []const FieldExpressionValue,
         json_set: []const JsonSetValue,
         array_update: []const ArrayTransformValue,
         returning: ReturningProjection,
@@ -4513,12 +5279,30 @@ const Parser = struct {
             }
             try writer.writeByte('}');
         }
+        if (patch_expr.len > 0) {
+            try writer.writeAll(",\"patch_expr\":{");
+            for (patch_expr, 0..) |item, i| {
+                if (i != 0) try writer.writeByte(',');
+                try writer.print("{f}:", .{std.json.fmt(item.field, .{})});
+                try writeRowExpressionJson(writer, item.expression);
+            }
+            try writer.writeByte('}');
+        }
         if (increment.len > 0) {
             try writer.writeAll(",\"increment\":{");
             for (increment, 0..) |item, i| {
                 if (i != 0) try writer.writeByte(',');
                 try writer.print("{f}:", .{std.json.fmt(item.field, .{})});
                 try writer.writeAll(item.value_json);
+            }
+            try writer.writeByte('}');
+        }
+        if (increment_expr.len > 0) {
+            try writer.writeAll(",\"increment_expr\":{");
+            for (increment_expr, 0..) |item, i| {
+                if (i != 0) try writer.writeByte(',');
+                try writer.print("{f}:", .{std.json.fmt(item.field, .{})});
+                try writeRowExpressionJson(writer, item.expression);
             }
             try writer.writeByte('}');
         }
@@ -4566,20 +5350,24 @@ const Parser = struct {
         if (source.predicates.len > 0 or
             source.array_contains.len > 0 or
             source.array_eq.len > 0 or
+            source.array_any.len > 0 or
             source.in_predicates.len > 0 or
             source.json_contains.len > 0 or
             source.json_path_eq.len > 0 or
             source.json_path_exists.len > 0 or
+            source.text_patterns.len > 0 or
             source.or_predicates.len > 0 or
             source.not_predicates.len > 0)
         {
             try writer.writeAll("\"where\":{");
             var wrote_where = false;
-            if (source.predicates.len > 0 or source.array_contains.len > 0 or source.array_eq.len > 0 or source.in_predicates.len > 0 or source.json_contains.len > 0 or source.json_path_eq.len > 0 or source.json_path_exists.len > 0) {
+            if (source.predicates.len > 0 or source.array_contains.len > 0 or source.array_eq.len > 0 or source.array_any.len > 0 or source.in_predicates.len > 0 or source.json_contains.len > 0 or source.json_path_eq.len > 0 or source.json_path_exists.len > 0 or source.text_patterns.len > 0) {
                 try writer.writeAll("\"all\":[");
                 var wrote_atom = false;
                 try writeRelationalCheckAtomsJson(writer, &wrote_atom, source.predicates);
                 try writeInPredicateAtomsJson(writer, &wrote_atom, source.in_predicates);
+                try writeTextPatternPredicateAtomsJson(writer, &wrote_atom, source.text_patterns);
+                try writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "array_any", source.array_any);
                 try writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "array_contains", source.array_contains);
                 try writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "array_eq", source.array_eq);
                 try writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "json_contains", source.json_contains);
@@ -4622,6 +5410,40 @@ const Parser = struct {
                 try writer.writeByte(']');
             }
             try writer.writeByte('}');
+            wrote = true;
+        }
+        if (source.expression_predicates.len > 0) {
+            if (wrote) try writer.writeByte(',');
+            try writer.writeAll("\"expression_where\":[");
+            for (source.expression_predicates, 0..) |condition, i| {
+                if (i != 0) try writer.writeByte(',');
+                try writeRowExpressionConditionJson(writer, condition);
+            }
+            try writer.writeByte(']');
+            wrote = true;
+        }
+        if (source.expression_or_predicates.len > 0) {
+            if (wrote) try writer.writeByte(',');
+            try writeRowExpressionPredicateGroupsJson(writer, "expression_any", source.expression_or_predicates);
+            wrote = true;
+        }
+        if (source.expression_not_predicates.len > 0) {
+            if (wrote) try writer.writeByte(',');
+            try writeRowExpressionPredicateGroupsJson(writer, "expression_not", source.expression_not_predicates);
+            wrote = true;
+        }
+        if (source.expression_array_contains.len > 0) {
+            if (wrote) try writer.writeByte(',');
+            try writer.writeAll("\"expression_array_contains\":[");
+            for (source.expression_array_contains, 0..) |predicate, i| {
+                if (i != 0) try writer.writeByte(',');
+                try writer.writeAll("{\"expr\":");
+                try writeRowExpressionJson(writer, predicate.expression);
+                try writer.writeAll(",\"value\":");
+                try writer.writeAll(predicate.value_json);
+                try writer.writeByte('}');
+            }
+            try writer.writeByte(']');
             wrote = true;
         }
         if (source.order_by.len > 0) {
@@ -4691,11 +5513,20 @@ const Parser = struct {
 
     fn writeRowExpressionJson(writer: *std.Io.Writer, expression: db_mod.types.RelationalRowsExpression) !void {
         switch (expression.kind) {
-            .field => try writer.print("{{\"field\":{f}}}", .{std.json.fmt(expression.field, .{})}),
+            .field => {
+                try writer.print("{{\"field\":{f}", .{std.json.fmt(expression.field, .{})});
+                if (expression.field_source != .row) {
+                    try writer.print(",\"source\":{f}", .{std.json.fmt(rowExpressionFieldSourceName(expression.field_source), .{})});
+                }
+                try writer.writeByte('}');
+            },
             .value => {
                 try writer.writeAll("{\"value\":");
                 try writer.writeAll(expression.value_json);
                 try writer.writeByte('}');
+            },
+            .now => {
+                try writer.writeAll("{\"op\":\"now\",\"args\":[]}");
             },
             .case => {
                 try writer.writeAll("{\"op\":\"case\",\"cases\":[");
@@ -4743,11 +5574,42 @@ const Parser = struct {
         }
     }
 
+    fn writeRowExpressionConditionJson(writer: *std.Io.Writer, condition: db_mod.types.RelationalRowsExpressionCondition) !void {
+        try writer.writeAll("{\"lhs\":");
+        try writeRowExpressionJson(writer, condition.lhs);
+        try writer.print(",\"op\":{f}", .{std.json.fmt(rowExpressionConditionOpName(condition.op), .{})});
+        if (condition.rhs.len == 1) {
+            try writer.writeAll(",\"rhs\":");
+            try writeRowExpressionJson(writer, condition.rhs[0]);
+        }
+        try writer.writeByte('}');
+    }
+
+    fn writeRowExpressionPredicateGroupsJson(
+        writer: *std.Io.Writer,
+        field_name: []const u8,
+        groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
+    ) !void {
+        try writer.print("{f}:[", .{std.json.fmt(field_name, .{})});
+        for (groups, 0..) |group, group_i| {
+            if (group_i != 0) try writer.writeByte(',');
+            try writer.writeAll("{\"all\":[");
+            for (group.conditions, 0..) |condition, condition_i| {
+                if (condition_i != 0) try writer.writeByte(',');
+                try writeRowExpressionConditionJson(writer, condition);
+            }
+            try writer.writeAll("]}");
+        }
+        try writer.writeByte(']');
+    }
+
     fn rowExpressionOpName(kind: db_mod.types.RelationalRowsExpressionKind) []const u8 {
         return switch (kind) {
             .field, .value => unreachable,
+            .now => "now",
             .coalesce => "coalesce",
             .lower => "lower",
+            .upper => "upper",
             .concat => "concat",
             .nullif => "nullif",
             .add => "add",
@@ -4758,6 +5620,15 @@ const Parser = struct {
             .cast => unreachable,
             .json_extract => unreachable,
             .array_length => "array_length",
+            .string_to_array => "string_to_array",
+        };
+    }
+
+    fn rowExpressionFieldSourceName(source: db_mod.types.RelationalRowsExpressionFieldSource) []const u8 {
+        return switch (source) {
+            .row => "row",
+            .existing => "existing",
+            .proposed => "proposed",
         };
     }
 
@@ -4779,6 +5650,8 @@ const Parser = struct {
             .lte => "lte",
             .is_null => "is_null",
             .is_not_null => "is_not_null",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
         };
     }
 
@@ -4791,9 +5664,13 @@ const Parser = struct {
         array_contains: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayContainsPredicate),
         array_eq: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayEqPredicate),
         in_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate),
+        text_patterns: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate),
         or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
         not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
         expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+        expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+        expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+        expression_array_contains: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate),
     ) !void {
         if (self.whereHasTopLevelOr()) {
             try self.parseScalarOrWhere(or_predicates);
@@ -4802,14 +5679,22 @@ const Parser = struct {
         while (true) {
             if (self.canParseScalarNotWhere()) {
                 try self.parseScalarNotWhere(not_predicates);
+            } else if (self.canParseExpressionNotWhere()) {
+                try self.parseExpressionNotWhere(expression_not_predicates);
+            } else if (self.peekKeyword("string_to_array")) {
+                if (self.stringToArrayPredicateIsContainment()) {
+                    const predicate = try self.parseExpressionArrayContainsPredicateAlloc();
+                    var predicate_transferred = false;
+                    errdefer if (!predicate_transferred) freeExpressionArrayContainsOne(self.alloc, predicate);
+                    try expression_array_contains.append(self.alloc, predicate);
+                    predicate_transferred = true;
+                } else {
+                    try self.parseExpressionWhereConditions(expression_predicates, expression_or_predicates);
+                }
             } else if (self.canParseExpressionWhereCondition()) {
-                const condition = try self.parseCaseExpressionConditionAlloc();
-                var condition_transferred = false;
-                errdefer if (!condition_transferred) freeExpressionCondition(self.alloc, condition);
-                try expression_predicates.append(self.alloc, condition);
-                condition_transferred = true;
+                try self.parseExpressionWhereConditions(expression_predicates, expression_or_predicates);
             } else {
-                try self.parseWhereAtom(predicates, json_contains, json_path_eq, json_path_exists, array_contains, array_eq, in_predicates, false);
+                try self.parseWhereAtom(predicates, json_contains, json_path_eq, json_path_exists, array_contains, array_eq, in_predicates, text_patterns, or_predicates, false);
             }
             if (!self.matchKeyword("and")) break;
         }
@@ -4822,6 +5707,7 @@ const Parser = struct {
             self.peekKeyword("coalesce") or
             self.peekKeyword("nullif")) return true;
         if (self.peekKeyword("lower")) return !self.lowerCallHasGeneratedColumn();
+        if (self.peekKeyword("upper")) return true;
         if (self.peekKind(.identifier) and
             !self.peekKeyword("null") and
             !self.peekKeyword("true") and
@@ -4834,6 +5720,342 @@ const Parser = struct {
             };
         }
         return false;
+    }
+
+    fn canParseExpressionNotWhere(self: *@This()) bool {
+        if (!self.peekKeyword("not") or self.pos + 2 >= self.tokens.len or self.tokens[self.pos + 1].kind != .lparen) return false;
+        return self.expressionCanStartAt(self.pos + 2);
+    }
+
+    fn expressionCanStartAt(self: *@This(), index: usize) bool {
+        if (index >= self.tokens.len) return false;
+        const token = self.tokens[index];
+        if (token.kind == .number or token.kind == .string or token.kind == .placeholder) return true;
+        if (token.kind != .identifier) return false;
+        if (std.ascii.eqlIgnoreCase(token.text, "array_length") or
+            std.ascii.eqlIgnoreCase(token.text, "case") or
+            std.ascii.eqlIgnoreCase(token.text, "cast") or
+            std.ascii.eqlIgnoreCase(token.text, "coalesce") or
+            std.ascii.eqlIgnoreCase(token.text, "current_timestamp") or
+            std.ascii.eqlIgnoreCase(token.text, "false") or
+            std.ascii.eqlIgnoreCase(token.text, "lower") or
+            std.ascii.eqlIgnoreCase(token.text, "now") or
+            std.ascii.eqlIgnoreCase(token.text, "null") or
+            std.ascii.eqlIgnoreCase(token.text, "nullif") or
+            std.ascii.eqlIgnoreCase(token.text, "string_to_array") or
+            std.ascii.eqlIgnoreCase(token.text, "true") or
+            std.ascii.eqlIgnoreCase(token.text, "upper"))
+        {
+            return true;
+        }
+        return index + 1 < self.tokens.len and switch (self.tokens[index + 1].kind) {
+            .plus, .minus, .star, .slash => true,
+            else => false,
+        };
+    }
+
+    fn parseExpressionNotWhere(
+        self: *@This(),
+        expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    ) !void {
+        try self.expectKeyword("not");
+        try self.expect(.lparen);
+        var conditions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+        errdefer {
+            freeExpressionConditions(self.alloc, conditions.items);
+            conditions.deinit(self.alloc);
+        }
+        while (true) {
+            try self.parseExpressionWhereConditionGroup(&conditions);
+            if (!self.matchKeyword("and")) break;
+        }
+        if (conditions.items.len == 0) return error.UnsupportedSqlShape;
+        try self.expect(.rparen);
+
+        const owned = try conditions.toOwnedSlice(self.alloc);
+        var owned_transferred = false;
+        errdefer if (!owned_transferred) {
+            freeExpressionConditions(self.alloc, owned);
+            self.alloc.free(owned);
+        };
+        try expression_not_predicates.append(self.alloc, .{ .conditions = owned });
+        owned_transferred = true;
+    }
+
+    fn parseExpressionWhereConditionGroup(
+        self: *@This(),
+        conditions: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+    ) !void {
+        const lhs = try self.parseRowExpressionAlloc();
+        var lhs_transferred = false;
+        errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
+
+        if (self.matchKeyword("not")) return error.UnsupportedSqlShape;
+
+        if (self.matchKeyword("between")) {
+            const upper_lhs = try cloneExpressionAlloc(self.alloc, lhs);
+            var upper_lhs_transferred = false;
+            errdefer if (!upper_lhs_transferred) freeExpression(self.alloc, upper_lhs);
+
+            const lower_expression = try self.parseRowExpressionAlloc();
+            var lower_transferred = false;
+            errdefer if (!lower_transferred) freeExpression(self.alloc, lower_expression);
+            try self.expectKeyword("and");
+            const upper_expression = try self.parseRowExpressionAlloc();
+            var upper_transferred = false;
+            errdefer if (!upper_transferred) freeExpression(self.alloc, upper_expression);
+
+            const lower_rhs = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var lower_rhs_transferred = false;
+            errdefer if (!lower_rhs_transferred) self.alloc.free(lower_rhs);
+            lower_rhs[0] = lower_expression;
+
+            const upper_rhs = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var upper_rhs_transferred = false;
+            errdefer if (!upper_rhs_transferred) self.alloc.free(upper_rhs);
+            upper_rhs[0] = upper_expression;
+
+            try conditions.append(self.alloc, .{
+                .lhs = lhs,
+                .op = .gte,
+                .rhs = lower_rhs,
+            });
+            lhs_transferred = true;
+            lower_transferred = true;
+            lower_rhs_transferred = true;
+
+            try conditions.append(self.alloc, .{
+                .lhs = upper_lhs,
+                .op = .lte,
+                .rhs = upper_rhs,
+            });
+            upper_lhs_transferred = true;
+            upper_transferred = true;
+            upper_rhs_transferred = true;
+            return;
+        }
+
+        const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
+            const not = self.matchKeyword("not");
+            if (self.matchKeyword("distinct")) {
+                try self.expectKeyword("from");
+                break :blk if (not) .is_not_distinct else .is_distinct;
+            }
+            try self.expectKeyword("null");
+            break :blk if (not) .is_not_null else .is_null;
+        } else try self.parseComparisonOp();
+
+        const rhs = switch (op) {
+            .is_null, .is_not_null => &.{},
+            else => blk: {
+                const out = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+                var out_transferred = false;
+                errdefer if (!out_transferred) self.alloc.free(out);
+                out[0] = try self.parseRowExpressionAlloc();
+                out_transferred = true;
+                break :blk out;
+            },
+        };
+        var rhs_transferred = false;
+        errdefer if (!rhs_transferred and rhs.len > 0) {
+            for (rhs) |expression| freeExpression(self.alloc, expression);
+            self.alloc.free(rhs);
+        };
+
+        try conditions.append(self.alloc, .{
+            .lhs = lhs,
+            .op = op,
+            .rhs = rhs,
+        });
+        lhs_transferred = true;
+        rhs_transferred = true;
+    }
+
+    fn parseExpressionWhereConditions(
+        self: *@This(),
+        expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+        expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    ) !void {
+        const lhs = try self.parseRowExpressionAlloc();
+        var lhs_transferred = false;
+        errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
+
+        if (self.matchKeyword("not")) {
+            try self.expectKeyword("between");
+            const lower_expression = try self.parseRowExpressionAlloc();
+            var lower_transferred = false;
+            errdefer if (!lower_transferred) freeExpression(self.alloc, lower_expression);
+            try self.expectKeyword("and");
+            const upper_expression = try self.parseRowExpressionAlloc();
+            var upper_transferred = false;
+            errdefer if (!upper_transferred) freeExpression(self.alloc, upper_expression);
+
+            const lower_lhs = try cloneExpressionAlloc(self.alloc, lhs);
+            var lower_lhs_transferred = false;
+            errdefer if (!lower_lhs_transferred) freeExpression(self.alloc, lower_lhs);
+            const upper_lhs = try cloneExpressionAlloc(self.alloc, lhs);
+            var upper_lhs_transferred = false;
+            errdefer if (!upper_lhs_transferred) freeExpression(self.alloc, upper_lhs);
+
+            const lower_rhs = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var lower_rhs_transferred = false;
+            errdefer if (!lower_rhs_transferred) self.alloc.free(lower_rhs);
+            lower_rhs[0] = lower_expression;
+
+            const upper_rhs = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var upper_rhs_transferred = false;
+            errdefer if (!upper_rhs_transferred) self.alloc.free(upper_rhs);
+            upper_rhs[0] = upper_expression;
+
+            const lower_conditions = try self.alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, 1);
+            var lower_conditions_transferred = false;
+            errdefer if (!lower_conditions_transferred) self.alloc.free(lower_conditions);
+            lower_conditions[0] = .{
+                .lhs = lower_lhs,
+                .op = .lt,
+                .rhs = lower_rhs,
+            };
+            lower_lhs_transferred = true;
+            lower_transferred = true;
+            lower_rhs_transferred = true;
+
+            const upper_conditions = try self.alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, 1);
+            var upper_conditions_transferred = false;
+            errdefer if (!upper_conditions_transferred) self.alloc.free(upper_conditions);
+            upper_conditions[0] = .{
+                .lhs = upper_lhs,
+                .op = .gt,
+                .rhs = upper_rhs,
+            };
+            upper_lhs_transferred = true;
+            upper_transferred = true;
+            upper_rhs_transferred = true;
+
+            try expression_or_predicates.append(self.alloc, .{ .conditions = lower_conditions });
+            lower_conditions_transferred = true;
+            try expression_or_predicates.append(self.alloc, .{ .conditions = upper_conditions });
+            upper_conditions_transferred = true;
+            freeExpression(self.alloc, lhs);
+            lhs_transferred = true;
+            return;
+        }
+
+        if (self.matchKeyword("between")) {
+            const upper_lhs = try cloneExpressionAlloc(self.alloc, lhs);
+            var upper_lhs_transferred = false;
+            errdefer if (!upper_lhs_transferred) freeExpression(self.alloc, upper_lhs);
+
+            const lower_expression = try self.parseRowExpressionAlloc();
+            var lower_transferred = false;
+            errdefer if (!lower_transferred) freeExpression(self.alloc, lower_expression);
+            try self.expectKeyword("and");
+            const upper_expression = try self.parseRowExpressionAlloc();
+            var upper_transferred = false;
+            errdefer if (!upper_transferred) freeExpression(self.alloc, upper_expression);
+
+            const lower_rhs = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var lower_rhs_transferred = false;
+            errdefer if (!lower_rhs_transferred) self.alloc.free(lower_rhs);
+            lower_rhs[0] = lower_expression;
+
+            const upper_rhs = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var upper_rhs_transferred = false;
+            errdefer if (!upper_rhs_transferred) self.alloc.free(upper_rhs);
+            upper_rhs[0] = upper_expression;
+
+            try expression_predicates.append(self.alloc, .{
+                .lhs = lhs,
+                .op = .gte,
+                .rhs = lower_rhs,
+            });
+            lhs_transferred = true;
+            lower_transferred = true;
+            lower_rhs_transferred = true;
+
+            try expression_predicates.append(self.alloc, .{
+                .lhs = upper_lhs,
+                .op = .lte,
+                .rhs = upper_rhs,
+            });
+            upper_lhs_transferred = true;
+            upper_transferred = true;
+            upper_rhs_transferred = true;
+            return;
+        }
+
+        const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
+            const not = self.matchKeyword("not");
+            if (self.matchKeyword("distinct")) {
+                try self.expectKeyword("from");
+                break :blk if (not) .is_not_distinct else .is_distinct;
+            }
+            try self.expectKeyword("null");
+            break :blk if (not) .is_not_null else .is_null;
+        } else try self.parseComparisonOp();
+
+        const rhs = switch (op) {
+            .is_null, .is_not_null => &.{},
+            else => blk: {
+                const out = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+                var out_transferred = false;
+                errdefer if (!out_transferred) self.alloc.free(out);
+                out[0] = try self.parseRowExpressionAlloc();
+                out_transferred = true;
+                break :blk out;
+            },
+        };
+        var rhs_transferred = false;
+        errdefer if (!rhs_transferred and rhs.len > 0) {
+            for (rhs) |expression| freeExpression(self.alloc, expression);
+            self.alloc.free(rhs);
+        };
+
+        try expression_predicates.append(self.alloc, .{
+            .lhs = lhs,
+            .op = op,
+            .rhs = rhs,
+        });
+        lhs_transferred = true;
+        rhs_transferred = true;
+    }
+
+    fn stringToArrayPredicateIsContainment(self: *@This()) bool {
+        if (!self.peekKeyword("string_to_array")) return false;
+        var depth: usize = 0;
+        var index = self.pos;
+        while (index < self.tokens.len) : (index += 1) {
+            const kind = self.tokens[index].kind;
+            switch (kind) {
+                .lparen => depth += 1,
+                .rparen => {
+                    if (depth == 0) return false;
+                    depth -= 1;
+                    if (depth == 0) {
+                        return index + 1 < self.tokens.len and self.tokens[index + 1].kind == .at_contains;
+                    }
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    fn parseExpressionArrayContainsPredicateAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionArrayContainsPredicate {
+        const expression = try self.parseStringToArrayRowExpressionAlloc();
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+        try self.expect(.at_contains);
+        const value_json = try self.parseJsonDocumentValueAlloc();
+        var value_transferred = false;
+        errdefer if (!value_transferred) self.alloc.free(value_json);
+        try validateJsonArray(self.alloc, value_json);
+
+        expression_transferred = true;
+        value_transferred = true;
+        return .{
+            .expression = expression,
+            .value_json = value_json,
+        };
     }
 
     fn lowerCallHasGeneratedColumn(self: *@This()) bool {
@@ -4861,6 +6083,7 @@ const Parser = struct {
                 .identifier => {
                     if (std.ascii.eqlIgnoreCase(token.text, "or") or
                         std.ascii.eqlIgnoreCase(token.text, "any") or
+                        std.ascii.eqlIgnoreCase(token.text, "between") or
                         std.ascii.eqlIgnoreCase(token.text, "in") or
                         std.ascii.eqlIgnoreCase(token.text, "exists"))
                     {
@@ -4956,32 +6179,20 @@ const Parser = struct {
 
         if (self.matchKeyword("is")) {
             const not = self.matchKeyword("not");
-            if (not and self.matchKeyword("distinct")) {
+            if (self.matchKeyword("distinct")) {
                 try self.expectKeyword("from");
                 const value_json = try self.parseSqlColumnValueAlloc(column);
                 var value_transferred = false;
                 errdefer if (!value_transferred) self.alloc.free(value_json);
-                const op: runtime_schema.RelationalCheckOp = if (std.mem.eql(u8, value_json, "null")) .is_null else .eq;
                 field_transferred = true;
-                if (op == .is_null) {
-                    self.alloc.free(value_json);
-                    value_transferred = true;
-                    return .{
-                        .name = "",
-                        .field = field,
-                        .op = op,
-                        .value_json = null,
-                    };
-                }
                 value_transferred = true;
                 return .{
                     .name = "",
                     .field = field,
-                    .op = op,
+                    .op = if (not) .is_not_distinct else .is_distinct,
                     .value_json = value_json,
                 };
             }
-            if (!not and self.peekKeyword("distinct")) return error.UnsupportedSqlShape;
             const op: runtime_schema.RelationalCheckOp = if (not) blk: {
                 try self.expectKeyword("null");
                 break :blk .is_not_null;
@@ -4999,6 +6210,7 @@ const Parser = struct {
         }
 
         if (self.peekKeyword("in") or self.peekKeyword("not")) return error.UnsupportedSqlShape;
+        if (self.peekKeyword("between")) return error.UnsupportedSqlShape;
         const op = try self.parseComparisonOp();
         if (self.peekKeyword("any")) return error.UnsupportedSqlShape;
         const value_json = try self.parseSqlColumnValueAlloc(column);
@@ -5023,11 +6235,13 @@ const Parser = struct {
         array_contains: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayContainsPredicate),
         array_eq: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayEqPredicate),
         in_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate),
+        text_patterns: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate),
+        or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
         negated: bool,
     ) !void {
         if (!negated and self.matchKeyword("not")) {
             try self.expect(.lparen);
-            try self.parseWhereAtom(predicates, json_contains, json_path_eq, json_path_exists, array_contains, array_eq, in_predicates, true);
+            try self.parseWhereAtom(predicates, json_contains, json_path_eq, json_path_exists, array_contains, array_eq, in_predicates, text_patterns, or_predicates, true);
             try self.expect(.rparen);
             return;
         }
@@ -5103,33 +6317,21 @@ const Parser = struct {
         const column = maybe_column orelse return error.InvalidSqlCatalog;
         if (self.matchKeyword("is")) {
             const not = self.matchKeyword("not");
-            if (not and self.matchKeyword("distinct")) {
+            if (self.matchKeyword("distinct")) {
                 try self.expectKeyword("from");
                 const value_json = try self.parseSqlColumnValueAlloc(column);
                 var value_transferred = false;
                 errdefer if (!value_transferred) self.alloc.free(value_json);
-                if (std.mem.eql(u8, value_json, "null")) {
-                    self.alloc.free(value_json);
-                    value_transferred = true;
-                    try predicates.append(self.alloc, .{
-                        .name = "",
-                        .field = field,
-                        .op = .is_null,
-                        .value_json = null,
-                    });
-                } else {
-                    try predicates.append(self.alloc, .{
-                        .name = "",
-                        .field = field,
-                        .op = .eq,
-                        .value_json = value_json,
-                    });
-                    value_transferred = true;
-                }
+                try predicates.append(self.alloc, .{
+                    .name = "",
+                    .field = field,
+                    .op = if (not) .is_not_distinct else .is_distinct,
+                    .value_json = value_json,
+                });
+                value_transferred = true;
                 field_transferred = true;
                 return;
             }
-            if (!not and self.peekKeyword("distinct")) return error.UnsupportedSqlShape;
             const op: runtime_schema.RelationalCheckOp = if (not) blk: {
                 try self.expectKeyword("null");
                 break :blk .is_not_null;
@@ -5146,7 +6348,25 @@ const Parser = struct {
             field_transferred = true;
             return;
         }
+        if (self.matchKeyword("like") or self.matchKeyword("ilike")) {
+            const case_insensitive = std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "ilike");
+            try self.appendTextPatternPredicate(text_patterns, field, column, case_insensitive, negated);
+            return;
+        }
+        if (self.matchKeyword("between")) {
+            try self.appendBetweenPredicate(predicates, or_predicates, field, column, negated);
+            return;
+        }
         if (self.matchKeyword("not")) {
+            if (self.matchKeyword("between")) {
+                try self.appendBetweenPredicate(predicates, or_predicates, field, column, true);
+                return;
+            }
+            if (self.matchKeyword("like") or self.matchKeyword("ilike")) {
+                const case_insensitive = std.ascii.eqlIgnoreCase(self.tokens[self.pos - 1].text, "ilike");
+                try self.appendTextPatternPredicate(text_patterns, field, column, case_insensitive, true);
+                return;
+            }
             try self.expectKeyword("in");
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             const values_json = try self.parseSqlInValuesJsonAlloc();
@@ -5218,6 +6438,119 @@ const Parser = struct {
         value_transferred = true;
     }
 
+    fn appendBetweenPredicate(
+        self: *@This(),
+        predicates: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+        or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup),
+        field: []const u8,
+        column: runtime_schema.RelationalColumn,
+        negated: bool,
+    ) !void {
+        if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
+        const lower_json = try self.parseSqlColumnValueAlloc(column);
+        var lower_transferred = false;
+        errdefer if (!lower_transferred) self.alloc.free(lower_json);
+        try self.expectKeyword("and");
+        const upper_json = try self.parseSqlColumnValueAlloc(column);
+        var upper_transferred = false;
+        errdefer if (!upper_transferred) self.alloc.free(upper_json);
+
+        if (!negated) {
+            const lower_field = try self.alloc.dupe(u8, field);
+            var lower_field_transferred = false;
+            errdefer if (!lower_field_transferred) self.alloc.free(lower_field);
+            const upper_field = try self.alloc.dupe(u8, field);
+            var upper_field_transferred = false;
+            errdefer if (!upper_field_transferred) self.alloc.free(upper_field);
+            try predicates.append(self.alloc, .{
+                .name = "",
+                .field = lower_field,
+                .op = .gte,
+                .value_json = lower_json,
+            });
+            lower_field_transferred = true;
+            lower_transferred = true;
+            try predicates.append(self.alloc, .{
+                .name = "",
+                .field = upper_field,
+                .op = .lte,
+                .value_json = upper_json,
+            });
+            upper_field_transferred = true;
+            upper_transferred = true;
+            return;
+        }
+
+        const lower_group = try self.alloc.alloc(runtime_schema.RelationalCheck, 1);
+        var lower_group_transferred = false;
+        errdefer if (!lower_group_transferred) self.alloc.free(lower_group);
+        const lower_field = try self.alloc.dupe(u8, field);
+        var lower_field_transferred = false;
+        errdefer if (!lower_field_transferred) self.alloc.free(lower_field);
+        lower_group[0] = .{
+            .name = "",
+            .field = lower_field,
+            .op = .lt,
+            .value_json = lower_json,
+        };
+        lower_field_transferred = true;
+        lower_transferred = true;
+
+        const upper_group = try self.alloc.alloc(runtime_schema.RelationalCheck, 1);
+        var upper_group_transferred = false;
+        errdefer if (!upper_group_transferred) self.alloc.free(upper_group);
+        const upper_field = try self.alloc.dupe(u8, field);
+        var upper_field_transferred = false;
+        errdefer if (!upper_field_transferred) self.alloc.free(upper_field);
+        upper_group[0] = .{
+            .name = "",
+            .field = upper_field,
+            .op = .gt,
+            .value_json = upper_json,
+        };
+        upper_field_transferred = true;
+        upper_transferred = true;
+
+        try or_predicates.append(self.alloc, .{ .predicates = lower_group });
+        lower_group_transferred = true;
+        try or_predicates.append(self.alloc, .{ .predicates = upper_group });
+        upper_group_transferred = true;
+    }
+
+    fn appendTextPatternPredicate(
+        self: *@This(),
+        text_patterns: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate),
+        field: []const u8,
+        column: runtime_schema.RelationalColumn,
+        case_insensitive: bool,
+        negated: bool,
+    ) !void {
+        if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidSqlCatalog;
+        const pattern_json = try self.parseSqlColumnValueAlloc(column);
+        defer self.alloc.free(pattern_json);
+        const pattern = try jsonStringLiteralValueAlloc(self.alloc, pattern_json);
+        var pattern_transferred = false;
+        errdefer if (!pattern_transferred) self.alloc.free(pattern);
+        const predicate_field = try self.alloc.dupe(u8, field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) self.alloc.free(predicate_field);
+        try text_patterns.append(self.alloc, .{
+            .field = predicate_field,
+            .pattern = pattern,
+            .case_insensitive = case_insensitive,
+            .negated = negated,
+        });
+        field_transferred = true;
+        pattern_transferred = true;
+    }
+
+    fn jsonStringLiteralValueAlloc(alloc: std.mem.Allocator, value_json: []const u8) ![]const u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+        defer parsed.deinit();
+        if (parsed.value != .string) return error.UnsupportedSqlShape;
+        return try alloc.dupe(u8, parsed.value.string);
+    }
+
     fn parseOrderBy(self: *@This(), order_by: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder)) !void {
         while (true) {
             var order = try self.parseOrderExpressionAlloc();
@@ -5258,16 +6591,18 @@ const Parser = struct {
             return .{ .field = field, .null_test = null_test };
         }
 
-        if (self.peekKeyword("lower")) {
-            const expression = try self.parseLowerRowExpressionAlloc();
+        if (self.peekKeyword("lower") or self.peekKeyword("upper")) {
+            const expression = try self.parseCaseFoldRowExpressionAlloc();
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
             if (expression.operands.len == 1 and expression.operands[0].kind == .field) {
-                if (generatedLowerColumnForField(self.schema, expression.operands[0].field)) |generated| {
-                    const field = try self.alloc.dupe(u8, generated.name);
-                    freeExpression(self.alloc, expression);
-                    expression_transferred = true;
-                    return .{ .field = field };
+                if (expression.kind == .lower) {
+                    if (generatedLowerColumnForField(self.schema, expression.operands[0].field)) |generated| {
+                        const field = try self.alloc.dupe(u8, generated.name);
+                        freeExpression(self.alloc, expression);
+                        expression_transferred = true;
+                        return .{ .field = field };
+                    }
                 }
             }
             expression_transferred = true;
@@ -5363,8 +6698,13 @@ const Parser = struct {
             var field_transferred = false;
             errdefer if (!field_transferred) self.alloc.free(field);
             if (!aggregateOutputContainsField(group_fields, aggregations, field)) return error.UnsupportedSqlShape;
-            const op = if (self.matchKeyword("is")) blk: {
-                const null_op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("not")) op_blk: {
+            const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
+                const not = self.matchKeyword("not");
+                if (self.matchKeyword("distinct")) {
+                    try self.expectKeyword("from");
+                    break :blk if (not) .is_not_distinct else .is_distinct;
+                }
+                const null_op: runtime_schema.RelationalCheckOp = if (not) op_blk: {
                     try self.expectKeyword("null");
                     break :op_blk .is_not_null;
                 } else op_blk: {
@@ -5761,7 +7101,7 @@ const Parser = struct {
 
     fn peekSimpleReturningField(self: *@This()) bool {
         if (!self.peekKind(.identifier)) return false;
-        if (self.peekKeyword("lower") or self.peekKeyword("concat") or self.peekKeyword("coalesce") or self.peekKeyword("nullif") or self.peekKeyword("case") or self.peekKeyword("cast")) return false;
+        if (self.peekKeyword("lower") or self.peekKeyword("upper") or self.peekKeyword("concat") or self.peekKeyword("coalesce") or self.peekKeyword("nullif") or self.peekKeyword("case") or self.peekKeyword("cast")) return false;
         if (self.pos + 1 >= self.tokens.len) return true;
         return switch (self.tokens[self.pos + 1].kind) {
             .plus, .minus, .star, .slash, .lparen, .arrow_json, .arrow_text, .pipe_concat => false,
@@ -5794,12 +7134,30 @@ const Parser = struct {
                 }
                 try writer.writeByte('}');
             }
+            if (clause.patch_expr.len > 0) {
+                try writer.writeAll(",\"patch_expr\":{");
+                for (clause.patch_expr, 0..) |item, i| {
+                    if (i != 0) try writer.writeByte(',');
+                    try writer.print("{f}:", .{std.json.fmt(item.field, .{})});
+                    try writeRowExpressionJson(writer, item.expression);
+                }
+                try writer.writeByte('}');
+            }
             if (clause.increment.len > 0) {
                 try writer.writeAll(",\"increment\":{");
                 for (clause.increment, 0..) |item, i| {
                     if (i != 0) try writer.writeByte(',');
                     try writer.print("{f}:", .{std.json.fmt(item.field, .{})});
                     try writer.writeAll(item.value_json);
+                }
+                try writer.writeByte('}');
+            }
+            if (clause.increment_expr.len > 0) {
+                try writer.writeAll(",\"increment_expr\":{");
+                for (clause.increment_expr, 0..) |item, i| {
+                    if (i != 0) try writer.writeByte(',');
+                    try writer.print("{f}:", .{std.json.fmt(item.field, .{})});
+                    try writeRowExpressionJson(writer, item.expression);
                 }
                 try writer.writeByte('}');
             }
@@ -5830,6 +7188,10 @@ const Parser = struct {
                     try writer.writeByte('}');
                 }
                 try writer.writeByte(']');
+            }
+            if (clause.where_expression) |condition| {
+                try writer.writeAll(",\"where_expression\":");
+                try writeRowExpressionConditionJson(writer, condition);
             }
             try writer.writeByte('}');
         }
@@ -5865,9 +7227,11 @@ const Parser = struct {
     }
 
     fn parseSelectItem(self: *@This()) !SelectItem {
+        if (self.peekKeyword("now") or self.peekKeyword("current_timestamp")) return .{ .expression = try self.parseNowExpressionProjectionAlloc() };
         if (self.peekKeyword("array_length")) return .{ .expression = try self.parseArrayLengthExpressionProjectionAlloc() };
+        if (self.peekKeyword("string_to_array")) return .{ .expression = try self.parseStringToArrayExpressionProjectionAlloc() };
         if (self.peekKeyword("coalesce")) return .{ .expression = try self.parseCoalesceExpressionProjectionAlloc() };
-        if (self.peekKeyword("lower")) return .{ .expression = try self.parseLowerExpressionProjectionAlloc() };
+        if (self.peekKeyword("lower") or self.peekKeyword("upper")) return .{ .expression = try self.parseCaseFoldExpressionProjectionAlloc() };
         if (self.peekKeyword("concat")) return .{ .expression = try self.parseConcatExpressionProjectionAlloc() };
         if (self.peekKeyword("nullif")) return .{ .expression = try self.parseNullifExpressionProjectionAlloc() };
         if (self.peekKeyword("case")) return .{ .expression = try self.parseCaseExpressionProjectionAlloc() };
@@ -5934,6 +7298,24 @@ const Parser = struct {
         }
         field_owned = false;
         return .{ .field = field };
+    }
+
+    fn parseNowExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
+        const expression = try self.parseNowRowExpressionAlloc();
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+        const output = if (self.matchKeyword("as"))
+            try self.parseIdentifierOwned()
+        else
+            try self.alloc.dupe(u8, "now");
+        var output_transferred = false;
+        errdefer if (!output_transferred) self.alloc.free(output);
+        expression_transferred = true;
+        output_transferred = true;
+        return .{
+            .output = output,
+            .expression = expression,
+        };
     }
 
     fn parseArithmeticExpressionProjectionFromFieldAlloc(
@@ -6043,6 +7425,7 @@ const Parser = struct {
                     else => return error.UnsupportedSqlShape,
                 }
             },
+            .now => {},
             .coalesce => {
                 if (expression.operands.len == 0) return error.UnsupportedSqlShape;
                 for (expression.operands) |operand| try self.validateNumericRowExpression(operand);
@@ -6082,8 +7465,13 @@ const Parser = struct {
         }
     }
 
-    fn parseLowerExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        try self.expectKeyword("lower");
+    fn parseCaseFoldExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
+        const kind: db_mod.types.RelationalRowsExpressionKind = if (self.matchKeyword("lower"))
+            .lower
+        else if (self.matchKeyword("upper"))
+            .upper
+        else
+            return error.UnsupportedSqlShape;
         try self.expect(.lparen);
         const field = try self.parseIdentifierOwned();
         var field_transferred = false;
@@ -6094,7 +7482,7 @@ const Parser = struct {
         const output = if (self.matchKeyword("as"))
             try self.parseIdentifierOwned()
         else
-            try self.alloc.dupe(u8, "lower");
+            try self.alloc.dupe(u8, rowExpressionOpName(kind));
         var output_transferred = false;
         errdefer if (!output_transferred) self.alloc.free(output);
 
@@ -6112,7 +7500,7 @@ const Parser = struct {
         return .{
             .output = output,
             .expression = .{
-                .kind = .lower,
+                .kind = kind,
                 .operands = operands,
             },
         };
@@ -6240,8 +7628,11 @@ const Parser = struct {
         if (self.peekKeyword("case")) {
             return try self.parseCaseRowExpressionAlloc();
         }
-        if (self.peekKeyword("lower")) {
-            return try self.parseLowerRowExpressionAlloc();
+        if (self.peekKeyword("now") or self.peekKeyword("current_timestamp")) {
+            return try self.parseNowRowExpressionAlloc();
+        }
+        if (self.peekKeyword("lower") or self.peekKeyword("upper")) {
+            return try self.parseCaseFoldRowExpressionAlloc();
         }
         if (self.peekKeyword("coalesce")) {
             return try self.parseCoalesceRowExpressionAlloc();
@@ -6251,6 +7642,9 @@ const Parser = struct {
         }
         if (self.peekKeyword("array_length")) {
             return try self.parseArrayLengthRowExpressionAlloc();
+        }
+        if (self.peekKeyword("string_to_array")) {
+            return try self.parseStringToArrayRowExpressionAlloc();
         }
         if (self.peekKind(.identifier) and
             !self.peekKeyword("null") and
@@ -6267,6 +7661,21 @@ const Parser = struct {
         const value_json = try self.parseJsonValueAlloc();
         errdefer self.alloc.free(value_json);
         return .{ .kind = .value, .value_json = value_json };
+    }
+
+    fn parseNowRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
+        if (self.matchKeyword("now")) {
+            try self.expect(.lparen);
+            try self.expect(.rparen);
+        } else if (self.matchKeyword("current_timestamp")) {
+            if (self.match(.lparen) != null) try self.expect(.rparen);
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+        return .{
+            .kind = .now,
+            .value_json = try std.fmt.allocPrint(self.alloc, "{d}", .{platform_time.realtimeNs()}),
+        };
     }
 
     fn parseCastRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
@@ -6358,6 +7767,10 @@ const Parser = struct {
 
         const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("is")) blk: {
             const not = self.matchKeyword("not");
+            if (self.matchKeyword("distinct")) {
+                try self.expectKeyword("from");
+                break :blk if (not) .is_not_distinct else .is_distinct;
+            }
             try self.expectKeyword("null");
             break :blk if (not) .is_not_null else .is_null;
         } else try self.parseComparisonOp();
@@ -6382,8 +7795,13 @@ const Parser = struct {
         };
     }
 
-    fn parseLowerRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try self.expectKeyword("lower");
+    fn parseCaseFoldRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
+        const kind: db_mod.types.RelationalRowsExpressionKind = if (self.matchKeyword("lower"))
+            .lower
+        else if (self.matchKeyword("upper"))
+            .upper
+        else
+            return error.UnsupportedSqlShape;
         try self.expect(.lparen);
         const field = try self.parseIdentifierOwned();
         var field_transferred = false;
@@ -6402,7 +7820,7 @@ const Parser = struct {
         field_transferred = true;
         operands_transferred = true;
         return .{
-            .kind = .lower,
+            .kind = kind,
             .operands = operands,
         };
     }
@@ -6479,6 +7897,52 @@ const Parser = struct {
         return .{
             .kind = .array_length,
             .operands = operands,
+        };
+    }
+
+    fn parseStringToArrayRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
+        try self.expectKeyword("string_to_array");
+        try self.expect(.lparen);
+        const text_expression = try self.parseRowExpressionAlloc();
+        var text_transferred = false;
+        errdefer if (!text_transferred) freeExpression(self.alloc, text_expression);
+        try self.expect(.comma);
+        const delimiter_expression = try self.parseRowExpressionAlloc();
+        var delimiter_transferred = false;
+        errdefer if (!delimiter_transferred) freeExpression(self.alloc, delimiter_expression);
+        try self.expect(.rparen);
+
+        const operands = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 2);
+        var operands_transferred = false;
+        errdefer if (!operands_transferred) self.alloc.free(operands);
+        operands[0] = text_expression;
+        operands[1] = delimiter_expression;
+
+        text_transferred = true;
+        delimiter_transferred = true;
+        operands_transferred = true;
+        return .{
+            .kind = .string_to_array,
+            .operands = operands,
+        };
+    }
+
+    fn parseStringToArrayExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
+        const expression = try self.parseStringToArrayRowExpressionAlloc();
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+        const output = if (self.matchKeyword("as"))
+            try self.parseIdentifierOwned()
+        else
+            try self.alloc.dupe(u8, "string_to_array");
+        var output_transferred = false;
+        errdefer if (!output_transferred) self.alloc.free(output);
+
+        expression_transferred = true;
+        output_transferred = true;
+        return .{
+            .output = output,
+            .expression = expression,
         };
     }
 
@@ -6837,6 +8301,24 @@ fn writeInPredicateAtomsJson(
             std.json.fmt(if (predicate.negated) "not_in" else "in", .{}),
         });
         try writer.writeAll(predicate.values_json);
+        try writer.writeByte('}');
+        wrote_atom.* = true;
+    }
+}
+
+fn writeTextPatternPredicateAtomsJson(
+    writer: *std.Io.Writer,
+    wrote_atom: *bool,
+    predicates: []const db_mod.types.RelationalRowsTextPatternPredicate,
+) !void {
+    for (predicates) |predicate| {
+        if (wrote_atom.*) try writer.writeByte(',');
+        try writer.print("{{\"field\":{f},\"op\":\"text_pattern\",\"pattern\":{f}", .{
+            std.json.fmt(predicate.field, .{}),
+            std.json.fmt(predicate.pattern, .{}),
+        });
+        if (predicate.case_insensitive) try writer.writeAll(",\"case_insensitive\":true");
+        if (predicate.negated) try writer.writeAll(",\"negated\":true");
         try writer.writeByte('}');
         wrote_atom.* = true;
     }
@@ -7285,6 +8767,8 @@ fn relationalCheckOpToken(op: runtime_schema.RelationalCheckOp) []const u8 {
     return switch (op) {
         .is_null => "is_null",
         .is_not_null => "is_not_null",
+        .is_distinct => "is_distinct",
+        .is_not_distinct => "is_not_distinct",
         .eq => "eq",
         .ne => "ne",
         .gt => "gt",
@@ -8459,6 +9943,13 @@ fn freeFieldJsonValues(alloc: std.mem.Allocator, values: []const Parser.FieldJso
     }
 }
 
+fn freeFieldExpressionValues(alloc: std.mem.Allocator, values: []const Parser.FieldExpressionValue) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        freeExpression(alloc, value.expression);
+    }
+}
+
 fn freeArrayTransformValues(alloc: std.mem.Allocator, values: []const Parser.ArrayTransformValue) void {
     for (values) |value| {
         alloc.free(value.field);
@@ -8546,10 +10037,32 @@ fn freeArrayEq(alloc: std.mem.Allocator, values: []const db_mod.types.Relational
     }
 }
 
+fn freeExpressionArrayContainsOne(
+    alloc: std.mem.Allocator,
+    value: db_mod.types.RelationalRowsExpressionArrayContainsPredicate,
+) void {
+    freeExpression(alloc, value.expression);
+    alloc.free(value.value_json);
+}
+
+fn freeExpressionArrayContains(
+    alloc: std.mem.Allocator,
+    values: []const db_mod.types.RelationalRowsExpressionArrayContainsPredicate,
+) void {
+    for (values) |value| freeExpressionArrayContainsOne(alloc, value);
+}
+
 fn freeInPredicates(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsInPredicate) void {
     for (values) |value| {
         alloc.free(value.field);
         alloc.free(value.values_json);
+    }
+}
+
+fn freeTextPatterns(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsTextPatternPredicate) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.pattern);
     }
 }
 
@@ -8567,12 +10080,17 @@ fn freeConflictClause(alloc: std.mem.Allocator, clause: Parser.ConflictClause) v
     freeConflictTarget(alloc, clause.target);
     freeFieldJsonValues(alloc, clause.patch);
     if (clause.patch.len > 0) alloc.free(clause.patch);
+    freeFieldExpressionValues(alloc, clause.patch_expr);
+    if (clause.patch_expr.len > 0) alloc.free(clause.patch_expr);
     freeFieldJsonValues(alloc, clause.increment);
     if (clause.increment.len > 0) alloc.free(clause.increment);
+    freeFieldExpressionValues(alloc, clause.increment_expr);
+    if (clause.increment_expr.len > 0) alloc.free(clause.increment_expr);
     freeJsonSetValues(alloc, clause.json_set);
     if (clause.json_set.len > 0) alloc.free(clause.json_set);
     freeArrayTransformValues(alloc, clause.array_update);
     if (clause.array_update.len > 0) alloc.free(clause.array_update);
+    if (clause.where_expression) |condition| freeExpressionCondition(alloc, condition);
 }
 
 fn freeJoinOn(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJoinOn) void {
@@ -8733,6 +10251,112 @@ fn freeExpression(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsEx
     if (value.case_else.len > 0) alloc.free(value.case_else);
 }
 
+fn cloneExpressionAlloc(
+    alloc: std.mem.Allocator,
+    value: db_mod.types.RelationalRowsExpression,
+) anyerror!db_mod.types.RelationalRowsExpression {
+    var cloned: db_mod.types.RelationalRowsExpression = .{
+        .kind = value.kind,
+        .field_source = value.field_source,
+        .cast_type = value.cast_type,
+        .json_as_text = value.json_as_text,
+    };
+    errdefer freeExpression(alloc, cloned);
+
+    if (value.field.len > 0) cloned.field = try alloc.dupe(u8, value.field);
+    if (value.value_json.len > 0) cloned.value_json = try alloc.dupe(u8, value.value_json);
+    if (value.json_path.len > 0) cloned.json_path = try alloc.dupe(u8, value.json_path);
+
+    if (value.operands.len > 0) {
+        const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, value.operands.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (operands[0..initialized]) |operand| freeExpression(alloc, operand);
+            alloc.free(operands);
+        }
+        for (value.operands, 0..) |operand, i| {
+            operands[i] = try cloneExpressionAlloc(alloc, operand);
+            initialized += 1;
+        }
+        cloned.operands = operands;
+    }
+
+    if (value.case_branches.len > 0) {
+        const branches = try alloc.alloc(db_mod.types.RelationalRowsExpressionCaseBranch, value.case_branches.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (branches[0..initialized]) |branch| freeExpressionCaseBranch(alloc, branch);
+            alloc.free(branches);
+        }
+        for (value.case_branches, 0..) |branch, i| {
+            branches[i] = try cloneExpressionCaseBranchAlloc(alloc, branch);
+            initialized += 1;
+        }
+        cloned.case_branches = branches;
+    }
+
+    if (value.case_else.len > 0) {
+        const fallback = try alloc.alloc(db_mod.types.RelationalRowsExpression, value.case_else.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (fallback[0..initialized]) |expression| freeExpression(alloc, expression);
+            alloc.free(fallback);
+        }
+        for (value.case_else, 0..) |expression, i| {
+            fallback[i] = try cloneExpressionAlloc(alloc, expression);
+            initialized += 1;
+        }
+        cloned.case_else = fallback;
+    }
+
+    return cloned;
+}
+
+fn cloneExpressionCaseBranchAlloc(
+    alloc: std.mem.Allocator,
+    value: db_mod.types.RelationalRowsExpressionCaseBranch,
+) anyerror!db_mod.types.RelationalRowsExpressionCaseBranch {
+    const when = try cloneExpressionConditionAlloc(alloc, value.when);
+    var when_transferred = false;
+    errdefer if (!when_transferred) freeExpressionCondition(alloc, when);
+    const then_expression = try cloneExpressionAlloc(alloc, value.then);
+    when_transferred = true;
+    return .{
+        .when = when,
+        .then = then_expression,
+    };
+}
+
+fn cloneExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    value: db_mod.types.RelationalRowsExpressionCondition,
+) anyerror!db_mod.types.RelationalRowsExpressionCondition {
+    const lhs = try cloneExpressionAlloc(alloc, value.lhs);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+
+    const rhs = if (value.rhs.len > 0) blk: {
+        const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, value.rhs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |expression| freeExpression(alloc, expression);
+            alloc.free(out);
+        }
+        for (value.rhs, 0..) |expression, i| {
+            out[i] = try cloneExpressionAlloc(alloc, expression);
+            initialized += 1;
+        }
+        break :blk out;
+    } else &.{};
+
+    lhs_transferred = true;
+    return .{
+        .lhs = lhs,
+        .op = value.op,
+        .rhs = rhs,
+    };
+}
+
 fn freeExpressionCaseBranch(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionCaseBranch) void {
     freeExpressionCondition(alloc, value.when);
     freeExpression(alloc, value.then);
@@ -8746,6 +10370,13 @@ fn freeExpressionCondition(alloc: std.mem.Allocator, value: db_mod.types.Relatio
 
 fn freeExpressionConditions(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionCondition) void {
     for (values) |value| freeExpressionCondition(alloc, value);
+}
+
+fn freeExpressionPredicateGroups(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionPredicateGroup) void {
+    for (values) |group| {
+        freeExpressionConditions(alloc, group.conditions);
+        if (group.conditions.len > 0) alloc.free(group.conditions);
+    }
 }
 
 fn freeExpressionProjection(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionProjection) void {
@@ -8771,6 +10402,8 @@ fn freeWindowSpec(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsWi
     freeStringSlice(alloc, value.partition_by);
     freeOrderBy(alloc, value.order_by);
     if (value.order_by.len > 0) alloc.free(value.order_by);
+    if (value.value_expression) |expression| freeExpression(alloc, expression);
+    if (value.default_json.len > 0) alloc.free(value.default_json);
 }
 
 fn freeWindowSpecs(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsWindowSpec) void {
@@ -9781,6 +11414,106 @@ test "postgres sql adapter lowers array_length projection" {
     try std.testing.expectEqualStrings("id", lowered.query.order_by[0].field);
 }
 
+test "postgres sql adapter lowers string_to_array projection" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"scope":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerSelectAlloc(
+        alloc,
+        "SELECT id, string_to_array(scope, ' ') AS scope_parts FROM usage_records ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expect(!lowered.query.select_all);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.select.len);
+    try std.testing.expectEqualStrings("id", lowered.query.select[0]);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.expressions.len);
+    try std.testing.expectEqualStrings("scope_parts", lowered.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, lowered.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), lowered.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, lowered.query.expressions[0].expression.operands[0].kind);
+    try std.testing.expectEqualStrings("scope", lowered.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, lowered.query.expressions[0].expression.operands[1].kind);
+    try std.testing.expectEqualStrings("\" \"", lowered.query.expressions[0].expression.operands[1].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.order_by.len);
+    try std.testing.expectEqualStrings("id", lowered.query.order_by[0].field);
+}
+
+test "postgres sql adapter lowers string_to_array containment predicate" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"scope":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE string_to_array(scope, ' ') @> $1 ORDER BY id",
+        schema,
+        &.{.{ .json = "[\"read\"]" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.select.len);
+    try std.testing.expectEqualStrings("id", lowered.query.select[0]);
+    try std.testing.expectEqual(@as(usize, 0), lowered.query.array_contains.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.expression_array_contains.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, lowered.query.expression_array_contains[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), lowered.query.expression_array_contains[0].expression.operands.len);
+    try std.testing.expectEqualStrings("[\"read\"]", lowered.query.expression_array_contains[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.order_by.len);
+    try std.testing.expectEqualStrings("id", lowered.query.order_by[0].field);
+}
+
+test "postgres sql adapter lowers string_to_array equality predicate" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"scope":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE string_to_array(scope, ' ') = $1 ORDER BY id",
+        schema,
+        &.{.{ .json = "[\"read\",\"write\"]" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.query.expression_array_contains.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.expression_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, lowered.query.expression_predicates[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, lowered.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.expression_predicates[0].rhs.len);
+    try std.testing.expectEqualStrings("[\"read\",\"write\"]", lowered.query.expression_predicates[0].rhs[0].value_json);
+
+    var not_lowered = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE string_to_array(scope, ' ') != $1 ORDER BY id",
+        schema,
+        &.{.{ .json = "[\"read\"]" }},
+    );
+    defer not_lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), not_lowered.query.expression_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, not_lowered.query.expression_predicates[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, not_lowered.query.expression_predicates[0].lhs.kind);
+}
+
 test "postgres sql adapter lowers coalesce projection" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -9855,6 +11588,34 @@ test "postgres sql adapter lowers scalar any predicates" {
     try std.testing.expect(negated.query.in_predicates[0].negated);
 }
 
+test "postgres sql adapter lowers text pattern predicates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"name":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE name ILIKE $1 AND name NOT LIKE 'bot%'",
+        schema,
+        &.{.{ .string = "a%" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), lowered.query.text_patterns.len);
+    try std.testing.expectEqualStrings("name", lowered.query.text_patterns[0].field);
+    try std.testing.expectEqualStrings("a%", lowered.query.text_patterns[0].pattern);
+    try std.testing.expect(lowered.query.text_patterns[0].case_insensitive);
+    try std.testing.expect(!lowered.query.text_patterns[0].negated);
+    try std.testing.expectEqualStrings("bot%", lowered.query.text_patterns[1].pattern);
+    try std.testing.expect(!lowered.query.text_patterns[1].case_insensitive);
+    try std.testing.expect(lowered.query.text_patterns[1].negated);
+}
+
 test "postgres sql adapter lowers scalar in predicates" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -9900,6 +11661,51 @@ test "postgres sql adapter lowers scalar in predicates" {
     try std.testing.expect(negated.query.in_predicates[0].negated);
 }
 
+test "postgres sql adapter lowers scalar between predicates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"priority":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var ranged = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE priority BETWEEN $1 AND $2 AND status = 'active'",
+        schema,
+        &.{ .{ .integer = 10 }, .{ .integer = 20 } },
+    );
+    defer ranged.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), ranged.query.predicates.len);
+    try std.testing.expectEqualStrings("priority", ranged.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, ranged.query.predicates[0].op);
+    try std.testing.expectEqualStrings("10", ranged.query.predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("priority", ranged.query.predicates[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, ranged.query.predicates[1].op);
+    try std.testing.expectEqualStrings("20", ranged.query.predicates[1].value_json.?);
+    try std.testing.expectEqualStrings("status", ranged.query.predicates[2].field);
+
+    var not_ranged = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE priority NOT BETWEEN 10 AND 20",
+        schema,
+        &.{},
+    );
+    defer not_ranged.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), not_ranged.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), not_ranged.query.or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), not_ranged.query.or_predicates[0].predicates.len);
+    try std.testing.expectEqualStrings("priority", not_ranged.query.or_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, not_ranged.query.or_predicates[0].predicates[0].op);
+    try std.testing.expectEqualStrings("10", not_ranged.query.or_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), not_ranged.query.or_predicates[1].predicates.len);
+    try std.testing.expectEqualStrings("priority", not_ranged.query.or_predicates[1].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, not_ranged.query.or_predicates[1].predicates[0].op);
+    try std.testing.expectEqualStrings("20", not_ranged.query.or_predicates[1].predicates[0].value_json.?);
+}
+
 test "postgres sql adapter lowers null-safe distinct predicates" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -9920,18 +11726,23 @@ test "postgres sql adapter lowers null-safe distinct predicates" {
 
     try std.testing.expectEqual(@as(usize, 2), lowered.query.predicates.len);
     try std.testing.expectEqualStrings("encryption_key_version", lowered.query.predicates[0].field);
-    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, lowered.query.predicates[0].op);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_distinct, lowered.query.predicates[0].op);
     try std.testing.expectEqualStrings("7", lowered.query.predicates[0].value_json.?);
     try std.testing.expectEqualStrings("encrypted_secret", lowered.query.predicates[1].field);
-    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, lowered.query.predicates[1].op);
-    try std.testing.expect(lowered.query.predicates[1].value_json == null);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_distinct, lowered.query.predicates[1].op);
+    try std.testing.expectEqualStrings("null", lowered.query.predicates[1].value_json.?);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
+    var distinct = try lowerSelectAlloc(
         alloc,
         "SELECT id FROM secrets WHERE encrypted_secret IS DISTINCT FROM $1",
         schema,
         &.{.{ .string = "old" }},
-    ));
+    );
+    defer distinct.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), distinct.query.predicates.len);
+    try std.testing.expectEqualStrings("encrypted_secret", distinct.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_distinct, distinct.query.predicates[0].op);
+    try std.testing.expectEqualStrings("\"old\"", distinct.query.predicates[0].value_json.?);
 }
 
 test "postgres sql adapter lowers scalar or predicates" {
@@ -10434,23 +12245,25 @@ test "postgres sql adapter lowers scalar expression order keys" {
 
     var lowered = try lowerSelectAlloc(
         alloc,
-        "SELECT id FROM users ORDER BY lower(email) ASC, amount - discount DESC, coalesce(status, 'pending') ASC, array_length(tags, 1) DESC LIMIT 10",
+        "SELECT id FROM users ORDER BY lower(email) ASC, upper(status) DESC, amount - discount DESC, coalesce(status, 'pending') ASC, array_length(tags, 1) DESC LIMIT 10",
         schema,
         &.{},
     );
     defer lowered.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 4), lowered.query.order_by.len);
+    try std.testing.expectEqual(@as(usize, 5), lowered.query.order_by.len);
     try std.testing.expectEqual(@as(usize, 0), lowered.query.order_by[0].field.len);
     try std.testing.expect(lowered.query.order_by[0].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.query.order_by[0].expression.?.kind);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, lowered.query.order_by[0].direction);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.query.order_by[1].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.upper, lowered.query.order_by[1].expression.?.kind);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.query.order_by[1].direction);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, lowered.query.order_by[2].expression.?.kind);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, lowered.query.order_by[2].direction);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, lowered.query.order_by[3].expression.?.kind);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.query.order_by[3].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.query.order_by[2].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.query.order_by[2].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, lowered.query.order_by[3].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, lowered.query.order_by[3].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, lowered.query.order_by[4].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.query.order_by[4].direction);
 }
 
 test "postgres sql adapter lowers concat projection into expression AST" {
@@ -10513,6 +12326,34 @@ test "postgres sql adapter lowers nullif projection into expression AST" {
     try std.testing.expectEqualStrings("email", lowered.query.expressions[0].expression.operands[0].operands[0].field);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, lowered.query.expressions[0].expression.operands[1].kind);
     try std.testing.expectEqualStrings("\"blocked@example.test\"", lowered.query.expressions[0].expression.operands[1].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.predicates.len);
+    try std.testing.expectEqualStrings("id", lowered.query.predicates[0].field);
+}
+
+test "postgres sql adapter lowers now projection into expression AST" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerSelectAlloc(
+        alloc,
+        "SELECT now() AS planned_at_ns FROM users WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.expressions.len);
+    try std.testing.expectEqualStrings("planned_at_ns", lowered.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.now, lowered.query.expressions[0].expression.kind);
+    const bound_now = try std.fmt.parseInt(u64, lowered.query.expressions[0].expression.value_json, 10);
+    try std.testing.expect(bound_now > 0);
     try std.testing.expectEqual(@as(usize, 1), lowered.query.predicates.len);
     try std.testing.expectEqualStrings("id", lowered.query.predicates[0].field);
 }
@@ -10663,7 +12504,7 @@ test "postgres sql adapter ignores harmless identifier casts" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.query.order_by[0].direction);
 }
 
-test "postgres sql adapter lowers lower predicate without generated column into expression predicate" {
+test "postgres sql adapter lowers case-fold predicates without generated column into expression predicates" {
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
@@ -10688,6 +12529,23 @@ test "postgres sql adapter lowers lower predicate without generated column into 
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, lowered.query.expression_predicates[0].op);
     try std.testing.expectEqual(@as(usize, 1), lowered.query.expression_predicates[0].rhs.len);
     try std.testing.expectEqualStrings("\"ada@example.test\"", lowered.query.expression_predicates[0].rhs[0].value_json);
+
+    var upper_lowered = try lowerSelectAlloc(
+        alloc,
+        "SELECT upper(email) AS email_upper FROM users WHERE upper(email) = $1",
+        schema,
+        &.{.{ .string = "ADA@EXAMPLE.TEST" }},
+    );
+    defer upper_lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), upper_lowered.query.expressions.len);
+    try std.testing.expectEqualStrings("email_upper", upper_lowered.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.upper, upper_lowered.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 0), upper_lowered.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), upper_lowered.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.upper, upper_lowered.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("email", upper_lowered.query.expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("\"ADA@EXAMPLE.TEST\"", upper_lowered.query.expression_predicates[0].rhs[0].value_json);
 }
 
 test "postgres sql adapter lowers arithmetic predicate into expression predicate" {
@@ -10778,6 +12636,63 @@ test "postgres sql adapter lowers array_length predicate into expression predica
     try std.testing.expectEqualStrings("tags", condition.lhs.operands[0].field);
     try std.testing.expectEqual(@as(usize, 1), condition.rhs.len);
     try std.testing.expectEqualStrings("0", condition.rhs[0].value_json);
+
+    var ranged = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE array_length(tags, 1) BETWEEN 1 AND $1 ORDER BY id ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 3 }},
+    );
+    defer ranged.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), ranged.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), ranged.query.expression_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, ranged.query.expression_predicates[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, ranged.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("1", ranged.query.expression_predicates[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, ranged.query.expression_predicates[1].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, ranged.query.expression_predicates[1].lhs.kind);
+    try std.testing.expectEqualStrings("3", ranged.query.expression_predicates[1].rhs[0].value_json);
+
+    var not_ranged = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE array_length(tags, 1) NOT BETWEEN 1 AND 3",
+        schema,
+        &.{},
+    );
+    defer not_ranged.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), not_ranged.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), not_ranged.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), not_ranged.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), not_ranged.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, not_ranged.query.expression_or_predicates[0].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, not_ranged.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("1", not_ranged.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), not_ranged.query.expression_or_predicates[1].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, not_ranged.query.expression_or_predicates[1].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, not_ranged.query.expression_or_predicates[1].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("3", not_ranged.query.expression_or_predicates[1].conditions[0].rhs[0].value_json);
+
+    var negated_condition = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE NOT (array_length(tags, 1) BETWEEN 1 AND 3)",
+        schema,
+        &.{},
+    );
+    defer negated_condition.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), negated_condition.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), negated_condition.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), negated_condition.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), negated_condition.query.expression_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), negated_condition.query.expression_not_predicates[0].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, negated_condition.query.expression_not_predicates[0].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, negated_condition.query.expression_not_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("1", negated_condition.query.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, negated_condition.query.expression_not_predicates[0].conditions[1].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, negated_condition.query.expression_not_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("3", negated_condition.query.expression_not_predicates[0].conditions[1].rhs[0].value_json);
 }
 
 test "postgres sql adapter lowers insert values returning into row batch" {
@@ -11051,7 +12966,13 @@ const AppCompatPlanSummary = struct {
     table_name: ?[]const u8 = null,
     ctes: ?usize = null,
     predicates: ?usize = null,
+    array_any: ?usize = null,
     json_path_eq: ?usize = null,
+    text_patterns: ?usize = null,
+    expression_predicates: ?usize = null,
+    expression_or_predicates: ?usize = null,
+    expression_not_predicates: ?usize = null,
+    expression_array_contains: ?usize = null,
     select: ?usize = null,
     order_by: ?usize = null,
     limit: ?u32 = null,
@@ -11059,6 +12980,8 @@ const AppCompatPlanSummary = struct {
     aggregations: ?usize = null,
     having: ?usize = null,
     operations: ?usize = null,
+    patch_expressions: ?usize = null,
+    increment_expressions: ?usize = null,
     returning: ?usize = null,
     join_on: ?usize = null,
     join_select: ?usize = null,
@@ -11123,9 +13046,174 @@ fn aggregateInputExpressionCount(aggregations: []const db_mod.types.RelationalRo
     return count;
 }
 
+fn windowValueExpressionCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
+    var count: usize = 0;
+    for (windows) |window| {
+        if (window.value_expression != null) count += 1;
+    }
+    return count;
+}
+
+fn windowDefaultCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
+    var count: usize = 0;
+    for (windows) |window| {
+        if (window.default_json.len > 0) count += 1;
+    }
+    return count;
+}
+
 fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table_name: []const u8, query: db_mod.types.RelationalRowsQueryRequest, ctes: usize) ![]u8 {
     const claim = if (query.row_claim) |claim_value| if (claim_value.skip_locked) "skip_locked" else "locked" else "none";
     const order_expr = expressionOrderCount(query.order_by);
+    if (ctes > 0 or query.source_cte.len > 0) {
+        return try std.fmt.allocPrint(
+            alloc,
+            "{s}:table={s}:ctes={d}:source_cte={d}:pred={d}:array_any={d}:expr_pred={d}:expr_or={d}:expr_not={d}:expr_array={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
+            .{
+                family,
+                table_name,
+                ctes,
+                @as(u8, if (query.source_cte.len > 0) 1 else 0),
+                query.predicates.len,
+                query.array_any.len,
+                query.expression_predicates.len,
+                query.expression_or_predicates.len,
+                query.expression_not_predicates.len,
+                query.expression_array_contains.len,
+                query.json_path_eq.len,
+                query.or_predicates.len,
+                query.not_predicates.len,
+                query.select.len,
+                query.expressions.len,
+                query.field_aliases.len,
+                query.order_by.len,
+                order_expr,
+                appCompatLimitValue(query.limit),
+                claim,
+            },
+        );
+    }
+    if (query.array_any.len > 0 or query.expression_or_predicates.len > 0 or query.expression_not_predicates.len > 0) {
+        return try std.fmt.allocPrint(
+            alloc,
+            "{s}:table={s}:ctes={d}:pred={d}:array_any={d}:expr_pred={d}:expr_or={d}:expr_not={d}:expr_array={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
+            .{
+                family,
+                table_name,
+                ctes,
+                query.predicates.len,
+                query.array_any.len,
+                query.expression_predicates.len,
+                query.expression_or_predicates.len,
+                query.expression_not_predicates.len,
+                query.expression_array_contains.len,
+                query.json_path_eq.len,
+                query.or_predicates.len,
+                query.not_predicates.len,
+                query.select.len,
+                query.expressions.len,
+                query.field_aliases.len,
+                query.order_by.len,
+                order_expr,
+                appCompatLimitValue(query.limit),
+                claim,
+            },
+        );
+    }
+    if (query.expression_array_contains.len > 0) {
+        if (query.limit) |limit| {
+            return try std.fmt.allocPrint(
+                alloc,
+                "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:expr_array={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
+                .{
+                    family,
+                    table_name,
+                    ctes,
+                    query.predicates.len,
+                    query.expression_predicates.len,
+                    query.expression_array_contains.len,
+                    query.json_path_eq.len,
+                    query.or_predicates.len,
+                    query.not_predicates.len,
+                    query.select.len,
+                    query.expressions.len,
+                    query.field_aliases.len,
+                    query.order_by.len,
+                    order_expr,
+                    limit,
+                    claim,
+                },
+            );
+        }
+        return try std.fmt.allocPrint(
+            alloc,
+            "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:expr_array={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit=none:claim={s}",
+            .{
+                family,
+                table_name,
+                ctes,
+                query.predicates.len,
+                query.expression_predicates.len,
+                query.expression_array_contains.len,
+                query.json_path_eq.len,
+                query.or_predicates.len,
+                query.not_predicates.len,
+                query.select.len,
+                query.expressions.len,
+                query.field_aliases.len,
+                query.order_by.len,
+                order_expr,
+                claim,
+            },
+        );
+    }
+    if (query.text_patterns.len > 0) {
+        if (query.limit) |limit| {
+            return try std.fmt.allocPrint(
+                alloc,
+                "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:text_pattern={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
+                .{
+                    family,
+                    table_name,
+                    ctes,
+                    query.predicates.len,
+                    query.expression_predicates.len,
+                    query.json_path_eq.len,
+                    query.text_patterns.len,
+                    query.or_predicates.len,
+                    query.not_predicates.len,
+                    query.select.len,
+                    query.expressions.len,
+                    query.field_aliases.len,
+                    query.order_by.len,
+                    order_expr,
+                    limit,
+                    claim,
+                },
+            );
+        }
+        return try std.fmt.allocPrint(
+            alloc,
+            "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:text_pattern={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit=none:claim={s}",
+            .{
+                family,
+                table_name,
+                ctes,
+                query.predicates.len,
+                query.expression_predicates.len,
+                query.json_path_eq.len,
+                query.text_patterns.len,
+                query.or_predicates.len,
+                query.not_predicates.len,
+                query.select.len,
+                query.expressions.len,
+                query.field_aliases.len,
+                query.order_by.len,
+                order_expr,
+                claim,
+            },
+        );
+    }
     if (query.limit) |limit| {
         return try std.fmt.allocPrint(
             alloc,
@@ -11268,7 +13356,13 @@ fn expectAppliedDdlCorpusPlan(
 
 fn expectQuerySummary(summary: AppCompatPlanSummary, query: db_mod.types.RelationalRowsQueryRequest) !void {
     try expectOptionalUsize(summary.predicates, query.predicates.len);
+    try expectOptionalUsize(summary.array_any, query.array_any.len);
     try expectOptionalUsize(summary.json_path_eq, query.json_path_eq.len);
+    try expectOptionalUsize(summary.text_patterns, query.text_patterns.len);
+    try expectOptionalUsize(summary.expression_predicates, query.expression_predicates.len);
+    try expectOptionalUsize(summary.expression_or_predicates, query.expression_or_predicates.len);
+    try expectOptionalUsize(summary.expression_not_predicates, query.expression_not_predicates.len);
+    try expectOptionalUsize(summary.expression_array_contains, query.expression_array_contains.len);
     try expectOptionalUsize(summary.select, query.select.len);
     try expectOptionalUsize(summary.order_by, query.order_by.len);
     try expectOptionalU32(summary.limit, query.limit);
@@ -11280,7 +13374,13 @@ fn expectQuerySummary(summary: AppCompatPlanSummary, query: db_mod.types.Relatio
 
 fn expectQuerySourceSummary(summary: AppCompatPlanSummary, query: db_mod.types.RelationalRowsQueryRequest) !void {
     try expectOptionalUsize(summary.predicates, query.predicates.len);
+    try expectOptionalUsize(summary.array_any, query.array_any.len);
     try expectOptionalUsize(summary.json_path_eq, query.json_path_eq.len);
+    try expectOptionalUsize(summary.text_patterns, query.text_patterns.len);
+    try expectOptionalUsize(summary.expression_predicates, query.expression_predicates.len);
+    try expectOptionalUsize(summary.expression_or_predicates, query.expression_or_predicates.len);
+    try expectOptionalUsize(summary.expression_not_predicates, query.expression_not_predicates.len);
+    try expectOptionalUsize(summary.expression_array_contains, query.expression_array_contains.len);
 }
 
 fn expectDdlSummary(summary: AppCompatPlanSummary, lowered: LoweredDdlPlan) !void {
@@ -11308,6 +13408,209 @@ fn expectDdlSummary(summary: AppCompatPlanSummary, lowered: LoweredDdlPlan) !voi
             try expectOptionalTableName(summary.table_name, plan.table_name);
         },
     }
+}
+
+fn sourceQueryUsesExtendedPredicates(query: db_mod.types.RelationalRowsQueryRequest) bool {
+    return query.array_any.len > 0 or
+        query.expression_predicates.len > 0 or
+        query.expression_or_predicates.len > 0 or
+        query.expression_not_predicates.len > 0 or
+        query.expression_array_contains.len > 0;
+}
+
+fn updateSourceFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredMutationSource) ![]u8 {
+    const source = lowered.mutation.req.source;
+    const claim = if (source.row_claim) |claim_value| if (claim_value.skip_locked) "skip_locked" else "locked" else "none";
+    if (sourceQueryUsesExtendedPredicates(source)) {
+        return try std.fmt.allocPrint(
+            alloc,
+            "update_source:table={s}:source_pred={d}:source_array_any={d}:source_expr_pred={d}:source_expr_or={d}:source_expr_not={d}:source_expr_array={d}:source_order={d}:source_limit={d}:claim={s}:ops={d}:patch_expr={d}:increment_expr={d}:returning={d}:returning_expr={d}",
+            .{
+                lowered.table_name,
+                source.predicates.len,
+                source.array_any.len,
+                source.expression_predicates.len,
+                source.expression_or_predicates.len,
+                source.expression_not_predicates.len,
+                source.expression_array_contains.len,
+                source.order_by.len,
+                appCompatLimitValue(source.limit),
+                claim,
+                lowered.mutation.req.operations.len,
+                lowered.mutation.req.patch_expressions.len,
+                lowered.mutation.req.increment_expressions.len,
+                lowered.mutation.req.returning.len,
+                lowered.mutation.req.returning_expressions.len,
+            },
+        );
+    }
+    return try std.fmt.allocPrint(
+        alloc,
+        "update_source:table={s}:source_pred={d}:source_order={d}:source_limit={d}:claim={s}:ops={d}:returning={d}:returning_expr={d}",
+        .{
+            lowered.table_name,
+            source.predicates.len,
+            source.order_by.len,
+            appCompatLimitValue(source.limit),
+            claim,
+            lowered.mutation.req.operations.len,
+            lowered.mutation.req.returning.len,
+            lowered.mutation.req.returning_expressions.len,
+        },
+    );
+}
+
+fn deleteSourceFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredMutationSource) ![]u8 {
+    const source = lowered.mutation.req.source;
+    const claim = if (source.row_claim) |claim_value| if (claim_value.skip_locked) "skip_locked" else "locked" else "none";
+    if (sourceQueryUsesExtendedPredicates(source)) {
+        return try std.fmt.allocPrint(
+            alloc,
+            "delete_source:table={s}:source_pred={d}:source_array_any={d}:source_expr_pred={d}:source_expr_or={d}:source_expr_not={d}:source_expr_array={d}:source_order={d}:source_limit={d}:claim={s}:returning={d}:returning_expr={d}",
+            .{
+                lowered.table_name,
+                source.predicates.len,
+                source.array_any.len,
+                source.expression_predicates.len,
+                source.expression_or_predicates.len,
+                source.expression_not_predicates.len,
+                source.expression_array_contains.len,
+                source.order_by.len,
+                appCompatLimitValue(source.limit),
+                claim,
+                lowered.mutation.req.returning.len,
+                lowered.mutation.req.returning_expressions.len,
+            },
+        );
+    }
+    return try std.fmt.allocPrint(
+        alloc,
+        "delete_source:table={s}:source_pred={d}:source_order={d}:source_limit={d}:claim={s}:returning={d}:returning_expr={d}",
+        .{
+            lowered.table_name,
+            source.predicates.len,
+            source.order_by.len,
+            appCompatLimitValue(source.limit),
+            claim,
+            lowered.mutation.req.returning.len,
+            lowered.mutation.req.returning_expressions.len,
+        },
+    );
+}
+
+fn aggregateFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredAggregate) ![]u8 {
+    const source = lowered.aggregate.source;
+    if (sourceQueryUsesExtendedPredicates(source)) {
+        return try std.fmt.allocPrint(
+            alloc,
+            "aggregate:table={s}:source_pred={d}:source_array_any={d}:source_expr_pred={d}:source_expr_or={d}:source_expr_not={d}:source_expr_array={d}:source_json_eq={d}:group={d}:aggs={d}:agg_expr={d}:filter_expr={d}:having={d}:order={d}:limit={d}",
+            .{
+                lowered.table_name,
+                source.predicates.len,
+                source.array_any.len,
+                source.expression_predicates.len,
+                source.expression_or_predicates.len,
+                source.expression_not_predicates.len,
+                source.expression_array_contains.len,
+                source.json_path_eq.len,
+                lowered.aggregate.group_by.len,
+                lowered.aggregate.aggregations.len,
+                aggregateInputExpressionCount(lowered.aggregate.aggregations),
+                aggregateFilterExpressionCount(lowered.aggregate.aggregations),
+                lowered.aggregate.having_predicates.len,
+                lowered.aggregate.order_by.len,
+                appCompatLimitValue(lowered.aggregate.limit),
+            },
+        );
+    }
+    return try std.fmt.allocPrint(
+        alloc,
+        "aggregate:table={s}:source_pred={d}:source_json_eq={d}:group={d}:aggs={d}:agg_expr={d}:filter_expr={d}:having={d}:order={d}:limit={d}",
+        .{
+            lowered.table_name,
+            source.predicates.len,
+            source.json_path_eq.len,
+            lowered.aggregate.group_by.len,
+            lowered.aggregate.aggregations.len,
+            aggregateInputExpressionCount(lowered.aggregate.aggregations),
+            aggregateFilterExpressionCount(lowered.aggregate.aggregations),
+            lowered.aggregate.having_predicates.len,
+            lowered.aggregate.order_by.len,
+            appCompatLimitValue(lowered.aggregate.limit),
+        },
+    );
+}
+
+fn joinFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredJoin) ![]u8 {
+    const left = lowered.join.left;
+    const right = lowered.join.right;
+    return try std.fmt.allocPrint(
+        alloc,
+        "join:left={s}:right={s}:left_pred={d}:left_array_any={d}:left_expr_pred={d}:left_expr_or={d}:left_expr_not={d}:left_expr_array={d}:left_json_eq={d}:left_text={d}:right_pred={d}:right_array_any={d}:right_expr_pred={d}:right_expr_or={d}:right_expr_not={d}:right_expr_array={d}:right_json_eq={d}:right_text={d}:on={d}:select={d}:order={d}:order_expr={d}:limit={d}",
+        .{
+            lowered.left_table_name,
+            lowered.right_table_name,
+            left.predicates.len,
+            left.array_any.len,
+            left.expression_predicates.len,
+            left.expression_or_predicates.len,
+            left.expression_not_predicates.len,
+            left.expression_array_contains.len,
+            left.json_path_eq.len,
+            left.text_patterns.len,
+            right.predicates.len,
+            right.array_any.len,
+            right.expression_predicates.len,
+            right.expression_or_predicates.len,
+            right.expression_not_predicates.len,
+            right.expression_array_contains.len,
+            right.json_path_eq.len,
+            right.text_patterns.len,
+            lowered.join.on.len,
+            lowered.join.select.len,
+            lowered.join.order_by.len,
+            expressionOrderCount(lowered.join.order_by),
+            appCompatLimitValue(lowered.join.limit),
+        },
+    );
+}
+
+fn lateralFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredLateralPlan) ![]u8 {
+    const left = lowered.plan.lateral.left;
+    const right = lowered.plan.lateral.right;
+    return try std.fmt.allocPrint(
+        alloc,
+        "lateral:left={s}:right={s}:ctes={d}:left_pred={d}:left_array_any={d}:left_expr_pred={d}:left_expr_or={d}:left_expr_not={d}:left_expr_array={d}:left_json_eq={d}:left_text={d}:right_pred={d}:right_array_any={d}:right_expr_pred={d}:right_expr_or={d}:right_expr_not={d}:right_expr_array={d}:right_json_eq={d}:right_text={d}:right_order={d}:right_order_expr={d}:right_limit={d}:corr={d}:select={d}:order={d}:order_expr={d}:limit={d}",
+        .{
+            lowered.left_table_name,
+            lowered.right_table_name,
+            lowered.plan.ctes.len,
+            left.predicates.len,
+            left.array_any.len,
+            left.expression_predicates.len,
+            left.expression_or_predicates.len,
+            left.expression_not_predicates.len,
+            left.expression_array_contains.len,
+            left.json_path_eq.len,
+            left.text_patterns.len,
+            right.predicates.len,
+            right.array_any.len,
+            right.expression_predicates.len,
+            right.expression_or_predicates.len,
+            right.expression_not_predicates.len,
+            right.expression_array_contains.len,
+            right.json_path_eq.len,
+            right.text_patterns.len,
+            right.order_by.len,
+            expressionOrderCount(right.order_by),
+            appCompatLimitValue(right.limit),
+            lowered.plan.lateral.correlations.len,
+            lowered.plan.lateral.select.len,
+            lowered.plan.lateral.order_by.len,
+            expressionOrderCount(lowered.plan.lateral.order_by),
+            appCompatLimitValue(lowered.plan.lateral.limit),
+        },
+    );
 }
 
 fn expectAppCompatCorpusEntry(
@@ -11348,22 +13651,7 @@ fn expectAppCompatCorpusEntry(
             try expectOptionalUsize(entry.summary.having, lowered.aggregate.having_predicates.len);
             try expectOptionalUsize(entry.summary.order_by, lowered.aggregate.order_by.len);
             try expectOptionalU32(entry.summary.limit, lowered.aggregate.limit);
-            const fingerprint = try std.fmt.allocPrint(
-                alloc,
-                "aggregate:table={s}:source_pred={d}:source_json_eq={d}:group={d}:aggs={d}:agg_expr={d}:filter_expr={d}:having={d}:order={d}:limit={d}",
-                .{
-                    lowered.table_name,
-                    lowered.aggregate.source.predicates.len,
-                    lowered.aggregate.source.json_path_eq.len,
-                    lowered.aggregate.group_by.len,
-                    lowered.aggregate.aggregations.len,
-                    aggregateInputExpressionCount(lowered.aggregate.aggregations),
-                    aggregateFilterExpressionCount(lowered.aggregate.aggregations),
-                    lowered.aggregate.having_predicates.len,
-                    lowered.aggregate.order_by.len,
-                    appCompatLimitValue(lowered.aggregate.limit),
-                },
-            );
+            const fingerprint = try aggregateFingerprintAlloc(alloc, lowered);
             defer alloc.free(fingerprint);
             try expectAppCompatPlan(entry.plan, fingerprint);
         },
@@ -11376,20 +13664,7 @@ fn expectAppCompatCorpusEntry(
             try expectOptionalUsize(entry.summary.join_select, lowered.join.select.len);
             try expectOptionalUsize(entry.summary.order_by, lowered.join.order_by.len);
             try expectOptionalU32(entry.summary.limit, lowered.join.limit);
-            const fingerprint = try std.fmt.allocPrint(
-                alloc,
-                "join:left={s}:right={s}:left_pred={d}:right_pred={d}:on={d}:select={d}:order={d}:limit={d}",
-                .{
-                    lowered.left_table_name,
-                    lowered.right_table_name,
-                    lowered.join.left.predicates.len,
-                    lowered.join.right.predicates.len,
-                    lowered.join.on.len,
-                    lowered.join.select.len,
-                    lowered.join.order_by.len,
-                    appCompatLimitValue(lowered.join.limit),
-                },
-            );
+            const fingerprint = try joinFingerprintAlloc(alloc, lowered);
             defer alloc.free(fingerprint);
             try expectAppCompatPlan(entry.plan, fingerprint);
         },
@@ -11402,20 +13677,7 @@ fn expectAppCompatCorpusEntry(
             try expectOptionalUsize(entry.summary.join_select, lowered.plan.lateral.select.len);
             try expectOptionalUsize(entry.summary.order_by, lowered.plan.lateral.order_by.len);
             try expectOptionalU32(entry.summary.limit, lowered.plan.lateral.limit);
-            const fingerprint = try std.fmt.allocPrint(
-                alloc,
-                "lateral:left={s}:right={s}:left_pred={d}:right_pred={d}:corr={d}:select={d}:order={d}:limit={d}",
-                .{
-                    lowered.left_table_name,
-                    lowered.right_table_name,
-                    lowered.plan.lateral.left.predicates.len,
-                    lowered.plan.lateral.right.predicates.len,
-                    lowered.plan.lateral.correlations.len,
-                    lowered.plan.lateral.select.len,
-                    lowered.plan.lateral.order_by.len,
-                    appCompatLimitValue(lowered.plan.lateral.limit),
-                },
-            );
+            const fingerprint = try lateralFingerprintAlloc(alloc, lowered);
             defer alloc.free(fingerprint);
             try expectAppCompatPlan(entry.plan, fingerprint);
         },
@@ -11431,12 +13693,15 @@ fn expectAppCompatCorpusEntry(
             try expectOptionalU32(entry.summary.limit, lowered.plan.window.limit);
             const fingerprint = try std.fmt.allocPrint(
                 alloc,
-                "window:table={s}:ctes={d}:source_pred={d}:windows={d}:select={d}:order={d}:limit={d}",
+                "window:table={s}:ctes={d}:source_cte={d}:source_pred={d}:windows={d}:window_expr={d}:window_default={d}:select={d}:order={d}:limit={d}",
                 .{
                     lowered.table_name,
                     lowered.plan.ctes.len,
+                    @as(u8, if (lowered.plan.window.source.source_cte.len > 0) 1 else 0),
                     lowered.plan.window.source.predicates.len,
                     lowered.plan.window.windows.len,
+                    windowValueExpressionCount(lowered.plan.window.windows),
+                    windowDefaultCount(lowered.plan.window.windows),
                     lowered.plan.window.select.len,
                     lowered.plan.window.order_by.len,
                     appCompatLimitValue(lowered.plan.window.limit),
@@ -11499,21 +13764,10 @@ fn expectAppCompatCorpusEntry(
             try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
             try expectQuerySummary(entry.summary, lowered.mutation.req.source);
             try expectOptionalUsize(entry.summary.operations, lowered.mutation.req.operations.len);
+            try expectOptionalUsize(entry.summary.patch_expressions, lowered.mutation.req.patch_expressions.len);
+            try expectOptionalUsize(entry.summary.increment_expressions, lowered.mutation.req.increment_expressions.len);
             try expectOptionalUsize(entry.summary.returning, lowered.mutation.req.returning.len);
-            const fingerprint = try std.fmt.allocPrint(
-                alloc,
-                "update_source:table={s}:source_pred={d}:source_order={d}:source_limit={d}:claim={s}:ops={d}:returning={d}:returning_expr={d}",
-                .{
-                    lowered.table_name,
-                    lowered.mutation.req.source.predicates.len,
-                    lowered.mutation.req.source.order_by.len,
-                    appCompatLimitValue(lowered.mutation.req.source.limit),
-                    if (lowered.mutation.req.source.row_claim) |claim_value| if (claim_value.skip_locked) "skip_locked" else "locked" else "none",
-                    lowered.mutation.req.operations.len,
-                    lowered.mutation.req.returning.len,
-                    lowered.mutation.req.returning_expressions.len,
-                },
-            );
+            const fingerprint = try updateSourceFingerprintAlloc(alloc, lowered);
             defer alloc.free(fingerprint);
             try expectAppCompatPlan(entry.plan, fingerprint);
         },
@@ -11523,19 +13777,7 @@ fn expectAppCompatCorpusEntry(
             try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
             try expectQuerySummary(entry.summary, lowered.mutation.req.source);
             try expectOptionalUsize(entry.summary.returning, lowered.mutation.req.returning.len);
-            const fingerprint = try std.fmt.allocPrint(
-                alloc,
-                "delete_source:table={s}:source_pred={d}:source_order={d}:source_limit={d}:claim={s}:returning={d}:returning_expr={d}",
-                .{
-                    lowered.table_name,
-                    lowered.mutation.req.source.predicates.len,
-                    lowered.mutation.req.source.order_by.len,
-                    appCompatLimitValue(lowered.mutation.req.source.limit),
-                    if (lowered.mutation.req.source.row_claim) |claim_value| if (claim_value.skip_locked) "skip_locked" else "locked" else "none",
-                    lowered.mutation.req.returning.len,
-                    lowered.mutation.req.returning_expressions.len,
-                },
-            );
+            const fingerprint = try deleteSourceFingerprintAlloc(alloc, lowered);
             defer alloc.free(fingerprint);
             try expectAppCompatPlan(entry.plan, fingerprint);
         },
@@ -11701,6 +13943,36 @@ test "postgres sql adapter classifies application compatibility corpus" {
             .params = &.{.{ .integer = 0 }},
         },
         .{
+            .name = "single table computed array containment query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:expr_array=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE string_to_array(status, ' ') @> $1 ORDER BY id ASC LIMIT 5",
+            .params = &.{.{ .json = "[\"active\"]" }},
+        },
+        .{
+            .name = "single table computed array equality query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE string_to_array(status, ' ') = $1 ORDER BY id ASC LIMIT 5",
+            .params = &.{.{ .json = "[\"active\"]" }},
+        },
+        .{
+            .name = "single table computed expression or query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE array_length(tags, 1) NOT BETWEEN 1 AND 3 ORDER BY id ASC LIMIT 5",
+        },
+        .{
+            .name = "single table computed expression not query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_not_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=1:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE NOT (array_length(tags, 1) BETWEEN 1 AND 3) ORDER BY id ASC LIMIT 5",
+        },
+        .{
             .name = "grouped aggregate",
             .family = .aggregate,
             .summary = .{ .table_name = "usage_records", .predicates = 1, .group_by = 1, .aggregations = 5, .having = 1, .order_by = 1, .limit = 5 },
@@ -11709,25 +13981,46 @@ test "postgres sql adapter classifies application compatibility corpus" {
             .params = &.{.{ .string = "tokens" }},
         },
         .{
+            .name = "grouped aggregate computed source predicate",
+            .family = .aggregate,
+            .summary = .{ .table_name = "usage_records", .expression_not_predicates = 1, .group_by = 1, .aggregations = 1, .order_by = 1, .limit = 5 },
+            .plan = "aggregate:table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=0:source_expr_or=0:source_expr_not=1:source_expr_array=0:source_json_eq=0:group=1:aggs=1:agg_expr=0:filter_expr=0:having=0:order=1:limit=5",
+            .sql = "SELECT organization_id, COUNT(*) AS record_count FROM usage_records WHERE NOT (array_length(tags, 1) BETWEEN 1 AND 3) GROUP BY organization_id ORDER BY record_count DESC LIMIT 5",
+        },
+        .{
+            .name = "chained cte query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .ctes = 2, .predicates = 0, .select = 1, .order_by = 1, .limit = 2 },
+            .plan = "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
+            .sql = "WITH open_usage AS (SELECT id, status, amount, created_at FROM usage_records WHERE status = 'open'), expensive_open_usage AS (SELECT id, amount, created_at FROM open_usage WHERE amount > 10) SELECT id FROM expensive_open_usage ORDER BY created_at DESC LIMIT 2",
+        },
+        .{
             .name = "equality join",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .predicates = 2, .join_on = 2, .join_select = 3, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=1:right_pred=1:on=2:select=3:order=1:limit=5",
+            .plan = "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=1:order_expr=0:limit=5",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY amount DESC LIMIT 5",
         },
         .{
             .name = "bounded lateral",
             .family = .lateral,
             .summary = .{ .table_name = "usage_records", .predicates = 2, .lateral_correlations = 1, .join_select = 2, .order_by = 1, .limit = 10 },
-            .plan = "lateral:left=usage_records:right=usage_records:left_pred=1:right_pred=1:corr=1:select=2:order=1:limit=10",
+            .plan = "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=1:right_order_expr=0:right_limit=1:corr=1:select=2:order=1:order_expr=0:limit=10",
             .sql = "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY created_at DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC LIMIT 10",
         },
         .{
             .name = "row number window",
             .family = .window,
-            .summary = .{ .table_name = "usage_records", .ctes = 0, .predicates = 1, .select = 2, .windows = 1, .order_by = 1, .limit = 5 },
-            .plan = "window:table=usage_records:ctes=0:source_pred=1:windows=1:select=2:order=1:limit=5",
-            .sql = "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC, id ASC) AS row_num FROM usage_records WHERE status = 'open' ORDER BY row_num ASC LIMIT 5",
+            .summary = .{ .table_name = "usage_records", .ctes = 0, .predicates = 1, .select = 2, .windows = 5, .order_by = 1, .limit = 5 },
+            .plan = "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=5:window_expr=2:window_default=1:select=2:order=1:limit=5",
+            .sql = "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC, id ASC) AS row_num, rank() OVER (PARTITION BY tenant_id ORDER BY amount DESC, id ASC) AS rank, dense_rank() OVER (PARTITION BY tenant_id ORDER BY amount DESC, id ASC) AS dense_rank, lag(amount, 1, 0) OVER (PARTITION BY tenant_id ORDER BY amount DESC, id ASC) AS prev_amount, lead(status) OVER (PARTITION BY tenant_id ORDER BY amount DESC, id ASC) AS next_status FROM usage_records WHERE status = 'open' ORDER BY row_num ASC LIMIT 5",
+        },
+        .{
+            .name = "cte window with value expressions",
+            .family = .window,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .predicates = 0, .select = 2, .windows = 2, .order_by = 1, .limit = 2 },
+            .plan = "window:table=usage_records:ctes=1:source_cte=1:source_pred=0:windows=2:window_expr=2:window_default=1:select=2:order=1:limit=2",
+            .sql = "WITH open_usage AS (SELECT tenant_id, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, id, lag(amount, 1, 0) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS prev_amount, lead(status) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS next_status FROM open_usage ORDER BY prev_amount ASC LIMIT 2",
         },
         .{
             .name = "conflict upsert",
@@ -11776,6 +14069,20 @@ test "postgres sql adapter classifies application compatibility corpus" {
             .params = &.{ .{ .string = "processing" }, .{ .string = "queued" } },
         },
         .{
+            .name = "claimed computed expression or update",
+            .family = .update_source,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .patch_expressions = 1, .returning = 1, .row_claim_skip_locked = false },
+            .plan = "update_source:table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=0:source_expr_or=2:source_expr_not=0:source_expr_array=0:source_order=0:source_limit=-1:claim=locked:ops=0:patch_expr=1:increment_expr=0:returning=1:returning_expr=0",
+            .sql = "UPDATE usage_records SET status = lower(status) WHERE array_length(tags, 1) NOT BETWEEN 1 AND 3 FOR UPDATE RETURNING id",
+        },
+        .{
+            .name = "claimed computed expression not update",
+            .family = .update_source,
+            .summary = .{ .table_name = "usage_records", .expression_not_predicates = 1, .patch_expressions = 1, .returning = 1, .row_claim_skip_locked = false },
+            .plan = "update_source:table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=0:source_expr_or=0:source_expr_not=1:source_expr_array=0:source_order=0:source_limit=-1:claim=locked:ops=0:patch_expr=1:increment_expr=0:returning=1:returning_expr=0",
+            .sql = "UPDATE usage_records SET status = lower(status) WHERE NOT (array_length(tags, 1) BETWEEN 1 AND 3) FOR UPDATE RETURNING id",
+        },
+        .{
             .name = "claimed cleanup delete",
             .family = .delete_source,
             .summary = .{ .table_name = "usage_records", .predicates = 2, .order_by = 1, .limit = 10, .returning = 1, .row_claim_skip_locked = false },
@@ -11784,9 +14091,18 @@ test "postgres sql adapter classifies application compatibility corpus" {
             .params = &.{.{ .integer = 1000 }},
         },
         .{
-            .name = "unsupported ilike expression",
-            .family = .unsupported,
-            .plan = "unsupported:query",
+            .name = "claimed cleanup delete returning expressions",
+            .family = .delete_source,
+            .summary = .{ .table_name = "usage_records", .predicates = 2, .order_by = 1, .limit = 10, .returning = 1, .row_claim_skip_locked = false },
+            .plan = "delete_source:table=usage_records:source_pred=2:source_order=1:source_limit=10:claim=locked:returning=1:returning_expr=2",
+            .sql = "DELETE FROM usage_records WHERE status = 'expired' AND expires_at < $1 ORDER BY expires_at ASC LIMIT 10 RETURNING id, LOWER(status) AS status_key, expires_at + 1 AS next_expires_at",
+            .params = &.{.{ .integer = 1000 }},
+        },
+        .{
+            .name = "single table text pattern predicate query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .text_patterns = 1, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:text_pattern=1:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
             .sql = "SELECT id FROM usage_records WHERE name ILIKE $1",
             .params = &.{.{ .string = "a%" }},
         },
@@ -11832,6 +14148,38 @@ test "postgres sql adapter lowers update patch with explicit version predicate" 
     try std.testing.expectEqualStrings("\"active\"", lowered.batch.transforms[0].operations[0].value_json.?);
     try std.testing.expectEqual(@as(usize, 1), lowered.batch.predicates.len);
     try std.testing.expectEqual(@as(u64, 42), lowered.batch.predicates[0].expected_version);
+}
+
+test "postgres sql adapter evaluates now returning expression from typed plan" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"pending\"}", .version = 42 };
+
+    var lowered = try lowerUpdateAlloc(
+        alloc,
+        "UPDATE usage_records SET status = $1 WHERE id = $2 RETURNING now() AS planned_at_ns",
+        schema,
+        &.{ .{ .string = "active" }, .{ .string = "u1" } },
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.batch.returning_rows.len);
+    var parsed_row = try std.json.parseFromSlice(std.json.Value, alloc, lowered.batch.returning_rows[0], .{});
+    defer parsed_row.deinit();
+    const planned_at = parsed_row.value.object.get("planned_at_ns") orelse return error.TestExpectedEqual;
+    const planned_at_ns: u64 = switch (planned_at) {
+        .integer => |value| if (value > 0) @intCast(value) else return error.TestExpectedEqual,
+        .number_string => |value| try std.fmt.parseInt(u64, value, 10),
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(planned_at_ns > 0);
 }
 
 test "postgres sql adapter lowers arithmetic updates into typed increments" {
@@ -12162,7 +14510,7 @@ test "postgres sql adapter lowers delete with explicit version predicate" {
 test "postgres sql adapter lowers claimed update mutation source" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"priority":{"type":"numeric"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"priority":{"type":"numeric"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -12212,6 +14560,61 @@ test "postgres sql adapter lowers claimed update mutation source" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.cast, lowered.mutation.req.returning_expressions[2].expression.kind);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.text, lowered.mutation.req.returning_expressions[2].expression.cast_type.?);
 
+    var expression_lowered = try lowerUpdateMutationSourceAlloc(
+        alloc,
+        "UPDATE usage_records SET status = lower(status), priority = priority + coalesce(priority, 1) WHERE status = 'queued' FOR UPDATE RETURNING id, status, priority + 1 AS next_priority",
+        schema,
+        &.{},
+        claim,
+    );
+    defer expression_lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_lowered.mutation.req.operations.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_lowered.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("status", expression_lowered.mutation.req.patch_expressions[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_lowered.mutation.req.patch_expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), expression_lowered.mutation.req.increment_expressions.len);
+    try std.testing.expectEqualStrings("priority", expression_lowered.mutation.req.increment_expressions[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, expression_lowered.mutation.req.increment_expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), expression_lowered.mutation.req.returning_expressions.len);
+    try std.testing.expectEqualStrings("next_priority", expression_lowered.mutation.req.returning_expressions[0].output);
+
+    var not_between_source = try lowerUpdateMutationSourceAlloc(
+        alloc,
+        "UPDATE usage_records SET status = lower(status) WHERE array_length(tags, 1) NOT BETWEEN 1 AND 3 FOR UPDATE RETURNING id",
+        schema,
+        &.{},
+        claim,
+    );
+    defer not_between_source.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), not_between_source.mutation.req.source.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), not_between_source.mutation.req.source.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), not_between_source.mutation.req.source.expression_not_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, not_between_source.mutation.req.source.expression_or_predicates[0].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, not_between_source.mutation.req.source.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("1", not_between_source.mutation.req.source.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, not_between_source.mutation.req.source.expression_or_predicates[1].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, not_between_source.mutation.req.source.expression_or_predicates[1].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("3", not_between_source.mutation.req.source.expression_or_predicates[1].conditions[0].rhs[0].value_json);
+
+    var expression_not_source = try lowerUpdateMutationSourceAlloc(
+        alloc,
+        "UPDATE usage_records SET status = lower(status) WHERE NOT (array_length(tags, 1) BETWEEN 1 AND 3) FOR UPDATE RETURNING id",
+        schema,
+        &.{},
+        claim,
+    );
+    defer expression_not_source.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_not_source.mutation.req.source.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), expression_not_source.mutation.req.source.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_not_source.mutation.req.source.expression_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), expression_not_source.mutation.req.source.expression_not_predicates[0].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, expression_not_source.mutation.req.source.expression_not_predicates[0].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, expression_not_source.mutation.req.source.expression_not_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("1", expression_not_source.mutation.req.source.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, expression_not_source.mutation.req.source.expression_not_predicates[0].conditions[1].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, expression_not_source.mutation.req.source.expression_not_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("3", expression_not_source.mutation.req.source.expression_not_predicates[0].conditions[1].rhs[0].value_json);
+
     var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"queued\",\"priority\":1,\"metadata\":{}}", .version = 1 };
     try std.testing.expectError(error.UnsupportedSqlShape, lowerUpdateAlloc(
         alloc,
@@ -12240,7 +14643,7 @@ test "postgres sql adapter lowers claimed delete mutation source" {
 
     var lowered = try lowerDeleteMutationSourceAlloc(
         alloc,
-        "DELETE FROM usage_records WHERE status = 'expired' AND expires_at < $1 ORDER BY expires_at ASC LIMIT 10 RETURNING id",
+        "DELETE FROM usage_records WHERE status = 'expired' AND expires_at < $1 ORDER BY expires_at ASC LIMIT 10 RETURNING id, LOWER(status) AS status_key, expires_at + 1 AS next_expires_at",
         schema,
         &.{.{ .integer = 1000 }},
         claim,
@@ -12257,6 +14660,11 @@ test "postgres sql adapter lowers claimed delete mutation source" {
     try std.testing.expectEqual(@as(usize, 0), lowered.mutation.req.operations.len);
     try std.testing.expectEqual(@as(usize, 1), lowered.mutation.req.returning.len);
     try std.testing.expectEqualStrings("id", lowered.mutation.req.returning[0]);
+    try std.testing.expectEqual(@as(usize, 2), lowered.mutation.req.returning_expressions.len);
+    try std.testing.expectEqualStrings("status_key", lowered.mutation.req.returning_expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.mutation.req.returning_expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("next_expires_at", lowered.mutation.req.returning_expressions[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, lowered.mutation.req.returning_expressions[1].expression.kind);
 }
 
 test "postgres sql adapter lowers on conflict primary do nothing" {
@@ -12388,7 +14796,7 @@ test "postgres sql adapter lowers cross-column excluded conflict values" {
     defer parsed.deinit(alloc);
     const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
     defer runtime_schema.freeSchema(alloc, schema);
-    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"old\"}", .version = 14 };
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"old\",\"amount\":5}", .version = 14 };
 
     var lowered = try lowerInsertWithResolverAlloc(
         alloc,
@@ -12405,6 +14813,85 @@ test "postgres sql adapter lowers cross-column excluded conflict values" {
     try std.testing.expectEqualStrings("\"active\"", lowered.batch.transforms[0].operations[0].value_json.?);
     try std.testing.expectEqual(@as(u64, 14), lowered.batch.predicates[0].expected_version);
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"active\"}", lowered.batch.returning_rows[0]);
+
+    var coalesced_patch = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', null) ON CONFLICT (email) DO UPDATE SET status = coalesce(excluded.next_status, status, 'fallback') RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer coalesced_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), coalesced_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), coalesced_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", coalesced_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"old\"", coalesced_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), coalesced_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"old\"}", coalesced_patch.batch.returning_rows[0]);
+
+    var case_patch = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status, amount) VALUES ('u2', 'a@example.test', null, 10) ON CONFLICT (email) DO UPDATE SET status = CASE WHEN excluded.amount > amount THEN 'bumped' ELSE status END RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer case_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), case_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), case_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", case_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"bumped\"", case_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), case_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"bumped\"}", case_patch.batch.returning_rows[0]);
+
+    var lower_patch = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET status = lower(excluded.next_status) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lower_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), lower_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), lower_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", lower_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"active\"", lower_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), lower_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"active\"}", lower_patch.batch.returning_rows[0]);
+
+    var conditional_patch = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status, amount) VALUES ('u2', 'a@example.test', 'higher', 10) ON CONFLICT (email) DO UPDATE SET status = excluded.next_status WHERE excluded.amount > amount RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer conditional_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), conditional_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), conditional_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", conditional_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"higher\"", conditional_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), conditional_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"higher\"}", conditional_patch.batch.returning_rows[0]);
+
+    var skipped_patch = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status, amount) VALUES ('u2', 'a@example.test', 'lower', 3) ON CONFLICT (email) DO UPDATE SET status = excluded.next_status WHERE excluded.amount > amount RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer skipped_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), skipped_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 0), skipped_patch.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 0), skipped_patch.batch.transforms.len);
+    try std.testing.expectEqual(@as(usize, 0), skipped_patch.batch.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), skipped_patch.batch.returning_rows.len);
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverAlloc(
         alloc,
@@ -12502,6 +14989,34 @@ test "postgres sql adapter lowers on conflict arithmetic update" {
     try std.testing.expectEqualStrings("amount", excluded_negative_delta.batch.transforms[0].operations[0].path);
     try std.testing.expectEqualStrings("-2", excluded_negative_delta.batch.transforms[0].operations[0].value_json.?);
     try std.testing.expectEqualStrings("{\"amount\":3}", excluded_negative_delta.batch.returning_rows[0]);
+
+    var coalesced_excluded_delta = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 6) ON CONFLICT (email) DO UPDATE SET amount = amount + coalesce(excluded.amount, 4) RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer coalesced_excluded_delta.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), coalesced_excluded_delta.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.inc, coalesced_excluded_delta.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", coalesced_excluded_delta.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("6", coalesced_excluded_delta.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":11}", coalesced_excluded_delta.batch.returning_rows[0]);
+
+    var coalesced_fallback_delta = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', null) ON CONFLICT (email) DO UPDATE SET amount = amount + coalesce(excluded.amount, 4) RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer coalesced_fallback_delta.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), coalesced_fallback_delta.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.inc, coalesced_fallback_delta.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", coalesced_fallback_delta.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("4", coalesced_fallback_delta.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":9}", coalesced_fallback_delta.batch.returning_rows[0]);
 }
 
 test "postgres sql adapter lowers on conflict jsonb concat update" {
@@ -12708,6 +15223,41 @@ test "postgres sql adapter lowers row_number window query plans" {
     try std.testing.expectEqual(@as(usize, 1), lowered.plan.window.order_by.len);
     try std.testing.expectEqualStrings("row_num", lowered.plan.window.order_by[0].field);
     try std.testing.expectEqual(@as(u32, 5), lowered.plan.window.limit.?);
+
+    var ranked = try lowerWindowPlanAlloc(
+        alloc,
+        "SELECT tenant, id, rank() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS usage_rank, dense_rank() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS usage_dense_rank FROM usage_records WHERE status = 'open' ORDER BY usage_rank ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer ranked.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", ranked.table_name);
+    try std.testing.expectEqual(@as(usize, 2), ranked.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.rank, ranked.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("usage_rank", ranked.plan.window.windows[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.dense_rank, ranked.plan.window.windows[1].function);
+    try std.testing.expectEqualStrings("usage_dense_rank", ranked.plan.window.windows[1].output);
+    try std.testing.expectEqual(@as(usize, 1), ranked.plan.window.order_by.len);
+    try std.testing.expectEqualStrings("usage_rank", ranked.plan.window.order_by[0].field);
+
+    var offset_windows = try lowerWindowPlanAlloc(
+        alloc,
+        "SELECT tenant, id, lag(amount, 2, 0) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS previous_amount, lead(status) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS next_status FROM usage_records WHERE status = 'open' ORDER BY previous_amount ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer offset_windows.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", offset_windows.table_name);
+    try std.testing.expectEqual(@as(usize, 2), offset_windows.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.lag, offset_windows.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("previous_amount", offset_windows.plan.window.windows[0].output);
+    try std.testing.expectEqual(@as(u32, 2), offset_windows.plan.window.windows[0].offset);
+    try std.testing.expectEqualStrings("0", offset_windows.plan.window.windows[0].default_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, offset_windows.plan.window.windows[0].value_expression.?.kind);
+    try std.testing.expectEqualStrings("amount", offset_windows.plan.window.windows[0].value_expression.?.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.lead, offset_windows.plan.window.windows[1].function);
+    try std.testing.expectEqualStrings("next_status", offset_windows.plan.window.windows[1].output);
+    try std.testing.expectEqualStrings("status", offset_windows.plan.window.windows[1].value_expression.?.field);
 
     var cte = try lowerWindowPlanAlloc(
         alloc,

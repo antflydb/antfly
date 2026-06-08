@@ -434,35 +434,34 @@ index-local metadata; they are not a second relational column store. Joins and
 `GROUP BY`-over-join are unchanged — they already exist (see `JOINS.md`,
 `ALGEBRAIC.md`).
 
-### SQL compatibility boundary
+### SQL adapter boundary
 
 Relational mode is the storage and API substrate that a SQL DSL can target. It
 is not itself a PostgreSQL wire server, SQL parser, migration runner, or PL/SQL
-runtime. PostgreSQL-specific compatibility work such as `pgx` protocol behavior,
-`golang-migrate` replay, extensions, triggers, PL/pgSQL functions, and exact
-PostgreSQL DDL syntax belongs in an adapter layer above this model.
+runtime. PostgreSQL-specific surface work such as `pgx` protocol behavior,
+migration-file replay, extensions, triggers, PL/pgSQL functions, and exact
+PostgreSQL DDL syntax belongs in an adapter layer above the Antfly model.
 
-The useful compatibility split is:
+The useful split is:
 
-- **Adapter-level PostgreSQL compatibility:** wire protocol, SQL text parsing,
-  PostgreSQL catalog views, migration-file parsing/replay compatibility,
-  extension emulation,
-  PostgreSQL-specific DDL syntax, PL/pgSQL, trigger/function compatibility, and
-  exact error-code/message mapping. These can sit above the Antfly API and do
-  not need to change the relational storage model.
+- **Adapter-level PostgreSQL surface:** wire protocol, SQL text parsing,
+  PostgreSQL catalog views, migration-file parsing/replay behavior, extension
+  declarations, PostgreSQL-specific DDL syntax, PL/pgSQL, trigger/function
+  parsing, and exact error-code/message mapping. These sit above the Antfly API
+  and do not change the relational storage model.
 - **Model-level SQL semantics:** the durable row, index, constraint, mutation,
   query, schema-evolution, validation, rebuild, and backfill contracts that
   multiple frontends can target. These belong in relational mode itself because
   the engine must enforce them consistently for SQL, REST, SDK, and internal
   callers.
 
-The migration boundary follows the same split. PostgreSQL compatibility does not
-require byte-for-byte replay of migration files inside the storage engine. The
-engine needs to produce equivalent catalog state, derived-index state,
+The migration boundary follows the same split. The storage engine does not need
+byte-for-byte replay of PostgreSQL migration files. The engine needs to produce
+equivalent catalog state, derived-index state,
 constraint state, server-update policies, and data rewrites through
-Antfly-native typed plans. Exact PostgreSQL migration-file replay is adapter
-compatibility that can be added later by parsing those files and lowering
-supported statements into the same native schema, expression, rewrite,
+Antfly-native typed plans. Exact migration-file replay can live in the adapter
+by parsing those files and lowering supported statements into the same native
+schema, expression, rewrite,
 validation, and rebuild operations.
 
 The long-term layering is:
@@ -507,18 +506,18 @@ PostgreSQL-shaped SQL surface should land in these tracks:
 | Track | Current model shape | Long-term production plan |
 | --- | --- | --- |
 | Partial, expression, and partial-unique indexes | Ordinary secondary indexes carry lifecycle state and rebuild generations; simple `lower(field)` expression indexes lower through generated-column metadata; partial predicates exist on secondary indexes and unique constraints; queries use only `ready` indexes and writes enforce only promoted unique constraints. | Move all partial predicates and expression keys onto one typed expression AST. Use one implication checker for query pushdown, uniqueness enforcement, and `ON CONFLICT ... WHERE`. Route expression-derived rebuilds through the same generation-aware catalog work, range repair, all-range readiness gate, and schema compare-and-swap promotion used by ordinary indexes. |
-| Raw DML syntax: `INSERT`, `UPDATE`, `DELETE`, `ON CONFLICT`, `RETURNING` | Point row-batch plans cover primary/unique selectors, `ON CONFLICT DO NOTHING/UPDATE`, `excluded.column`, numeric conflict deltas such as `SET amount = amount + excluded.amount`, arithmetic updates, JSONB/array transforms, defaults, `NOW()`, table-owned updated-at policies, field `RETURNING`, and committed-row `returning_expressions` over the shared row-expression AST. Local transaction-aware `mutation_source` plans now update/delete rows selected from a lockable typed row query, require a `FOR UPDATE` row claim, stage through the claiming transaction, add committed-version predicates from the selected preimages, and have an API parser/response contract plus PostgreSQL-adapter lowering for bounded `UPDATE ... WHERE ... [ORDER BY] [LIMIT] [FOR UPDATE SKIP LOCKED] RETURNING ...` and `DELETE ... WHERE ...` sources. | Resolve every non-primary selector through durable unique-owner rows before prepare. Evaluate conflict actions, generated columns, server-owned policies, update transforms, and remaining conflict-action expressions over the final committed image through the shared expression tree, then extend mutation sources to routed multi-range fill and hosted 2PC participant planning. |
-| Query predicates, projection expressions, ordering, and pagination | Typed row-query plans cover scalar predicates, JSONB/array predicates, OR/NOT groups, generated-column pushdown, null-test ordering, executable typed expression predicates, executable typed expression order keys, `ORDER BY`, `LIMIT`, `OFFSET`, row claims for base-row streams, and API-native expression projections over fields, literals, `coalesce`, `lower`, `concat`, `nullif`, `add`, `sub`, `mul`, `div`, searched `case` branches, typed `cast` nodes, typed JSON path extraction, and typed array length. SQL `field AS label`, `COALESCE(...) AS label`, `LOWER(field) AS label`, `CONCAT(...) AS label`, `NULLIF(...) AS label`, searched `CASE WHEN ... THEN ... ELSE ... END AS label`, `CAST(expr AS text|numeric|bool) AS label`, JSON extraction such as `metadata->'flags' AS flags` and `metadata->>'source' AS label`, `array_length(tags, 1) AS label`, and numeric `+`, `-`, `*`, and `/` projections lower into that same row-query expression projection while existing projection encoders continue to emit the public result shape. SQL `WHERE lower(field) = ...` still uses a stored generated column when one exists, otherwise it lowers to a typed expression predicate; `COALESCE`, `array_length`, and numeric arithmetic predicates lower the same way. `ORDER BY lower(field)` follows the same pushdown/residual split; `ORDER BY COALESCE(...)`, `ORDER BY array_length(...)`, and arithmetic order expressions lower to typed expression order keys. | Replace remaining shape-specific predicate/projection/order cases with one bound scalar expression tree. Planner pushdown is derived from that tree only when it maps to primary, unique, generated, column-major, array, JSON, or embedded-JSON access paths; otherwise evaluation happens over hydrated bounded streams or fails closed. |
+| Raw DML syntax: `INSERT`, `UPDATE`, `DELETE`, `ON CONFLICT`, `RETURNING` | Point row-batch plans cover primary/unique selectors, `ON CONFLICT DO NOTHING/UPDATE`, `excluded.column`, numeric conflict deltas such as `SET amount = amount + excluded.amount`, source-qualified typed `increment_expr` deltas over existing/proposed rows such as `SET amount = amount + COALESCE(excluded.amount, 0)`, and source-qualified typed `patch_expr` assignments over existing/proposed rows, literals, casts, `LOWER`, `UPPER`, `COALESCE`, `NULLIF`, searched `CASE`, `array_length`, and numeric arithmetic. Conflict-action `WHERE` predicates lower to native `where_expression` conditions over the same existing/proposed row sources; false predicates skip the update and emit no `RETURNING` row. Arithmetic updates, JSONB/array transforms, defaults, `NOW()`, table-owned updated-at policies, field `RETURNING`, and committed-row `returning_expressions` over the shared row-expression AST also lower to typed row-batch plans. Transaction-aware `mutation_source` plans update/delete rows selected from a lockable typed row query, require a `FOR UPDATE` row claim, stage through the claiming transaction, preserve the same typed source-query surface as reads including scalar OR/NOT, computed `expression_where`, `expression_any`, `expression_not`, computed-array containment, and row-claim metadata, reject CTE and physical doc-key range sources at the typed boundary, add committed-version predicates from the selected preimages, materialize `patch_expr`/`increment_expr` per selected row before staging, apply table-owned update policies and generated columns to that final image, and project field plus expression `RETURNING` output from the same planned image. The public `/tables/{tableName}/rows:mutation-source` endpoint, OpenAPI contract, and SDK models expose that typed mutation-source plan directly; PostgreSQL-adapter lowering covers bounded `UPDATE ... WHERE ... [ORDER BY] [LIMIT] [FOR UPDATE SKIP LOCKED] RETURNING ...` and `DELETE ... WHERE ...` sources. | Resolve every non-primary selector through durable unique-owner rows before prepare, then extend mutation sources to routed multi-range fill and hosted 2PC participant planning. Keep conflict actions, generated columns, server-owned policies, update transforms, and mutation result projection on the shared expression tree so local and routed execution use the same final-image semantics. |
+| Query predicates, projection expressions, ordering, and pagination | Typed row-query plans cover scalar predicates, native null-safe distinct predicates, JSONB/array predicates, text-pattern predicates over keyword/text/link columns, OR/NOT groups, generated-column pushdown, null-test ordering, executable typed expression predicates, executable typed expression OR/NOT groups, executable typed expression order keys, `ORDER BY`, `LIMIT`, `OFFSET`, row claims for base-row streams, and API-native expression projections over fields, literals, statement-bound `now`, `coalesce`, `lower`, `upper`, `concat`, `nullif`, `add`, `sub`, `mul`, `div`, searched `case` branches, typed `cast` nodes, typed JSON path extraction, typed array length, and typed `string_to_array`. SQL `field AS label`, `NOW() AS label`, `COALESCE(...) AS label`, `LOWER(field) AS label`, `UPPER(field) AS label`, `CONCAT(...) AS label`, `NULLIF(...) AS label`, searched `CASE WHEN ... THEN ... ELSE ... END AS label`, `CAST(expr AS text|numeric|bool) AS label`, JSON extraction such as `metadata->'flags' AS flags` and `metadata->>'source' AS label`, `array_length(tags, 1) AS label`, `string_to_array(scope, ' ') AS scope_parts`, and numeric `+`, `-`, `*`, and `/` projections lower into that same row-query expression projection while existing projection encoders continue to emit the public result shape. SQL `WHERE lower(field) = ...` still uses a stored generated column when one exists, otherwise it lowers to a typed expression predicate; `WHERE upper(field) = ...`, `COALESCE`, `array_length`, numeric arithmetic predicates, SQL `IS [NOT] DISTINCT FROM`, SQL `BETWEEN`/`NOT BETWEEN`, SQL `NOT (...)` over computed predicates, and SQL `LIKE`/`ILIKE` over declared text-like columns lower into typed predicates. Scalar `BETWEEN` becomes native `>=` plus `<=` predicates, scalar `NOT BETWEEN` becomes a native OR group of `< low` or `> high`, computed expression `BETWEEN` becomes two expression predicates over the same cloned left-hand typed expression, computed expression `NOT BETWEEN` becomes an `expression_any` OR group of `< low` or `> high` branches, and `NOT (computed expression conditions...)` becomes an `expression_not` group. `ORDER BY lower(field)` follows the same pushdown/residual split; `ORDER BY upper(field)`, `ORDER BY COALESCE(...)`, `ORDER BY array_length(...)`, and arithmetic order expressions lower to typed expression order keys. | Replace remaining shape-specific predicate/projection/order cases with one bound scalar expression tree. Planner pushdown is derived from that tree only when it maps to primary, unique, generated, column-major, text-pattern, array, JSON, or embedded-JSON access paths; otherwise evaluation happens over hydrated bounded streams or fails closed. |
 | JSONB and array operators | Declared `json` and `array` columns lower to typed path predicates, structured/text extraction with `->`/`->>`, containment/existence, `jsonb_set`, JSON construction/concat, array membership/equality/containment, and append/remove/add-to-set transforms. | Treat SQL operators such as `->`, `->>`, `@>`, `jsonb_set`, `ANY`, `array_length`, and array containment as adapter sugar over typed JSON/array nodes. Indexed JSON-column schemas and dynamic-template changes schedule explicit embedded document-index rebuild work rather than bypassing the relational row model. |
-| `FOR UPDATE`, `FOR UPDATE SKIP LOCKED`, and queues | Row-claim metadata exists for lockable base-row streams, and local mutation sources can stage claimed update/delete intents with OCC predicates in the claiming transaction. | Add ordered multi-range fill, durable claim ownership beyond local transaction intents, lease/retry semantics, hosted participant registration, and range-movement chaos coverage. Keep claims illegal over joins, aggregates, windows, and materialized CTEs until those stages expose a lockable base-row source. Gate queue workloads with chaos tests that move ranges while writers and claimers run. |
-| Joins, CTEs, aggregates, and windows | Local equality joins, non-recursive CTE lowering, scalar aggregate lowering, scalar `FILTER`, executable typed aggregate filter expressions, typed aggregate input expressions for scalar expression keys such as `COUNT(DISTINCT lower(status))`, `COUNT(DISTINCT coalesce(status, 'missing'))`, and numeric expression inputs such as `SUM(amount - discount)`, `SUM(coalesce(amount, 0))`, and `SUM(array_length(tags, 1))`, scalar `DISTINCT`, bounded ordered `array_agg`, `GROUP BY`, `HAVING`, aggregate ordering, aggregate pagination, native aggregate API parsing, native equality join API parsing, native ordered CTE plan parsing, local `row_number()` windows with native window API parsing, and bounded local `LEFT JOIN LATERAL` stages with native lateral API parsing have typed plan homes. | Add routed cross-table/cross-range stream execution, CTE output-schema tracking, bounded materialization with spill/fail policy, spill-backed distinct aggregate state, broader JSON/array/complex aggregate filters and distinct keys over the shared expression tree, routed/cross-range lateral execution, broader window functions/frames, and routed/spill-safe window execution. |
+| `FOR UPDATE`, `FOR UPDATE SKIP LOCKED`, and queues | Row-claim metadata exists for lockable base-row streams, and local mutation sources stage claimed update/delete intents with OCC predicates, per-row expression transforms, server-owned update policies, generated-column repair, and final-image `RETURNING` projections in the claiming transaction. | Add ordered multi-range fill, durable claim ownership beyond local transaction intents, lease/retry semantics, hosted participant registration, and range-movement chaos coverage. Keep claims illegal over joins, aggregates, windows, and materialized CTEs until those stages expose a lockable base-row source. Gate queue workloads with chaos tests that move ranges while writers and claimers run. |
+| Joins, CTEs, aggregates, and windows | Local equality joins, non-recursive CTE lowering, scalar aggregate lowering, scalar `FILTER`, executable typed aggregate filter expressions, typed aggregate input expressions for scalar expression keys such as `COUNT(DISTINCT lower(status))`, `COUNT(DISTINCT coalesce(status, 'missing'))`, and numeric expression inputs such as `SUM(amount - discount)`, `SUM(coalesce(amount, 0))`, and `SUM(array_length(tags, 1))`, scalar `DISTINCT`, bounded ordered `array_agg`, `GROUP BY`, `HAVING`, aggregate ordering, aggregate pagination, native aggregate API parsing, native equality join API parsing, native ordered CTE plan parsing, local `row_number()`, `rank()`, `dense_rank()`, `lag()`, and `lead()` windows with native window API parsing, and bounded local `LEFT JOIN LATERAL` stages with native lateral API parsing have typed plan homes. | Add routed cross-table/cross-range stream execution, CTE output-schema tracking, bounded materialization with spill/fail policy, spill-backed distinct aggregate state, broader JSON/array/complex aggregate filters and distinct keys over the shared expression tree, routed/cross-range lateral execution, richer window frame semantics and additional frame-aware functions, and routed/spill-safe window execution. |
 | SQL compatibility evidence | Supported SQL fails closed into typed DDL, row-query, mutation, aggregate, join, CTE, and expression plans; unsupported syntax does not pass through storage. | Harvest a representative SQL and migration-equivalence corpus, bind it against Antfly catalog snapshots, record golden typed plans or intentional unsupported classifications, run representative row/identity/constraint/queue/JSON/usage flows, and add chaos/sim workloads that combine live writes, FK actions, unique-owner repair, secondary and embedded-JSON rebuilds, row claims, joins, aggregates, range movement, catalog promotion, and native schema/rewrite/rebuild jobs. |
 
 This means the important missing work is model-level, even when the visible
-syntax is PostgreSQL: partial/expression index completeness, multi-row DML,
-full `ON CONFLICT ... DO UPDATE` expressions, committed-image `RETURNING`
-expressions, routed joins, CTE materialization, aggregate/window stages,
-queue-safe locking, and representative SQL corpus gates. Adapter-only compatibility
+syntax is PostgreSQL: partial/expression index completeness, routed multi-range
+DML, routed joins, CTE materialization, aggregate/window spill and routing,
+durable cross-range queue ownership, and representative SQL corpus gates.
+Adapter-only compatibility
 such as `pgx` protocol behavior, SQLSTATE text, catalog views, extensions,
 dump boilerplate, and PL/pgSQL syntax should remain above this layer.
 
@@ -642,11 +641,40 @@ and typed partial predicates without copying SQL text into storage metadata. The
 conflict target and partial-index predicate must be part of the durable plan so
 concurrent inserts for the same unique value conflict on the same owner record.
 Conflict update assignments compile into the same typed mutation operations as
-ordinary updates: literal/default patches, numeric increments, JSON path sets,
-JSON object concat/build patches, and array append/remove/add-to-set transforms.
-`excluded.column` is resolved from the typed proposed row before prepare, and
-numeric deltas such as `SET amount = amount + excluded.amount` compile to typed
-increment operations with the proposed row's value as the delta.
+ordinary updates: literal/default patches, numeric increments, source-qualified
+`patch_expr` assignments, source-qualified `increment_expr` deltas, JSON path
+sets, JSON object concat/build patches, and array append/remove/add-to-set
+transforms.
+The public REST/SDK contract exposes these as named typed structs, not
+anonymous adapter blobs: `RowsFieldPatch`, `RowsNumericIncrement`,
+`RowsExpressionAssignmentMap`, `RowsJsonSetTransform`,
+`RowsArrayUpdateTransform`, `RowsConflictTarget`, `RowsConflictUniqueTarget`,
+`RowsUniquePredicateGroup`, and `RowsOnConflict`. Ordinary row-batch
+`RowOperation` and transaction-claimed `RowsMutationSourceRequest` share those
+same update operator schemas, while `RowOperation.on_conflict` adds the conflict
+target, action, and optional `where_expression` guard. That keeps SQL lowering
+and direct REST/SDK writes on one typed mutation-plan surface.
+`excluded.column` is resolved from the typed proposed row before prepare.
+Value expressions such as
+`SET status = COALESCE(excluded.next_status, status, 'fallback')`,
+`SET status = CASE WHEN excluded.amount > amount THEN 'bumped' ELSE status END`,
+and `SET status = LOWER(excluded.next_status)` compile to typed `patch_expr`
+operations.
+Numeric deltas such as `SET amount = amount + excluded.amount` and
+`SET amount = amount + COALESCE(excluded.amount, 0)` compile to typed increment
+operations. These conflict expressions lower through the native row-expression
+AST as `patch_expr` or `increment_expr`, where `{ "source": "proposed" }` names
+the inserted row and `{ "source": "existing" }` names the resolved conflict row.
+Assignment expressions are bound against the target column type, while condition
+subexpressions can compare any valid existing/proposed fields. Ordinary query
+expressions still use unqualified row fields.
+SQL conflict action predicates such as
+`DO UPDATE SET status = excluded.next_status WHERE excluded.amount > amount`
+compile to a native `where_expression` condition on `on_conflict`. This is
+separate from partial unique target predicates: target predicates choose the
+unique owner row, while action predicates decide whether the resolved conflict
+row is transformed. A false action predicate appends no transform, no version
+predicate, and no `RETURNING` row.
 `SET field = DEFAULT` resolves through the field's declared Antfly default
 instead of storing a SQL expression.
 For a partial unique constraint, the row API requires the conflict target to
@@ -699,15 +727,20 @@ The row API exposes this as typed `returning` fields and
 `returning_expressions` on each mutation. Field returning covers
 `{ "returning": ["tenant_id", "id", "status"] }` and `{ "returning": ["*"] }`.
 Expression returning uses the same row-expression AST as query projections and
-currently supports field/literal, `coalesce`, `lower`, `concat`, `nullif`,
-numeric arithmetic, searched `case`, typed `cast`, JSON path extraction, and
-array length nodes. PostgreSQL `RETURNING field`, aliases, `LOWER(...)`,
+currently supports field/literal, statement-bound `now`, `coalesce`, `lower`,
+`upper`, `concat`, `nullif`, numeric arithmetic, searched `case`, typed `cast`,
+JSON path extraction, and array length nodes. PostgreSQL `RETURNING field`,
+aliases, `NOW() AS label`, `LOWER(...)`,
+`UPPER(...)`,
 `CONCAT(...)`, `COALESCE(...)`, `NULLIF(...)`, searched `CASE`, `CAST(...)`,
 JSON extraction, array length, and numeric arithmetic projections lower into
 those typed row-batch fields/expressions. The same `returning` plus
 `returning_expressions` shape is accepted on mutation-source update/delete plans
-so routed execution can preserve projected result contracts without carrying SQL
-text. The result is emitted as a `returning` array on the batch or
+so local and routed execution can preserve projected result contracts without
+carrying SQL text. Source-update plans evaluate `patch_expr` and
+`increment_expr` once per selected row, apply table-owned update policies and
+generated-column updates, and then evaluate `returning_expressions` from that
+planned post-image. The result is emitted as a `returning` array on the batch or
 mutation-source response. Inserts project the proposed row image.
 Updates resolve the base row, apply the same transform logic used by storage,
 and project the post-image. Deletes project the resolved pre-delete row image.
@@ -739,23 +772,28 @@ for queue and ledger workloads:
 
 Claims are transaction-bound. The query/API contract carries `mode`,
 `skip_locked`, `lease_ms`, `owner_id`, and a 16-byte transaction identity exposed
-as `transaction_id`/`txn_id` hex at the API boundary. Storage lowers each claimed
-base row to a metadata key under `txn_row_claim:<row-key>` and writes a pending
-2PC delete intent for that key. The intent is the lock: competing claimers and
-ordinary writers both hit the same transaction-manager conflict check. Ordinary
-batch and transaction mutations add an expected-absent predicate on the row claim
-key, so a pending claim blocks direct writes, transactional writes, updates, and
-deletes until the claiming transaction commits or aborts. Transaction resolution
-always consumes row-claim intent keys instead of applying them as user data, so a
-commit releases the lock rather than leaving a durable row-claim record behind.
+as `transaction_id` hex at the API boundary; `txn_id` is accepted as an adapter
+alias. `mode` is currently `for_update`, `skip_locked` defaults to `false`,
+`lease_ms` defaults to `30000`, and `transaction_id` must be 32 hexadecimal
+characters. Storage lowers each claimed base row to a metadata key under
+`txn_row_claim:<row-key>` and writes a pending 2PC delete intent for that key.
+The intent is the lock: competing claimers and ordinary writers both hit the
+same transaction-manager conflict check. Ordinary batch and transaction
+mutations add an expected-absent predicate on the row claim key, so a pending
+claim blocks direct writes, transactional writes, updates, and deletes until the
+claiming transaction commits or aborts. Transaction resolution always consumes
+row-claim intent keys instead of applying them as user data, so a commit
+releases the lock rather than leaving a durable row-claim record behind.
 
 The typed relational row-query request carries this as `row_claim` beside
 `where`, `order_by`, `doc_key_range`, `limit`, and `offset`. The optional
-`doc_key_range` is a start-inclusive/end-exclusive physical row-key span. The
-row-query executor clips both base-row scans and index-derived candidates to
-that span before ordering and claiming, so a distributed planner can execute the
-same typed query independently on each table/range owner. The local coordinator
-contract accepts multiple non-overlapping owner spans, merges the hydrated
+`doc_key_range` is a start-inclusive/end-exclusive physical row-key span with
+`start`, `end`, or both; an empty range is rejected, and a bounded range must
+have `start < end`. The row-query executor clips both base-row scans and
+index-derived candidates to that span before ordering and claiming, so a
+distributed planner can execute the same typed query independently on each
+table/range owner. The local coordinator contract accepts multiple
+non-overlapping owner spans, merges the hydrated
 candidate streams into one globally ordered row stream, and applies `OFFSET`,
 `LIMIT`, projection, and row claiming once after that merge. `skip_locked:
 false` claims all returned base rows or fails with the underlying intent
@@ -1078,9 +1116,9 @@ row image. Updates and conflict-target updates that touch tables with checks or
 generated columns resolve the base row, apply the requested patch/JSON updates,
 regenerate stored generated values as ordinary transform operations, and
 validate checks against that final planned row image. `CHECK` predicates are
-named typed atoms (`is_null`, `is_not_null`, `eq`, `ne`, `gt`, `gte`, `lt`,
-`lte`) over declared columns so REST, SDK, and future SQL adapters compile to
-the same backend contract.
+named typed atoms (`is_null`, `is_not_null`, `is_distinct`,
+`is_not_distinct`, `eq`, `ne`, `gt`, `gte`, `lt`, `lte`) over declared columns
+so REST, SDK, and future SQL adapters compile to the same backend contract.
 
 #### Relational query lowering
 
@@ -1281,8 +1319,8 @@ not as SQL text:
 
 The same contract also accepts shorthand equality filters such as
 `{ "where": { "status": "ready" } }`. Scalar predicates are typed atoms over
-declared relational columns (`is_null`, `is_not_null`, `eq`, `ne`, `gt`, `gte`,
-`lt`, `lte`). Array and JSON operators are also typed atoms: `array_any`
+declared relational columns (`is_null`, `is_not_null`, `is_distinct`,
+`is_not_distinct`, `eq`, `ne`, `gt`, `gte`, `lt`, `lte`). Array and JSON operators are also typed atoms: `array_any`
 requires a declared `array` column and compares one typed JSON value against
 array elements; `array_contains` requires a declared `array` column and an array
 operand whose elements must all be present; `array_eq` requires a declared
@@ -1290,8 +1328,13 @@ operand whose elements must all be present; `array_eq` requires a declared
 requires a declared `json` column and uses recursive JSON containment semantics;
 `json_path_eq` requires a declared `json` column, a structured path, and an
 exact JSON value; `json_path_exists` requires a declared `json` column and a
-structured path. `where.any` carries scalar disjunction branches: each branch is
-either one scalar atom or an `all` list of scalar atoms, branches are unioned,
+structured path. `is_distinct` and `is_not_distinct` are null-safe equality
+predicates. Missing row fields are treated as JSON `null`, so `is_not_distinct`
+with a `null` value matches both absent and explicit-null fields, and
+`is_distinct` is its logical inverse. The SQL adapter lowers `IS DISTINCT FROM`
+and `IS NOT DISTINCT FROM` to these native row-query operators rather than
+rewriting them to ordinary `eq`/`ne` predicates. `where.any` carries scalar
+disjunction branches: each branch is either one scalar atom or an `all` list of scalar atoms, branches are unioned,
 and the row must match at least one branch in addition to any top-level `all`
 predicates. Indexed scalar OR branches are planned as independent candidate
 sets and unioned before authoritative hydrated-row recheck; unindexable branches
@@ -1304,12 +1347,27 @@ prove the subtraction is complete for indexed and unindexed paths.
 Projections are field lists or `["*"]` plus `expressions` for the shared
 row-expression AST. Compact API projection lists such as `json_extract`,
 `array_length`, `coalesce`, and `field_aliases` are still accepted for direct
-REST/SDK callers, but SQL lowering targets row-expression projections for field
-aliases, JSON extraction, array length, and COALESCE. Expression projections currently cover `field`, JSON-literal
-`value`, `coalesce`, `lower`, `concat`, `nullif`, `add`, `sub`, `mul`, `div`,
+REST/SDK callers as typed structs: `RowsJsonExtractProjection` requires
+`as`, `field`, `path`, and optional `as_text`; `RowsArrayLengthProjection`
+requires `as` and `field`; `RowsCoalesceProjection` requires `as` and one or
+more `RowsCoalesceOperand` entries, each exactly one of `field` or `value`; and
+`RowsFieldAliasProjection` requires `as` and `field`. SQL lowering targets
+row-expression projections for field aliases, JSON extraction, array length,
+and COALESCE. Public OpenAPI/SDK contracts expose computed nodes through one
+shared `RowsExpression` schema plus expression-condition/projection wrappers,
+so query predicates, order keys, aggregate inputs/filters, window value
+expressions, mutation-source expression assignments, and `RETURNING`
+expressions all use the same typed AST shape.
+Nested operator operands and searched `case` branches are typed recursive
+`RowsExpression` nodes rather than endpoint-local JSON blobs. Public route
+handlers still validate each expression against the table schema before
+execution. Expression projections currently cover `field`, JSON-literal
+`value`, statement-bound `now`, `coalesce`, `lower`, `upper`, `concat`, `nullif`, `add`, `sub`, `mul`, `div`,
 searched `case` branches, typed `cast` nodes, `json_extract`, and
-`array_length`; `coalesce` emits the first present
-non-null operand, `lower` emits a lowercased string or `null`, and `concat`
+`array_length`, and `string_to_array`; `now` emits the nanosecond timestamp
+bound when the typed plan was parsed/lowered, `coalesce` emits the first present
+non-null operand, `lower` emits a lowercased string or `null`, `upper` emits an
+uppercased string or `null`, and `concat`
 emits the concatenated scalar text of each operand while treating null operands
 as empty strings. `nullif` emits `null` when both non-null operands are equal,
 otherwise it emits the first operand. `add`, `sub`, `mul`, and `div` accept
@@ -1317,7 +1375,7 @@ numeric operands, propagate `null`, and reject non-numeric operands at the
 typed-plan boundary. Division by zero is rejected during expression evaluation.
 `case` evaluates typed searched branches in order; branch conditions use the
 same scalar comparison operators as row predicates (`eq`, `ne`, `gt`, `gte`,
-`lt`, `lte`, `is_null`, `is_not_null`) and emit the matching branch expression
+`lt`, `lte`, `is_null`, `is_not_null`, `is_distinct`, `is_not_distinct`) and emit the matching branch expression
 or the required `else` expression. `cast` accepts one operand and a typed target
 (`text`, `numeric`, or `bool`), propagates `null`, and rejects unsupported
 runtime conversions instead of carrying SQL cast text into storage.
@@ -1327,11 +1385,25 @@ emits the selected JSON value, and text extraction mirrors `->>` by returning a
 string for non-string scalars and structured JSON values.
 `array_length` accepts one declared array operand, emits a numeric length,
 propagates `null`, and rejects non-array runtime values.
+`string_to_array` accepts one text-like expression and one non-empty string
+delimiter expression, emits a JSON array of string parts, propagates `null` from
+either operand, and rejects non-string runtime values.
+`expression_array_contains` is the REST/SDK predicate form for computed arrays:
+each item carries an `expr` row-expression plus an array `value`, and hydrated
+rows match when the computed array contains every requested value. This is the
+typed home for SQL sugar such as
+`string_to_array(scope, ' ') @> $json_array`; declared array-column containment
+continues to use `where` atoms with `op: "array_contains"` so index pushdown can
+stay column-aware.
+Exact computed-array equality and inequality use the existing `expression_where`
+form with `op: "eq"` or `op: "ne"` and an array-valued `rhs`, which keeps
+structured expression comparison on the shared row-expression predicate path.
 SQL shapes such as
-`field AS label`, `COALESCE(...) AS label`, `LOWER(field) AS label`, `CONCAT(...) AS label`,
+`field AS label`, `COALESCE(...) AS label`, `LOWER(field) AS label`, `UPPER(field) AS label`, `CONCAT(...) AS label`,
 `NULLIF(...) AS label`, searched `CASE WHEN ... THEN ... ELSE ... END AS label`,
 `CAST(expr AS text|numeric|bool) AS label`, `metadata->'flags' AS flags`,
-`metadata->>'source' AS label`, `array_length(tags, 1) AS label`, numeric
+`metadata->>'source' AS label`, `array_length(tags, 1) AS label`,
+`string_to_array(scope, ' ') AS scope_parts`, numeric
 arithmetic projections with `+`, `-`, `*`, and `/`, and `id::text AS id_text`
 lower to typed projection nodes rather than carrying SQL cast/function strings
 into storage. Ordering is over
@@ -1342,11 +1414,36 @@ keys sort after present scalar values for plain field ordering; null-test order
 keys sort by the produced boolean value. The executor projects from the
 relational row JSON/codec and applies `OFFSET`/`LIMIT` after filtering and
 ordering.
-`doc_key_range` is optional; when present, it scopes the query to a
-start-inclusive/end-exclusive physical doc-key span before ordering,
-pagination, projection, or row claiming. That makes range owners a planner
-concern instead of a SQL syntax concern: SQL/REST/SDK adapters all target the
-same typed span contract.
+Text-pattern predicates are native row-query predicates, not SQL strings. The
+REST/SDK shape is:
+
+```json
+{
+  "where": {
+    "field": "name",
+    "op": "text_pattern",
+    "pattern": "a%",
+    "case_insensitive": true
+  }
+}
+```
+
+`pattern` uses SQL `LIKE` wildcards (`%` for any span, `_` for one byte) with
+backslash escapes for literal wildcard bytes. `case_insensitive` gives the
+ASCII-insensitive `ILIKE` behavior, and `negated` represents `NOT LIKE` /
+`NOT ILIKE`. Without a declared text-pattern access path, the planner evaluates
+these predicates over hydrated bounded row streams.
+`row_claim` and `doc_key_range` are internal/coordinator fields on the shared
+row-query struct, not free-form public query knobs. Their REST/SDK schemas are
+typed as `RowsRowClaim` and `RowsDocKeyRange` so internal/coordinator callers
+get the same validation contract as the Zig parser. Public row-plan endpoints
+reject `row_claim`; lockable public access goes through
+`/tables/{table}/rows:mutation-source`, where the source must carry a
+transaction-bound `row_claim`. Public endpoints also reject `doc_key_range`.
+After durable table/range ownership routing chooses owner spans, internal
+coordinators can attach a start-inclusive/end-exclusive `doc_key_range` before
+storage scans so physical placement remains a planner concern instead of a SQL
+syntax concern.
 
 The DB executor uses the same relational filter pushdown machinery as search.
 Exact equality predicates that fully determine the primary key or a declared
@@ -1378,10 +1475,11 @@ A coordinator can also issue one typed row query across multiple non-overlapping
 physical row-key spans. Each span is resolved against the same base-row and
 index contracts, then the coordinator globally orders the merged candidates and
 applies pagination, projection, and optional row claims exactly once. This is
-the model-level equivalent of a SQL range router: SQL, REST, and SDK adapters
-choose spans from durable table/range ownership metadata, but the executor only
-sees typed `doc_key_range` bounds and row-query atoms. The table catalog exposes
-that bridge as a typed table doc-key range plan: it sorts the table's durable
+the model-level equivalent of a SQL range router: public SQL/REST/SDK adapters
+target logical typed row plans, while internal coordinators choose spans from
+durable table/range ownership metadata and the storage executor sees typed
+`doc_key_range` bounds plus row-query atoms. The table catalog exposes that
+bridge as a typed table doc-key range plan: it sorts the table's durable
 `RangeRecord`s, clips a requested key span to each owner range, returns the
 owning `group_id`, and stamps each span with the table topology epoch. Hosted
 and provisioned routers can validate the epoch before executing the span, then
@@ -1404,6 +1502,9 @@ request is a source row query plus typed group keys and named metrics:
     { "name": "amount_min", "op": "min", "field": "amount" },
     { "name": "amount_max", "op": "max", "field": "amount" }
   ],
+  "having": {
+    "all": [{ "field": "amount_sum", "op": "gt", "value": 100 }]
+  },
   "order_by": [{ "field": "amount_sum", "direction": "desc" }],
   "limit": 100,
   "offset": 0
@@ -1419,8 +1520,15 @@ a field is `count(*)`; `count` with a field ignores null/missing values. Numeric
 metrics ignore null/missing values and reject non-numeric inputs for the metric
 field. Aggregate `order_by` sorts over the emitted group/metric rows before
 `offset` and `limit`, so SQL `ORDER BY amount_sum DESC LIMIT ...` lowers without
-re-reading base rows. This gives a future SQL adapter a direct lowering target for
-single-table `GROUP BY` before join streams are attached.
+re-reading base rows. Aggregate `having` is a typed conjunction over emitted
+group/metric fields and is encoded as `{ "all": [...] }`; each predicate uses
+the same scalar comparison operators as row predicates (`eq`, `ne`, `gt`,
+`gte`, `lt`, `lte`, `is_null`, `is_not_null`, `is_distinct`, and
+`is_not_distinct`). SQL adapter lowering for ordinary `HAVING a AND b` targets
+this explicit group shape. Unsupported `OR` or nested boolean aggregate-output
+predicates fail closed until the shared boolean expression planner owns
+aggregate-output predicates. This gives a future SQL adapter a direct lowering
+target for single-table `GROUP BY` before join streams are attached.
 
 Joins compose two typed row-query sources with explicit equality predicates and
 projection fields:
@@ -1497,8 +1605,9 @@ join/lateral sides, or the final row query can name a materialized source with
 including declared indexes, before materialization; predicates over a
 materialized CTE are evaluated against that materialized row stream. Native
 REST/SDK plan parsers use the same ordered typed contract and reject forward
-references, duplicate CTE names, durable row claims, and physical doc-key ranges
-inside CTE definitions. Durable row claims and physical doc-key ranges are
+references, duplicate CTE names, missing final-stage `source_cte` references
+from query, aggregate, window, join, and lateral plans, durable row claims, and
+physical doc-key ranges inside CTE definitions. Durable row claims and physical doc-key ranges are
 base-row planner features and are rejected over materialized CTE sources.
 The PostgreSQL adapter exposes this through `lowerQueryPlanAlloc`: non-recursive
 `WITH name AS (SELECT ...) ... SELECT ... FROM name` lowers to ordered CTE
@@ -1555,17 +1664,18 @@ Current PR status:
   constraint to enforced state after validation; row-query
   lowering for equality/range/null predicates,
   JSONB extraction/containment/existence, array equality/containment/membership,
+  text-pattern predicates for SQL `LIKE`/`ILIKE` over declared text-like columns,
   generated `lower(...)` pushdown, scalar OR
-  predicate groups with unioned candidate planning, null-safe
-  `IS NOT DISTINCT FROM` predicates normalized to `eq` or `is_null` from bound
-  parameters, typed null-test ordering, typed expression order keys,
+  predicate groups with unioned candidate planning, native null-safe
+  `is_distinct`/`is_not_distinct` predicates with SQL
+  `IS [NOT] DISTINCT FROM` lowering, typed null-test ordering, typed expression order keys,
   `ORDER BY`, `LIMIT`/`OFFSET`,
   `FOR UPDATE [SKIP LOCKED]`, and typed projection aliases for
-  `array_length(...)`, simple `COALESCE(...)`, `LOWER(field)`, `CONCAT(...)`,
+  `array_length(...)`, `string_to_array(...)`, simple `COALESCE(...)`, `LOWER(field)`, `UPPER(field)`, `CONCAT(...)`,
   `NULLIF(...)`, numeric `+`/`-`/`*`/`/` projection expressions, and field/cast
   aliases such as `id::text AS id_text`, with JSON extraction via `->` and `->>`
-  and `array_length(...)` lowering into the shared expression AST, and SQL
-  `ORDER BY lower(field)`, `ORDER BY COALESCE(...)`,
+  and `array_length(...)` plus `string_to_array(...)` lowering into the shared expression AST, and SQL
+  `ORDER BY lower(field)`, `ORDER BY upper(field)`, `ORDER BY COALESCE(...)`,
   `ORDER BY array_length(...)`, and numeric arithmetic lowering to expression
   order keys when no generated-column pushdown exists;
   row-batch lowering for
@@ -1573,9 +1683,14 @@ Current PR status:
   partial-unique, and expression-unique targets, arithmetic increments, JSONB
   patch/set/concat/build/convert operations, typed array append/remove/add-to-set
   transforms, same-column and typed cross-column `excluded.column` conflict
-  value reuse, numeric conflict deltas from `excluded` values,
-  conflict-action `DEFAULT`, explicit `NOW()`, explicit SQL `DEFAULT`, and
-  table-owned `now_ns` update policies for updated-at columns;
+  value reuse, numeric conflict deltas from `excluded` values, source-qualified
+  typed `patch_expr` assignments over `excluded` and committed-row fields,
+  including `COALESCE`, `LOWER`, `UPPER`, searched `CASE`, `NULLIF`, casts,
+  `array_length`, and arithmetic, source-qualified typed `increment_expr`
+  deltas from `COALESCE(excluded.column, fallback)`, source-qualified
+  conflict-action `where_expression` predicates, conflict-action `DEFAULT`,
+  explicit `NOW()`, explicit SQL `DEFAULT`, and table-owned `now_ns` update
+  policies for updated-at columns;
   aggregate lowering for
   `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, scalar `FILTER`, typed aggregate
   filter expressions such as `FILTER (WHERE lower(status) = 'open')`, scalar
@@ -1584,23 +1699,29 @@ Current PR status:
   `array_agg`, `GROUP BY`, and output-alias `HAVING`;
   local equality `INNER`/`LEFT` row-stream joins; scalar `NOT (...)` predicate
   groups; non-recursive `WITH` lowering to ordered typed query plans; typed
-  `row_number() OVER (PARTITION BY ... ORDER BY ...)` window-plan lowering and
-  local execution over filtered base-row or materialized CTE sources, with
+  `row_number()`, `rank()`, `dense_rank()`, `lag()`, and `lead()` window-plan lowering and local
+  execution over filtered base-row or materialized CTE sources, with
   source row claims rejected for windowed output; native REST/SDK aggregate,
   equality join, bounded lateral, window, and ordered CTE plan parsers plus
-  public `rows:query`, `rows:aggregate`, `rows:window`, `rows:join`, and
-  `rows:lateral` HTTP endpoints that accept the same typed
-  predicate/projection/expression/order contracts as the SQL adapter, return
-  stable row-result envelopes, reject lockable or range-internal sources at the
-  public boundary, push supported conjunctive row filters into every base row
-  source, and fail closed for unsupported row-filter shapes; a seeded SQL compatibility
+  public `rows:query`, `rows:aggregate`, `rows:window`, `rows:join`,
+  `rows:lateral`, and `rows:mutation-source` HTTP endpoints that accept the same typed
+  predicate/projection/expression/order contracts as the SQL adapter, preserve
+  rich join/lateral side-query predicates including expression OR/NOT groups
+  and computed-array containment, validate ordered `source_cte` references for
+  join/lateral plan sides, publish typed OpenAPI/SDK row-plan envelope structs
+  through the Zig, Go, TypeScript, and Python SDKs instead of raw JSON-only
+  client inputs, require each public operation endpoint to receive exactly its
+  matching top-level envelope field plus optional ordered CTEs, return stable row-result envelopes, reject
+  lockable or range-internal sources at the public boundary, push supported
+  conjunctive row filters into every base row source, and fail closed for
+  unsupported row-filter shapes; a seeded SQL compatibility
   corpus test that classifies representative schema,
   migration-equivalence, query, aggregate, join, lateral, window, point DML,
   claimed mutation-source, and unsupported adapter-only shapes through the
   fail-closed SQL boundary and pins stable typed-plan fingerprints for target
   tables, DDL tags, predicates, projections, expression projections,
   operations, joins, windows, insert/update/delete returning rows,
-  insert/update/delete and mutation-source returning expressions, limits, row
+  insert/update/delete and update/delete mutation-source returning expressions, limits, row
   claims, and unsupported
   classifications, plus catalog-application fingerprints for representative DDL
   rebuild flags, validation flags, building secondary indexes, unvalidated
@@ -1655,8 +1776,8 @@ Current PR status:
   capped scalar implementation, and broader JSON/array/complex aggregate filter
   and distinct keys over the shared expression tree; routed/cross-range lateral
   execution beyond the bounded local `LEFT JOIN LATERAL` stage; richer window
-  functions, frames, spill/backpressure, and routed window execution beyond the
-  first local `row_number()` stage; broader mutation-hook policies
+  frame semantics, additional frame-aware functions, spill/backpressure, and
+  routed window execution beyond the local ranking/value stages; broader mutation-hook policies
   beyond table-owned updated-at `now_ns`; and SQL
   corpus/golden-plan/execution/chaos gates that prove compatibility.
 
@@ -1673,9 +1794,14 @@ Planning assumptions for the remaining work:
 - Relational mode starts from the current relational storage format.
   Unsupported or partially implemented SQL shapes should fail closed until they
   lower to a typed plan with catalog metadata, execution semantics, and tests.
-- Migration compatibility means equivalent Antfly-native catalog, validation,
+- This feature set starts here. Do not add legacy relational encodings,
+  compatibility aliases, old request fallbacks, or migration shims for
+  pre-relational behavior; unsupported shapes should become typed Antfly plans,
+  explicit rewrite/rebuild jobs, adapter-only no-ops, or stable unsupported
+  errors.
+- Migration-equivalent work means Antfly-native catalog, validation,
   rebuild, and rewrite plans. Exact PostgreSQL migration-file replay can be
-  added as an adapter feature, but it is not the backend contract.
+  implemented as an adapter feature, but it is not the backend contract.
 - SQL text is not a backend data structure. Parser output must normalize into
   Antfly-owned structs for schemas, expressions, row selectors, mutations,
   queries, joins, aggregates, CTEs, windows, repair, and rebuild.
@@ -1694,12 +1820,12 @@ planned as model-owned Antfly capabilities in this order:
 
 | Layer | Scope | Long-term plan |
 | --- | --- | --- |
-| Adapter-only compatibility | `pgx` wire behavior, placeholders, SQLSTATE errors, result labels, catalog-view shims, extension declarations, dump boilerplate, and exact migration-file replay syntax. | Keep this in the Postgres-facing adapter. These shapes either lower to typed Antfly plans, become proven no-op compatibility records, or fail with stable unsupported-shape errors. They do not create backend SQL strings. |
-| Schema/catalog foundation | `CREATE TABLE`, additive and non-additive `ALTER TABLE`, constraints, defaults, generated columns, checks, JSONB/array columns, trigger-derived update policies, partial indexes, expression indexes, unique/FK validation, and migration-equivalent data rewrites. | Apply schema changes through typed catalog mutations and typed rewrite/backfill jobs. Existing-table derived artifacts become explicit validation or rebuild work with deterministic generations, range ownership, repair workers, and schema compare-and-swap promotion. Since the relational format starts here, non-additive migration support can be designed as planned rewrite/rebuild jobs instead of compatibility shims, and a PostgreSQL migration runner can later lower into the same operations. |
-| Row mutation foundation | `INSERT`, `UPDATE`, `DELETE`, `ON CONFLICT ... DO NOTHING/UPDATE`, `RETURNING`, `DEFAULT`, `NOW()`, `EXCLUDED.column`, JSONB transforms, array transforms, updated-at policies, and local transaction-aware `mutation_source` update/delete over claimed base-row query sources, with API parser/encoder coverage and SQL lowerer support. | Keep mutations as row-batch or mutation-source plans over structured primary/unique selectors, OCC predicates, 2PC participants, transforms, and returning projections. The remaining production work is full expression support over `excluded` and the committed row image, unique-owner routing for every non-primary selector, and routed/hosted mutation-source execution across table ranges. |
+| Adapter-only PostgreSQL surface | `pgx` wire behavior, placeholders, SQLSTATE errors, result labels, catalog-view shims, extension declarations, dump boilerplate, and exact migration-file replay syntax. | Keep this in the Postgres-facing adapter. These shapes either lower to typed Antfly plans, become proven no-op adapter records, or fail with stable unsupported-shape errors. They do not create backend SQL strings. |
+| Schema/catalog foundation | `CREATE TABLE`, additive and non-additive `ALTER TABLE`, constraints, defaults, generated columns, checks, JSONB/array columns, trigger-derived update policies, partial indexes, expression indexes, unique/FK validation, and migration-equivalent data rewrites. | Apply schema changes through typed catalog mutations and typed rewrite/backfill jobs. Existing-table derived artifacts become explicit validation or rebuild work with deterministic generations, range ownership, repair workers, and schema compare-and-swap promotion. Since the relational format starts here, non-additive migration work should be planned rewrite/rebuild jobs, and a PostgreSQL migration runner can later lower into the same operations. |
+| Row mutation foundation | `INSERT`, `UPDATE`, `DELETE`, `ON CONFLICT ... DO NOTHING/UPDATE`, `RETURNING`, `DEFAULT`, `NOW()`, `EXCLUDED.column`, JSONB transforms, array transforms, updated-at policies, and transaction-aware `mutation_source` update/delete over claimed base-row query sources, with API parser/encoder coverage, a public HTTP endpoint, SDK models, and SQL lowerer support. | Keep mutations as row-batch or mutation-source plans over structured primary/unique selectors, OCC predicates, 2PC participants, transforms, and returning projections. The remaining production work is full expression support over `excluded` and the committed row image, unique-owner routing for every non-primary selector, and routed/hosted mutation-source execution across table ranges. |
 | Query and expression foundation | `WHERE`, `ANY`, `IN`, `NOT`, mixed `AND`/`OR`, casts, scalar functions, JSONB operators, array operators, projection expressions, typed row-query expression order keys, `ORDER BY`, `LIMIT`, and `OFFSET`. | Collapse remaining shape-specific lowering into one typed scalar expression tree used by predicates, projections, generated columns, checks, expression indexes, conflict actions, aggregate filters, order keys, and `RETURNING`. Planner pushdown is derived from that tree only when it maps to declared primary, unique, generated, column-major, array, JSON, or embedded-JSON access paths. |
 | Lockable row streams | `FOR UPDATE`, `FOR UPDATE SKIP LOCKED`, queue claims, and local multi-row `UPDATE`/`DELETE` mutation sources have a base-row claim/OCC contract. | Add ordered multi-range fill, durable claim ownership beyond the local transaction record, lease/retry semantics, hosted participant registration, and range-movement chaos coverage. Keep claims illegal over joins, aggregates, materialized CTEs, and windows until those stages expose a lockable base-row contract. |
-| Routed stream composition | Equality joins, `LEFT JOIN`, bounded local `LEFT JOIN LATERAL`, grouped rollups, aggregate `FILTER`/`DISTINCT`, `HAVING`, CTEs, and window stages including local `row_number()`. | Use typed routed streams with output schemas, table/range ownership routing, lookup/hash/merge join strategies, coordinator merge ordering, bounded CTE materialization, spill-aware aggregate/window state, routed window partitions, and routed correlated lateral stages with declared right-side bounds. |
+| Routed stream composition | Equality joins, `LEFT JOIN`, bounded local `LEFT JOIN LATERAL`, grouped rollups, aggregate `FILTER`/`DISTINCT`, `HAVING`, CTEs, and local window stages including `row_number()`, `rank()`, `dense_rank()`, `lag()`, and `lead()`. | Use typed routed streams with output schemas, table/range ownership routing, lookup/hash/merge join strategies, coordinator merge ordering, bounded CTE materialization, spill-aware aggregate/window state, routed window partitions, and routed correlated lateral stages with declared right-side bounds. |
 | Compatibility evidence | Representative SQL, migration-equivalent schema/data changes, representative execution flows, and failure modes under repair/routing. | Gate parity with harvested SQL and native migration-equivalence golden plans, execution tests for row/identity/constraint/queue/JSON/usage flows, and chaos/sim workloads that combine live writes, FK checks/actions, unique-owner repair, secondary and embedded-JSON rebuilds, row claims, joins, aggregates, range movement, catalog promotion, and rewrite/rebuild jobs. |
 
 The concrete rollout should keep the backend model ahead of the SQL adapter.
@@ -1708,13 +1834,13 @@ Postgres-facing adapter to lower PostgreSQL syntax into that contract:
 
 | Milestone | Scope | Existing work it builds on | Completion criteria |
 | --- | --- | --- | --- |
-| 0. Corpus and plan contracts | Harvest representative SQL and schema/data-change intent; define stable JSON/typed structs for DDL, row selectors, mutations, expressions, row queries, joins, aggregates, CTEs, windows, row claims, repair, rebuild, and rewrite jobs. | The adapter already fails closed, lowers supported syntax into Antfly structs, and the seeded corpus gate pins typed-plan fingerprints for representative DDL, query, aggregate, join, lateral, window, DML, mutation-source, and unsupported shapes. | Every harvested runtime statement and migration-equivalence step has a golden typed plan, an adapter-only no-op classification, or an unsupported classification that names the missing model feature. No storage path accepts SQL text. |
+| 0. Corpus and plan contracts | Harvest representative SQL and schema/data-change intent; define stable JSON/typed structs for DDL, row selectors, mutations, expressions, row queries, joins, aggregates, CTEs, windows, row claims, repair, rebuild, and rewrite jobs. | The adapter already fails closed, lowers supported syntax into Antfly structs, and the seeded corpus gate pins typed-plan fingerprints for representative DDL, query, aggregate, join, lateral, window, DML, mutation-source, and unsupported shapes. The seeded gate now includes computed expression predicates, computed expression OR/NOT groups, computed-array predicates, aggregate source predicates, CTE source boundaries, join/lateral side-query predicate classes, bounded lateral right-side order/limit, window value/default expressions, and mutation-source `patch_expr` / `increment_expr` counts so the corpus catches lossy adapter-to-API lowering. | Every harvested runtime statement and migration-equivalence step has a golden typed plan, an adapter-only no-op classification, or an unsupported classification that names the missing model feature. No storage path accepts SQL text. |
 | 1. Shared expression spine | Replace shape-specific predicate/projection/update/index cases with one bound expression AST over fields, literals, parameters, casts, deterministic functions, boolean ops, arithmetic, null semantics, JSON, and arrays. | Existing row queries, generated columns, checks, JSONB/array predicates, order keys, aggregate filters, conflict updates, and simple `RETURNING` already have typed pieces. | The same AST is used for `WHERE`, projections, checks, generated columns, expression indexes, partial predicates, `ON CONFLICT` actions, update transforms, aggregate filters, order keys, and `RETURNING`; pushdown is derived from the AST rather than hand-coded parser cases. |
 | 2. Catalog and migration lifecycle | Apply migration-equivalent DDL and data-change intent as transactional catalog mutations, typed rewrites, rebuilds, and validations. | Composite identity, unique/FK validation state, schema-controller repair/promotion, secondary-index lifecycle, CAS schema promotion, and embedded JSON-column indexing are now the baseline. | Intended final schema and migration effects compile into catalog schema JSON; every existing-table index, expression index, unique constraint, FK, check, embedded JSON schema/template change, and non-additive rewrite produces durable work with deterministic range ownership and promotion gates. Exact PostgreSQL migration-file replay can be layered on top by lowering into these same steps. |
 | 3. Point and selector DML hardening | Finish `INSERT`, point/unique `UPDATE` and `DELETE`, `ON CONFLICT ... DO UPDATE/NOTHING`, `DEFAULT`, `NOW()`, `EXCLUDED`, JSONB/array transforms, server-owned update policies, and committed-image `RETURNING`. | Structured primary/unique selectors, durable unique-owner rows, point row-batch plans, 2PC participants, table-owned updated-at policies, JSONB/array transforms, and simple returning are implemented. | Ledger, auth, RBAC, billing, seed, and JSON metadata flows run through typed row-batch plans; non-primary selectors resolve through unique-owner rows before prepare; `RETURNING` is evaluated from the final committed image. |
 | 4. Multi-row DML and queue claims | Local `mutation_source` plans update/delete rows selected from ordered lockable row-query sources for `UPDATE ... WHERE`, `DELETE ... WHERE`, `FOR UPDATE`, and `FOR UPDATE SKIP LOCKED`; the row API can parse/encode the typed contract and the PostgreSQL adapter can lower bounded transaction-claimed update/delete statements into it. | Base-row row claims, ordering, pagination, unique-owner routing, FK/unique 2PC participants, OCC predicates, SQL lowerer support, and transaction-staged mutation sources exist. | Queue, cleanup, re-encryption, and batch mutation workloads claim rows durably, fill across ranges in order, integrate with OCC/2PC, survive retries and range movement, and reject claims over joins, aggregates, windows, and materialized CTEs until those stages expose lockable base rows. |
 | 5. Index and JSON/array completeness | Generalize partial/expression indexes, partial unique constraints, JSONB operators, array operators, and embedded JSON-column document indexes through the shared expression and catalog-work lifecycle. | Simple partial predicates, `lower(field)` expression indexes through generated columns, ordinary secondary-index rebuild work, JSON/array predicates/transforms, and embedded JSON-column design are present. | Planner uses only `ready` derived artifacts; writes enforce only `enforced` unique constraints; partial implication is shared by planner, uniqueness, and `ON CONFLICT ... WHERE`; JSON/array SQL sugar has equivalent REST/SDK typed nodes; embedded JSON schema/template changes rebuild deterministically. |
-| 6. Routed stream execution | Extend local row streams, joins, CTEs, aggregates, lateral stages, and windows to routed cross-table/cross-range execution with output schemas and memory/spill bounds. | Local equality joins, non-recursive CTE lowering, native ordered CTE plan parsing, scalar aggregates, bounded `array_agg`, scalar `FILTER`/`DISTINCT`, bounded local `LEFT JOIN LATERAL`, and local `row_number()` are modeled. | Billing, usage, RBAC, dashboard, wake-one, and migration/backfill reads execute with correct row-version visibility, ordering, pagination, coordinator merge behavior, bounded materialization, and explicit spill/fail policy. |
+| 6. Routed stream execution | Extend local row streams, joins, CTEs, aggregates, lateral stages, and windows to routed cross-table/cross-range execution with output schemas and memory/spill bounds. | Local equality joins, non-recursive CTE lowering, native ordered CTE plan parsing, scalar aggregates, bounded `array_agg`, scalar `FILTER`/`DISTINCT`, bounded local `LEFT JOIN LATERAL`, and local `row_number()`, `rank()`, `dense_rank()`, `lag()`, and `lead()` are modeled. | Billing, usage, RBAC, dashboard, wake-one, and migration/backfill reads execute with correct row-version visibility, ordering, pagination, coordinator merge behavior, bounded materialization, and explicit spill/fail policy. |
 | 7. Compatibility proof | Make SQL/API compatibility a test gate rather than a parser breadth claim. | Focused unit/runtime tests and core storage chaos/sim coverage already exist. | Golden-plan corpus tests, representative execution flows, and sim/chaos workloads combine live writes, FK checks/actions, unique-owner repair, secondary and embedded-JSON rebuilds, row claims, joins, aggregates, range movement, catalog promotion, and native rewrite/rebuild jobs. |
 
 The representative SQL corpus should be treated as a compatibility workload, not
@@ -1727,8 +1853,8 @@ workloads and migrations are:
 - point and selector-based `INSERT`, `UPDATE`, `DELETE`, `ON CONFLICT ... DO
   NOTHING/UPDATE`, `RETURNING`, arithmetic updates, `NOW()`, explicit
   `DEFAULT`, `EXCLUDED.column`, and JSONB/array transforms;
-- scalar predicates with `LOWER(...)`, `COALESCE(...)`, casts, null tests,
-  `IS NOT DISTINCT FROM`, `IN`, `ANY`, `NOT`, mixed `AND`/`OR`, and timestamp
+- scalar predicates with `LOWER(...)`, `UPPER(...)`, `COALESCE(...)`, casts, null tests,
+  `IS DISTINCT FROM`, `IS NOT DISTINCT FROM`, `IN`, `ANY`, `NOT`, mixed `AND`/`OR`, and timestamp
   comparisons;
 - JSONB and array operators including `->`, `->>`, `@>`, existence checks,
   `jsonb_set`, `to_jsonb`, JSONB concat/build forms, array membership,
@@ -1748,22 +1874,22 @@ JSON, and secondary-index lifecycle work in this PR, the long-term plan is:
 | P1 | Partial/expression indexes and conflict targets | Use the common typed expression tree for partial predicates, generated columns, expression unique keys, and conflict-target inference. Ordinary secondary indexes use generation-aware rebuild work and catalog schema compare-and-swap promotion; expression-derived indexes should reuse that lifecycle as they move onto the common expression tree. | Queries use only `ready` secondary indexes; writes enforce only `enforced` unique constraints; `ON CONFLICT ... WHERE` shares the same predicate normalizer as planner pushdown and uniqueness enforcement. |
 | P1 | Point DML, selector DML, and `RETURNING` | Keep row mutations as typed row-batch plans over structured primary/unique selectors, OCC predicates, transforms, conflict actions, generated/default/server-owned values, and returning projections from the committed image. | Cover ledger, RBAC, auth, billing, and user flows that depend on `RETURNING`, `EXCLUDED.column`, arithmetic increments, JSONB updates, array transforms, `NOW()`, and explicit `DEFAULT`. |
 | P1 | Multi-row `UPDATE`/`DELETE` and row locks | A local `mutation_source` node now accepts a lockable typed row-query source with order/limit, row-claim metadata, OCC preimage predicates, and `SKIP LOCKED` selection, then stages update/delete intents in the claiming transaction. | Queue and re-encryption workloads using `FOR UPDATE` or `FOR UPDATE SKIP LOCKED` run without double-claiming, lost updates, or range-movement leaks across routed owner ranges. Claims stay illegal over joins, aggregates, and materialized CTEs until those sources expose lockable base rows. |
-| P1 | Scalar expression tree | One expression AST covers predicates, projections, generated columns, check constraints, expression indexes, conflict actions, update transforms, aggregate filters, order keys, and `RETURNING`. Nodes include row fields, parameters, literals, casts, null tests, boolean ops, arithmetic, `LOWER`, `COALESCE`, `NULLIF`, `CASE`, `NOW`, interval arithmetic, and `IS [NOT] DISTINCT FROM`. | Every expression is type-bound once at the adapter boundary; planner pushdown is an optimizer property of the AST; unsupported functions fail before execution. |
+| P1 | Scalar expression tree | One expression AST covers predicates, projections, generated columns, check constraints, expression indexes, conflict actions, update transforms, aggregate filters, order keys, and `RETURNING`. Nodes include row fields, parameters, literals, casts, null tests, boolean ops, arithmetic, `LOWER`, `UPPER`, `COALESCE`, `NULLIF`, `CASE`, `NOW`, interval arithmetic, and `IS [NOT] DISTINCT FROM`. | Every expression is type-bound once at the adapter boundary; planner pushdown is an optimizer property of the AST; unsupported functions fail before execution. |
 | P1 | JSONB and array operators | Treat SQL operators as sugar over typed JSON/array predicate, projection, construction, and transform nodes on declared relational columns or embedded JSON-column indexes. | JSONB path/extract/containment and array membership/equality/containment are available through REST/SDK typed plans as well as SQL; indexed paths rebuild through the same derived-artifact lifecycle as secondary indexes. |
 | P2 | Joins and routed streams | Ordinary `INNER`/`LEFT` equality joins use typed row streams; distributed execution routes each table/range through durable ownership and chooses lookup/hash/merge strategies from typed hints. | Cross-table/range join tests cover live writes, owner movement, row-version visibility, ordering, and coordinator merge semantics. |
 | P2 | `LEFT JOIN LATERAL` | Bounded local lateral is modeled as a correlated subquery stage: the right plan binds against left-row fields, requires a capped right-side plan, and preserves unmatched left rows with null right outputs. | Bugeye/dashboard queries using per-organization balance and stipend lookups run through typed lateral stages rather than bespoke SQL execution; routed/cross-range lateral remains future work. |
 | P2 | Aggregates, `DISTINCT`, `FILTER`, and `HAVING` | Extend aggregate specs so filters and distinct keys are expression nodes; keep ordered `array_agg` explicitly capped; add spill-backed distinct/materialized state when a declared memory bound is exceeded. | Usage rollups, billing balances, RBAC membership summaries, `COUNT(DISTINCT ...)`, `array_agg(DISTINCT ...) FILTER (...)`, output-alias `HAVING`, and aggregate ordering/pagination have golden plans and execution tests. |
-| P2 | CTEs and windows | Non-recursive CTEs are named typed subplans with output schemas, inlining rules, and materialization bounds. Windows are separate ordered stream stages with partition/order metadata; the first local `row_number()` stage is implemented. | Migration/backfill queries either lower to bounded CTE/window plans or fail closed with a replacement plan; recursive CTEs remain unsupported until a graph/fixpoint node exists, and broader window frames/functions need spill/backpressure before unbounded use. |
+| P2 | CTEs and windows | Non-recursive CTEs are named typed subplans with output schemas, inlining rules, and materialization bounds. Windows are separate ordered stream stages with partition/order metadata; local `row_number()`, `rank()`, `dense_rank()`, `lag()`, and `lead()` stages are implemented. | Migration/backfill queries either lower to bounded CTE/window plans or fail closed with a replacement plan; recursive CTEs remain unsupported until a graph/fixpoint node exists, and broader window frame semantics and additional frame-aware functions need spill/backpressure before unbounded use. |
 | P3 | Compatibility chaos | Combine live writes, FK checks/actions, unique-owner movement, secondary and embedded-JSON rebuilds, row claims, joins, aggregates, range movement, catalog promotion, and repair in one modeled workload. | A SQL/API compatibility sim suite becomes a release gate alongside SQL golden-plan and representative execution tests. |
 
 PostgreSQL-shaped SQL coverage should be divided into three buckets:
 
-1. **Adapter-only Postgres compatibility.**
+1. **Adapter-only Postgres surface.**
    `pgx` protocol behavior, PostgreSQL catalog views, placeholder numbering,
    SQLSTATE error mapping, extension declarations, dump boilerplate,
    PL/pgSQL/function syntax, exact trigger syntax, and exact migration-file replay are
-   not storage-model features. The adapter owns parsing and compatibility
-   presentation, then either lowers the statement into a typed Antfly plan or
+   not storage-model features. The adapter owns parsing and presentation, then
+   either lowers the statement into a typed Antfly plan or
    rejects it with a stable unsupported-shape classification. These items should
    not introduce SQL strings into the backend.
 
@@ -1784,7 +1910,7 @@ PostgreSQL-shaped SQL coverage should be divided into three buckets:
    completeness, multi-row DML over lockable row-query sources, full expression
    support for `excluded` and `RETURNING`, routed cross-range joins, reusable CTE
    materialization bounds, spill-backed aggregate `DISTINCT`, richer aggregate
-   filters, routed lateral beyond bounded local `LEFT JOIN LATERAL`, broader window stages beyond local `row_number()`, advanced
+   filters, routed lateral beyond bounded local `LEFT JOIN LATERAL`, broader window frame semantics beyond local ranking/value windows, advanced
    JSONB/array expression operands, queue-safe `FOR UPDATE SKIP LOCKED`, and
    corpus/chaos gates. These should land as typed Antfly APIs first, then be
    exposed by the SQL adapter.
@@ -1801,7 +1927,7 @@ The detailed plan for the remaining model-level bucket is:
 | CTE materialization | Named typed subplans with output schemas, inlining rules, and explicit memory/spill limits. | Inline single-use CTEs when safe; materialize reused CTEs with declared bounds; reject recursive CTEs until a separate fixpoint/graph plan exists; preserve column aliases and types for downstream joins/aggregates/windows. |
 | Aggregate filters and `DISTINCT` | Aggregate specs whose filters and distinct keys are expression nodes, with bounded in-memory state and optional spill. | Move scalar `FILTER` and `DISTINCT` paths onto the expression tree; add per-group/per-metric memory accounting; spill or fail predictably when a declared bound is exceeded; keep ordered `array_agg` explicitly capped. |
 | `LEFT JOIN LATERAL` | A correlated, bounded per-left-row subquery stage, not a special case inside ordinary joins; local execution supports declared correlations, right filters, right order/limit, and null-preserving left output. | Extend the same stage to routed cross-table/range execution with durable ownership routing, coordinator merge behavior, and explicit resource bounds. |
-| Window functions | Ordered, partitioned stream stages with typed partition keys and order keys; local `row_number()` over base-row or materialized CTE sources is modeled. | Add additional window functions, frame metadata, routed partition execution, and spill/backpressure before allowing unbounded partitions. |
+| Window functions | Ordered, partitioned stream stages with typed partition keys and order keys; local `row_number()`, `rank()`, `dense_rank()`, `lag()`, and `lead()` over base-row or materialized CTE sources are modeled. | Add frame metadata, additional frame-aware functions, routed partition execution, and spill/backpressure before allowing unbounded partitions. |
 | JSONB and array advanced operators | JSON/array predicate, projection, construction, and transform nodes over declared relational columns and embedded JSON-column indexes. | Keep SQL operators as adapter sugar; push down only through declared column, array, generated-column, or embedded JSON indexes; run schema/template changes through explicit derived-index rebuild work; evaluate unsupported operators over hydrated rows only when bounded, otherwise reject. |
 | `FOR UPDATE SKIP LOCKED` queues | Lockable base-row streams with durable claim ownership, lease/retry semantics, OCC integration, and ordered multi-range fill. | Keep claims illegal over joins/aggregates/CTEs; add coordinator fill across ranges without double-claiming; persist claim ownership and lease expiry; test range movement, retries, aborts, and concurrent writers in chaos. |
 | SQL/API compatibility gates | Generated SQL and migration-equivalence corpus, golden typed plans, representative execution tests, and combined repair/routing chaos workloads. | Harvest representative SQL plus native schema/data-change intent from migrations; classify every runtime statement and native migration step as supported, unsupported, or adapter-only no-op; add golden typed-plan tests; run row, queue, identity, constraint, JSON metadata, usage-rollup, and migration/backfill flows; combine live writes, FK checks/actions, unique-owner repair, secondary/embedded-JSON rebuilds, row claims, joins, aggregates, range movement, catalog promotion, and typed rewrite/backfill jobs in sim. |
@@ -1814,8 +1940,8 @@ rather than a separate PostgreSQL executor:
 | Schema and migration-equivalence corpus | Supported `CREATE TABLE`, `CREATE INDEX`, additive `ALTER TABLE`, generated columns, defaults, checks, JSONB/array columns, FKs, unique constraints, partial indexes, expression indexes, `NOT VALID`/`VALIDATE CONSTRAINT`, and updated-at trigger shapes lower to typed schema/catalog plans. | Capture the intended final schema and migration effects, classify each native step or adapter-lowered statement, apply supported plans transactionally to catalog schema JSON, add explicit rebuild/validation jobs for every non-empty-table index/constraint change, and fail unsupported dump/extension/PL/pgSQL-only syntax with stable adapter errors. |
 | Partial and expression index lifecycle | Partial predicates, simple `lower(field)` expression indexes, unique validation state, and ordinary secondary-index lifecycle metadata are modeled. Durable ordinary secondary-index rebuild ranges are scheduled and placed; expired `building` leases can be reclaimed; a generic local worker helper can claim, repair, finish, or invalidate one building generation without clearing unrelated secondary namespaces; provisioned/hosted table-write sources can run a bounded catalog-projected rebuild worker pass, including hosted remote group forwarding through an internal route; valid unvalidated unique constraints and completed ordinary secondary-index generations promote through raft-applied schema compare-and-swap updates against the exact observed schema bytes, and secondary-index promotion additionally requires every table range to have a `ready` rebuild record for the exact building generation. | Share partial-predicate implication across planner, uniqueness, and `ON CONFLICT ... WHERE`, generalize expression indexes onto the common typed expression tree, and route expression-derived rebuild/promotion through the same lifecycle contract. |
 | CRUD, conflict, and returning | Point `INSERT`, `UPDATE`, `DELETE`, `ON CONFLICT DO NOTHING/UPDATE`, server defaults, updated-at policies, JSONB/array transforms, field/expression `RETURNING` over committed row images, and local claimed mutation-source update/delete with typed field/expression returning lower to typed mutation plans. | Add full expressions over `excluded`, non-primary selector routing through durable unique-owner rows, routed/hosted mutation-source execution, and mutation hooks for any remaining deterministic trigger patterns. |
-| Query predicates and ordering | Scalar predicates, generated-column pushdown, JSONB/array predicates, OR/NOT groups, `IS NOT DISTINCT FROM` normalization over bound parameters, field order keys, typed expression predicates, typed expression order keys for lower/coalesce/array-length/arithmetic nodes, null-test ordering, limit/offset, and row claims have model homes. | Collapse remaining shape-specific lowering into one typed scalar expression tree and let the planner derive pushdown from primary, unique, generated, column-major, array, JSON, and embedded-JSON access paths. |
-| Joins, CTEs, aggregates, and windows | Local equality joins, bounded local `LEFT JOIN LATERAL`, non-recursive CTE lowering, scalar aggregate lowering over field and shared expression inputs, bounded `array_agg`, scalar `FILTER`, typed aggregate filter expressions, scalar `DISTINCT`, `GROUP BY`, `HAVING`, aggregate ordering/pagination, native join/aggregate/lateral/window API parsing, native ordered CTE plan parsing, and the first local `row_number()` window stage are modeled. | Add routed cross-table/cross-range stream execution, CTE output-schema tracking and spill bounds, spill-backed distinct state, broader aggregate filters and distinct keys over expression trees, routed lateral execution, additional window functions/frames, and spill/backpressure for unbounded partitions. |
+| Query predicates and ordering | Scalar predicates, generated-column pushdown, JSONB/array predicates, OR/NOT groups, native null-safe `is_distinct`/`is_not_distinct` predicates with SQL `IS [NOT] DISTINCT FROM` lowering, field order keys, typed expression predicates, typed expression OR/NOT groups, typed expression order keys for lower/coalesce/array-length/arithmetic nodes, null-test ordering, limit/offset, and row claims have model homes. | Collapse remaining shape-specific lowering into one typed scalar expression tree and let the planner derive pushdown from primary, unique, generated, column-major, array, JSON, and embedded-JSON access paths. |
+| Joins, CTEs, aggregates, and windows | Local equality joins, bounded local `LEFT JOIN LATERAL`, non-recursive CTE lowering, scalar aggregate lowering over field and shared expression inputs, bounded `array_agg`, scalar `FILTER`, typed aggregate filter expressions, scalar `DISTINCT`, `GROUP BY`, `HAVING`, aggregate ordering/pagination, native join/aggregate/lateral/window API parsing, native ordered CTE plan parsing, and local `row_number()`, `rank()`, `dense_rank()`, `lag()`, and `lead()` window stages are modeled. | Add routed cross-table/cross-range stream execution, CTE output-schema tracking and spill bounds, spill-backed distinct state, broader aggregate filters and distinct keys over expression trees, routed lateral execution, additional window frames, frame-aware functions, and spill/backpressure for unbounded partitions. |
 | Queue-style locking | `FOR UPDATE [SKIP LOCKED]` lowers only over lockable base-row streams. | Add ordered multi-range filling, durable claim ownership, OCC integration, retry/lease semantics, and chaos coverage with range movement before using it as a production queue primitive. |
 | JSONB/document-in-row fields | Declared `json` columns are committed row cells with typed JSON predicates/transforms and an embedded document-index design under the column path. | Route embedded JSON full-text/path/algebraic rebuilds through the same catalog work-unit lifecycle as secondary indexes, expose typed JSON selectors/transforms through REST/SDK, and keep SQL JSONB syntax as adapter sugar. |
 | Compatibility evidence | The backend boundary rejects unsupported SQL instead of passing SQL text through storage. | Generate SQL and migration-equivalence golden-plan tests, execute representative flows, and add chaos/sim workloads that combine live writes, FK checks/actions, unique-owner repair, secondary and embedded-JSON rebuilds, row claims, joins, aggregates, range movement, catalog promotion, and typed rewrite/backfill jobs. |
@@ -1828,7 +1954,7 @@ tracks:
 | Composite identity, uniqueness, and foreign keys | Structured primary-key and unique selectors, composite tuple encoding, durable unique-owner rows, FK metadata, reverse-reference rows, owner-range routing, local/cross-range parent validation, restrict/cascade/set-null action jobs, and schema-controller repair/promotion are modeled as relational metadata and 2PC participants. | Keep expanding chaos coverage that combines live row writes, owner movement, FK checks, unique-owner repair, action jobs, and range movement; expose structured unique selectors consistently through REST/SDK/SQL; and keep non-primary selectors routed through durable owners rather than scans. |
 | Partial and expression indexes | Typed partial predicates on secondary indexes and unique constraints; simple `lower(field)` expression indexes lowered through generated-column metadata; conflict-target inference shares named unique metadata; unique constraints carry durable validation state; unvalidated unique constraints do not derive owner ranges or participate in write-time uniqueness enforcement until promoted; local and catalog-backed unique schema-controller maintenance can repair, validate, and promote unvalidated unique constraints after owner rows are complete and valid; ordinary secondary indexes carry schema-level lifecycle state and deterministic rebuild generation IDs; metadata has durable generation-aware secondary-index rebuild work ranges with lifecycle, lease, progress, error, projection, status, reconciler scheduling, placement intents, stale-generation cleanup, and in-flight progress preservation; expired rebuild leases are reclaimable; local storage can execute a targeted generation rebuild over one row span; local worker execution can claim/finish/invalidate a work record; provisioned/hosted table-write sources can scan catalog work, claim ranges, execute local or remote-hosted repairs, aggregate progress, and promote only when every table range is ready for the exact generation; and planners use only `ready` indexes. | Add a first-class metadata CAS primitive for final rebuild promotion, richer expression-index ASTs, collation/null semantics, and implication checks shared by query pushdown, uniqueness enforcement, and `ON CONFLICT ... WHERE`. |
 | Raw DML and conflict handling | Typed row-batch plans for point `INSERT`, `UPDATE`, `DELETE`, `RETURNING`, primary/unique `ON CONFLICT`, arithmetic updates, numeric `excluded` deltas, JSONB updates, array updates, `excluded.column`, `DEFAULT`, table-owned updated-at policies, local claimed mutation-source update/delete, and PostgreSQL-adapter lowering for bounded transaction-claimed multi-row `UPDATE`/`DELETE`. | Add full expressions over `excluded`, returning expressions over the committed image, broader mutation hooks, routed/hosted mutation-source execution, and unique-owner lookup for every non-primary conflict or selector path. |
-| Query composition | Typed row queries for scalar, array, JSONB, OR, NOT, ordering, pagination, row claims, aggregates, local equality joins, bounded local lateral stages, non-recursive CTEs, and local `row_number()` windows over ordered base/CTE streams. | Add routed cross-table/cross-range joins, richer CTE output schemas, spill bounds for materialized streams, routed lateral stages, broader window stages, and full scalar-expression ordering/projection/filtering. |
+| Query composition | Typed row queries for scalar, array, JSONB, OR, NOT, ordering, pagination, row claims, aggregates, local equality joins, bounded local lateral stages, non-recursive CTEs, and local ranking/value windows over ordered base/CTE streams. | Add routed cross-table/cross-range joins, richer CTE output schemas, spill bounds for materialized streams, routed lateral stages, broader frame-aware window stages, and full scalar-expression ordering/projection/filtering. |
 | JSONB and array SQL operators | Declared `json` and `array` relational columns lower to typed path predicates, containment/existence, `jsonb_set`, JSON construction/concat, array equality/membership/containment, and append/remove/add-to-set transforms. | Route every remaining operator through the common expression tree, add nested path/index planning where declared, keep schemaless JSON rebuilds explicit, and reject unsupported PostgreSQL operator semantics at the adapter boundary. |
 | Embedded JSON document fields | A relational `json` column is an opaque committed row cell plus derived document-style full-text/path/algebraic projection under the owning column path, with schema-versioned rebuild behavior when that embedded schema or dynamic template changes. | Make JSON-column index rebuilds visible through the same catalog work-unit and lifecycle machinery as other derived artifacts; expose typed JSON path selectors and transforms directly through API/SDK plans; and ensure SQL JSONB sugar never bypasses the relational row. |
 | PostgreSQL adapter and corpus gates | Supported SQL lowers fail-closed into typed DDL, row-query, mutation, aggregate, join, CTE, and expression plans. | Generate a representative SQL and migration-equivalence corpus, record golden typed plans or intentional unsupported classifications, execute representative flows, and combine them with repair, range movement, FK checks, unique-owner movement, row claims, rewrite, and rebuild jobs in chaos/sim tests. |
@@ -1868,7 +1994,7 @@ The implementation order should keep correctness before breadth:
 5. **Routed stream execution before advanced SQL composition.**
    Cross-range joins, aggregate streams, reused CTEs, lateral stages, and window
    stages should share one routed stream model with output schemas and
-   memory/spill bounds. Routed lateral beyond local `LEFT JOIN LATERAL` and broader windows beyond local `row_number()` should be planned
+   memory/spill bounds. Routed lateral beyond local `LEFT JOIN LATERAL` and broader windows beyond local ranking/value functions should be planned
    as bounded stream stages, not as ad hoc SQL executor behavior.
 
 6. **Chaos and repair gates before declaring parity.**
@@ -1929,7 +2055,7 @@ The highest-priority remaining gaps for PostgreSQL-shaped SQL are:
    typed join and aggregate executors.
 
 5. **Lateral, window, and advanced aggregate stages.**
-   routed `LEFT JOIN LATERAL` beyond the bounded local stage, broader window stages beyond local `row_number() OVER (...)`, richer aggregate
+   routed `LEFT JOIN LATERAL` beyond the bounded local stage, broader window stages beyond local ranking/value windows, richer aggregate
    `FILTER`/`DISTINCT` expressions, and spill-backed distinct state are not
    storage primitives hidden behind SQL text. They should be explicit bounded
    stream stages: lateral is a correlated per-left-row query with required
@@ -1958,13 +2084,13 @@ not as ad hoc Postgres passthrough:
 | Point selectors and unique selectors | Structured row identity plus durable unique-owner lookup | Continue to expose primary-key and unique-key selectors as typed JSON identity, not physical row keys. Non-primary update/delete must resolve through unique-owner rows before prepare. |
 | `WHERE`, `ANY`, `IN`, `NOT IN`, `NOT`, mixed `AND`/`OR`, casts/functions | Reusable typed scalar expression tree over rows, literals, parameters, and deterministic functions | Replace scattered scalar predicate special cases with a single expression plan that can evaluate over hydrated rows and advertise pushdown opportunities only when it maps to primary, unique, generated, column-major, array, or JSON indexes. |
 | JSONB operators `->`, `->>`, `@>`, path exists, `jsonb_set`, concat/build, `convert_from(..., 'UTF8')::jsonb` | Typed JSON predicate, projection, construction, and transform nodes over declared `json` columns | Keep SQL operators as adapter sugar over JSON nodes. Reuse document-store JSON indexing only through explicit relational JSON column/index metadata, so schema changes rebuild the affected embedded JSON index deterministically. |
-| Array operators, `ANY`, `array_length`, containment, defaults, `array_append`, `array_remove`, `string_to_array(...)` | Typed array predicate, projection, generated-column, and transform nodes | Keep exact array equality, membership, containment, and append/remove/add-to-set transforms typed. Push down only through declared array indexes or generated-column indexes and evaluate the rest over hydrated rows. Remaining array expression operands should lower through the general typed expression tree. |
+| Array operators, `ANY`, `array_length`, containment, defaults, `array_append`, `array_remove`, `string_to_array(...)` | Typed array predicate, projection, generated-column, function-expression, and transform nodes | Keep exact array equality, membership, containment, and append/remove/add-to-set transforms typed. Push down only through declared array indexes or generated-column indexes and evaluate the rest over hydrated rows. `string_to_array(...)` is a typed expression node for projections, aggregate inputs, exact computed-array equality/inequality, and computed-array containment predicates; pushdown for computed arrays comes through generated columns or later expression-index metadata. |
 | `ORDER BY`, `LIMIT`, `OFFSET`, null-test order expressions | Executable typed order keys and pagination over row, join, aggregate, CTE, or window streams | Keep field, null-test, and scalar expression order keys as typed plan nodes. Pagination is applied after authoritative filtering for a single ordered stream or after coordinator merge for multi-range streams. |
 | `FOR UPDATE` and `FOR UPDATE SKIP LOCKED` | Lockable base-row query plans with row-claim metadata | Keep claims limited to base-row streams. Add ordered multi-range filling, durable claim ownership, OCC integration, and chaos coverage with range movement before allowing queue workloads at production scale. |
 | Equality joins, `LEFT JOIN`, `LEFT JOIN LATERAL` | Typed join plans plus bounded local correlated lateral subquery stages | Keep local equality joins as row-stream joins. Add routed cross-table/range joins using durable ownership metadata and lookup/hash/merge strategy choice; extend lateral joins as explicit bounded per-left-row subqueries over routed right-side plans. |
 | CTEs | Ordered named typed subplans and bounded materialized streams | Track output schemas across row, join, and aggregate plans; inline one-use CTEs when safe; spill or reject reused materializations that exceed declared memory bounds. |
 | Aggregates, `FILTER`, `DISTINCT`, `array_agg`, `HAVING` | Typed aggregate plans with per-aggregate predicate filters, executable expression filters, expression inputs, distinct state, ordering, and output predicates | Extend JSON/array and complex boolean aggregate filters/distinct keys over the shared expression tree, add spill-backed distinct state beyond the current explicit cap, and keep ordered collection aggregates bounded. |
-| Window functions such as `row_number()` | Typed local `row_number()` stages over ordered base-row or materialized CTE streams | Add richer frame metadata, additional window functions, routed partition execution, and memory/spill bounds. Use window stages for migration/backfill ranking and wake-one job selection rather than folding windows into aggregate or join nodes. |
+| Window functions | Typed local `row_number()`, `rank()`, `dense_rank()`, `lag()`, and `lead()` stages over ordered base-row or materialized CTE streams | Add richer frame metadata, additional frame-aware functions, routed partition execution, and memory/spill bounds. Use window stages for migration/backfill ranking, previous/next-row value projection, and wake-one job selection rather than folding windows into aggregate or join nodes. |
 | Triggers and server-maintained columns | Explicit table-owned server-update policies and mutation hooks | Do not emulate PL/pgSQL trigger execution. Updated timestamps use `x-antfly-on-update` metadata today. Compile any remaining known trigger patterns into typed policies for denormalized JSON/array fields, action-job creation, or other deterministic mutation hooks. |
 
 The remaining PostgreSQL/API work should land in these model-level slices:
@@ -2044,7 +2170,7 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    Generalize the current typed projection/predicate pieces into a reusable
    expression tree with explicit input columns, literals, parameters, casts,
    deterministic functions, arithmetic, boolean operators, null tests, and
-   result types. `COALESCE`, `LOWER`, `id::text`, `NOW()`, `DEFAULT`,
+   result types. `COALESCE`, `LOWER`, `UPPER`, `id::text`, `NOW()`, `DEFAULT`,
    `convert_from(..., 'UTF8')::jsonb`, `(expires_at IS NULL)`, `NOT`, and mixed
    `AND`/`OR` combinations should all normalize through this tree. Expressions
    used for storage semantics normalize to generated columns, expression-index
@@ -2134,8 +2260,9 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    JSONB concatenation, and `convert_from(..., 'UTF8')::jsonb` lower to typed
    JSON projection, predicate, construction, or transform nodes. `ANY`, `IN`,
    `NOT IN`, equality, containment, `array_length(col, 1)`, array defaults, and
-   `string_to_array(scope, ' ') @> ...` lower to typed array membership,
-   equality, containment, scalar function, or generated-column plans. Operators
+   `string_to_array(scope, ' ') @> $json_array` lower to typed array
+   membership, equality, containment, computed-array containment, scalar
+   function, or generated-column plans. Operators
    that require indexes or write-time maintenance become explicit catalog
    capabilities; purely syntactic sugar stays in the adapter.
 
@@ -2173,15 +2300,20 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    accident. Remaining aggregate expression work is structured JSON/array and
    complex boolean distinct/filter keys plus spill-backed continuation beyond
    the explicit in-memory cap.
-   Window functions such as `row_number() OVER (PARTITION BY ... ORDER BY ...)`
-   are separate typed window stages over ordered materialized streams; they are
-   needed for migration/backfill ranking and wake-one job selection.
+   Window functions such as
+   `row_number() OVER (PARTITION BY ... ORDER BY ...)`,
+   `rank() OVER (...)`, `dense_rank() OVER (...)`, `lag(expr, offset, default)
+   OVER (...)`, and `lead(expr, offset, default) OVER (...)` are separate typed
+   window stages over ordered materialized streams; they are needed for
+   migration/backfill ranking, previous/next-row value projection, and wake-one
+   job selection.
 
 10. **Order, limit, offset, and row claiming.**
    `ORDER BY`, `LIMIT`, and `OFFSET` lower to typed order keys and pagination
    over either base row streams, join outputs, aggregate outputs, or CTE
    materializations. Order expressions such as `(expires_at IS NULL)`,
-   `lower(status)`, and numeric arithmetic are typed scalar order expressions.
+   `lower(status)`, `upper(status)`, and numeric arithmetic are typed scalar
+   order expressions.
    `FOR UPDATE` and `FOR UPDATE SKIP LOCKED`
    lower only over base-row streams that can claim durable row ownership. They
    remain rejected over aggregate, join, CTE-materialized, graph, and count-only
@@ -2242,11 +2374,11 @@ is:
 | Schema and migrations | Supported `CREATE TABLE`, `CREATE INDEX`, additive `ALTER TABLE`, defaults, checks, generated columns, JSONB/array columns, foreign keys, unique constraints, partial indexes, expression indexes, btree `ASC`/`DESC` and `NULLS` index element syntax, simple parenthesized/casted partial-index predicates, `NOT VALID` constraint additions, `VALIDATE CONSTRAINT`, and updated-at trigger shapes lower to typed catalog plans. | Apply native migration-equivalent plans transactionally through catalog schema JSON, schedule validation/rebuild work for every non-empty-table derived artifact, and model non-additive changes as rewrite/rebuild jobs because the relational format starts here. Ordered index element clauses are accepted at the adapter boundary today and normalized to column membership; durable ordered-composite access-path metadata should land with routed ordering/planner work. Simple check/FK validation state is durable today; richer check expressions still need the common expression tree before they can compile every PostgreSQL dump-style check into a native plan. | Intended final schema and migration effects compile into catalog state; all rebuild/validation/rewrite work is durable; dump, extension, PL/pgSQL, or unsupported trigger syntax is either proven no-op adapter compatibility or rejected before storage. |
 | Point CRUD and conflict upserts | Point `INSERT`, `UPDATE`, `DELETE`, primary/unique `ON CONFLICT`, `excluded.column`, numeric conflict deltas from `excluded` values, defaults, `NOW()`, updated-at policies, JSONB/array transforms, and simple `RETURNING` have row-batch model homes. | Move remaining conflict actions and `RETURNING` onto the shared expression tree, evaluate them over the final committed row image, and route every non-primary selector through durable unique-owner lookup before prepare. | Ledger, RBAC, auth, billing, and seed flows run from typed row-batch plans without raw SQL or hidden scans. |
 | Multi-row DML and queue claims | Base-row queries can carry row-claim metadata, `FOR UPDATE [SKIP LOCKED]` lowering exists for lockable sources, and local mutation-source update/delete stages claimed rows in the owning transaction with OCC predicates. | Add routed multi-range fill, durable claim ownership beyond local transaction intents, lease/retry semantics, and hosted participant registration. Keep claims illegal over joins, aggregates, windows, and materialized CTEs until those stages expose lockable base rows. | Queue, re-encryption, cleanup, and batch update/delete flows do not double-claim, miss rows after range movement, or mutate rows without a lockable source contract. |
-| Scalar expressions | Many common predicates, projections, casts, null tests, generated expressions, JSON/array predicates, expression order keys, aggregate filter expressions, aggregate input expressions, and returning expressions lower through typed paths. | Replace remaining scattered lowerer cases with one typed expression AST for predicates, projections, checks, generated columns, expression indexes, conflict actions, update transforms, aggregate filters/inputs, order keys, and `RETURNING`. Planner pushdown becomes an optimizer property of that AST. | Every supported expression is type-bound once at the adapter boundary and can be executed through REST/SDK plans as well as SQL. |
+| Scalar expressions | Many common predicates, text-pattern predicates, projections, casts, null tests, generated expressions, JSON/array predicates, expression order keys, aggregate filter expressions, aggregate input expressions, and returning expressions lower through typed paths. | Replace remaining scattered lowerer cases with one typed expression AST for predicates, projections, checks, generated columns, expression indexes, conflict actions, update transforms, aggregate filters/inputs, order keys, and `RETURNING`. Planner pushdown becomes an optimizer property of that AST. | Every supported expression is type-bound once at the adapter boundary and can be executed through REST/SDK plans as well as SQL. |
 | JSONB and arrays | Declared `json` and `array` columns have typed predicates/transforms, and embedded JSON columns have a document-index-in-row design. | Route remaining SQL operators through typed JSON/array expression nodes, expose the same selectors/transforms directly through API/SDK plans, and run embedded JSON schema/template changes through catalog rebuild work. | JSONB metadata, array membership, rollup metadata, and embedded document-index queries work without bypassing the relational row store. |
 | Indexes and planner trust | Ordinary secondary indexes have lifecycle state and rebuild generations; unique constraints have validation state; simple partial and `lower(field)` expression index metadata is modeled; planners use only `ready` secondary indexes. | Put partial predicates and expression keys onto the common expression tree, share implication logic across pushdown, uniqueness, and `ON CONFLICT ... WHERE`, and route expression-derived rebuild/promotion through the same generation/CAS lifecycle as ordinary indexes. | Planner choices depend only on ready/enforced catalog metadata; stale, building, or unvalidated derived artifacts cannot affect query answers or write enforcement. |
 | Joins and routed reads | Local equality `INNER`/`LEFT` joins, non-recursive CTE lowering, native ordered CTE plan parsing, scalar aggregate plans, grouping, `HAVING`, ordering, and pagination have typed plan homes. | Add cross-table/cross-range routed stream execution with output schemas, row-version visibility, coordinator merge ordering, lookup/hash/merge strategy choice, and bounded CTE materialization. | Billing, usage, RBAC, and dashboard reads execute with correct pagination and ordering across range movement and live writes. |
-| Lateral, windows, and advanced aggregates | Bounded scalar aggregates, scalar `FILTER`, expression aggregate filters/inputs, scalar `DISTINCT`, ordered capped `array_agg`, bounded local `LEFT JOIN LATERAL`, and local `row_number()` over ordered/partitioned base or CTE streams are modeled. | Add routed lateral execution, broader window functions/frames as partitioned ordered stream stages, routed window execution, and spill-backed aggregate/window distinct/filter state over JSON/array/complex expression keys. | Migration/backfill, wake-one, dashboard, and rollup queries either run through bounded typed stages or fail closed with a replacement plan. |
+| Lateral, windows, and advanced aggregates | Bounded scalar aggregates, scalar `FILTER`, expression aggregate filters/inputs, scalar `DISTINCT`, ordered capped `array_agg`, bounded local `LEFT JOIN LATERAL`, and local `row_number()`, `rank()`, `dense_rank()`, `lag()`, and `lead()` over ordered/partitioned base or CTE streams are modeled. | Add routed lateral execution, broader window frame semantics as partitioned ordered stream stages, routed window execution, and spill-backed aggregate/window distinct/filter state over JSON/array/complex expression keys. | Migration/backfill, wake-one, dashboard, and rollup queries either run through bounded typed stages or fail closed with a replacement plan. |
 | Production evidence | Existing lowerer and runtime tests cover focused features; sim/chaos work exists for core storage behavior. | Add a SQL/API compatibility suite that combines corpus golden plans, representative execution flows, live writes, FK checks/actions, unique-owner repair, secondary and embedded-JSON rebuilds, row claims, joins, aggregates, range movement, catalog promotion, and typed rewrite/backfill jobs. | SQL/API compatibility is gated by workload evidence, not parser breadth. |
 
 The production milestones are:
@@ -2271,7 +2403,7 @@ The production milestones are:
    execution tests for usage rollups and RBAC membership queries.
 
 4. **Migration/backfill advanced SQL.**
-   Add routed `LEFT JOIN LATERAL`, broader typed window stages beyond local `row_number()`, complex
+   Add routed `LEFT JOIN LATERAL`, broader typed window stages beyond local ranking/value functions, complex
    expression ordering, recursive-CTE rejection with explicit alternatives, and
    bounded materialized-stream execution for migration/backfill jobs.
 

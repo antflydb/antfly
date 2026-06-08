@@ -2276,6 +2276,74 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the graph index
+        schema:
+          type: string
+      - name: metricName
+        in: path
+        required: true
+        description: Name of the configured graph metric
+        schema:
+          type: string
+      - name: action
+        in: path
+        required: true
+        description: Operational action to apply to the graph metric materialization
+        schema:
+          type: string
+          enum:
+            - refresh
+            - rebuild
+            - delete
+            - pause
+            - resume
+    post:
+      summary: Execute a graph metric operational action
+      description: >
+        Refresh, rebuild, delete, pause, or resume maintenance for a configured
+
+        graph metric. The metric configuration remains owned by the graph index.
+
+        `delete` clears materialized metric state and maintenance controls; a
+
+        later refresh or rebuild can publish a new generation.
+      tags:
+        - index_management
+      operationId: executeGraphMetricAction
+      responses:
+        '200':
+          description: Updated graph metric status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphMetricActionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          description: Graph metric actions are unavailable for this runtime
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/transactions/commit:
     post:
       summary: Commit an OCC transaction
@@ -3519,6 +3587,58 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/rows:mutation-source:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Stage typed relational update/delete operations from a claimed row source
+      tags:
+        - data_operations
+      operationId: rowsMutationSource
+      description: >
+        Transaction-staging endpoint for bounded multi-row relational
+
+        update/delete operations. The source is a typed base row query with a
+
+        `row_claim` and transaction id; the server claims selected rows,
+
+        records committed-version predicates, stages update/delete intents into
+
+        the existing transaction, and returns optional projections from the
+
+        planned final image or deleted row image.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RowsMutationSourceRequest'
+      responses:
+        '200':
+          description: Rows staged into the claimed transaction
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowsMutationSourceResultSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '501':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/rows:get:
     parameters:
       - name: tableName
@@ -3585,7 +3705,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RowsPlanRequest'
+              $ref: '#/components/schemas/RowsQueryPlanRequest'
       responses:
         '200':
           description: Row query response
@@ -3623,7 +3743,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RowsPlanRequest'
+              $ref: '#/components/schemas/RowsAggregatePlanRequest'
       responses:
         '200':
           description: Row aggregate response
@@ -3661,7 +3781,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RowsPlanRequest'
+              $ref: '#/components/schemas/RowsWindowPlanRequest'
       responses:
         '200':
           description: Row window response
@@ -3699,7 +3819,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RowsPlanRequest'
+              $ref: '#/components/schemas/RowsJoinPlanRequest'
       responses:
         '200':
           description: Row join response
@@ -3737,7 +3857,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RowsPlanRequest'
+              $ref: '#/components/schemas/RowsLateralPlanRequest'
       responses:
         '200':
           description: Row lateral response
@@ -6876,6 +6996,13 @@ components:
           $ref: '#/components/schemas/IndexConfig'
         status:
           $ref: '#/components/schemas/IndexStats'
+    GraphMetricActionResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          $ref: '#/components/schemas/GraphMetricStatus'
     LsmStorageStatus:
       type: object
       description: Compact LSM backend operational status. Detailed low-level counters are available through
@@ -7301,6 +7428,163 @@ components:
           $ref: '#/components/schemas/RowPrimarySelector'
         unique:
           $ref: '#/components/schemas/RowUniqueSelector'
+    RowsRowDocument:
+      type: object
+      additionalProperties: true
+      description: >
+        Full relational row document. Keys are declared relational columns and
+
+        values are JSON values coerced through the table schema before storage.
+    RowsFieldPatch:
+      type: object
+      additionalProperties: true
+      description: >
+        Static field patch for top-level relational columns. Primary-key fields
+
+        are rejected by the server.
+    RowsNumericIncrement:
+      type: object
+      description: Numeric increment map keyed by declared numeric columns.
+      additionalProperties:
+        type: number
+        format: double
+    RowsExpressionAssignmentMap:
+      type: object
+      description: Field-to-expression assignment map over the shared row-expression AST.
+      additionalProperties:
+        $ref: '#/components/schemas/RowsExpression'
+    RowsJsonSetTransform:
+      type: object
+      additionalProperties: false
+      description: JSON path assignment for a declared `json` column.
+      properties:
+        field:
+          type: string
+          description: Declared `json` column to update.
+        path:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: Non-empty path under the JSON column.
+        value:
+          description: JSON value to write at the path.
+      required:
+        - field
+        - path
+        - value
+    RowsArrayUpdateTransform:
+      type: object
+      additionalProperties: false
+      description: Array transform for a declared `array` column.
+      properties:
+        field:
+          type: string
+          description: Declared `array` column to update.
+        op:
+          type: string
+          enum:
+            - append
+            - remove
+            - add_to_set
+        value:
+          description: JSON value to append, remove, or add if absent.
+      required:
+        - field
+        - op
+        - value
+    RowsUniquePredicate:
+      type: object
+      additionalProperties: false
+      description: Predicate atom that must match a partial unique constraint definition.
+      properties:
+        field:
+          type: string
+        op:
+          type: string
+          enum:
+            - is_null
+            - is_not_null
+            - eq
+            - ne
+        value:
+          description: Predicate comparison value. Omit for null-test operators.
+      required:
+        - field
+        - op
+    RowsUniquePredicateGroup:
+      type: object
+      additionalProperties: false
+      description: Conjunction of partial-unique predicate atoms.
+      properties:
+        all:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsUniquePredicate'
+      required:
+        - all
+    RowsConflictUniqueTarget:
+      type: object
+      additionalProperties: false
+      description: Declared unique constraint target for `ON CONFLICT`.
+      properties:
+        name:
+          type: string
+          description: Unique constraint name.
+        where:
+          $ref: '#/components/schemas/RowsUniquePredicateGroup'
+      required:
+        - name
+    RowsConflictTarget:
+      type: object
+      additionalProperties: false
+      description: Primary-key or named unique constraint conflict target.
+      properties:
+        primary:
+          type: boolean
+          description: Set to `true` to target the declared primary key.
+        unique:
+          $ref: '#/components/schemas/RowsConflictUniqueTarget'
+    RowsOnConflict:
+      type: object
+      additionalProperties: false
+      description: >
+        Typed conflict action for insert operations. `nothing` skips the insert
+
+        when the target already exists. `update` applies the same typed update
+
+        operators as ordinary row updates, with expression sources allowed to
+
+        reference `existing` and `proposed` row images.
+      properties:
+        target:
+          $ref: '#/components/schemas/RowsConflictTarget'
+        action:
+          type: string
+          enum:
+            - update
+            - nothing
+        patch:
+          $ref: '#/components/schemas/RowsFieldPatch'
+        increment:
+          $ref: '#/components/schemas/RowsNumericIncrement'
+        patch_expr:
+          $ref: '#/components/schemas/RowsExpressionAssignmentMap'
+        increment_expr:
+          $ref: '#/components/schemas/RowsExpressionAssignmentMap'
+        json_set:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsJsonSetTransform'
+        array_update:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsArrayUpdateTransform'
+        where_expression:
+          $ref: '#/components/schemas/RowsExpressionCondition'
+      required:
+        - target
+        - action
     RowOperation:
       type: object
       description: >
@@ -7324,15 +7608,42 @@ components:
             - update
             - delete
         row:
-          type: object
-          additionalProperties: true
+          $ref: '#/components/schemas/RowsRowDocument'
           description: Full row document for insert/upsert. Must include primary-key columns.
         where:
           $ref: '#/components/schemas/RowSelector'
         patch:
-          type: object
-          additionalProperties: true
+          $ref: '#/components/schemas/RowsFieldPatch'
           description: Top-level field patch for update operations.
+        increment:
+          $ref: '#/components/schemas/RowsNumericIncrement'
+        patch_expr:
+          $ref: '#/components/schemas/RowsExpressionAssignmentMap'
+        increment_expr:
+          $ref: '#/components/schemas/RowsExpressionAssignmentMap'
+        json_set:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsJsonSetTransform'
+        array_update:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsArrayUpdateTransform'
+        on_conflict:
+          $ref: '#/components/schemas/RowsOnConflict'
+        where_expression:
+          $ref: '#/components/schemas/RowsExpressionCondition'
+        returning:
+          type: array
+          items:
+            type: string
+          description: Fields to return from the committed mutation image. `*` returns the full row and
+            cannot be combined with expression projections.
+        returning_expressions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsExpressionProjection'
+          description: Typed row-expression projections from the committed mutation image.
         expected_version:
           type: integer
           format: int64
@@ -7352,6 +7663,83 @@ components:
           $ref: '#/components/schemas/SyncLevel'
       required:
         - operations
+    RowsMutationSourceRequest:
+      type: object
+      description: >
+        Typed relational mutation-source plan. The `source` is a lockable base
+
+        row-query request with `row_claim.transaction_id` and no
+
+        `source_cte` or `doc_key_range`; update/delete intents are staged into
+
+        that transaction using committed-version predicates from the selected
+
+        preimages. Claims over physical ranges, CTEs, joins, aggregates,
+
+        windows, and lateral outputs are rejected until those stages expose an
+
+        explicit lockable base-row contract.
+      properties:
+        op:
+          type: string
+          enum:
+            - update
+            - delete
+        source:
+          $ref: '#/components/schemas/RowsQueryRequest'
+        patch:
+          $ref: '#/components/schemas/RowsFieldPatch'
+          description: Top-level static field patch for update operations.
+        increment:
+          $ref: '#/components/schemas/RowsNumericIncrement'
+          description: Numeric increments for update operations.
+        patch_expr:
+          $ref: '#/components/schemas/RowsExpressionAssignmentMap'
+          description: Field-to-expression assignments evaluated over the selected row image.
+        increment_expr:
+          $ref: '#/components/schemas/RowsExpressionAssignmentMap'
+          description: Field-to-expression numeric deltas evaluated over the selected row image.
+        json_set:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsJsonSetTransform'
+          description: JSON path transforms for update operations.
+        array_update:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsArrayUpdateTransform'
+          description: Array transforms for update operations.
+        returning:
+          type: array
+          items:
+            type: string
+          description: Fields to return from the final update image or deleted row image. `*` returns
+            the full row.
+        returning_expressions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsExpressionProjection'
+          description: Typed row-expression projections over the final update image or deleted row image.
+      required:
+        - op
+        - source
+    RowsMutationSourceResultSet:
+      type: object
+      properties:
+        matched:
+          type: integer
+          format: int64
+          description: Number of source rows that matched before lock/limit selection.
+        staged:
+          type: integer
+          format: int64
+          description: Number of rows staged into the claimed transaction.
+        returning:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Optional returning rows from the staged mutation.
     RowsGetRequest:
       type: object
       properties:
@@ -7390,16 +7778,721 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/RowsGetResult'
-    RowsPlanRequest:
-      anyOf:
-        - type: object
-          additionalProperties: true
+    RowsQueryOrder:
+      type: object
+      description: Ordered row-stream key. `field` names an output/base field; `expression` carries a
+        typed row-expression AST for computed ordering.
+      properties:
+        field:
+          type: string
+        expression:
+          $ref: '#/components/schemas/RowsExpression'
+        direction:
+          type: string
+          enum:
+            - asc
+            - desc
+      required:
+        - direction
+    RowsRowClaim:
+      type: object
+      additionalProperties: false
       description: >
-        Typed relational row plan envelope. The top-level operation-specific
+        Lockable base-row claim metadata. Public row-plan endpoints reject this
 
-        field is one of `query`, `aggregate`, `window`, `join`, or `lateral`;
+        field; it is only accepted by `rows:mutation-source` lockable base-row
 
-        `ctes` is optional and contains ordered named row-query subplans.
+        sources and internal/coordinator execution paths. `transaction_id` is
+
+        the canonical field name; `txn_id` is accepted as an adapter alias.
+      properties:
+        mode:
+          type: string
+          enum:
+            - for_update
+          default: for_update
+        skip_locked:
+          type: boolean
+          default: false
+        lease_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 30000
+        owner_id:
+          type: string
+        transaction_id:
+          type: string
+          pattern: ^[0-9a-fA-F]{32}$
+          description: Canonical 16-byte transaction id encoded as 32 hex characters.
+        txn_id:
+          type: string
+          pattern: ^[0-9a-fA-F]{32}$
+          description: Alias for `transaction_id`.
+    RowsDocKeyRange:
+      type: object
+      additionalProperties: false
+      description: >
+        Internal physical range selector used after durable range ownership
+
+        routing. Public REST/SDK endpoints reject this field; it is not stable
+
+        public row identity. At least one of `start` or `end` must be present,
+
+        and a bounded range must have `start < end`.
+      properties:
+        start:
+          type: string
+          description: Inclusive physical row-key lower bound.
+        end:
+          type: string
+          description: Exclusive physical row-key upper bound.
+    RowsExpression:
+      type: object
+      additionalProperties: true
+      description: >
+        Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+
+        `{ "value": ... }`, or an operator node such as
+
+        `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators
+
+        include `now`, `coalesce`, `lower`, `upper`, `concat`, `nullif`, numeric
+
+        `add`/`sub`/`mul`/`div`, `cast`, `json_extract`, `array_length`,
+
+        `string_to_array`, and searched `case` with `cases` and `else`.
+
+        Mutation expressions may set `source` to `existing` or `proposed`; query
+
+        expressions use the default row source.
+      properties:
+        field:
+          type: string
+        source:
+          type: string
+          enum:
+            - row
+            - existing
+            - proposed
+        value:
+          description: Literal JSON value for a value node.
+        op:
+          type: string
+          enum:
+            - now
+            - coalesce
+            - lower
+            - upper
+            - concat
+            - nullif
+            - add
+            - sub
+            - mul
+            - div
+            - cast
+            - json_extract
+            - array_length
+            - string_to_array
+            - case
+        args:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsExpression'
+          description: Operand expressions for operator nodes.
+        to:
+          type: string
+          enum:
+            - text
+            - numeric
+            - bool
+            - boolean
+          description: Cast target for `cast`.
+        path:
+          description: Structured JSON path for `json_extract`.
+        as_text:
+          type: boolean
+          description: Return JSON path extraction as text.
+        cases:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsExpressionCaseBranch'
+          description: Searched case branches, each with `when` and `then`.
+        else:
+          x-go-type-skip-optional-pointer: false
+          allOf:
+            - $ref: '#/components/schemas/RowsExpression'
+          description: Fallback expression for searched `case`.
+    RowsExpressionCaseBranch:
+      type: object
+      properties:
+        when:
+          $ref: '#/components/schemas/RowsExpressionCondition'
+        then:
+          $ref: '#/components/schemas/RowsExpression'
+      required:
+        - when
+        - then
+    RowsExpressionCondition:
+      type: object
+      description: Computed expression predicate over the shared row-expression AST.
+      properties:
+        lhs:
+          $ref: '#/components/schemas/RowsExpression'
+        op:
+          type: string
+          enum:
+            - is_null
+            - is_not_null
+            - is_distinct
+            - is_not_distinct
+            - eq
+            - ne
+            - gt
+            - gte
+            - lt
+            - lte
+        rhs:
+          $ref: '#/components/schemas/RowsExpression'
+      required:
+        - lhs
+        - op
+    RowsExpressionConditionGroup:
+      type: object
+      properties:
+        all:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsExpressionCondition'
+      required:
+        - all
+    RowsExpressionArrayContainsPredicate:
+      type: object
+      properties:
+        expr:
+          $ref: '#/components/schemas/RowsExpression'
+        value:
+          type: array
+          items: {}
+      required:
+        - expr
+        - value
+    RowsExpressionProjection:
+      type: object
+      properties:
+        as:
+          type: string
+        expr:
+          $ref: '#/components/schemas/RowsExpression'
+      required:
+        - as
+        - expr
+    RowsJsonExtractProjection:
+      type: object
+      additionalProperties: false
+      description: Compact JSON path projection over a declared `json` column.
+      properties:
+        as:
+          type: string
+          description: Output field name.
+        field:
+          type: string
+          description: Declared `json` column to read.
+        path:
+          description: Non-empty JSON path, encoded as a dot path string or array of path components.
+        as_text:
+          type: boolean
+          default: false
+          description: Return the extracted value as text, matching SQL `->>` behavior.
+      required:
+        - as
+        - field
+        - path
+    RowsArrayLengthProjection:
+      type: object
+      additionalProperties: false
+      description: Compact array-length projection over a declared `array` column.
+      properties:
+        as:
+          type: string
+          description: Output field name.
+        field:
+          type: string
+          description: Declared `array` column to measure.
+      required:
+        - as
+        - field
+    RowsCoalesceOperand:
+      type: object
+      additionalProperties: false
+      description: Compact COALESCE operand. Exactly one of `field` or `value` is accepted by the server.
+      properties:
+        field:
+          type: string
+          description: Declared column to read.
+        value:
+          description: Literal JSON fallback value.
+    RowsCoalesceProjection:
+      type: object
+      additionalProperties: false
+      description: Compact COALESCE projection.
+      properties:
+        as:
+          type: string
+          description: Output field name.
+        operands:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/RowsCoalesceOperand'
+      required:
+        - as
+        - operands
+    RowsFieldAliasProjection:
+      type: object
+      additionalProperties: false
+      description: Compact field alias projection over a declared column.
+      properties:
+        as:
+          type: string
+          description: Output field name.
+        field:
+          type: string
+          description: Declared column to project.
+      required:
+        - as
+        - field
+    RowsQueryRequest:
+      type: object
+      description: >
+        Typed relational row-query plan. Predicate and expression arrays carry
+
+        Antfly row-expression AST nodes; SQL syntax is adapter sugar over this
+
+        native request shape.
+      properties:
+        source_cte:
+          type: string
+          description: Optional ordered CTE name to read instead of the base table.
+        where:
+          type: object
+          additionalProperties: true
+          description: Typed scalar, array, JSON, text-pattern, OR, and NOT predicates.
+        expression_where:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsExpressionCondition'
+          description: All computed expression predicates that must pass.
+        expression_any:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsExpressionConditionGroup'
+          description: OR groups of computed expression predicates.
+        expression_not:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsExpressionConditionGroup'
+          description: NOT groups of computed expression predicates.
+        expression_array_contains:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsExpressionArrayContainsPredicate'
+          description: Computed array-containment predicates.
+        select:
+          type: array
+          items:
+            type: string
+        json_extract:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsJsonExtractProjection'
+        array_length:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsArrayLengthProjection'
+        coalesce:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsCoalesceProjection'
+        field_aliases:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsFieldAliasProjection'
+        expressions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsExpressionProjection'
+          description: Typed row-expression projections.
+        order_by:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsQueryOrder'
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+        row_claim:
+          $ref: '#/components/schemas/RowsRowClaim'
+        doc_key_range:
+          $ref: '#/components/schemas/RowsDocKeyRange'
+    RowsCte:
+      type: object
+      description: Ordered named row-query subplan. Later CTEs and final plan stages can reference earlier
+        names through `source_cte`.
+      properties:
+        name:
+          type: string
+        query:
+          $ref: '#/components/schemas/RowsQueryRequest'
+      required:
+        - name
+        - query
+    RowsAggregateSpec:
+      type: object
+      properties:
+        name:
+          type: string
+        op:
+          type: string
+        field:
+          type: string
+        expression:
+          $ref: '#/components/schemas/RowsExpression'
+        distinct:
+          type: boolean
+        filter:
+          type: object
+          additionalProperties: true
+        filter_expressions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsExpressionCondition'
+      required:
+        - name
+        - op
+    RowsAggregateHavingPredicate:
+      type: object
+      additionalProperties: false
+      description: Predicate over aggregate output fields, evaluated after grouping.
+      properties:
+        field:
+          type: string
+          description: Aggregate output field name, usually an aggregation `name` or group key.
+        op:
+          type: string
+          enum:
+            - is_null
+            - is_not_null
+            - is_distinct
+            - is_not_distinct
+            - eq
+            - ne
+            - gt
+            - gte
+            - lt
+            - lte
+        value:
+          description: Comparison value. Omit for `is_null` and `is_not_null`.
+      required:
+        - field
+        - op
+    RowsAggregateHaving:
+      type: object
+      additionalProperties: false
+      description: Conjunction of aggregate-output predicates for HAVING.
+      properties:
+        all:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsAggregateHavingPredicate'
+      required:
+        - all
+    RowsAggregateRequest:
+      type: object
+      properties:
+        source:
+          $ref: '#/components/schemas/RowsQueryRequest'
+        group_by:
+          type: array
+          items:
+            type: string
+        aggregations:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsAggregateSpec'
+        having:
+          $ref: '#/components/schemas/RowsAggregateHaving'
+        order_by:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsQueryOrder'
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+        - source
+    RowsWindowSpec:
+      type: object
+      properties:
+        as:
+          type: string
+        function:
+          type: string
+        partition_by:
+          type: array
+          items:
+            type: string
+        order_by:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsQueryOrder'
+        field:
+          type: string
+        expression:
+          $ref: '#/components/schemas/RowsExpression'
+        offset:
+          type: integer
+          format: int64
+          minimum: 1
+        default:
+          nullable: true
+      required:
+        - as
+        - function
+        - order_by
+    RowsWindowRequest:
+      type: object
+      properties:
+        source:
+          $ref: '#/components/schemas/RowsQueryRequest'
+        windows:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsWindowSpec'
+        select:
+          type: array
+          items:
+            type: string
+        order_by:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsQueryOrder'
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+        - source
+        - windows
+    RowsJoinOn:
+      type: object
+      properties:
+        left_field:
+          type: string
+        right_field:
+          type: string
+      required:
+        - left_field
+        - right_field
+    RowsJoinProjection:
+      type: object
+      properties:
+        as:
+          type: string
+        side:
+          type: string
+          enum:
+            - left
+            - right
+        field:
+          type: string
+      required:
+        - as
+        - side
+        - field
+    RowsJoinRequest:
+      type: object
+      description: Typed equality join plan. Each side is a full row-query request and can read an ordered
+        CTE through `source_cte`.
+      properties:
+        left:
+          $ref: '#/components/schemas/RowsQueryRequest'
+        right:
+          $ref: '#/components/schemas/RowsQueryRequest'
+        'on':
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsJoinOn'
+        join_type:
+          type: string
+          enum:
+            - inner
+            - left
+        select:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsJoinProjection'
+        order_by:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsQueryOrder'
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+        - left
+        - right
+        - 'on'
+    RowsLateralCorrelation:
+      type: object
+      properties:
+        left_field:
+          type: string
+        right_field:
+          type: string
+      required:
+        - left_field
+        - right_field
+    RowsLateralRequest:
+      type: object
+      description: Typed bounded lateral plan. The right side must include a limit and can read an ordered
+        CTE through `source_cte`.
+      properties:
+        left:
+          $ref: '#/components/schemas/RowsQueryRequest'
+        right:
+          $ref: '#/components/schemas/RowsQueryRequest'
+        correlations:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsLateralCorrelation'
+        select:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsJoinProjection'
+        order_by:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsQueryOrder'
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+        - left
+        - right
+        - correlations
+    RowsPlanRequest:
+      type: object
+      description: >
+        Generic typed relational row plan envelope. Public operation endpoints
+
+        use the operation-specific envelope schemas below and accept exactly one
+
+        top-level operation field plus optional ordered `ctes`.
+      properties:
+        ctes:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsCte'
+        query:
+          $ref: '#/components/schemas/RowsQueryRequest'
+        aggregate:
+          $ref: '#/components/schemas/RowsAggregateRequest'
+        window:
+          $ref: '#/components/schemas/RowsWindowRequest'
+        join:
+          $ref: '#/components/schemas/RowsJoinRequest'
+        lateral:
+          $ref: '#/components/schemas/RowsLateralRequest'
+    RowsQueryPlanRequest:
+      type: object
+      additionalProperties: false
+      description: Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes`.
+      properties:
+        ctes:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsCte'
+        query:
+          $ref: '#/components/schemas/RowsQueryRequest'
+      required:
+        - query
+    RowsAggregatePlanRequest:
+      type: object
+      additionalProperties: false
+      description: Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered
+        `ctes`.
+      properties:
+        ctes:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsCte'
+        aggregate:
+          $ref: '#/components/schemas/RowsAggregateRequest'
+      required:
+        - aggregate
+    RowsWindowPlanRequest:
+      type: object
+      additionalProperties: false
+      description: Typed row-window plan envelope. Accepts exactly `window` plus optional ordered `ctes`.
+      properties:
+        ctes:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsCte'
+        window:
+          $ref: '#/components/schemas/RowsWindowRequest'
+      required:
+        - window
+    RowsJoinPlanRequest:
+      type: object
+      additionalProperties: false
+      description: Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`.
+      properties:
+        ctes:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsCte'
+        join:
+          $ref: '#/components/schemas/RowsJoinRequest'
+      required:
+        - join
+    RowsLateralPlanRequest:
+      type: object
+      additionalProperties: false
+      description: Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes`.
+      properties:
+        ctes:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsCte'
+        lateral:
+          $ref: '#/components/schemas/RowsLateralRequest'
+      required:
+        - lateral
     RowsQueryResultSet:
       type: object
       properties:
@@ -9491,6 +10584,14 @@ components:
             }
 
             ```
+        graph_metric_rerank:
+          $ref: '#/components/schemas/GraphMetricRerank'
+          description: >
+            Optional graph metric score feature to blend into ordinary search hit ranking.
+
+            The metric must have a published generation. With `metric_freshness: fresh`,
+
+            the request fails if graph writes have made the published generation stale.
         analyses:
           $ref: '#/components/schemas/Analyses'
         graph_searches:
@@ -9900,6 +11001,39 @@ components:
         merge:
           $ref: '#/components/schemas/MergeProfile'
           description: Result merge statistics (present for hybrid search).
+        graph_metrics:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphMetricProfile'
+          description: Graph metric freshness and generation details for metric-aware query work.
+    GraphMetricProfile:
+      type: object
+      required:
+        - query_name
+        - source
+        - index_name
+        - metric_name
+        - freshness
+        - status
+      properties:
+        query_name:
+          type: string
+          description: Name of the graph query or graph metric query that used the metric.
+        source:
+          type: string
+          description: Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`.
+        index_name:
+          type: string
+          description: Graph index that owns the metric.
+        metric_name:
+          type: string
+          description: Graph metric name within the index.
+        freshness:
+          type: string
+          description: Effective freshness mode requested for this metric use.
+        status:
+          $ref: '#/components/schemas/GraphMetricStatus'
+          description: Published generation and freshness status observed by the query.
     ShardsProfile:
       type: object
       description: Shard-level execution statistics.
@@ -10031,6 +11165,67 @@ components:
             type: number
             format: float
             x-go-type: float64
+    QueryScoreDetails:
+      type: object
+      description: Optional score provenance for ranking features that changed the final hit score.
+      properties:
+        graph_metric_rerank:
+          $ref: '#/components/schemas/GraphMetricRerankScoreDetails'
+          description: Score contribution from an explicit graph_metric_rerank request.
+    GraphMetricRerankScoreDetails:
+      type: object
+      required:
+        - index_name
+        - metric_name
+        - base_score
+        - base_weight
+        - metric_score_used
+        - metric_weight
+        - missing_score_used
+        - final_score
+        - published_generation
+      properties:
+        index_name:
+          type: string
+          description: Graph index that provided the metric score.
+        metric_name:
+          type: string
+          description: Graph metric used as a score feature.
+        base_score:
+          type: number
+          format: double
+          description: Hit score before graph metric rerank composition.
+        base_weight:
+          type: number
+          format: double
+          description: Weight applied to the base score.
+        metric_score:
+          type: number
+          format: double
+          nullable: true
+          description: Published metric score for this hit, or null when the hit was missing from the
+            metric generation.
+        metric_score_used:
+          type: number
+          format: double
+          description: Metric feature value used in the formula after applying missing_score fallback
+            if needed.
+        metric_weight:
+          type: number
+          format: double
+          description: Weight applied to the metric score feature.
+        missing_score_used:
+          type: boolean
+          description: True when metric_score was missing and the request's missing_score fallback was
+            used.
+        final_score:
+          type: number
+          format: double
+          description: Final hit score after graph metric rerank composition.
+        published_generation:
+          type: integer
+          format: int64
+          description: Published graph metric score generation used for this hit.
     QueryHit:
       type: object
       description: A single query result hit
@@ -10053,6 +11248,10 @@ components:
           additionalProperties: true
           description: Scores partitioned by index when using RRF search.
           x-go-name: indexScores
+        _score_details:
+          $ref: '#/components/schemas/QueryScoreDetails'
+          description: Optional explain-style score provenance for score features applied to this hit.
+          x-go-name: scoreDetails
         _source:
           type: object
           additionalProperties: true
@@ -13659,6 +14858,177 @@ components:
         - $ref: '#/components/schemas/EmbeddingsIndexStats'
         - $ref: '#/components/schemas/GraphIndexStats'
         - $ref: '#/components/schemas/AlgebraicIndexStats'
+    GraphMetricEdgeFilterStatus:
+      type: object
+      required:
+        - mode
+      properties:
+        mode:
+          type: string
+          enum:
+            - all
+            - types
+        types:
+          type: array
+          items:
+            type: string
+    GraphMetricEvent:
+      type: object
+      required:
+        - sequence
+        - kind
+        - at_ms
+        - target_edge_generation
+        - published_generation
+        - score_count
+      properties:
+        sequence:
+          type: integer
+          format: int64
+        kind:
+          type: string
+          enum:
+            - publish
+            - delete
+            - pause
+            - resume
+            - failed
+        at_ms:
+          type: integer
+          format: int64
+        target_edge_generation:
+          type: integer
+          format: int64
+        published_generation:
+          type: integer
+          format: int64
+        score_count:
+          type: integer
+          format: int64
+    GraphMetricStatus:
+      type: object
+      required:
+        - state
+        - phase
+        - published_generation
+        - edge_generation
+        - target_edge_generation
+        - build_queued
+        - progress
+        - converged
+        - iterations_completed
+        - delta
+        - computed_at_ms
+      properties:
+        state:
+          type: string
+        phase:
+          type: string
+          enum:
+            - idle
+            - computing
+            - publishing
+            - complete
+            - prepare_generation
+            - scan_edges_and_out_degree
+            - initialize_ranks
+            - iterate_contributions
+            - reduce_ranks
+            - check_convergence
+            - publish_generation
+            - cleanup_old_generations
+        edge_filter:
+          $ref: '#/components/schemas/GraphMetricEdgeFilterStatus'
+        metadata_version:
+          type: integer
+          format: int64
+          description: Version of the published graph metric metadata schema. Legacy unversioned materializations
+            report 0.
+        maintenance_paused:
+          type: boolean
+        build_queued:
+          type: boolean
+          description: Whether a local or distributed build is queued after the currently published or
+            building generation.
+        published_generation:
+          type: integer
+          format: int64
+        edge_generation:
+          type: integer
+          format: int64
+        target_edge_generation:
+          type: integer
+          format: int64
+        queued_generation:
+          type: integer
+          format: int64
+          description: Pending edge generation waiting to build, or 0 when no build is queued.
+        building_generation:
+          type: integer
+          format: int64
+          description: Edge generation currently held by an active build lease, or 0 when idle.
+        build_job_id:
+          type: integer
+          format: int64
+          description: Durable identifier for the active graph metric build job, or 0 when idle.
+        build_started_at_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the active graph metric build started, or 0 when idle.
+        build_iteration:
+          type: integer
+          format: int64
+          description: Iteration number reported by the active build lease, or 0 when idle or not iterative.
+        build_lease_expires_at_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the active build lease expires, or 0 when idle.
+        build_worker_id:
+          type: string
+          description: Worker id that owns the active build lease. Local builds use `local`.
+        build_cursor:
+          type: string
+          description: Opaque resumable cursor for the active build phase. Empty or omitted when idle
+            or when the phase has no cursor.
+        build_completed_units:
+          type: integer
+          format: int64
+          description: Completed work units for the active graph metric build, or 0 when idle or unknown.
+        build_total_units:
+          type: integer
+          format: int64
+          description: Estimated total work units for the active graph metric build, or 0 when idle or
+            unknown.
+        retry_count:
+          type: integer
+          format: int64
+          description: Number of consecutive failed build attempts for the current target generation,
+            or 0 when no failure applies.
+        last_error:
+          type: string
+          description: Last build error for the current failed target generation.
+        progress:
+          type: number
+          format: double
+          description: Build progress for the target edge generation, from 0.0 to 1.0
+        converged:
+          type: boolean
+        iterations_completed:
+          type: integer
+          format: int64
+        delta:
+          type: number
+          format: double
+        computed_at_ms:
+          type: integer
+          format: int64
+        last_event:
+          $ref: '#/components/schemas/GraphMetricEvent'
+        recent_events:
+          type: array
+          description: Recent graph metric events, newest first.
+          items:
+            $ref: '#/components/schemas/GraphMetricEvent'
     ChatToolName:
       type: string
       description: >
@@ -14975,6 +16345,42 @@ components:
         provider: ollama
         model: dengcao/Qwen3-Reranker-0.6B:F16
         field: content
+    GraphMetricRerank:
+      type: object
+      required:
+        - index
+        - metric
+      properties:
+        index:
+          type: string
+          description: Graph index that owns the published metric.
+        metric:
+          type: string
+          description: Graph metric name to blend into the search hit score.
+        base_weight:
+          type: number
+          format: double
+          default: 1.0
+          description: Multiplier applied to the existing hit score before adding the graph metric feature.
+        weight:
+          type: number
+          format: double
+          default: 1.0
+          description: Multiplier applied to the graph metric score before it is added to the existing
+            hit score.
+        missing_score:
+          type: number
+          format: double
+          default: 0.0
+          description: Metric feature value to use for hits that do not have a score in the published
+            metric generation.
+        metric_freshness:
+          type: string
+          enum:
+            - published
+            - fresh
+          default: published
+          description: Whether stale published generations are acceptable or the metric must be fresh.
     GraphQueryType:
       x-go-type-skip-optional-pointer: true
       type: string
@@ -15148,6 +16554,47 @@ components:
         edge:
           $ref: '#/components/schemas/PatternEdgeStep'
           description: Edge to traverse to reach this step (null for first step)
+    GraphMetricOrder:
+      type: object
+      required:
+        - metric
+      properties:
+        metric:
+          type: string
+        direction:
+          type: string
+          enum:
+            - asc
+            - desc
+        nulls:
+          type: string
+          enum:
+            - first
+            - last
+            - nulls_first
+            - nulls_last
+    GraphMetricFilter:
+      type: object
+      required:
+        - metric
+        - op
+        - value
+      properties:
+        metric:
+          type: string
+        op:
+          type: string
+          enum:
+            - '>'
+            - '>='
+            - <
+            - <=
+            - '='
+            - ==
+            - '!='
+        value:
+          type: number
+          format: double
     GraphQuery:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -15197,6 +16644,35 @@ components:
           items:
             type: string
           description: Which fields to return from documents
+        metrics:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: Graph metric names to project onto result nodes
+        order_by:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphMetricOrder'
+          description: Sort graph result nodes by graph metric scores
+        where_metric:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphMetricFilter'
+          description: Filter graph result nodes by graph metric scores
+        metric_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - published
+            - fresh
+          description: Freshness mode for projected, ordered, and filtered graph metrics
+        include_metric_status:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Include graph metric status metadata in the graph result
     Pruner:
       type: object
       description: >
@@ -15304,6 +16780,12 @@ components:
             type: string
           description: Algebraic provenance labels folded into this result, when requested by an algebraic
             graph executor
+        metrics:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Projected graph metric scores keyed by metric name. Values are numbers or null
+            when a requested metric has no score for the node.
         edges:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -15365,6 +16847,12 @@ components:
           format: int64
           x-go-type: time.Duration
           description: Query execution time
+        metric_status:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphMetricStatus'
+          description: Graph metric status metadata keyed by metric name
     GraphMetricScore:
       type: object
       required:
@@ -15376,36 +16864,6 @@ components:
         score:
           type: number
           format: double
-    GraphMetricStatus:
-      type: object
-      required:
-        - state
-        - published_generation
-        - edge_generation
-        - converged
-        - iterations_completed
-        - delta
-        - computed_at_ms
-      properties:
-        state:
-          type: string
-        published_generation:
-          type: integer
-          format: int64
-        edge_generation:
-          type: integer
-          format: int64
-        converged:
-          type: boolean
-        iterations_completed:
-          type: integer
-          format: int64
-        delta:
-          type: number
-          format: double
-        computed_at_ms:
-          type: integer
-          format: int64
     GraphMetricResult:
       type: object
       required:

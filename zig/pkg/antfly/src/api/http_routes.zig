@@ -63,6 +63,7 @@ pub const Routes = struct {
     pub const rows_window_suffix = "/rows:window";
     pub const rows_join_suffix = "/rows:join";
     pub const rows_lateral_suffix = "/rows:lateral";
+    pub const rows_mutation_source_suffix = "/rows:mutation-source";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const restore_suffix = "/restore";
@@ -101,6 +102,7 @@ pub const Routes = struct {
     pub const schema_suffix = "/schema";
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
+    pub const graph_metrics_marker = "/graph-metrics/";
 
     pub const TableLookup = struct {
         table_name: []const u8,
@@ -162,6 +164,13 @@ pub const Routes = struct {
     pub const TableIndex = struct {
         table_name: []const u8,
         index_name: []const u8,
+    };
+
+    pub const TableGraphMetric = struct {
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
     };
 
     pub const SecretPath = struct {
@@ -443,6 +452,10 @@ pub const Routes = struct {
         return matchTableRowsAction(path, rows_lateral_suffix);
     }
 
+    pub fn matchTableRowsMutationSource(path: []const u8) ?TableRows {
+        return matchTableRowsAction(path, rows_mutation_source_suffix);
+    }
+
     fn matchTableRowsAction(path: []const u8, suffix: []const u8) ?TableRows {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, suffix)) return null;
@@ -533,6 +546,34 @@ pub const Routes = struct {
         return .{
             .table_name = table_name,
             .index_name = index_name,
+        };
+    }
+
+    pub fn matchTableGraphMetric(path: []const u8) ?TableGraphMetric {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        const rest = path[tables_prefix.len..];
+        const marker_index = std.mem.indexOf(u8, rest, indexes_marker) orelse return null;
+        if (marker_index == 0) return null;
+        const table_name = rest[0..marker_index];
+        if (std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+
+        const index_and_metric = rest[marker_index + indexes_marker.len ..];
+        const graph_metric_marker_index = std.mem.indexOf(u8, index_and_metric, graph_metrics_marker) orelse return null;
+        const index_name = index_and_metric[0..graph_metric_marker_index];
+        if (index_name.len == 0 or std.mem.indexOfScalar(u8, index_name, '/') != null) return null;
+
+        const metric_action = index_and_metric[graph_metric_marker_index + graph_metrics_marker.len ..];
+        const action_index = std.mem.lastIndexOfScalar(u8, metric_action, ':') orelse return null;
+        const metric_name = metric_action[0..action_index];
+        const action = metric_action[action_index + 1 ..];
+        if (metric_name.len == 0 or action.len == 0) return null;
+        if (std.mem.indexOfScalar(u8, metric_name, '/') != null) return null;
+        if (std.mem.indexOfScalar(u8, action, '/') != null) return null;
+        return .{
+            .table_name = table_name,
+            .index_name = index_name,
+            .metric_name = metric_name,
+            .action = action,
         };
     }
 
@@ -1066,6 +1107,12 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", index.table_name);
     try std.testing.expectEqualStrings("search_idx", index.index_name);
     try std.testing.expect(Routes.matchTableIndex("/tables/docs/indexes/search_idx/algebraic") == null);
+    const graph_metric = Routes.matchTableGraphMetric("/tables/docs/indexes/graph_idx/graph-metrics/pagerank:refresh").?;
+    try std.testing.expectEqualStrings("docs", graph_metric.table_name);
+    try std.testing.expectEqualStrings("graph_idx", graph_metric.index_name);
+    try std.testing.expectEqualStrings("pagerank", graph_metric.metric_name);
+    try std.testing.expectEqualStrings("refresh", graph_metric.action);
+    try std.testing.expect(Routes.matchTableIndex("/tables/docs/indexes/graph_idx/graph-metrics/pagerank:refresh") == null);
     const algebraic_partials = Routes.matchGroupAlgebraicPartials("/internal/v1/groups/42/tables/docs/algebraic-partials").?;
     try std.testing.expectEqual(@as(u64, 42), algebraic_partials.group_id);
     try std.testing.expectEqualStrings("docs", algebraic_partials.table_name);

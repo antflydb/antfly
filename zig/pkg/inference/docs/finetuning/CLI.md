@@ -388,8 +388,7 @@ limited to parser and dispatch behavior.
 
 ## Migration Order
 
-Because there is no legacy support requirement, migrate toward the target
-surface directly:
+Migrate toward the target surface directly:
 
 1. Add `src/finetune/core/run_context.zig`.
 2. Add `src/finetune/cli/root.zig` and wire `antfly inference finetune`.

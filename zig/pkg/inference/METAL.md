@@ -896,8 +896,8 @@ Implementation order:
   records (`kind`, `source`, `region`, `scope`, barrier flag, resource slice,
   and quant dispatch). The Q8_0 greedy tail and active Q8_0/f32-KV row-1 layer
   helper both run encoder loops over those records and dispatch by op kind; the
-  older cursor path remains only as a compatibility fallback for callers that
-  have not supplied command-op records yet.
+  cursor path remains the alternate path for callers that have not supplied
+  command-op records yet.
 - [ ] Extend command-plan builders to the qLen>1 prefill layer contract and
   non-Q8/dense tail variants, then assemble embedding -> PLE -> layers -> tail
   as one frame command plan before any runtime encoding starts.

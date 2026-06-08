@@ -57,11 +57,11 @@ Sync from Git:
 cd examples/memoryaf
 GOWORK=off go run . sync \
   --source git \
-  --git-url github.com/antflydb/colony \
+  --git-url github.com/antflydb/docs-source \
   --git-ref main \
   --git-subpath docs \
   --url http://localhost:8080/db/v1 \
-  --project colony-docs
+  --project antfly-docs
 ```
 
 Sync from S3:

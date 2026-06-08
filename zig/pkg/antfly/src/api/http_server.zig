@@ -3226,6 +3226,16 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST) {
+            if (routes.Routes.matchTableGraphMetric(uri_parts.path)) |graph_metric| {
+                return try self.handlePublicTableGraphMetricAction(
+                    graph_metric.table_name,
+                    graph_metric.index_name,
+                    graph_metric.metric_name,
+                    graph_metric.action,
+                );
+            }
+        }
+        if (req.method == .POST) {
             if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
                 return try self.handlePublicTableCreateIndex(table_index.table_name, table_index.index_name, req.body);
             }
@@ -3570,6 +3580,11 @@ pub const ApiHttpServer = struct {
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsLateral(uri_parts.path)) |rows_route| {
                 return try self.handlePublicTableRowsLateral(rows_route.table_name, req.body, authenticated_identity);
+            }
+        }
+        if (req.method == .POST) {
+            if (routes.Routes.matchTableRowsMutationSource(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsMutationSource(rows_route.table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
@@ -4612,6 +4627,7 @@ pub const ApiHttpServer = struct {
                 .execute_table_get_index = executePublicTableGetIndex,
                 .execute_table_create_index = executePublicTableCreateIndex,
                 .execute_table_delete_index = executePublicTableDeleteIndex,
+                .execute_table_graph_metric_action = executePublicTableGraphMetricAction,
             },
         };
     }
@@ -5393,6 +5409,28 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn executePublicTableGraphMetricAction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) public_table_http.TableApi.ExecuteGraphMetricActionError![]u8 {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_writes orelse return error.MethodNotAllowed;
+        var status = (source.graphMetricAction(alloc, table_name, index_name, metric_name, action) catch |err| switch (err) {
+            error.InvalidGraphMetricAction => return error.InvalidGraphMetricAction,
+            error.TableNotFound, error.IndexNotFound, error.MetricNotReady => return error.NotFound,
+            else => {
+                std.log.err("public graph metric action failed table={s} index={s} metric={s} action={s} err={}", .{ table_name, index_name, metric_name, action, err });
+                return error.InternalFailure;
+            },
+        }) orelse return error.NotFound;
+        defer status.deinit(alloc);
+        return indexes_api.encodeGraphMetricStatusResponse(alloc, status) catch return error.InternalFailure;
+    }
+
     fn executePublicClusterBackupList(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5695,6 +5733,52 @@ pub const ApiHttpServer = struct {
         const response_body = try relational_rows_api.encodeRowsBatchResponseAlloc(self.alloc, rows_req);
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 201, response_body);
+    }
+
+    pub fn handlePublicTableRowsMutationSource(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
+        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var rows_req = relational_rows_api.parseRowsMutationSourceRequest(self.alloc, body, schema) catch return try textResponse(self.alloc, 400, "invalid rows mutation source request");
+        defer rows_req.deinit(self.alloc);
+
+        var filter = self.rowsAuthFilterPlanForIdentity(table_name, authenticated_identity, schema) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+            else => return err,
+        };
+        defer if (filter) |*value| value.deinit(self.alloc);
+        if (filter) |active| {
+            try self.applyRowsAuthFilterToQuery(schema, active, &rows_req.req.source);
+        }
+
+        var result = (source.mutateRowsFromSource(self.alloc, table_name, schema, rows_req.req) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows mutation source unavailable"),
+            error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
+            error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+            error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+            error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
+            else => {
+                std.log.err("public table rows mutation source failed table={s} err={}", .{ table_name, err });
+                return try textResponse(self.alloc, 500, "rows mutation source failed");
+            },
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+
+        const response_body = try relational_rows_api.encodeRowsMutationSourceResponseAlloc(self.alloc, result);
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
 
     pub fn handlePublicTableRowsGet(
@@ -6634,6 +6718,21 @@ pub const ApiHttpServer = struct {
                 const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
                 break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
             },
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicTableGraphMetricAction(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !http_common.HttpResponse {
+        var resp = try public_table_http.handleTableGraphMetricAction(self.alloc, table_name, index_name, metric_name, action, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
     }
@@ -12814,6 +12913,24 @@ test "api http server executes public relational row plan endpoints" {
     try std.testing.expectEqual(@as(i64, 2), parsed_query.value.object.get("total").?.integer);
     try std.testing.expectEqualStrings("o2", parsed_query.value.object.get("rows").?.array.items[0].object.get("id").?.string);
 
+    var public_claim_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:query",
+        .content_type = "application/json",
+        .body = "{\"query\":{\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"worker:test\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}}",
+    });
+    defer public_claim_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), public_claim_query_resp.status);
+
+    var public_range_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:query",
+        .content_type = "application/json",
+        .body = "{\"query\":{\"doc_key_range\":{\"start\":\"row:a\",\"end\":\"row:z\"}}}",
+    });
+    defer public_range_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), public_range_query_resp.status);
+
     var aggregate_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/records/rows:aggregate",
@@ -12865,6 +12982,40 @@ test "api http server executes public relational row plan endpoints" {
     defer parsed_lateral.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed_lateral.value.object.get("total_rows").?.integer);
     try std.testing.expectEqualStrings("o2", parsed_lateral.value.object.get("rows").?.array.items[0].object.get("latest_order_id").?.string);
+
+    const mutation_txn_hex = "00112233445566778899aabbccddeeff";
+    const mutation_txn_id = try distributed_txn.parseTxnIdHex(mutation_txn_hex);
+    _ = try db.beginTransactionWithId(mutation_txn_id, 1_000);
+    var mutation_source_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:mutation-source",
+        .content_type = "application/json",
+        .body = "{\"op\":\"update\",\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"closed\"}]},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"worker:test\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"},\"limit\":1},\"patch\":{\"status\":\"archived\"},\"returning\":[\"id\",\"status\"],\"returning_expressions\":[{\"as\":\"status_label\",\"expr\":{\"op\":\"concat\",\"args\":[{\"field\":\"id\"},{\"value\":\":\"},{\"field\":\"status\"}]}}]}",
+    });
+    defer mutation_source_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), mutation_source_resp.status);
+    var parsed_mutation_source = try std.json.parseFromSlice(std.json.Value, alloc, mutation_source_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_mutation_source.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_mutation_source.value.object.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed_mutation_source.value.object.get("staged").?.integer);
+    const staged_returning = parsed_mutation_source.value.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("o3", staged_returning.get("id").?.string);
+    try std.testing.expectEqualStrings("archived", staged_returning.get("status").?.string);
+    try std.testing.expectEqualStrings("o3:archived", staged_returning.get("status_label").?.string);
+    try db.commitTransaction(mutation_txn_id, 1_001);
+
+    var archived_get_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:get",
+        .content_type = "application/json",
+        .body = "{\"keys\":[{\"primary\":{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o3\"}}]}",
+    });
+    defer archived_get_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), archived_get_resp.status);
+    var parsed_archived_get = try std.json.parseFromSlice(std.json.Value, alloc, archived_get_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_archived_get.deinit();
+    const archived_row = parsed_archived_get.value.object.get("rows").?.array.items[0].object.get("row").?.object;
+    try std.testing.expectEqualStrings("archived", archived_row.get("status").?.string);
 
     var cross_tenant_resp = try server.handle(.{
         .method = .POST,
@@ -12918,6 +13069,10 @@ test "api http server executes public relational row plan endpoints" {
     var unsupported_resp = try server.handlePublicTableRowsQuery("records", "{\"query\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"}}}", unsupported_identity);
     defer unsupported_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), unsupported_resp.status);
+
+    var unsupported_mutation_resp = try server.handlePublicTableRowsMutationSource("records", "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"worker:test\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"patch\":{\"status\":\"claimed\"}}", unsupported_identity);
+    defer unsupported_mutation_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), unsupported_mutation_resp.status);
 }
 
 test "api http server serves public transaction commit route" {
@@ -15517,6 +15672,135 @@ test "api http server serves local index runtime backfill status" {
     const local_shard = parsed_detail.value.shard_status.@"7" orelse parsed_detail.value.shard_status.local.?;
     try std.testing.expectEqual(@as(?bool, false), local_shard.backfill_active);
     try std.testing.expectEqual(@as(?u64, 1), local_shard.doc_count);
+}
+
+test "api http server graph metric action endpoint returns updated status" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-http-graph-metric-action";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var source = FakeSource{};
+    var write_source = table_writes.BoundTableWriteSource.init("docs", &db);
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, write_source.source());
+
+    var pause_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/graph_idx/graph-metrics/degree:pause",
+        .body = "",
+    });
+    defer pause_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), pause_resp.status);
+    try std.testing.expectEqualStrings("application/json", pause_resp.content_type.?);
+    var parsed_pause = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, pause_resp.body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed_pause.deinit();
+    const pause_status = parsed_pause.value.object.get("status").?.object;
+    try std.testing.expectEqualStrings("fresh", pause_status.get("state").?.string);
+    try std.testing.expectEqualStrings("complete", pause_status.get("phase").?.string);
+    try std.testing.expectEqual(@as(i64, 1), pause_status.get("target_edge_generation").?.integer);
+    try std.testing.expect(switch (pause_status.get("progress").?) {
+        .float => |progress| progress == 1.0,
+        .integer => |progress| progress == 1,
+        else => false,
+    });
+    const pause_event = pause_status.get("last_event").?.object;
+    try std.testing.expectEqualStrings("pause", pause_event.get("kind").?.string);
+    try std.testing.expectEqual(@as(i64, 1), pause_event.get("published_generation").?.integer);
+    const pause_events = pause_status.get("recent_events").?.array;
+    try std.testing.expect(pause_events.items.len >= 2);
+    try std.testing.expectEqualStrings("pause", pause_events.items[0].object.get("kind").?.string);
+    try std.testing.expectEqualStrings("publish", pause_events.items[1].object.get("kind").?.string);
+    try std.testing.expect(pause_status.get("maintenance_paused").?.bool);
+
+    var resume_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/graph_idx/graph-metrics/degree:resume",
+        .body = "",
+    });
+    defer resume_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), resume_resp.status);
+    var parsed_resume = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, resume_resp.body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed_resume.deinit();
+    const resume_status = parsed_resume.value.object.get("status").?.object;
+    try std.testing.expectEqualStrings("fresh", resume_status.get("state").?.string);
+    try std.testing.expect(!resume_status.get("maintenance_paused").?.bool);
+
+    var delete_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/graph_idx/graph-metrics/degree:delete",
+        .body = "",
+    });
+    defer delete_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), delete_resp.status);
+    var parsed_delete = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, delete_resp.body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed_delete.deinit();
+    const delete_status = parsed_delete.value.object.get("status").?.object;
+    try std.testing.expectEqualStrings("not_ready", delete_status.get("state").?.string);
+    try std.testing.expectEqualStrings("idle", delete_status.get("phase").?.string);
+    try std.testing.expectEqual(@as(i64, 1), delete_status.get("target_edge_generation").?.integer);
+    try std.testing.expect(switch (delete_status.get("progress").?) {
+        .float => |progress| progress == 0.0,
+        .integer => |progress| progress == 0,
+        else => false,
+    });
+    const delete_event = delete_status.get("last_event").?.object;
+    try std.testing.expectEqualStrings("delete", delete_event.get("kind").?.string);
+    try std.testing.expectEqual(@as(i64, 0), delete_event.get("published_generation").?.integer);
+    const delete_events = delete_status.get("recent_events").?.array;
+    try std.testing.expectEqual(@as(usize, 1), delete_events.items.len);
+    try std.testing.expectEqualStrings("delete", delete_events.items[0].object.get("kind").?.string);
+    try std.testing.expect(!delete_status.get("maintenance_paused").?.bool);
+
+    var invalid_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/graph_idx/graph-metrics/degree:compact",
+        .body = "",
+    });
+    defer invalid_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
 }
 
 test "api http server create index relies on metadata projection without local index polling" {

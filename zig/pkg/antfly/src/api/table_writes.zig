@@ -2787,6 +2787,14 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             index_name: []const u8,
         ) anyerror!?void = null,
+        graph_metric_action: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            metric_name: []const u8,
+            action: []const u8,
+        ) anyerror!?db_mod.types.GraphMetricStatus = null,
         drop_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2825,6 +2833,13 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             req: db_mod.types.BatchRequest,
         ) anyerror!?void,
+        mutate_rows_from_source: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsMutationSourceRequest,
+        ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
         begin_bulk_ingest: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3191,6 +3206,17 @@ pub const TableWriteSource = struct {
         return try self.vtable.batch(self.ptr, alloc, table_name, req);
     }
 
+    pub fn mutateRowsFromSource(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const fn_ptr = self.vtable.mutate_rows_from_source orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, schema, req);
+    }
+
     pub fn beginBulkIngest(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8) !?void {
         const fn_ptr = self.vtable.begin_bulk_ingest orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name);
@@ -3250,6 +3276,18 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.drop_index orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, index_name);
+    }
+
+    pub fn graphMetricAction(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !?db_mod.types.GraphMetricStatus {
+        const fn_ptr = self.vtable.graph_metric_action orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, index_name, metric_name, action);
     }
 
     pub fn dropTable(
@@ -6747,11 +6785,13 @@ pub const BoundTableWriteSource = struct {
                 .update_schema = updateSchema,
                 .create_index = createIndex,
                 .drop_index = dropIndex,
+                .graph_metric_action = graphMetricAction,
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .batch = batch,
+                .mutate_rows_from_source = mutateRowsFromSource,
                 .begin_bulk_ingest = beginBulkIngest,
                 .finish_bulk_ingest = finishBulkIngest,
                 .abort_bulk_ingest = abortBulkIngest,
@@ -7616,6 +7656,18 @@ pub const BoundTableWriteSource = struct {
         self.db.batch(req) catch |err| return normalizeRelationalConstraintError(err);
     }
 
+    fn mutateRowsFromSource(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try self.db.mutateRelationalRowsFromSource(alloc, schema, req);
+    }
+
     fn beginBulkIngest(
         ptr: *anyopaque,
         _: std.mem.Allocator,
@@ -7788,6 +7840,34 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         _ = try self.db.deleteIndex(index_name);
+    }
+
+    fn graphMetricAction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !?db_mod.types.GraphMetricStatus {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        if (std.mem.eql(u8, action, "refresh")) {
+            return try self.db.refreshGraphMetric(alloc, index_name, metric_name);
+        }
+        if (std.mem.eql(u8, action, "rebuild")) {
+            return try self.db.rebuildGraphMetric(alloc, index_name, metric_name);
+        }
+        if (std.mem.eql(u8, action, "delete")) {
+            return try self.db.deleteGraphMetricMaterialization(alloc, index_name, metric_name);
+        }
+        if (std.mem.eql(u8, action, "pause")) {
+            return try self.db.pauseGraphMetricMaintenance(alloc, index_name, metric_name);
+        }
+        if (std.mem.eql(u8, action, "resume")) {
+            return try self.db.resumeGraphMetricMaintenance(alloc, index_name, metric_name);
+        }
+        return error.InvalidGraphMetricAction;
     }
 
     fn batchGroupLocal(

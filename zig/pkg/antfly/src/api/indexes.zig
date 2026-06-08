@@ -18,6 +18,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const graph_mod = @import("../graph/graph.zig");
 const tables_api = @import("tables.zig");
 const runtime_status = @import("runtime_status.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
@@ -238,6 +239,18 @@ pub fn encodeSingleIndexConfig(
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try appendIndexConfig(alloc, &out, index_name, lookup.config);
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn encodeGraphMetricStatusResponse(
+    alloc: std.mem.Allocator,
+    status: db_mod.types.GraphMetricStatus,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"status\":");
+    try appendGraphMetricStatusValue(alloc, &out, status);
+    try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -1249,21 +1262,8 @@ fn appendSingleIndexRuntimeStatus(
             for (item.graph_metric_status, 0..) |status, i| {
                 if (i > 0) try out.append(alloc, ',');
                 try appendJsonString(alloc, out, status.name);
-                try out.appendSlice(alloc, ":{\"state\":");
-                try appendJsonString(alloc, out, @tagName(status.state));
-                try out.appendSlice(alloc, ",\"published_generation\":");
-                try appendIntValue(alloc, out, status.published_generation);
-                try out.appendSlice(alloc, ",\"edge_generation\":");
-                try appendIntValue(alloc, out, status.edge_generation);
-                try out.appendSlice(alloc, ",\"converged\":");
-                try out.appendSlice(alloc, if (status.converged) "true" else "false");
-                try out.appendSlice(alloc, ",\"iterations_completed\":");
-                try appendIntValue(alloc, out, @as(u64, status.iterations_completed));
-                try out.appendSlice(alloc, ",\"delta\":");
-                try appendFloatValue(alloc, out, status.delta);
-                try out.appendSlice(alloc, ",\"computed_at_ms\":");
-                try appendIntValue(alloc, out, status.computed_at_ms);
-                try out.append(alloc, '}');
+                try out.append(alloc, ':');
+                try appendGraphMetricStatusValue(alloc, out, status);
             }
             try out.append(alloc, '}');
         }
@@ -1345,6 +1345,105 @@ fn appendSingleIndexRuntimeStatus(
     }
     try out.appendSlice(alloc, ",\"async_indexing\":");
     try appendAsyncIndexingStatus(alloc, out, async_indexing);
+    try out.append(alloc, '}');
+}
+
+fn appendGraphMetricStatusValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    status: db_mod.types.GraphMetricStatus,
+) !void {
+    try out.appendSlice(alloc, "{\"state\":");
+    try appendJsonString(alloc, out, @tagName(status.state));
+    try out.appendSlice(alloc, ",\"phase\":");
+    try appendJsonString(alloc, out, @tagName(status.phase));
+    try out.appendSlice(alloc, ",\"edge_filter\":{\"mode\":");
+    try appendJsonString(alloc, out, @tagName(status.edge_filter.mode));
+    if (status.edge_filter.mode == .types and status.edge_filter.types.len > 0) {
+        try out.appendSlice(alloc, ",\"types\":[");
+        for (status.edge_filter.types, 0..) |edge_type, edge_type_i| {
+            if (edge_type_i > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, edge_type);
+        }
+        try out.append(alloc, ']');
+    }
+    try out.append(alloc, '}');
+    try out.appendSlice(alloc, ",\"metadata_version\":");
+    try appendIntValue(alloc, out, @as(u64, status.metadata_version));
+    try out.appendSlice(alloc, ",\"maintenance_paused\":");
+    try out.appendSlice(alloc, if (status.maintenance_paused) "true" else "false");
+    try out.appendSlice(alloc, ",\"build_queued\":");
+    try out.appendSlice(alloc, if (status.build_queued) "true" else "false");
+    try out.appendSlice(alloc, ",\"published_generation\":");
+    try appendIntValue(alloc, out, status.published_generation);
+    try out.appendSlice(alloc, ",\"edge_generation\":");
+    try appendIntValue(alloc, out, status.edge_generation);
+    try out.appendSlice(alloc, ",\"target_edge_generation\":");
+    try appendIntValue(alloc, out, status.target_edge_generation);
+    try out.appendSlice(alloc, ",\"queued_generation\":");
+    try appendIntValue(alloc, out, status.queued_generation);
+    try out.appendSlice(alloc, ",\"building_generation\":");
+    try appendIntValue(alloc, out, status.building_generation);
+    try out.appendSlice(alloc, ",\"build_job_id\":");
+    try appendIntValue(alloc, out, status.build_job_id);
+    try out.appendSlice(alloc, ",\"build_started_at_ms\":");
+    try appendIntValue(alloc, out, status.build_started_at_ms);
+    try out.appendSlice(alloc, ",\"build_iteration\":");
+    try appendIntValue(alloc, out, @as(u64, status.build_iteration));
+    try out.appendSlice(alloc, ",\"build_lease_expires_at_ms\":");
+    try appendIntValue(alloc, out, status.build_lease_expires_at_ms);
+    if (status.build_worker_id.len > 0) {
+        try out.appendSlice(alloc, ",\"build_worker_id\":");
+        try appendJsonString(alloc, out, status.build_worker_id);
+    }
+    try out.appendSlice(alloc, ",\"retry_count\":");
+    try appendIntValue(alloc, out, status.retry_count);
+    if (status.last_error.len > 0) {
+        try out.appendSlice(alloc, ",\"last_error\":");
+        try appendJsonString(alloc, out, status.last_error);
+    }
+    try out.appendSlice(alloc, ",\"progress\":");
+    try appendFloatValue(alloc, out, status.progress);
+    try out.appendSlice(alloc, ",\"converged\":");
+    try out.appendSlice(alloc, if (status.converged) "true" else "false");
+    try out.appendSlice(alloc, ",\"iterations_completed\":");
+    try appendIntValue(alloc, out, @as(u64, status.iterations_completed));
+    try out.appendSlice(alloc, ",\"delta\":");
+    try appendFloatValue(alloc, out, status.delta);
+    try out.appendSlice(alloc, ",\"computed_at_ms\":");
+    try appendIntValue(alloc, out, status.computed_at_ms);
+    if (status.last_event) |event| {
+        try out.appendSlice(alloc, ",\"last_event\":");
+        try appendGraphMetricEventValue(alloc, out, event);
+    }
+    if (status.recent_events.len > 0) {
+        try out.appendSlice(alloc, ",\"recent_events\":[");
+        for (status.recent_events, 0..) |event, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try appendGraphMetricEventValue(alloc, out, event);
+        }
+        try out.append(alloc, ']');
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendGraphMetricEventValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    event: graph_mod.GraphIndex.GraphMetricEvent,
+) !void {
+    try out.appendSlice(alloc, "{\"sequence\":");
+    try appendIntValue(alloc, out, event.sequence);
+    try out.appendSlice(alloc, ",\"kind\":");
+    try appendJsonString(alloc, out, @tagName(event.kind));
+    try out.appendSlice(alloc, ",\"at_ms\":");
+    try appendIntValue(alloc, out, event.at_ms);
+    try out.appendSlice(alloc, ",\"target_edge_generation\":");
+    try appendIntValue(alloc, out, event.target_edge_generation);
+    try out.appendSlice(alloc, ",\"published_generation\":");
+    try appendIntValue(alloc, out, event.published_generation);
+    try out.appendSlice(alloc, ",\"score_count\":");
+    try appendIntValue(alloc, out, event.score_count);
     try out.append(alloc, '}');
 }
 

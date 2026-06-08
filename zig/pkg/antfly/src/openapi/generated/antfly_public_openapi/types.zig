@@ -452,6 +452,10 @@ pub const IndexStatus = struct {
     status: antfly_indexes_openapi.IndexStats,
 };
 
+pub const GraphMetricActionResponse = struct {
+    status: antfly_indexes_openapi.GraphMetricStatus,
+};
+
 /// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
 pub const LsmStorageStatus = struct {
     run_count: ?i64 = null,
@@ -560,8 +564,131 @@ pub const RowUniqueSelector = struct {
     values: std.json.Value,
 };
 
-/// Typed relational row plan envelope. The top-level operation-specific field is one of `query`, `aggregate`, `window`, `join`, or `lateral`; `ctes` is optional and contains ordered named row-query subplans.
-pub const RowsPlanRequest = std.json.Value;
+/// Full relational row document. Keys are declared relational columns and values are JSON values coerced through the table schema before storage.
+pub const RowsRowDocument = struct {};
+
+/// Static field patch for top-level relational columns. Primary-key fields are rejected by the server.
+pub const RowsFieldPatch = struct {};
+
+/// Numeric increment map keyed by declared numeric columns.
+pub const RowsNumericIncrement = struct {};
+
+/// JSON path assignment for a declared `json` column.
+pub const RowsJsonSetTransform = struct {
+    /// Declared `json` column to update.
+    field: []const u8,
+    /// Non-empty path under the JSON column.
+    path: []const []const u8,
+    /// JSON value to write at the path.
+    value: std.json.Value,
+};
+
+/// Array transform for a declared `array` column.
+pub const RowsArrayUpdateTransform = struct {
+    /// Declared `array` column to update.
+    field: []const u8,
+    op: []const u8,
+    /// JSON value to append, remove, or add if absent.
+    value: std.json.Value,
+};
+
+/// Predicate atom that must match a partial unique constraint definition.
+pub const RowsUniquePredicate = struct {
+    field: []const u8,
+    op: []const u8,
+    /// Predicate comparison value. Omit for null-test operators.
+    value: ?std.json.Value = null,
+};
+
+pub const RowsMutationSourceResultSet = struct {
+    /// Number of source rows that matched before lock/limit selection.
+    matched: ?i64 = null,
+    /// Number of rows staged into the claimed transaction.
+    staged: ?i64 = null,
+    /// Optional returning rows from the staged mutation.
+    returning: ?[]const std.json.Value = null,
+};
+
+/// Lockable base-row claim metadata. Public row-plan endpoints reject this field; it is only accepted by `rows:mutation-source` lockable base-row sources and internal/coordinator execution paths. `transaction_id` is the canonical field name; `txn_id` is accepted as an adapter alias.
+pub const RowsRowClaim = struct {
+    mode: ?[]const u8 = null,
+    skip_locked: ?bool = null,
+    lease_ms: ?i64 = null,
+    owner_id: ?[]const u8 = null,
+    /// Canonical 16-byte transaction id encoded as 32 hex characters.
+    transaction_id: ?[]const u8 = null,
+    /// Alias for `transaction_id`.
+    txn_id: ?[]const u8 = null,
+};
+
+/// Internal physical range selector used after durable range ownership routing. Public REST/SDK endpoints reject this field; it is not stable public row identity. At least one of `start` or `end` must be present, and a bounded range must have `start < end`.
+pub const RowsDocKeyRange = struct {
+    /// Inclusive physical row-key lower bound.
+    start: ?[]const u8 = null,
+    /// Exclusive physical row-key upper bound.
+    end: ?[]const u8 = null,
+};
+
+/// Compact JSON path projection over a declared `json` column.
+pub const RowsJsonExtractProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    /// Declared `json` column to read.
+    field: []const u8,
+    /// Non-empty JSON path, encoded as a dot path string or array of path components.
+    path: std.json.Value,
+    /// Return the extracted value as text, matching SQL `->>` behavior.
+    as_text: ?bool = null,
+};
+
+/// Compact array-length projection over a declared `array` column.
+pub const RowsArrayLengthProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    /// Declared `array` column to measure.
+    field: []const u8,
+};
+
+/// Compact COALESCE operand. Exactly one of `field` or `value` is accepted by the server.
+pub const RowsCoalesceOperand = struct {
+    /// Declared column to read.
+    field: ?[]const u8 = null,
+    /// Literal JSON fallback value.
+    value: ?std.json.Value = null,
+};
+
+/// Compact field alias projection over a declared column.
+pub const RowsFieldAliasProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    /// Declared column to project.
+    field: []const u8,
+};
+
+/// Predicate over aggregate output fields, evaluated after grouping.
+pub const RowsAggregateHavingPredicate = struct {
+    /// Aggregate output field name, usually an aggregation `name` or group key.
+    field: []const u8,
+    op: []const u8,
+    /// Comparison value. Omit for `is_null` and `is_not_null`.
+    value: ?std.json.Value = null,
+};
+
+pub const RowsJoinOn = struct {
+    left_field: []const u8,
+    right_field: []const u8,
+};
+
+pub const RowsJoinProjection = struct {
+    as: []const u8,
+    side: []const u8,
+    field: []const u8,
+};
+
+pub const RowsLateralCorrelation = struct {
+    left_field: []const u8,
+    right_field: []const u8,
+};
 
 pub const RowsQueryResultSet = struct {
     total: ?i64 = null,
@@ -1163,6 +1290,21 @@ pub const JoinStrategy = enum {
     }
 };
 
+pub const GraphMetricProfile = struct {
+    /// Name of the graph query or graph metric query that used the metric.
+    query_name: []const u8,
+    /// Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`.
+    source: []const u8,
+    /// Graph index that owns the metric.
+    index_name: []const u8,
+    /// Graph metric name within the index.
+    metric_name: []const u8,
+    /// Effective freshness mode requested for this metric use.
+    freshness: []const u8,
+    /// Published generation and freshness status observed by the query.
+    status: antfly_indexes_openapi.GraphMetricStatus,
+};
+
 /// Shard-level execution statistics.
 pub const ShardsProfile = struct {
     /// Total shards targeted by the query.
@@ -1214,17 +1356,27 @@ pub const AnalysesResult = struct {
     tsne: ?[]const f32 = null,
 };
 
-/// A single query result hit
-pub const QueryHit = struct {
-    /// ID of the record.
-    _id: []const u8,
-    /// Relevance score of the hit.
-    _score: f32,
-    /// Scores partitioned by index when using RRF search.
-    _index_scores: ?std.json.Value = null,
-    _source: ?std.json.Value = null,
-    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Only present when order_by is specified.
-    _sort: ?[]const []const u8 = null,
+pub const GraphMetricRerankScoreDetails = struct {
+    /// Graph index that provided the metric score.
+    index_name: []const u8,
+    /// Graph metric used as a score feature.
+    metric_name: []const u8,
+    /// Hit score before graph metric rerank composition.
+    base_score: f64,
+    /// Weight applied to the base score.
+    base_weight: f64,
+    /// Published metric score for this hit, or null when the hit was missing from the metric generation.
+    metric_score: ?f64 = null,
+    /// Metric feature value used in the formula after applying missing_score fallback if needed.
+    metric_score_used: f64,
+    /// Weight applied to the metric score feature.
+    metric_weight: f64,
+    /// True when metric_score was missing and the request's missing_score fallback was used.
+    missing_score_used: bool,
+    /// Final hit score after graph metric rerank composition.
+    final_score: f64,
+    /// Published graph metric score generation used for this hit.
+    published_generation: i64,
 };
 
 /// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
@@ -1555,6 +1707,23 @@ pub const RowSelector = struct {
     unique: ?RowUniqueSelector = null,
 };
 
+/// Conjunction of partial-unique predicate atoms.
+pub const RowsUniquePredicateGroup = struct {
+    all: []const RowsUniquePredicate,
+};
+
+/// Compact COALESCE projection.
+pub const RowsCoalesceProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    operands: []const RowsCoalesceOperand,
+};
+
+/// Conjunction of aggregate-output predicates for HAVING.
+pub const RowsAggregateHaving = struct {
+    all: []const RowsAggregateHavingPredicate,
+};
+
 pub const TransactionStageReadResponse = struct {
     status: []const u8,
     transaction_id: []const u8,
@@ -1753,13 +1922,10 @@ pub const TableStatistics = struct {
     last_updated: ?[]const u8 = null,
 };
 
-/// A list of query hits.
-pub const QueryHits = struct {
-    /// Total number of hits available.
-    total: ?i64 = null,
-    hits: ?[]const QueryHit = null,
-    /// Maximum score of the results.
-    max_score: ?f32 = null,
+/// Optional score provenance for ranking features that changed the final hit score.
+pub const QueryScoreDetails = struct {
+    /// Score contribution from an explicit graph_metric_rerank request.
+    graph_metric_rerank: ?GraphMetricRerankScoreDetails = null,
 };
 
 pub const LinearMergeResult = struct {
@@ -1862,18 +2028,6 @@ pub const TransactionSessionCommitResponse = struct {
     transaction_id: []const u8,
 };
 
-/// Structured relational row mutation. `insert` fails if the primary identity already exists, `upsert` overwrites or creates, `update` applies a non-upsert patch by primary or unique identity, and `delete` removes by primary or unique identity. `update.patch` cannot change primary-key components. Missing unique selectors fail the write request rather than falling back to scans.
-pub const RowOperation = struct {
-    op: []const u8,
-    /// Full row document for insert/upsert. Must include primary-key columns.
-    row: ?std.json.Value = null,
-    where: ?RowSelector = null,
-    /// Top-level field patch for update operations.
-    patch: ?std.json.Value = null,
-    /// Optional optimistic-concurrency predicate for update/delete. The predicate applies to the physical row resolved from primary or unique identity.
-    expected_version: ?i64 = null,
-};
-
 pub const RowsGetRequest = struct {
     keys: []const RowSelector,
     /// Include the diagnostic storage-owned physical key in each result.
@@ -1889,59 +2043,14 @@ pub const RowsGetResult = struct {
     physical_key: ?[]const u8 = null,
 };
 
-pub const SSEStepCompleted = AgentStep;
-
-/// Result from the retrieval agent
-pub const RetrievalAgentResult = struct {
-    /// Unique response ID for logging and tracing
-    id: ?[]const u8 = null,
-    /// LLM model used for generation
-    model: ?[]const u8 = null,
-    /// Unix timestamp (seconds) when the response was created
-    created_at: ?i64 = null,
-    /// Current status of the bounded agent execution
-    status: AgentStatus,
-    /// Present when status is "incomplete" — explains why
-    incomplete_details: ?IncompleteDetails = null,
-    /// Token usage and resource statistics from this execution
-    usage: ?RetrievalAgentUsage = null,
-    /// Retrieved query hits
-    hits: []const QueryHit,
-    /// Shared bounded-agent execution trace for this retrieval run.
-    steps: ?[]const AgentStep = null,
-    /// Primary strategy that was used (optional in agentic mode)
-    strategy_used: ?RetrievalStrategy = null,
-    /// Correlation identifier for client-carried continuation.
-    session_id: ?[]const u8 = null,
-    /// Current internal iteration count for this bounded session.
-    iteration: ?i64 = null,
-    /// Number of user clarification turns already consumed in this session.
-    clarification_count: ?i64 = null,
-    /// Remaining internal reasoning/tool-use iterations for this session.
-    remaining_internal_iterations: ?i64 = null,
-    /// Remaining clarification turns allowed for this session.
-    remaining_user_clarifications: ?i64 = null,
-    /// Clarification questions exposed in the shared bounded-agent envelope.
-    questions: ?[]const AgentQuestion = null,
-    /// Filters that were applied during retrieval
-    applied_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
-    /// Total number of tool calls made during retrieval
-    tool_calls_made: ?i64 = null,
-    /// Optional conversational context including tool calls and responses. Decisions remain the authoritative continuation input for bounded agent interactions.
-    messages: ?[]const antfly_generating_openapi.ChatMessage = null,
-    /// Query classification and transformation result. Present when steps.classification was configured. Includes strategy, semantic_query, sub_questions (decompose), step_back_query, and reasoning.
-    classification: ?antfly_generating_api_openapi.ClassificationTransformationResult = null,
-    /// Generated response in markdown format. Present when steps.generation was configured.
-    generation: ?[]const u8 = null,
-    /// Confidence in the generated response (requires steps.confidence)
-    generation_confidence: ?f32 = null,
-    /// Relevance of retrieved documents to the query (requires steps.confidence)
-    context_relevance: ?f32 = null,
-    /// Suggested follow-up questions (requires steps.followup)
-    followup_questions: ?[]const []const u8 = null,
-    /// Evaluation results when steps.eval was configured
-    eval_result: ?antfly_eval_openapi.EvalResult = null,
+/// Declared unique constraint target for `ON CONFLICT`.
+pub const RowsConflictUniqueTarget = struct {
+    /// Unique constraint name.
+    name: []const u8,
+    where: ?RowsUniquePredicateGroup = null,
 };
+
+pub const SSEStepCompleted = AgentStep;
 
 /// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
 pub const JoinClause = struct {
@@ -1971,6 +2080,23 @@ pub const QueryProfile = struct {
     reranker: ?RerankerProfile = null,
     /// Result merge statistics (present for hybrid search).
     merge: ?MergeProfile = null,
+    /// Graph metric freshness and generation details for metric-aware query work.
+    graph_metrics: ?[]const GraphMetricProfile = null,
+};
+
+/// A single query result hit
+pub const QueryHit = struct {
+    /// ID of the record.
+    _id: []const u8,
+    /// Relevance score of the hit.
+    _score: f32,
+    /// Scores partitioned by index when using RRF search.
+    _index_scores: ?std.json.Value = null,
+    /// Optional explain-style score provenance for score features applied to this hit.
+    _score_details: ?QueryScoreDetails = null,
+    _source: ?std.json.Value = null,
+    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Only present when order_by is specified.
+    _sort: ?[]const []const u8 = null,
 };
 
 pub const ReplicationSource = struct {
@@ -2051,13 +2177,15 @@ pub const BatchRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
-pub const RowsBatchRequest = struct {
-    operations: []const RowOperation,
-    sync_level: ?SyncLevel = null,
-};
-
 pub const RowsGetResultSet = struct {
     rows: ?[]const RowsGetResult = null,
+};
+
+/// Primary-key or named unique constraint conflict target.
+pub const RowsConflictTarget = struct {
+    /// Set to `true` to target the declared primary key.
+    primary: ?bool = null,
+    unique: ?RowsConflictUniqueTarget = null,
 };
 
 pub const QueryRequest = struct {
@@ -2109,6 +2237,8 @@ pub const QueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
+    /// Optional graph metric score feature to blend into ordinary search hit ranking. The metric must have a published generation. With `metric_freshness: fresh`, the request fails if graph writes have made the published generation stale.
+    graph_metric_rerank: ?antfly_indexes_openapi.GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
     graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,
@@ -2122,6 +2252,67 @@ pub const QueryRequest = struct {
     join: ?JoinClause = null,
     /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
     foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
+};
+
+/// Result from the retrieval agent
+pub const RetrievalAgentResult = struct {
+    /// Unique response ID for logging and tracing
+    id: ?[]const u8 = null,
+    /// LLM model used for generation
+    model: ?[]const u8 = null,
+    /// Unix timestamp (seconds) when the response was created
+    created_at: ?i64 = null,
+    /// Current status of the bounded agent execution
+    status: AgentStatus,
+    /// Present when status is "incomplete" — explains why
+    incomplete_details: ?IncompleteDetails = null,
+    /// Token usage and resource statistics from this execution
+    usage: ?RetrievalAgentUsage = null,
+    /// Retrieved query hits
+    hits: []const QueryHit,
+    /// Shared bounded-agent execution trace for this retrieval run.
+    steps: ?[]const AgentStep = null,
+    /// Primary strategy that was used (optional in agentic mode)
+    strategy_used: ?RetrievalStrategy = null,
+    /// Correlation identifier for client-carried continuation.
+    session_id: ?[]const u8 = null,
+    /// Current internal iteration count for this bounded session.
+    iteration: ?i64 = null,
+    /// Number of user clarification turns already consumed in this session.
+    clarification_count: ?i64 = null,
+    /// Remaining internal reasoning/tool-use iterations for this session.
+    remaining_internal_iterations: ?i64 = null,
+    /// Remaining clarification turns allowed for this session.
+    remaining_user_clarifications: ?i64 = null,
+    /// Clarification questions exposed in the shared bounded-agent envelope.
+    questions: ?[]const AgentQuestion = null,
+    /// Filters that were applied during retrieval
+    applied_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
+    /// Total number of tool calls made during retrieval
+    tool_calls_made: ?i64 = null,
+    /// Optional conversational context including tool calls and responses. Decisions remain the authoritative continuation input for bounded agent interactions.
+    messages: ?[]const antfly_generating_openapi.ChatMessage = null,
+    /// Query classification and transformation result. Present when steps.classification was configured. Includes strategy, semantic_query, sub_questions (decompose), step_back_query, and reasoning.
+    classification: ?antfly_generating_api_openapi.ClassificationTransformationResult = null,
+    /// Generated response in markdown format. Present when steps.generation was configured.
+    generation: ?[]const u8 = null,
+    /// Confidence in the generated response (requires steps.confidence)
+    generation_confidence: ?f32 = null,
+    /// Relevance of retrieved documents to the query (requires steps.confidence)
+    context_relevance: ?f32 = null,
+    /// Suggested follow-up questions (requires steps.followup)
+    followup_questions: ?[]const []const u8 = null,
+    /// Evaluation results when steps.eval was configured
+    eval_result: ?antfly_eval_openapi.EvalResult = null,
+};
+
+/// A list of query hits.
+pub const QueryHits = struct {
+    /// Total number of hits available.
+    total: ?i64 = null,
+    hits: ?[]const QueryHit = null,
+    /// Maximum score of the results.
+    max_score: ?f32 = null,
 };
 
 pub const CreateTableRequest = struct {
@@ -2238,6 +2429,8 @@ pub const RetrievalQueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
+    /// Optional graph metric score feature to blend into ordinary search hit ranking. The metric must have a published generation. With `metric_freshness: fresh`, the request fails if graph writes have made the published generation stale.
+    graph_metric_rerank: ?antfly_indexes_openapi.GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
     graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,
@@ -2418,6 +2611,263 @@ pub const AggregationResult = struct {
     variance: ?f32 = null,
     /// Buckets for bucketing aggregations (terms, range, histogram, etc.)
     buckets: ?[]const AggregationBucket = null,
+};
+
+/// Field-to-expression assignment map over the shared row-expression AST.
+pub const RowsExpressionAssignmentMap = struct {};
+
+/// Typed conflict action for insert operations. `nothing` skips the insert when the target already exists. `update` applies the same typed update operators as ordinary row updates, with expression sources allowed to reference `existing` and `proposed` row images.
+pub const RowsOnConflict = struct {
+    target: RowsConflictTarget,
+    action: []const u8,
+    patch: ?RowsFieldPatch = null,
+    increment: ?RowsNumericIncrement = null,
+    patch_expr: ?RowsExpressionAssignmentMap = null,
+    increment_expr: ?RowsExpressionAssignmentMap = null,
+    json_set: ?[]const RowsJsonSetTransform = null,
+    array_update: ?[]const RowsArrayUpdateTransform = null,
+    where_expression: ?RowsExpressionCondition = null,
+};
+
+/// Structured relational row mutation. `insert` fails if the primary identity already exists, `upsert` overwrites or creates, `update` applies a non-upsert patch by primary or unique identity, and `delete` removes by primary or unique identity. `update.patch` cannot change primary-key components. Missing unique selectors fail the write request rather than falling back to scans.
+pub const RowOperation = struct {
+    op: []const u8,
+    /// Full row document for insert/upsert. Must include primary-key columns.
+    row: ?RowsRowDocument = null,
+    where: ?RowSelector = null,
+    /// Top-level field patch for update operations.
+    patch: ?RowsFieldPatch = null,
+    increment: ?RowsNumericIncrement = null,
+    patch_expr: ?RowsExpressionAssignmentMap = null,
+    increment_expr: ?RowsExpressionAssignmentMap = null,
+    json_set: ?[]const RowsJsonSetTransform = null,
+    array_update: ?[]const RowsArrayUpdateTransform = null,
+    on_conflict: ?RowsOnConflict = null,
+    where_expression: ?RowsExpressionCondition = null,
+    /// Fields to return from the committed mutation image. `*` returns the full row and cannot be combined with expression projections.
+    returning: ?[]const []const u8 = null,
+    /// Typed row-expression projections from the committed mutation image.
+    returning_expressions: ?[]const RowsExpressionProjection = null,
+    /// Optional optimistic-concurrency predicate for update/delete. The predicate applies to the physical row resolved from primary or unique identity.
+    expected_version: ?i64 = null,
+};
+
+pub const RowsBatchRequest = struct {
+    operations: []const RowOperation,
+    sync_level: ?SyncLevel = null,
+};
+
+/// Typed relational mutation-source plan. The `source` is a lockable base row-query request with `row_claim.transaction_id` and no `source_cte` or `doc_key_range`; update/delete intents are staged into that transaction using committed-version predicates from the selected preimages. Claims over physical ranges, CTEs, joins, aggregates, windows, and lateral outputs are rejected until those stages expose an explicit lockable base-row contract.
+pub const RowsMutationSourceRequest = struct {
+    op: []const u8,
+    source: RowsQueryRequest,
+    /// Top-level static field patch for update operations.
+    patch: ?RowsFieldPatch = null,
+    /// Numeric increments for update operations.
+    increment: ?RowsNumericIncrement = null,
+    /// Field-to-expression assignments evaluated over the selected row image.
+    patch_expr: ?RowsExpressionAssignmentMap = null,
+    /// Field-to-expression numeric deltas evaluated over the selected row image.
+    increment_expr: ?RowsExpressionAssignmentMap = null,
+    /// JSON path transforms for update operations.
+    json_set: ?[]const RowsJsonSetTransform = null,
+    /// Array transforms for update operations.
+    array_update: ?[]const RowsArrayUpdateTransform = null,
+    /// Fields to return from the final update image or deleted row image. `*` returns the full row.
+    returning: ?[]const []const u8 = null,
+    /// Typed row-expression projections over the final update image or deleted row image.
+    returning_expressions: ?[]const RowsExpressionProjection = null,
+};
+
+/// Ordered row-stream key. `field` names an output/base field; `expression` carries a typed row-expression AST for computed ordering.
+pub const RowsQueryOrder = struct {
+    field: ?[]const u8 = null,
+    expression: ?RowsExpression = null,
+    direction: []const u8,
+};
+
+/// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators include `now`, `coalesce`, `lower`, `upper`, `concat`, `nullif`, numeric `add`/`sub`/`mul`/`div`, `cast`, `json_extract`, `array_length`, `string_to_array`, and searched `case` with `cases` and `else`. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
+pub const RowsExpression = struct {
+    field: ?[]const u8 = null,
+    source: ?[]const u8 = null,
+    /// Literal JSON value for a value node.
+    value: ?std.json.Value = null,
+    op: ?[]const u8 = null,
+    /// Operand expressions for operator nodes.
+    args: ?[]const RowsExpression = null,
+    /// Cast target for `cast`.
+    to: ?[]const u8 = null,
+    /// Structured JSON path for `json_extract`.
+    path: ?std.json.Value = null,
+    /// Return JSON path extraction as text.
+    as_text: ?bool = null,
+    /// Searched case branches, each with `when` and `then`.
+    cases: ?[]const RowsExpressionCaseBranch = null,
+    /// Fallback expression for searched `case`.
+    @"else": ?std.json.Value = null,
+};
+
+pub const RowsExpressionCaseBranch = struct {
+    when: RowsExpressionCondition,
+    then: RowsExpression,
+};
+
+/// Computed expression predicate over the shared row-expression AST.
+pub const RowsExpressionCondition = struct {
+    lhs: RowsExpression,
+    op: []const u8,
+    rhs: ?RowsExpression = null,
+};
+
+pub const RowsExpressionConditionGroup = struct {
+    all: []const RowsExpressionCondition,
+};
+
+pub const RowsExpressionArrayContainsPredicate = struct {
+    expr: RowsExpression,
+    value: []const std.json.Value,
+};
+
+pub const RowsExpressionProjection = struct {
+    as: []const u8,
+    expr: RowsExpression,
+};
+
+/// Typed relational row-query plan. Predicate and expression arrays carry Antfly row-expression AST nodes; SQL syntax is adapter sugar over this native request shape.
+pub const RowsQueryRequest = struct {
+    /// Optional ordered CTE name to read instead of the base table.
+    source_cte: ?[]const u8 = null,
+    /// Typed scalar, array, JSON, text-pattern, OR, and NOT predicates.
+    where: ?std.json.Value = null,
+    /// All computed expression predicates that must pass.
+    expression_where: ?[]const RowsExpressionCondition = null,
+    /// OR groups of computed expression predicates.
+    expression_any: ?[]const RowsExpressionConditionGroup = null,
+    /// NOT groups of computed expression predicates.
+    expression_not: ?[]const RowsExpressionConditionGroup = null,
+    /// Computed array-containment predicates.
+    expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    select: ?[]const []const u8 = null,
+    json_extract: ?[]const RowsJsonExtractProjection = null,
+    array_length: ?[]const RowsArrayLengthProjection = null,
+    coalesce: ?[]const RowsCoalesceProjection = null,
+    field_aliases: ?[]const RowsFieldAliasProjection = null,
+    /// Typed row-expression projections.
+    expressions: ?[]const RowsExpressionProjection = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+    row_claim: ?RowsRowClaim = null,
+    doc_key_range: ?RowsDocKeyRange = null,
+};
+
+/// Ordered named row-query subplan. Later CTEs and final plan stages can reference earlier names through `source_cte`.
+pub const RowsCte = struct {
+    name: []const u8,
+    query: RowsQueryRequest,
+};
+
+pub const RowsAggregateSpec = struct {
+    name: []const u8,
+    op: []const u8,
+    field: ?[]const u8 = null,
+    expression: ?RowsExpression = null,
+    distinct: ?bool = null,
+    filter: ?std.json.Value = null,
+    filter_expressions: ?[]const RowsExpressionCondition = null,
+};
+
+pub const RowsAggregateRequest = struct {
+    source: RowsQueryRequest,
+    group_by: ?[]const []const u8 = null,
+    aggregations: ?[]const RowsAggregateSpec = null,
+    having: ?RowsAggregateHaving = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+};
+
+pub const RowsWindowSpec = struct {
+    as: []const u8,
+    function: []const u8,
+    partition_by: ?[]const []const u8 = null,
+    order_by: []const RowsQueryOrder,
+    field: ?[]const u8 = null,
+    expression: ?RowsExpression = null,
+    offset: ?i64 = null,
+    default: ?std.json.Value = null,
+};
+
+pub const RowsWindowRequest = struct {
+    source: RowsQueryRequest,
+    windows: []const RowsWindowSpec,
+    select: ?[]const []const u8 = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+};
+
+/// Typed equality join plan. Each side is a full row-query request and can read an ordered CTE through `source_cte`.
+pub const RowsJoinRequest = struct {
+    left: RowsQueryRequest,
+    right: RowsQueryRequest,
+    on: []const RowsJoinOn,
+    join_type: ?[]const u8 = null,
+    select: ?[]const RowsJoinProjection = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+};
+
+/// Typed bounded lateral plan. The right side must include a limit and can read an ordered CTE through `source_cte`.
+pub const RowsLateralRequest = struct {
+    left: RowsQueryRequest,
+    right: RowsQueryRequest,
+    correlations: []const RowsLateralCorrelation,
+    select: ?[]const RowsJoinProjection = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+};
+
+/// Generic typed relational row plan envelope. Public operation endpoints use the operation-specific envelope schemas below and accept exactly one top-level operation field plus optional ordered `ctes`.
+pub const RowsPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    query: ?RowsQueryRequest = null,
+    aggregate: ?RowsAggregateRequest = null,
+    window: ?RowsWindowRequest = null,
+    join: ?RowsJoinRequest = null,
+    lateral: ?RowsLateralRequest = null,
+};
+
+/// Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes`.
+pub const RowsQueryPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    query: RowsQueryRequest,
+};
+
+/// Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered `ctes`.
+pub const RowsAggregatePlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    aggregate: RowsAggregateRequest,
+};
+
+/// Typed row-window plan envelope. Accepts exactly `window` plus optional ordered `ctes`.
+pub const RowsWindowPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    window: RowsWindowRequest,
+};
+
+/// Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`.
+pub const RowsJoinPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    join: RowsJoinRequest,
+};
+
+/// Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes`.
+pub const RowsLateralPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    lateral: RowsLateralRequest,
 };
 
 /// DEPRECATED: Use RetrievalAgentResult instead. Result from the answer agent.

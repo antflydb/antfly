@@ -440,6 +440,10 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
     try std.testing.expect(@hasField(server.GetIndexPathParams, "table_name"));
     try std.testing.expect(@hasField(server.GetIndexPathParams, "index_name"));
     try std.testing.expect(@hasField(server.DropIndexPathParams, "index_name"));
+    try std.testing.expect(@hasField(server.ExecuteGraphMetricActionPathParams, "table_name"));
+    try std.testing.expect(@hasField(server.ExecuteGraphMetricActionPathParams, "index_name"));
+    try std.testing.expect(@hasField(server.ExecuteGraphMetricActionPathParams, "metric_name"));
+    try std.testing.expect(@hasField(server.ExecuteGraphMetricActionPathParams, "action"));
 
     var found_get_status = false;
     var found_list_secrets = false;
@@ -468,6 +472,7 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
     var found_create_index = false;
     var found_drop_index = false;
     var found_get_index = false;
+    var found_execute_graph_metric_action = false;
     for (server.routes) |route| {
         if (std.mem.eql(u8, route.operation_id, "getStatus")) found_get_status = true;
         if (std.mem.eql(u8, route.operation_id, "listSecrets")) found_list_secrets = true;
@@ -496,6 +501,7 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
         if (std.mem.eql(u8, route.operation_id, "createIndex")) found_create_index = true;
         if (std.mem.eql(u8, route.operation_id, "dropIndex")) found_drop_index = true;
         if (std.mem.eql(u8, route.operation_id, "getIndex")) found_get_index = true;
+        if (std.mem.eql(u8, route.operation_id, "executeGraphMetricAction")) found_execute_graph_metric_action = true;
     }
     try std.testing.expect(found_get_status);
     try std.testing.expect(found_list_secrets);
@@ -524,6 +530,7 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
     try std.testing.expect(found_create_index);
     try std.testing.expect(found_drop_index);
     try std.testing.expect(found_get_index);
+    try std.testing.expect(found_execute_graph_metric_action);
 }
 
 test "public chunker config keeps flattened provider-specific fields" {
@@ -583,6 +590,24 @@ test "client openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@hasDecl(client_generated.Client, "createIndex"));
     try std.testing.expect(@hasDecl(client_generated.Client, "dropIndex"));
     try std.testing.expect(@hasDecl(client_generated.Client, "getIndex"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "executeGraphMetricAction"));
+    try std.testing.expect(@FieldType(client_generated.GraphMetricActionResponse, "status") == client_generated.GraphMetricStatus);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "phase") == []const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "metadata_version") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "target_edge_generation") == i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_queued") == bool);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "queued_generation") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "building_generation") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_job_id") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_started_at_ms") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_iteration") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_lease_expires_at_ms") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_worker_id") == ?[]const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "retry_count") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "last_error") == ?[]const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "progress") == f64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "last_event") == ?client_generated.GraphMetricEvent);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "recent_events") == ?[]const client_generated.GraphMetricEvent);
     try std.testing.expect(@hasDecl(client_generated.Client, "evaluate"));
     try std.testing.expect(@hasDecl(client_generated.Client, "queryBuilderAgent"));
     try std.testing.expect(@hasDecl(client_generated.Client, "retrievalAgent"));

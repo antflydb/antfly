@@ -19,7 +19,7 @@ class TransformOp:
         op (TransformOpType): MongoDB-style update operator
         path (str): JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name") Example: $.views.
         value (Any | Unset): Value for operation (not required for $unset, $currentDate). Type depends on operator
-            (number for $inc/$mul, any for $set, etc.)
+            (number for $inc/$mul, any for $set/$setOnInsert, etc.)
     """
 
     op: TransformOpType
