@@ -15,11 +15,10 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Check if antfly is running
-if ! curl -s http://localhost:8080/db/v1/health > /dev/null 2>&1; then
+if ! curl -s http://localhost:8080/healthz > /dev/null 2>&1; then
     echo -e "${YELLOW}Warning: Antfly doesn't appear to be running${NC}"
     echo "Please start Antfly first:"
-    echo "  cd ../../"
-    echo "  go run ./go/pkg/antfly/cmd swarm"
+    echo "  antfly swarm"
     echo ""
     read -p "Continue anyway? (y/n) " -n 1 -r
     echo

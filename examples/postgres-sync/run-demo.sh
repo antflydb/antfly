@@ -76,7 +76,8 @@ fi
 # Check if Antfly is running
 if [ "$SKIP_ANTFLY_CHECK" = false ]; then
   echo -ne "${BLUE}Checking Antfly connection...${NC} "
-  if curl -s "${ANTFLY_URL}/health" > /dev/null 2>&1; then
+  ANTFLY_HEALTH_URL="${ANTFLY_URL%/db/v1}/healthz"
+  if curl -s "$ANTFLY_HEALTH_URL" > /dev/null 2>&1; then
     echo -e "${GREEN}✓${NC}"
   else
     echo -e "${RED}✗${NC}"
@@ -84,8 +85,7 @@ if [ "$SKIP_ANTFLY_CHECK" = false ]; then
     echo -e "${YELLOW}Antfly is not running at: $ANTFLY_URL${NC}"
     echo ""
     echo "Start Antfly first:"
-    echo "  cd ../../"
-    echo "  go run ./go/pkg/antfly/cmd swarm"
+    echo "  antfly swarm"
     echo ""
     echo "Or skip this check:"
     echo "  $0 --skip-antfly-check"

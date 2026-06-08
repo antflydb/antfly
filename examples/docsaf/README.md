@@ -45,8 +45,7 @@ Each type has its own schema with specific metadata fields. See `schemas.yaml` f
 
 1. **Antfly running locally**:
    ```bash
-   cd /path/to/antfly
-   go run ./go/pkg/antfly/cmd swarm
+   antfly swarm
    ```
 
 2. **Build docsaf** (from antfly root):
@@ -613,7 +612,7 @@ This ensures:
 **Connection refused**:
 ```bash
 # Make sure Antfly is running
-go run ./go/pkg/antfly/cmd swarm
+antfly swarm
 ```
 
 **No documents found**:
