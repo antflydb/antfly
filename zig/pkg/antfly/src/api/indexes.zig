@@ -571,7 +571,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
             }
         }
         if (expected_group_ids.len > 0) {
@@ -584,7 +584,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, .{}, null, .{
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, .{}, null, null, null, .{
                     .source = .synthetic_config,
                     .freshness = .missing,
                 }, false);
@@ -604,7 +604,7 @@ fn appendIndexRuntimeStatus(
         try out.appendSlice(alloc, "{}");
         return;
     };
-    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, null, item.runtime_present);
+    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, null, item.runtime_present);
 }
 
 const AggregatedIndexStatus = struct {
@@ -630,6 +630,8 @@ const AggregatedIndexStatus = struct {
     hbc_posting: db_mod.types.HbcPostingStats = .{},
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
     enrichment: db_mod.types.EnrichmentStats = .{},
+    resolution: db_mod.types.ReplayStageStats = .{},
+    promotion: db_mod.types.ReplayStageStats = .{},
     expected_group_count: u64 = 0,
     reported_group_count: u64 = 0,
     fresh_group_count: u64 = 0,
@@ -788,6 +790,8 @@ fn aggregateIndexStatus(
         }
         db_mod.types.accumulateAsyncIndexingStats(&aggregate.async_indexing, runtime.stats.async_indexing);
         aggregateEnrichmentStats(&aggregate.enrichment, runtime.stats.enrichment);
+        aggregateReplayStageStats(&aggregate.resolution, runtime.stats.resolution);
+        aggregateReplayStageStats(&aggregate.promotion, runtime.stats.promotion);
         if (item.backfill_active) {
             aggregate.backfill_active = true;
             active_count += 1;
@@ -844,6 +848,16 @@ fn algebraicCapabilityLifecycleRank(status: []const u8) u8 {
     if (std.mem.eql(u8, status, "backfilling")) return 10;
     if (std.mem.eql(u8, status, "current")) return 0;
     return 5;
+}
+
+fn aggregateReplayStageStats(dst: *db_mod.types.ReplayStageStats, src: db_mod.types.ReplayStageStats) void {
+    dst.enabled = dst.enabled or src.enabled;
+    dst.target_sequence += src.target_sequence;
+    dst.applied_sequence += src.applied_sequence;
+    dst.catch_up_required = dst.catch_up_required or src.catch_up_required;
+    dst.blocked = dst.blocked or src.blocked;
+    if (dst.blocked_reason.len == 0 and src.blocked_reason.len > 0) dst.blocked_reason = src.blocked_reason;
+    dst.error_count += src.error_count;
 }
 
 fn aggregateEnrichmentStats(dst: *db_mod.types.EnrichmentStats, src: db_mod.types.EnrichmentStats) void {
@@ -1123,6 +1137,8 @@ fn appendSingleIndexRuntimeStatus(
     graph_source_status: ?GraphSourceStatus,
     async_indexing: db_mod.types.AsyncIndexingStats,
     enrichment: ?db_mod.types.EnrichmentStats,
+    resolution: ?db_mod.types.ReplayStageStats,
+    promotion: ?db_mod.types.ReplayStageStats,
     metadata: ?runtime_status.RuntimeStatusMetadata,
     runtime_present: bool,
 ) !void {
@@ -1276,6 +1292,8 @@ fn appendSingleIndexRuntimeStatus(
         false;
     try out.appendSlice(alloc, ",\"runtime_fresh\":");
     try out.appendSlice(alloc, if (runtime_fresh) "true" else "false");
+    if (resolution) |stats| try appendReplayStageStatus(alloc, out, "resolution", stats);
+    if (promotion) |stats| try appendReplayStageStatus(alloc, out, "promotion", stats);
     if (metadata) |md| {
         try out.appendSlice(alloc, ",\"runtime_source\":");
         try appendJsonString(alloc, out, statusSourceName(md.source));
@@ -1319,6 +1337,27 @@ fn appendSingleIndexRuntimeStatus(
     }
     try out.appendSlice(alloc, ",\"async_indexing\":");
     try appendAsyncIndexingStatus(alloc, out, async_indexing);
+    try out.append(alloc, '}');
+}
+
+fn appendReplayStageStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, stats: db_mod.types.ReplayStageStats) !void {
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, out, name);
+    try out.appendSlice(alloc, ":{");
+    try out.appendSlice(alloc, "\"enabled\":");
+    try out.appendSlice(alloc, if (stats.enabled) "true" else "false");
+    try out.appendSlice(alloc, ",\"target_sequence\":");
+    try appendIntValue(alloc, out, stats.target_sequence);
+    try out.appendSlice(alloc, ",\"applied_sequence\":");
+    try appendIntValue(alloc, out, stats.applied_sequence);
+    try out.appendSlice(alloc, ",\"catch_up_required\":");
+    try out.appendSlice(alloc, if (stats.catch_up_required) "true" else "false");
+    try out.appendSlice(alloc, ",\"blocked\":");
+    try out.appendSlice(alloc, if (stats.blocked) "true" else "false");
+    try out.appendSlice(alloc, ",\"blocked_reason\":");
+    try appendJsonString(alloc, out, stats.blocked_reason);
+    try out.appendSlice(alloc, ",\"error_count\":");
+    try appendIntValue(alloc, out, stats.error_count);
     try out.append(alloc, '}');
 }
 
