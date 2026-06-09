@@ -5040,6 +5040,10 @@ pub const ApiHttpServer = struct {
         req: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
+        // Signal background enrichment to yield the embedder while this
+        // interactive query executes (see enrichment_types.public_query_inflight).
+        _ = db_mod.enrichment_types.public_query_inflight.fetchAdd(1, .monotonic);
+        defer _ = db_mod.enrichment_types.public_query_inflight.fetchSub(1, .monotonic);
         const retry_timeout_ns = 5 * std.time.ns_per_s;
         const retry_poll_ns = 25 * std.time.ns_per_ms;
         const start_ns = platform_time.monotonicNs();

@@ -758,6 +758,12 @@ pub const IndexManager = struct {
     resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
     cached_has_generated_enrichment_targets: std.atomic.Value(bool),
     status_only_index_configs: []types.IndexConfig,
+    // Indexes whose persisted artifacts failed to open (e.g. UnsupportedVersion).
+    // Their configs are quarantined into status_only_index_configs so the
+    // catalog, status reporting, and drop/recreate keep working while the
+    // runtime index stays absent; this map carries the per-index load error.
+    // Keys are duped index names; values are static @errorName memory.
+    failed_index_loads: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     pub const TextIndex = struct {
         apply_mutex: *std.atomic.Mutex,
@@ -1557,6 +1563,8 @@ pub const IndexManager = struct {
             self.freeAlgebraicIndexEntry(entry);
         }
         self.clearStatusOnlyIndexConfigs();
+        self.clearFailedIndexLoads();
+        self.failed_index_loads.deinit(self.alloc);
         for (self.enrichments.items) |*entry| entry.deinit(self.alloc);
         for (self.resolvers.items) |*entry| entry.deinit(self.alloc);
         self.text_indexes.deinit(self.alloc);
@@ -1574,6 +1582,49 @@ pub const IndexManager = struct {
         for (self.status_only_index_configs) |*cfg| cfg.deinit(self.alloc);
         if (self.status_only_index_configs.len > 0) self.alloc.free(self.status_only_index_configs);
         self.status_only_index_configs = &.{};
+    }
+
+    /// Load error recorded for `name` during the last catalog load, or null
+    /// if the index loaded normally (or is not configured).
+    pub fn loadFailure(self: *const IndexManager, name: []const u8) ?[]const u8 {
+        return self.failed_index_loads.get(name);
+    }
+
+    pub fn hasLoadFailures(self: *const IndexManager) bool {
+        return self.failed_index_loads.count() > 0;
+    }
+
+    fn clearFailedIndexLoads(self: *IndexManager) void {
+        var it = self.failed_index_loads.keyIterator();
+        while (it.next()) |key| self.alloc.free(key.*);
+        self.failed_index_loads.clearRetainingCapacity();
+    }
+
+    fn dropFailedIndexLoad(self: *IndexManager, name: []const u8) void {
+        if (self.failed_index_loads.fetchRemove(name)) |entry| self.alloc.free(entry.key);
+    }
+
+    fn appendStatusOnlyConfig(self: *IndexManager, cfg: types.IndexConfig) !void {
+        const old = self.status_only_index_configs;
+        const replacement = try self.alloc.alloc(types.IndexConfig, old.len + 1);
+        @memcpy(replacement[0..old.len], old);
+        replacement[old.len] = cfg;
+        if (old.len > 0) self.alloc.free(old);
+        self.status_only_index_configs = replacement;
+    }
+
+    /// Quarantine an index whose persisted artifacts could not be opened:
+    /// keep its config visible (catalog persistence, status, drop/recreate)
+    /// while the runtime index stays absent, and record the load error.
+    fn recordFailedIndexLoad(self: *IndexManager, cfg: types.IndexConfig, err: anyerror) !void {
+        if (self.loadFailure(cfg.name) != null) return;
+        var cloned = try types.IndexConfig.clone(self.alloc, cfg);
+        errdefer cloned.deinit(self.alloc);
+        try self.appendStatusOnlyConfig(cloned);
+        // The clone is owned by status_only_index_configs from here on.
+        const name_key = try self.alloc.dupe(u8, cfg.name);
+        errdefer self.alloc.free(name_key);
+        try self.failed_index_loads.put(self.alloc, name_key, @errorName(err));
     }
 
     fn accountFullTextPendingBytes(self: *IndexManager, pending_bytes: u64) !void {
@@ -2285,6 +2336,7 @@ pub const IndexManager = struct {
         const load_started_ns = nowNs();
         self.bindPrimaryStore(store);
         self.clearStatusOnlyIndexConfigs();
+        self.clearFailedIndexLoads();
         try self.loadEnrichmentCatalog(store);
         try self.loadResolverCatalog(store);
 
@@ -2309,13 +2361,27 @@ pub const IndexManager = struct {
         var parallelism: usize = 1;
         if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) {
             for (configs) |cfg| {
-                try self.openConfiguredIndex(store, cfg, allow_backfill, read_only);
+                self.openConfiguredIndex(store, cfg, allow_backfill, read_only) catch |err| {
+                    std.log.warn("load configured index failed name={s} kind={s} err={s}", .{
+                        cfg.name,
+                        @tagName(cfg.kind),
+                        @errorName(err),
+                    });
+                    try self.recordFailedIndexLoad(cfg, err);
+                };
             }
         } else {
             parallelism = self.resolvedLoadParallelism(configs.len);
             if (parallelism <= 1) {
                 for (configs) |cfg| {
-                    try self.openConfiguredIndex(store, cfg, allow_backfill, read_only);
+                    self.openConfiguredIndex(store, cfg, allow_backfill, read_only) catch |err| {
+                        std.log.warn("load configured index failed name={s} kind={s} err={s}", .{
+                            cfg.name,
+                            @tagName(cfg.kind),
+                            @errorName(err),
+                        });
+                        try self.recordFailedIndexLoad(cfg, err);
+                    };
                 }
             } else {
                 for (configs) |cfg| {
@@ -2336,6 +2402,7 @@ pub const IndexManager = struct {
 
     pub fn loadCatalogOnly(self: *IndexManager, store: anytype) !void {
         self.bindPrimaryStore(store);
+        self.clearFailedIndexLoads();
         try self.loadEnrichmentCatalog(store);
         try self.loadResolverCatalog(store);
 
@@ -2444,8 +2511,13 @@ pub const IndexManager = struct {
         for (threads[0..spawned]) |*thread| thread.join();
         threads_joined = true;
 
-        for (results) |*result| {
-            if (result.err) |err| return err;
+        // A failed index load quarantines that index instead of failing the
+        // whole table open; the other indexes stay usable and the failure is
+        // reported via loadFailure()/status so clients can drop+recreate.
+        for (results, 0..) |*result, i| {
+            if (result.err) |err| {
+                try self.recordFailedIndexLoad(configs[i], err);
+            }
         }
 
         for (results) |*result| {
@@ -2708,7 +2780,13 @@ pub const IndexManager = struct {
     pub fn remove(self: *IndexManager, store: anytype, name: []const u8) !bool {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        if (try self.removeStatusOnlyConfig(store, name)) return true;
+        if (try self.removeStatusOnlyConfig(store, name)) {
+            // Quarantined (failed-to-load) indexes live in the status-only
+            // list; removing one must also clear its recorded load error so a
+            // subsequent recreate starts clean.
+            self.dropFailedIndexLoad(name);
+            return true;
+        }
         for (self.text_indexes.items, 0..) |*entry, i| {
             if (std.mem.eql(u8, entry.config.name, name)) {
                 const index_path = try self.indexPath(name);
@@ -3016,7 +3094,11 @@ pub const IndexManager = struct {
     }
 
     pub fn managedIndexes(self: *const IndexManager, alloc: Allocator) ![]ManagedIndexRef {
-        const total = self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len + self.graph_indexes.items.len + self.algebraic_indexes.items.len + self.status_only_index_configs.len;
+        var status_only_count: usize = 0;
+        for (self.status_only_index_configs) |cfg| {
+            if (self.loadFailure(cfg.name) == null) status_only_count += 1;
+        }
+        const total = self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len + self.graph_indexes.items.len + self.algebraic_indexes.items.len + status_only_count;
         var refs = try alloc.alloc(ManagedIndexRef, total);
         var initialized: usize = 0;
         errdefer {
@@ -3060,6 +3142,10 @@ pub const IndexManager = struct {
             initialized += 1;
         }
         for (self.status_only_index_configs) |cfg| {
+            // Quarantined indexes (config retained after a load failure) have
+            // no runtime; replay/apply/maintenance work driven off this list
+            // must skip them or it would fail with IndexNotFound.
+            if (self.loadFailure(cfg.name) != null) continue;
             refs[initialized] = .{
                 .name = try alloc.dupe(u8, cfg.name),
                 .kind = cfg.kind,
@@ -15202,7 +15288,7 @@ test "dense embedding writes prefer inline vectors over artifact reloads" {
     try std.testing.expectEqualStrings("doc:inline", metadata);
 }
 
-test "loadConfiguredIndexesParallel returns worker errors without double-joining threads" {
+test "loadConfiguredIndexesParallel quarantines worker errors without double-joining threads" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -15236,7 +15322,14 @@ test "loadConfiguredIndexesParallel returns worker errors without double-joining
         try manager.ensureConfiguredIndexDir(cfg);
     }
 
-    try std.testing.expectError(error.InvalidIndexConfig, manager.loadConfiguredIndexesParallel(&store, &configs, 2, true, false));
+    // A worker error no longer fails the load: the failing index is
+    // quarantined (config retained, error recorded) while the healthy one
+    // loads normally — and the worker threads still join exactly once.
+    try manager.loadConfiguredIndexesParallel(&store, &configs, 2, true, false);
+    try std.testing.expect(manager.textIndexEntry("ft_v1") != null);
+    try std.testing.expect(manager.denseIndex("dv_bad") == null);
+    const recorded = manager.loadFailure("dv_bad") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("InvalidIndexConfig", recorded);
 }
 
 test "dense apply resource manager accounts working bytes and releases them" {

@@ -773,6 +773,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
     errdefer {
         for (indexes[0..initialized]) |item| {
             alloc.free(item.name);
+            if (item.load_error) |value| alloc.free(value);
             if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
             if (item.algebraic_last_error_reason) |value| alloc.free(value);
             if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
@@ -811,6 +812,11 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
     }
 
     for (stats.indexes, 0..) |item, i| {
+        const load_error = if (item.load_error) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (load_error) |value| alloc.free(value);
         const algebraic_last_error_doc_key = if (item.algebraic_last_error_doc_key) |value|
             try alloc.dupe(u8, value)
         else
@@ -900,6 +906,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         indexes[i] = .{
             .name = try alloc.dupe(u8, item.name),
             .kind = item.kind,
+            .load_error = load_error,
             .doc_count = item.doc_count,
             .term_count = item.term_count,
             .edge_count = item.edge_count,

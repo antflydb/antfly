@@ -15,6 +15,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Process-wide count of public table queries currently executing. The HTTP
+/// layer increments it around query execution; the enrichment embed loop
+/// briefly defers the next embed batch while it is non-zero so interactive
+/// queries get the embedder first. Lives here so the embed loop has no
+/// dependency on HTTP wiring.
+pub var public_query_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
 pub const GeneratedEnrichmentKind = enum {
     dense_embedding,
     sparse_embedding,
