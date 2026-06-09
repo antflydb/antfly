@@ -445,21 +445,35 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         };
     }
 
-    if (!cli_tooling.enabled) {
-        if (try tryRunLiveWholeModelExecutorGenerate(
-            allocator,
-            io,
-            &opts,
-            model,
-            gpt_config,
-            tokenizer,
-            config,
-            prompt_encoded.ids[0..countPromptTokens(prompt_encoded.attention_mask)],
-            prompt_tokens,
-            started_at,
-            loaded_model_at,
-            encoded_prompt_at,
-        )) return;
+    var live_result = try tryRunLiveWholeModelExecutorGenerate(
+        allocator,
+        io,
+        &opts,
+        model,
+        gpt_config,
+        tokenizer,
+        config,
+        prompt_encoded.ids[0..countPromptTokens(prompt_encoded.attention_mask)],
+        prompt_tokens,
+        cli_tooling.parserPtr(),
+        started_at,
+        loaded_model_at,
+        encoded_prompt_at,
+    );
+    if (live_result) |*result| {
+        defer result.deinit();
+        if (cli_tooling.enabled) {
+            if (std.mem.eql(u8, result.finish_reason, "tool_calls")) {
+                try emitCliToolAwareJsonResult(allocator, io, opts.model_dir, result, cli_tooling.parserPtr().?, cli_tooling.parsed_choice);
+                return;
+            }
+            if (opts.print_timing) {
+                print("live_whole_model_executor_tool_fallback=true finish_reason={s} tokens={d}\n", .{ result.finish_reason, result.tokens_used });
+            }
+        } else {
+            emitLiveWholeModelExecutorResult(result, &opts);
+            return;
+        }
     }
 
     if (!graph_mode) {
@@ -1161,14 +1175,15 @@ fn tryRunLiveWholeModelExecutorGenerate(
     config: generation.GenerationConfig,
     prompt_token_ids: []const i32,
     prompt_tokens: usize,
+    tool_parser: ?*tool_parser_mod.Parser,
     started_at: std.Io.Timestamp,
     loaded_model_at: std.Io.Timestamp,
     encoded_prompt_at: std.Io.Timestamp,
-) !bool {
-    if (!liveWholeModelExecutorRequested(opts)) return false;
-    if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return false;
-    if (opts.draft_model != null) return false;
-    if (opts.image_count > 0 or opts.audio_count > 0) return false;
+) !?generation.GenerationResult {
+    if (!liveWholeModelExecutorRequested(opts)) return null;
+    if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return null;
+    if (opts.draft_model != null) return null;
+    if (opts.image_count > 0 or opts.audio_count > 0) return null;
 
     gpt_arch.resetDebugTimingStats();
 
@@ -1182,7 +1197,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDType
     else
         session_factory.recommendedKvDTypeForSession(model.session, kv_backend_kind);
-    var executor = (try model.wholeModelExecutor(allocator, kv_dtype)) orelse return false;
+    var executor = (try model.wholeModelExecutor(allocator, kv_dtype)) orelse return null;
     defer executor.deinit();
 
     var runtime_model = try executor.createRuntime(allocator);
@@ -1205,6 +1220,10 @@ fn tryRunLiveWholeModelExecutorGenerate(
     defer generated_token_ids.deinit(allocator);
 
     var finish_reason: []const u8 = "length";
+    var emitted_text = try allocator.dupe(u8, "");
+    defer allocator.free(emitted_text);
+    if (tool_parser) |parser| parser.reset();
+
     const max_tokens: usize = if (opts.max_tokens > 0) @intCast(opts.max_tokens) else 0;
     const sampling_config: graph_mod.model_runtime.SamplingConfig = .{
         .temperature = config.temperature,
@@ -1234,6 +1253,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 .seq_len = chunk_end,
                 .query_seq_len = chunk_end - processed,
                 .attention_mode = .paged_prefill,
+                .force_host_logits = tool_parser != null,
             });
             processed = chunk_end;
         }
@@ -1244,9 +1264,6 @@ fn tryRunLiveWholeModelExecutorGenerate(
     var generated: usize = 0;
     while (generated < max_tokens) {
         const next_token_i32: i32 = if (generated == 0) blk: {
-            if (use_greedy_decode) {
-                break :blk @intCast(try output.greedyToken(allocator, gpt_config.vocab_size));
-            }
             const output_logits = try output.hostLogits(allocator);
             break :blk @intCast(generation.sampleTokenFromLogits(
                 allocator,
@@ -1286,6 +1303,13 @@ fn tryRunLiveWholeModelExecutorGenerate(
         try all_token_ids.append(allocator, next_token_i64);
         generated += 1;
 
+        if (tool_parser) |parser| {
+            const keep_generating = try feedToolParserDeltaForFastPath(allocator, tokenizer, generated_token_ids.items, &emitted_text, parser);
+            if (!keep_generating) {
+                finish_reason = "tool_calls";
+                break;
+            }
+        }
         if (gpt_config.eos_token_id >= 0 and next_token_i32 == gpt_config.eos_token_id) {
             finish_reason = "stop";
             break;
@@ -1303,30 +1327,16 @@ fn tryRunLiveWholeModelExecutorGenerate(
     }
 
     const result_token_ids = try allocator.dupe(i32, generated_token_ids.items);
-    defer allocator.free(result_token_ids);
+    errdefer allocator.free(result_token_ids);
     const result_text = if (result_token_ids.len > 0)
         try tokenizer.decode(allocator, result_token_ids)
     else
         try allocator.dupe(u8, "");
-    defer allocator.free(result_text);
+    errdefer allocator.free(result_text);
 
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
-    print("{s}\n", .{result_text});
-    if (opts.print_token_ids) {
-        print("token_ids:", .{});
-        for (result_token_ids) |id| print(" {d}", .{id});
-        print("\n", .{});
-    }
-    if (opts.print_finish_reason or opts.print_token_count) {
-        if (opts.print_finish_reason and opts.print_token_count) {
-            print("finish_reason={s} tokens={d}\n", .{ finish_reason, result_token_ids.len });
-        } else if (opts.print_finish_reason) {
-            print("finish_reason={s}\n", .{finish_reason});
-        } else {
-            print("tokens={d}\n", .{result_token_ids.len});
-        }
-    }
     if (opts.print_timing) {
+        print("live_whole_model_executor=true\n", .{});
         print(
             "timing_ms: load_model={d} prompt_prep={d} scheduler=0 backend_setup={d} decode_setup=0 generate={d} total={d}\n",
             .{
@@ -1582,7 +1592,57 @@ fn tryRunLiveWholeModelExecutorGenerate(
             );
         }
     }
-    return true;
+    return .{
+        .text = result_text,
+        .token_ids = result_token_ids,
+        .prompt_tokens = prompt_tokens,
+        .tokens_used = result_token_ids.len,
+        .finish_reason = finish_reason,
+        .allocator = allocator,
+    };
+}
+
+fn emitLiveWholeModelExecutorResult(result: *const generation.GenerationResult, opts: *const Options) void {
+    print("{s}\n", .{result.text});
+    if (opts.print_token_ids) {
+        if (result.token_ids) |ids| {
+            print("token_ids:", .{});
+            for (ids) |id| print(" {d}", .{id});
+            print("\n", .{});
+        } else {
+            print("token_ids=unavailable\n", .{});
+        }
+    }
+    if (opts.print_finish_reason or opts.print_token_count) {
+        if (opts.print_finish_reason and opts.print_token_count) {
+            print("finish_reason={s} tokens={d}\n", .{ result.finish_reason, result.tokens_used });
+        } else if (opts.print_finish_reason) {
+            print("finish_reason={s}\n", .{result.finish_reason});
+        } else {
+            print("tokens={d}\n", .{result.tokens_used});
+        }
+    }
+}
+
+fn feedToolParserDeltaForFastPath(
+    allocator: std.mem.Allocator,
+    tokenizer: tokenizer_mod.Tokenizer,
+    generated_token_ids: []const i32,
+    emitted_text: *[]u8,
+    parser: *tool_parser_mod.Parser,
+) !bool {
+    const decoded_text = try tokenizer.decode(allocator, generated_token_ids);
+    defer allocator.free(decoded_text);
+
+    const prefix_len = std.mem.indexOfDiff(u8, emitted_text.*, decoded_text) orelse @min(emitted_text.*.len, decoded_text.len);
+    const delta = decoded_text[prefix_len..];
+
+    const next_emitted_text = try allocator.dupe(u8, decoded_text);
+    allocator.free(emitted_text.*);
+    emitted_text.* = next_emitted_text;
+    if (delta.len == 0) return true;
+    _ = try parser.feed(delta);
+    return parser.toolCalls().len == 0;
 }
 
 fn runOnnxWholeModelGraphGenerate(
@@ -2533,6 +2593,25 @@ test "parseCliToolChoice variants" {
     try std.testing.expectEqual(tool_parser_mod.ParsedToolChoice.none, try parseCliToolChoice("none"));
     const forced = try parseCliToolChoice("lookup_order");
     try std.testing.expectEqualStrings("lookup_order", tool_parser_mod.forcedFunctionName(forced).?);
+}
+
+test "tool flags keep Metal live whole-model executor eligible" {
+    const opts = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--backend",
+        "metal",
+        "--tools",
+        "/tmp/tools.json",
+        "--tool-choice",
+        "lookup_order",
+    });
+    try std.testing.expect(liveWholeModelExecutorRequested(&opts));
+}
+
+test "tool-choice none remains disabled for tool prompting" {
+    const parsed = try parseCliToolChoice("none");
+    try std.testing.expect(!tool_parser_mod.toolCallsEnabled(parsed));
 }
 
 test "CLI forced tool selection rejects missing function" {

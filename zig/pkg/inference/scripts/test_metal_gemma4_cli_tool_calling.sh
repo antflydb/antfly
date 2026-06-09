@@ -83,10 +83,25 @@ run_antfly() {
 if ! run_antfly generate "$MODEL_DIR" "$PROMPT" \
   --backend metal \
   --max-tokens "$MAX_TOKENS" \
+  --print-timing \
   --tools "$TOOLS_JSON" \
   --tool-choice lookup_order \
   >"$RESPONSE_JSON" 2>"$STDERR_LOG"; then
   echo "CLI generate failed" >&2
+  echo "stderr: $STDERR_LOG" >&2
+  sed -n '1,220p' "$STDERR_LOG" >&2 || true
+  exit 1
+fi
+
+if ! grep -q 'live_whole_model_executor=true' "$STDERR_LOG"; then
+  echo "CLI generate did not report the live whole-model executor fast path" >&2
+  echo "stderr: $STDERR_LOG" >&2
+  sed -n '1,220p' "$STDERR_LOG" >&2 || true
+  exit 1
+fi
+
+if grep -q 'live_whole_model_executor_tool_fallback=true' "$STDERR_LOG"; then
+  echo "CLI generate fell back after the live whole-model executor fast path" >&2
   echo "stderr: $STDERR_LOG" >&2
   sed -n '1,220p' "$STDERR_LOG" >&2 || true
   exit 1
