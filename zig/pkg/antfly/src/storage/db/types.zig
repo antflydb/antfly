@@ -1349,6 +1349,43 @@ pub const DBStats = struct {
     term_doc_freq_cache_hits: u64 = 0,
     term_doc_freq_cache_misses: u64 = 0,
     async_indexing: AsyncIndexingStats = .{},
+    dense_posting_maintenance: DensePostingMaintenanceStats = .{},
+};
+
+pub const DensePostingMaintenanceStats = struct {
+    runs: u64 = 0,
+    total_steps: u64 = 0,
+    total_scanned_indexes: u64 = 0,
+    total_attempted_indexes: u64 = 0,
+    total_skipped_clean_indexes: u64 = 0,
+    total_limit_reached_indexes: u64 = 0,
+    total_elapsed_ns: u64 = 0,
+    max_elapsed_ns: u64 = 0,
+    limit_reached_runs: u64 = 0,
+    budget_stop_max_indexes_runs: u64 = 0,
+    budget_stop_elapsed_runs: u64 = 0,
+    budget_stop_resource_runs: u64 = 0,
+    query_guardrail_stop_runs: u64 = 0,
+    profiled_dense_search_observations: u64 = 0,
+    profiled_dense_search_last_ns: u64 = 0,
+    profiled_dense_search_max_ns: u64 = 0,
+    query_guardrail_threshold_ns: u64 = 0,
+    last_steps: u64 = 0,
+    last_scanned_indexes: u64 = 0,
+    last_attempted_indexes: u64 = 0,
+    last_skipped_clean_indexes: u64 = 0,
+    last_limit_reached_indexes: u64 = 0,
+    last_remaining_dirty_postings: u64 = 0,
+    last_remaining_delta_tail_postings: u64 = 0,
+    last_remaining_overfull_postings: u64 = 0,
+    last_remaining_postings_at_capacity: u64 = 0,
+    last_max_remaining_over_capacity_members: u64 = 0,
+    last_elapsed_ns: u64 = 0,
+    last_needs_more_work: bool = false,
+    last_stopped_by_max_indexes: bool = false,
+    last_stopped_by_elapsed_budget: bool = false,
+    last_stopped_by_resource_budget: bool = false,
+    last_stopped_by_query_guardrail: bool = false,
 };
 
 pub const AlgebraicCandidateStatus = struct {
@@ -1573,11 +1610,41 @@ pub fn freeAlgebraicAdaptiveProgress(alloc: Allocator, progress: []AlgebraicAdap
 }
 
 pub const HbcPostingStats = struct {
+    policy_max_postings: u64 = 0,
+    policy_fold_delta_tails: bool = false,
+    policy_min_delta_records_to_fold: u64 = 0,
+    policy_min_tombstone_records_to_fold: u64 = 0,
+    policy_min_delta_to_base_ratio_bps: u64 = 0,
+    policy_max_delta_tail_postings: u64 = 0,
+    policy_min_dirty_postings: u64 = 0,
+    policy_max_dirty_version_age: u64 = 0,
+    policy_min_delta_records_to_run: u64 = 0,
+    policy_min_tombstone_records_to_run: u64 = 0,
+    policy_min_delta_to_base_ratio_bps_to_run: u64 = 0,
+    policy_min_centroid_version_lag: u64 = 0,
+    policy_min_payload_version_lag: u64 = 0,
+    policy_max_layout_changes: u64 = 0,
+    policy_split_full_postings: bool = false,
+    policy_min_overfull_postings_to_run: u64 = 0,
+    policy_min_postings_at_capacity_to_run: u64 = 0,
+    policy_max_boundary_reassignments: u64 = 0,
+    policy_allow_overfull_reassignment: bool = false,
+    policy_max_overfull_reassignment_postings: u64 = 0,
+    policy_max_over_capacity_reassignment_members: u64 = 0,
     scanned_nodes: u64 = 0,
     scanned_postings: u64 = 0,
     dirty_postings: u64 = 0,
     centroid_dirty_postings: u64 = 0,
     payload_dirty_postings: u64 = 0,
+    min_dirty_mutation_version: u64 = 0,
+    max_dirty_version_age: u64 = 0,
+    delta_tail_postings: u64 = 0,
+    max_delta_tail_records: u64 = 0,
+    max_tombstone_tail_records: u64 = 0,
+    max_delta_to_base_ratio_bps: u64 = 0,
+    overfull_postings: u64 = 0,
+    postings_at_capacity: u64 = 0,
+    max_over_capacity_members: u64 = 0,
     max_centroid_version_lag: u64 = 0,
     max_payload_version_lag: u64 = 0,
     max_mutation_version: u64 = 0,
@@ -1592,6 +1659,12 @@ pub const HbcPostingStats = struct {
     maintenance_split_postings: u64 = 0,
     maintenance_merged_postings: u64 = 0,
     maintenance_boundary_reassigned_vectors: u64 = 0,
+    maintenance_boundary_reassignment_capacity_skips: u64 = 0,
+    maintenance_boundary_reassignment_min_source_skips: u64 = 0,
+    maintenance_boundary_reassignment_swap_moves: u64 = 0,
+    maintenance_delta_fold_attempts: u64 = 0,
+    maintenance_delta_fold_skipped: u64 = 0,
+    maintenance_delta_fold_records: u64 = 0,
     lazy_centroid_deferrals: u64 = 0,
     lazy_payload_deferrals: u64 = 0,
     lazy_ancestor_deferrals: u64 = 0,
@@ -1855,6 +1928,42 @@ fn minNonZeroU64(lhs: u64, rhs: u64) u64 {
     if (lhs == 0) return rhs;
     if (rhs == 0) return lhs;
     return @min(lhs, rhs);
+}
+
+pub fn accumulateDensePostingMaintenanceStats(dst: *DensePostingMaintenanceStats, src: DensePostingMaintenanceStats) void {
+    dst.runs += src.runs;
+    dst.total_steps += src.total_steps;
+    dst.total_scanned_indexes += src.total_scanned_indexes;
+    dst.total_attempted_indexes += src.total_attempted_indexes;
+    dst.total_skipped_clean_indexes += src.total_skipped_clean_indexes;
+    dst.total_limit_reached_indexes += src.total_limit_reached_indexes;
+    dst.total_elapsed_ns += src.total_elapsed_ns;
+    dst.max_elapsed_ns = @max(dst.max_elapsed_ns, src.max_elapsed_ns);
+    dst.limit_reached_runs += src.limit_reached_runs;
+    dst.budget_stop_max_indexes_runs += src.budget_stop_max_indexes_runs;
+    dst.budget_stop_elapsed_runs += src.budget_stop_elapsed_runs;
+    dst.budget_stop_resource_runs += src.budget_stop_resource_runs;
+    dst.query_guardrail_stop_runs += src.query_guardrail_stop_runs;
+    dst.profiled_dense_search_observations += src.profiled_dense_search_observations;
+    dst.profiled_dense_search_last_ns = @max(dst.profiled_dense_search_last_ns, src.profiled_dense_search_last_ns);
+    dst.profiled_dense_search_max_ns = @max(dst.profiled_dense_search_max_ns, src.profiled_dense_search_max_ns);
+    dst.query_guardrail_threshold_ns = @max(dst.query_guardrail_threshold_ns, src.query_guardrail_threshold_ns);
+    dst.last_steps = @max(dst.last_steps, src.last_steps);
+    dst.last_scanned_indexes = @max(dst.last_scanned_indexes, src.last_scanned_indexes);
+    dst.last_attempted_indexes = @max(dst.last_attempted_indexes, src.last_attempted_indexes);
+    dst.last_skipped_clean_indexes = @max(dst.last_skipped_clean_indexes, src.last_skipped_clean_indexes);
+    dst.last_limit_reached_indexes = @max(dst.last_limit_reached_indexes, src.last_limit_reached_indexes);
+    dst.last_remaining_dirty_postings = @max(dst.last_remaining_dirty_postings, src.last_remaining_dirty_postings);
+    dst.last_remaining_delta_tail_postings = @max(dst.last_remaining_delta_tail_postings, src.last_remaining_delta_tail_postings);
+    dst.last_remaining_overfull_postings = @max(dst.last_remaining_overfull_postings, src.last_remaining_overfull_postings);
+    dst.last_remaining_postings_at_capacity = @max(dst.last_remaining_postings_at_capacity, src.last_remaining_postings_at_capacity);
+    dst.last_max_remaining_over_capacity_members = @max(dst.last_max_remaining_over_capacity_members, src.last_max_remaining_over_capacity_members);
+    dst.last_elapsed_ns = @max(dst.last_elapsed_ns, src.last_elapsed_ns);
+    dst.last_needs_more_work = dst.last_needs_more_work or src.last_needs_more_work;
+    dst.last_stopped_by_max_indexes = dst.last_stopped_by_max_indexes or src.last_stopped_by_max_indexes;
+    dst.last_stopped_by_elapsed_budget = dst.last_stopped_by_elapsed_budget or src.last_stopped_by_elapsed_budget;
+    dst.last_stopped_by_resource_budget = dst.last_stopped_by_resource_budget or src.last_stopped_by_resource_budget;
+    dst.last_stopped_by_query_guardrail = dst.last_stopped_by_query_guardrail or src.last_stopped_by_query_guardrail;
 }
 
 pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexingStats) void {

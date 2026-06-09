@@ -140,6 +140,7 @@ pub const TableRuntimeSummary = struct {
     outstanding_replay_sequences: u64 = 0,
     max_index_replay_backlog: u64 = 0,
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
+    dense_posting_maintenance: db_mod.types.DensePostingMaintenanceStats = .{},
 };
 
 pub const TableRuntimeSnapshotCache = struct {
@@ -371,6 +372,7 @@ pub const TableRuntimeSnapshotCache = struct {
             for (entry.statuses.items) |status| {
                 result.group_count += 1;
                 db_mod.types.accumulateAsyncIndexingStats(&result.async_indexing, status.stats.async_indexing);
+                db_mod.types.accumulateDensePostingMaintenanceStats(&result.dense_posting_maintenance, status.stats.dense_posting_maintenance);
                 var group_has_replay_debt = false;
                 result.index_count += status.stats.indexes.len;
                 for (status.stats.indexes) |index| {
@@ -458,6 +460,7 @@ fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     if (stats.async_indexing.startup.active or stats.async_indexing.dense_catch_up.active) return true;
     if (stats.enrichment.enabled and (stats.enrichment.processed_requests > 0 or stats.enrichment.applied_sequence > 0 or stats.enrichment.target_sequence > 0 or stats.enrichment.retrying or stats.enrichment.worker_failed)) return true;
     if (stats.text_merge.pending_segments > 0 or stats.text_merge.in_flight_merges > 0 or stats.text_merge.completed_merges > 0 or stats.text_merge.failed_merges > 0) return true;
+    if (stats.dense_posting_maintenance.runs > 0) return true;
     for (stats.indexes) |index| {
         if (indexHasArtifactVisibilityFacts(index)) return true;
         if (index.backfill_active or index.catch_up_active or index.replay_catch_up_required) return true;
@@ -548,6 +551,7 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
     merged.stats.term_doc_freq_cache_hits = previous.stats.term_doc_freq_cache_hits;
     merged.stats.term_doc_freq_cache_misses = previous.stats.term_doc_freq_cache_misses;
     merged.stats.async_indexing = previous.stats.async_indexing;
+    merged.stats.dense_posting_maintenance = previous.stats.dense_posting_maintenance;
     merged.stats.index_count = @intCast(merged.stats.indexes.len);
 
     for (merged.stats.indexes) |*dst| {
@@ -977,6 +981,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .term_doc_freq_cache_hits = stats.term_doc_freq_cache_hits,
         .term_doc_freq_cache_misses = stats.term_doc_freq_cache_misses,
         .async_indexing = stats.async_indexing,
+        .dense_posting_maintenance = stats.dense_posting_maintenance,
     };
 }
 
@@ -1011,6 +1016,18 @@ test "table runtime snapshot cache clones stored status" {
                 .ordinal_list_docs = 7,
                 .missing_ordinal_coverage_count = 6,
                 .stale_identity_generation_rejection_count = 5,
+            },
+            .dense_posting_maintenance = .{
+                .runs = 3,
+                .last_steps = 17,
+                .limit_reached_runs = 1,
+                .last_limit_reached_indexes = 2,
+                .last_remaining_dirty_postings = 5,
+                .last_needs_more_work = true,
+                .last_stopped_by_max_indexes = true,
+                .budget_stop_max_indexes_runs = 2,
+                .last_stopped_by_resource_budget = true,
+                .budget_stop_resource_runs = 4,
             },
         },
     };
@@ -1130,6 +1147,16 @@ test "table runtime snapshot cache clones stored status" {
     try std.testing.expectEqual(@as(u64, 9), cloned.items[0].stats.doc_set_planning.resolved_set_count);
     try std.testing.expectEqual(@as(u64, 8), cloned.items[0].stats.doc_set_planning.ordinal_list_count);
     try std.testing.expectEqual(@as(u64, 5), cloned.items[0].stats.doc_set_planning.stale_identity_generation_rejection_count);
+    try std.testing.expectEqual(@as(u64, 3), cloned.items[0].stats.dense_posting_maintenance.runs);
+    try std.testing.expectEqual(@as(u64, 17), cloned.items[0].stats.dense_posting_maintenance.last_steps);
+    try std.testing.expectEqual(@as(u64, 1), cloned.items[0].stats.dense_posting_maintenance.limit_reached_runs);
+    try std.testing.expectEqual(@as(u64, 2), cloned.items[0].stats.dense_posting_maintenance.last_limit_reached_indexes);
+    try std.testing.expectEqual(@as(u64, 5), cloned.items[0].stats.dense_posting_maintenance.last_remaining_dirty_postings);
+    try std.testing.expect(cloned.items[0].stats.dense_posting_maintenance.last_needs_more_work);
+    try std.testing.expect(cloned.items[0].stats.dense_posting_maintenance.last_stopped_by_max_indexes);
+    try std.testing.expectEqual(@as(u64, 2), cloned.items[0].stats.dense_posting_maintenance.budget_stop_max_indexes_runs);
+    try std.testing.expect(cloned.items[0].stats.dense_posting_maintenance.last_stopped_by_resource_budget);
+    try std.testing.expectEqual(@as(u64, 4), cloned.items[0].stats.dense_posting_maintenance.budget_stop_resource_runs);
     try std.testing.expectEqualStrings("vec", cloned.items[0].stats.indexes[0].name);
     try std.testing.expectEqualStrings("alg", cloned.items[0].stats.indexes[1].name);
     try std.testing.expectEqual(@as(u64, 1), cloned.items[0].stats.indexes[1].algebraic_parse_error_count);
@@ -1930,6 +1957,27 @@ test "table runtime snapshot cache summarizes replay debt" {
             .doc_count = 11,
             .index_count = 2,
             .indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 2),
+            .dense_posting_maintenance = .{
+                .runs = 2,
+                .total_steps = 10,
+                .total_limit_reached_indexes = 2,
+                .total_elapsed_ns = 100,
+                .max_elapsed_ns = 70,
+                .limit_reached_runs = 1,
+                .budget_stop_max_indexes_runs = 1,
+                .budget_stop_resource_runs = 2,
+                .last_steps = 4,
+                .last_limit_reached_indexes = 2,
+                .last_remaining_dirty_postings = 6,
+                .last_remaining_delta_tail_postings = 5,
+                .last_remaining_overfull_postings = 4,
+                .last_remaining_postings_at_capacity = 3,
+                .last_max_remaining_over_capacity_members = 2,
+                .last_elapsed_ns = 25,
+                .last_needs_more_work = true,
+                .last_stopped_by_max_indexes = true,
+                .last_stopped_by_resource_budget = true,
+            },
         },
     };
     docs_items[0].stats.indexes[0] = .{
@@ -1951,6 +1999,25 @@ test "table runtime snapshot cache summarizes replay debt" {
             .doc_count = 6,
             .index_count = 1,
             .indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1),
+            .dense_posting_maintenance = .{
+                .runs = 1,
+                .total_steps = 7,
+                .total_limit_reached_indexes = 3,
+                .total_elapsed_ns = 50,
+                .max_elapsed_ns = 50,
+                .limit_reached_runs = 1,
+                .budget_stop_elapsed_runs = 1,
+                .last_steps = 9,
+                .last_limit_reached_indexes = 3,
+                .last_remaining_dirty_postings = 8,
+                .last_remaining_delta_tail_postings = 7,
+                .last_remaining_overfull_postings = 6,
+                .last_remaining_postings_at_capacity = 5,
+                .last_max_remaining_over_capacity_members = 4,
+                .last_elapsed_ns = 55,
+                .last_needs_more_work = true,
+                .last_stopped_by_elapsed_budget = true,
+            },
         },
     };
     docs_items[1].stats.indexes[0] = .{
@@ -1986,6 +2053,7 @@ test "table runtime snapshot cache summarizes replay debt" {
         .statuses = .{ .items = logs_items },
     };
     cache.replaceOwned(snapshots);
+    std.testing.allocator.free(snapshots);
 
     const summary = cache.summary();
     try std.testing.expectEqual(@as(usize, 2), summary.table_count);
@@ -1996,4 +2064,25 @@ test "table runtime snapshot cache summarizes replay debt" {
     try std.testing.expectEqual(@as(usize, 2), summary.indexes_with_replay_debt);
     try std.testing.expectEqual(@as(u64, 6), summary.outstanding_replay_sequences);
     try std.testing.expectEqual(@as(u64, 3), summary.max_index_replay_backlog);
+    try std.testing.expectEqual(@as(u64, 3), summary.dense_posting_maintenance.runs);
+    try std.testing.expectEqual(@as(u64, 17), summary.dense_posting_maintenance.total_steps);
+    try std.testing.expectEqual(@as(u64, 5), summary.dense_posting_maintenance.total_limit_reached_indexes);
+    try std.testing.expectEqual(@as(u64, 150), summary.dense_posting_maintenance.total_elapsed_ns);
+    try std.testing.expectEqual(@as(u64, 70), summary.dense_posting_maintenance.max_elapsed_ns);
+    try std.testing.expectEqual(@as(u64, 2), summary.dense_posting_maintenance.limit_reached_runs);
+    try std.testing.expectEqual(@as(u64, 1), summary.dense_posting_maintenance.budget_stop_max_indexes_runs);
+    try std.testing.expectEqual(@as(u64, 1), summary.dense_posting_maintenance.budget_stop_elapsed_runs);
+    try std.testing.expectEqual(@as(u64, 2), summary.dense_posting_maintenance.budget_stop_resource_runs);
+    try std.testing.expectEqual(@as(u64, 9), summary.dense_posting_maintenance.last_steps);
+    try std.testing.expectEqual(@as(u64, 3), summary.dense_posting_maintenance.last_limit_reached_indexes);
+    try std.testing.expectEqual(@as(u64, 8), summary.dense_posting_maintenance.last_remaining_dirty_postings);
+    try std.testing.expectEqual(@as(u64, 7), summary.dense_posting_maintenance.last_remaining_delta_tail_postings);
+    try std.testing.expectEqual(@as(u64, 6), summary.dense_posting_maintenance.last_remaining_overfull_postings);
+    try std.testing.expectEqual(@as(u64, 5), summary.dense_posting_maintenance.last_remaining_postings_at_capacity);
+    try std.testing.expectEqual(@as(u64, 4), summary.dense_posting_maintenance.last_max_remaining_over_capacity_members);
+    try std.testing.expectEqual(@as(u64, 55), summary.dense_posting_maintenance.last_elapsed_ns);
+    try std.testing.expect(summary.dense_posting_maintenance.last_needs_more_work);
+    try std.testing.expect(summary.dense_posting_maintenance.last_stopped_by_max_indexes);
+    try std.testing.expect(summary.dense_posting_maintenance.last_stopped_by_elapsed_budget);
+    try std.testing.expect(summary.dense_posting_maintenance.last_stopped_by_resource_budget);
 }

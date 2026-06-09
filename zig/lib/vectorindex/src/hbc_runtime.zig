@@ -111,6 +111,9 @@ pub const WriteProfile = struct {
     grouped_ancestor_range_nodes: u64 = 0,
     grouped_node_body_writes: u64 = 0,
     grouped_vec_leaf_writes: u64 = 0,
+    existing_same_vector_coalesces: u64 = 0,
+    existing_same_leaf_updates: u64 = 0,
+    existing_vector_reroutes: u64 = 0,
     batch_route_calls: u64 = 0,
     batch_route_internal_nodes: u64 = 0,
     batch_route_leaf_groups: u64 = 0,
@@ -153,9 +156,45 @@ pub const WriteProfile = struct {
     posting_maintenance_split_postings: u64 = 0,
     posting_maintenance_merged_postings: u64 = 0,
     posting_maintenance_boundary_reassigned_vectors: u64 = 0,
+    posting_maintenance_boundary_reassignment_capacity_skips: u64 = 0,
+    posting_maintenance_boundary_reassignment_min_source_skips: u64 = 0,
+    posting_maintenance_boundary_reassignment_swap_moves: u64 = 0,
+    posting_maintenance_delta_fold_attempts: u64 = 0,
+    posting_maintenance_delta_fold_skipped: u64 = 0,
+    posting_maintenance_delta_fold_records: u64 = 0,
+    auto_posting_maintenance_runs: u64 = 0,
+    auto_posting_maintenance_observed_max_repaired_postings: u64 = 0,
+    auto_posting_maintenance_observed_max_layout_changes: u64 = 0,
+    auto_posting_maintenance_observed_max_split_postings: u64 = 0,
+    auto_posting_maintenance_observed_max_merged_postings: u64 = 0,
+    auto_posting_maintenance_observed_max_boundary_reassigned_vectors: u64 = 0,
+    auto_posting_maintenance_observed_max_delta_fold_records: u64 = 0,
     posting_lazy_centroid_deferrals: u64 = 0,
     posting_lazy_payload_deferrals: u64 = 0,
     posting_lazy_ancestor_deferrals: u64 = 0,
+    posting_base_put_calls: u64 = 0,
+    posting_base_key_bytes: u64 = 0,
+    posting_base_value_bytes: u64 = 0,
+    centroid_directory_put_calls: u64 = 0,
+    centroid_directory_key_bytes: u64 = 0,
+    centroid_directory_value_bytes: u64 = 0,
+    assignment_map_put_calls: u64 = 0,
+    assignment_map_delete_calls: u64 = 0,
+    assignment_map_key_bytes: u64 = 0,
+    assignment_map_value_bytes: u64 = 0,
+    posting_delta_append_calls: u64 = 0,
+    posting_delta_records: u64 = 0,
+    posting_delta_key_bytes: u64 = 0,
+    posting_delta_value_bytes: u64 = 0,
+    posting_delta_fold_calls: u64 = 0,
+    posting_delta_fold_records: u64 = 0,
+    posting_delta_fold_base_members: u64 = 0,
+    posting_delta_fold_materialized_members: u64 = 0,
+    posting_delta_fold_deleted_tail_keys: u64 = 0,
+    posting_delta_fold_deleted_tail_key_bytes: u64 = 0,
+    posting_delta_fold_deleted_tail_value_bytes: u64 = 0,
+    posting_delta_fold_written_base_key_bytes: u64 = 0,
+    posting_delta_fold_written_base_value_bytes: u64 = 0,
     range_put_calls: u64 = 0,
     range_delete_calls: u64 = 0,
     range_key_bytes: u64 = 0,
@@ -189,6 +228,8 @@ pub const BatchInsertOptions = struct {
     bulk_ingest: bool = false,
     defer_leaf_splits_to_batch_finish: bool = false,
     defer_leaf_splits_to_bulk_finish: bool = false,
+    defer_leaf_splits_to_posting_maintenance: bool = false,
+    capacity_balance_leaf_split: bool = false,
     suppress_quantized_payload_persist: bool = false,
     bulk_rebuild_leaf_min_members: usize = 0,
     batch_vectors: ?BatchVectorLookup = null,
@@ -631,6 +672,8 @@ pub fn acquireSearchScratch(self: anytype) !ScratchHandle {
         @intCast(self.metadata.dims),
         @intCast(self.metadata.branching_factor),
         @intCast(self.metadata.leaf_size),
+        @intCast(self.config.max_posting_overlay_cache_bytes),
+        @intCast(self.config.max_posting_overlay_cache_entry_bytes),
     );
     if (comptime @hasDecl(@TypeOf(self.*), "observeSearchWorkspaceBytes")) {
         self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted + scratch.bytes());
@@ -673,6 +716,18 @@ pub fn releaseSearchScratch(self: anytype, handle: *ScratchHandle) void {
             self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| handle.accounted_bytes);
         }
         scratch.deinit(self.alloc);
+    }
+}
+
+pub fn clearSearchScratchCache(self: anytype) void {
+    lockAtomic(&self.scratch_mu);
+    defer self.scratch_mu.unlock();
+    if (self.cached_scratch) |*scratch| {
+        if (comptime @hasDecl(@TypeOf(self.*), "observeSearchWorkspaceBytes")) {
+            self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| scratch.bytes());
+        }
+        scratch.deinit(self.alloc);
+        self.cached_scratch = null;
     }
 }
 

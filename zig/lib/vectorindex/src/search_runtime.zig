@@ -25,6 +25,19 @@ pub const RerankLookup = struct {
     key: [10]u8,
 };
 
+pub const PostingMemberCacheEntry = struct {
+    posting_id: u64,
+    mutation_version: u64,
+    members: []u64,
+};
+
+pub const PostingMemberCacheResult = struct {
+    inserted: bool = false,
+    admission_skips: u64 = 0,
+    evictions: u64 = 0,
+    member_bytes: u64 = 0,
+};
+
 pub const SearchScratch = struct {
     dims: usize,
     estimate: quantizer.RaBitQuantizer.EstimateScratch,
@@ -43,8 +56,19 @@ pub const SearchScratch = struct {
     vector_views: [][]const f32,
     distances: []f32,
     error_bounds: []f32,
+    posting_member_cache: std.ArrayListUnmanaged(PostingMemberCacheEntry) = .empty,
+    posting_member_cache_bytes: u64 = 0,
+    max_posting_member_cache_bytes: u64 = 0,
+    max_posting_member_cache_entry_bytes: u64 = 0,
 
-    pub fn init(alloc: Allocator, dims: usize, max_branching: usize, max_leaf: usize) !SearchScratch {
+    pub fn init(
+        alloc: Allocator,
+        dims: usize,
+        max_branching: usize,
+        max_leaf: usize,
+        max_posting_member_cache_bytes: u64,
+        max_posting_member_cache_entry_bytes: u64,
+    ) !SearchScratch {
         const max_candidates = @max(max_branching, max_leaf);
         const estimate = try quantizer.RaBitQuantizer.EstimateScratch.init(alloc, dims);
         errdefer {
@@ -98,6 +122,11 @@ pub const SearchScratch = struct {
             .vector_views = vector_views,
             .distances = distances,
             .error_bounds = error_bounds,
+            .max_posting_member_cache_bytes = max_posting_member_cache_bytes,
+            .max_posting_member_cache_entry_bytes = effectivePostingMemberCacheEntryBytes(
+                max_posting_member_cache_bytes,
+                max_posting_member_cache_entry_bytes,
+            ),
         };
     }
 
@@ -114,6 +143,12 @@ pub const SearchScratch = struct {
         if (self.vector_batch.len < self.dims * needed) self.vector_batch = try alloc.realloc(self.vector_batch, self.dims * needed);
     }
 
+    pub fn ensureDistanceCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
+        if (self.positions.len < needed) self.positions = try alloc.realloc(self.positions, needed);
+        if (self.distances.len < needed) self.distances = try alloc.realloc(self.distances, needed);
+        if (self.error_bounds.len < needed) self.error_bounds = try alloc.realloc(self.error_bounds, needed);
+    }
+
     pub fn ensureRerankCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         if (self.flags.len < needed) self.flags = try alloc.realloc(self.flags, needed);
         try self.ensureVectorFetchCapacity(alloc, needed);
@@ -123,7 +158,69 @@ pub const SearchScratch = struct {
         if (self.member_ids.len < needed) self.member_ids = try alloc.realloc(self.member_ids, needed);
     }
 
+    pub fn cachedPostingMembers(self: *SearchScratch, posting_id: u64, mutation_version: u64) ?[]const u64 {
+        for (self.posting_member_cache.items, 0..) |entry, i| {
+            if (entry.posting_id == posting_id and entry.mutation_version == mutation_version) {
+                if (i + 1 != self.posting_member_cache.items.len) {
+                    const hot_entry = entry;
+                    std.mem.copyForwards(
+                        PostingMemberCacheEntry,
+                        self.posting_member_cache.items[i .. self.posting_member_cache.items.len - 1],
+                        self.posting_member_cache.items[i + 1 ..],
+                    );
+                    self.posting_member_cache.items[self.posting_member_cache.items.len - 1] = hot_entry;
+                }
+                return self.posting_member_cache.items[self.posting_member_cache.items.len - 1].members;
+            }
+        }
+        return null;
+    }
+
+    pub fn cachePostingMembers(self: *SearchScratch, alloc: Allocator, posting_id: u64, mutation_version: u64, members: []const u64) !PostingMemberCacheResult {
+        const member_bytes = byteLen(members);
+        var result = PostingMemberCacheResult{ .member_bytes = self.posting_member_cache_bytes };
+        if (self.max_posting_member_cache_bytes == 0 or self.max_posting_member_cache_entry_bytes == 0) {
+            result.admission_skips += 1;
+            return result;
+        }
+        var existing_index: ?usize = null;
+        for (self.posting_member_cache.items, 0..) |entry, i| {
+            if (entry.posting_id == posting_id) {
+                existing_index = i;
+                break;
+            }
+        }
+        if (existing_index) |i| self.evictPostingMemberCacheEntry(alloc, i);
+        if (member_bytes > self.max_posting_member_cache_entry_bytes or member_bytes > self.max_posting_member_cache_bytes) {
+            result.admission_skips += 1;
+            result.member_bytes = self.posting_member_cache_bytes;
+            return result;
+        }
+        var evictions: u64 = 0;
+        while (self.max_posting_member_cache_bytes != 0 and self.posting_member_cache_bytes + member_bytes > self.max_posting_member_cache_bytes and self.posting_member_cache.items.len != 0) {
+            self.evictPostingMemberCacheEntry(alloc, 0);
+            evictions += 1;
+        }
+        try self.posting_member_cache.append(alloc, .{
+            .posting_id = posting_id,
+            .mutation_version = mutation_version,
+            .members = try alloc.dupe(u64, members),
+        });
+        self.posting_member_cache_bytes += member_bytes;
+        result.inserted = true;
+        result.evictions = evictions;
+        result.member_bytes = self.posting_member_cache_bytes;
+        return result;
+    }
+
+    fn evictPostingMemberCacheEntry(self: *SearchScratch, alloc: Allocator, index: usize) void {
+        const entry = self.posting_member_cache.orderedRemove(index);
+        self.posting_member_cache_bytes -|= byteLen(entry.members);
+        alloc.free(entry.members);
+    }
+
     pub fn bytes(self: *const SearchScratch) u64 {
+        const posting_member_cache_bytes = byteLen(self.posting_member_cache.items) + self.posting_member_cache_bytes;
         return estimateScratchBytes(&self.estimate) +
             byteLen(self.transformed_query) +
             byteLen(self.centroid) +
@@ -139,7 +236,8 @@ pub const SearchScratch = struct {
             byteLen(self.values) +
             byteLen(self.vector_views) +
             byteLen(self.distances) +
-            byteLen(self.error_bounds);
+            byteLen(self.error_bounds) +
+            posting_member_cache_bytes;
     }
 
     pub fn deinit(self: *SearchScratch, alloc: Allocator) void {
@@ -159,9 +257,17 @@ pub const SearchScratch = struct {
         alloc.free(self.vector_views);
         alloc.free(self.distances);
         alloc.free(self.error_bounds);
+        for (self.posting_member_cache.items) |entry| alloc.free(entry.members);
+        self.posting_member_cache.deinit(alloc);
         self.* = undefined;
     }
 };
+
+fn effectivePostingMemberCacheEntryBytes(max_cache_bytes: u64, configured_entry_bytes: u64) u64 {
+    if (max_cache_bytes == 0) return 0;
+    if (configured_entry_bytes != 0) return @min(configured_entry_bytes, max_cache_bytes);
+    return @max(@as(u64, @sizeOf(u64)), max_cache_bytes / 4);
+}
 
 fn byteLen(values: anytype) u64 {
     return @as(u64, @intCast(values.len * @sizeOf(std.meta.Child(@TypeOf(values)))));
@@ -169,7 +275,7 @@ fn byteLen(values: anytype) u64 {
 
 test "SearchScratch grows error bounds with vector fetch capacity" {
     const alloc = std.testing.allocator;
-    var scratch = try SearchScratch.init(alloc, 4, 2, 2);
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
     defer scratch.deinit(alloc);
 
     try scratch.ensureVectorFetchCapacity(alloc, 5);
@@ -177,6 +283,103 @@ test "SearchScratch grows error bounds with vector fetch capacity" {
     try std.testing.expect(scratch.distances.len >= 5);
     try std.testing.expect(scratch.error_bounds.len >= 5);
     try std.testing.expect(scratch.vector_batch.len >= 4 * 5);
+}
+
+test "SearchScratch grows distance capacity without vector fetch buffers" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
+    defer scratch.deinit(alloc);
+
+    const vector_batch_len = scratch.vector_batch.len;
+    const vector_ids_len = scratch.vector_ids.len;
+
+    try scratch.ensureDistanceCapacity(alloc, 5);
+
+    try std.testing.expect(scratch.positions.len >= 5);
+    try std.testing.expect(scratch.distances.len >= 5);
+    try std.testing.expect(scratch.error_bounds.len >= 5);
+    try std.testing.expectEqual(vector_batch_len, scratch.vector_batch.len);
+    try std.testing.expectEqual(vector_ids_len, scratch.vector_ids.len);
+}
+
+test "SearchScratch bounds posting member cache and reports evictions" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 4 * @sizeOf(u64), 4 * @sizeOf(u64));
+    defer scratch.deinit(alloc);
+
+    const first = [_]u64{ 1, 2 };
+    const first_result = try scratch.cachePostingMembers(alloc, 1, 1, first[0..]);
+    try std.testing.expect(first_result.inserted);
+    try std.testing.expectEqual(@as(u64, 0), first_result.evictions);
+    try std.testing.expectEqual(@as(u64, 2 * @sizeOf(u64)), first_result.member_bytes);
+
+    const second = [_]u64{ 3, 4, 5 };
+    const second_result = try scratch.cachePostingMembers(alloc, 2, 1, second[0..]);
+    try std.testing.expect(second_result.inserted);
+    try std.testing.expectEqual(@as(u64, 1), second_result.evictions);
+    try std.testing.expectEqual(@as(u64, 3 * @sizeOf(u64)), second_result.member_bytes);
+    try std.testing.expect(scratch.cachedPostingMembers(1, 1) == null);
+    try std.testing.expect(scratch.cachedPostingMembers(2, 1) != null);
+
+    const oversized = [_]u64{ 6, 7, 8, 9, 10 };
+    const oversized_result = try scratch.cachePostingMembers(alloc, 3, 1, oversized[0..]);
+    try std.testing.expect(!oversized_result.inserted);
+    try std.testing.expectEqual(@as(u64, 1), oversized_result.admission_skips);
+    try std.testing.expectEqual(@as(u64, 3 * @sizeOf(u64)), oversized_result.member_bytes);
+}
+
+test "SearchScratch posting member cache refreshes hit recency" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 4 * @sizeOf(u64), 4 * @sizeOf(u64));
+    defer scratch.deinit(alloc);
+
+    const first = [_]u64{ 1, 2 };
+    const second = [_]u64{ 3, 4 };
+    const third = [_]u64{ 5, 6 };
+    _ = try scratch.cachePostingMembers(alloc, 1, 1, first[0..]);
+    _ = try scratch.cachePostingMembers(alloc, 2, 1, second[0..]);
+
+    const hot = scratch.cachedPostingMembers(1, 1) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualSlices(u64, first[0..], hot);
+
+    const third_result = try scratch.cachePostingMembers(alloc, 3, 1, third[0..]);
+    try std.testing.expect(third_result.inserted);
+    try std.testing.expectEqual(@as(u64, 1), third_result.evictions);
+    try std.testing.expect(scratch.cachedPostingMembers(1, 1) != null);
+    try std.testing.expect(scratch.cachedPostingMembers(2, 1) == null);
+    try std.testing.expect(scratch.cachedPostingMembers(3, 1) != null);
+}
+
+test "SearchScratch disables posting member cache when byte cap is zero" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
+    defer scratch.deinit(alloc);
+
+    const members = [_]u64{ 1, 2 };
+    const result = try scratch.cachePostingMembers(alloc, 1, 1, members[0..]);
+    try std.testing.expect(!result.inserted);
+    try std.testing.expectEqual(@as(u64, 1), result.admission_skips);
+    try std.testing.expectEqual(@as(u64, 0), result.member_bytes);
+    try std.testing.expect(scratch.cachedPostingMembers(1, 1) == null);
+}
+
+test "SearchScratch skips entries above per posting member cache cap" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 8 * @sizeOf(u64), 2 * @sizeOf(u64));
+    defer scratch.deinit(alloc);
+
+    const small = [_]u64{ 1, 2 };
+    const small_result = try scratch.cachePostingMembers(alloc, 1, 1, small[0..]);
+    try std.testing.expect(small_result.inserted);
+    try std.testing.expectEqual(@as(u64, 2 * @sizeOf(u64)), small_result.member_bytes);
+
+    const large = [_]u64{ 3, 4, 5 };
+    const large_result = try scratch.cachePostingMembers(alloc, 2, 1, large[0..]);
+    try std.testing.expect(!large_result.inserted);
+    try std.testing.expectEqual(@as(u64, 1), large_result.admission_skips);
+    try std.testing.expectEqual(@as(u64, 2 * @sizeOf(u64)), large_result.member_bytes);
+    try std.testing.expect(scratch.cachedPostingMembers(1, 1) != null);
+    try std.testing.expect(scratch.cachedPostingMembers(2, 1) == null);
 }
 
 fn estimateScratchBytes(scratch: *const quantizer.RaBitQuantizer.EstimateScratch) u64 {

@@ -13,6 +13,14 @@ The current conclusion is:
   - a posting store
   - a vector-to-posting assignment map
 - Keep the existing HBC as the first centroid directory implementation.
+- Replace HBC's packed mutable posting/centroid persistence incrementally,
+  starting with explicit posting base/delta records that can be tested against
+  the existing HBC format.
+- The concrete storage target is to stop making packed HBC leaf records the
+  authoritative posting store. Posting membership should live in explicit
+  posting base/delta records, posting centroids should live in explicit
+  centroid-directory records, and HBC should initially remain only the routing
+  structure over those posting IDs.
 - Use the refactor to test SPFresh-style maintenance policies: lazy centroid
   refresh, local split/merge, and targeted boundary reassignment after
   split/merge if we later choose to enforce a nearest-partition invariant.
@@ -26,9 +34,12 @@ separated enough that posting updates can stay local.
 Current status:
 
 - Phase 1 is implemented.
-- `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/posting.zig` defines the initial `PostingId`,
+- `zig/lib/vectorindex/src/posting.zig` defines the initial `PostingId`,
   `PostingView`, `PostingStore`, `AssignmentMap`, and `CentroidDirectory`
   names.
+- `PostingFormat` now defines the first explicit SPFresh-style posting storage
+  contract: immutable posting base records, append-only delta tails, tombstone
+  and replacement records, and deterministic overlay materialization.
 - Existing vector-to-leaf assignment storage now flows through
   `AssignmentMap`, while preserving the current key format.
 - Existing leaf/member scoring setup now flows through `PostingStore`.
@@ -41,6 +52,11 @@ Current status:
 - Existing leaf RaBitQ payload cache/write mechanics now flow through
   `PostingStore.refreshQuantizedPayload`; internal-node quantized payloads
   remain owned by HBC.
+- Search now profiles internal-routing quantized misses separately from leaf
+  posting-payload misses. If an internal routing payload is missing or stale in
+  a read transaction, search can rebuild a read-only in-memory payload from
+  cached child centroids and cache it, avoiding repeated warm-query storage
+  reads while leaving durable repair to maintenance.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.
@@ -52,12 +68,32 @@ Current status:
   payload, and ancestor refresh work to posting maintenance.
 - Dirty posting backlog visibility now exists via `PostingBacklogStats` and a
   `std.Io.Writer` debug renderer, so we can inspect how much deferred work is
-  accumulating.
+  accumulating, including dirty-posting count, oldest dirty mutation version,
+  max dirty age, delta-tail postings, max delta records, max tombstone records,
+  delta-to-base ratio, centroid lag, and payload lag.
 - A disabled-by-default bounded automatic repair hook now runs before write
-  commit when `auto_posting_maintenance_max_postings` is non-zero. This lets us
-  amortize lazy posting repair without introducing a background thread.
+  commit when `auto_posting_maintenance_max_postings` is non-zero. Optional
+  dirty-count, dirty-age, delta-tail, tombstone-tail, delta-ratio,
+  centroid-lag, and payload-lag gates let us amortize lazy posting repair
+  without turning every foreground write into synchronous full repair.
+- Automatic repair also exposes `auto_posting_maintenance_max_delta_tail_postings`.
+  Fold thresholds can stay high to avoid eager folding, while maintenance
+  force-folds only enough postings to keep total delta-tail debt under a
+  configured cap.
 - Dense-index config parsing and DB/API runtime status now expose the lazy
-  posting knobs and posting backlog/maintenance counters.
+  posting knobs, posting backlog/maintenance counters, and the configured
+  automatic-maintenance policy bounds next to the observed debt.
+- DB/API posting status now includes delta-tail debt, tombstone/ratio debt,
+  overfull and at-capacity posting debt, boundary-reassignment capacity skips,
+  swap moves, delta-fold attempts/skips/records, and the dirty-age,
+  delta-tail, centroid/payload lag, layout-change, and overfull-reassignment
+  policy caps. These are the production counters and bounds needed to enforce
+  the "bounded maintenance, no hidden overfull debt" optimization gate outside
+  the write bench.
+- Overfull reassignment is no longer only an unlimited opt-in. Maintenance
+  options and dense config now support explicit max-overfull-posting and
+  max-over-capacity-member limits; direct moves that would exceed those limits
+  are skipped or converted to capacity-neutral swaps when possible.
 - Existing insert routing now flows through `CentroidDirectory.findPosting`,
   which still delegates to current HBC leaf routing.
 - Bounded local posting layout maintenance now exists: oversized postings can
@@ -84,8 +120,14 @@ The current persisted key families are effectively:
 
 - `hbc_nodes`: node headers, centroids, children, leaf members, and split ranges
 - `hbc_quant`: quantized payloads for node search
-- `hbc_vecs`: raw vectors and vector metadata
-- `hbc_meta`: index metadata and vector-to-leaf assignments
+- `hbc_vecs`: vector-to-leaf assignments plus standalone-HBC raw vectors and
+  vector metadata
+- `hbc_meta`: index metadata
+
+Normal DB-backed dense indexes already load raw vectors from the primary
+doc/artifact store. For those indexes the high-churn HBC state is structural:
+posting membership, centroid/payload refresh, splits, ancestor refresh, and
+assignment-map writes.
 
 In the current implementation, one `Node` abstraction does both jobs:
 
@@ -207,6 +249,36 @@ If every write deletes and reinserts a posting centroid in a centroid-HBC, then
 the design may be worse than current HBC. The value comes from lazy and batched
 directory maintenance plus local background repair.
 
+### Current lazy posting maintenance is only an intermediate step
+
+The existing lazy mode can defer centroid, quantized payload, and ancestor
+refresh work, but current posting membership is still embedded in the packed HBC
+leaf node. That means every non-noop insert still rewrites the packed leaf
+member list, even when centroid repair is lazy.
+
+The next storage target is:
+
+```text
+posting_base(posting_id, generation)
+  -> compact sorted/stable member IDs
+
+centroid_directory(posting_id, generation)
+  -> centroid and posting metadata
+
+posting_delta(posting_id, sequence)
+  -> insert(vector_id)
+  -> tombstone(vector_id)
+  -> replace(vector_id)
+
+assignment_map(vector_id)
+  -> posting_id
+  -> vector/version reference
+```
+
+Queries materialize a posting view by reading the immutable base and overlaying
+the delta tail. Maintenance folds a bounded tail into a new base generation,
+refreshes centroid/payload state, then publishes the new generation.
+
 ### The leaf RaBitQ payload can remain conceptually similar
 
 The RaBitQ posting list does not need to be replaced to test the SPFresh
@@ -257,6 +329,8 @@ or better.
 Potential wins:
 
 - foreground writes can touch one posting instead of a tree path
+- with base/delta storage, foreground writes can append a small delta instead
+  of rewriting the full posting member list
 - posting centroid updates can be batched or made approximate
 - splits/merges can run as local background work
 - write amplification should drop for continuous insert/update/delete workloads
@@ -264,6 +338,7 @@ Potential wins:
 Potential losses:
 
 - background maintenance becomes necessary
+- query-time overlay adds CPU and possibly extra reads while deltas are pending
 - stale centroids can reduce recall until repaired
 - local reassignment logic is more complex than pure tree maintenance
 - correctness around versions, tombstones, and concurrent search becomes more
@@ -381,6 +456,14 @@ search performance alone.
    it can reuse `posting.zig` and selected maintenance code behind a cleaner
    interface.
 
+8. Introduce the file format before switching the write path.
+
+   The first base/delta implementation lives in `PostingFormat` and is tested
+   without changing HBC behavior. This gives us a stable byte contract and
+   overlay semantics before we route production HBC writes through the new
+   storage. The migration should preserve the existing packed-node HBC as the
+   benchmark baseline.
+
 ## Refactor Plan
 
 ### Phase 1: Name the boundaries
@@ -482,7 +565,2031 @@ Acceptance:
   maintenance debt
 - background maintenance debt is bounded
 
-### Phase 6: Alternative centroid directories
+### Phase 6: Posting base/delta storage
+
+Objective:
+- make posting membership a first-class storage unit instead of packed leaf
+  node payload
+
+Plan:
+- define immutable posting base records with posting id, generation, and base
+  member IDs
+- define independent centroid-directory records with posting id, generation,
+  centroid, and posting metadata
+- define append-only delta/tail records for insert, tombstone, and replacement
+  operations
+- materialize query/maintenance views by overlaying base plus ordered deltas
+- fold bounded delta tails into new base generations in maintenance
+- group same-posting batch mutations into one delta key/value when the caller
+  already has an ordered posting-local mutation set
+- keep the current packed HBC leaf format available as the baseline
+- treat the explicit posting base, posting delta, and centroid-directory bytes
+  as a new file format with strict magic/version decoding and no legacy
+  posting-list variants. If we ever need to move data between posting-list
+  formats, that should be an explicit migration tool or rewrite pass, not extra
+  branches in the hot decode path.
+
+Acceptance:
+- format encode/decode and overlay tests pass
+- write benchmarks can count packed-leaf rewrites versus delta appends
+- query benchmarks can compare base-only and base-plus-tail overlay cost
+- maintenance benchmarks can measure fold cost, tail debt, and post-fold query
+  behavior
+
+Current slice:
+- `PostingFormat.encodeBase` / `decodeBase`
+- `PostingFormat.encodeDeltaTail` / `decodeDeltaTail`
+- posting base and delta records now use compact exact-size v1 byte layouts:
+  base records store only magic, version, posting id, generation, member count,
+  and member ids; delta records store only magic, version, record count, and
+  packed `(sequence, op, vector_id)` entries. The posting-list decoders reject
+  unsupported versions, corrupt lengths, and unsupported delta ops instead of
+  carrying legacy/future variant branches in the hot path.
+- grouped delta tails with at least three records now use a compact v2 value
+  layout: magic, version, record count, base sequence, and packed
+  `(u32 sequence_offset, op, vector_id)` entries. Single-record and two-record
+  tails keep the v1 layout because v2 would be larger or equal. The decoder
+  still accepts v1 tails, rejects compact sequence overflow, and treats other
+  versions as unsupported, so existing base-delta tail values remain readable
+  while grouped overwrite/append batches use fewer value bytes.
+- `PostingFormat.materializeMembers` and
+  `materializeMembersAfterGeneration`
+- `PostingStore.appendDeltaRecords` writes multiple ordered posting-local delta
+  records under one tail key, so grouped insert/delete batches can reduce LSM
+  key count without changing query overlay semantics
+- batched existing-vector reroutes now normalize source tombstones and grouped
+  target inserts to the posting's final mutation generation with ordered
+  per-record offsets before appending the tail value. That avoids duplicate or
+  generation-gapped sequences inside one grouped tail and lets the compact v2
+  value layout apply to multi-reroute source/target batches.
+- delta-tail folds now report deleted tail key/value bytes, replacement base
+  key/value bytes, and folded record/member counts, so benchmark rows can
+  verify both sides of the maintenance write-amplification tradeoff:
+  posting-local delta keys should collapse into one compact base generation,
+  but the replacement base bytes per folded record must stay bounded
+- `CentroidDirectoryFormat.encode` / `decode` records posting-id, generation,
+  mutation version, payload version, dirty flags, parent, level, member count,
+  bounds radius, and centroid independently of the posting base blob. These
+  records are the query-time source of posting metadata for flat/two-level
+  base-delta directories.
+- `AssignmentFormat.encode` / `decode` records posting-id, assignment version,
+  and flags in a compact fixed-size value. The vector id and current vector
+  reference are implied by the `hbc.encodeAssignmentKey` key because dense
+  vectors already live in the main DB store. Assignment compatibility is
+  separate from posting-list storage; the new posting base/delta and
+  centroid-directory decoders accept only the current v1 bytes, with unsupported
+  assignment/centroid flags rejected at decode time.
+- `hbc.encodePostingBaseKey` and `hbc.encodePostingDeltaKey` provide stable
+  namespaced keys for base records and ordered delta records. Delta-tail cursor
+  scans now accept only the exact current `PD<posting-id><sequence>` key shape,
+  so future posting-list variants cannot be silently interpreted as v1 tail
+  records in query or maintenance paths.
+- `hbc.encodeCentroidDirectoryKey` provides a separate stable key family for
+  posting-id -> centroid-directory records
+- `hbc.encodeAssignmentKey` provides a separate stable key family for versioned
+  assignment-map records while preserving the legacy `l:` vector -> leaf key
+- `PostingStore.saveBase`, `loadBase`, `appendDelta`, `loadDeltaTail`,
+  `materializeBaseDeltaMembers`, and `foldDeltaTailIntoBase` persist, scan,
+  overlay, and fold the new records through existing transactional namespace
+  helpers
+- `PostingStore.saveCentroidDirectoryRecord` /
+  `loadCentroidDirectoryRecord` persist the separate centroid-directory record;
+  `loadCentroidDirectoryRecords` scans the `CD` key family directly when a
+  cursor-capable transaction is available
+- `AssignmentMap.put` and `delete` keep the legacy vector -> leaf mapping for
+  update/delete routing. `shadow_base_delta` still dual-writes the versioned
+  assignment record, while canonical `base_delta` derives `getRecord` from the
+  legacy vec-leaf key instead of writing a duplicate current assignment-map key
+  for every append.
+- `HBCConfig.posting_storage_mode = .shadow_base_delta` opt-in dual-writes
+  posting base records on leaf saves and posting delta records at semantic
+  insert/replace/tombstone mutation points while keeping packed HBC reads as
+  the source of truth
+- `HBCConfig.posting_storage_mode = .base_delta` is the first experimental
+  canonical posting-store mode. Incremental leaf writes keep the packed HBC node
+  record for routing metadata, but omit packed leaf member IDs and use
+  posting-base plus posting-delta materialization as the authoritative member
+  view.
+- generic HBC loads and DB adapter pointer/debug paths now overlay
+  `posting_base + posting_delta` into leaf member views in `base_delta`, so
+  cached nodes, validation, upper-tree pinning, and routing fallback paths do
+  not depend on packed leaf member IDs
+- structural leaf split saves publish a fresh full posting-base snapshot in
+  `base_delta`, and split/merge outputs advance persisted posting state before
+  saving. This prevents stale pre-split append deltas from being replayed over a
+  new partitioned posting base.
+- node deletion now also removes explicit posting-base, posting-delta, and
+  centroid-directory records when the transaction supports delta-tail scans, so
+  a record-backed centroid directory does not probe dead postings after splits,
+  merges, or deletes and old posting tails do not linger as query/repair debt
+- default bulk-build leaf saves now use the known-vector, base/delta-aware leaf
+  save path. Parent updates in `base_delta` refresh centroid-directory parent
+  metadata and invalidate stale root/non-root quantized payload shape lazily;
+  internal-node quantized rebuilds load raw child node centroids instead of
+  forcing a posting overlay, because child membership is not needed for that
+  operation.
+- the same shadow mode also dual-writes centroid-directory records on leaf saves
+  and after bounded centroid repair
+- HBC query leaf scoring now asks `PostingStore.copyQueryMemberIds` for member
+  IDs. In `shadow_base_delta` mode it attempts to materialize base+delta,
+  records overlay counters in `SearchProfile`, and falls back to packed HBC if
+  the base is missing, older than the packed posting state, or does not exactly
+  match packed member order. The exact-match guard is required while quantized
+  payloads are still built in packed-member order.
+- In canonical `base_delta` flat/two-level directory search, the selected
+  centroid-directory probe now carries posting parent, level, and persisted
+  posting state, so query materialization goes straight through the posting
+  store and does not read packed leaf nodes as a metadata fallback.
+- delta sequence high bits are treated as the posting mutation generation; query
+  overlay and maintenance fold ignore records at or below the base generation so
+  full base snapshots are authoritative over older shadow deltas.
+- standalone dirty-posting repair uses a cursor-capable write transaction so
+  shadow and canonical `base_delta` tails can fold into a new base after
+  writes. Its default fold policy is thresholded
+  (`min_delta_records_to_fold=64`, `min_tombstone_records_to_fold=16`, ratio
+  trigger disabled) so repair does not recreate foreground write amplification
+  by folding every tiny tail. Explicit eager fold remains available by setting
+  the thresholds to `1/0/0`, and ratio-based folding remains available through
+  explicit options and DB idle-maintenance policy. Automatic repair invoked
+  inside a namespace batch still skips tail folding because batches do not
+  expose cursors
+- automatic posting maintenance is now policy-shaped instead of only
+  `max_postings`: `HBCConfig` exposes fold thresholds, layout-change budgets,
+  a max-delta-tail debt cap, dirty-count/age trigger gates,
+  delta-tail/tombstone/ratio trigger gates, centroid/payload lag trigger gates,
+  overfull/full-posting capacity gates, capacity-safe boundary reassignment
+  budgets, opt-in full-posting splits for creating layout slack, and an
+  explicit overfull opt-in. Zero trigger gates preserve the old "run whenever
+  max_postings is non-zero" behavior. For
+  canonical `base_delta`, auto repair skips batch transaction contexts that
+  cannot scan delta tails; the explicit background repair API remains the
+  cursor-capable path for draining that debt.
+- DB idle posting maintenance now treats dirty postings, actionable delta-tail
+  fold debt, and layout debt as separate reasons to run. Clean postings with
+  delta tails can be folded without requiring a synthetic dirty flag, and
+  successful fold calls count as idle maintenance progress. The DB scheduler
+  also accepts per-run index-count and elapsed-time budgets
+  (`ANTFLY_DENSE_POSTING_IDLE_MAX_INDEXES_PER_RUN`,
+  `ANTFLY_DENSE_POSTING_IDLE_MAX_ELAPSED_NS`) plus overfull/full-posting
+  trigger thresholds (`ANTFLY_DENSE_POSTING_IDLE_MIN_OVERFULL_POSTINGS_TO_RUN`,
+  `ANTFLY_DENSE_POSTING_IDLE_MIN_POSTINGS_AT_CAPACITY_TO_RUN`) with defaults
+  that preserve the current "first layout-debt posting is actionable" behavior.
+  Base-delta tail folding is also thresholded and capped through
+  `ANTFLY_DENSE_POSTING_IDLE_FOLD_DELTA_TAILS`,
+  `ANTFLY_DENSE_POSTING_IDLE_MIN_DELTA_RECORDS_TO_FOLD`,
+  `ANTFLY_DENSE_POSTING_IDLE_MIN_TOMBSTONE_RECORDS_TO_FOLD`,
+  `ANTFLY_DENSE_POSTING_IDLE_MIN_DELTA_TO_BASE_RATIO_BPS`, and
+  `ANTFLY_DENSE_POSTING_IDLE_MAX_DELTA_TAIL_POSTINGS`; the default ratio
+  trigger is disabled so tiny clean tails are not folded solely because their
+  posting is small, while the explicit tail cap can still force bounded debt
+  drainage.
+  This lets production-shaped background maintenance be bounded independently
+  from LSM compaction and avoids attempting clean at-capacity postings until
+  policy says the accumulated layout debt is worth a repair pass. Profiled
+  dense searches also feed a query-pressure guardrail:
+  `ANTFLY_DENSE_POSTING_IDLE_MAX_PROFILED_SEARCH_NS=0` disables it, while a
+  non-zero value makes idle posting maintenance skip when the most recent
+  profiled dense query exceeded that latency budget. The profiled
+  idle-maintenance path reports scanned indexes, repaired indexes, elapsed
+  time, and whether the pass stopped on index-count, elapsed-time, resource, or
+  query-guardrail budget.
+  `DBStats.dense_posting_maintenance` preserves the cumulative and last-pass
+  scheduler result plus observed profiled dense-search latency through runtime
+  snapshots and provisioned runtime-status Prometheus metrics, so bounded
+  maintenance debt is observable instead of inferred from backlog deltas alone.
+  When a bounded pass reports remaining debt via `limit_reached`, `runUntilIdle`
+  and the submitted background maintenance job now repeat dense posting
+  maintenance while progress continues, stopping only when debt is drained or a
+  scheduler budget/resource/query guardrail fires.
+- Dense posting maintenance is now part of the shared runtime abstraction
+  surface instead of a bespoke side loop. The DB exposes a `BackendRuntime`
+  maintenance-job submission path for the same idle repair pass, and the pass
+  reserves `ResourceManager` slice
+  `dense.posting_maintenance_working_set` before mutating postings. Resource
+  pressure can therefore defer/reject posting repair independently from LSM
+  compaction, dense replay, search scratch, and text merge buffers, and
+  `DBStats.dense_posting_maintenance`, runtime-status snapshots, and
+  provisioned Prometheus metrics report resource-budget stops separately from
+  index-count and elapsed-time stops. The focused DB tests cover both the
+  inline/manual and threaded `BackendRuntime` durable-job lanes, including the
+  combined threaded-lane plus `ResourceManager` rejection path.
+- Metadata-optional external vector loading now applies to both batch loaders
+  and single-vector scratch fallbacks. That matters for DB-backed dense indexes:
+  posting repair, centroid recompute, and RaBitQ refresh can load vectors by
+  vector ID through the external loader without requiring duplicate vector
+  metadata in the dense index's private keyspace. Metadata-addressed loaders
+  keep the old strict behavior by leaving `external_vector_metadata_required`
+  enabled.
+- Large external-vector evidence should use the DB-backed vector-store shape,
+  not the standalone-HBC "own every vector payload" shape. `hbc-write-bench`
+  now has `--dataset-mode procedural` for
+  `online_batches_dense_external_vectors_empty` and
+  `online_batches_dense_external_vectors_per_batch_session_empty`: it generates
+  deterministic vectors per batch, installs the normal external-vector loader,
+  forces index-local vector payload storage off for those VDBB-style rows, and
+  computes post-write recall by regenerating exact ground truth instead of
+  materializing a `vectors * dims` array. This is the practical path for
+  1M x 1536 VectorDBBench-shaped runs while preserving the production contract
+  that vectors live in the main DB store and the dense index stores posting
+  membership plus assignment metadata. `--post-write-recall-mode self_hit`
+  adds a scalable diagnostic mode for large procedural runs: it still executes
+  real ANN read-after-write queries and records QPS, latency, and profile
+  counters, but validates only whether the queried vector id is returned. Exact
+  recall remains the default and remains required for the optimized gate. The
+  comparison runner exposes opt-in `ENABLE_VDBB_PROCEDURAL=1` rows for packed
+  HBC, canonical base/delta HBC, canonical base/delta flat RaBitQ, and
+  canonical base/delta two-level RaBitQ, plus
+  `ENABLE_VDBB_1M_PROCEDURAL=1` rows for `write_vdbb_1m_procedural_*` labels
+  that default to `VDBB_1M_VECTORS=1000000`, exact post-write recall, 100
+  post-write query vectors, and k=10. That gives the optimized gate a 1000-item
+  exact-recall denominator for each required 1M VDBB row, but the synthetic
+  procedural exact oracle is still a brute-force generated-vector scan. The
+  cosine path avoids materializing and normalizing a candidate vector for every
+  row by computing exact generated-vector cosine distance in one pass, which
+  cuts a large constant factor but does not change the asymptotic scan cost.
+  Materialized and generated post-write exact truth is precomputed before timed
+  query loops, so post-write QPS and p95 rows measure ANN search/rerank work
+  instead of brute-force oracle work. Generated exact truth is also cached per
+  repeated post-write query row so warm-round query timings are not polluted by
+  recomputing the exact oracle.
+  The comparison runner now passes a shared `--post-write-truth-cache-path` for
+  comparable procedural write rows: online VDBB rows share one file per
+  vector/query shape, and procedural mutation rows share one file per
+  distribution. The cache header includes seed, vector/query shape, metric,
+  dataset mode, live-row count, and a hash of active rows plus override vectors,
+  so hot/random/semantic/append/mixed workloads cannot silently reuse each
+  other's truth. Write summaries preserve `post_write_exact_truth_cache_hit`
+  and `post_write_exact_truth_build_ns`, plus the corresponding `pre_repair_*`
+  fields for mutation rows. This still leaves the first exact 1M synthetic
+  oracle expensive, but it prevents paying that brute-force cost again for each
+  packed/base-delta comparison row.
+  Procedural mode now also supports warm random-overwrite,
+  semantic-drift-overwrite, append-streaming, and mixed insert/delete/update
+  rows. Those rows build the warm index from generated vectors, materialize
+  only changed/appended vectors, and install an override-aware external-vector
+  loader so post-write repair, rerank, exact recall, and self-hit diagnostics
+  see the current vector values without allocating the full `vectors * dims`
+  matrix. The comparison runner exposes those rows through
+  `ENABLE_VDBB_PROCEDURAL_MUTATIONS=1` and
+  `ENABLE_VDBB_1M_PROCEDURAL_MUTATIONS=1`; the same slow exact-oracle guard
+  applies at 1M scale. The optimized-gate summarizer treats these procedural
+  mutation rows as DB-backed vector evidence and, for hot/random/semantic/
+  append/mixed distributions, selects the largest available row so 1M
+  procedural mutation evidence can satisfy the distribution checks without
+  requiring a materialized 1M x 1536 vector matrix.
+  The focused bench unit step verifies that one-pass generated cosine distance
+  matches the materialized-vector exact distance:
+
+  ```text
+  zig build hbc-write-bench-test
+  ```
+
+  The runner fails fast when that scan would exceed
+  `VDBB_1M_EXACT_RECALL_MAX_OPS` (default `20_000_000_000` generated-vector
+  dimensions) unless the selected 1M row's exact-truth cache already exists or
+  `ALLOW_SLOW_VDBB_1M_EXACT_RECALL=1` is set. This keeps accidental brute-force
+  1M oracle work out of normal runs while still allowing cached exact-recall
+  rows to be appended to a resumable result file. Use
+  `VDBB_1M_POST_WRITE_RECALL_MODE=self_hit` for 1M performance diagnostics, or
+  use real VectorDBBench query/ground-truth artifacts for the optimized 1M
+  recall proof instead of the synthetic brute-force oracle. Even the 1M
+  `self_hit` rows still build the full 1M-vector packed/base-delta index, so
+  they are long-running benchmark jobs rather than smoke validation rows.
+  `VDBB_1M_POST_WRITE_RECALL_MODE=self_hit` remains an explicit diagnostic
+  override only and cannot satisfy the optimized gate. The procedural VDBB rows
+  use posting-count-derived two-level directory block sizing instead of
+  inheriting the small default comparison geometry.
+  Flat/two-level online ingest now publishes deferred node keys at each safe
+  batch boundary inside a bulk-ingest session so foreground routing can see the
+  staged tree while the public search snapshot remains gated by the session
+  finish path.
+- The write bench can now build generated exact post-write truth caches without
+  building or querying an index by passing `--post-write-truth-cache-only` with
+  `--dataset-mode procedural`, exact recall mode, a single supported workload,
+  and `--post-write-truth-cache-path`. The comparison runner exposes the same
+  path for selected 1M rows:
+
+  ```text
+  env ENABLE_VDBB_1M_PROCEDURAL=1 \
+    PREBUILD_VDBB_1M_EXACT_TRUTH_CACHES=1 \
+    RUN_LABELS=write_vdbb_1m_procedural_base_delta_two_level_rabitq_bounded_maintenance \
+    RESULT_DIR=zig/bench/results/spfresh-hbc-comparison-1m \
+    zig/scripts/run_spfresh_hbc_comparison.sh
+  ```
+
+  This builds the selected 1M exact-truth cache files and exits without
+  appending benchmark rows. Later exact-recall runs with the same result
+  directory load those files and can pass the slow-oracle guard without setting
+  `ALLOW_SLOW_VDBB_1M_EXACT_RECALL=1`. Generated cosine exact-truth scans also
+  precompute the query norm once per query and candidate norms once per cache
+  build before scanning candidates, avoiding repeated `dims`-wide norm
+  accumulation while preserving the same distance formula and top-k tie-breaker.
+- DB idle maintenance defaults to bounded full-posting split scheduling while
+  keeping overfull reassignment disabled. That creates layout slack for
+  capacity-safe reassignment under background budgets instead of buying recall
+  with unbounded overfull posting debt.
+- Bounded posting repair results now report remaining dirty, delta-tail,
+  overfull, at-capacity, and max-over-capacity debt after the pass, and set
+  `limit_reached` when the configured maintenance budget did not drain the debt
+  it is responsible for. Write-bench rows emit matching
+  `posting_repair_*_remaining_*` fields, and the optimized gate requires the
+  production proof log to include a bounded split-budget reporting test.
+  `IndexManager.DensePostingMaintenanceResult` and
+  `DBStats.dense_posting_maintenance` now preserve those remaining-debt fields,
+  including last-pass dirty/delta-tail/overfull/at-capacity debt and
+  limit-reached index counts, so production status can tell the difference
+  between "bounded pass made progress" and "bounded pass finished all debt".
+- Non-overfull maintenance policies now publish explicit zero overfull debt
+  limits by default. The write bench, HBC runtime config, and parsed dense-index
+  config all report `max_overfull_reassignment_postings=0` and
+  `max_over_capacity_reassignment_members=0` when overfull reassignment is
+  disabled; the comparison runner keeps separate finite defaults only for the
+  explicit overfull contrast row. The optimized gate now requires required
+  non-overfull repair and automatic-maintenance rows to publish `0/0` limits.
+  Existing 1M artifacts collected before this change still show
+  `unbounded/unbounded` until those rows are rerun.
+- A bounded repair pass no longer lets an exhausted dirty-refresh budget prevent
+  later layout work in the same scan when layout-change budget remains. This
+  keeps capacity debt draining independently from ordinary centroid/payload
+  refresh budget.
+- multi-write `base_delta` batches that may update existing vector IDs use a
+  cursor-capable write transaction instead of the namespace batch path, because
+  leaf loads need to materialize posting base+delta state
+- overwrite-heavy write-bench workloads now enable same-leaf overwrite
+  coalescing by default. When an existing vector still belongs to its current
+  posting, the write path refreshes vector/metadata state and dirties the
+  posting without appending a replacement posting-delta key. Pass
+  `--no-coalesce-overwrite-leaf-writes` to measure the uncoalesced baseline.
+- `overwrite_same_leaf_vectors_warm` is the clean same-posting refresh
+  workload: it keeps vector values stable and changes metadata, so benchmark
+  rows can separate same-leaf overwrite cost from semantic-drift replacement
+  cost.
+- canonical lazy `base_delta` replacements for existing vector IDs are
+  posting-local: they update the current vector/assignment, append a replacement
+  delta to the current posting, persist dirty posting state, and defer
+  centroid/payload/relocation repair
+- mixed write batches now coalesce existing-vector replacement deltas by current
+  posting before routing remaining absent inserts through the grouped insert
+  path. A focused tiny mixed smoke improved foreground delta density from
+  27 records / 22 physical appends to 32 records / 14 physical appends, clearing
+  the 2.0 grouped-density gate at that shape.
+- writes-only overwrite batches now use the same cursor-transaction coalescing
+  pass as mixed batches. For canonical `base_delta`, an existing vector that
+  stays in its current posting updates vector/metadata state and dirty posting
+  maintenance state without appending a replacement delta record, because the
+  posting membership did not change. Delta records are reserved for real
+  membership edits such as tombstone/insert moves. A focused hot-overwrite auto
+  maintenance smoke dropped the row from one physical delta key per logical
+  overwrite to 102 logical delta records over 65 physical appends while keeping
+  same-posting replacement records out of the tail.
+- moved overwrite target inserts are now grouped by target posting before
+  appending delta tails. On the same focused hot-overwrite auto-maintenance
+  smoke, per-source grouping dropped physical foreground delta appends from
+  65 to 41 for the same 102 logical delta records, and batch-wide target
+  grouping dropped them again to 27, raising foreground delta density to
+  3.78 records per physical append.
+- lazy existing-vector reroutes now refuse full target postings when
+  `base_delta` is the canonical posting store. If the nearest posting is at
+  capacity and overfull reassignment is disabled, the overwrite stays in the
+  source posting, updates vector/metadata state, dirties posting maintenance
+  state, and leaves relocation to bounded background repair. The apply path no
+  longer pre-counts a reroute before the delegated insert path decides whether
+  a physical move happened. A focused hot-overwrite auto-maintenance smoke with
+  `AUTO_SPLIT_FULL_MAX_LAYOUT_CHANGES=2` kept remaining overfull and
+  over-capacity debt at `0 / 0` while reducing storage write bytes to about
+  `1.40x` packed HBC for that tiny shape.
+- `hbc-write-bench --posting-storage shadow_base_delta --workload <name>`
+  exposes posting base/delta, centroid-directory, and assignment-map write
+  counters alongside existing packed-HBC, host-storage, LSM, latency, and
+  `vectors_per_second` counters. `posting_delta_append_calls` versus
+  `posting_delta_records` now shows whether grouped posting mutations are
+  sharing physical delta keys, and `posting_delta_fold_deleted_tail_keys` /
+  `posting_delta_fold_deleted_tail_value_bytes` show whether repair reclaimed
+  those physical tail records after folding.
+- warm append/overwrite/mixed rows also emit `foreground_*` profile counters
+  captured immediately after the foreground mutation phase and `repair_*`
+  counters for the optional explicit repair pass. Use `foreground_*` fields for
+  write-amplification comparisons; aggregate profile fields still describe the
+  final post-repair row.
+- `hbc-write-bench --workload overwrite_hot_vectors_warm` builds a warm index
+  and repeatedly overwrites a configurable hot set of existing vector IDs using
+  `--overwrite-hot-keys` and `--overwrite-rounds`, so overwrite-specific
+  structural work, posting deltas, fold work, host IO, and LSM bytes are
+  visible
+- `hbc-write-bench` now exposes the automatic posting-maintenance policy knobs
+  (`--auto-posting-maintenance-*`) and emits them on each JSON row, so
+  pre-commit/background-style repair can be measured separately from explicit
+  `--repair-postings-after-write` passes. It also emits backlog counters after
+  the write phase, so "skipped repair" rows show the remaining dirty posting
+  count, max dirty age, delta-tail count, max tombstone tail, max delta ratio,
+  centroid lag, and payload lag.
+- `hbc-write-bench --post-write-queries <n>` now runs a same-index query phase
+  after foreground writes and optional post-write posting repair. It reports
+  post-write QPS, read IO, search workspace bytes, scored-vector counts, and
+  posting-overlay counters on the same JSON row as the write result. With
+  `--post-write-query-rounds <n>`, it also reports warm-round counters that
+  exclude the first query round, so base/delta cold overlay misses can be
+  separated from steady cached-query behavior.
+- the same post-write query phase now computes exact recall@k against the
+  current post-mutation vector snapshot, including overwritten vector values.
+  The JSON rows include full and warm `post_write*_recall_at_k` plus raw
+  hit/total counters so write-path savings can be read alongside after-write
+  quality.
+- `hbc-write-bench --centroid-directory <mode>` now mirrors the read benchmark's
+  centroid-directory controls, including `flat_rabitq`, `two_level_rabitq`,
+  `--flat-centroid-block-size`, `--flat-centroid-probe-count`, and
+  `--flat-centroid-block-probe-count`. This lets an overwrite run compare
+  foreground write cost and post-write query behavior for HBC routing versus
+  the separate centroid-directory paths.
+- in `shadow_base_delta` and `base_delta`, `flat_rabitq` now builds from the
+  explicit centroid-directory record key range first and falls back to leaf-node
+  traversal only when no records exist, keeping packed-HBC data compatible
+  while making the separate centroid directory an actual query input
+- write-bench storage counters now separate full-file reads, range reads,
+  trailer reads, file-size calls, and read bytes. This matters for base/delta
+  overlay reads, which commonly show up as range reads rather than full-file
+  loads.
+- write-bench scenarios install a dataset-backed external vector loader, so
+  `skip_vector_store` workloads can still split postings, refresh payloads, and
+  run post-write repair without falling back to missing raw-vector keys
+- `hbc-read-bench --posting-storage shadow_base_delta` exposes read-side overlay
+  counters (`profile_posting_overlay_*`) alongside existing query profile,
+  storage-read, latency, and `queries_per_second` counters
+- the posting-member overlay cache is now bounded by
+  `max_posting_overlay_cache_bytes` on `HBCConfig` and by
+  `--max-posting-overlay-cache-bytes` in the HBC write/read benches and recall
+  harness; zero disables the cache instead of making it unbounded. A separate
+  `max_posting_overlay_cache_entry_bytes` /
+  `--max-posting-overlay-cache-entry-bytes` admission cap prevents one large
+  posting from consuming the full resident set. When the entry cap is zero, the
+  runtime derives a per-posting cap of one quarter of the total byte budget.
+  Cache hits refresh recency, and byte-pressure eviction removes the
+  least-recently-used posting member view first. Profile rows report
+  overlay-cache evictions, admission skips, and resident member bytes so
+  warm-query wins cannot hide unbounded scratch memory. The optimized gate
+  now checks resident overlay member bytes against the configured cache byte
+  cap for both write-side post-write queries and read rows, and rejects
+  admission skips in required optimized rows by default so a too-small
+  per-posting entry cap cannot pass as a "bounded" cache while skipping every
+  useful posting view.
+- the optimized gate now distinguishes DB-backed procedural vector rows from
+  arbitrary `skip_vector_store` experiments. Procedural VDBB rows with
+  dense-external-vector workloads count as the production "vectors live in the
+  DB store" shape, but they still must run at gate scale and use exact
+  post-write recall. Other `skip_vector_store` rows remain excluded unless
+  `--gate-allow-skip-vector-store` is passed for an intentional external-vector
+  layout experiment. Same-leaf metadata-only rows also gate on zero warm
+  post-write range reads so a warm-query win cannot hide repeated base/delta or
+  quantized-payload storage misses.
+- the optimized gate now requires the `write_base_delta_hbc_auto_split_full`
+  automatic-maintenance row. That row must run at the target scale, keep vectors
+  in the DB store by default, publish bounded per-pass posting, layout-change,
+  delta-tail, and boundary-reassignment budgets, use thresholded delta/tombstone
+  folding instead of eager folds, keep overfull reassignment disabled, and show
+  that bounded repair work actually ran during the write phase while satisfying
+  the same warm internal-routing and write-amplification limits as the other
+  optimized overwrite rows. Scheduled automatic split work is counted against
+  the auto layout budget; accidental non-maintenance foreground splits remain
+  disallowed.
+- the comparison runner's automatic-maintenance row now uses deferred fold
+  thresholds by default (`AUTO_MIN_DELTA_RECORDS_TO_FOLD` inherits the repair
+  threshold, tombstone folds default high, ratio folding defaults off) and caps
+  layout changes to `AUTO_SPLIT_FULL_MAX_POSTINGS` unless the run overrides it.
+  This keeps the row closer to a production scheduler: bounded repair progress,
+  no eager tail folding, and no one-layout-change-per-hot-key burst by default.
+- canonical `base_delta` queries now skip the posting-delta cursor scan when
+  the loaded posting base generation is already at or beyond the posting view's
+  mutation version. Repaired/folded postings can therefore copy the current
+  base member list directly into query scratch and cache it without paying a
+  range scan for an empty or obsolete tail. Query profiles report this as
+  `posting_overlay_delta_scan_skips`.
+- `hbc-read-bench --repair-postings-after-build` runs bounded posting repair
+  after the build phase and before optional reopen, and emits the repair cost
+  on every read result row. This lets read-side benchmarks compare dirty
+  post-build state against the post-maintenance state.
+- `recall-harness` now accepts the same experimental storage/directory flags:
+  `--posting-storage`, `--centroid-directory`, `--flat-centroid-block-size`,
+  `--flat-centroid-probe-count`, and `--repair-postings-after-build`. This lets
+  the recall suite validate `base_delta` and flat-directory query behavior
+  against the existing HBC recall baselines instead of only comparing
+  performance counters.
+- storage regression coverage now verifies `base_delta` close/reopen
+  invariants across separate posting-base, posting-delta, assignment-map, and
+  centroid-directory key families. It covers both dirty pending tails and
+  folded clean generations, including current-member materialization and search
+  after reopen.
+- `PostingStore` unit coverage now models recovery by cloning only the committed
+  posting-family bytes into a fresh store, then verifies folded base generation,
+  materialized members, centroid-directory generation/member count, assignment
+  records, removed assignments, and drained delta tails all agree.
+- `PostingStore` unit coverage also directly verifies posting deletion cleanup:
+  deleting a posting removes its posting-base record, centroid-directory record,
+  and delta tail while preserving unrelated posting tails.
+- close/reopen coverage also verifies clean postings with remaining delta-tail
+  debt still report repair debt and can fold that tail after reopen without
+  requiring a synthetic dirty flag.
+- modeled LSM crash/reopen coverage now verifies committed and synced
+  `base_delta` posting-family state after storage crash. The test covers both a
+  pending delta-tail generation and a folded clean generation, including member
+  materialization and search after recovery.
+- modeled LSM crash/reopen coverage now also verifies a committed multi-posting
+  `batchApply` mutation. After recovery, updated vectors keep assignment-map
+  records aligned with materialized posting members, deleted vectors have no
+  assignment records, affected centroid-directory records exist and mark stale
+  member counts as dirty, and global stored-structure validation passes.
+- modeled write-fault coverage now verifies a failed `base_delta` fold
+  transaction does not leave partial folded state behind. After an injected
+  write failure and modeled crash, recovery still materializes the original
+  pending delta tail and search returns the overwritten vector correctly.
+- modeled write-fault coverage now also verifies failed foreground `base_delta`
+  overwrite and delete transactions recover the previous committed posting
+  membership, assignment map, and vector/search state after modeled crash.
+- `validateStoredStructure` now checks canonical `base_delta` posting-family
+  invariants globally: every reachable materialized posting member must have a
+  current assignment shadow record and legacy vector-to-leaf mapping pointing
+  back to that posting, duplicate live members are rejected, live materialized
+  members must equal `active_count`, and clean centroid-directory member counts
+  must match the materialized posting size. Wiring this validator into modeled
+  crash/reopen tests exposed and fixed a real layout-repair recovery bug:
+  public `repairDirtyPostingsWithOptions` could commit root/layout changes
+  without flushing updated index metadata, leaving recovered HBC traversal on
+  the old root while assignment/posting records pointed at the split postings.
+- quantized `base_delta` reopen coverage now verifies that missing durable
+  internal routing payloads self-heal from child centroids after modeled crash
+  and that corrupt durable leaf payload bytes self-heal from vector data after
+  modeled crash: the first search rebuilds an in-memory payload, and the next
+  warm search reports zero misses for the repaired payload level.
+- both HBC write and read benches now emit HBC cache byte counters
+  (`hbc_cache_total_bytes`, node, quantized, vector, metadata), giving the
+  packed-HBC versus base/delta comparison a stable memory/cache footprint signal
+- dense index JSON config accepts `"posting_storage_mode": "shadow_base_delta"`
+  and `"posting_storage_mode": "base_delta"` for the same opt-in paths
+- unit coverage in `lib-vectorindex-test`
+
+Initial smoke comparison:
+
+```text
+zig build hbc-write-bench -- \
+  --samples 1 --vectors 128 --dims 16 --batch-size 32 \
+  --leaf-size 16 --branching-factor 16 --storage memory \
+  --workload online_batches_coalesced_empty \
+  --lazy-posting-maintenance --repair-postings-after-write \
+  --posting-storage packed_hbc
+
+packed_hbc:
+  ns_per_vector=13609.38
+  ns_nodes_put_calls=107
+  ns_nodes_value_bytes=10390
+  posting_base_put_calls=0
+  centroid_directory_put_calls=0
+  assignment_map_put_calls=0
+  posting_delta_append_calls=0
+  posting_delta_fold_calls=0
+  posting_repair_after_write_ns=466000
+  lsm_total_run_bytes=36225
+
+shadow_base_delta:
+  ns_per_vector=20179.69
+  ns_nodes_put_calls=173
+  ns_nodes_append_calls=128
+  ns_nodes_value_bytes=25254
+  ns_nodes_delete_calls=8
+  posting_base_put_calls=33
+  posting_base_value_bytes=6560
+  centroid_directory_put_calls=33
+  centroid_directory_value_bytes=3696
+  assignment_map_put_calls=174
+  assignment_map_value_bytes=6960
+  posting_delta_append_calls=128
+  posting_delta_value_bytes=4608
+  posting_delta_fold_calls=4
+  posting_delta_fold_records=0
+  posting_repair_after_write_ns=981000
+  lsm_total_run_bytes=52556
+```
+
+Host-storage smoke with the same arguments except `--storage host`:
+
+```text
+packed_hbc:
+  ns_per_vector=13578.13
+  storage_write_file=45
+  storage_write_bytes=90331
+  storage_read_file=5
+  storage_read_bytes=964607
+  lsm_total_run_bytes=36225
+  latest_lsm_keys=429
+
+shadow_base_delta:
+  ns_per_vector=15914.06
+  storage_write_file=45
+  storage_write_bytes=143457
+  storage_read_file=5
+  storage_read_bytes=1628217
+  posting_base_put_calls=33
+  centroid_directory_put_calls=33
+  assignment_map_put_calls=174
+  posting_delta_append_calls=128
+  lsm_total_run_bytes=52556
+  latest_lsm_keys=640
+```
+
+This is intentionally a shadow-write experiment, not the final storage win: it
+adds base/delta, centroid-directory, and assignment-map bytes on top of packed
+HBC and, when repair folds tails, also adds delete traffic for old delta
+records. The next step is an opt-in read/write path that can skip packed
+leaf-member rewrites for non-structural posting mutations, build quantized
+payloads from posting-store materialization, and route from the separate
+centroid-directory records.
+
+First canonical posting-store smoke:
+
+```text
+zig build hbc-write-bench -- \
+  --samples 1 --vectors 128 --dims 16 --batch-size 32 \
+  --leaf-size 16 --branching-factor 16 --storage memory \
+  --workload online_batches_coalesced_empty \
+  --lazy-posting-maintenance --repair-postings-after-write \
+  --posting-storage base_delta
+
+base_delta:
+  ns_per_vector=15210.94
+  vectors_per_second=65742.17
+  ns_nodes_put_calls=180
+  ns_nodes_append_calls=128
+  ns_nodes_value_bytes=20290
+  posting_base_put_calls=22
+  posting_base_value_bytes=4480
+  centroid_directory_put_calls=29
+  centroid_directory_value_bytes=3248
+  assignment_map_put_calls=174
+  posting_delta_append_calls=128
+  posting_delta_fold_calls=0
+  lsm_total_run_bytes=51340
+```
+
+Host-storage smoke with the same arguments except `--storage host`:
+
+```text
+base_delta:
+  ns_per_vector=15101.56
+  vectors_per_second=66218.31
+  storage_write_file=45
+  storage_write_bytes=135110
+  storage_read_file=5
+  storage_read_bytes=1337279
+  ns_nodes_value_bytes=17478
+  posting_base_put_calls=12
+  lsm_total_run_bytes=50844
+  latest_lsm_keys=640
+```
+
+This confirms the intended direction: `base_delta` reduces packed node bytes
+relative to `shadow_base_delta` by making posting membership authoritative
+outside the packed HBC leaf record. It is not yet a full replacement of HBC
+storage. The packed node record still carries leaf routing metadata, internal
+nodes still carry child centroids, split ranges still live in the HBC node
+namespace, and quantized payload refresh still follows the HBC save path.
+
+The split-state fix intentionally increases `posting_base_put_calls` from the
+first smoke's 12 to 22 in this workload: structural split outputs need to
+overwrite full posting bases so old append deltas do not leak across the new
+posting partition. That is the right tradeoff for correctness; ordinary
+incremental appends still use delta records.
+
+Current `base_delta` caveats:
+
+- the default Hilbert-seeded bulk-build path now runs in `base_delta`; during
+  parent assignment it updates the separate centroid-directory parent metadata
+  and invalidates stale root/non-root quantized payload shape instead of forcing
+  an in-batch posting overlay scan
+- structural split/build saves still publish full posting bases, so large
+  topology changes intentionally trade extra base writes for correctness
+- focused online-coalesced query behavior now matches packed-HBC scored-vector
+  counts in memory and host/reopen smokes, but broader recall comparisons still
+  need to be run before treating `base_delta` as generally equivalent
+
+Initial read-through smoke:
+
+```text
+zig build hbc-read-bench -- \
+  --samples 1 --vectors 128 --dims 16 --queries 4 --k 4 \
+  --batch-size 32 --leaf-size 16 --branching-factor 16 \
+  --storage memory --build online_coalesced --no-reopen \
+  --posting-storage packed_hbc
+
+packed_hbc warm_query_no_metadata:
+  ns_per_query=21000
+  profile_posting_overlay_calls=0
+  profile_posting_overlay_fallbacks=0
+  approx_vectors_scored=342
+
+shadow_base_delta warm_query_no_metadata:
+  ns_per_query=139250
+  profile_posting_overlay_ns=252000
+  profile_posting_overlay_calls=22
+  profile_posting_overlay_base_members=234
+  profile_posting_overlay_delta_records=0
+  profile_posting_overlay_materialized_members=234
+  profile_posting_overlay_fallbacks=12
+  approx_vectors_scored=342
+```
+
+This confirms the query path can read through `PostingStore` and account for
+overlay cost, but it also shows the current compatibility cost clearly. Because
+packed HBC is still written and used to validate quantized payload order,
+base/delta reads either materialize a base-only view or fall back; the real
+performance experiment still requires a mode that stops rewriting packed leaf
+members and owns quantized payload refresh from the posting store.
+
+Focused `base_delta` read-through smoke after split/base snapshot fixes:
+
+```text
+zig build hbc-read-bench -- \
+  --samples 1 --vectors 128 --dims 16 --queries 4 --k 4 \
+  --batch-size 32 --leaf-size 16 --branching-factor 16 \
+  --storage memory --build online_coalesced --no-reopen \
+  --posting-storage base_delta
+
+base_delta warm_query_no_metadata:
+  ns_per_query=124250
+  queries_per_second=8048.29
+  profile_posting_overlay_ns=417000
+  profile_posting_overlay_calls=34
+  profile_posting_overlay_base_members=332
+  profile_posting_overlay_delta_records=10
+  profile_posting_overlay_materialized_members=342
+  profile_posting_overlay_fallbacks=0
+  approx_vectors_scored=342
+  exact_vectors_scored=101
+```
+
+Host/reopen online-coalesced smoke:
+
+```text
+zig build hbc-read-bench -- \
+  --samples 1 --vectors 128 --dims 16 --queries 4 --k 4 \
+  --batch-size 32 --leaf-size 16 --branching-factor 16 \
+  --storage host --build online_coalesced \
+  --posting-storage base_delta
+
+base_delta warm_query_no_metadata:
+  ns_per_query=31000
+  queries_per_second=32258.06
+  storage_read_range=1
+  storage_read_bytes=7251
+  hbc_cache_total_bytes=9792
+  profile_posting_overlay_ns=0
+  profile_posting_overlay_calls=34
+  profile_posting_overlay_base_members=342
+  profile_posting_overlay_delta_records=0
+  profile_posting_overlay_materialized_members=342
+  profile_posting_overlay_fallbacks=0
+  profile_posting_overlay_cache_hits=34
+  profile_posting_overlay_cache_misses=0
+  approx_vectors_scored=342
+  exact_vectors_scored=101
+```
+
+The matching packed-HBC host/reopen run scored the same 342 approximate and 101
+exact vectors for warm no-metadata. Before the scratch-level posting-member
+cache, `base_delta` warm no-metadata read 296,288 bytes in 35 ranges because
+base/delta posting materialization was per-posting and cursor-based. With the
+versioned scratch cache, repeated warm queries hit cached materialized postings,
+bringing the same workload down to 7,251 bytes in 1 range. The tradeoff is
+search-workspace memory for cached posting member lists. That cache is now
+bounded by `max_posting_overlay_cache_bytes`; tiny-cache overwrite smoke with a
+128-byte cap reported 103 post-write overlay-cache evictions, 0 admission skips,
+and 128 resident member bytes, making the memory/IO tradeoff explicit instead of
+silently unbounded.
+
+Host write smoke for the same online-coalesced workload:
+
+```text
+base_delta:
+  ns_per_vector=18914.06
+  vectors_per_second=52870.71
+  storage_write_file=45
+  storage_write_bytes=137692
+  storage_read_file=5
+  storage_read_bytes=1305776
+  hbc_cache_total_bytes=26812
+  ns_nodes_put_calls=180
+  ns_nodes_value_bytes=20290
+  posting_base_put_calls=22
+  posting_delta_append_calls=128
+  lsm_total_run_bytes=51340
+  latest_lsm_keys=716
+```
+
+Recursive bulk-build smoke:
+
+```text
+zig build hbc-write-bench -- \
+  --samples 1 --vectors 128 --dims 16 --batch-size 32 \
+  --leaf-size 16 --branching-factor 16 --storage memory \
+  --posting-storage base_delta --bulk-build-recursive \
+  --workload bulk_build_empty
+
+base_delta recursive bulk:
+  ns_per_vector=11351.56
+  vectors_per_second=88093.60
+  posting_base_put_calls=12
+  posting_delta_append_calls=0
+  lsm_total_run_bytes=35291
+```
+
+Recursive bulk host/reopen read also works with zero overlay fallbacks:
+
+```text
+base_delta recursive bulk warm_query_no_metadata:
+  ns_per_query=75500
+  queries_per_second=13245.03
+  profile_posting_overlay_calls=21
+  profile_posting_overlay_base_members=239
+  profile_posting_overlay_delta_records=0
+  profile_posting_overlay_materialized_members=239
+  profile_posting_overlay_fallbacks=0
+```
+
+Default Hilbert-seeded bulk-build smoke:
+
+```text
+zig build hbc-write-bench -- \
+  --samples 1 --vectors 128 --dims 16 --batch-size 32 \
+  --leaf-size 16 --branching-factor 16 --storage memory \
+  --posting-storage base_delta --lazy-posting-maintenance \
+  --repair-postings-after-write --workload bulk_build_empty
+
+base_delta default bulk:
+  ns_per_vector=7179.69
+  vectors_per_second=139281.83
+  posting_repair_after_write_ns_per_vector=8531.25
+  ns_nodes_put_calls=82
+  ns_nodes_value_bytes=7759
+  posting_base_put_calls=8
+  posting_delta_append_calls=0
+  centroid_directory_put_calls=16
+  assignment_map_put_calls=128
+  lsm_total_run_bytes=30796
+
+packed_hbc default bulk, same shape:
+  ns_per_vector=10375.00
+  vectors_per_second=96385.54
+  ns_nodes_put_calls=34
+  ns_nodes_value_bytes=4087
+  posting_base_put_calls=0
+  centroid_directory_put_calls=0
+  assignment_map_put_calls=0
+  lsm_total_run_bytes=24704
+```
+
+This is the expected storage-shape tradeoff: `base_delta` removes authoritative
+leaf members from packed node values, but pays extra key count for posting
+bases, centroid-directory records, and explicit assignment records. On a small
+bulk build with no deltas, packed HBC is still leaner. The win for `base_delta`
+is not bulk-build byte count; it is making later overwrite/insert/delete
+mutations posting-local instead of repeatedly rewriting packed leaf member
+payloads.
+
+Default Hilbert host/reopen read comparison:
+
+```text
+base_delta warm_query_no_metadata:
+  ns_per_query=81750.00
+  queries_per_second=12232.42
+  storage_read_range=32
+  storage_read_bytes=345792
+  search_workspace_bytes=4656
+  profile_posting_overlay_calls=26
+  profile_posting_overlay_cache_hits=26
+  profile_posting_overlay_cache_misses=0
+  profile_posting_overlay_fallbacks=0
+  approx_vectors_scored=0
+  exact_vectors_scored=416
+
+packed_hbc warm_query_no_metadata:
+  ns_per_query=21750.00
+  queries_per_second=45977.01
+  storage_read_range=0
+  storage_read_bytes=0
+  search_workspace_bytes=6336
+  profile_posting_overlay_calls=0
+  approx_vectors_scored=416
+  exact_vectors_scored=110
+```
+
+The read tradeoff is also explicit: default bulk `base_delta` currently marks
+leaf payloads dirty after root/non-root payload shape changes, so the query path
+uses exact vector scoring until bounded repair refreshes the quantized payloads.
+That avoids impossible in-batch overlay cursor work and keeps correctness, but
+it is slower than packed HBC's immediately fresh quantized payloads in this
+bulk-only smoke.
+
+Post-repair default Hilbert host/reopen read:
+
+```text
+zig build hbc-read-bench -- \
+  --samples 1 --vectors 128 --dims 16 --queries 4 --k 4 \
+  --batch-size 32 --leaf-size 16 --branching-factor 16 \
+  --storage host --build bulk_build --posting-storage base_delta \
+  --repair-postings-after-build
+
+base_delta warm_query_no_metadata after repair:
+  ns_per_query=32250.00
+  queries_per_second=31007.75
+  posting_repair_after_build_ns_per_vector=10007.81
+  storage_read_range=0
+  storage_read_bytes=0
+  search_workspace_bytes=7616
+  profile_posting_overlay_calls=26
+  profile_posting_overlay_cache_hits=26
+  profile_posting_overlay_cache_misses=0
+  profile_posting_overlay_fallbacks=0
+  approx_vectors_scored=416
+  exact_vectors_scored=110
+```
+
+After bounded repair, default bulk `base_delta` is back on the approximate
+payload path and matches packed HBC's scored-vector shape for this smoke. The
+remaining cost is explicit: repair takes about 10 us/vector in this tiny run,
+and the search workspace is larger because the scratch cache holds materialized
+posting member lists.
+
+Hot overwrite workload:
+
+```text
+zig build hbc-write-bench -- \
+  --samples 1 --vectors 128 --dims 16 --batch-size 16 \
+  --leaf-size 16 --branching-factor 16 --storage host \
+  --workload overwrite_hot_vectors_warm \
+  --overwrite-hot-keys 16 --overwrite-rounds 4
+
+packed_hbc:
+  ns_per_vector=46484.38
+  storage_write_file=36
+  storage_write_bytes=85404
+  storage_read_file=4
+  storage_read_bytes=3676564
+  split_leaf_calls=6
+  save_node_calls=154
+  ns_nodes_put_calls=432
+  ns_nodes_value_bytes=36246
+  ns_quant_put_calls=154
+  range_put_calls=154
+  lsm_total_run_bytes=57331
+  latest_lsm_keys=444
+
+base_delta + lazy repair:
+  ns_per_vector=27140.63
+  posting_repair_after_write_ns_per_vector=30687.50
+  storage_write_file=45
+  storage_write_bytes=67508
+  storage_read_file=5
+  storage_read_bytes=3333627
+  split_leaf_calls=0
+  save_node_calls=6
+  ns_nodes_put_calls=104
+  ns_nodes_append_calls=64
+  ns_nodes_value_bytes=7986
+  range_put_calls=6
+  posting_base_put_calls=6
+  posting_delta_append_calls=64
+  posting_delta_fold_calls=6
+  posting_delta_fold_records=64
+  centroid_directory_put_calls=6
+  assignment_map_put_calls=64
+  lsm_total_run_bytes=49951
+  latest_lsm_keys=628
+```
+
+This is the first overwrite smoke where `base_delta` shows the intended
+foreground shape. Existing-ID replacements stay in their current posting:
+foreground routing is skipped, no leaves split, packed node/range writes drop
+sharply, and the write path appends one replacement delta plus one assignment
+record per overwrite. Bounded repair then folds the 64 replacement records into
+new posting bases and refreshes quantized payloads. The remaining tradeoff is
+explicit: base-delta foreground writes are faster and smaller than packed HBC in
+this overwrite case, but post-write repair is still about 31 us/vector and must
+be scheduled/bounded as real background maintenance.
+
+Combined overwrite + post-write query smoke:
+
+```text
+zig build hbc-write-bench -- \
+  --samples 1 --vectors 128 --dims 16 --batch-size 32 \
+  --leaf-size 16 --branching-factor 8 --storage host \
+  --workload overwrite_hot_vectors_warm \
+  --overwrite-hot-keys 32 --overwrite-rounds 2 \
+  --post-write-queries 8 --post-write-query-rounds 2 \
+  --post-write-k 5
+
+packed_hbc:
+  ns_per_vector=46953.13
+  split_leaf_calls=6
+  save_node_calls=172
+  ns_nodes_put_calls=490
+  ns_nodes_value_bytes=41778
+  storage_read_range=302
+  storage_read_bytes=3727774
+  post_write_query_ns_per_query=14562.50
+  post_write_queries_per_second=68669.53
+  post_write_storage_read_range=0
+  post_write_storage_read_bytes=0
+  post_write_profile_posting_overlay_calls=0
+  post_write_warm_query_ns_per_query=10750.00
+  post_write_warm_storage_read_range=0
+  post_write_warm_storage_read_bytes=0
+  post_write_warm_profile_posting_overlay_calls=0
+  post_write_search_workspace_bytes=7816
+
+base_delta + lazy repair:
+  ns_per_vector=38437.50
+  posting_repair_after_write_ns_per_vector=30906.25
+  split_leaf_calls=0
+  save_node_calls=8
+  ns_nodes_put_calls=112
+  ns_nodes_append_calls=64
+  ns_nodes_value_bytes=9024
+  posting_delta_append_calls=64
+  posting_delta_fold_calls=8
+  posting_delta_fold_records=64
+  storage_read_range=584
+  storage_read_bytes=4369478
+  post_write_query_ns_per_query=32250.00
+  post_write_queries_per_second=31007.75
+  post_write_storage_read_range=10
+  post_write_storage_read_bytes=46599
+  post_write_profile_posting_overlay_calls=104
+  post_write_profile_posting_overlay_cache_hits=96
+  post_write_profile_posting_overlay_cache_misses=8
+  post_write_profile_posting_overlay_delta_records=0
+  post_write_warm_query_ns_per_query=9375.00
+  post_write_warm_queries_per_second=106666.67
+  post_write_warm_storage_read_range=0
+  post_write_warm_storage_read_bytes=0
+  post_write_warm_profile_posting_overlay_calls=52
+  post_write_warm_profile_posting_overlay_cache_hits=52
+  post_write_warm_profile_posting_overlay_cache_misses=0
+  post_write_search_workspace_bytes=9096
+```
+
+This adds the missing after-write read-side signal. In this small repaired
+overwrite run, `base_delta` still removes foreground splits and most packed node
+rewrites. The first post-write query round pays base-posting range reads on
+cold posting-cache misses. The warm round has zero posting-base reads, all
+posting-overlay cache hits, and lower query latency than packed HBC in this
+tiny run. Repair folded the delta records first, so the remaining cold overlay
+cost is base materialization rather than tail replay. That points at two
+separate follow-ups: decide whether scratch-local member caching is enough for
+production concurrency, and consider a read-optimized packed posting base layout
+for repaired postings.
+
+Same overwrite setup, `base_delta + lazy repair`, comparing post-write query
+directory modes:
+
+```text
+hbc directory:
+  ns_per_vector=38796.88
+  posting_repair_after_write_ns_per_vector=29140.63
+  post_write_query_ns_per_query=32250.00
+  post_write_queries_per_second=31007.75
+  post_write_profile_child_expand_ns=2000
+  post_write_storage_read_range=10
+  post_write_storage_read_bytes=46599
+  post_write_profile_posting_overlay_cache_misses=8
+  post_write_warm_query_ns_per_query=9625.00
+  post_write_warm_queries_per_second=103896.10
+  post_write_warm_storage_read_range=0
+  post_write_warm_profile_posting_overlay_cache_hits=52
+
+flat_rabitq directory:
+  command adds:
+    --centroid-directory flat_rabitq --flat-centroid-probe-count 8
+  ns_per_vector=37312.50
+  posting_repair_after_write_ns_per_vector=30390.63
+  post_write_query_ns_per_query=49625.00
+  post_write_queries_per_second=20151.13
+  post_write_profile_child_expand_ns=51000
+  post_write_storage_read_range=11
+  post_write_storage_read_bytes=57405
+  post_write_profile_posting_overlay_cache_misses=8
+  post_write_warm_query_ns_per_query=9625.00
+  post_write_warm_queries_per_second=103896.10
+  post_write_warm_storage_read_range=0
+  post_write_warm_profile_posting_overlay_cache_hits=64
+```
+
+The flat directory path is now benchmarkable in the same write/read row. In
+`base_delta`, it now builds from the separate centroid-directory record key
+range instead of published leaf nodes. The first flat query still pays directory
+build/read cost, but the read footprint drops compared with probing node IDs
+because it scans the `CD` key family directly. The warm path uses zero storage
+reads once the flat directory and posting-member overlay cache are hot. The
+remaining caveat for `flat_rabitq` is algorithmic scale: it still scans/probes
+all posting centroids, so it is a useful experimental directory source, not the
+final scalable centroid index.
+
+`two_level_rabitq` is the first scalable increment over that flat source. It
+groups posting centroids into blocks, builds coarse block centroids, and probes
+a selected block subset before scoring posting centroids. Blocks are no longer
+formed in posting-id order: directory construction sorts posting centroids by
+the dimension with the largest observed range before chunking, so coarse block
+centroids represent spatial neighborhoods instead of arbitrary storage order.
+The current query path uses RaBitQ at both directory layers. Coarse block
+centroids are ranked with the block-level RaBitQ payload plus a
+radius/error-bound margin, so large directories can avoid touching every
+posting block exactly. Once blocks are selected, posting centroids inside those
+blocks are first ranked with each block's quantized posting-centroid payload,
+then only a bounded candidate subset per block is exact-scored before final
+probe insertion. Exact posting-centroid scoring remains the full fallback when
+quantization is disabled.
+
+The runtime config supports adaptive block probing when
+`flat_centroid_block_probe_count=0`: after ranking coarse blocks by lower
+bound, it includes additional blocks whose lower bound overlaps the selected
+boundary's upper bound, capped at `2x` the default probe count. Small
+directories are full-scanned by default (`<=32` coarse blocks), because a
+16-block/4096-vector smoke showed that pruning before the directory is large
+enough loses recall while proving little about 1M behavior. The comparison
+runner now leaves two-level block probing adaptive by default. Posting probe
+count follows `SEARCH_WIDTH`, block size is derived from the estimated posting
+count with a 128-posting maximum, and the internal default block probe count is
+based on the block count and the minimum blocks needed to cover the requested
+posting probes. This keeps small smokes from degenerating to one centroid
+block, keeps VDBB-style 1M runs near 128 postings per block, and avoids a fixed
+block-probe cap that can under-select after foreground split-full repair. In
+the current VDBB-like 1M shape (`leaf_size=168`), the effective policy sees
+about `47` coarse blocks and probes `7` before adaptive expansion.
+
+A focused 4096-vector directory smoke with `SEARCH_WIDTH=32` demonstrates the
+current tradeoff. Centroid ranking at 32 posting probes lifts repaired warm
+no-metadata recall from `0.1375` to `0.5875` for flat and to `0.375` for
+two-level while two-level still evaluates only `1024 / 4096` posting centroids.
+With the wider capped block default (`8` blocks/query in that shape),
+two-level recall rises to `0.45`, evaluates `2048 / 4096` posting centroids,
+selects `128 / 256` blocks, and keeps workspace within `0.954x` of flat. That
+is scalability and recall progress, not yet a finished directory: the focused
+smoke still needs to scale to the 1M read-after-write gate and the two-level
+row still trades recall for directory pruning at the default probe settings.
+
+After moving parent/level/posting-state metadata into the strict
+centroid-directory record and into flat/two-level probes, maintenance must also
+republish the centroid-directory record when it only refreshes the posting
+payload. Otherwise the directory can keep a stale `payload_dirty` flag and
+queries will exact-score every selected posting member even though a fresh
+RaBitQ payload exists. With payload refresh now updating the directory record,
+the same focused 4096-vector run uses the posting RaBitQ path again:
+warm no-metadata packed HBC is `12678` QPS at `50us` p95 with `0.275` recall;
+repaired `base_delta + flat_rabitq` is `2732` QPS at `358us` p95 with `0.5875`
+recall; and repaired `base_delta + two_level_rabitq` is `2758` QPS at `353us`
+p95 with `0.45` recall. Both canonical base-delta rows have zero node-cache and
+quantized-cache misses in the warm profile, approximate-score `8192` posting
+members, and exact-rerank about `633-637` candidates instead of exact-scoring
+all selected members. This is a correctness and read-path efficiency fix, but
+it exposed another avoidable cost: the flat/two-level search branch was still
+pinning the HBC upper-tree cache during generic query setup, even though it
+does not traverse that tree when directory probing succeeds.
+
+After moving upper-tree pinning onto the HBC traversal/fallback path and
+profiling it separately, the same focused 4096-vector warm no-metadata row
+changes materially. Packed HBC is `12030` QPS at `53us` p95 with `0.275`
+recall and spends `384us` cumulative in upper-tree pinning. Repaired
+`base_delta + flat_rabitq` is `16789` QPS at `35us` p95 with `0.5875` recall,
+and repaired `base_delta + two_level_rabitq` is `17391` QPS at `29us` p95 with
+`0.45` recall. The canonical base-delta directory rows report
+`profile_upper_tree_pin_ns=0`, zero storage reads in warm no-metadata, and
+single-digit-microsecond setup. This clears the focused small-read performance
+smoke, but not the optimized claim: the 1M read-after-write gate still has to
+show comparable recall/QPS and materially better overwrite write amplification,
+and two-level still needs recall/probe tuning at larger posting counts.
+
+The search profile now reports:
+
+```text
+centroid_directory_blocks_scanned
+centroid_directory_blocks_selected
+centroid_directory_block_probe_limit
+centroid_directory_block_probe_count
+centroid_directory_posting_centroids_scored
+centroid_directory_posting_centroid_estimates
+profile_upper_tree_pin_ns
+profile_runtime_txn_ns
+profile_scratch_acquire_ns
+```
+
+Those counters are emitted by the HBC read/write benches so flat versus
+two-level runs can show whether the directory is actually pruning work. Local
+smoke coverage verifies that `two_level_rabitq` can preserve the nearest hit
+while selecting one centroid block, but recall/performance still need to be
+measured against packed HBC at larger posting counts.
+The two-level query path also reuses distance-only scratch for coarse block
+selection, so scoring block centroids does not grow vector-fetch buffers by the
+number of centroid blocks. The optimized gate checks the resulting
+`search_workspace_bytes` ratio against the flat directory row. Write/read bench
+rows now also emit the observed effective block-probe limit and selected block
+count, so adaptive two-level rows can prove how many coarse blocks they actually
+probed instead of relying only on the configured
+`flat_centroid_block_probe_count` value.
+
+Repeatable comparison runner:
+
+```text
+zig/scripts/run_spfresh_hbc_comparison.sh
+```
+
+The runner writes labeled JSON rows to:
+
+```text
+zig/bench/results/spfresh-hbc-comparison/spfresh-hbc-comparison.jsonl
+```
+
+It defaults to `STORAGE=host` for the evidence run, but accepts
+`STORAGE=memory` for cheap matrix-shape smoke checks that should not be used as
+optimization evidence.
+
+Summarize those wide JSON rows with:
+
+```text
+python3 zig/scripts/summarize_spfresh_hbc_comparison.py \
+  zig/bench/results/spfresh-hbc-comparison/spfresh-hbc-comparison.jsonl
+```
+
+Use `--format markdown` for a pasteable table and `--kind write` or
+`--kind read` when only one side of the matrix matters. The summary groups
+multiple samples by `comparison_label + workload` and reports the gate fields:
+post-write recall, QPS, baseline ratios versus the packed-HBC row for the same
+workload, foreground node bytes/saves/splits, posting-delta foreground records,
+explicit repair cost, overfull repair limits, backlog debt, overlay delta scans,
+centroid-directory blocks selected plus posting centroid scores/estimates,
+upper-tree pin time, LSM run bytes, and read locality counters.
+
+The default matrix runs:
+
+- overwrite-hot write workload with post-write query rounds:
+  - `packed_hbc + hbc + no coalesced overwrite fast path`
+  - `base_delta + hbc + lazy repair + eager fold`
+  - `base_delta + hbc + lazy repair + deferred fold`
+  - `base_delta + hbc + lazy repair + capacity-safe reassignment/swap`
+  - `base_delta + hbc + auto maintenance + split full postings`
+  - `base_delta + hbc + lazy repair + bounded overfull reassignment`
+  - `base_delta + flat_rabitq + lazy repair`
+  - `base_delta + two_level_rabitq + lazy repair + capacity-safe reassignment/swap`
+- overwrite-random write workload with post-write query rounds:
+  - `packed_hbc + hbc + no coalesced overwrite fast path`
+  - `base_delta + hbc + lazy repair + capacity-safe reassignment/swap`
+  - `base_delta + two_level_rabitq + lazy repair + capacity-safe reassignment/swap`
+- overwrite-same-leaf write workload with post-write query rounds:
+  - `packed_hbc + hbc + no coalesced overwrite fast path`
+  - `base_delta + hbc + lazy repair`
+  - `base_delta + hbc + lazy repair + no coalesced overwrite fast path`
+- overwrite-semantic-drift, append-streaming, and mixed insert/delete/update
+  write workloads:
+  - `packed_hbc + hbc + no coalesced overwrite fast path`
+  - `base_delta + hbc + lazy repair`
+  - `base_delta + two_level_rabitq + lazy repair`
+  - mixed rows use the same default finite capacity-reassignment budget as
+    overwrite rows; set `MIXED_REPAIR_DIRTY_REASSIGNMENTS=0` only for an
+    explicit no-reassignment contrast run
+  - packed-HBC write rows use `--no-coalesce-overwrite-leaf-writes` as the
+    stable existing-index baseline; coalesced overwrite routing depends on the
+    explicit assignment-map/base-delta state that the packed baseline does not
+    maintain after bulk build
+- VectorDBBench-shaped warm batch-apply write workload with post-write query
+  rounds:
+  - `packed_hbc + hbc + dense external-vector batch apply`
+  - `base_delta + hbc + dense external-vector batch apply + capacity-safe repair`
+  - the runner exposes this as `write_vdbb_*` rows with independent
+    `VDBB_*` sizing knobs; the intended 1M validation shape is 1536D vectors,
+    500-row batches, 168-member leaves/branching, and warm post-write recall/QPS
+  - the optimized base-delta row repairs dirty postings before closing the
+    bulk-ingest session, so repair and fold output can stay in the same ingest
+    window instead of creating a separate maintenance flush/run
+- repaired bulk-build read workload:
+  - `packed_hbc + hbc`
+  - `base_delta + hbc`
+  - `base_delta + flat_rabitq`
+  - `base_delta + two_level_rabitq`
+
+For write-amplification decisions, compare the `foreground_*` fields first.
+The aggregate profile fields include optional explicit repair work, while
+`repair_*` fields isolate that maintenance phase.
+The overfull reassignment row is bounded by default with
+`REPAIR_DIRTY_REASSIGNMENT_MAX_OVERFULL_POSTINGS=4` and
+`REPAIR_DIRTY_REASSIGNMENT_MAX_OVER_CAPACITY_MEMBERS=1`; the summary table
+prints those as `repair_overfull_limit` and `repair_over_capacity_limit`.
+The capacity-safe row remains the default comparison for optimized behavior,
+and now pairs boundary reassignment with bounded full-posting split scheduling
+via `repair_split_full_postings` and `repair_max_layout_changes`. The summary
+also prints `repair_allow_overfull` and `auto_allow_overfull`, and the optimized
+gate requires both to remain false for required optimized rows. The
+bounded-overfull row measures whether limited debt buys enough recall to justify
+additional split repair; it is a contrast row, not the optimized default.
+Production dense-index config enforces the same rule for automatic maintenance:
+if `auto_posting_maintenance_allow_overfull_reassignment=true`, both
+`auto_posting_maintenance_max_overfull_reassignment_postings` and
+`auto_posting_maintenance_max_over_capacity_reassignment_members` must be
+explicit finite limits. The unbounded opt-in form is rejected as
+`InvalidIndexConfig`.
+
+Large comparison shape for the 1M gate:
+
+```text
+cd /path/to/antfly
+env VECTORS=1000000 DIMS=768 BATCH_SIZE=512 LEAF_SIZE=512 \
+  BRANCHING_FACTOR=16 SEARCH_WIDTH=32 \
+  OVERWRITE_HOT_KEYS=10000 OVERWRITE_ROUNDS=2 \
+  MAX_POSTING_OVERLAY_CACHE_BYTES=8388608 \
+  MAX_POSTING_OVERLAY_CACHE_ENTRY_BYTES=0 \
+  POST_WRITE_QUERIES=200 POST_WRITE_QUERY_ROUNDS=2 POST_WRITE_K=10 \
+  READ_QUERIES=200 READ_K=10 \
+  RESULT_DIR=zig/bench/results/spfresh-hbc-comparison-1m \
+  zig/scripts/run_spfresh_hbc_comparison.sh
+```
+
+When `VECTORS>=1000000`, the runner defaults repaired read-bench rows to
+`READ_QUERIES=100`, `READ_K=10`, and `READ_DATASET_MODE=procedural` unless
+those variables are set explicitly, so the read side also produces a 1000-item
+recall denominator by default without allocating a materialized
+`vectors * dims` matrix. The procedural read-bench path uses the same
+external-vector loader contract as the procedural write rows and preserves
+`dataset_mode` / `skip_vector_store` in the summarized read output. Exact read
+truth is precomputed once per read-bench invocation and reported as
+`exact_truth_build_ns`, so read QPS/latency rows measure search and result
+materialization rather than brute-force truth generation. Exact read recall
+still scans generated candidates, so this removes the 1M memory wall and
+prevents oracle work from polluting timings, but it does not by itself make the
+synthetic exact oracle cheap.
+
+The comparison runner passes a shared `READ_EXACT_TRUTH_CACHE_PATH` to all
+read-bench rows by default. The first comparable read row builds and writes the
+truth IDs, later read rows load the same file, and summaries preserve
+`exact_truth_cache_hit` next to `exact_truth_build_ns`. With a cache file,
+`exact_truth_build_ns` is the load-or-build elapsed time for that row, not query
+latency.
+
+The runner also supports resumable targeted rows, which is the practical way
+to collect the 1M gate because the packed-HBC hot overwrite baseline alone can
+take tens of minutes:
+
+```text
+env ... RESULT_DIR=zig/bench/results/spfresh-hbc-comparison-1m \
+  RUN_LABELS=write_base_delta_hbc_reassign_capacity \
+  APPEND_RESULTS=1 \
+  zig/scripts/run_spfresh_hbc_comparison.sh
+```
+
+`RUN_LABELS` accepts a space- or comma-separated label list. `APPEND_RESULTS=1`
+keeps existing rows in `spfresh-hbc-comparison.jsonl`, so packed baselines can
+be captured once and optimized rows can be appended without truncating the
+file. The optimized repair defaults are finite but scale with overwrite
+pressure: boundary reassignment and layout-change budgets default to
+`OVERWRITE_HOT_KEYS`, and `REPAIR_MAX_DELTA_TAIL_POSTINGS` defaults to the gate
+cap (`1024`). This prevents a high-ingest 1M run from passing foreground write
+amplification by leaving unbounded posting-layout or delta-tail debt behind.
+The comparison runner passes the same cap into the automatic repair contrast
+row through `--auto-posting-maintenance-max-delta-tail-postings`, so the
+background-style row is measured with the same bounded-debt policy.
+
+That run is the current evidence gate for calling the approach optimized:
+base-delta should preserve comparable post-write recall/QPS versus packed HBC
+while materially lowering foreground structural write amplification under the
+same-leaf, hot, random, semantic-drift, append-streaming, mixed, and
+two-level-directory hot-overwrite workloads, plus the VectorDBBench-shaped
+1536D dense external-vector warm batch-apply workload. The `two_level_rabitq` write row
+must use the same bounded repair-side split/reassignment and delta-tail debt
+policy as the HBC-directory capacity row, so the scalable directory is tested
+under read-after-write pressure rather than only on repaired bulk reads. The
+procedural VDBB bounded-maintenance rows pass finite
+`repair_dirty_reassignments`, keep overfull reassignment disabled, enable
+full-posting split scheduling, and cap layout changes, so they model the
+capacity-safe posting-local policy instead of a repair pass that only refreshes
+centroids and folds delta tails. The `two_level_rabitq` write and read rows
+should also show materially fewer
+posting centroid evaluations than `flat_rabitq` at the same recall target, and
+coarse block centroid scores/estimates should stay small relative to flat
+posting-centroid evaluations; otherwise the directory change is only moving
+bytes around, not solving the large-posting-count search shape.
+The summary table is the first pass/fail readout. Write rows print both
+`operation_vectors` and `active_vectors`: `operation_vectors` is the number of
+mutations in the workload sample, while `active_vectors` is the post-write index
+population reported by `active_count_after`. The optimized gate uses
+`active_vectors` for write-row scale, so a 20k-overwrite workload over a 1M
+corpus is judged as a 1M-index run rather than as a 20k-vector toy run. Write
+rows also print automatic-maintenance run counts and per-pass observed maxima
+(`auto_max_*_observed`) so bounded background policy checks can distinguish
+total work accumulated across a workload from the maximum work allowed in any
+single maintenance pass. Write and read `recall_delta` should stay within the
+accepted tolerance,
+`qps_vs_packed` should not regress materially (write rows use warm post-write
+QPS when `post_write_query_rounds > 1`; write recall, overlay-cache, and
+centroid-directory counters also prefer warm post-write rounds when present),
+non-bulk optimized write rows also report pre-repair recall/QPS/p95 so bounded
+maintenance lag cannot hide a large temporary recall or latency regression,
+warm post-write and read-bench `p95_vs_packed` should stay bounded,
+`fg_node_bytes_vs_packed` and foreground split/save counts should be materially
+lower on overwrite-heavy, append-heavy, mixed, and VDBB-shaped rows,
+`storage_write_bytes_vs_packed` and
+`lsm_run_bytes_vs_packed` should stay bounded so the storage layer is not hiding
+the write amplification, `storage_write_files_vs_packed` and
+`lsm_runs_vs_packed` should also stay bounded so smaller bytes do not hide
+excess physical file/run churn, and backlog/overlay-debt columns should stay
+bounded rather than growing with the run.
+Overlay-cache admission skips should remain zero in required optimized rows
+unless a run explicitly relaxes `--gate-max-overlay-cache-admission-skips`;
+otherwise a small entry cap can hide cache ineffectiveness behind a bounded
+resident-byte counter.
+The write-side overlay-cache hit-rate gate now requires true warm evidence:
+`post_write_query_rounds >= 2`, at least one warm post-write query, and warm
+overlay-cache observations. Cold one-round totals remain useful diagnostics but
+cannot satisfy the optimized cache-hit proof.
+`fg_delta_records_per_append` should stay at least 1.0 when foreground delta
+records are emitted, and the append-streaming row should stay at least 2.0 to
+prove posting-local grouping is reducing physical delta keys when write
+locality is expected. Mixed insert/delete/update remains a required workload,
+but it intentionally spreads operations across postings; same-posting mixed
+grouping is covered by focused regression tests rather than by requiring the
+whole mixed workload to have append-streaming locality.
+When grouped foreground appends average at least three records, the gate also
+checks `fg_delta_value_bytes_vs_legacy` against the equivalent v1 value layout
+and requires the compact value bytes to stay at or below 95% of legacy. That
+keeps the file-layout proof tied to actual physical bytes instead of only
+record/key density.
+Rows that fold delta records should also show nonzero `repair_fold_tail_keys`,
+`repair_fold_tail_value_bytes`, and `repair_fold_written_base_value_bytes`;
+otherwise the run has not proven that posting-local mutations use compact
+physical delta keys, that maintenance reclaims those keys after folding, and
+that the replacement base write is visible. The optimized gate additionally
+bounds `repair_fold_base_bytes_per_record` and `repair_fold_base_tail_ratio` so
+deferred maintenance cannot pass by folding tiny tails into large base rewrites.
+Use the machine-checkable gate before calling the result optimized:
+
+```text
+python3 zig/scripts/summarize_spfresh_hbc_comparison.py \
+  zig/bench/results/spfresh-hbc-comparison-1m/spfresh-hbc-comparison.jsonl \
+  --optimized-gate check \
+  --gate-production-proof-file zig/bench/results/spfresh-production-test.log
+```
+
+The comparison runner exposes a curated optimized-gate evidence set:
+
+```text
+RUN_OPTIMIZED_GATE_LABELS=1 PRINT_OPTIMIZED_GATE_LABELS=1 \
+  zig/scripts/run_spfresh_hbc_comparison.sh
+```
+
+`RUN_OPTIMIZED_GATE_LABELS=1` defaults `VECTORS` to `1000000`, enables the
+1M procedural VDBB online and mutation rows, and selects the packed baselines,
+same-leaf row, bounded base-delta rows, VDBB-shaped two-level rows, and repaired
+flat/two-level read rows required by the gate. It does not bypass the exact
+truth guard: either prebuild the selected 1M exact-truth caches with
+`PREBUILD_VDBB_1M_EXACT_TRUTH_CACHES=1`, provide existing cache files, or set
+`ALLOW_SLOW_VDBB_1M_EXACT_RECALL=1` intentionally.
+
+The same-leaf overwrite row is the metadata-only/no-vector-change control. Its
+optimized behavior is different from semantic overwrite rows: it should not
+schedule posting split repair or perform split/reassign/fold maintenance at
+all. The gate treats this as proof that base-delta can avoid structural
+maintenance when the posting membership and vector payload did not change.
+
+The default gate requires each required packed-HBC baseline and optimized
+write/read comparison row, not just the overall result file, to run at least
+1M vectors. For write rows that means at least 1M active vectors after the
+mutations, not at least 1M overwrite operations in the sample. It also requires
+those packed baselines to report the recall, latency, and structural/storage
+counters used for ratios, so resumable 1M result files cannot accidentally
+compare optimized rows against missing, smaller, stale, or
+external-vector-only baselines. When small VDBB smoke rows and 1M procedural
+VDBB rows are present in the same result file, the gate uses the largest
+available VDBB baseline/optimized rows so a small smoke row cannot shadow the
+1M evidence. The VDBB optimized quality row is now the bounded-maintenance
+two-level RaBitQ row when that evidence exists; the older HBC-directory
+base-delta row is only a fallback and cannot satisfy the separate scalable
+directory pruning proof. It applies the same largest-row rule to the write-side
+flat-RaBitQ versus two-level-RaBitQ directory comparison and requires both
+selected rows to meet the gate's minimum vector count before accepting the
+two-level pruning proof. The selected two-level write row must be the
+bounded-maintenance variant, report precomputed/loadable exact truth outside
+query timing, and pass the same exact-recall, QPS, and p95 envelope against the
+packed-HBC baseline, and
+ratio baselines are chosen from the largest packed row for the matching
+workload so small smoke baselines cannot shadow 1M procedural evidence. By
+default required write rows must keep vectors
+in the DB store, either directly or through procedural dense-external-vector
+rows that model DB-backed vector storage; `--gate-allow-skip-vector-store` is
+reserved for separate external-vector layout experiments. It also requires
+post-write and
+read-bench recall within 0.05 of the packed-HBC baseline, warm post-write
+QPS at least 80% of packed HBC when warm rounds exist, warm post-write and
+read-bench p95 query latency at most 1.25x packed HBC, zero warm internal
+quantized routing misses on optimized write rows, exact post-write recall
+denominators of at least 40 for ordinary write rows and 1000 for required 1M
+VDBB-shaped rows, a read-bench recall denominator of at least 1000, pre-repair recall within 0.20
+of packed HBC plus pre-repair QPS at least 50% and p95 at most 2.0x packed HBC
+on non-bulk optimized mutation rows. VDBB-shaped bulk-ingest rows instead must
+publish `repair_before_bulk_finish=true`, proving posting repair happens before
+the bulk ingest window closes. VDBB bulk rows keep the storage-write-file,
+storage-write-byte, LSM-run-byte, and L0-run-fanout bounds. Total active run
+bytes remain capped against packed HBC, while the run-count maintenance-debt
+gate uses `lsm_l0_runs_vs_packed` so a bounded compact finish may leave one
+lower-level compacted run plus one deferred L0 run without being treated as
+unbounded L0 backlog. The zero foreground split and foreground-node-byte
+overwrite checks apply to mutation workloads, not initial bulk index
+construction. Foreground node bytes at
+most 50% of packed HBC on overwrite rows, storage write bytes, storage write
+file count, LSM run bytes, and LSM run count at most 1.5x packed HBC on
+overwrite rows, no foreground splits on those
+overwrite rows including the required two-level-directory overwrite row,
+repair-side split scheduling with a finite layout-change budget on required
+optimized rows that can create layout debt, no split/reassign/fold repair on
+the same-leaf metadata-only row, zero same-leaf warm post-write range reads, explicit
+overfull reassignment disabled for both repair and automatic maintenance, a
+required automatic-maintenance row with bounded per-pass postings, bounded
+layout changes, bounded delta-tail debt, thresholded delta/tombstone folding,
+capacity-debt-triggered split scheduling, finite boundary-reassignment budget,
+observed repair work during the write phase, observed per-pass layout work no
+larger than the advertised `auto_posting_maintenance_max_layout_changes`, and
+the same foreground/storage write-amplification limits as other overwrite rows,
+while separating scheduled maintenance splits from non-maintenance foreground
+splits, no
+remaining dirty/overfull/over-capacity posting debt in those required rows,
+bounded full-posting slack debt, bounded remaining delta-tail debt, grouped
+physical delta-key density on append-streaming rows, fold-tail cleanup evidence
+and bounded replacement-base write amplification when rows fold deltas, an
+enabled but bounded posting-overlay cache, warm post-write and warm read
+overlay-cache hit rates of at least 0.80 when overlay lookups occur, and
+pre-finish posting repair on VDBB-shaped optimized batch-apply rows, and
+two-level RaBitQ directory rows
+on both write-side post-write queries and repaired read-bench queries. At
+smoke scale the rows must preserve recall/QPS and show coarse block RaBitQ
+estimate counters with zero exact coarse-block scoring. At larger proof
+shapes, the aggregated scanned-block count must cross the gate threshold
+(default `256`), the directory must select fewer blocks than it scans, and
+both selected posting-centroid and coarse block-centroid evaluations must be
+materially lower than the flat directory row. VDBB-shaped two-level rows use
+the observed per-query block-probe budget when present, falling back to the
+configured block-probe count only for older artifacts, and require that budget
+to be at least the final posting probe count. The gate also
+checks read-bench search workspace bytes against the flat row and requires
+zero upper-tree pin time on record-backed flat/two-level query paths.
+`--optimized-gate report` prints the same checks without failing the process,
+which is useful for smoke runs and tuning.
+
+Production integration is part of that bar, not a follow-on cleanup. The
+SPFresh-style maintenance path must run through the DB's idle maintenance
+entrypoint and `BackendRuntime` durable-job lane, and each pass must reserve
+the `ResourceManager` `dense.posting_maintenance_working_set` slice before
+mutating postings. Focused storage tests currently cover the direct idle path,
+manual and threaded runtime submission, elapsed-budget stops,
+query-guardrail skips, resource-budget stops, and runtime-submitted
+resource-budget stops on both durable-job lanes:
+
+```text
+zig build spfresh-production-test --summary all 2>&1 \
+  | tee zig/bench/results/spfresh-production-test.log
+zig build lib-storage-test -- --test-filter "db dense posting maintenance"
+```
+
+Crash/reopen and posting-family recovery invariants are kept in a smaller gate
+that runs both the low-level posting-family tests and the storage-backed modeled
+crash cases:
+
+```text
+zig build spfresh-recovery-test
+```
+
+Current partial 1M evidence:
+
+- `write_packed_hbc_hbc`, `overwrite_hot_vectors_warm`, 1M active vectors,
+  20k overwrites, 768 dims:
+  - foreground node bytes: `295406801`
+  - foreground leaf splits: `1237`
+  - post-write recall@10: `0.0530`
+  - post-write QPS: `6.61`
+  - write throughput: `14.85` vectors/s
+- `write_base_delta_hbc_reassign_capacity`, same workload, finite repair
+  budgets (`repair_dirty_reassignments=10000`,
+  `repair_max_layout_changes=10000`,
+  `repair_max_delta_tail_postings=1024`):
+  - foreground node bytes ratio: `0.0084x`
+  - foreground leaf splits: `0`
+  - post-write recall delta: `-0.0085`
+  - post-write QPS ratio: `0.956`
+  - write throughput: `530.33` vectors/s
+  - remaining overfull / over-capacity debt: `0 / 0`
+  - remaining delta-tail postings: `518`
+- VDBB-shaped procedural diagnostic, 10k active vectors, 1536 dims,
+  `skip_vector_store=true`, self-hit validation, bounded pre-query repair:
+  - packed HBC: self-hit@10 `0.75`, warm QPS `1612`, p95 `650000 ns`
+  - `base_delta + hbc`: self-hit@10 `0.75`, warm QPS `1664`,
+    p95 `646000 ns`, repair cost `18279 ns/vector`, remaining dirty postings
+    `0`, remaining delta-tail postings `73`
+  - an under-probed `base_delta + two_level_rabitq` row originally used only
+    the generic small-benchmark `flat_centroid_probe_count=8`, producing
+    self-hit@10 `0.50`. The comparison runner now derives VDBB-specific
+    posting probe counts from `VDBB_SEARCH_WIDTH`; with the corrected default
+    (`flat_centroid_probe_count=168`,
+    `flat_centroid_block_probe_count=15`), the same shape produced
+    self-hit@10 `1.00`, warm QPS `1193`, p95 `904000 ns`, selected 60 of
+    88 centroid blocks, and scored 240 posting centroids.
+  - interpretation: bounded repair fixes the HBC-directory query-latency
+    regression from raw lazy posting maintenance, and the two-level directory
+    quality gap was partly a benchmark under-probing artifact. The corrected
+    row trades more centroid/posting scoring for self-hit quality and is still
+    not optimized-gate proof because `self_hit` is diagnostic only and the gate
+    requires exact recall at the target scale.
+
+The hot-overwrite 1M row has encouraging foreground, recall, QPS, and debt
+signals, but the artifact is not a passing optimized-gate result: it is missing
+required workloads/read rows and was captured before the current p95,
+in-DB-vector, pre-repair, and fold-base-byte counters were fully enforced. The
+full optimized gate is still incomplete until same-leaf, random, semantic-drift,
+append-streaming, mixed, VDBB-shaped batch-apply, and read-directory rows are
+collected at 1M scale with current instrumentation.
+
+Append-streaming and mixed insert/delete/update rows are now part of the
+foreground/storage write-amplification gate rather than only the quality/debt
+gate. The optimized rows now enable
+`defer_leaf_splits_to_posting_maintenance`, and the gate requires that knob so
+append/mixed runs cannot silently fall back to foreground HBC splitting. A
+focused 128-vector smoke now shows `write_append_base_delta_hbc_lazy_fold`
+clearing foreground write amp (`fg_node_bytes_vs_packed=0.3305`,
+`fg_splits=0`, `storage_write_bytes_vs_packed=1.4508`,
+`recall_delta=-0.025`) and
+`write_mixed_base_delta_hbc_reassign_capacity` clearing foreground node/split
+amp (`fg_node_bytes_vs_packed=0.3315`, `fg_splits=0`), storage bytes
+(`storage_write_bytes_vs_packed=1.4894`), and recall/QPS
+(`recall_delta=0.200`, `qps_vs_packed=0.7826`) with
+`fg_delta_records_per_append=2.2963` and no overfull debt. The mixed row uses
+zero dirty boundary reassignment by default; its shape is posting-local repair
+plus bounded layout repair, not recall bought by moving vectors into overfull
+targets. The remaining focused failure is append-specific: under the current
+layout budget, append repair leaves bounded over-capacity debt
+(`backlog_overfull=4`, `backlog_max_over_capacity=4`). Raising the overfull-only
+layout budget to drain that debt fixed capacity debt in a probe but regressed
+storage bytes and recall, so the next optimization target is a smarter append
+maintenance/split policy rather than more repair work. The write bench now
+emits split-input diagnostics (`split_leaf_input_members_total`,
+`split_leaf_input_overflow_members_total`, and bulk-leaf rebuild counters) so
+this can be measured directly. The latest append smoke consumed 64 overflow
+members across 8 maintenance splits (`split_input_members=192`,
+`split_input_overflow=64`) while still leaving 4 overfull postings. That points
+to imbalanced binary split output recreating capacity debt, not simply too few
+split attempts. Posting-maintenance splits now request a capacity-aware binary
+split output: when the split input can fit into two postings, the split result
+is rebalanced by centroid-distance margin so neither child exceeds `leaf_size`.
+A regression test covers the skewed case that used to produce an oversized
+child. In the focused append smoke, the layout-8 policy now drains capacity debt
+(`backlog_overfull=0`, `backlog_max_over_capacity=0`) with the same 8
+maintenance splits. The split helper also keeps the larger capacity-balanced
+child on the old posting ID when possible, so only the smaller child needs
+vector-to-posting remaps. That drops append storage write bytes from `1.5015x`
+to `1.4551x` packed HBC while keeping `backlog_overfull=0` and
+`backlog_max_over_capacity=0`.
+
+The VDBB-shaped warm batch-apply row now reports foreground route fanout
+(`fg_route_leaf_groups`, `fg_route_items`, and
+`fg_route_items_per_leaf_group`) so we can distinguish routing scatter from
+physical delta fragmentation. A focused 128-vector VDBB smoke initially routed
+64 inserted items into only 6 leaf groups but fell back to per-item insert work
+for 26 items, producing 30 foreground delta appends and
+`fg_node_bytes_vs_packed=2.2927`. For bulk ingest rows that explicitly defer
+oversized leaf splits to posting maintenance, the grouped insert path now allows
+temporarily larger overfull leaves before falling back. The same smoke now keeps
+63 of 64 items in the grouped path, drops foreground delta appends from 30 to 6,
+raises `fg_delta_records_per_append` from `2.1333` to `10.67`, and lowers
+`fg_node_bytes_vs_packed` from `2.2927` to `1.3083`. A follow-up changed
+deferred overfull base-delta leaf saves to publish only explicit posting state
+instead of rewriting the packed leaf body, and the write bench now attributes
+bulk-finish repair artifacts to repair rather than foreground. With the compact
+assignment-map value, the same focused no-legacy-format VDBB smoke clears the
+focused VDBB gates: `fg_node_bytes_vs_packed=0.3103`,
+`storage_write_bytes_vs_packed=1.4233`, `lsm_run_bytes_vs_packed=1.3932`,
+`storage_write_files_vs_packed=1.2308`, `lsm_runs_vs_packed=1.5`,
+`recall_delta=0.100`, `qps_vs_packed=0.8739`, and
+`p95_vs_packed=1.0769`, while draining overfull debt
+(`backlog_overfull=0`, `backlog_max_over_capacity=0`) and preserving grouped
+delta density (`fg_delta_records_per_append=10.67`). This is still a focused
+128-vector result, not completion of the optimized claim: the full matrix still
+needs same-leaf, random, semantic-drift, append-streaming, mixed, read-directory,
+and 1M VDBB-scale rows before we call the SPFresh path optimized.
+
+Fresh small matrix, default runner settings
+(`samples=1 vectors=128 dims=16 batch_size=32 leaf_size=16
+branching_factor=8 overwrite_hot_keys=32 overwrite_rounds=2`):
+
+```text
+overwrite_hot_vectors_warm + post-write queries:
+
+packed_hbc + hbc:
+  ns_per_vector=43203.13
+  storage_write_bytes=59079
+  storage_read_bytes=3738352
+  save_node_calls=172
+  split_leaf_calls=6
+  ns_nodes_put_calls=490
+  ns_nodes_append_calls=0
+  ns_nodes_value_bytes=41778
+  posting_delta_append_calls=0
+  posting_delta_fold_records=0
+  lsm_total_run_bytes=49255
+  post_write_query_ns_per_query=12937.50
+  post_write_queries_per_second=77294.69
+  post_write_recall_at_k=0.5500
+  post_write_recall_hits=44
+  post_write_recall_total=80
+  post_write_storage_read_bytes=0
+  post_write_search_workspace_bytes=7816
+  post_write_warm_recall_at_k=0.5500
+
+base_delta + hbc + lazy repair + eager fold:
+  ns_per_vector=33843.75
+  posting_repair_after_write_ns_per_vector=28078.13
+  storage_write_bytes=61367
+  storage_read_bytes=4369478
+  save_node_calls=8
+  split_leaf_calls=0
+  ns_nodes_put_calls=112
+  ns_nodes_append_calls=64
+  ns_nodes_value_bytes=9024
+  posting_maintenance_delta_fold_attempts=8
+  posting_maintenance_delta_fold_skipped=0
+  posting_maintenance_delta_fold_records=64
+  posting_delta_append_calls=64
+  posting_delta_fold_records=64
+  lsm_total_run_bytes=48838
+  post_write_query_ns_per_query=27062.50
+  post_write_queries_per_second=36951.50
+  post_write_recall_at_k=0.2500
+  post_write_recall_hits=20
+  post_write_recall_total=80
+  post_write_storage_read_bytes=46599
+  post_write_search_workspace_bytes=9096
+  post_write_warm_recall_at_k=0.2500
+
+base_delta + hbc + lazy repair + deferred fold:
+  ns_per_vector=33484.38
+  posting_repair_after_write_ns_per_vector=26531.25
+  storage_write_bytes=53529
+  storage_read_bytes=4369478
+  save_node_calls=8
+  split_leaf_calls=0
+  ns_nodes_put_calls=104
+  ns_nodes_append_calls=64
+  ns_nodes_value_bytes=7232
+  posting_maintenance_delta_fold_attempts=8
+  posting_maintenance_delta_fold_skipped=8
+  posting_maintenance_delta_fold_records=0
+  posting_delta_append_calls=64
+  posting_delta_fold_records=0
+  lsm_total_run_bytes=46016
+  post_write_query_ns_per_query=25750.00
+  post_write_queries_per_second=38834.95
+  post_write_recall_at_k=0.2500
+  post_write_recall_hits=20
+  post_write_recall_total=80
+  post_write_storage_read_bytes=91049
+  post_write_profile_posting_overlay_delta_records=64
+  post_write_search_workspace_bytes=9096
+  post_write_warm_recall_at_k=0.2500
+
+base_delta + hbc + lazy repair + capacity-safe reassignment/swap:
+  ns_per_vector=33921.88
+  posting_repair_after_write_ns_per_vector=58875.00
+  storage_write_bytes=67188
+  storage_read_bytes=4840488
+  save_node_calls=16
+  split_leaf_calls=0
+  ns_nodes_put_calls=140
+  ns_nodes_append_calls=64
+  ns_nodes_value_bytes=12906
+  posting_maintenance_boundary_reassigned_vectors=23
+  assignment_map_put_calls=110
+  posting_maintenance_delta_fold_attempts=2
+  posting_maintenance_delta_fold_records=8
+  posting_delta_append_calls=64
+  posting_delta_fold_records=8
+  lsm_total_run_bytes=50620
+  post_write_query_ns_per_query=18000.00
+  post_write_queries_per_second=55555.56
+  post_write_recall_at_k=0.6250
+  post_write_recall_hits=50
+  post_write_recall_total=80
+  post_write_storage_read_bytes=51765
+  post_write_search_workspace_bytes=9096
+  post_write_warm_recall_at_k=0.6250
+
+base_delta + hbc + lazy repair + overfull reassignment (pre-limit sample):
+  ns_per_vector=30937.50
+  posting_repair_after_write_ns_per_vector=32015.63
+  storage_write_bytes=69992
+  storage_read_bytes=4890703
+  save_node_calls=10
+  split_leaf_calls=0
+  ns_nodes_put_calls=112
+  ns_nodes_append_calls=64
+  ns_nodes_value_bytes=9655
+  posting_maintenance_boundary_reassigned_vectors=54
+  assignment_map_put_calls=118
+  posting_maintenance_delta_fold_attempts=1
+  posting_maintenance_delta_fold_records=4
+  posting_delta_append_calls=64
+  posting_delta_fold_records=4
+  lsm_total_run_bytes=51954
+  post_write_query_ns_per_query=18000.00
+  post_write_queries_per_second=55555.56
+  post_write_recall_at_k=0.6750
+  post_write_recall_hits=54
+  post_write_recall_total=80
+  post_write_storage_read_bytes=56987
+  post_write_search_workspace_bytes=9160
+  post_write_warm_recall_at_k=0.6750
+
+base_delta + flat_rabitq + lazy repair:
+  ns_per_vector=35031.25
+  posting_repair_after_write_ns_per_vector=27281.25
+  storage_write_bytes=61367
+  storage_read_bytes=4369478
+  save_node_calls=8
+  split_leaf_calls=0
+  ns_nodes_put_calls=112
+  ns_nodes_append_calls=64
+  ns_nodes_value_bytes=9024
+  posting_delta_append_calls=64
+  posting_delta_fold_records=64
+  lsm_total_run_bytes=48838
+  post_write_query_ns_per_query=26562.50
+  post_write_queries_per_second=37647.06
+  post_write_recall_at_k=0.2250
+  post_write_recall_hits=18
+  post_write_recall_total=80
+  post_write_storage_read_bytes=57405
+  post_write_search_workspace_bytes=9096
+  post_write_warm_recall_at_k=0.2250
+```
+
+```text
+repaired bulk-build warm_query_no_metadata:
+
+packed_hbc + hbc:
+  ns_per_query=26000.00
+  queries_per_second=38461.54
+  storage_read_bytes=14607
+  hbc_cache_total_bytes=11424
+  search_workspace_bytes=7816
+  approx_vectors_scored=800
+  exact_vectors_scored=279
+
+base_delta + hbc:
+  ns_per_query=24500.00
+  queries_per_second=40816.33
+  posting_repair_after_build_ns_per_vector=9984.38
+  storage_read_bytes=10806
+  hbc_cache_total_bytes=11424
+  search_workspace_bytes=9096
+  profile_posting_overlay_cache_hits=50
+  profile_posting_overlay_cache_misses=0
+  approx_vectors_scored=800
+  exact_vectors_scored=279
+
+base_delta + flat_rabitq:
+  ns_per_query=21000.00
+  queries_per_second=47619.05
+  posting_repair_after_build_ns_per_vector=8757.81
+  storage_read_bytes=3899
+  hbc_cache_total_bytes=11832
+  search_workspace_bytes=9096
+  profile_posting_overlay_cache_hits=64
+  profile_posting_overlay_cache_misses=0
+  approx_vectors_scored=1024
+  exact_vectors_scored=295
+```
+
+This is the clearest current tradeoff:
+
+- `base_delta` gives the overwrite behavior we want: zero foreground leaf
+  splits in this run, 8 node saves instead of 172, and 9,024 packed-node value
+  bytes instead of 41,778, with foreground work represented as 64 posting
+  deltas and 64 folded records during repair.
+- Deferred folding addresses the eager-fold write-amplification problem: the
+  same 64 overwrite deltas stay in the tail, storage write bytes fall from
+  61,367 to 53,529, node value bytes fall from 9,024 to 7,232, and LSM bytes
+  fall from 48,838 to 46,016. The debt is explicit: post-write query reads rise
+  from 46,599 to 91,049 bytes and the overlay must merge 64 delta records.
+- The same threshold policy is now available to automatic maintenance. A small
+  auto-maintenance overwrite smoke with
+  `auto_posting_maintenance_min_dirty_postings=999` skipped pre-commit repair
+  and reported the explicit remaining debt: 8 dirty postings, max dirty age 8,
+  centroid lag 12, and payload lag 12. The same smoke with
+  `auto_posting_maintenance_min_dirty_postings=1` repaired 8 postings, folded
+  34 records, and left 4 dirty postings because the repair budget was capped.
+  A tail-debt-triggered smoke with dirty-count threshold still at 999 and
+  `auto_posting_maintenance_min_delta_records_to_run=1` repaired 8 postings,
+  skipped all 8 fold attempts under high fold thresholds, folded 0 records, and
+  reported 8 postings with live delta tails, max tail length 12, and max
+  delta-to-base ratio 7500 bps. This avoids recreating foreground write
+  amplification through eager pre-commit folding while still letting
+  centroid/payload repair make bounded progress.
+- Capacity-safe dirty-posting reassignment now swaps members between sibling
+  postings instead of relying on overfull targets. The apply path re-checks
+  target capacity and source minimum occupancy before every non-swap move, so a
+  stale plan cannot overfill a posting when overfull reassignment is disabled.
+  Unit coverage now verifies both sides of that default: a useful
+  capacity-neutral swap is applied, while a better direct move into a full
+  target is skipped when no useful swap exists.
+  It moved 23 vectors and raised post-write recall from 0.25 to 0.625 without
+  creating overfull posting debt. The earlier unbounded overfull shortcut
+  reached 0.675 by moving 54 vectors, but current comparison runs bound that
+  row with explicit max-overfull-posting and max-over-capacity-member limits.
+  It remains a contrast case, not the default target.
+- Capacity-pressure maintenance can now run on layout debt, not only dirty
+  posting state. Opt-in `split_full_postings` lets automatic/idle repair split
+  full-but-not-overfull postings when the postings-at-capacity gate fires,
+  creating slack for later non-overfull reassignment instead of requiring
+  overfull moves. Bench rows expose this through
+  `auto_posting_maintenance_split_full_postings`,
+  `posting_maintenance_split_postings`, per-pass observed maxima such as
+  `auto_posting_maintenance_observed_max_layout_changes`, and the capacity
+  backlog counters. A focused 128-vector auto-maintenance smoke accumulated 9
+  maintenance splits across 2 automatic repair passes while keeping the maximum
+  observed layout work per pass at the configured cap (`8/8`). That is the
+  bounded-background shape we want the gate to test; aggregate split count still
+  matters for write amplification, but it is not the same invariant as the
+  per-pass scheduler budget.
+- Random overwrite coverage now uses the same post-write exact recall path.
+  In the small default matrix, packed HBC had 11 foreground leaf splits and
+  0.475 recall; `base_delta + hbc + capacity-safe reassignment/swap` had zero
+  foreground splits, moved 22 vectors, and reached 0.60 recall. This is still
+  small-scale evidence, but it avoids tuning only for hot-key churn.
+- Mixed insert/delete/update coverage now exercises canonical `base_delta`
+  through a single batch-apply workload. The smoke run updates 32 vectors,
+  appends 16, deletes 16, emits 64 posting-delta records, skips all 7 repair
+  fold attempts under the deferred-fold threshold, and reaches 0.80 post-write
+  recall@5 on 8 read-after-write queries. This required batch cursor support
+  through the vector-index storage wrappers so base/delta materialization can
+  scan tails inside write batches, plus explicit tombstone deltas on grouped
+  delete paths.
+- Append-heavy streaming coverage now builds a warm index, appends a 64-vector
+  tail, and queries the expanded post-write population. In the small
+  `base_delta + hbc + lazy repair` smoke, the append stream emitted 64 posting
+  deltas, repaired 4 dirty postings, skipped all 3 fold attempts under the
+  deferred-fold threshold, left `active_count_after=192`, and reached 0.40
+  post-write recall@5 on 8 read-after-write queries. This makes the benchmark
+  matrix cover append-heavy streaming separately from empty-index ingest.
+- `base_delta + hbc` repaired reads are close to packed HBC for this small
+  warm no-metadata workload, while using more search workspace for the posting
+  overlay cache.
+- `base_delta + flat_rabitq` proves the separate centroid-directory path is a
+  real query input and has lower warm read bytes here, but it probes/scores more
+  postings and is slower. It is still an experiment, not the scalable directory
+  answer.
+- the new post-write recall fields expose the missing repair policy: in this
+  synthetic overwrite workload, hot vector IDs are replaced by vectors copied
+  from other clusters. The local `base_delta` replacement path keeps those
+  vectors in their current postings, so centroid/payload repair alone leaves
+  recall lower than packed HBC. The new reassignment row shows the next
+  maintenance policy direction: changed vectors need bounded relocation or
+  swap/reassignment work, not only delta folding and centroid refresh.
+
+Focused recall equivalence smoke:
+
+```text
+zig build recall-harness -- \
+  --dataset-dir testdata/vectorsets --suite hbc \
+  --dataset random-20d-1k.gob
+
+zig build recall-harness -- \
+  --dataset-dir testdata/vectorsets --suite hbc \
+  --dataset random-20d-1k.gob \
+  --posting-storage base_delta --repair-postings-after-build
+
+zig build recall-harness -- \
+  --dataset-dir testdata/vectorsets --suite hbc \
+  --dataset random-20d-1k.gob \
+  --posting-storage base_delta --repair-postings-after-build \
+  --centroid-directory flat_rabitq --flat-centroid-probe-count 8
+```
+
+All three runs matched the existing recall baselines for both fixture cases:
+
+```text
+randomize=false:
+  recall(E=99.50 IP=99.50 C=98.50)
+  expected(E=99.50 IP=99.50 C=98.50)
+  OK
+
+randomize=true:
+  recall(E=97.50 IP=99.00 C=97.50)
+  expected(E=97.50 IP=99.00 C=97.50)
+  OK
+```
+
+This is not broad proof that `base_delta` is generally equivalent yet, but it
+does prove the repaired base/delta posting overlay and flat centroid-directory
+path can satisfy an existing HBC recall fixture, including randomized
+orthogonal transforms and all three metrics.
+
+### Phase 7: Alternative centroid directories
 
 Objective:
 - decide whether HBC is still the right centroid directory
@@ -518,13 +2625,19 @@ Writes:
 - centroid-directory updates per vector write
 - split/merge/reassignment queue depth
 - dirty posting count and max dirty age
-- tombstone ratio by posting
+- delta/tombstone tail ratio by posting
+- posting delta key grouping: delta append calls versus logical delta records
+- posting capacity debt: overfull posting count, postings at capacity, and max
+  members over capacity
+- boundary-reassignment decisions: moved vectors, capacity skips, minimum-source
+  skips, and swap moves
 
 Storage/cache:
 
 - centroid directory cache hit rate
 - posting payload cache hit rate
 - raw vector cache hit rate
+- posting overlay-cache evictions/skips/resident bytes under bounded caps
 - bytes read per query
 - bytes written per vector update
 
@@ -535,15 +2648,33 @@ Storage/cache:
 - Stale posting centroids can hurt recall if maintenance lag is too high.
 - Background split/merge and any boundary reassignment need clear bounds to
   avoid unbounded maintenance debt.
+- Close/reopen, committed modeled-crash, and failed-fold write-fault tests now
+  cover key-family interpretation for pending and folded `base_delta` state.
+  The modeled committed-crash and failed-fold recovery paths explicitly verify
+  posting base, posting delta tail, centroid-directory record, and assignment
+  map agreement before search, including committed multi-posting batch updates
+  and compact grouped multi-record delta-tail values that must survive crash,
+  decode as v2, materialize, fold, and reopen cleanly after folding
+  and deletes after modeled crash. Unit coverage also verifies explicit posting
+  artifact deletion removes base, centroid-directory, and delta-tail state for
+  the deleted posting without crossing into other posting tails. Foreground
+  overwrite/delete write-fault tests cover rollback to the previous committed
+  state after modeled crash. Broader randomized fault schedules still need to
+  cover publish boundaries, partial write-fault schedules across multi-posting
+  batches, and arbitrary corrupt quantized payload bytes across every routing
+  and posting shape.
 - Introducing multiple directory implementations too early will distract from
-  the main maintenance-policy experiment.
+  the main maintenance-policy experiment. The current `two_level_rabitq`
+  directory is the scalable candidate, not final proof: it keeps coarse block
+  selection separate from selected posting-centroid evaluation and the optimized
+  gate requires it to prune against flat at the 1M-vector shape before we call
+  the posting layout optimized.
 
 ## Near-Term Recommendation
 
-Start with the refactor, not a new index.
+Keep the LSM substrate; finish changing the vector-index maintenance model.
 
-The first useful engineering milestone is a current-behavior-preserving split
-between:
+The current implementation has the behavior-preserving split between:
 
 ```text
 CentroidDirectory
@@ -551,9 +2682,24 @@ PostingStore
 AssignmentMap
 ```
 
-Lazy posting maintenance, dirty backlog stats, and bounded pre-commit repair are
-now in place behind disabled-by-default knobs. The next useful work is measuring
-that policy on write-heavy workloads and then deciding whether split/merge or
-targeted boundary reassignment needs to change. Replacing HBC as the centroid
-directory should remain a separate, well-scoped optimization rather than a full
-index rewrite.
+Lazy posting maintenance, dirty backlog stats, bounded repair, canonical
+`base_delta` posting appends, explicit assignment maps, centroid-directory
+records, exact post-write recall measurement, mixed insert/delete/update
+and append-heavy read-after-write coverage, bounded overlay-cache
+instrumentation, explicit capacity-debt/reassignment-skip counters,
+debt-gated automatic maintenance, a two-level RaBitQ centroid-directory
+candidate, and committed modeled crash/reopen plus failed-fold/foreground-
+mutation fault coverage are now in place behind opt-in knobs. The remaining
+work before calling this optimized is to tune those debt gates under real
+ingest/query load, choose split/merge/reassignment work with non-overfull
+capacity accounting, prove the two-level directory prunes enough at the
+1M-vector shape, tighten the posting file layout for sequential reads, add
+broader randomized fault-injection coverage around publish boundaries and
+multi-posting batches, and run the comparison at 1M-vector scale against the
+existing packed-HBC index.
+
+For VDBB-shaped two-level RaBitQ rows, the comparison runner now keeps the
+coarse block probe count at least as large as the final posting probe count.
+This preserves a bounded final posting search while avoiding over-pruning at
+the coarse directory layer; the optimized gate checks this explicitly with the
+`two_level_block_probe_budget` marker.

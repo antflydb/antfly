@@ -435,6 +435,7 @@ pub const NamespaceBatch = struct {
         put: *const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void,
         append_put: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror!void,
+        open_cursor: ?*const fn (Allocator, *anyopaque, backend_types.Namespace) anyerror!Cursor = null,
     };
 
     pub fn abort(self: *NamespaceBatch) void {
@@ -462,6 +463,11 @@ pub const NamespaceBatch = struct {
 
     pub fn delete(self: *NamespaceBatch, namespace: backend_types.Namespace, key: []const u8) !void {
         try self.vtable.delete(self.ptr, namespace, key);
+    }
+
+    pub fn openCursor(self: *NamespaceBatch, namespace: backend_types.Namespace) !Cursor {
+        const open_cursor = self.vtable.open_cursor orelse return error.Unsupported;
+        return try open_cursor(self.allocator, self.ptr, namespace);
     }
 };
 
@@ -1241,6 +1247,10 @@ pub fn namespaceBatchFrom(
         fn delete(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8) anyerror!void {
             try unbox(ptr).handle.delete(try mapNamespace(namespace), key);
         }
+
+        fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: backend_types.Namespace) anyerror!Cursor {
+            return try cursorFrom(alloc, try unbox(ptr).handle.openCursor(try mapNamespace(namespace)));
+        }
     };
 
     return .{
@@ -1253,6 +1263,7 @@ pub fn namespaceBatchFrom(
             .put = vt.put,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
+            .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
         },
     };
 }

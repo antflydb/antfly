@@ -304,6 +304,17 @@ fn shouldSeedRetainedVectorCacheOnSkipStore(self: anytype) bool {
     return true;
 }
 
+fn hasOpenBulkIngestSession(self: anytype) bool {
+    const Index = switch (@typeInfo(@TypeOf(self))) {
+        .pointer => |ptr| ptr.child,
+        else => @TypeOf(self),
+    };
+    if (comptime @hasField(Index, "bulk_ingest_session_depth")) {
+        return self.bulk_ingest_session_depth > 0;
+    }
+    return false;
+}
+
 fn borrowCachedMetadataHandle(self: anytype, vector_id: u64) ?CachedMetadataReadHandle(@TypeOf(self)) {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "borrowCachedMetadata")) {
@@ -330,6 +341,7 @@ fn loadNodeReadHandleProfiled(
     const start = now_fn();
     var loaded = try loadSearchNodeFromStorage(self, txn, node_id);
     errdefer loaded.deinit(self.alloc);
+    try overlayBaseDeltaMembersOnLoadedNode(self, txn, &loaded);
     try self.cacheSearchNode(&loaded);
     profile.node_cache_miss_ns += elapsed_fn(start);
     profile.node_cache_misses += 1;
@@ -345,8 +357,33 @@ fn loadNodeReadHandle(
 
     var loaded = try loadSearchNodeFromStorage(self, txn, node_id);
     errdefer loaded.deinit(self.alloc);
+    try overlayBaseDeltaMembersOnLoadedNode(self, txn, &loaded);
     try self.cacheSearchNode(&loaded);
     return .{ .owned = loaded };
+}
+
+const QuantizedProfileRole = enum {
+    internal,
+    leaf,
+};
+
+fn noteQuantizedProfileMiss(
+    profile: *search_types.SearchProfile,
+    role: QuantizedProfileRole,
+    elapsed_ns: u64,
+) void {
+    profile.quantized_cache_miss_ns += elapsed_ns;
+    profile.quantized_cache_misses += 1;
+    switch (role) {
+        .internal => {
+            profile.quantized_internal_cache_miss_ns += elapsed_ns;
+            profile.quantized_internal_cache_misses += 1;
+        },
+        .leaf => {
+            profile.quantized_leaf_cache_miss_ns += elapsed_ns;
+            profile.quantized_leaf_cache_misses += 1;
+        },
+    }
 }
 
 fn loadQuantizedReadHandleProfiled(
@@ -355,6 +392,7 @@ fn loadQuantizedReadHandleProfiled(
     node_id: u64,
     is_root: bool,
     expected_count: usize,
+    role: QuantizedProfileRole,
     profile: *search_types.SearchProfile,
     now_fn: fn () u64,
     elapsed_fn: fn (u64) u64,
@@ -391,11 +429,13 @@ fn loadQuantizedReadHandleProfiled(
 
     const start = now_fn();
     const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
-        if (is_not_found(err) or err == error.Corrupted) return null;
+        if (is_not_found(err) or err == error.Corrupted) {
+            noteQuantizedProfileMiss(profile, role, elapsed_fn(start));
+            return null;
+        }
         return err;
     };
-    profile.quantized_cache_miss_ns += elapsed_fn(start);
-    profile.quantized_cache_misses += 1;
+    noteQuantizedProfileMiss(profile, role, elapsed_fn(start));
     if (self.cache_enabled) {
         self.cacheQuantized(node_id, &decoded) catch {};
     }
@@ -443,6 +483,93 @@ fn loadQuantizedReadHandle(
     return .{ .owned = decoded };
 }
 
+fn rebuildInternalQuantizedReadHandleForQuery(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+    uses_nonquantized_payload: bool,
+    child_ids: []const u64,
+    profile: *search_types.SearchProfile,
+    now_fn: fn () u64,
+    elapsed_fn: fn (u64) u64,
+) !?CachedQuantizedReadHandle(@TypeOf(self)) {
+    if (child_ids.len == 0) return null;
+    const dims: usize = @intCast(self.metadata.dims);
+    const child_vectors = try self.alloc.alloc(f32, child_ids.len * dims);
+    defer self.alloc.free(child_vectors);
+
+    for (child_ids, 0..) |child_id, i| {
+        var child_handle = loadNodeReadHandleProfiled(self, txn, child_id, profile, now_fn, elapsed_fn) catch return null;
+        defer child_handle.deinit(self.alloc);
+        const child = child_handle.ptr();
+        if (child.centroid.len < dims) return null;
+        @memcpy(child_vectors[i * dims ..][0..dims], child.centroid[0..dims]);
+    }
+
+    var rebuilt: hbc_runtime.QuantizedSet = if (uses_nonquantized_payload)
+        .{ .nonquant = .{
+            .vectors = .{
+                .dims = @intCast(dims),
+                .count = @intCast(child_ids.len),
+                .data = try self.alloc.dupe(f32, child_vectors),
+            },
+        } }
+    else blk: {
+        var node_handle = loadNodeReadHandleProfiled(self, txn, node_id, profile, now_fn, elapsed_fn) catch return null;
+        defer node_handle.deinit(self.alloc);
+        const node = node_handle.ptr();
+        if (node.centroid.len < dims) return null;
+        break :blk .{ .rabit = try self.quantizer.quantize(node.centroid[0..dims], child_vectors, child_ids.len) };
+    };
+    errdefer rebuilt.deinit(self.alloc);
+
+    if (self.cache_enabled) {
+        self.cacheQuantized(node_id, &rebuilt) catch {};
+    }
+    return .{ .owned = rebuilt };
+}
+
+fn rebuildLeafQuantizedReadHandleForQuery(
+    self: anytype,
+    txn: anytype,
+    leaf_id: u64,
+    uses_nonquantized_payload: bool,
+    member_ids: []const u64,
+    scratch: anytype,
+    profile: *search_types.SearchProfile,
+    now_fn: fn () u64,
+    elapsed_fn: fn (u64) u64,
+) !?CachedQuantizedReadHandle(@TypeOf(self)) {
+    if (member_ids.len == 0) return null;
+    const dims: usize = @intCast(self.metadata.dims);
+    const vector_count = std.math.mul(usize, member_ids.len, dims) catch return null;
+    try scratch.ensureVectorFetchCapacity(self.alloc, member_ids.len);
+    const vectors = scratch.vector_batch[0..vector_count];
+    loadTransformedVectorIdsIntoMatrix(self, txn, member_ids, vectors, .{}) catch return null;
+
+    var rebuilt: hbc_runtime.QuantizedSet = if (uses_nonquantized_payload)
+        .{ .nonquant = .{
+            .vectors = .{
+                .dims = @intCast(dims),
+                .count = @intCast(member_ids.len),
+                .data = try self.alloc.dupe(f32, vectors),
+            },
+        } }
+    else blk: {
+        var leaf_handle = loadNodeReadHandleProfiled(self, txn, leaf_id, profile, now_fn, elapsed_fn) catch return null;
+        defer leaf_handle.deinit(self.alloc);
+        const leaf = leaf_handle.ptr();
+        if (leaf.centroid.len < dims) return null;
+        break :blk .{ .rabit = try self.quantizer.quantize(leaf.centroid[0..dims], vectors, member_ids.len) };
+    };
+    errdefer rebuilt.deinit(self.alloc);
+
+    if (self.cache_enabled) {
+        self.cacheQuantized(leaf_id, &rebuilt) catch {};
+    }
+    return .{ .owned = rebuilt };
+}
+
 fn recordDeferredQuantizedNode(self: anytype, node_id: u64) !void {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "recordDeferredQuantizedNode")) {
@@ -484,7 +611,13 @@ fn suppressQuantizedPayloadPersist(options: anytype) bool {
 
 fn shouldDeferOversizedLeafSplit(self: anytype, leaf: *const types.Node, options: hbc_runtime.BatchInsertOptions) bool {
     if (!leaf.is_leaf or leaf.members.len <= self.config.leaf_size) return false;
-    return deferLeafSplitToBatchFinish(options) or shouldDeferLeafSplitToBulkFinish(self, options);
+    return deferLeafSplitToBatchFinish(options) or
+        shouldDeferLeafSplitToBulkFinish(self, options) or
+        options.defer_leaf_splits_to_posting_maintenance;
+}
+
+fn shouldRecordDeferredOversizedLeafForSplitFinish(options: hbc_runtime.BatchInsertOptions) bool {
+    return !options.defer_leaf_splits_to_posting_maintenance;
 }
 
 fn normalizeDeferredOversizedLeavesForBatchFinish(self: anytype, txn: anytype, options: hbc_runtime.BatchInsertOptions) !bool {
@@ -612,6 +745,7 @@ pub fn loadNode(self: anytype, txn: anytype, node_id: u64) !types.Node {
 
     var loaded = try self.loadNodeFromStorage(txn, node_id);
     errdefer loaded.deinit(self.alloc);
+    try overlayBaseDeltaMembersOnLoadedNode(self, txn, &loaded);
     try self.cacheNode(&loaded);
     return loaded;
 }
@@ -629,6 +763,7 @@ pub fn loadNodeProfiled(
     const start = now_fn();
     var loaded = try self.loadNodeFromStorage(txn, node_id);
     errdefer loaded.deinit(self.alloc);
+    try overlayBaseDeltaMembersOnLoadedNode(self, txn, &loaded);
     try self.cacheNode(&loaded);
     profile.node_cache_miss_ns += elapsed_fn(start);
     profile.node_cache_misses += 1;
@@ -640,6 +775,7 @@ pub fn deleteNode(self: anytype, txn: anytype, node_id: u64) !void {
     self.deleteNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node_id, .packed_node)) catch {};
     self.deleteNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node_id, .range)) catch {};
     self.deleteNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node_id, .posting)) catch {};
+    try posting.PostingStore.deletePostingArtifacts(self, txn, node_id, isNotFoundGeneric);
     var qkey_buf: [10]u8 = undefined;
     self.deleteNamespaced(txn, .quant, hbc.encodeQuantKey(&qkey_buf, node_id)) catch {};
     self.invalidateNodeCache(node_id);
@@ -664,8 +800,14 @@ pub fn updateParent(self: anytype, txn: anytype, node_id: u64, new_parent: u64, 
     _ = try hbc.encodePackedNodeValue(packed_value, decoded.header, decoded.centroid_bytes, decoded.ids_bytes);
     try self.putNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node_id, .packed_node), packed_value);
     self.invalidateNodeCache(node_id);
-    if (self.config.use_quantization and (old_parent == 0) != (new_parent == 0)) {
+    const payload_shape_changed = (old_parent == 0) != (new_parent == 0);
+    const base_delta_parent_handled = if (old_parent != new_parent)
+        try updateBaseDeltaParentMetadata(self, txn, node_id, decoded, payload_shape_changed)
+    else
+        false;
+    if (self.config.use_quantization and payload_shape_changed) {
         self.invalidateQuantizedCache(node_id);
+        if (base_delta_parent_handled) return;
         var node = try loadNode(self, txn, node_id);
         defer node.deinit(self.alloc);
         try refreshQuantized(self, txn, &node, now_fn, elapsed_fn);
@@ -763,6 +905,10 @@ pub fn getVecLeaf(self: anytype, txn: anytype, vector_id: u64) !u64 {
     return try posting.AssignmentMap.get(self, txn, vector_id);
 }
 
+pub fn deleteVecLeaf(self: anytype, txn: anytype, vector_id: u64) !void {
+    try posting.AssignmentMap.delete(self, txn, vector_id);
+}
+
 pub fn loadMetadataRaw(self: anytype, txn: anytype, vector_id: u64, is_not_found: fn (anyerror) bool) !?[]const u8 {
     if (self.getCachedMetadata(vector_id)) |cached| return cached;
     var key_buf: [10]u8 = undefined;
@@ -810,20 +956,219 @@ fn shouldDeferPostingPayloadRefresh(self: anytype, node: *const types.Node) bool
         node.posting_state.payload_dirty;
 }
 
-fn savePackedNodeValue(self: anytype, txn: anytype, node: *const types.Node) !void {
+fn savePackedNodeValueWithLeafMembers(self: anytype, txn: anytype, node: *const types.Node, include_leaf_members: bool) !void {
     const header = hbc.NodeHeader{
         .is_leaf = node.is_leaf,
         .level = node.level,
         .parent = node.parent,
     };
     const centroid_bytes = std.mem.sliceAsBytes(node.centroid);
-    const ids_bytes = if (node.is_leaf) std.mem.sliceAsBytes(node.members) else std.mem.sliceAsBytes(node.children);
+    const ids_bytes = if (node.is_leaf)
+        if (include_leaf_members) std.mem.sliceAsBytes(node.members) else &.{}
+    else
+        std.mem.sliceAsBytes(node.children);
     const packed_len = hbc.packedNodeValueSize(centroid_bytes.len, ids_bytes.len);
     const packed_value = try self.alloc.alloc(u8, packed_len);
     defer self.alloc.free(packed_value);
     const encoded = try hbc.encodePackedNodeValue(packed_value, header, centroid_bytes, ids_bytes);
     var key_buf: [12]u8 = undefined;
     try self.putNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node.id, .packed_node), encoded);
+}
+
+fn savePackedNodeValue(self: anytype, txn: anytype, node: *const types.Node) !void {
+    try savePackedNodeValueWithLeafMembers(self, txn, node, true);
+}
+
+fn shouldWritePostingBaseDelta(self: anytype) bool {
+    return switch (self.config.posting_storage_mode) {
+        .shadow_base_delta, .base_delta => true,
+        .packed_hbc => false,
+    };
+}
+
+fn shouldUseBaseDeltaAsCanonicalPosting(self: anytype) bool {
+    return self.config.posting_storage_mode == .base_delta;
+}
+
+fn shouldRouteExistingUpdatesByCentroidOnly(self: anytype) bool {
+    return shouldUseBaseDeltaAsCanonicalPosting(self) and self.config.lazy_posting_maintenance;
+}
+
+fn shouldUseCursorTxnForBatchWrites(self: anytype, options: hbc_runtime.BatchInsertOptions) bool {
+    return shouldUseBaseDeltaAsCanonicalPosting(self) and !options.assume_absent_ids;
+}
+
+fn centroidDirectoryFlagsFromPostingState(state: types.PostingState) u8 {
+    var flags: u8 = 0;
+    if (state.dirty) flags |= posting.CentroidDirectoryFormat.dirty_flag;
+    if (state.centroid_dirty) flags |= posting.CentroidDirectoryFormat.centroid_dirty_flag;
+    if (state.payload_dirty) flags |= posting.CentroidDirectoryFormat.payload_dirty_flag;
+    return flags;
+}
+
+fn saveCentroidDirectoryForLeafWithRadius(self: anytype, txn: anytype, node: *const types.Node, bounds_radius: f32) !void {
+    if (!node.is_leaf or !shouldWritePostingBaseDelta(self)) return;
+    try posting.PostingStore.saveCentroidDirectoryRecord(self, txn, .{
+        .posting_id = node.id,
+        .generation = node.posting_state.centroid_version,
+        .mutation_version = node.posting_state.mutation_version,
+        .payload_version = node.posting_state.payload_version,
+        .flags = centroidDirectoryFlagsFromPostingState(node.posting_state),
+        .parent = node.parent,
+        .level = node.level,
+        .member_count = node.members.len,
+        .bounds_radius = bounds_radius,
+        .centroid = node.centroid,
+    });
+}
+
+fn shadowSavePostingBaseWithRadius(self: anytype, txn: anytype, node: *const types.Node, bounds_radius: f32) !void {
+    if (!node.is_leaf or !shouldWritePostingBaseDelta(self)) return;
+    try posting.PostingStore.saveBase(self, txn, .{
+        .posting_id = node.id,
+        .generation = node.posting_state.mutation_version,
+        .members = node.members,
+    });
+    try saveCentroidDirectoryForLeafWithRadius(self, txn, node, bounds_radius);
+}
+
+fn shadowSavePostingBase(self: anytype, txn: anytype, node: *const types.Node) !void {
+    try shadowSavePostingBaseWithRadius(self, txn, node, 0);
+}
+
+fn shadowAppendPostingDelta(
+    self: anytype,
+    txn: anytype,
+    posting_id: posting.PostingId,
+    op: posting.PostingDeltaOp,
+    vector_id: posting.VectorId,
+    sequence: u64,
+) !void {
+    if (!shouldWritePostingBaseDelta(self)) return;
+    try posting.PostingStore.appendDelta(self, txn, posting_id, .{
+        .sequence = sequence,
+        .op = op,
+        .vector_id = vector_id,
+    });
+}
+
+fn shadowAppendPostingDeltas(
+    self: anytype,
+    txn: anytype,
+    posting_id: posting.PostingId,
+    records: []const posting.PostingDeltaRecord,
+) !void {
+    if (!shouldWritePostingBaseDelta(self)) return;
+    try posting.PostingStore.appendDeltaRecords(self, txn, posting_id, records);
+}
+
+fn saveCentroidDirectoryForLeaf(self: anytype, txn: anytype, node: *const types.Node) !void {
+    try saveCentroidDirectoryForLeafWithRadius(self, txn, node, 0);
+}
+
+fn ensurePostingBaseExists(self: anytype, txn: anytype, node: *const types.Node) !void {
+    if (!node.is_leaf or !shouldUseBaseDeltaAsCanonicalPosting(self)) return;
+    var existing = posting.PostingStore.loadBase(self, txn, node.id, isNotFoundGeneric) catch |err| {
+        if (!isNotFoundGeneric(err)) return err;
+        try posting.PostingStore.saveBase(self, txn, .{
+            .posting_id = node.id,
+            .generation = node.posting_state.mutation_version,
+            .members = node.members,
+        });
+        return;
+    };
+    existing.deinit(self.alloc);
+}
+
+fn overlayBaseDeltaMembersOnLoadedNode(self: anytype, txn: anytype, node: *types.Node) !void {
+    if (!node.is_leaf or !shouldUseBaseDeltaAsCanonicalPosting(self)) return;
+    const materialized = posting.PostingStore.materializeBaseDeltaMembers(self, txn, node.id, isNotFoundGeneric) catch |err| {
+        if (isNotFoundGeneric(err)) return;
+        return err;
+    };
+    errdefer self.alloc.free(materialized);
+
+    try node.ensureUnbacked(self.alloc);
+    if (node.members.len > 0) self.alloc.free(node.members);
+    node.members = materialized;
+}
+
+pub fn overlayBaseDeltaMembersForLoadedNode(self: anytype, txn: anytype, node: *types.Node) !void {
+    try overlayBaseDeltaMembersOnLoadedNode(self, txn, node);
+}
+
+fn saveDeltaBackedLeafNodeValue(self: anytype, txn: anytype, node: *const types.Node) !void {
+    if (!node.is_leaf or !shouldUseBaseDeltaAsCanonicalPosting(self)) {
+        try savePackedNodeValue(self, txn, node);
+        try shadowSavePostingBase(self, txn, node);
+        return;
+    }
+    try ensurePostingBaseExists(self, txn, node);
+    try savePackedNodeValueWithLeafMembers(self, txn, node, false);
+    try saveCentroidDirectoryForLeaf(self, txn, node);
+}
+
+fn postingDeltaSequence(mutation_version: u64, offset: usize) u64 {
+    const low_mask: u64 = 0xffff_ffff;
+    const high = if (mutation_version > (std.math.maxInt(u64) >> 32))
+        std.math.maxInt(u64) & ~low_mask
+    else
+        mutation_version << 32;
+    return high | @min(@as(u64, @intCast(offset)), low_mask);
+}
+
+fn updateBaseDeltaParentMetadata(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+    packed_value: hbc.PackedNodeValue,
+    payload_shape_changed: bool,
+) !bool {
+    if (!shouldUseBaseDeltaAsCanonicalPosting(self)) return false;
+
+    if (payload_shape_changed) {
+        var qkey_buf: [10]u8 = undefined;
+        self.deleteNamespaced(txn, .quant, hbc.encodeQuantKey(&qkey_buf, node_id)) catch {};
+        self.invalidateQuantizedCache(node_id);
+    }
+
+    if (!packed_value.header.is_leaf) return true;
+    if (packed_value.centroid_bytes.len % @sizeOf(f32) != 0) return error.Corrupted;
+
+    var state = try posting.PostingStore.loadState(self, txn, node_id, isNotFoundGeneric);
+    if (payload_shape_changed) {
+        state.payload_dirty = true;
+        state.dirty = true;
+        try posting.PostingStore.saveState(self, txn, node_id, state);
+    }
+
+    const centroid = try self.alloc.alloc(f32, packed_value.centroid_bytes.len / @sizeOf(f32));
+    defer self.alloc.free(centroid);
+    @memcpy(std.mem.sliceAsBytes(centroid), packed_value.centroid_bytes);
+
+    const member_count = blk: {
+        if (packed_value.ids_bytes.len != 0) {
+            if (packed_value.ids_bytes.len % @sizeOf(u64) != 0) return error.Corrupted;
+            break :blk packed_value.ids_bytes.len / @sizeOf(u64);
+        }
+        var base = try posting.PostingStore.loadBase(self, txn, node_id, isNotFoundGeneric);
+        defer base.deinit(self.alloc);
+        break :blk base.members.len;
+    };
+
+    try posting.PostingStore.saveCentroidDirectoryRecord(self, txn, .{
+        .posting_id = node_id,
+        .generation = state.centroid_version,
+        .mutation_version = state.mutation_version,
+        .payload_version = state.payload_version,
+        .flags = centroidDirectoryFlagsFromPostingState(state),
+        .parent = packed_value.header.parent,
+        .level = packed_value.header.level,
+        .member_count = member_count,
+        .bounds_radius = 0,
+        .centroid = centroid,
+    });
+    return true;
 }
 
 pub fn saveNode(
@@ -918,6 +1263,29 @@ fn refreshQuantizedWithKnownVectors(
     self.write_profile.quantized_store_ns += elapsed_fn(store_start);
 }
 
+fn leafBoundsRadiusFromKnownVectors(self: anytype, node: *const types.Node, vectors: []const f32) !f32 {
+    if (!node.is_leaf) return error.ExpectedLeaf;
+    if (node.members.len == 0 or node.centroid.len == 0) return 0;
+    const dims: usize = @intCast(self.metadata.dims);
+    if (vectors.len < node.members.len * dims) return error.InvalidArgument;
+    var radius: f32 = 0;
+    for (0..node.members.len) |i| {
+        const vector = vectors[i * dims ..][0..dims];
+        radius = @max(radius, vec.distance(node.centroid, vector, self.config.metric));
+    }
+    return radius;
+}
+
+fn leafBoundsRadiusFromStorage(self: anytype, txn: anytype, node: *const types.Node) !f32 {
+    if (!node.is_leaf) return error.ExpectedLeaf;
+    if (node.members.len == 0 or node.centroid.len == 0) return 0;
+    const dims: usize = @intCast(self.metadata.dims);
+    const vectors = try self.alloc.alloc(f32, node.members.len * dims);
+    defer self.alloc.free(vectors);
+    try posting.PostingStore.loadTransformedVectorsForQuantizedRefresh(self, txn, node, vectors, .{});
+    return try leafBoundsRadiusFromKnownVectors(self, node, vectors);
+}
+
 fn saveLeafNodeBodyWithKnownVectors(
     self: anytype,
     txn: anytype,
@@ -934,10 +1302,25 @@ fn saveLeafNodeBodyWithKnownVectors(
         self.write_profile.save_node_calls += 1;
     }
 
-    try savePackedNodeValue(self, txn, node);
+    if (node.is_leaf and shouldUseBaseDeltaAsCanonicalPosting(self)) {
+        const bounds_radius = try leafBoundsRadiusFromKnownVectors(self, node, vectors);
+        try savePackedNodeValueWithLeafMembers(self, txn, node, false);
+        try shadowSavePostingBaseWithRadius(self, txn, node, bounds_radius);
+    } else {
+        try saveDeltaBackedLeafNodeValue(self, txn, node);
+    }
     try refreshQuantizedWithKnownVectors(self, txn, node, vectors, nowNsU64Fixed, elapsedSinceU64Fixed);
     clearDeferredQuantizedNode(self, node.id);
-    try self.cacheNode(node);
+    var posting_state_to_save = node.posting_state;
+    if (node.is_leaf) {
+        posting_state_to_save.notePayloadRefreshed();
+        try posting.PostingStore.saveState(self, txn, node.id, posting_state_to_save);
+        var node_for_cache = node.*;
+        node_for_cache.posting_state = posting_state_to_save;
+        try self.cacheNode(&node_for_cache);
+    } else {
+        try self.cacheNode(node);
+    }
 }
 
 fn saveLeafNodeWithKnownVectors(
@@ -1051,7 +1434,7 @@ pub fn saveExistingNodeBodyWithAddedVectorsOptions(
     var posting_payload_refreshed = node.is_leaf and !self.config.use_quantization;
     const defer_posting_payload_refresh = shouldDeferPostingPayloadRefresh(self, node);
 
-    try savePackedNodeValue(self, txn, node);
+    try saveDeltaBackedLeafNodeValue(self, txn, node);
 
     if (defer_posting_payload_refresh) {
         self.write_profile.posting_lazy_payload_deferrals += 1;
@@ -1090,6 +1473,13 @@ pub fn saveExistingNodeBodyWithAddedVectorsOptions(
     }
 }
 
+fn saveDeferredBaseDeltaLeafMutationState(self: anytype, txn: anytype, node: *const types.Node) !void {
+    if (!node.is_leaf or !shouldUseBaseDeltaAsCanonicalPosting(self)) return error.InvalidArgument;
+    try ensurePostingBaseExists(self, txn, node);
+    try posting.PostingStore.saveState(self, txn, node.id, node.posting_state);
+    try self.cacheNode(node);
+}
+
 pub fn saveNodeBodyInternal(
     self: anytype,
     txn: anytype,
@@ -1106,7 +1496,12 @@ pub fn saveNodeBodyInternal(
     var posting_payload_refreshed = node.is_leaf and !self.config.use_quantization;
     const defer_posting_payload_refresh = shouldDeferPostingPayloadRefresh(self, node);
 
-    try savePackedNodeValue(self, txn, node);
+    if (added_vector != null) {
+        try saveDeltaBackedLeafNodeValue(self, txn, node);
+    } else {
+        try savePackedNodeValue(self, txn, node);
+        try shadowSavePostingBase(self, txn, node);
+    }
     if (defer_posting_payload_refresh) {
         self.write_profile.posting_lazy_payload_deferrals += 1;
     } else if (defer_quantized_rebuild and suppressQuantizedPayloadPersist(options)) {
@@ -1676,9 +2071,6 @@ pub fn searchProfiledRequest(
     var txn = try self.beginRuntimeSearchTxn();
     profile.runtime_txn_ns += elapsed_fn_u64(txn_start);
     defer txn.abort();
-    if (comptime @hasDecl(Index, "pinUpperTreeCache")) {
-        try self.pinUpperTreeCache(&txn);
-    }
     var filter_state = try search_types.RequestFilterState.init(self.alloc, req);
     defer filter_state.deinit(self.alloc);
     const scratch_start = now_fn_u64();
@@ -1718,7 +2110,7 @@ pub fn searchProfiledRequest(
     errdefer approx_results.deinit();
     profile.setup_ns += elapsed_fn_u64(setup_start);
 
-    if (self.config.centroid_directory_mode == .flat_rabitq and self.config.use_quantization) {
+    if (self.config.centroid_directory_mode != .hbc and self.config.use_quantization) {
         const configured_probe_count = if (self.config.flat_centroid_probe_count != 0)
             self.config.flat_centroid_probe_count
         else
@@ -1739,26 +2131,34 @@ pub fn searchProfiledRequest(
             elapsed_fn_u64,
         );
 
+        const packed_bulk_ingest_session = self.config.posting_storage_mode == .packed_hbc and hasOpenBulkIngestSession(self);
         var flat_leaves_scored: usize = 0;
         for (probes[0..probe_count]) |probe| {
+            if (packed_bulk_ingest_session) continue;
             profile.nodes_visited += 1;
-            var leaf_handle = loadNodeReadHandleProfiled(self, &txn, probe.posting_id, &profile, now_fn_u64, elapsed_fn_u64) catch continue;
-            var leaf_handle_active = true;
-            defer if (leaf_handle_active) leaf_handle.deinit(self.alloc);
-            const leaf = leaf_handle.ptr();
-            if (!leaf.is_leaf) {
-                leaf_handle.deinit(self.alloc);
-                leaf_handle_active = false;
-                continue;
+            if (self.config.posting_storage_mode == .base_delta) {
+                const leaf_posting = posting.PostingView{
+                    .id = probe.posting_id,
+                    .parent = probe.parent,
+                    .level = probe.level,
+                    .centroid = &.{},
+                    .members = &.{},
+                    .state = probe.state,
+                };
+                const member_ids = try posting.PostingStore.copyQueryMemberIds(self, &txn, self.alloc, scratch, leaf_posting, &profile, now_fn_u64, elapsed_fn_u64);
+                try @This().scoreLeafMemberIds(self, &txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+            } else {
+                var leaf_handle = loadNodeReadHandleProfiled(self, &txn, probe.posting_id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| {
+                    if (isNotFoundGeneric(err)) continue;
+                    return err;
+                };
+                defer leaf_handle.deinit(self.alloc);
+                const leaf = leaf_handle.ptr();
+                if (!leaf.is_leaf) continue;
+                const leaf_posting = try posting.PostingStore.view(leaf);
+                const member_ids = try posting.PostingStore.copyQueryMemberIds(self, &txn, self.alloc, scratch, leaf_posting, &profile, now_fn_u64, elapsed_fn_u64);
+                try @This().scoreLeafMemberIds(self, &txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, now_fn_u64, elapsed_fn_u64);
             }
-            const leaf_posting = try posting.PostingStore.view(leaf);
-            const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
-            const leaf_id = leaf_posting.id;
-            const leaf_uses_nonquantized_payload = leaf_posting.usesNonQuantizedPayload();
-            const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
-            leaf_handle.deinit(self.alloc);
-            leaf_handle_active = false;
-            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, now_fn_u64, elapsed_fn_u64);
             profile.leaves_explored += 1;
             flat_leaves_scored += 1;
         }
@@ -1778,7 +2178,19 @@ pub fn searchProfiledRequest(
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{ .results = results, .profile = profile };
         }
+
+        if (packed_bulk_ingest_session) {
+            approx_results.deinit();
+            const empty = search_results.SearchResults.init(self.alloc, req.k);
+            profile.total_ns = elapsed_fn_u64(total_start);
+            return .{
+                .results = empty,
+                .profile = profile,
+            };
+        }
     }
+
+    try pinUpperTreeCacheProfiled(self, &txn, &profile, now_fn_u64, elapsed_fn_u64);
 
     const root_start = now_fn_u64();
     var root_handle = loadNodeReadHandleProfiled(self, &txn, root_node_id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
@@ -1801,7 +2213,7 @@ pub fn searchProfiledRequest(
         const root = root_handle.ptr();
         if (root.is_leaf) {
             const root_posting = try posting.PostingStore.view(root);
-            const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, root_posting);
+            const member_ids = try posting.PostingStore.copyQueryMemberIds(self, &txn, self.alloc, scratch, root_posting, &profile, now_fn_u64, elapsed_fn_u64);
             const leaf_id = root_posting.id;
             const leaf_uses_nonquantized_payload = root_posting.usesNonQuantizedPayload();
             const leaf_has_fresh_stored_payload = root_posting.hasFreshStoredPayload();
@@ -1872,7 +2284,7 @@ pub fn searchProfiledRequest(
                 continue;
             }
             const leaf_posting = try posting.PostingStore.view(node);
-            const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
+            const member_ids = try posting.PostingStore.copyQueryMemberIds(self, &txn, self.alloc, scratch, leaf_posting, &profile, now_fn_u64, elapsed_fn_u64);
             const leaf_id = leaf_posting.id;
             const leaf_uses_nonquantized_payload = leaf_posting.usesNonQuantizedPayload();
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
@@ -1957,6 +2369,21 @@ fn searchRootNode(self: anytype) u64 {
     return self.metadata.root_node;
 }
 
+fn pinUpperTreeCacheProfiled(
+    self: anytype,
+    txn: anytype,
+    profile: *search_types.SearchProfile,
+    now_fn_u64: fn () u64,
+    elapsed_fn_u64: fn (u64) u64,
+) !void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "pinUpperTreeCache")) {
+        const start = now_fn_u64();
+        try self.pinUpperTreeCache(txn);
+        profile.upper_tree_pin_ns += elapsed_fn_u64(start);
+    }
+}
+
 pub fn addChildCandidates(
     self: anytype,
     txn: anytype,
@@ -1993,7 +2420,26 @@ fn addChildCandidatesFromIds(
     defer profile.child_expand_ns += elapsed_fn_u64(start);
     const child_count = child_ids.len;
     if (self.config.use_quantization) {
-        if (try loadQuantizedReadHandleProfiled(self, txn, node_id, uses_nonquantized_payload, child_count, profile, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
+        if (try loadQuantizedReadHandleProfiled(self, txn, node_id, uses_nonquantized_payload, child_count, .internal, profile, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
+            defer {
+                var handle = quantized_handle;
+                handle.deinit(self.alloc);
+            }
+            const quantized = quantized_handle.ptr();
+            profile.approx_nodes_expanded += 1;
+
+            const count = child_count;
+            const distances = scratch.distances[0..count];
+            const error_bounds = scratch.error_bounds[0..count];
+
+            try self.estimateQuantizedDistances(quantized, query, query_measure, distances, error_bounds, &scratch.estimate);
+            for (child_ids, 0..) |child_id, i| {
+                _ = error_bounds[i];
+                try candidates.push(self.alloc, .{ .id = child_id, .distance = distances[i], .error_bound = 0 });
+            }
+            return;
+        }
+        if (try rebuildInternalQuantizedReadHandleForQuery(self, txn, node_id, uses_nonquantized_payload, child_ids, profile, now_fn_u64, elapsed_fn_u64)) |quantized_handle| {
             defer {
                 var handle = quantized_handle;
                 handle.deinit(self.alloc);
@@ -2025,7 +2471,7 @@ fn addChildCandidatesFromIds(
             continue;
         }
 
-        var child_handle = loadNodeReadHandle(self, txn, child_id) catch continue;
+        var child_handle = loadNodeReadHandleProfiled(self, txn, child_id, profile, now_fn_u64, elapsed_fn_u64) catch continue;
         defer child_handle.deinit(self.alloc);
         const dist = vec.distanceToQuery(query, query_measure, child_handle.ptr().centroid, self.config.metric);
         try candidates.push(self.alloc, .{ .id = child_id, .distance = dist, .error_bound = 0 });
@@ -2049,7 +2495,7 @@ pub fn scoreLeafMembers(
     elapsed_fn_u64: fn (u64) u64,
 ) !void {
     const leaf_posting = try posting.PostingStore.view(leaf);
-    const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
+    const member_ids = try posting.PostingStore.copyQueryMemberIds(self, txn, self.alloc, scratch, leaf_posting, profile, now_fn_u64, elapsed_fn_u64);
     return try @This().scoreLeafMemberIds(self, txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, now_fn_u64, elapsed_fn_u64);
 }
 
@@ -2077,7 +2523,29 @@ fn scoreLeafMemberIds(
     const has_extra_filters = search_runtime.requestHasExtraFilters(req, filter_state);
     try scratch.ensureVectorFetchCapacity(self.alloc, member_ids.len);
     if (self.config.use_quantization and leaf_has_fresh_stored_payload) {
-        if (try loadQuantizedReadHandleProfiled(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, profile, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
+        if (try loadQuantizedReadHandleProfiled(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, .leaf, profile, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
+            defer {
+                var handle = quantized_handle;
+                handle.deinit(self.alloc);
+            }
+            const quantized = quantized_handle.ptr();
+            profile.approx_leaves_scored += 1;
+            const count = member_ids.len;
+            const distances = scratch.distances[0..count];
+            const error_bounds = scratch.error_bounds[0..count];
+            try self.estimateQuantizedDistances(quantized, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
+            if (!has_extra_filters) {
+                for (member_ids, 0..) |member_id, i| results.addApproxResult(member_id, distances[i], error_bounds[i]);
+            } else {
+                for (member_ids, 0..) |member_id, i| {
+                    if (!try memberMatchesRequest(self, txn, member_id, distances[i], error_bounds[i], req, filter_state, true)) continue;
+                    results.addApproxResult(member_id, distances[i], error_bounds[i]);
+                }
+            }
+            profile.approx_vectors_scored += count;
+            return;
+        }
+        if (try rebuildLeafQuantizedReadHandleForQuery(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids, scratch, profile, now_fn_u64, elapsed_fn_u64)) |quantized_handle| {
             defer {
                 var handle = quantized_handle;
                 handle.deinit(self.alloc);
@@ -3672,6 +4140,18 @@ fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
             group_start = group_end;
             continue;
         }
+        if (shouldWritePostingBaseDelta(self)) {
+            const delta_records = try self.alloc.alloc(posting.PostingDeltaRecord, group.len);
+            defer self.alloc.free(delta_records);
+            for (group, 0..) |entry, offset| {
+                delta_records[offset] = .{
+                    .sequence = postingDeltaSequence(leaf.posting_state.mutation_version, offset),
+                    .op = .tombstone,
+                    .vector_id = entry.vector_id,
+                };
+            }
+            try shadowAppendPostingDeltas(self, txn, leaf.id, delta_records);
+        }
 
         if (leaf.members.len > 0 and shouldDeferPostingCentroidRefresh(self, &leaf)) {
             self.write_profile.posting_lazy_centroid_deferrals += 1;
@@ -3705,7 +4185,7 @@ fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
         var vkey_buf: [10]u8 = undefined;
         for (group) |entry| {
             self.deleteNamespaced(txn, .vecs, hbc.encodeVecKey(&vkey_buf, entry.vector_id)) catch {};
-            self.deleteNamespaced(txn, .vecs, hbc.encodeVecLeafKey(&vkey_buf, entry.vector_id)) catch {};
+            self.deleteVecLeaf(txn, entry.vector_id) catch {};
             self.deleteNamespaced(txn, .vecs, hbc.encodeVecMetaKey(&vkey_buf, entry.vector_id)) catch {};
             self.invalidateVectorCache(entry.vector_id);
             self.invalidateMetadataCache(entry.vector_id);
@@ -3727,6 +4207,7 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
     try leaf.ensureUnbacked(self.alloc);
 
     try posting.PostingStore.removeMember(self.alloc, &leaf, vector_id);
+    try shadowAppendPostingDelta(self, txn, leaf.id, .tombstone, vector_id, postingDeltaSequence(leaf.posting_state.mutation_version, 0));
 
     if (leaf.members.len > 0 and shouldDeferPostingCentroidRefresh(self, &leaf)) {
         self.write_profile.posting_lazy_centroid_deferrals += 1;
@@ -3785,6 +4266,7 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
                 @memcpy(merged[sibling.members.len..], leaf.members);
                 self.alloc.free(sibling.members);
                 sibling.members = merged;
+                posting.PostingStore.noteMembersChanged(&sibling);
                 try posting.PostingStore.recomputeCentroid(self, txn, &sibling);
                 try self.saveNode(txn, &sibling);
                 for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
@@ -3808,7 +4290,7 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
 
     var vkey_buf: [10]u8 = undefined;
     self.deleteNamespaced(txn, .vecs, hbc.encodeVecKey(&vkey_buf, vector_id)) catch {};
-    self.deleteNamespaced(txn, .vecs, hbc.encodeVecLeafKey(&vkey_buf, vector_id)) catch {};
+    self.deleteVecLeaf(txn, vector_id) catch {};
     self.deleteNamespaced(txn, .vecs, hbc.encodeVecMetaKey(&vkey_buf, vector_id)) catch {};
     self.invalidateVectorCache(vector_id);
     self.invalidateMetadataCache(vector_id);
@@ -3891,6 +4373,45 @@ pub fn extendAncestorSplitRanges(
     }
 }
 
+fn saveNodeSplitRangeAfterMetadataOverwrite(
+    self: anytype,
+    txn: anytype,
+    node: *const types.Node,
+    previous_metadata: ?[]const u8,
+    next_metadata: []const u8,
+    is_not_found: fn (anyerror) bool,
+) !void {
+    const maybe_existing = try loadNodeSplitRange(self, txn, node.id, is_not_found);
+    var range = maybe_existing orelse {
+        if (previous_metadata == null and next_metadata.len == 0) return;
+        return saveNodeSplitRange(self, txn, node, is_not_found);
+    };
+    defer range.deinit(self.alloc);
+
+    if (previous_metadata) |old_metadata| {
+        const old_touched_min = std.mem.eql(u8, old_metadata, range.min_key);
+        const old_touched_max = std.mem.eql(u8, old_metadata, range.max_key);
+        if ((old_touched_min or old_touched_max) and !std.mem.eql(u8, old_metadata, next_metadata)) {
+            return saveNodeSplitRange(self, txn, node, is_not_found);
+        }
+    }
+
+    if (next_metadata.len == 0) return;
+
+    var changed = false;
+    if (std.mem.order(u8, next_metadata, range.min_key) == .lt) {
+        self.alloc.free(range.min_key);
+        range.min_key = try self.alloc.dupe(u8, next_metadata);
+        changed = true;
+    }
+    if (std.mem.order(u8, next_metadata, range.max_key) == .gt) {
+        self.alloc.free(range.max_key);
+        range.max_key = try self.alloc.dupe(u8, next_metadata);
+        changed = true;
+    }
+    if (changed) try putNodeSplitRange(self, txn, node.id, &range, is_not_found);
+}
+
 pub fn insert(self: anytype, vector_id: u64, vector_data: []const f32, now_fn_u64: fn () u64, elapsed_fn_u64: fn (u64) u64) !void {
     try insertWithMetadata(self, vector_id, vector_data, "", now_fn_u64, elapsed_fn_u64);
 }
@@ -3956,6 +4477,7 @@ pub fn insertWithMetadataTxnOptions(
     const bulk_ingest = if (@hasField(Options, "bulk_ingest")) options.bulk_ingest else false;
     const defer_leaf_splits_to_batch_finish = if (@hasField(Options, "defer_leaf_splits_to_batch_finish")) options.defer_leaf_splits_to_batch_finish else false;
     const defer_leaf_splits_to_bulk_finish = if (@hasField(Options, "defer_leaf_splits_to_bulk_finish")) options.defer_leaf_splits_to_bulk_finish else false;
+    const defer_leaf_splits_to_posting_maintenance = if (@hasField(Options, "defer_leaf_splits_to_posting_maintenance")) options.defer_leaf_splits_to_posting_maintenance else false;
     const bulk_rebuild_leaf_min_members = if (@hasField(Options, "bulk_rebuild_leaf_min_members")) options.bulk_rebuild_leaf_min_members else 0;
     const batch_vectors = if (@hasField(Options, "batch_vectors")) options.batch_vectors else null;
     const batch_insert_options: hbc_runtime.BatchInsertOptions = .{
@@ -3969,6 +4491,7 @@ pub fn insertWithMetadataTxnOptions(
         .bulk_ingest = bulk_ingest,
         .defer_leaf_splits_to_batch_finish = defer_leaf_splits_to_batch_finish,
         .defer_leaf_splits_to_bulk_finish = defer_leaf_splits_to_bulk_finish,
+        .defer_leaf_splits_to_posting_maintenance = defer_leaf_splits_to_posting_maintenance,
         .suppress_quantized_payload_persist = if (@hasField(Options, "suppress_quantized_payload_persist")) options.suppress_quantized_payload_persist else false,
         .bulk_rebuild_leaf_min_members = bulk_rebuild_leaf_min_members,
         .batch_vectors = batch_vectors,
@@ -4010,7 +4533,8 @@ pub fn insertWithMetadataTxnOptions(
     const target_leaf_id = blk_leaf: {
         if (existing_leaf_id != 0) {
             const find_leaf_start = now_fn_u64();
-            const leaf_id = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, effective_transformed, allow_quantized_routing);
+            const existing_update_allow_quantized_routing = if (shouldRouteExistingUpdatesByCentroidOnly(self)) false else allow_quantized_routing;
+            const leaf_id = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, effective_transformed, existing_update_allow_quantized_routing);
             self.write_profile.insert_find_leaf_ns += elapsed_fn_u64(find_leaf_start);
             if (existing_leaf_id == leaf_id) {
                 if (try tryUpdateExistingVectorInLeafTxnOptions(
@@ -4029,6 +4553,44 @@ pub fn insertWithMetadataTxnOptions(
                     return;
                 }
             } else {
+                if (shouldRouteExistingUpdatesByCentroidOnly(self)) {
+                    if (try tryLazyRerouteExistingVectorTxnOptions(
+                        self,
+                        txn,
+                        existing_leaf_id,
+                        leaf_id,
+                        vector_id,
+                        vector_data,
+                        metadata_value,
+                        skip_vector_store,
+                    )) {
+                        return;
+                    }
+                    var target_leaf = loadNode(self, txn, leaf_id) catch |err| {
+                        if (isNotFoundGeneric(err)) break :blk_leaf existing_leaf_id;
+                        return err;
+                    };
+                    defer target_leaf.deinit(self.alloc);
+                    if (!leafCanAcceptMember(self, &target_leaf, vector_id)) {
+                        if (try tryUpdateExistingVectorInLeafTxnOptions(
+                            self,
+                            txn,
+                            existing_leaf_id,
+                            vector_id,
+                            vector_data,
+                            metadata_value,
+                            effective_transformed,
+                            previous_vector_storage.?,
+                            previous_transformed_storage.?,
+                            skip_vector_store,
+                            batch_insert_options,
+                        )) {
+                            return;
+                        }
+                        break :blk_leaf existing_leaf_id;
+                    }
+                }
+                self.write_profile.existing_vector_reroutes += 1;
                 removeFromLeaf(self, txn, existing_leaf_id, vector_id) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
@@ -4058,6 +4620,7 @@ pub fn insertWithMetadataTxnOptions(
     try leaf.ensureUnbacked(self.alloc);
 
     _ = try posting.PostingStore.appendMember(self.alloc, &leaf, vector_id);
+    try shadowAppendPostingDelta(self, txn, leaf.id, .insert, vector_id, postingDeltaSequence(leaf.posting_state.mutation_version, 0));
 
     const n = leaf.members.len;
     if (shouldDeferPostingCentroidRefresh(self, &leaf)) {
@@ -4075,9 +4638,10 @@ pub fn insertWithMetadataTxnOptions(
         posting.PostingStore.noteCentroidRefreshed(&leaf);
     }
     const leaf_overflows = leaf.members.len > self.config.leaf_size;
+    const defer_lazy_existing_leaf_split = leaf_overflows and existing_leaf_id != 0 and shouldRouteExistingUpdatesByCentroidOnly(self);
     const defer_leaf_split = shouldDeferOversizedLeafSplit(self, &leaf, batch_insert_options);
     var save_options = batch_insert_options;
-    save_options.suppress_quantized_payload_persist = defer_leaf_split;
+    save_options.suppress_quantized_payload_persist = defer_leaf_split or defer_lazy_existing_leaf_split;
 
     if (metadata_value.len > 0) {
         var range_changed = false;
@@ -4125,8 +4689,12 @@ pub fn insertWithMetadataTxnOptions(
     if (existing_leaf_id == 0) self.metadata.active_count += 1;
 
     if (leaf_overflows) {
-        if (defer_leaf_split) {
-            try recordDeferredOversizedLeaf(self, leaf.id);
+        if (defer_lazy_existing_leaf_split) {
+            self.write_profile.posting_lazy_payload_deferrals += 1;
+        } else if (defer_leaf_split) {
+            if (shouldRecordDeferredOversizedLeafForSplitFinish(batch_insert_options)) {
+                try recordDeferredOversizedLeaf(self, leaf.id);
+            }
         } else {
             try self.splitLeafWithOptions(txn, &leaf, batch_insert_options);
         }
@@ -4139,6 +4707,68 @@ fn nodeHasMember(members: []const u64, vector_id: u64) bool {
         if (member_id == vector_id) return true;
     }
     return false;
+}
+
+fn leafCanAcceptMember(self: anytype, leaf: *const types.Node, vector_id: u64) bool {
+    if (!leaf.is_leaf) return false;
+    return nodeHasMember(leaf.members, vector_id) or leaf.members.len < self.config.leaf_size;
+}
+
+fn tryLazyRerouteExistingVectorTxnOptions(
+    self: anytype,
+    txn: anytype,
+    source_leaf_id: u64,
+    target_leaf_id: u64,
+    vector_id: u64,
+    vector_data: []const f32,
+    metadata_value: []const u8,
+    skip_vector_store: bool,
+) !bool {
+    if (!shouldRouteExistingUpdatesByCentroidOnly(self)) return false;
+    if (source_leaf_id == 0 or target_leaf_id == 0 or source_leaf_id == target_leaf_id) return false;
+
+    var source_leaf = try loadNode(self, txn, source_leaf_id);
+    defer source_leaf.deinit(self.alloc);
+    if (!source_leaf.is_leaf or !nodeHasMember(source_leaf.members, vector_id)) return false;
+    try source_leaf.ensureUnbacked(self.alloc);
+
+    var target_leaf = try loadNode(self, txn, target_leaf_id);
+    defer target_leaf.deinit(self.alloc);
+    if (!leafCanAcceptMember(self, &target_leaf, vector_id)) return false;
+    try target_leaf.ensureUnbacked(self.alloc);
+
+    const store_start = nowNsU64Fixed();
+    try storeVectorAndMetadataWithOptions(self, txn, vector_id, vector_data, metadata_value, skip_vector_store);
+    self.write_profile.insert_store_vector_ns += elapsedSinceU64Fixed(store_start);
+
+    const mutate_start = nowNsU64Fixed();
+    try posting.PostingStore.removeMember(self.alloc, &source_leaf, vector_id);
+    try shadowAppendPostingDelta(self, txn, source_leaf.id, .tombstone, vector_id, postingDeltaSequence(source_leaf.posting_state.mutation_version, 0));
+
+    if (!nodeHasMember(target_leaf.members, vector_id)) {
+        _ = try posting.PostingStore.appendMember(self.alloc, &target_leaf, vector_id);
+        try shadowAppendPostingDelta(self, txn, target_leaf.id, .insert, vector_id, postingDeltaSequence(target_leaf.posting_state.mutation_version, 0));
+    } else {
+        posting.PostingStore.noteVectorsChanged(&target_leaf);
+        try shadowAppendPostingDelta(self, txn, target_leaf.id, .replace, vector_id, postingDeltaSequence(target_leaf.posting_state.mutation_version, 0));
+    }
+
+    try self.putVecLeaf(txn, vector_id, target_leaf.id);
+    try posting.PostingStore.saveState(self, txn, source_leaf.id, source_leaf.posting_state);
+    try posting.PostingStore.saveState(self, txn, target_leaf.id, target_leaf.posting_state);
+
+    self.invalidateQuantizedCache(source_leaf.id);
+    self.invalidateQuantizedCache(target_leaf.id);
+    try self.cacheNode(&source_leaf);
+    try self.cacheNode(&target_leaf);
+
+    self.write_profile.existing_vector_reroutes += 1;
+    self.write_profile.posting_lazy_centroid_deferrals += 2;
+    self.write_profile.posting_lazy_payload_deferrals += 2;
+    if (source_leaf.parent != 0) self.write_profile.posting_lazy_ancestor_deferrals += 1;
+    if (target_leaf.parent != 0) self.write_profile.posting_lazy_ancestor_deferrals += 1;
+    self.write_profile.insert_mutate_leaf_ns += elapsedSinceU64Fixed(mutate_start);
+    return true;
 }
 
 fn tryUpdateExistingVectorInLeafTxnOptions(
@@ -4157,6 +4787,7 @@ fn tryUpdateExistingVectorInLeafTxnOptions(
     var existing_leaf = try loadNode(self, txn, leaf_id);
     defer existing_leaf.deinit(self.alloc);
     if (!nodeHasMember(existing_leaf.members, vector_id)) return false;
+    self.write_profile.existing_same_leaf_updates += 1;
 
     const previous_transformed = blk_previous: {
         const previous_vector = self.getVectorScratch(txn, vector_id, previous_vector_storage) catch |err| switch (err) {
@@ -4166,10 +4797,38 @@ fn tryUpdateExistingVectorInLeafTxnOptions(
         _ = self.transformVector(previous_vector, previous_transformed_storage);
         break :blk_previous previous_transformed_storage[0..];
     };
+    var previous_metadata_owned: ?[]u8 = null;
+    defer if (previous_metadata_owned) |metadata| self.alloc.free(metadata);
+    if (try getMetadataInTxn(self, txn, vector_id, isNotFoundGeneric)) |metadata| {
+        previous_metadata_owned = try self.alloc.dupe(u8, metadata);
+    }
     const store_start = nowNsU64Fixed();
     try storeVectorAndMetadataWithOptions(self, txn, vector_id, vector_data, metadata_value, skip_vector_store);
     self.write_profile.insert_store_vector_ns += elapsedSinceU64Fixed(store_start);
+
+    if (shouldUseBaseDeltaAsCanonicalPosting(self) and self.config.lazy_posting_maintenance) {
+        const mutate_start = nowNsU64Fixed();
+        posting.PostingStore.noteVectorsChanged(&existing_leaf);
+        try self.putVecLeaf(txn, vector_id, existing_leaf.id);
+        if (shouldDeferPostingCentroidRefresh(self, &existing_leaf)) {
+            self.write_profile.posting_lazy_centroid_deferrals += 1;
+        }
+        if (shouldDeferPostingPayloadRefresh(self, &existing_leaf)) {
+            self.write_profile.posting_lazy_payload_deferrals += 1;
+        }
+        if (existing_leaf.parent != 0) {
+            self.write_profile.posting_lazy_ancestor_deferrals += 1;
+        }
+        try posting.PostingStore.saveState(self, txn, existing_leaf.id, existing_leaf.posting_state);
+        try saveNodeSplitRangeAfterMetadataOverwrite(self, txn, &existing_leaf, previous_metadata_owned, metadata_value, isNotFoundGeneric);
+        self.invalidateQuantizedCache(existing_leaf.id);
+        try self.cacheNode(&existing_leaf);
+        self.write_profile.insert_mutate_leaf_ns += elapsedSinceU64Fixed(mutate_start);
+        return true;
+    }
+
     posting.PostingStore.noteVectorsChanged(&existing_leaf);
+    try shadowAppendPostingDelta(self, txn, existing_leaf.id, .replace, vector_id, postingDeltaSequence(existing_leaf.posting_state.mutation_version, 0));
     if (shouldDeferPostingCentroidRefresh(self, &existing_leaf)) {
         self.write_profile.posting_lazy_centroid_deferrals += 1;
     } else if (previous_transformed) |old_transformed| {
@@ -4214,6 +4873,48 @@ fn tryCoalesceExistingVectorInLeafTxnOptions(
         return true;
     }
 
+    if (shouldUseBaseDeltaAsCanonicalPosting(self) and self.config.lazy_posting_maintenance) {
+        const vector_matches_stored = try existingVectorMatchesStoredVector(self, txn, vector_id, vector_data, previous_vector_storage);
+        var previous_metadata_owned: ?[]u8 = null;
+        defer if (previous_metadata_owned) |metadata| self.alloc.free(metadata);
+        if (try getMetadataInTxn(self, txn, vector_id, isNotFoundGeneric)) |metadata| {
+            previous_metadata_owned = try self.alloc.dupe(u8, metadata);
+        }
+
+        const store_start = nowNsU64Fixed();
+        if (vector_matches_stored) {
+            if (metadata_value.len > 0) try putMetadata(self, txn, vector_id, metadata_value);
+        } else {
+            try storeVectorAndMetadataWithOptions(self, txn, vector_id, vector_data, metadata_value, options.skip_vector_store);
+        }
+        self.write_profile.insert_store_vector_ns += elapsedSinceU64Fixed(store_start);
+
+        var leaf = try loadNode(self, txn, leaf_id);
+        defer leaf.deinit(self.alloc);
+        if (!nodeHasMember(leaf.members, vector_id)) return false;
+
+        const mutate_start = nowNsU64Fixed();
+        if (vector_matches_stored) {
+            try saveNodeSplitRangeAfterMetadataOverwrite(self, txn, &leaf, previous_metadata_owned, metadata_value, isNotFoundGeneric);
+            self.write_profile.existing_same_vector_coalesces += 1;
+            self.write_profile.insert_mutate_leaf_ns += elapsedSinceU64Fixed(mutate_start);
+            return true;
+        }
+
+        posting.PostingStore.noteVectorsChanged(&leaf);
+        self.write_profile.posting_lazy_centroid_deferrals += 1;
+        self.write_profile.posting_lazy_payload_deferrals += 1;
+        try self.putVecLeaf(txn, vector_id, leaf.id);
+        if (leaf.parent != 0) self.write_profile.posting_lazy_ancestor_deferrals += 1;
+        try posting.PostingStore.saveState(self, txn, leaf.id, leaf.posting_state);
+        try saveNodeSplitRangeAfterMetadataOverwrite(self, txn, &leaf, previous_metadata_owned, metadata_value, isNotFoundGeneric);
+        self.invalidateQuantizedCache(leaf.id);
+        try self.cacheNode(&leaf);
+        self.write_profile.existing_same_leaf_updates += 1;
+        self.write_profile.insert_mutate_leaf_ns += elapsedSinceU64Fixed(mutate_start);
+        return true;
+    }
+
     const previous_transformed = blk_previous: {
         const previous_vector = self.getVectorScratch(txn, vector_id, previous_vector_storage) catch |err| switch (err) {
             error.NotFound => break :blk_previous null,
@@ -4235,7 +4936,224 @@ fn tryCoalesceExistingVectorInLeafTxnOptions(
     var leaf = try loadNode(self, txn, leaf_id);
     defer leaf.deinit(self.alloc);
     try appendUniqueU64(self.alloc, deferred_ancestor_centroid_refresh_ids, leaf.parent);
+    self.write_profile.existing_same_vector_coalesces += 1;
     return true;
+}
+
+fn batchCoalesceBaseDeltaExistingUpdatesTxnOptions(
+    self: anytype,
+    txn: anytype,
+    writes: []const hbc_runtime.BatchInsertItem,
+    options: hbc_runtime.BatchInsertOptions,
+    processed: []bool,
+) !usize {
+    if (!options.coalesce_leaf_writes) return 0;
+    if (!shouldUseBaseDeltaAsCanonicalPosting(self) or !self.config.lazy_posting_maintenance) return 0;
+    if (writes.len < 2) return 0;
+
+    var prepared = std.ArrayListUnmanaged(PreparedExistingBatchUpdate).empty;
+    defer prepared.deinit(self.alloc);
+    try prepared.ensureTotalCapacity(self.alloc, @intCast(writes.len));
+
+    const dims: usize = @intCast(self.config.dims);
+    const compare_vector = try self.alloc.alloc(f32, dims);
+    defer self.alloc.free(compare_vector);
+
+    var processed_count: usize = 0;
+    for (writes, 0..) |item, item_index| {
+        const leaf_id = self.getVecLeaf(txn, item.vector_id) catch |err| {
+            if (isNotFoundGeneric(err)) continue;
+            return err;
+        };
+        if (try existingVectorMatchesNoOp(self, txn, item.vector_id, item.vector, item.metadata, compare_vector)) {
+            self.write_profile.noop_existing_skips += 1;
+            processed[item_index] = true;
+            processed_count += 1;
+            continue;
+        }
+        prepared.appendAssumeCapacity(.{ .item_index = item_index, .leaf_id = leaf_id });
+    }
+    if (prepared.items.len == 0) return processed_count;
+
+    std.mem.sort(PreparedExistingBatchUpdate, prepared.items, {}, lessPreparedExistingBatchUpdate);
+
+    var target_delta_records = std.ArrayListUnmanaged(TargetPostingDeltaRecord).empty;
+    defer target_delta_records.deinit(self.alloc);
+    try target_delta_records.ensureTotalCapacity(self.alloc, prepared.items.len);
+
+    var group_start: usize = 0;
+    while (group_start < prepared.items.len) {
+        var group_end = group_start + 1;
+        while (group_end < prepared.items.len and prepared.items[group_end].leaf_id == prepared.items[group_start].leaf_id) : (group_end += 1) {}
+        const group = prepared.items[group_start..group_end];
+        const leaf_id = group[0].leaf_id;
+
+        var leaf = try loadNode(self, txn, leaf_id);
+        defer leaf.deinit(self.alloc);
+        try leaf.ensureUnbacked(self.alloc);
+
+        const records = try self.alloc.alloc(posting.PostingDeltaRecord, group.len);
+        defer self.alloc.free(records);
+        var record_count: usize = 0;
+        var same_posting_update_count: usize = 0;
+        const transformed = try self.alloc.alloc(f32, dims);
+        defer self.alloc.free(transformed);
+
+        const store_start = nowNsU64Fixed();
+        for (group) |entry| {
+            const item = writes[entry.item_index];
+            if (!nodeHasMember(leaf.members, item.vector_id)) continue;
+
+            if (try existingVectorMatchesStoredVector(self, txn, item.vector_id, item.vector, compare_vector)) {
+                var previous_metadata_owned: ?[]u8 = null;
+                defer if (previous_metadata_owned) |metadata| self.alloc.free(metadata);
+                if (try getMetadataInTxn(self, txn, item.vector_id, isNotFoundGeneric)) |metadata| {
+                    previous_metadata_owned = try self.alloc.dupe(u8, metadata);
+                }
+                if (item.metadata.len > 0) try putMetadata(self, txn, item.vector_id, item.metadata);
+                try saveNodeSplitRangeAfterMetadataOverwrite(self, txn, &leaf, previous_metadata_owned, item.metadata, isNotFoundGeneric);
+                self.write_profile.existing_same_vector_coalesces += 1;
+                processed[entry.item_index] = true;
+                processed_count += 1;
+                continue;
+            }
+
+            _ = self.transformVector(item.vector, transformed);
+
+            const find_leaf_start = nowNsU64Fixed();
+            const allow_quantized_routing = if (shouldRouteExistingUpdatesByCentroidOnly(self))
+                false
+            else if (@hasField(@TypeOf(options), "allow_quantized_routing"))
+                options.allow_quantized_routing
+            else
+                !options.centroid_only_routing;
+            const target_leaf_id = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, transformed, allow_quantized_routing);
+            self.write_profile.insert_find_leaf_ns += elapsedSinceU64Fixed(find_leaf_start);
+            const moved_to_target = if (target_leaf_id != leaf.id) moved_blk: {
+                var target_leaf = loadNode(self, txn, target_leaf_id) catch |err| {
+                    if (isNotFoundGeneric(err)) break :moved_blk false;
+                    return err;
+                };
+                defer target_leaf.deinit(self.alloc);
+                if (!leafCanAcceptMember(self, &target_leaf, item.vector_id)) break :moved_blk false;
+
+                try target_leaf.ensureUnbacked(self.alloc);
+                try storeVectorAndMetadataWithOptions(self, txn, item.vector_id, item.vector, item.metadata, options.skip_vector_store);
+                try posting.PostingStore.removeMember(self.alloc, &leaf, item.vector_id);
+                records[record_count] = .{
+                    .sequence = postingDeltaSequence(leaf.posting_state.mutation_version, record_count),
+                    .op = .tombstone,
+                    .vector_id = item.vector_id,
+                };
+                record_count += 1;
+                _ = try posting.PostingStore.appendMember(self.alloc, &target_leaf, item.vector_id);
+                target_delta_records.appendAssumeCapacity(.{
+                    .posting_id = target_leaf.id,
+                    .record = .{
+                        .sequence = target_leaf.posting_state.mutation_version,
+                        .op = .insert,
+                        .vector_id = item.vector_id,
+                    },
+                });
+                try self.putVecLeaf(txn, item.vector_id, target_leaf.id);
+                try posting.PostingStore.saveState(self, txn, target_leaf.id, target_leaf.posting_state);
+                self.invalidateQuantizedCache(target_leaf.id);
+                try self.cacheNode(&target_leaf);
+                self.write_profile.existing_vector_reroutes += 1;
+                self.write_profile.posting_lazy_centroid_deferrals += 1;
+                self.write_profile.posting_lazy_payload_deferrals += 1;
+                if (target_leaf.parent != 0) {
+                    self.write_profile.posting_lazy_ancestor_deferrals += 1;
+                }
+                processed[entry.item_index] = true;
+                processed_count += 1;
+                break :moved_blk true;
+            } else false;
+            if (moved_to_target) continue;
+
+            var previous_metadata_owned: ?[]u8 = null;
+            defer if (previous_metadata_owned) |metadata| self.alloc.free(metadata);
+            if (try getMetadataInTxn(self, txn, item.vector_id, isNotFoundGeneric)) |metadata| {
+                previous_metadata_owned = try self.alloc.dupe(u8, metadata);
+            }
+            try storeVectorAndMetadataWithOptions(self, txn, item.vector_id, item.vector, item.metadata, options.skip_vector_store);
+            posting.PostingStore.noteVectorsChanged(&leaf);
+            try saveNodeSplitRangeAfterMetadataOverwrite(self, txn, &leaf, previous_metadata_owned, item.metadata, isNotFoundGeneric);
+            try self.putVecLeaf(txn, item.vector_id, leaf.id);
+            same_posting_update_count += 1;
+            processed[entry.item_index] = true;
+            processed_count += 1;
+        }
+        self.write_profile.insert_store_vector_ns += elapsedSinceU64Fixed(store_start);
+
+        if (record_count != 0 or same_posting_update_count != 0) {
+            const mutate_start = nowNsU64Fixed();
+            if (record_count != 0) {
+                for (records[0..record_count], 0..) |*record, record_index| {
+                    record.sequence = postingDeltaSequence(leaf.posting_state.mutation_version, record_index);
+                }
+                try shadowAppendPostingDeltas(self, txn, leaf.id, records[0..record_count]);
+            }
+            const deferral_count = record_count + same_posting_update_count;
+            self.write_profile.posting_lazy_centroid_deferrals += @intCast(deferral_count);
+            self.write_profile.posting_lazy_payload_deferrals += @intCast(deferral_count);
+            if (leaf.parent != 0) {
+                self.write_profile.posting_lazy_ancestor_deferrals += @intCast(deferral_count);
+            }
+            try posting.PostingStore.saveState(self, txn, leaf.id, leaf.posting_state);
+            self.invalidateQuantizedCache(leaf.id);
+            try self.cacheNode(&leaf);
+            self.write_profile.insert_mutate_leaf_ns += elapsedSinceU64Fixed(mutate_start);
+        }
+
+        group_start = group_end;
+    }
+
+    if (target_delta_records.items.len != 0) {
+        const mutate_start = nowNsU64Fixed();
+        std.mem.sort(TargetPostingDeltaRecord, target_delta_records.items, {}, lessTargetPostingDeltaRecord);
+        var target_group_start: usize = 0;
+        while (target_group_start < target_delta_records.items.len) {
+            var target_group_end = target_group_start + 1;
+            while (target_group_end < target_delta_records.items.len and
+                target_delta_records.items[target_group_end].posting_id == target_delta_records.items[target_group_start].posting_id) : (target_group_end += 1)
+            {}
+
+            const target_group = target_delta_records.items[target_group_start..target_group_end];
+            {
+                const target_records = try self.alloc.alloc(posting.PostingDeltaRecord, target_group.len);
+                defer self.alloc.free(target_records);
+                var target_mutation_version: u64 = 0;
+                for (target_group) |entry| {
+                    target_mutation_version = @max(target_mutation_version, entry.record.sequence);
+                }
+                for (target_group, 0..) |entry, target_index| {
+                    target_records[target_index] = entry.record;
+                    target_records[target_index].sequence = postingDeltaSequence(target_mutation_version, target_index);
+                }
+                try shadowAppendPostingDeltas(self, txn, target_group[0].posting_id, target_records);
+            }
+            target_group_start = target_group_end;
+        }
+        self.write_profile.insert_mutate_leaf_ns += elapsedSinceU64Fixed(mutate_start);
+    }
+
+    return processed_count;
+}
+
+fn existingVectorMatchesStoredVector(
+    self: anytype,
+    txn: anytype,
+    vector_id: u64,
+    next_vector: []const f32,
+    scratch: []f32,
+) !bool {
+    const existing_vector = getVectorScratch(self, txn, vector_id, scratch) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (existing_vector.len != next_vector.len) return false;
+    return std.mem.eql(u8, std.mem.sliceAsBytes(existing_vector), std.mem.sliceAsBytes(next_vector));
 }
 
 fn existingVectorMatchesNoOp(
@@ -4267,6 +5185,7 @@ pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64)
     try leaf.ensureUnbacked(self.alloc);
 
     try posting.PostingStore.removeMember(self.alloc, &leaf, vector_id);
+    try shadowAppendPostingDelta(self, txn, leaf.id, .tombstone, vector_id, postingDeltaSequence(leaf.posting_state.mutation_version, 0));
 
     if (leaf.members.len > 0 and shouldDeferPostingCentroidRefresh(self, &leaf)) {
         self.write_profile.posting_lazy_centroid_deferrals += 1;
@@ -4329,6 +5248,7 @@ pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64)
             @memcpy(merged[sibling.members.len..], leaf.members);
             self.alloc.free(sibling.members);
             sibling.members = merged;
+            posting.PostingStore.noteMembersChanged(&sibling);
             try posting.PostingStore.recomputeCentroid(self, txn, &sibling);
             try self.saveNodeWithOptionsMode(txn, &sibling, .{}, false);
             for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
@@ -4697,6 +5617,9 @@ pub fn splitLeafWithOptions(
             split = replacement;
         }
     }
+    if (options.capacity_balance_leaf_split) {
+        try capacityBalanceLeafSplitToMaxMembers(self, &vector_set, leaf.members, &split, self.config.leaf_size);
+    }
     self.write_profile.split_leaf_partition_ns += elapsed_fn(partition_start);
     const partition_workspace_bytes =
         @as(u64, @intCast((split.c1.len + split.c2.len) * @sizeOf(f32))) +
@@ -4743,6 +5666,13 @@ pub fn splitLeafWithOptions(
     split.c2 = &.{};
     split.g2 = &.{};
     defer right_node.deinit(self.alloc);
+
+    left_node.posting_state = leaf.posting_state;
+    posting.PostingStore.noteMembersChanged(&left_node);
+    posting.PostingStore.noteCentroidRefreshed(&left_node);
+    right_node.posting_state = leaf.posting_state;
+    posting.PostingStore.noteMembersChanged(&right_node);
+    posting.PostingStore.noteCentroidRefreshed(&right_node);
 
     const publish_known_quantized_now = !(deferQuantizedRebuild(options) and shouldDeferQuantizedRebuildToBulkFinish(self, options));
     var left_vectors: []f32 = &.{};
@@ -5111,17 +6041,52 @@ pub fn batchApplyOptions(
 
     try batchDeleteTxn(self, &batch, deletes);
 
+    var processed_write_updates: []bool = &.{};
+    var remaining_write_storage: []hbc_runtime.BatchInsertItem = &.{};
+    defer if (processed_write_updates.len > 0) self.alloc.free(processed_write_updates);
+    defer if (remaining_write_storage.len > 0) self.alloc.free(remaining_write_storage);
+
+    var effective_writes = writes;
+    if (writes.len > 1 and options.coalesce_leaf_writes) {
+        processed_write_updates = try self.alloc.alloc(bool, writes.len);
+        @memset(processed_write_updates, false);
+        const processed_count = try batchCoalesceBaseDeltaExistingUpdatesTxnOptions(
+            self,
+            &batch,
+            writes,
+            options,
+            processed_write_updates,
+        );
+        if (processed_count != 0) {
+            remaining_write_storage = try self.alloc.alloc(hbc_runtime.BatchInsertItem, writes.len - processed_count);
+            var wi: usize = 0;
+            for (writes, 0..) |item, i| {
+                if (processed_write_updates[i]) continue;
+                remaining_write_storage[wi] = item;
+                wi += 1;
+            }
+            effective_writes = remaining_write_storage;
+        }
+    }
+
     var insert_options = options;
     if (!insert_options.assume_absent_ids and
-        try batchWritesAreUniqueAndCoveredByDeletes(self.alloc, writes, deletes))
+        try batchWritesAreUniqueAndCoveredByDeletes(self.alloc, effective_writes, deletes))
     {
         insert_options.assume_absent_ids = true;
     }
-    const grouped = if (writes.len > 1 and insert_options.assume_absent_ids and insert_options.coalesce_leaf_writes)
-        try batchInsertAssumeAbsentGroupedTxnOptions(self, &batch, writes, insert_options, now_fn, elapsed_fn)
+    if (!insert_options.assume_absent_ids and
+        effective_writes.len > 1 and
+        insert_options.coalesce_leaf_writes and
+        try batchWritesAreUniqueAndAbsent(self, &batch, effective_writes))
+    {
+        insert_options.assume_absent_ids = true;
+    }
+    const grouped = if (effective_writes.len > 1 and insert_options.assume_absent_ids and insert_options.coalesce_leaf_writes)
+        try batchInsertAssumeAbsentGroupedTxnOptions(self, &batch, effective_writes, insert_options, now_fn, elapsed_fn)
     else
         false;
-    if (!grouped) try batchInsertWithMetadataTxnOptions(self, &batch, writes, insert_options);
+    if (!grouped and effective_writes.len != 0) try batchInsertWithMetadataTxnOptions(self, &batch, effective_writes, insert_options);
     try finalizeWriteTxnOptions(self, &batch, insert_options, now_fn, elapsed_fn);
     const commit_start = now_fn();
     const publishing = beginPublishSearchStateIfSupported(self);
@@ -5141,6 +6106,61 @@ pub fn batchInsertWithMetadataOptions(
     if (items.len == 0) return;
 
     if (items.len > 1) {
+        if (shouldUseCursorTxnForBatchWrites(self, options)) {
+            var txn = try self.beginRuntimeWriteTxn();
+            errdefer txn.abort();
+            var processed_write_updates: []bool = &.{};
+            var remaining_write_storage: []hbc_runtime.BatchInsertItem = &.{};
+            defer if (processed_write_updates.len > 0) self.alloc.free(processed_write_updates);
+            defer if (remaining_write_storage.len > 0) self.alloc.free(remaining_write_storage);
+
+            var effective_items = items;
+            if (options.coalesce_leaf_writes) {
+                processed_write_updates = try self.alloc.alloc(bool, items.len);
+                @memset(processed_write_updates, false);
+                const processed_count = try batchCoalesceBaseDeltaExistingUpdatesTxnOptions(
+                    self,
+                    &txn,
+                    items,
+                    options,
+                    processed_write_updates,
+                );
+                if (processed_count != 0) {
+                    remaining_write_storage = try self.alloc.alloc(hbc_runtime.BatchInsertItem, items.len - processed_count);
+                    var wi: usize = 0;
+                    for (items, 0..) |item, i| {
+                        if (processed_write_updates[i]) continue;
+                        remaining_write_storage[wi] = item;
+                        wi += 1;
+                    }
+                    effective_items = remaining_write_storage;
+                }
+            }
+
+            if (effective_items.len != 0) {
+                var insert_options = options;
+                if (!insert_options.assume_absent_ids and
+                    insert_options.coalesce_leaf_writes and
+                    try batchWritesAreUniqueAndAbsent(self, &txn, effective_items))
+                {
+                    insert_options.assume_absent_ids = true;
+                }
+                const grouped = if (insert_options.assume_absent_ids and insert_options.coalesce_leaf_writes)
+                    try batchInsertAssumeAbsentGroupedTxnOptions(self, &txn, effective_items, insert_options, now_fn, elapsed_fn)
+                else
+                    false;
+                if (!grouped) try batchInsertWithMetadataTxnOptions(self, &txn, effective_items, insert_options);
+            }
+            try finalizeWriteTxnOptions(self, &txn, options, now_fn, elapsed_fn);
+            const commit_start = now_fn();
+            const publishing = beginPublishSearchStateIfSupported(self);
+            errdefer abortPublishSearchStateIfSupported(self, publishing);
+            try txn.commit();
+            self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
+            finishPublishSearchStateIfSupported(self, publishing);
+            return;
+        }
+
         const Index = comptime childType(@TypeOf(self));
         var batch = if (options.bulk_ingest and comptime @hasDecl(Index, "beginRuntimeBatchTxnOptions"))
             try self.beginRuntimeBatchTxnOptions(options)
@@ -5178,6 +6198,16 @@ const PreparedBatchInsert = struct {
     leaf_id: u64,
 };
 
+const PreparedExistingBatchUpdate = struct {
+    item_index: usize,
+    leaf_id: u64,
+};
+
+const TargetPostingDeltaRecord = struct {
+    posting_id: posting.PostingId,
+    record: posting.PostingDeltaRecord,
+};
+
 const BatchRouteProfile = struct {
     internal_nodes: u64 = 0,
     leaf_groups: u64 = 0,
@@ -5192,6 +6222,20 @@ fn lessPreparedBatchInsert(_: void, lhs: PreparedBatchInsert, rhs: PreparedBatch
         lhs.item_index < rhs.item_index
     else
         lhs.leaf_id < rhs.leaf_id;
+}
+
+fn lessPreparedExistingBatchUpdate(_: void, lhs: PreparedExistingBatchUpdate, rhs: PreparedExistingBatchUpdate) bool {
+    return if (lhs.leaf_id == rhs.leaf_id)
+        lhs.item_index < rhs.item_index
+    else
+        lhs.leaf_id < rhs.leaf_id;
+}
+
+fn lessTargetPostingDeltaRecord(_: void, lhs: TargetPostingDeltaRecord, rhs: TargetPostingDeltaRecord) bool {
+    return if (lhs.posting_id == rhs.posting_id)
+        lhs.record.sequence < rhs.record.sequence
+    else
+        lhs.posting_id < rhs.posting_id;
 }
 
 fn lessBatchInsertItemVectorId(items: []const hbc_runtime.BatchInsertItem, lhs: usize, rhs: usize) bool {
@@ -5237,6 +6281,24 @@ fn batchWritesAreUniqueAndCoveredByDeletes(
         if (!deleted.contains(item.vector_id)) return false;
         if (seen.contains(item.vector_id)) return false;
         try seen.put(alloc, item.vector_id, {});
+    }
+    return true;
+}
+
+fn batchWritesAreUniqueAndAbsent(self: anytype, txn: anytype, writes: []const hbc_runtime.BatchInsertItem) !bool {
+    if (writes.len == 0) return true;
+
+    var seen = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer seen.deinit(self.alloc);
+    try seen.ensureTotalCapacity(self.alloc, @intCast(writes.len));
+    for (writes) |item| {
+        if (seen.contains(item.vector_id)) return false;
+        try seen.put(self.alloc, item.vector_id, {});
+        _ = self.getVecLeaf(txn, item.vector_id) catch |err| {
+            if (isNotFoundGeneric(err)) continue;
+            return err;
+        };
+        return false;
     }
     return true;
 }
@@ -5605,7 +6667,9 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
         defer leaf.deinit(self.alloc);
         const group_len = group_end - group_start;
         const post_group_member_count = leaf.members.len + group_len;
-        const max_batched_overflow_members: usize = @max(@as(usize, self.config.leaf_size) * 4, @as(usize, self.config.leaf_size) + 1);
+        const leaf_size: usize = @intCast(self.config.leaf_size);
+        const max_batched_overflow_multiplier: usize = if (options.bulk_ingest and options.defer_leaf_splits_to_posting_maintenance) 8 else 4;
+        const max_batched_overflow_members: usize = @max(leaf_size * max_batched_overflow_multiplier, leaf_size + 1);
         if (group_len < 2 or !leaf.is_leaf or post_group_member_count > max_batched_overflow_members) {
             for (prepared[group_start..group_end]) |entry| {
                 const item = items[entry.item_index];
@@ -5628,6 +6692,18 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
             added_member_ids[j] = items[entry.item_index].vector_id;
         }
         const old_len = try posting.PostingStore.appendMembers(self.alloc, &leaf, added_member_ids);
+        if (shouldWritePostingBaseDelta(self)) {
+            const delta_records = try self.alloc.alloc(posting.PostingDeltaRecord, added_member_ids.len);
+            defer self.alloc.free(delta_records);
+            for (added_member_ids, 0..) |member_id, offset| {
+                delta_records[offset] = .{
+                    .sequence = postingDeltaSequence(leaf.posting_state.mutation_version, offset),
+                    .op = .insert,
+                    .vector_id = member_id,
+                };
+            }
+            try shadowAppendPostingDeltas(self, txn, leaf.id, delta_records);
+        }
 
         const added_vectors = try self.alloc.alloc(f32, group_len * dims);
         defer self.alloc.free(added_vectors);
@@ -5703,10 +6779,14 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
             const save_start = now_fn();
             var save_options = options;
             save_options.suppress_quantized_payload_persist = defer_leaf_split;
-            try saveExistingNodeBodyWithAddedVectorsOptions(self, txn, &leaf, added_vectors, group_len, save_options, now_fn_u64_adapter(now_fn), elapsed_fn_u64_adapter(elapsed_fn));
+            if (defer_leaf_split and shouldUseBaseDeltaAsCanonicalPosting(self)) {
+                try saveDeferredBaseDeltaLeafMutationState(self, txn, &leaf);
+            } else {
+                try saveExistingNodeBodyWithAddedVectorsOptions(self, txn, &leaf, added_vectors, group_len, save_options, now_fn_u64_adapter(now_fn), elapsed_fn_u64_adapter(elapsed_fn));
+                self.write_profile.save_node_calls += 1;
+                grouped_node_body_writes += 1;
+            }
             self.write_profile.save_node_ns += elapsed_fn(save_start);
-            self.write_profile.save_node_calls += 1;
-            grouped_node_body_writes += 1;
         }
         if (updated_range) |*range| {
             if (range_changed and !leaf_overflows) {
@@ -5724,7 +6804,9 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
         }
         if (leaf_overflows) {
             if (defer_leaf_split) {
-                try recordDeferredOversizedLeaf(self, leaf.id);
+                if (shouldRecordDeferredOversizedLeafForSplitFinish(options)) {
+                    try recordDeferredOversizedLeaf(self, leaf.id);
+                }
                 for (prepared[group_start..group_end]) |entry| {
                     try self.putVecLeaf(txn, items[entry.item_index].vector_id, leaf.id);
                 }
@@ -5932,6 +7014,172 @@ pub fn bulkBuildPreparedInputsTxnOptions(
     self.write_profile.bulk_build_tree_ns += elapsed_fn(build_start);
     self.metadata.root_node = built.node_id;
     self.metadata.active_count = @intCast(inputs.len);
+}
+
+pub fn bulkBuildExternalSequentialWithMetadataOptions(
+    self: anytype,
+    count: usize,
+    options: bulk_build.BulkBuildOptions,
+    now_fn: fn () u64,
+    elapsed_fn: fn (u64) u64,
+) !void {
+    if (count == 0) return;
+
+    var batch = try self.beginRuntimeBatchTxn();
+    errdefer batch.abort();
+    try bulkBuildExternalSequentialTxnOptions(self, &batch, count, options, now_fn, elapsed_fn);
+    try finalizeWriteTxnOptions(self, &batch, .{}, now_fn, elapsed_fn);
+    const commit_start = now_fn();
+    const publishing = beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
+    try batch.commit();
+    self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
+    finishPublishSearchStateIfSupported(self, publishing);
+}
+
+pub fn bulkBuildExternalSequentialTxnOptions(
+    self: anytype,
+    txn: anytype,
+    count: usize,
+    options: bulk_build.BulkBuildOptions,
+    now_fn: fn () u64,
+    elapsed_fn: fn (u64) u64,
+) !void {
+    if (count == 0) return;
+    if (!options.skip_vector_store) return error.InvalidArgument;
+    if (!indexHasExternalVectorLoader(self)) return error.InvalidArgument;
+
+    try self.bindTxnLike(txn);
+    const empty_inputs: []const bulk_build.PreparedBulkBuildInput = &.{};
+    try self.prepareEmptyPreparedBulkBuild(txn, empty_inputs);
+
+    const dims: usize = @intCast(self.config.dims);
+    const leaf_size = @max(@as(usize, 1), self.config.leaf_size);
+    const target_leaf_size = leaf_size;
+    const leaf_count = std.math.divCeil(usize, count, target_leaf_size) catch unreachable;
+    var current = try self.alloc.alloc(BuiltBulkNode, leaf_count);
+    var current_count: usize = 0;
+    var current_owned = true;
+    errdefer if (current_owned) {
+        for (current[0..current_count]) |*node| node.deinit(self.alloc);
+        self.alloc.free(current);
+    };
+
+    const scratch_capacity = @min(count, @max(leaf_size, @as(usize, 4096)));
+    const vector_ids = try self.alloc.alloc(u64, scratch_capacity);
+    defer self.alloc.free(vector_ids);
+    const transformed = try self.alloc.alloc(f32, scratch_capacity * dims);
+    defer self.alloc.free(transformed);
+    var inputs = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, leaf_size);
+    defer self.alloc.free(inputs);
+
+    const build_start = now_fn();
+    switch (options.algo orelse self.config.bulk_build_algo) {
+        .hilbert_seeded => {
+            const Entry = struct {
+                vector_id: u64,
+                embedding: []const u8,
+            };
+
+            const hilbert = try self.getHilbert();
+            const embedding_len = hilbert.byteLen();
+            var entries = try self.alloc.alloc(Entry, count);
+            defer self.alloc.free(entries);
+            const embeddings = try self.alloc.alloc(u8, count * embedding_len);
+            defer self.alloc.free(embeddings);
+            const coords = try self.alloc.alloc(u32, hilbert.dimension);
+            defer self.alloc.free(coords);
+
+            var offset: usize = 0;
+            while (offset < count) {
+                const group_size = @min(scratch_capacity, count - offset);
+                for (0..group_size) |i| {
+                    const vector_id: u64 = @intCast(offset + i + 1);
+                    vector_ids[i] = vector_id;
+                }
+                try loadTransformedVectorIdsIntoMatrix(self, txn, vector_ids[0..group_size], transformed[0 .. group_size * dims], .{});
+                for (0..group_size) |i| {
+                    const entry_index = offset + i;
+                    const embedding = embeddings[entry_index * embedding_len ..][0..embedding_len];
+                    try hilbert.encodeVecBytesInto(transformed[i * dims ..][0..dims], coords, embedding);
+                    entries[entry_index] = .{
+                        .vector_id = vector_ids[i],
+                        .embedding = embedding,
+                    };
+                }
+                offset += group_size;
+            }
+
+            std.mem.sort(Entry, entries, {}, struct {
+                fn lessThan(_: void, a: Entry, b: Entry) bool {
+                    return std.mem.order(u8, a.embedding, b.embedding) == .lt;
+                }
+            }.lessThan);
+
+            var entry_offset: usize = 0;
+            while (entry_offset < count) {
+                const group_size = @min(target_leaf_size, count - entry_offset);
+                for (0..group_size) |i| vector_ids[i] = entries[entry_offset + i].vector_id;
+                try loadTransformedVectorIdsIntoMatrix(self, txn, vector_ids[0..group_size], transformed[0 .. group_size * dims], .{});
+                for (0..group_size) |i| {
+                    inputs[i] = .{
+                        .vector_id = vector_ids[i],
+                        .vector = &.{},
+                        .transformed = transformed[i * dims ..][0..dims],
+                        .metadata = "",
+                    };
+                }
+                current[current_count] = try buildBulkLeaf(self, txn, self.nextNodeId(), inputs[0..group_size], 0, 0);
+                current_count += 1;
+                entry_offset += group_size;
+            }
+        },
+        .doc_key_seeded => {
+            var offset: usize = 0;
+            while (offset < count) {
+                const group_size = @min(target_leaf_size, count - offset);
+                for (0..group_size) |i| {
+                    const vector_id: u64 = @intCast(offset + i + 1);
+                    vector_ids[i] = vector_id;
+                }
+                try loadTransformedVectorIdsIntoMatrix(self, txn, vector_ids[0..group_size], transformed[0 .. group_size * dims], .{});
+                for (0..group_size) |i| {
+                    inputs[i] = .{
+                        .vector_id = vector_ids[i],
+                        .vector = &.{},
+                        .transformed = transformed[i * dims ..][0..dims],
+                        .metadata = "",
+                    };
+                }
+                current[current_count] = try buildBulkLeaf(self, txn, self.nextNodeId(), inputs[0..group_size], 0, 0);
+                current_count += 1;
+                offset += group_size;
+            }
+        },
+        .recursive, .kmeans => return error.InvalidArgument,
+    }
+
+    var built = if (current_count == 1) blk: {
+        const root = current[0];
+        const cloned = BuiltBulkNode{
+            .node_id = root.node_id,
+            .centroid = try self.alloc.dupe(f32, root.centroid),
+            .range = if (root.range) |range| try range.clone(self.alloc) else null,
+            .level = root.level,
+            .member_count = root.member_count,
+        };
+        for (current[0..current_count]) |*node| node.deinit(self.alloc);
+        self.alloc.free(current);
+        current_owned = false;
+        break :blk cloned;
+    } else blk: {
+        current_owned = false;
+        break :blk try buildBulkParentLevels(self, txn, current, current_count);
+    };
+    defer built.deinit(self.alloc);
+    self.write_profile.bulk_build_tree_ns += elapsed_fn(build_start);
+    self.metadata.root_node = built.node_id;
+    self.metadata.active_count = @intCast(count);
 }
 
 pub fn bulkBuildWithMetadataTxnOptions(
@@ -6297,6 +7545,108 @@ pub fn splitVectorSet(
     };
 }
 
+fn capacityBalanceLeafSplitToMaxMembers(
+    self: anytype,
+    vectors: *const vec.Set,
+    ids: []const u64,
+    split: *SplitResult,
+    max_members: usize,
+) !void {
+    if (max_members == 0 or ids.len > max_members * 2) return;
+    if (split.g1.len <= max_members and split.g2.len <= max_members) return;
+
+    const count = ids.len;
+    const target_left_count = if (split.g1.len > max_members)
+        max_members
+    else
+        count - max_members;
+    if (target_left_count == 0 or target_left_count >= count) return;
+
+    const offsets = try self.alloc.alloc(usize, count);
+    defer self.alloc.free(offsets);
+    const margins = try self.alloc.alloc(f32, count);
+    defer self.alloc.free(margins);
+    const assignments = try self.alloc.alloc(u64, count);
+    defer self.alloc.free(assignments);
+
+    const spherical = self.config.metric == .cosine;
+    var inv_left_norm: f32 = 1;
+    var inv_right_norm: f32 = 1;
+    if (spherical) {
+        const ln = vec.norm(split.c1);
+        if (ln != 0) inv_left_norm = 1.0 / ln;
+        const rn = vec.norm(split.c2);
+        if (rn != 0) inv_right_norm = 1.0 / rn;
+    }
+
+    for (0..count) |i| {
+        offsets[i] = i;
+        const v = vectors.atConst(i);
+        const left_dist = if (spherical)
+            -vec.dot(v, split.c1) * inv_left_norm
+        else if (self.config.metric == .inner_product)
+            -vec.dot(v, split.c1)
+        else
+            vec.l2SquaredDistance(v, split.c1);
+        const right_dist = if (spherical)
+            -vec.dot(v, split.c2) * inv_right_norm
+        else if (self.config.metric == .inner_product)
+            -vec.dot(v, split.c2)
+        else
+            vec.l2SquaredDistance(v, split.c2);
+        margins[i] = left_dist - right_dist;
+    }
+    stableSortOffsetsByDistance(offsets, margins);
+
+    for (0..count) |i| assignments[i] = 1;
+    for (offsets[0..target_left_count]) |offset| assignments[offset] = 0;
+
+    const left_centroid = try self.alloc.alloc(f32, self.config.dims);
+    errdefer self.alloc.free(left_centroid);
+    const right_centroid = try self.alloc.alloc(f32, self.config.dims);
+    errdefer self.alloc.free(right_centroid);
+    calcPartitionCentroids(vectors, count, assignments, left_centroid, right_centroid);
+    if (self.config.metric == .cosine) {
+        _ = vec.normalize(left_centroid);
+        _ = vec.normalize(right_centroid);
+    }
+
+    const out_g1 = try self.alloc.alloc(u64, target_left_count);
+    errdefer self.alloc.free(out_g1);
+    const out_g2 = try self.alloc.alloc(u64, count - target_left_count);
+    errdefer self.alloc.free(out_g2);
+    var left_pos: usize = 0;
+    var right_pos: usize = 0;
+    for (assignments, 0..) |assignment, i| {
+        if (assignment == 0) {
+            out_g1[left_pos] = ids[i];
+            left_pos += 1;
+        } else {
+            out_g2[right_pos] = ids[i];
+            right_pos += 1;
+        }
+    }
+
+    self.alloc.free(split.c1);
+    self.alloc.free(split.g1);
+    self.alloc.free(split.c2);
+    self.alloc.free(split.g2);
+    split.* = if (out_g1.len >= out_g2.len)
+        .{
+            .c1 = left_centroid,
+            .g1 = out_g1,
+            .c2 = right_centroid,
+            .g2 = out_g2,
+        }
+    else
+        .{
+            .c1 = right_centroid,
+            .g1 = out_g2,
+            .c2 = left_centroid,
+            .g2 = out_g1,
+        };
+}
+
 pub fn maybeBuildKeyLocalLeafSplit(
     self: anytype,
     txn: anytype,
@@ -6368,9 +7718,15 @@ pub fn loadQuantized(self: anytype, txn: anytype, node_id: u64, is_root: bool, e
     var key_buf: [10]u8 = undefined;
     const data = try self.getNamespaced(txn, .quant, hbc.encodeQuantKey(&key_buf, node_id));
     var decoded = if (is_root)
-        hbc_runtime.QuantizedSet{ .nonquant = try proto.NonQuantizedVectorSet.decode(self.alloc, data) }
+        hbc_runtime.QuantizedSet{ .nonquant = proto.NonQuantizedVectorSet.decode(self.alloc, data) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.Corrupted,
+        } }
     else
-        hbc_runtime.QuantizedSet{ .rabit = try proto.RaBitQuantizedVectorSet.decode(self.alloc, data) };
+        hbc_runtime.QuantizedSet{ .rabit = proto.RaBitQuantizedVectorSet.decode(self.alloc, data) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.Corrupted,
+        } };
     errdefer decoded.deinit(self.alloc);
     try validateQuantizedSet(self, &decoded, expected_count);
     return decoded;
@@ -6411,7 +7767,11 @@ pub fn getQuantizedProfiled(
 
     const start = now_fn();
     const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
-        if (is_not_found(err) or err == error.Corrupted) return null;
+        if (is_not_found(err) or err == error.Corrupted) {
+            profile.quantized_cache_miss_ns += elapsed_fn(start);
+            profile.quantized_cache_misses += 1;
+            return null;
+        }
         return err;
     };
     const cached = try self.cacheQuantizedOwned(node_id, decoded);
@@ -6440,7 +7800,11 @@ fn loadQuantizedProfiledOwned(
 
     const start = now_fn();
     const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
-        if (is_not_found(err) or err == error.Corrupted) return null;
+        if (is_not_found(err) or err == error.Corrupted) {
+            profile.quantized_cache_miss_ns += elapsed_fn(start);
+            profile.quantized_cache_misses += 1;
+            return null;
+        }
         return err;
     };
     profile.quantized_cache_miss_ns += elapsed_fn(start);
@@ -6516,7 +7880,10 @@ pub fn refreshQuantizedWithOptions(
         self.write_profile.quantized_leaf_vector_load_ns += load_elapsed;
     } else {
         for (node.children, 0..) |child_id, i| {
-            var child = try loadNode(self, txn, child_id);
+            var child = if (shouldUseBaseDeltaAsCanonicalPosting(self))
+                try self.loadNodeFromStorage(txn, child_id)
+            else
+                try loadNode(self, txn, child_id);
             defer child.deinit(self.alloc);
             if (child.centroid.len == 0) {
                 @memset(vectors[i * dims ..][0..dims], 0);
@@ -6655,8 +8022,29 @@ pub fn batchInsertWithMetadataTxnOptions(
                     self.write_profile.noop_existing_skips += 1;
                     continue;
                 }
+                if (options.coalesce_leaf_writes and try existingVectorMatchesStoredVector(self, txn, item.vector_id, item.vector, previous_vector_storage)) {
+                    if (try tryCoalesceExistingVectorInLeafTxnOptions(
+                        self,
+                        txn,
+                        existing_leaf_id,
+                        item.vector_id,
+                        item.vector,
+                        item.metadata,
+                        effective_transformed,
+                        previous_vector_storage,
+                        previous_transformed_storage,
+                        &deferred_recompute_leaf_ids,
+                        &deferred_leaf_centroid_deltas,
+                        &deferred_ancestor_centroid_refresh_ids,
+                        options,
+                    )) {
+                        continue;
+                    }
+                }
                 const find_leaf_start = nowNsU64Fixed();
-                const allow_quantized_routing = if (@hasField(@TypeOf(options), "allow_quantized_routing"))
+                const allow_quantized_routing = if (shouldRouteExistingUpdatesByCentroidOnly(self))
+                    false
+                else if (@hasField(@TypeOf(options), "allow_quantized_routing"))
                     options.allow_quantized_routing
                 else
                     !options.centroid_only_routing;
@@ -7254,7 +8642,12 @@ fn buildBulkLeaf(
         .children = &.{},
         .members = members,
     };
-    try self.saveNodeBody(txn, &node);
+    const leaf_vectors = try self.alloc.alloc(f32, inputs.len * self.config.dims);
+    defer self.alloc.free(leaf_vectors);
+    for (inputs, 0..) |input, i| {
+        @memcpy(leaf_vectors[i * self.config.dims ..][0..self.config.dims], input.transformed);
+    }
+    try saveLeafNodeBodyWithKnownVectors(self, txn, &node, leaf_vectors, nowNsI128Fixed, elapsedSinceNsFixed);
     try self.putNodeSplitRange(txn, node_id, &range);
     self.alloc.free(members);
 

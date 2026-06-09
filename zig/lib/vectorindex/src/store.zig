@@ -203,6 +203,7 @@ pub const NamespaceBatch = struct {
         put: *const fn (*anyopaque, Namespace, []const u8, []const u8) anyerror!void,
         append_put: ?*const fn (*anyopaque, Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,
+        open_cursor: ?*const fn (Allocator, *anyopaque, Namespace) anyerror!Cursor = null,
     };
 
     pub fn abort(self: *NamespaceBatch) void {
@@ -230,6 +231,11 @@ pub const NamespaceBatch = struct {
 
     pub fn delete(self: *NamespaceBatch, namespace: Namespace, key: []const u8) !void {
         try self.vtable.delete(self.ptr, namespace, key);
+    }
+
+    pub fn openCursor(self: *NamespaceBatch, namespace: Namespace) !Cursor {
+        const open_cursor = self.vtable.open_cursor orelse return error.Unsupported;
+        return try open_cursor(self.allocator, self.ptr, namespace);
     }
 };
 
@@ -510,6 +516,10 @@ pub fn namespaceBatchFrom(
         fn delete(ptr: *anyopaque, namespace: Namespace, key: []const u8) anyerror!void {
             try unbox(ptr).handle.delete(try mapNamespace(namespace), key);
         }
+
+        fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: Namespace) anyerror!Cursor {
+            return try cursorFrom(alloc, try unbox(ptr).handle.openCursor(try mapNamespace(namespace)));
+        }
     };
 
     return .{
@@ -522,6 +532,7 @@ pub fn namespaceBatchFrom(
             .put = vt.put,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
+            .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
         },
     };
 }
@@ -672,6 +683,9 @@ test "failed commit keeps vectorindex namespace write handle abortable" {
 test "failed commit keeps vectorindex namespace batch handle abortable" {
     var shared = FailingCommitShared{};
     var batch = try namespaceBatchFrom(std.testing.allocator, FailingCommitHandle{ .shared = &shared }, Namespace, identityNamespace);
+
+    var cursor = try batch.openCursor(.nodes);
+    cursor.close();
 
     try std.testing.expectError(error.CommitFailed, batch.commit());
     try std.testing.expectEqual(@as(usize, 1), shared.commits);

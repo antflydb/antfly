@@ -39,6 +39,13 @@ pub const HBCConfig = struct {
     pub const CentroidDirectoryMode = enum {
         hbc,
         flat_rabitq,
+        two_level_rabitq,
+    };
+
+    pub const PostingStorageMode = enum {
+        packed_hbc,
+        shadow_base_delta,
+        base_delta,
     };
 
     storage_backend: StorageBackend = .lmdb,
@@ -71,9 +78,34 @@ pub const HBCConfig = struct {
     defer_page_mutation: bool = false,
     lazy_posting_maintenance: bool = false,
     auto_posting_maintenance_max_postings: usize = 0,
+    auto_posting_maintenance_fold_delta_tails: bool = true,
+    auto_posting_maintenance_min_delta_records_to_fold: usize = 64,
+    auto_posting_maintenance_min_tombstone_records_to_fold: usize = 16,
+    auto_posting_maintenance_min_delta_to_base_ratio_bps: u32 = 2500,
+    auto_posting_maintenance_max_delta_tail_postings: usize = std.math.maxInt(usize),
+    auto_posting_maintenance_min_dirty_postings: usize = 0,
+    auto_posting_maintenance_max_dirty_version_age: u64 = 0,
+    auto_posting_maintenance_min_delta_records_to_run: usize = 0,
+    auto_posting_maintenance_min_tombstone_records_to_run: usize = 0,
+    auto_posting_maintenance_min_delta_to_base_ratio_bps_to_run: u32 = 0,
+    auto_posting_maintenance_min_centroid_version_lag: u64 = 0,
+    auto_posting_maintenance_min_payload_version_lag: u64 = 0,
+    auto_posting_maintenance_max_layout_changes: usize = 0,
+    auto_posting_maintenance_split_full_postings: bool = false,
+    auto_posting_maintenance_min_overfull_postings_to_run: usize = 0,
+    auto_posting_maintenance_min_postings_at_capacity_to_run: usize = 0,
+    auto_posting_maintenance_max_boundary_reassignments: usize = 0,
+    auto_posting_maintenance_allow_overfull_reassignment: bool = false,
+    auto_posting_maintenance_max_overfull_reassignment_postings: usize = 0,
+    auto_posting_maintenance_max_over_capacity_reassignment_members: usize = 0,
+    auto_posting_maintenance_boundary_reassignment_min_improvement: f32 = 0.0,
     centroid_directory_mode: CentroidDirectoryMode = .hbc,
-    flat_centroid_block_size: usize = 8192,
+    posting_storage_mode: PostingStorageMode = .packed_hbc,
+    flat_centroid_block_size: usize = 128,
     flat_centroid_probe_count: usize = 0,
+    flat_centroid_block_probe_count: usize = 0,
+    max_posting_overlay_cache_bytes: usize = 8 * 1024 * 1024,
+    max_posting_overlay_cache_entry_bytes: usize = 0,
 };
 
 pub const StorageBackend = enum {

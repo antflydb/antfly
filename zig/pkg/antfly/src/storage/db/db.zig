@@ -365,8 +365,20 @@ const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const dense_catch_up_startup_cache_nodes_default: usize = 2048;
 const dense_catch_up_startup_cache_vectors_default: usize = 2048;
 const dense_posting_idle_default_max_postings_per_index: usize = 64;
+const dense_posting_idle_default_fold_delta_tails: bool = true;
+const dense_posting_idle_default_min_delta_records_to_fold: usize = 64;
+const dense_posting_idle_default_min_tombstone_records_to_fold: usize = 16;
+const dense_posting_idle_default_min_delta_to_base_ratio_bps: usize = 0;
+const dense_posting_idle_default_max_delta_tail_postings: usize = std.math.maxInt(usize) - 1;
 const dense_posting_idle_default_max_layout_changes_per_index: usize = 8;
+const dense_posting_idle_default_split_full_postings: bool = true;
+const dense_posting_idle_default_min_overfull_postings_to_run: usize = 1;
+const dense_posting_idle_default_min_postings_at_capacity_to_run: usize = 1;
 const dense_posting_idle_default_max_boundary_reassignments_per_index: usize = 64;
+const dense_posting_idle_default_max_indexes_per_run: usize = std.math.maxInt(usize) - 1;
+const dense_posting_idle_default_max_elapsed_ns: usize = 0;
+const dense_posting_idle_default_max_profiled_search_ns: u64 = 0;
+const dense_posting_idle_max_convergence_passes: usize = 1024;
 const applied_sequence_flush_interval_ns: u64 = 100 * std.time.ns_per_ms;
 
 fn backgroundRuntimeAllocator(fallback: Allocator) Allocator {
@@ -935,6 +947,12 @@ pub const BatchProfile = struct {
     hbc_posting_maintenance_split_postings: u64 = 0,
     hbc_posting_maintenance_merged_postings: u64 = 0,
     hbc_posting_maintenance_boundary_reassigned_vectors: u64 = 0,
+    hbc_posting_maintenance_boundary_reassignment_capacity_skips: u64 = 0,
+    hbc_posting_maintenance_boundary_reassignment_min_source_skips: u64 = 0,
+    hbc_posting_maintenance_boundary_reassignment_swap_moves: u64 = 0,
+    hbc_posting_maintenance_delta_fold_attempts: u64 = 0,
+    hbc_posting_maintenance_delta_fold_skipped: u64 = 0,
+    hbc_posting_maintenance_delta_fold_records: u64 = 0,
     hbc_posting_lazy_centroid_deferrals: u64 = 0,
     hbc_posting_lazy_payload_deferrals: u64 = 0,
     hbc_posting_lazy_ancestor_deferrals: u64 = 0,
@@ -1081,6 +1099,12 @@ fn addBatchProfile(total: *BatchProfile, delta: BatchProfile) void {
     total.hbc_posting_maintenance_split_postings += delta.hbc_posting_maintenance_split_postings;
     total.hbc_posting_maintenance_merged_postings += delta.hbc_posting_maintenance_merged_postings;
     total.hbc_posting_maintenance_boundary_reassigned_vectors += delta.hbc_posting_maintenance_boundary_reassigned_vectors;
+    total.hbc_posting_maintenance_boundary_reassignment_capacity_skips += delta.hbc_posting_maintenance_boundary_reassignment_capacity_skips;
+    total.hbc_posting_maintenance_boundary_reassignment_min_source_skips += delta.hbc_posting_maintenance_boundary_reassignment_min_source_skips;
+    total.hbc_posting_maintenance_boundary_reassignment_swap_moves += delta.hbc_posting_maintenance_boundary_reassignment_swap_moves;
+    total.hbc_posting_maintenance_delta_fold_attempts += delta.hbc_posting_maintenance_delta_fold_attempts;
+    total.hbc_posting_maintenance_delta_fold_skipped += delta.hbc_posting_maintenance_delta_fold_skipped;
+    total.hbc_posting_maintenance_delta_fold_records += delta.hbc_posting_maintenance_delta_fold_records;
     total.hbc_posting_lazy_centroid_deferrals += delta.hbc_posting_lazy_centroid_deferrals;
     total.hbc_posting_lazy_payload_deferrals += delta.hbc_posting_lazy_payload_deferrals;
     total.hbc_posting_lazy_ancestor_deferrals += delta.hbc_posting_lazy_ancestor_deferrals;
@@ -1162,6 +1186,12 @@ fn addHbcWriteProfileDelta(total: *BatchProfile, before: hbc_mod.WriteProfile, a
     total.hbc_posting_maintenance_split_postings += profileDelta(after.posting_maintenance_split_postings, before.posting_maintenance_split_postings);
     total.hbc_posting_maintenance_merged_postings += profileDelta(after.posting_maintenance_merged_postings, before.posting_maintenance_merged_postings);
     total.hbc_posting_maintenance_boundary_reassigned_vectors += profileDelta(after.posting_maintenance_boundary_reassigned_vectors, before.posting_maintenance_boundary_reassigned_vectors);
+    total.hbc_posting_maintenance_boundary_reassignment_capacity_skips += profileDelta(after.posting_maintenance_boundary_reassignment_capacity_skips, before.posting_maintenance_boundary_reassignment_capacity_skips);
+    total.hbc_posting_maintenance_boundary_reassignment_min_source_skips += profileDelta(after.posting_maintenance_boundary_reassignment_min_source_skips, before.posting_maintenance_boundary_reassignment_min_source_skips);
+    total.hbc_posting_maintenance_boundary_reassignment_swap_moves += profileDelta(after.posting_maintenance_boundary_reassignment_swap_moves, before.posting_maintenance_boundary_reassignment_swap_moves);
+    total.hbc_posting_maintenance_delta_fold_attempts += profileDelta(after.posting_maintenance_delta_fold_attempts, before.posting_maintenance_delta_fold_attempts);
+    total.hbc_posting_maintenance_delta_fold_skipped += profileDelta(after.posting_maintenance_delta_fold_skipped, before.posting_maintenance_delta_fold_skipped);
+    total.hbc_posting_maintenance_delta_fold_records += profileDelta(after.posting_maintenance_delta_fold_records, before.posting_maintenance_delta_fold_records);
     total.hbc_posting_lazy_centroid_deferrals += profileDelta(after.posting_lazy_centroid_deferrals, before.posting_lazy_centroid_deferrals);
     total.hbc_posting_lazy_payload_deferrals += profileDelta(after.posting_lazy_payload_deferrals, before.posting_lazy_payload_deferrals);
     total.hbc_posting_lazy_ancestor_deferrals += profileDelta(after.posting_lazy_ancestor_deferrals, before.posting_lazy_ancestor_deferrals);
@@ -1440,7 +1470,7 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
         },
     );
     std.log.info(
-        "antfly_bench_batch_hbc_posting writes={d} maintenance_scanned_nodes={d} maintenance_scanned_postings={d} maintenance_dirty_postings={d} maintenance_repaired_postings={d} maintenance_centroid_refreshed={d} maintenance_payload_refreshed={d} maintenance_ancestor_refresh_roots={d} maintenance_split_postings={d} maintenance_merged_postings={d} maintenance_boundary_reassigned_vectors={d} lazy_centroid_deferrals={d} lazy_payload_deferrals={d} lazy_ancestor_deferrals={d}",
+        "antfly_bench_batch_hbc_posting writes={d} maintenance_scanned_nodes={d} maintenance_scanned_postings={d} maintenance_dirty_postings={d} maintenance_repaired_postings={d} maintenance_centroid_refreshed={d} maintenance_payload_refreshed={d} maintenance_ancestor_refresh_roots={d} maintenance_split_postings={d} maintenance_merged_postings={d} maintenance_boundary_reassigned_vectors={d} maintenance_boundary_reassignment_capacity_skips={d} maintenance_boundary_reassignment_min_source_skips={d} maintenance_boundary_reassignment_swap_moves={d} maintenance_delta_fold_attempts={d} maintenance_delta_fold_skipped={d} maintenance_delta_fold_records={d} lazy_centroid_deferrals={d} lazy_payload_deferrals={d} lazy_ancestor_deferrals={d}",
         .{
             req.writes.len,
             profile.hbc_posting_maintenance_scanned_nodes,
@@ -1453,6 +1483,12 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
             profile.hbc_posting_maintenance_split_postings,
             profile.hbc_posting_maintenance_merged_postings,
             profile.hbc_posting_maintenance_boundary_reassigned_vectors,
+            profile.hbc_posting_maintenance_boundary_reassignment_capacity_skips,
+            profile.hbc_posting_maintenance_boundary_reassignment_min_source_skips,
+            profile.hbc_posting_maintenance_boundary_reassignment_swap_moves,
+            profile.hbc_posting_maintenance_delta_fold_attempts,
+            profile.hbc_posting_maintenance_delta_fold_skipped,
+            profile.hbc_posting_maintenance_delta_fold_records,
             profile.hbc_posting_lazy_centroid_deferrals,
             profile.hbc_posting_lazy_payload_deferrals,
             profile.hbc_posting_lazy_ancestor_deferrals,
@@ -2370,6 +2406,10 @@ pub const DB = struct {
     identity_visibility_summary_cache: ?doc_identity.VisibilitySummary = null,
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
+    dense_posting_maintenance_stats: types.DensePostingMaintenanceStats = .{},
+    profiled_dense_search_observations: AtomicU64 = AtomicU64.init(0),
+    profiled_dense_search_last_ns: AtomicU64 = AtomicU64.init(0),
+    profiled_dense_search_max_ns: AtomicU64 = AtomicU64.init(0),
 
     const engine_vtable = db_core.Engine.VTable{
         .batch = engineBatch,
@@ -3042,6 +3082,7 @@ pub const DB = struct {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
+        self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
         self.core.deinit();
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         self.async_context.deinit(self.runtime_alloc);
@@ -6938,18 +6979,82 @@ pub const DB = struct {
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
         try self.drainScheduledTextMerges();
-        _ = try self.runDensePostingMaintenanceForIdle();
+        try self.runDensePostingMaintenanceForIdleUntilStable();
         _ = try self.runLsmMaintenanceUntilIdle();
     }
 
     pub fn runDensePostingMaintenanceForIdle(self: *DB) !usize {
+        return (try self.runDensePostingMaintenanceForIdleProfiled()).total_steps;
+    }
+
+    const DensePostingMaintenanceJob = struct {
+        db: *DB,
+
+        fn run(ptr: *anyopaque) !void {
+            const job: *DensePostingMaintenanceJob = @ptrCast(@alignCast(ptr));
+            try job.db.runDensePostingMaintenanceForIdleUntilStable();
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const job: *DensePostingMaintenanceJob = @ptrCast(@alignCast(ptr));
+            job.db.runtime_alloc.destroy(job);
+        }
+    };
+
+    pub fn submitDensePostingMaintenanceForIdle(self: *DB) !void {
+        const job = try self.runtime_alloc.create(DensePostingMaintenanceJob);
+        errdefer self.runtime_alloc.destroy(job);
+        job.* = .{ .db = self };
+        try self.backend_runtime.durable_jobs.submit(.{
+            .owner_id = self.backend_owner_id,
+            .class = .maintenance,
+            .ptr = job,
+            .run = DensePostingMaintenanceJob.run,
+            .deinit = DensePostingMaintenanceJob.deinit,
+        });
+    }
+
+    fn runDensePostingMaintenanceForIdleUntilStable(self: *DB) !void {
+        var passes: usize = 0;
+        while (passes < dense_posting_idle_max_convergence_passes) : (passes += 1) {
+            const result = try self.runDensePostingMaintenanceForIdleProfiled();
+            if (!result.needs_more_work) return;
+            if (result.stoppedBySchedulerBudget()) return;
+            if (result.total_steps == 0) return;
+        }
+        return error.RunUntilIdleDidNotConverge;
+    }
+
+    pub fn runDensePostingMaintenanceForIdleProfiled(self: *DB) !index_manager_mod.IndexManager.DensePostingMaintenanceResult {
         lockApply(self);
         defer self.core.unlockApply();
-        return try self.core.index_manager.runDensePostingMaintenance(.{
+        const query_guardrail_threshold_ns = densePostingIdleMaxProfiledSearchNs();
+        if (query_guardrail_threshold_ns != 0 and
+            self.profiled_dense_search_last_ns.load(.monotonic) > query_guardrail_threshold_ns)
+        {
+            const result: index_manager_mod.IndexManager.DensePostingMaintenanceResult = .{
+                .stopped_by_query_guardrail = true,
+            };
+            self.recordDensePostingMaintenanceResult(result);
+            return result;
+        }
+        const result = try self.core.index_manager.runDensePostingMaintenanceProfiled(.{
             .max_postings_per_index = densePostingIdleMaxPostingsPerIndex(),
+            .fold_delta_tails = densePostingIdleFoldDeltaTails(),
+            .min_delta_records_to_fold = densePostingIdleMinDeltaRecordsToFold(),
+            .min_tombstone_records_to_fold = densePostingIdleMinTombstoneRecordsToFold(),
+            .min_delta_to_base_ratio_bps = @intCast(densePostingIdleMinDeltaToBaseRatioBps()),
+            .max_delta_tail_postings = densePostingIdleMaxDeltaTailPostings(),
             .max_layout_changes_per_index = densePostingIdleMaxLayoutChangesPerIndex(),
+            .split_full_postings = densePostingIdleSplitFullPostings(),
+            .min_overfull_postings_to_run = densePostingIdleMinOverfullPostingsToRun(),
+            .min_postings_at_capacity_to_run = densePostingIdleMinPostingsAtCapacityToRun(),
             .max_boundary_reassignments_per_index = densePostingIdleMaxBoundaryReassignmentsPerIndex(),
+            .max_indexes = densePostingIdleMaxIndexesPerRun(),
+            .max_elapsed_ns = @intCast(densePostingIdleMaxElapsedNs()),
         });
+        self.recordDensePostingMaintenanceResult(result);
+        return result;
     }
 
     fn flushAppliedSequencesForIdle(self: *DB) !void {
@@ -7762,13 +7867,47 @@ pub const DB = struct {
         };
     }
 
-    fn dbHbcPostingStats(backlog: hbc_mod.PostingBacklogStats, profile: hbc_mod.WriteProfile) types.HbcPostingStats {
+    fn dbHbcPostingStats(
+        config: hbc_mod.HBCConfig,
+        backlog: hbc_mod.PostingBacklogStats,
+        profile: hbc_mod.WriteProfile,
+    ) types.HbcPostingStats {
         return .{
+            .policy_max_postings = @intCast(config.auto_posting_maintenance_max_postings),
+            .policy_fold_delta_tails = config.auto_posting_maintenance_fold_delta_tails,
+            .policy_min_delta_records_to_fold = @intCast(config.auto_posting_maintenance_min_delta_records_to_fold),
+            .policy_min_tombstone_records_to_fold = @intCast(config.auto_posting_maintenance_min_tombstone_records_to_fold),
+            .policy_min_delta_to_base_ratio_bps = config.auto_posting_maintenance_min_delta_to_base_ratio_bps,
+            .policy_max_delta_tail_postings = @intCast(config.auto_posting_maintenance_max_delta_tail_postings),
+            .policy_min_dirty_postings = @intCast(config.auto_posting_maintenance_min_dirty_postings),
+            .policy_max_dirty_version_age = config.auto_posting_maintenance_max_dirty_version_age,
+            .policy_min_delta_records_to_run = @intCast(config.auto_posting_maintenance_min_delta_records_to_run),
+            .policy_min_tombstone_records_to_run = @intCast(config.auto_posting_maintenance_min_tombstone_records_to_run),
+            .policy_min_delta_to_base_ratio_bps_to_run = config.auto_posting_maintenance_min_delta_to_base_ratio_bps_to_run,
+            .policy_min_centroid_version_lag = config.auto_posting_maintenance_min_centroid_version_lag,
+            .policy_min_payload_version_lag = config.auto_posting_maintenance_min_payload_version_lag,
+            .policy_max_layout_changes = @intCast(config.auto_posting_maintenance_max_layout_changes),
+            .policy_split_full_postings = config.auto_posting_maintenance_split_full_postings,
+            .policy_min_overfull_postings_to_run = @intCast(config.auto_posting_maintenance_min_overfull_postings_to_run),
+            .policy_min_postings_at_capacity_to_run = @intCast(config.auto_posting_maintenance_min_postings_at_capacity_to_run),
+            .policy_max_boundary_reassignments = @intCast(config.auto_posting_maintenance_max_boundary_reassignments),
+            .policy_allow_overfull_reassignment = config.auto_posting_maintenance_allow_overfull_reassignment,
+            .policy_max_overfull_reassignment_postings = @intCast(config.auto_posting_maintenance_max_overfull_reassignment_postings),
+            .policy_max_over_capacity_reassignment_members = @intCast(config.auto_posting_maintenance_max_over_capacity_reassignment_members),
             .scanned_nodes = backlog.scanned_nodes,
             .scanned_postings = backlog.scanned_postings,
             .dirty_postings = backlog.dirty_postings,
             .centroid_dirty_postings = backlog.centroid_dirty_postings,
             .payload_dirty_postings = backlog.payload_dirty_postings,
+            .min_dirty_mutation_version = backlog.min_dirty_mutation_version,
+            .max_dirty_version_age = backlog.max_dirty_version_age,
+            .delta_tail_postings = backlog.delta_tail_postings,
+            .max_delta_tail_records = backlog.max_delta_tail_records,
+            .max_tombstone_tail_records = backlog.max_tombstone_tail_records,
+            .max_delta_to_base_ratio_bps = backlog.max_delta_to_base_ratio_bps,
+            .overfull_postings = backlog.overfull_postings,
+            .postings_at_capacity = backlog.postings_at_capacity,
+            .max_over_capacity_members = backlog.max_over_capacity_members,
             .max_centroid_version_lag = backlog.max_centroid_version_lag,
             .max_payload_version_lag = backlog.max_payload_version_lag,
             .max_mutation_version = backlog.max_mutation_version,
@@ -7783,6 +7922,12 @@ pub const DB = struct {
             .maintenance_split_postings = profile.posting_maintenance_split_postings,
             .maintenance_merged_postings = profile.posting_maintenance_merged_postings,
             .maintenance_boundary_reassigned_vectors = profile.posting_maintenance_boundary_reassigned_vectors,
+            .maintenance_boundary_reassignment_capacity_skips = profile.posting_maintenance_boundary_reassignment_capacity_skips,
+            .maintenance_boundary_reassignment_min_source_skips = profile.posting_maintenance_boundary_reassignment_min_source_skips,
+            .maintenance_boundary_reassignment_swap_moves = profile.posting_maintenance_boundary_reassignment_swap_moves,
+            .maintenance_delta_fold_attempts = profile.posting_maintenance_delta_fold_attempts,
+            .maintenance_delta_fold_skipped = profile.posting_maintenance_delta_fold_skipped,
+            .maintenance_delta_fold_records = profile.posting_maintenance_delta_fold_records,
             .lazy_centroid_deferrals = profile.posting_lazy_centroid_deferrals,
             .lazy_payload_deferrals = profile.posting_lazy_payload_deferrals,
             .lazy_ancestor_deferrals = profile.posting_lazy_ancestor_deferrals,
@@ -8433,6 +8578,55 @@ pub const DB = struct {
         return self.doc_set_planning_stats.snapshot();
     }
 
+    fn recordDensePostingMaintenanceResult(self: *DB, result: index_manager_mod.IndexManager.DensePostingMaintenanceResult) void {
+        var current = self.dense_posting_maintenance_stats;
+        current.runs += 1;
+        current.total_steps += @intCast(result.total_steps);
+        current.total_scanned_indexes += @intCast(result.scanned_indexes);
+        current.total_attempted_indexes += @intCast(result.attempted_indexes);
+        current.total_skipped_clean_indexes += @intCast(result.skipped_clean_indexes);
+        current.total_limit_reached_indexes += @intCast(result.limit_reached_indexes);
+        current.total_elapsed_ns += result.elapsed_ns;
+        current.max_elapsed_ns = @max(current.max_elapsed_ns, result.elapsed_ns);
+        if (result.needs_more_work) current.limit_reached_runs += 1;
+        if (result.stopped_by_max_indexes) current.budget_stop_max_indexes_runs += 1;
+        if (result.stopped_by_elapsed_budget) current.budget_stop_elapsed_runs += 1;
+        if (result.stopped_by_resource_budget) current.budget_stop_resource_runs += 1;
+        if (result.stopped_by_query_guardrail) current.query_guardrail_stop_runs += 1;
+        current.last_steps = @intCast(result.total_steps);
+        current.last_scanned_indexes = @intCast(result.scanned_indexes);
+        current.last_attempted_indexes = @intCast(result.attempted_indexes);
+        current.last_skipped_clean_indexes = @intCast(result.skipped_clean_indexes);
+        current.last_limit_reached_indexes = @intCast(result.limit_reached_indexes);
+        current.last_remaining_dirty_postings = result.remaining_dirty_postings;
+        current.last_remaining_delta_tail_postings = result.remaining_delta_tail_postings;
+        current.last_remaining_overfull_postings = result.remaining_overfull_postings;
+        current.last_remaining_postings_at_capacity = result.remaining_postings_at_capacity;
+        current.last_max_remaining_over_capacity_members = result.max_remaining_over_capacity_members;
+        current.last_elapsed_ns = result.elapsed_ns;
+        current.last_needs_more_work = result.needs_more_work;
+        current.last_stopped_by_max_indexes = result.stopped_by_max_indexes;
+        current.last_stopped_by_elapsed_budget = result.stopped_by_elapsed_budget;
+        current.last_stopped_by_resource_budget = result.stopped_by_resource_budget;
+        current.last_stopped_by_query_guardrail = result.stopped_by_query_guardrail;
+        self.dense_posting_maintenance_stats = current;
+    }
+
+    fn recordProfiledDenseSearch(self: *DB, profile: db_query_search.DenseSearchProfile) void {
+        _ = self.profiled_dense_search_observations.fetchAdd(1, .monotonic);
+        self.profiled_dense_search_last_ns.store(profile.total_ns, .monotonic);
+        atomicMaxU64(&self.profiled_dense_search_max_ns, profile.total_ns);
+    }
+
+    fn snapshotDensePostingMaintenanceStats(self: *DB) types.DensePostingMaintenanceStats {
+        var result = self.dense_posting_maintenance_stats;
+        result.profiled_dense_search_observations = self.profiled_dense_search_observations.load(.monotonic);
+        result.profiled_dense_search_last_ns = self.profiled_dense_search_last_ns.load(.monotonic);
+        result.profiled_dense_search_max_ns = self.profiled_dense_search_max_ns.load(.monotonic);
+        result.query_guardrail_threshold_ns = densePostingIdleMaxProfiledSearchNs();
+        return result;
+    }
+
     const DocIdentityCoverage = struct {
         scanned_primary_docs: u64 = 0,
         primary_docs_missing_ordinals: u64 = 0,
@@ -8575,6 +8769,7 @@ pub const DB = struct {
             .term_doc_freq_cache_hits = term_doc_freq_cache_hits,
             .term_doc_freq_cache_misses = term_doc_freq_cache_misses,
             .async_indexing = async_indexing,
+            .dense_posting_maintenance = self.snapshotDensePostingMaintenanceStats(),
         };
     }
 
@@ -8650,7 +8845,7 @@ pub const DB = struct {
                         item.node_count = hbc_stats.node_count;
                         item.root_node = hbc_stats.root_node;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
-                        item.hbc_posting = dbHbcPostingStats(try entry.index.postingBacklogStats(), entry.index.getWriteProfile());
+                        item.hbc_posting = dbHbcPostingStats(entry.index.config, try entry.index.postingBacklogStats(), entry.index.getWriteProfile());
                         if (async_indexing.dense_catch_up.active) {
                             item.catch_up_active = true;
                             item.backfill_active = true;
@@ -8763,6 +8958,7 @@ pub const DB = struct {
                 break :blk total;
             },
             .async_indexing = async_indexing,
+            .dense_posting_maintenance = self.snapshotDensePostingMaintenanceStats(),
         };
     }
 
@@ -10018,12 +10214,16 @@ pub const DB = struct {
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         if (self.canUsePublishedDenseSearch(req)) {
-            return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
+            const result = try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
+            self.recordProfiledDenseSearch(result.profile);
+            return result;
         }
         {
             lockApplyShared(self);
             defer self.core.unlockApplyShared();
-            return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
+            const result = try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
+            self.recordProfiledDenseSearch(result.profile);
+            return result;
         }
     }
 
@@ -14742,8 +14942,19 @@ var dense_catch_up_startup_max_chunk_bytes_cache = AtomicU64.init(0);
 var dense_catch_up_startup_cache_nodes_cache = std.atomic.Value(usize).init(0);
 var dense_catch_up_startup_cache_vectors_cache = std.atomic.Value(usize).init(0);
 var dense_posting_idle_max_postings_cache = std.atomic.Value(usize).init(0);
+var dense_posting_idle_fold_delta_tails_cache = std.atomic.Value(usize).init(0);
+var dense_posting_idle_min_delta_records_to_fold_cache = std.atomic.Value(usize).init(0);
+var dense_posting_idle_min_tombstone_records_to_fold_cache = std.atomic.Value(usize).init(0);
+var dense_posting_idle_min_delta_to_base_ratio_bps_cache = std.atomic.Value(usize).init(0);
+var dense_posting_idle_max_delta_tail_postings_cache = std.atomic.Value(usize).init(0);
 var dense_posting_idle_max_layout_changes_cache = std.atomic.Value(usize).init(0);
+var dense_posting_idle_split_full_postings_cache = std.atomic.Value(usize).init(0);
+var dense_posting_idle_min_overfull_postings_cache = std.atomic.Value(usize).init(0);
+var dense_posting_idle_min_postings_at_capacity_cache = std.atomic.Value(usize).init(0);
 var dense_posting_idle_max_boundary_reassignments_cache = std.atomic.Value(usize).init(0);
+var dense_posting_idle_max_indexes_cache = std.atomic.Value(usize).init(0);
+var dense_posting_idle_max_elapsed_ns_cache = std.atomic.Value(usize).init(0);
+var dense_posting_idle_max_profiled_search_ns_cache = AtomicU64.init(0);
 
 fn cachedEnvUsize(cache: *std.atomic.Value(usize), name: [:0]const u8, default_value: usize) usize {
     const cached = cache.load(.acquire);
@@ -14880,6 +15091,46 @@ fn densePostingIdleMaxPostingsPerIndex() usize {
     );
 }
 
+fn densePostingIdleFoldDeltaTails() bool {
+    return cachedEnvUsize(
+        &dense_posting_idle_fold_delta_tails_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_FOLD_DELTA_TAILS",
+        if (dense_posting_idle_default_fold_delta_tails) 1 else 0,
+    ) != 0;
+}
+
+fn densePostingIdleMinDeltaRecordsToFold() usize {
+    return cachedEnvUsize(
+        &dense_posting_idle_min_delta_records_to_fold_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_MIN_DELTA_RECORDS_TO_FOLD",
+        dense_posting_idle_default_min_delta_records_to_fold,
+    );
+}
+
+fn densePostingIdleMinTombstoneRecordsToFold() usize {
+    return cachedEnvUsize(
+        &dense_posting_idle_min_tombstone_records_to_fold_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_MIN_TOMBSTONE_RECORDS_TO_FOLD",
+        dense_posting_idle_default_min_tombstone_records_to_fold,
+    );
+}
+
+fn densePostingIdleMinDeltaToBaseRatioBps() usize {
+    return cachedEnvUsize(
+        &dense_posting_idle_min_delta_to_base_ratio_bps_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_MIN_DELTA_TO_BASE_RATIO_BPS",
+        dense_posting_idle_default_min_delta_to_base_ratio_bps,
+    );
+}
+
+fn densePostingIdleMaxDeltaTailPostings() usize {
+    return cachedEnvUsize(
+        &dense_posting_idle_max_delta_tail_postings_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_MAX_DELTA_TAIL_POSTINGS",
+        dense_posting_idle_default_max_delta_tail_postings,
+    );
+}
+
 fn densePostingIdleMaxLayoutChangesPerIndex() usize {
     return cachedEnvUsize(
         &dense_posting_idle_max_layout_changes_cache,
@@ -14888,11 +15139,59 @@ fn densePostingIdleMaxLayoutChangesPerIndex() usize {
     );
 }
 
+fn densePostingIdleSplitFullPostings() bool {
+    return cachedEnvUsize(
+        &dense_posting_idle_split_full_postings_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_SPLIT_FULL_POSTINGS",
+        if (dense_posting_idle_default_split_full_postings) 1 else 0,
+    ) != 0;
+}
+
+fn densePostingIdleMinOverfullPostingsToRun() usize {
+    return cachedEnvUsize(
+        &dense_posting_idle_min_overfull_postings_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_MIN_OVERFULL_POSTINGS_TO_RUN",
+        dense_posting_idle_default_min_overfull_postings_to_run,
+    );
+}
+
+fn densePostingIdleMinPostingsAtCapacityToRun() usize {
+    return cachedEnvUsize(
+        &dense_posting_idle_min_postings_at_capacity_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_MIN_POSTINGS_AT_CAPACITY_TO_RUN",
+        dense_posting_idle_default_min_postings_at_capacity_to_run,
+    );
+}
+
 fn densePostingIdleMaxBoundaryReassignmentsPerIndex() usize {
     return cachedEnvUsize(
         &dense_posting_idle_max_boundary_reassignments_cache,
         "ANTFLY_DENSE_POSTING_IDLE_MAX_BOUNDARY_REASSIGNMENTS_PER_INDEX",
         dense_posting_idle_default_max_boundary_reassignments_per_index,
+    );
+}
+
+fn densePostingIdleMaxIndexesPerRun() usize {
+    return cachedEnvUsize(
+        &dense_posting_idle_max_indexes_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_MAX_INDEXES_PER_RUN",
+        dense_posting_idle_default_max_indexes_per_run,
+    );
+}
+
+fn densePostingIdleMaxElapsedNs() usize {
+    return cachedEnvUsize(
+        &dense_posting_idle_max_elapsed_ns_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_MAX_ELAPSED_NS",
+        dense_posting_idle_default_max_elapsed_ns,
+    );
+}
+
+fn densePostingIdleMaxProfiledSearchNs() u64 {
+    return cachedEnvU64(
+        &dense_posting_idle_max_profiled_search_ns_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_MAX_PROFILED_SEARCH_NS",
+        dense_posting_idle_default_max_profiled_search_ns,
     );
 }
 
@@ -28074,7 +28373,7 @@ test "db runUntilIdle drains lazy dense posting maintenance" {
     try db.addIndex(.{
         .name = "dv_v1",
         .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false,\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0}",
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false,\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0,\"auto_posting_maintenance_max_delta_tail_postings\":13,\"auto_posting_maintenance_min_dirty_postings\":3,\"auto_posting_maintenance_max_dirty_version_age\":5,\"auto_posting_maintenance_min_centroid_version_lag\":7,\"auto_posting_maintenance_min_payload_version_lag\":11,\"auto_posting_maintenance_max_layout_changes\":2,\"auto_posting_maintenance_max_boundary_reassignments\":4}",
     });
 
     try db.batch(.{
@@ -28102,6 +28401,31 @@ test "db runUntilIdle drains lazy dense posting maintenance" {
         const stats = try db.diagnosticStats(alloc);
         defer types.freeDBStats(alloc, stats);
         try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].hbc_posting.dirty_postings);
+        try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].hbc_posting.policy_max_postings);
+        try std.testing.expectEqual(@as(u64, 13), stats.indexes[0].hbc_posting.policy_max_delta_tail_postings);
+        try std.testing.expectEqual(@as(u64, 3), stats.indexes[0].hbc_posting.policy_min_dirty_postings);
+        try std.testing.expectEqual(@as(u64, 5), stats.indexes[0].hbc_posting.policy_max_dirty_version_age);
+        try std.testing.expectEqual(@as(u64, 7), stats.indexes[0].hbc_posting.policy_min_centroid_version_lag);
+        try std.testing.expectEqual(@as(u64, 11), stats.indexes[0].hbc_posting.policy_min_payload_version_lag);
+        try std.testing.expectEqual(@as(u64, 2), stats.indexes[0].hbc_posting.policy_max_layout_changes);
+        try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].hbc_posting.policy_max_boundary_reassignments);
+        try std.testing.expect(!stats.indexes[0].hbc_posting.policy_allow_overfull_reassignment);
+    }
+
+    {
+        const skipped = try db.core.index_manager.runDensePostingMaintenanceProfiled(.{ .max_indexes = 0 });
+        try std.testing.expectEqual(@as(usize, 0), skipped.total_steps);
+        try std.testing.expectEqual(@as(usize, 0), skipped.scanned_indexes);
+        try std.testing.expectEqual(@as(usize, 0), skipped.attempted_indexes);
+        try std.testing.expect(skipped.stopped_by_max_indexes);
+        db.recordDensePostingMaintenanceResult(skipped);
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].hbc_posting.dirty_postings);
+        try std.testing.expectEqual(@as(u64, 0), stats.dense_posting_maintenance.last_steps);
+        try std.testing.expectEqual(@as(u64, 0), stats.dense_posting_maintenance.last_scanned_indexes);
+        try std.testing.expect(stats.dense_posting_maintenance.last_stopped_by_max_indexes);
+        try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.budget_stop_max_indexes_runs);
     }
 
     try db.runUntilIdle();
@@ -28111,7 +28435,676 @@ test "db runUntilIdle drains lazy dense posting maintenance" {
         defer types.freeDBStats(alloc, stats);
         try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].hbc_posting.dirty_postings);
         try std.testing.expect(stats.indexes[0].hbc_posting.maintenance_repaired_postings > 0);
+        try std.testing.expect(stats.dense_posting_maintenance.runs >= 2);
+        try std.testing.expect(stats.dense_posting_maintenance.last_steps > 0);
+        try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.budget_stop_max_indexes_runs);
     }
+}
+
+test "db runUntilIdle repeats bounded dense posting maintenance while debt remains" {
+    const alloc = std.testing.allocator;
+
+    dense_posting_idle_max_postings_cache.store(2, .release);
+    defer dense_posting_idle_max_postings_cache.store(0, .release);
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"leaf_size\":2,\"use_quantization\":false,\"lazy_posting_maintenance\":true}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:0", .value = "{\"embedding\":[0.0,0.0]}" },
+            .{ .key = "doc:1", .value = "{\"embedding\":[1.0,0.0]}" },
+            .{ .key = "doc:2", .value = "{\"embedding\":[2.0,0.0]}" },
+            .{ .key = "doc:3", .value = "{\"embedding\":[3.0,0.0]}" },
+            .{ .key = "doc:4", .value = "{\"embedding\":[4.0,0.0]}" },
+            .{ .key = "doc:5", .value = "{\"embedding\":[5.0,0.0]}" },
+            .{ .key = "doc:6", .value = "{\"embedding\":[6.0,0.0]}" },
+            .{ .key = "doc:7", .value = "{\"embedding\":[7.0,0.0]}" },
+            .{ .key = "doc:8", .value = "{\"embedding\":[8.0,0.0]}" },
+            .{ .key = "doc:9", .value = "{\"embedding\":[9.0,0.0]}" },
+            .{ .key = "doc:10", .value = "{\"embedding\":[10.0,0.0]}" },
+            .{ .key = "doc:11", .value = "{\"embedding\":[11.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    {
+        const entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        var marked: usize = 0;
+        var node_id: u64 = 1;
+        while (node_id <= entry.index.metadata.node_count) : (node_id += 1) {
+            var node = entry.index.loadNode(&txn, node_id) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            defer node.deinit(alloc);
+            if (!node.is_leaf or node.members.len == 0) continue;
+            try node.ensureUnbacked(alloc);
+            node.posting_state.noteMembersChanged(node.members.len);
+            try entry.index.saveNode(&txn, &node);
+            marked += 1;
+        }
+        try entry.index.finishWriteTxn(&txn);
+        try std.testing.expect(marked > 2);
+
+        node_id = 1;
+        while (node_id <= entry.index.metadata.node_count) : (node_id += 1) {
+            entry.index.invalidateNodeCache(node_id);
+        }
+    }
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expect(stats.indexes[0].hbc_posting.dirty_postings > 1);
+    }
+
+    const first = try db.runDensePostingMaintenanceForIdleProfiled();
+    try std.testing.expect(first.needs_more_work);
+    try std.testing.expectEqual(@as(usize, 1), first.limit_reached_indexes);
+    try std.testing.expect(first.remaining_dirty_postings > 0);
+    try std.testing.expect(first.total_steps > 0);
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expect(stats.indexes[0].hbc_posting.dirty_postings > 0);
+        try std.testing.expect(stats.dense_posting_maintenance.last_needs_more_work);
+        try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.last_limit_reached_indexes);
+        try std.testing.expect(stats.dense_posting_maintenance.last_remaining_dirty_postings > 0);
+        try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.limit_reached_runs);
+    }
+
+    {
+        const entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        var marked: usize = 0;
+        var node_id: u64 = 1;
+        while (node_id <= entry.index.metadata.node_count) : (node_id += 1) {
+            var node = entry.index.loadNode(&txn, node_id) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            defer node.deinit(alloc);
+            if (!node.is_leaf or node.members.len == 0) continue;
+            try node.ensureUnbacked(alloc);
+            node.posting_state.noteMembersChanged(node.members.len);
+            try entry.index.saveNode(&txn, &node);
+            marked += 1;
+        }
+        try entry.index.finishWriteTxn(&txn);
+        try std.testing.expect(marked > 2);
+
+        node_id = 1;
+        while (node_id <= entry.index.metadata.node_count) : (node_id += 1) {
+            entry.index.invalidateNodeCache(node_id);
+        }
+    }
+
+    const runs_before_idle = blk: {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expect(stats.indexes[0].hbc_posting.dirty_postings > 1);
+        break :blk stats.dense_posting_maintenance.runs;
+    };
+
+    try db.runUntilIdle();
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].hbc_posting.dirty_postings);
+        try std.testing.expect(!stats.dense_posting_maintenance.last_needs_more_work);
+        try std.testing.expectEqual(@as(u64, 0), stats.dense_posting_maintenance.last_remaining_dirty_postings);
+        try std.testing.expect(stats.dense_posting_maintenance.runs > runs_before_idle + 1);
+        try std.testing.expect(stats.dense_posting_maintenance.limit_reached_runs >= 1);
+    }
+}
+
+test "db dense posting maintenance respects resource manager budget" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.dense_posting_maintenance_working_set)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 1,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &resource_manager });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false,\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" },
+            .{ .key = "doc:b", .value = "{\"embedding\":[3.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    {
+        const entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try entry.index.loadNode(&txn, entry.index.metadata.root_node);
+        defer root.deinit(alloc);
+        try root.ensureUnbacked(alloc);
+        root.posting_state.noteMembersChanged(root.members.len);
+        try entry.index.saveNode(&txn, &root);
+        try entry.index.finishWriteTxn(&txn);
+        entry.index.invalidateNodeCache(root.id);
+    }
+
+    const result = try db.runDensePostingMaintenanceForIdleProfiled();
+    try std.testing.expect(result.stopped_by_resource_budget);
+    try std.testing.expectEqual(@as(usize, 0), result.total_steps);
+
+    const resource_stats = resource_manager.sliceStats(.dense_posting_maintenance_working_set);
+    try std.testing.expect(resource_stats.hard_limit_rejections > 0);
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].hbc_posting.dirty_postings);
+    try std.testing.expect(stats.dense_posting_maintenance.last_stopped_by_resource_budget);
+    try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.budget_stop_resource_runs);
+}
+
+test "db dense posting maintenance respects elapsed budget" {
+    const alloc = std.testing.allocator;
+
+    dense_posting_idle_max_elapsed_ns_cache.store(2, .release);
+    defer dense_posting_idle_max_elapsed_ns_cache.store(0, .release);
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false,\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v2",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false,\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" },
+            .{ .key = "doc:b", .value = "{\"embedding\":[3.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    for ([_][]const u8{ "dv_v1", "dv_v2" }) |index_name| {
+        const entry = db.core.denseIndex(index_name) orelse return error.IndexNotFound;
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try entry.index.loadNode(&txn, entry.index.metadata.root_node);
+        defer root.deinit(alloc);
+        try root.ensureUnbacked(alloc);
+        root.posting_state.noteMembersChanged(root.members.len);
+        try entry.index.saveNode(&txn, &root);
+        try entry.index.finishWriteTxn(&txn);
+        entry.index.invalidateNodeCache(root.id);
+    }
+
+    const result = try db.runDensePostingMaintenanceForIdleProfiled();
+    try std.testing.expect(result.stopped_by_elapsed_budget);
+    try std.testing.expect(result.scanned_indexes < 2);
+    try std.testing.expect(result.elapsed_ns > 0);
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.dense_posting_maintenance.last_stopped_by_elapsed_budget);
+    try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.budget_stop_elapsed_runs);
+    try std.testing.expect(stats.dense_posting_maintenance.last_elapsed_ns > 0);
+}
+
+test "db dense posting maintenance thresholds clean at-capacity layout debt" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"leaf_size\":2,\"use_quantization\":false}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" },
+            .{ .key = "doc:b", .value = "{\"embedding\":[3.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].hbc_posting.dirty_postings);
+        try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].hbc_posting.postings_at_capacity);
+    }
+
+    const skipped = try db.core.index_manager.runDensePostingMaintenanceProfiled(.{
+        .split_full_postings = true,
+        .min_postings_at_capacity_to_run = 2,
+    });
+    try std.testing.expectEqual(@as(usize, 1), skipped.scanned_indexes);
+    try std.testing.expectEqual(@as(usize, 0), skipped.attempted_indexes);
+    try std.testing.expectEqual(@as(usize, 1), skipped.skipped_clean_indexes);
+    try std.testing.expectEqual(@as(usize, 0), skipped.total_steps);
+
+    const attempted = try db.core.index_manager.runDensePostingMaintenanceProfiled(.{
+        .split_full_postings = true,
+        .min_postings_at_capacity_to_run = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), attempted.scanned_indexes);
+    try std.testing.expectEqual(@as(usize, 1), attempted.attempted_indexes);
+}
+
+test "db dense posting maintenance thresholds and caps base delta tail folding" {
+    const alloc = std.testing.allocator;
+
+    dense_posting_idle_min_delta_records_to_fold_cache.store(100, .release);
+    defer dense_posting_idle_min_delta_records_to_fold_cache.store(0, .release);
+    dense_posting_idle_min_tombstone_records_to_fold_cache.store(100, .release);
+    defer dense_posting_idle_min_tombstone_records_to_fold_cache.store(0, .release);
+    dense_posting_idle_min_delta_to_base_ratio_bps_cache.store(1, .release);
+    defer dense_posting_idle_min_delta_to_base_ratio_bps_cache.store(0, .release);
+    dense_posting_idle_max_delta_tail_postings_cache.store(17, .release);
+    defer dense_posting_idle_max_delta_tail_postings_cache.store(0, .release);
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"leaf_size\":16,\"use_quantization\":false,\"posting_storage_mode\":\"base_delta\",\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:b", .value = "{\"embedding\":[3.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].hbc_posting.delta_tail_postings);
+        try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].hbc_posting.max_delta_tail_records);
+    }
+
+    const thresholded = try db.runDensePostingMaintenanceForIdleProfiled();
+    try std.testing.expectEqual(@as(u64, 1), thresholded.remaining_delta_tail_postings);
+    try std.testing.expect(!thresholded.needs_more_work);
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].hbc_posting.delta_tail_postings);
+        try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.last_remaining_delta_tail_postings);
+        try std.testing.expect(!stats.dense_posting_maintenance.last_needs_more_work);
+    }
+
+    dense_posting_idle_max_delta_tail_postings_cache.store(1, .release);
+    const capped = try db.runDensePostingMaintenanceForIdleProfiled();
+    try std.testing.expect(capped.total_steps > 0);
+    try std.testing.expectEqual(@as(u64, 0), capped.remaining_delta_tail_postings);
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].hbc_posting.delta_tail_postings);
+        try std.testing.expect(stats.indexes[0].hbc_posting.maintenance_delta_fold_records > 0);
+        try std.testing.expectEqual(@as(u64, 0), stats.dense_posting_maintenance.last_remaining_delta_tail_postings);
+    }
+}
+
+test "db dense posting maintenance query guardrail skips after slow profiled dense search" {
+    const alloc = std.testing.allocator;
+
+    dense_posting_idle_max_profiled_search_ns_cache.store(2, .release);
+    defer dense_posting_idle_max_profiled_search_ns_cache.store(0, .release);
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false,\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" },
+            .{ .key = "doc:b", .value = "{\"embedding\":[3.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    {
+        const entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try entry.index.loadNode(&txn, entry.index.metadata.root_node);
+        defer root.deinit(alloc);
+        try root.ensureUnbacked(alloc);
+        root.posting_state.noteMembersChanged(root.members.len);
+        try entry.index.saveNode(&txn, &root);
+        try entry.index.finishWriteTxn(&txn);
+        entry.index.invalidateNodeCache(root.id);
+    }
+
+    var dense = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+    }, .{ .vector = &.{ 1.0, 0.0 }, .k = 1 });
+    defer dense.result.deinit();
+    try std.testing.expect(dense.profile.total_ns > 1);
+
+    const result = try db.runDensePostingMaintenanceForIdleProfiled();
+    try std.testing.expect(result.stopped_by_query_guardrail);
+    try std.testing.expectEqual(@as(usize, 0), result.scanned_indexes);
+    try std.testing.expectEqual(@as(usize, 0), result.attempted_indexes);
+    try std.testing.expectEqual(@as(usize, 0), result.total_steps);
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].hbc_posting.dirty_postings);
+    try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.profiled_dense_search_observations);
+    try std.testing.expectEqual(dense.profile.total_ns, stats.dense_posting_maintenance.profiled_dense_search_last_ns);
+    try std.testing.expect(stats.dense_posting_maintenance.profiled_dense_search_max_ns >= dense.profile.total_ns);
+    try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.query_guardrail_threshold_ns);
+    try std.testing.expect(stats.dense_posting_maintenance.last_stopped_by_query_guardrail);
+    try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.query_guardrail_stop_runs);
+}
+
+test "db dense posting maintenance can submit through backend runtime" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false,\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" },
+            .{ .key = "doc:b", .value = "{\"embedding\":[3.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    {
+        const entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try entry.index.loadNode(&txn, entry.index.metadata.root_node);
+        defer root.deinit(alloc);
+        try root.ensureUnbacked(alloc);
+        root.posting_state.noteMembersChanged(root.members.len);
+        try entry.index.saveNode(&txn, &root);
+        try entry.index.finishWriteTxn(&txn);
+        entry.index.invalidateNodeCache(root.id);
+    }
+
+    try db.submitDensePostingMaintenanceForIdle();
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].hbc_posting.dirty_postings);
+    try std.testing.expect(stats.dense_posting_maintenance.last_steps > 0);
+}
+
+test "db dense posting maintenance can submit through threaded backend runtime" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .io_threaded },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false,\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" },
+            .{ .key = "doc:b", .value = "{\"embedding\":[3.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    {
+        const entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try entry.index.loadNode(&txn, entry.index.metadata.root_node);
+        defer root.deinit(alloc);
+        try root.ensureUnbacked(alloc);
+        root.posting_state.noteMembersChanged(root.members.len);
+        try entry.index.saveNode(&txn, &root);
+        try entry.index.finishWriteTxn(&txn);
+        entry.index.invalidateNodeCache(root.id);
+    }
+
+    try db.submitDensePostingMaintenanceForIdle();
+    runtime.ptr().durable_jobs.drainOwner(db.backend_owner_id);
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].hbc_posting.dirty_postings);
+    try std.testing.expect(stats.dense_posting_maintenance.last_steps > 0);
+}
+
+test "db dense posting maintenance submitted through backend runtime respects resource manager budget" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.dense_posting_maintenance_working_set)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 1,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .resource_manager = &resource_manager,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false,\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" },
+            .{ .key = "doc:b", .value = "{\"embedding\":[3.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    {
+        const entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try entry.index.loadNode(&txn, entry.index.metadata.root_node);
+        defer root.deinit(alloc);
+        try root.ensureUnbacked(alloc);
+        root.posting_state.noteMembersChanged(root.members.len);
+        try entry.index.saveNode(&txn, &root);
+        try entry.index.finishWriteTxn(&txn);
+        entry.index.invalidateNodeCache(root.id);
+    }
+
+    try db.submitDensePostingMaintenanceForIdle();
+
+    const resource_stats = resource_manager.sliceStats(.dense_posting_maintenance_working_set);
+    try std.testing.expect(resource_stats.hard_limit_rejections > 0);
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].hbc_posting.dirty_postings);
+    try std.testing.expect(stats.dense_posting_maintenance.last_stopped_by_resource_budget);
+    try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.budget_stop_resource_runs);
+}
+
+test "db dense posting maintenance submitted through threaded backend runtime respects resource manager budget" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.dense_posting_maintenance_working_set)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 1,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .io_threaded },
+        .resource_manager = &resource_manager,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false,\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" },
+            .{ .key = "doc:b", .value = "{\"embedding\":[3.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    {
+        const entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try entry.index.loadNode(&txn, entry.index.metadata.root_node);
+        defer root.deinit(alloc);
+        try root.ensureUnbacked(alloc);
+        root.posting_state.noteMembersChanged(root.members.len);
+        try entry.index.saveNode(&txn, &root);
+        try entry.index.finishWriteTxn(&txn);
+        entry.index.invalidateNodeCache(root.id);
+    }
+
+    try db.submitDensePostingMaintenanceForIdle();
+    runtime.ptr().durable_jobs.drainOwner(db.backend_owner_id);
+
+    const resource_stats = resource_manager.sliceStats(.dense_posting_maintenance_working_set);
+    try std.testing.expect(resource_stats.hard_limit_rejections > 0);
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].hbc_posting.dirty_postings);
+    try std.testing.expect(stats.dense_posting_maintenance.last_stopped_by_resource_budget);
+    try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.budget_stop_resource_runs);
 }
 
 test "db leased enrichment worker materializes chunk artifacts" {

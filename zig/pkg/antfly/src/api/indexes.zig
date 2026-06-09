@@ -912,11 +912,46 @@ fn aggregateHbcCacheStats(dst: *db_mod.types.HbcCacheStats, src: db_mod.types.Hb
 }
 
 fn aggregateHbcPostingStats(dst: *db_mod.types.HbcPostingStats, src: db_mod.types.HbcPostingStats) void {
+    dst.policy_max_postings = @max(dst.policy_max_postings, src.policy_max_postings);
+    dst.policy_fold_delta_tails = dst.policy_fold_delta_tails or src.policy_fold_delta_tails;
+    dst.policy_min_delta_records_to_fold = @max(dst.policy_min_delta_records_to_fold, src.policy_min_delta_records_to_fold);
+    dst.policy_min_tombstone_records_to_fold = @max(dst.policy_min_tombstone_records_to_fold, src.policy_min_tombstone_records_to_fold);
+    dst.policy_min_delta_to_base_ratio_bps = @max(dst.policy_min_delta_to_base_ratio_bps, src.policy_min_delta_to_base_ratio_bps);
+    dst.policy_max_delta_tail_postings = @max(dst.policy_max_delta_tail_postings, src.policy_max_delta_tail_postings);
+    dst.policy_min_dirty_postings = @max(dst.policy_min_dirty_postings, src.policy_min_dirty_postings);
+    dst.policy_max_dirty_version_age = @max(dst.policy_max_dirty_version_age, src.policy_max_dirty_version_age);
+    dst.policy_min_delta_records_to_run = @max(dst.policy_min_delta_records_to_run, src.policy_min_delta_records_to_run);
+    dst.policy_min_tombstone_records_to_run = @max(dst.policy_min_tombstone_records_to_run, src.policy_min_tombstone_records_to_run);
+    dst.policy_min_delta_to_base_ratio_bps_to_run = @max(dst.policy_min_delta_to_base_ratio_bps_to_run, src.policy_min_delta_to_base_ratio_bps_to_run);
+    dst.policy_min_centroid_version_lag = @max(dst.policy_min_centroid_version_lag, src.policy_min_centroid_version_lag);
+    dst.policy_min_payload_version_lag = @max(dst.policy_min_payload_version_lag, src.policy_min_payload_version_lag);
+    dst.policy_max_layout_changes = @max(dst.policy_max_layout_changes, src.policy_max_layout_changes);
+    dst.policy_split_full_postings = dst.policy_split_full_postings or src.policy_split_full_postings;
+    dst.policy_min_overfull_postings_to_run = @max(dst.policy_min_overfull_postings_to_run, src.policy_min_overfull_postings_to_run);
+    dst.policy_min_postings_at_capacity_to_run = @max(dst.policy_min_postings_at_capacity_to_run, src.policy_min_postings_at_capacity_to_run);
+    dst.policy_max_boundary_reassignments = @max(dst.policy_max_boundary_reassignments, src.policy_max_boundary_reassignments);
+    dst.policy_allow_overfull_reassignment = dst.policy_allow_overfull_reassignment or src.policy_allow_overfull_reassignment;
+    dst.policy_max_overfull_reassignment_postings = @max(dst.policy_max_overfull_reassignment_postings, src.policy_max_overfull_reassignment_postings);
+    dst.policy_max_over_capacity_reassignment_members = @max(dst.policy_max_over_capacity_reassignment_members, src.policy_max_over_capacity_reassignment_members);
     dst.scanned_nodes += src.scanned_nodes;
     dst.scanned_postings += src.scanned_postings;
     dst.dirty_postings += src.dirty_postings;
     dst.centroid_dirty_postings += src.centroid_dirty_postings;
     dst.payload_dirty_postings += src.payload_dirty_postings;
+    dst.min_dirty_mutation_version = if (dst.min_dirty_mutation_version == 0)
+        src.min_dirty_mutation_version
+    else if (src.min_dirty_mutation_version == 0)
+        dst.min_dirty_mutation_version
+    else
+        @min(dst.min_dirty_mutation_version, src.min_dirty_mutation_version);
+    dst.max_dirty_version_age = @max(dst.max_dirty_version_age, src.max_dirty_version_age);
+    dst.delta_tail_postings += src.delta_tail_postings;
+    dst.max_delta_tail_records = @max(dst.max_delta_tail_records, src.max_delta_tail_records);
+    dst.max_tombstone_tail_records = @max(dst.max_tombstone_tail_records, src.max_tombstone_tail_records);
+    dst.max_delta_to_base_ratio_bps = @max(dst.max_delta_to_base_ratio_bps, src.max_delta_to_base_ratio_bps);
+    dst.overfull_postings += src.overfull_postings;
+    dst.postings_at_capacity += src.postings_at_capacity;
+    dst.max_over_capacity_members = @max(dst.max_over_capacity_members, src.max_over_capacity_members);
     dst.max_centroid_version_lag = @max(dst.max_centroid_version_lag, src.max_centroid_version_lag);
     dst.max_payload_version_lag = @max(dst.max_payload_version_lag, src.max_payload_version_lag);
     dst.max_mutation_version = @max(dst.max_mutation_version, src.max_mutation_version);
@@ -931,6 +966,12 @@ fn aggregateHbcPostingStats(dst: *db_mod.types.HbcPostingStats, src: db_mod.type
     dst.maintenance_split_postings += src.maintenance_split_postings;
     dst.maintenance_merged_postings += src.maintenance_merged_postings;
     dst.maintenance_boundary_reassigned_vectors += src.maintenance_boundary_reassigned_vectors;
+    dst.maintenance_boundary_reassignment_capacity_skips += src.maintenance_boundary_reassignment_capacity_skips;
+    dst.maintenance_boundary_reassignment_min_source_skips += src.maintenance_boundary_reassignment_min_source_skips;
+    dst.maintenance_boundary_reassignment_swap_moves += src.maintenance_boundary_reassignment_swap_moves;
+    dst.maintenance_delta_fold_attempts += src.maintenance_delta_fold_attempts;
+    dst.maintenance_delta_fold_skipped += src.maintenance_delta_fold_skipped;
+    dst.maintenance_delta_fold_records += src.maintenance_delta_fold_records;
     dst.lazy_centroid_deferrals += src.lazy_centroid_deferrals;
     dst.lazy_payload_deferrals += src.lazy_payload_deferrals;
     dst.lazy_ancestor_deferrals += src.lazy_ancestor_deferrals;
@@ -1570,7 +1611,49 @@ fn appendHbcCacheStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u
 
 fn appendHbcPostingStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), stats: db_mod.types.HbcPostingStats) !void {
     try out.append(alloc, '{');
-    try out.appendSlice(alloc, "\"scanned_nodes\":");
+    try out.appendSlice(alloc, "\"policy_max_postings\":");
+    try appendIntValue(alloc, out, stats.policy_max_postings);
+    try out.appendSlice(alloc, ",\"policy_fold_delta_tails\":");
+    try out.appendSlice(alloc, if (stats.policy_fold_delta_tails) "true" else "false");
+    try out.appendSlice(alloc, ",\"policy_min_delta_records_to_fold\":");
+    try appendIntValue(alloc, out, stats.policy_min_delta_records_to_fold);
+    try out.appendSlice(alloc, ",\"policy_min_tombstone_records_to_fold\":");
+    try appendIntValue(alloc, out, stats.policy_min_tombstone_records_to_fold);
+    try out.appendSlice(alloc, ",\"policy_min_delta_to_base_ratio_bps\":");
+    try appendIntValue(alloc, out, stats.policy_min_delta_to_base_ratio_bps);
+    try out.appendSlice(alloc, ",\"policy_max_delta_tail_postings\":");
+    try appendIntValue(alloc, out, stats.policy_max_delta_tail_postings);
+    try out.appendSlice(alloc, ",\"policy_min_dirty_postings\":");
+    try appendIntValue(alloc, out, stats.policy_min_dirty_postings);
+    try out.appendSlice(alloc, ",\"policy_max_dirty_version_age\":");
+    try appendIntValue(alloc, out, stats.policy_max_dirty_version_age);
+    try out.appendSlice(alloc, ",\"policy_min_delta_records_to_run\":");
+    try appendIntValue(alloc, out, stats.policy_min_delta_records_to_run);
+    try out.appendSlice(alloc, ",\"policy_min_tombstone_records_to_run\":");
+    try appendIntValue(alloc, out, stats.policy_min_tombstone_records_to_run);
+    try out.appendSlice(alloc, ",\"policy_min_delta_to_base_ratio_bps_to_run\":");
+    try appendIntValue(alloc, out, stats.policy_min_delta_to_base_ratio_bps_to_run);
+    try out.appendSlice(alloc, ",\"policy_min_centroid_version_lag\":");
+    try appendIntValue(alloc, out, stats.policy_min_centroid_version_lag);
+    try out.appendSlice(alloc, ",\"policy_min_payload_version_lag\":");
+    try appendIntValue(alloc, out, stats.policy_min_payload_version_lag);
+    try out.appendSlice(alloc, ",\"policy_max_layout_changes\":");
+    try appendIntValue(alloc, out, stats.policy_max_layout_changes);
+    try out.appendSlice(alloc, ",\"policy_split_full_postings\":");
+    try out.appendSlice(alloc, if (stats.policy_split_full_postings) "true" else "false");
+    try out.appendSlice(alloc, ",\"policy_min_overfull_postings_to_run\":");
+    try appendIntValue(alloc, out, stats.policy_min_overfull_postings_to_run);
+    try out.appendSlice(alloc, ",\"policy_min_postings_at_capacity_to_run\":");
+    try appendIntValue(alloc, out, stats.policy_min_postings_at_capacity_to_run);
+    try out.appendSlice(alloc, ",\"policy_max_boundary_reassignments\":");
+    try appendIntValue(alloc, out, stats.policy_max_boundary_reassignments);
+    try out.appendSlice(alloc, ",\"policy_allow_overfull_reassignment\":");
+    try out.appendSlice(alloc, if (stats.policy_allow_overfull_reassignment) "true" else "false");
+    try out.appendSlice(alloc, ",\"policy_max_overfull_reassignment_postings\":");
+    try appendIntValue(alloc, out, stats.policy_max_overfull_reassignment_postings);
+    try out.appendSlice(alloc, ",\"policy_max_over_capacity_reassignment_members\":");
+    try appendIntValue(alloc, out, stats.policy_max_over_capacity_reassignment_members);
+    try out.appendSlice(alloc, ",\"scanned_nodes\":");
     try appendIntValue(alloc, out, stats.scanned_nodes);
     try out.appendSlice(alloc, ",\"scanned_postings\":");
     try appendIntValue(alloc, out, stats.scanned_postings);
@@ -1580,6 +1663,24 @@ fn appendHbcPostingStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     try appendIntValue(alloc, out, stats.centroid_dirty_postings);
     try out.appendSlice(alloc, ",\"payload_dirty_postings\":");
     try appendIntValue(alloc, out, stats.payload_dirty_postings);
+    try out.appendSlice(alloc, ",\"min_dirty_mutation_version\":");
+    try appendIntValue(alloc, out, stats.min_dirty_mutation_version);
+    try out.appendSlice(alloc, ",\"max_dirty_version_age\":");
+    try appendIntValue(alloc, out, stats.max_dirty_version_age);
+    try out.appendSlice(alloc, ",\"delta_tail_postings\":");
+    try appendIntValue(alloc, out, stats.delta_tail_postings);
+    try out.appendSlice(alloc, ",\"max_delta_tail_records\":");
+    try appendIntValue(alloc, out, stats.max_delta_tail_records);
+    try out.appendSlice(alloc, ",\"max_tombstone_tail_records\":");
+    try appendIntValue(alloc, out, stats.max_tombstone_tail_records);
+    try out.appendSlice(alloc, ",\"max_delta_to_base_ratio_bps\":");
+    try appendIntValue(alloc, out, stats.max_delta_to_base_ratio_bps);
+    try out.appendSlice(alloc, ",\"overfull_postings\":");
+    try appendIntValue(alloc, out, stats.overfull_postings);
+    try out.appendSlice(alloc, ",\"postings_at_capacity\":");
+    try appendIntValue(alloc, out, stats.postings_at_capacity);
+    try out.appendSlice(alloc, ",\"max_over_capacity_members\":");
+    try appendIntValue(alloc, out, stats.max_over_capacity_members);
     try out.appendSlice(alloc, ",\"max_centroid_version_lag\":");
     try appendIntValue(alloc, out, stats.max_centroid_version_lag);
     try out.appendSlice(alloc, ",\"max_payload_version_lag\":");
@@ -1608,6 +1709,18 @@ fn appendHbcPostingStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     try appendIntValue(alloc, out, stats.maintenance_merged_postings);
     try out.appendSlice(alloc, ",\"maintenance_boundary_reassigned_vectors\":");
     try appendIntValue(alloc, out, stats.maintenance_boundary_reassigned_vectors);
+    try out.appendSlice(alloc, ",\"maintenance_boundary_reassignment_capacity_skips\":");
+    try appendIntValue(alloc, out, stats.maintenance_boundary_reassignment_capacity_skips);
+    try out.appendSlice(alloc, ",\"maintenance_boundary_reassignment_min_source_skips\":");
+    try appendIntValue(alloc, out, stats.maintenance_boundary_reassignment_min_source_skips);
+    try out.appendSlice(alloc, ",\"maintenance_boundary_reassignment_swap_moves\":");
+    try appendIntValue(alloc, out, stats.maintenance_boundary_reassignment_swap_moves);
+    try out.appendSlice(alloc, ",\"maintenance_delta_fold_attempts\":");
+    try appendIntValue(alloc, out, stats.maintenance_delta_fold_attempts);
+    try out.appendSlice(alloc, ",\"maintenance_delta_fold_skipped\":");
+    try appendIntValue(alloc, out, stats.maintenance_delta_fold_skipped);
+    try out.appendSlice(alloc, ",\"maintenance_delta_fold_records\":");
+    try appendIntValue(alloc, out, stats.maintenance_delta_fold_records);
     try out.appendSlice(alloc, ",\"lazy_centroid_deferrals\":");
     try appendIntValue(alloc, out, stats.lazy_centroid_deferrals);
     try out.appendSlice(alloc, ",\"lazy_payload_deferrals\":");
@@ -3207,4 +3320,134 @@ test "single embeddings index encoder keeps partial backfill active while indexe
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
+}
+
+test "hbc posting status includes layout debt counters and maintenance policy" {
+    var stats = db_mod.types.HbcPostingStats{};
+    aggregateHbcPostingStats(&stats, .{
+        .policy_max_postings = 8,
+        .policy_fold_delta_tails = true,
+        .policy_min_delta_records_to_fold = 32,
+        .policy_min_tombstone_records_to_fold = 7,
+        .policy_min_delta_to_base_ratio_bps = 2000,
+        .policy_max_delta_tail_postings = 128,
+        .policy_min_dirty_postings = 4,
+        .policy_max_dirty_version_age = 12,
+        .policy_min_delta_records_to_run = 16,
+        .policy_min_tombstone_records_to_run = 2,
+        .policy_min_delta_to_base_ratio_bps_to_run = 1000,
+        .policy_min_centroid_version_lag = 3,
+        .policy_min_payload_version_lag = 5,
+        .policy_max_layout_changes = 9,
+        .policy_split_full_postings = true,
+        .policy_min_overfull_postings_to_run = 2,
+        .policy_min_postings_at_capacity_to_run = 6,
+        .policy_max_boundary_reassignments = 10,
+        .policy_allow_overfull_reassignment = false,
+        .policy_max_overfull_reassignment_postings = 1,
+        .policy_max_over_capacity_reassignment_members = 3,
+        .min_dirty_mutation_version = 9,
+        .max_dirty_version_age = 4,
+        .delta_tail_postings = 2,
+        .max_delta_tail_records = 11,
+        .max_tombstone_tail_records = 3,
+        .max_delta_to_base_ratio_bps = 2500,
+        .overfull_postings = 1,
+        .postings_at_capacity = 5,
+        .max_over_capacity_members = 2,
+        .maintenance_boundary_reassignment_capacity_skips = 7,
+        .maintenance_boundary_reassignment_min_source_skips = 1,
+        .maintenance_boundary_reassignment_swap_moves = 2,
+        .maintenance_delta_fold_attempts = 4,
+        .maintenance_delta_fold_skipped = 3,
+        .maintenance_delta_fold_records = 8,
+    });
+    aggregateHbcPostingStats(&stats, .{
+        .policy_max_postings = 16,
+        .policy_fold_delta_tails = false,
+        .policy_min_delta_records_to_fold = 64,
+        .policy_min_tombstone_records_to_fold = 4,
+        .policy_min_delta_to_base_ratio_bps = 2500,
+        .policy_max_delta_tail_postings = 256,
+        .policy_min_dirty_postings = 2,
+        .policy_max_dirty_version_age = 7,
+        .policy_min_delta_records_to_run = 24,
+        .policy_min_tombstone_records_to_run = 3,
+        .policy_min_delta_to_base_ratio_bps_to_run = 1500,
+        .policy_min_centroid_version_lag = 2,
+        .policy_min_payload_version_lag = 8,
+        .policy_max_layout_changes = 5,
+        .policy_split_full_postings = false,
+        .policy_min_overfull_postings_to_run = 4,
+        .policy_min_postings_at_capacity_to_run = 3,
+        .policy_max_boundary_reassignments = 12,
+        .policy_allow_overfull_reassignment = true,
+        .policy_max_overfull_reassignment_postings = 5,
+        .policy_max_over_capacity_reassignment_members = 2,
+        .min_dirty_mutation_version = 6,
+        .max_dirty_version_age = 8,
+        .delta_tail_postings = 3,
+        .max_delta_tail_records = 5,
+        .max_tombstone_tail_records = 9,
+        .max_delta_to_base_ratio_bps = 5000,
+        .overfull_postings = 2,
+        .postings_at_capacity = 4,
+        .max_over_capacity_members = 6,
+        .maintenance_boundary_reassignment_capacity_skips = 10,
+        .maintenance_boundary_reassignment_min_source_skips = 4,
+        .maintenance_boundary_reassignment_swap_moves = 1,
+        .maintenance_delta_fold_attempts = 2,
+        .maintenance_delta_fold_skipped = 1,
+        .maintenance_delta_fold_records = 12,
+    });
+
+    try std.testing.expectEqual(@as(u64, 16), stats.policy_max_postings);
+    try std.testing.expect(stats.policy_fold_delta_tails);
+    try std.testing.expectEqual(@as(u64, 64), stats.policy_min_delta_records_to_fold);
+    try std.testing.expectEqual(@as(u64, 7), stats.policy_min_tombstone_records_to_fold);
+    try std.testing.expectEqual(@as(u64, 2500), stats.policy_min_delta_to_base_ratio_bps);
+    try std.testing.expectEqual(@as(u64, 256), stats.policy_max_delta_tail_postings);
+    try std.testing.expectEqual(@as(u64, 4), stats.policy_min_dirty_postings);
+    try std.testing.expectEqual(@as(u64, 12), stats.policy_max_dirty_version_age);
+    try std.testing.expectEqual(@as(u64, 24), stats.policy_min_delta_records_to_run);
+    try std.testing.expectEqual(@as(u64, 3), stats.policy_min_tombstone_records_to_run);
+    try std.testing.expectEqual(@as(u64, 1500), stats.policy_min_delta_to_base_ratio_bps_to_run);
+    try std.testing.expectEqual(@as(u64, 3), stats.policy_min_centroid_version_lag);
+    try std.testing.expectEqual(@as(u64, 8), stats.policy_min_payload_version_lag);
+    try std.testing.expectEqual(@as(u64, 9), stats.policy_max_layout_changes);
+    try std.testing.expect(stats.policy_split_full_postings);
+    try std.testing.expectEqual(@as(u64, 4), stats.policy_min_overfull_postings_to_run);
+    try std.testing.expectEqual(@as(u64, 6), stats.policy_min_postings_at_capacity_to_run);
+    try std.testing.expectEqual(@as(u64, 12), stats.policy_max_boundary_reassignments);
+    try std.testing.expect(stats.policy_allow_overfull_reassignment);
+    try std.testing.expectEqual(@as(u64, 5), stats.policy_max_overfull_reassignment_postings);
+    try std.testing.expectEqual(@as(u64, 3), stats.policy_max_over_capacity_reassignment_members);
+    try std.testing.expectEqual(@as(u64, 6), stats.min_dirty_mutation_version);
+    try std.testing.expectEqual(@as(u64, 8), stats.max_dirty_version_age);
+    try std.testing.expectEqual(@as(u64, 5), stats.delta_tail_postings);
+    try std.testing.expectEqual(@as(u64, 11), stats.max_delta_tail_records);
+    try std.testing.expectEqual(@as(u64, 9), stats.max_tombstone_tail_records);
+    try std.testing.expectEqual(@as(u64, 5000), stats.max_delta_to_base_ratio_bps);
+    try std.testing.expectEqual(@as(u64, 3), stats.overfull_postings);
+    try std.testing.expectEqual(@as(u64, 9), stats.postings_at_capacity);
+    try std.testing.expectEqual(@as(u64, 6), stats.max_over_capacity_members);
+    try std.testing.expectEqual(@as(u64, 17), stats.maintenance_boundary_reassignment_capacity_skips);
+    try std.testing.expectEqual(@as(u64, 5), stats.maintenance_boundary_reassignment_min_source_skips);
+    try std.testing.expectEqual(@as(u64, 3), stats.maintenance_boundary_reassignment_swap_moves);
+    try std.testing.expectEqual(@as(u64, 6), stats.maintenance_delta_fold_attempts);
+    try std.testing.expectEqual(@as(u64, 4), stats.maintenance_delta_fold_skipped);
+    try std.testing.expectEqual(@as(u64, 20), stats.maintenance_delta_fold_records);
+
+    var encoded: std.ArrayListUnmanaged(u8) = .empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendHbcPostingStatus(std.testing.allocator, &encoded, stats);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"policy_max_delta_tail_postings\":256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"policy_fold_delta_tails\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"policy_max_dirty_version_age\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"policy_allow_overfull_reassignment\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"policy_max_over_capacity_reassignment_members\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"overfull_postings\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"postings_at_capacity\":9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"maintenance_boundary_reassignment_capacity_skips\":17") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"maintenance_delta_fold_skipped\":4") != null);
 }

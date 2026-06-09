@@ -3410,6 +3410,14 @@ pub const Backend = struct {
                 }
             }
             try self.finalizeDeferredRunWork(.{ .force_soft_compaction = options.compact });
+            if (options.compact and options.max_foreground_compaction_steps != 0) {
+                try self.runForegroundCompactionBudget(options);
+                if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
+                    try self.persistManifest();
+                } else {
+                    _ = self.refreshCachedMaintenanceHintLocked();
+                }
+            }
         }
     }
 
@@ -3489,7 +3497,9 @@ pub const Backend = struct {
                 if (self.writeStatsElapsedNs(start_ns) >= budget_ns) break;
             }
             if (limit > 0 and countLevelRuns(self.runs.items, 0) <= limit) break;
-            const score = self.maintenanceScoreLocked();
+            const l0_runs = countLevelRuns(self.runs.items, 0);
+            var score = self.maintenanceScoreLocked();
+            if (score == 0 and l0_runs > limit) score = 1;
             const compacted = try compaction_mod.compactL0ToLimitScheduledWithinBudget(
                 Backend,
                 self,
@@ -7311,6 +7321,41 @@ test "lsm backend bulk ingest finish applies bounded foreground L0 budget" {
     try std.testing.expectEqual(@as(usize, 1), backend.compaction_stats.compactions);
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:0"));
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:4"));
+}
+
+test "lsm backend compact bulk ingest finish applies bounded foreground L0 budget" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+        .compact_threshold_runs = 1,
+    });
+    defer backend.close();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "compact:{d}", .{i});
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.appendPut(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 5), countLevelRuns(backend.runs.items, 0));
+    try backend.finishBulkIngestSessionWithOptions(.{
+        .compact = true,
+        .max_deferred_l0_runs = 1,
+        .max_foreground_compaction_steps = 1,
+    });
+    bulk_active = false;
+
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+    try std.testing.expect(backend.compaction_stats.compactions > 0);
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "compact:0"));
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "compact:4"));
 }
 
 test "lsm backend hard L0 pressure applies bounded step after publish not inside compact false finish" {

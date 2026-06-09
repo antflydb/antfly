@@ -1457,9 +1457,34 @@ pub const IndexManager = struct {
             .max_cached_metadata = dense_cfg.max_cached_metadata,
             .lazy_posting_maintenance = dense_cfg.lazy_posting_maintenance,
             .auto_posting_maintenance_max_postings = dense_cfg.auto_posting_maintenance_max_postings,
+            .auto_posting_maintenance_fold_delta_tails = dense_cfg.auto_posting_maintenance_fold_delta_tails,
+            .auto_posting_maintenance_min_delta_records_to_fold = dense_cfg.auto_posting_maintenance_min_delta_records_to_fold,
+            .auto_posting_maintenance_min_tombstone_records_to_fold = dense_cfg.auto_posting_maintenance_min_tombstone_records_to_fold,
+            .auto_posting_maintenance_min_delta_to_base_ratio_bps = dense_cfg.auto_posting_maintenance_min_delta_to_base_ratio_bps,
+            .auto_posting_maintenance_max_delta_tail_postings = dense_cfg.auto_posting_maintenance_max_delta_tail_postings,
+            .auto_posting_maintenance_min_dirty_postings = dense_cfg.auto_posting_maintenance_min_dirty_postings,
+            .auto_posting_maintenance_max_dirty_version_age = dense_cfg.auto_posting_maintenance_max_dirty_version_age,
+            .auto_posting_maintenance_min_delta_records_to_run = dense_cfg.auto_posting_maintenance_min_delta_records_to_run,
+            .auto_posting_maintenance_min_tombstone_records_to_run = dense_cfg.auto_posting_maintenance_min_tombstone_records_to_run,
+            .auto_posting_maintenance_min_delta_to_base_ratio_bps_to_run = dense_cfg.auto_posting_maintenance_min_delta_to_base_ratio_bps_to_run,
+            .auto_posting_maintenance_min_centroid_version_lag = dense_cfg.auto_posting_maintenance_min_centroid_version_lag,
+            .auto_posting_maintenance_min_payload_version_lag = dense_cfg.auto_posting_maintenance_min_payload_version_lag,
+            .auto_posting_maintenance_max_layout_changes = dense_cfg.auto_posting_maintenance_max_layout_changes,
+            .auto_posting_maintenance_split_full_postings = dense_cfg.auto_posting_maintenance_split_full_postings,
+            .auto_posting_maintenance_min_overfull_postings_to_run = dense_cfg.auto_posting_maintenance_min_overfull_postings_to_run,
+            .auto_posting_maintenance_min_postings_at_capacity_to_run = dense_cfg.auto_posting_maintenance_min_postings_at_capacity_to_run,
+            .auto_posting_maintenance_max_boundary_reassignments = dense_cfg.auto_posting_maintenance_max_boundary_reassignments,
+            .auto_posting_maintenance_allow_overfull_reassignment = dense_cfg.auto_posting_maintenance_allow_overfull_reassignment,
+            .auto_posting_maintenance_max_overfull_reassignment_postings = dense_cfg.auto_posting_maintenance_max_overfull_reassignment_postings,
+            .auto_posting_maintenance_max_over_capacity_reassignment_members = dense_cfg.auto_posting_maintenance_max_over_capacity_reassignment_members,
+            .auto_posting_maintenance_boundary_reassignment_min_improvement = dense_cfg.auto_posting_maintenance_boundary_reassignment_min_improvement,
             .centroid_directory_mode = dense_cfg.centroid_directory_mode,
+            .posting_storage_mode = dense_cfg.posting_storage_mode,
             .flat_centroid_block_size = dense_cfg.flat_centroid_block_size,
             .flat_centroid_probe_count = dense_cfg.flat_centroid_probe_count,
+            .flat_centroid_block_probe_count = dense_cfg.flat_centroid_block_probe_count,
+            .max_posting_overlay_cache_bytes = dense_cfg.max_posting_overlay_cache_bytes,
+            .max_posting_overlay_cache_entry_bytes = dense_cfg.max_posting_overlay_cache_entry_bytes,
             .no_sync = self.relaxed_split_durability,
             .no_meta_sync = self.relaxed_split_durability,
         }, .{
@@ -2153,27 +2178,184 @@ pub const IndexManager = struct {
 
     pub const DensePostingMaintenanceOptions = struct {
         max_postings_per_index: usize = 64,
+        fold_delta_tails: bool = true,
+        min_delta_records_to_fold: usize = 64,
+        min_tombstone_records_to_fold: usize = 16,
+        min_delta_to_base_ratio_bps: u32 = 2500,
+        max_delta_tail_postings: usize = std.math.maxInt(usize) - 1,
         max_layout_changes_per_index: usize = 8,
+        split_full_postings: bool = false,
+        min_overfull_postings_to_run: usize = 1,
+        min_postings_at_capacity_to_run: usize = 1,
         max_boundary_reassignments_per_index: usize = 64,
+        allow_overfull_reassignment: bool = false,
+        max_overfull_reassignment_postings: usize = std.math.maxInt(usize),
+        max_over_capacity_reassignment_members: usize = std.math.maxInt(usize),
         boundary_reassignment_min_improvement: f32 = 0.0,
+        max_indexes: usize = std.math.maxInt(usize),
+        max_elapsed_ns: u64 = 0,
     };
 
-    pub fn runDensePostingMaintenance(self: *IndexManager, options: DensePostingMaintenanceOptions) !usize {
-        var total_steps: usize = 0;
-        for (self.dense_indexes.items) |*entry| {
-            const backlog = try entry.index.postingBacklogStats();
-            if (!backlog.needsRepair()) continue;
+    pub const DensePostingMaintenanceResult = struct {
+        total_steps: usize = 0,
+        scanned_indexes: usize = 0,
+        attempted_indexes: usize = 0,
+        skipped_clean_indexes: usize = 0,
+        limit_reached_indexes: usize = 0,
+        remaining_dirty_postings: u64 = 0,
+        remaining_delta_tail_postings: u64 = 0,
+        remaining_overfull_postings: u64 = 0,
+        remaining_postings_at_capacity: u64 = 0,
+        max_remaining_over_capacity_members: u64 = 0,
+        needs_more_work: bool = false,
+        elapsed_ns: u64 = 0,
+        stopped_by_max_indexes: bool = false,
+        stopped_by_elapsed_budget: bool = false,
+        stopped_by_resource_budget: bool = false,
+        stopped_by_query_guardrail: bool = false,
 
-            const result = try entry.index.repairDirtyPostingsWithOptions(.{
+        pub fn stoppedBySchedulerBudget(self: DensePostingMaintenanceResult) bool {
+            return self.stopped_by_max_indexes or
+                self.stopped_by_elapsed_budget or
+                self.stopped_by_resource_budget or
+                self.stopped_by_query_guardrail;
+        }
+    };
+
+    const dense_posting_maintenance_min_reservation_bytes: u64 = 1024 * 1024;
+    const dense_posting_maintenance_max_reservation_bytes: u64 = 256 * 1024 * 1024;
+
+    fn reserveDensePostingMaintenanceWorkingSet(
+        self: *IndexManager,
+        entry: *const DenseIndex,
+        options: DensePostingMaintenanceOptions,
+    ) !?resource_manager_mod.Reservation {
+        const manager = self.resource_manager orelse return null;
+        const max_postings_by_vector_bytes_u64 = dense_posting_maintenance_max_reservation_bytes / @max(@as(u64, entry.dims) * @sizeOf(f32), 1);
+        const max_postings_by_vector_bytes: usize = if (max_postings_by_vector_bytes_u64 > std.math.maxInt(usize))
+            std.math.maxInt(usize)
+        else
+            @intCast(max_postings_by_vector_bytes_u64);
+        const postings = @min(options.max_postings_per_index, max_postings_by_vector_bytes);
+        const posting_count: u64 = @max(@as(u64, @intCast(postings)), 1);
+        const leaf_members: u64 = @max(@as(u64, entry.index.config.leaf_size), 1);
+        const vector_bytes = std.math.mul(u64, @as(u64, entry.dims), @sizeOf(f32)) catch return error.ResourceBudgetExceeded;
+        const member_workspace = std.math.add(u64, vector_bytes, @sizeOf(u64) + @sizeOf(u32)) catch return error.ResourceBudgetExceeded;
+        const posting_workspace = std.math.mul(u64, leaf_members, member_workspace) catch return error.ResourceBudgetExceeded;
+        const planned_workspace = std.math.mul(u64, posting_count, posting_workspace) catch return error.ResourceBudgetExceeded;
+        const layout_workspace = std.math.mul(u64, @as(u64, @intCast(@max(options.max_layout_changes_per_index, 1))), 4096) catch return error.ResourceBudgetExceeded;
+        const reservation_bytes = @min(
+            dense_posting_maintenance_max_reservation_bytes,
+            @max(dense_posting_maintenance_min_reservation_bytes, planned_workspace +| layout_workspace),
+        );
+        return try manager.reserve(.dense_posting_maintenance_working_set, reservation_bytes);
+    }
+
+    fn backlogHasActionableDeltaTail(backlog: hbc_mod.PostingBacklogStats, options: DensePostingMaintenanceOptions) bool {
+        if (!options.fold_delta_tails or backlog.delta_tail_postings == 0) return false;
+        if (backlog.max_delta_tail_records >= options.min_delta_records_to_fold) return true;
+        if (options.min_tombstone_records_to_fold != 0 and
+            backlog.max_tombstone_tail_records >= options.min_tombstone_records_to_fold)
+        {
+            return true;
+        }
+        if (options.min_delta_to_base_ratio_bps != 0 and
+            backlog.max_delta_to_base_ratio_bps >= options.min_delta_to_base_ratio_bps)
+        {
+            return true;
+        }
+        if (backlog.delta_tail_postings > options.max_delta_tail_postings) return true;
+        return false;
+    }
+
+    fn backlogHasActionableLayoutDebt(backlog: hbc_mod.PostingBacklogStats, options: DensePostingMaintenanceOptions) bool {
+        if (options.min_overfull_postings_to_run != 0 and
+            backlog.overfull_postings >= options.min_overfull_postings_to_run)
+        {
+            return true;
+        }
+        if (options.split_full_postings and
+            options.min_postings_at_capacity_to_run != 0 and
+            backlog.postings_at_capacity >= options.min_postings_at_capacity_to_run)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    pub fn runDensePostingMaintenance(self: *IndexManager, options: DensePostingMaintenanceOptions) !usize {
+        return (try self.runDensePostingMaintenanceProfiled(options)).total_steps;
+    }
+
+    pub fn runDensePostingMaintenanceProfiled(self: *IndexManager, options: DensePostingMaintenanceOptions) !DensePostingMaintenanceResult {
+        var result = DensePostingMaintenanceResult{};
+        if (options.max_indexes == 0) {
+            result.stopped_by_max_indexes = self.dense_indexes.items.len != 0;
+            return result;
+        }
+
+        const start_ns = if (options.max_elapsed_ns != 0) nowNs() else 0;
+        for (self.dense_indexes.items) |*entry| {
+            if (result.attempted_indexes >= options.max_indexes) {
+                result.stopped_by_max_indexes = true;
+                break;
+            }
+            if (densePostingMaintenanceBudgetExpired(start_ns, options.max_elapsed_ns)) {
+                result.stopped_by_elapsed_budget = true;
+                break;
+            }
+
+            result.scanned_indexes += 1;
+            const backlog = try entry.index.postingBacklogStats();
+            const has_repair_debt = backlog.dirty_postings != 0 or
+                backlogHasActionableDeltaTail(backlog, options);
+            const has_layout_debt = backlogHasActionableLayoutDebt(backlog, options);
+            if (!has_repair_debt and !has_layout_debt) {
+                result.skipped_clean_indexes += 1;
+                continue;
+            }
+
+            var reservation = self.reserveDensePostingMaintenanceWorkingSet(entry, options) catch {
+                result.stopped_by_resource_budget = true;
+                break;
+            };
+            defer if (reservation) |*reserved| reserved.release();
+
+            result.attempted_indexes += 1;
+            const repair_result = try entry.index.repairDirtyPostingsWithOptions(.{
                 .max_postings = options.max_postings_per_index,
+                .fold_delta_tails = options.fold_delta_tails,
+                .min_delta_records_to_fold = options.min_delta_records_to_fold,
+                .min_tombstone_records_to_fold = options.min_tombstone_records_to_fold,
+                .min_delta_to_base_ratio_bps = options.min_delta_to_base_ratio_bps,
+                .max_delta_tail_postings = options.max_delta_tail_postings,
                 .rebalance_layout = true,
+                .split_full_postings = options.split_full_postings,
                 .max_layout_changes = options.max_layout_changes_per_index,
                 .max_boundary_reassignments = options.max_boundary_reassignments_per_index,
+                .reassign_dirty_postings = options.max_boundary_reassignments_per_index != 0,
+                .allow_overfull_reassignment = options.allow_overfull_reassignment,
+                .max_overfull_reassignment_postings = options.max_overfull_reassignment_postings,
+                .max_over_capacity_reassignment_members = options.max_over_capacity_reassignment_members,
                 .boundary_reassignment_min_improvement = options.boundary_reassignment_min_improvement,
             });
-            total_steps += @intCast(result.repaired_postings + result.split_postings + result.merged_postings + result.boundary_reassigned_vectors);
+            const successful_delta_folds = repair_result.delta_fold_attempts -| repair_result.delta_fold_skipped;
+            result.total_steps += @intCast(repair_result.repaired_postings + repair_result.split_postings + repair_result.merged_postings + repair_result.boundary_reassigned_vectors + successful_delta_folds);
+            result.remaining_dirty_postings += repair_result.remaining_dirty_postings;
+            result.remaining_delta_tail_postings += repair_result.remaining_delta_tail_postings;
+            result.remaining_overfull_postings += repair_result.remaining_overfull_postings;
+            result.remaining_postings_at_capacity += repair_result.remaining_postings_at_capacity;
+            result.max_remaining_over_capacity_members = @max(
+                result.max_remaining_over_capacity_members,
+                repair_result.remaining_max_over_capacity_members,
+            );
+            if (repair_result.limit_reached) {
+                result.limit_reached_indexes += 1;
+                result.needs_more_work = true;
+            }
         }
-        return total_steps;
+        result.elapsed_ns = if (options.max_elapsed_ns != 0) elapsedSince(start_ns) else 0;
+        return result;
     }
 
     pub fn denseLsmMaintenanceScoreByName(self: *IndexManager, name: []const u8) !u64 {
@@ -5603,9 +5785,34 @@ pub const IndexManager = struct {
                     .max_cached_metadata = dense_cfg.max_cached_metadata,
                     .lazy_posting_maintenance = dense_cfg.lazy_posting_maintenance,
                     .auto_posting_maintenance_max_postings = dense_cfg.auto_posting_maintenance_max_postings,
+                    .auto_posting_maintenance_fold_delta_tails = dense_cfg.auto_posting_maintenance_fold_delta_tails,
+                    .auto_posting_maintenance_min_delta_records_to_fold = dense_cfg.auto_posting_maintenance_min_delta_records_to_fold,
+                    .auto_posting_maintenance_min_tombstone_records_to_fold = dense_cfg.auto_posting_maintenance_min_tombstone_records_to_fold,
+                    .auto_posting_maintenance_min_delta_to_base_ratio_bps = dense_cfg.auto_posting_maintenance_min_delta_to_base_ratio_bps,
+                    .auto_posting_maintenance_max_delta_tail_postings = dense_cfg.auto_posting_maintenance_max_delta_tail_postings,
+                    .auto_posting_maintenance_min_dirty_postings = dense_cfg.auto_posting_maintenance_min_dirty_postings,
+                    .auto_posting_maintenance_max_dirty_version_age = dense_cfg.auto_posting_maintenance_max_dirty_version_age,
+                    .auto_posting_maintenance_min_delta_records_to_run = dense_cfg.auto_posting_maintenance_min_delta_records_to_run,
+                    .auto_posting_maintenance_min_tombstone_records_to_run = dense_cfg.auto_posting_maintenance_min_tombstone_records_to_run,
+                    .auto_posting_maintenance_min_delta_to_base_ratio_bps_to_run = dense_cfg.auto_posting_maintenance_min_delta_to_base_ratio_bps_to_run,
+                    .auto_posting_maintenance_min_centroid_version_lag = dense_cfg.auto_posting_maintenance_min_centroid_version_lag,
+                    .auto_posting_maintenance_min_payload_version_lag = dense_cfg.auto_posting_maintenance_min_payload_version_lag,
+                    .auto_posting_maintenance_max_layout_changes = dense_cfg.auto_posting_maintenance_max_layout_changes,
+                    .auto_posting_maintenance_split_full_postings = dense_cfg.auto_posting_maintenance_split_full_postings,
+                    .auto_posting_maintenance_min_overfull_postings_to_run = dense_cfg.auto_posting_maintenance_min_overfull_postings_to_run,
+                    .auto_posting_maintenance_min_postings_at_capacity_to_run = dense_cfg.auto_posting_maintenance_min_postings_at_capacity_to_run,
+                    .auto_posting_maintenance_max_boundary_reassignments = dense_cfg.auto_posting_maintenance_max_boundary_reassignments,
+                    .auto_posting_maintenance_allow_overfull_reassignment = dense_cfg.auto_posting_maintenance_allow_overfull_reassignment,
+                    .auto_posting_maintenance_max_overfull_reassignment_postings = dense_cfg.auto_posting_maintenance_max_overfull_reassignment_postings,
+                    .auto_posting_maintenance_max_over_capacity_reassignment_members = dense_cfg.auto_posting_maintenance_max_over_capacity_reassignment_members,
+                    .auto_posting_maintenance_boundary_reassignment_min_improvement = dense_cfg.auto_posting_maintenance_boundary_reassignment_min_improvement,
                     .centroid_directory_mode = dense_cfg.centroid_directory_mode,
+                    .posting_storage_mode = dense_cfg.posting_storage_mode,
                     .flat_centroid_block_size = dense_cfg.flat_centroid_block_size,
                     .flat_centroid_probe_count = dense_cfg.flat_centroid_probe_count,
+                    .flat_centroid_block_probe_count = dense_cfg.flat_centroid_block_probe_count,
+                    .max_posting_overlay_cache_bytes = dense_cfg.max_posting_overlay_cache_bytes,
+                    .max_posting_overlay_cache_entry_bytes = dense_cfg.max_posting_overlay_cache_entry_bytes,
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                 }, .{
@@ -11199,9 +11406,34 @@ const DenseConfig = struct {
     max_cached_metadata: usize = 100_000,
     lazy_posting_maintenance: bool = false,
     auto_posting_maintenance_max_postings: usize = 0,
+    auto_posting_maintenance_fold_delta_tails: bool = true,
+    auto_posting_maintenance_min_delta_records_to_fold: usize = 64,
+    auto_posting_maintenance_min_tombstone_records_to_fold: usize = 16,
+    auto_posting_maintenance_min_delta_to_base_ratio_bps: u32 = 2500,
+    auto_posting_maintenance_max_delta_tail_postings: usize = std.math.maxInt(usize),
+    auto_posting_maintenance_min_dirty_postings: usize = 0,
+    auto_posting_maintenance_max_dirty_version_age: u64 = 0,
+    auto_posting_maintenance_min_delta_records_to_run: usize = 0,
+    auto_posting_maintenance_min_tombstone_records_to_run: usize = 0,
+    auto_posting_maintenance_min_delta_to_base_ratio_bps_to_run: u32 = 0,
+    auto_posting_maintenance_min_centroid_version_lag: u64 = 0,
+    auto_posting_maintenance_min_payload_version_lag: u64 = 0,
+    auto_posting_maintenance_max_layout_changes: usize = 0,
+    auto_posting_maintenance_split_full_postings: bool = false,
+    auto_posting_maintenance_min_overfull_postings_to_run: usize = 0,
+    auto_posting_maintenance_min_postings_at_capacity_to_run: usize = 0,
+    auto_posting_maintenance_max_boundary_reassignments: usize = 0,
+    auto_posting_maintenance_allow_overfull_reassignment: bool = false,
+    auto_posting_maintenance_max_overfull_reassignment_postings: usize = 0,
+    auto_posting_maintenance_max_over_capacity_reassignment_members: usize = 0,
+    auto_posting_maintenance_boundary_reassignment_min_improvement: f32 = 0.0,
     centroid_directory_mode: hbc_mod.HBCConfig.CentroidDirectoryMode = .hbc,
-    flat_centroid_block_size: usize = 8192,
+    posting_storage_mode: hbc_mod.HBCConfig.PostingStorageMode = .packed_hbc,
+    flat_centroid_block_size: usize = 128,
     flat_centroid_probe_count: usize = 0,
+    flat_centroid_block_probe_count: usize = 0,
+    max_posting_overlay_cache_bytes: usize = 8 * 1024 * 1024,
+    max_posting_overlay_cache_entry_bytes: usize = 0,
 
     fn deinit(self: *const DenseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
@@ -11405,7 +11637,7 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
     const dims = root.object.get("dims") orelse return error.InvalidIndexConfig;
     const metric = root.object.get("metric");
 
-    return .{
+    var cfg = DenseConfig{
         .field_name = try alloc.dupe(u8, field.string),
         .dims = std.math.cast(u32, dims.integer) orelse return error.InvalidIndexConfig,
         .metric = if (metric) |value| try parseMetric(value.string) else .l2_squared,
@@ -11491,19 +11723,135 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
             std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
         else
             0,
+        .auto_posting_maintenance_fold_delta_tails = if (root.object.get("auto_posting_maintenance_fold_delta_tails")) |value|
+            value.bool
+        else
+            true,
+        .auto_posting_maintenance_min_delta_records_to_fold = if (root.object.get("auto_posting_maintenance_min_delta_records_to_fold")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            64,
+        .auto_posting_maintenance_min_tombstone_records_to_fold = if (root.object.get("auto_posting_maintenance_min_tombstone_records_to_fold")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            16,
+        .auto_posting_maintenance_min_delta_to_base_ratio_bps = if (root.object.get("auto_posting_maintenance_min_delta_to_base_ratio_bps")) |value|
+            std.math.cast(u32, value.integer) orelse return error.InvalidIndexConfig
+        else
+            2500,
+        .auto_posting_maintenance_max_delta_tail_postings = if (root.object.get("auto_posting_maintenance_max_delta_tail_postings")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            std.math.maxInt(usize),
+        .auto_posting_maintenance_min_dirty_postings = if (root.object.get("auto_posting_maintenance_min_dirty_postings")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
+        .auto_posting_maintenance_max_dirty_version_age = if (root.object.get("auto_posting_maintenance_max_dirty_version_age")) |value|
+            std.math.cast(u64, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
+        .auto_posting_maintenance_min_delta_records_to_run = if (root.object.get("auto_posting_maintenance_min_delta_records_to_run")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
+        .auto_posting_maintenance_min_tombstone_records_to_run = if (root.object.get("auto_posting_maintenance_min_tombstone_records_to_run")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
+        .auto_posting_maintenance_min_delta_to_base_ratio_bps_to_run = if (root.object.get("auto_posting_maintenance_min_delta_to_base_ratio_bps_to_run")) |value|
+            std.math.cast(u32, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
+        .auto_posting_maintenance_min_centroid_version_lag = if (root.object.get("auto_posting_maintenance_min_centroid_version_lag")) |value|
+            std.math.cast(u64, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
+        .auto_posting_maintenance_min_payload_version_lag = if (root.object.get("auto_posting_maintenance_min_payload_version_lag")) |value|
+            std.math.cast(u64, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
+        .auto_posting_maintenance_max_layout_changes = if (root.object.get("auto_posting_maintenance_max_layout_changes")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
+        .auto_posting_maintenance_split_full_postings = if (root.object.get("auto_posting_maintenance_split_full_postings")) |value|
+            value.bool
+        else
+            false,
+        .auto_posting_maintenance_min_overfull_postings_to_run = if (root.object.get("auto_posting_maintenance_min_overfull_postings_to_run")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
+        .auto_posting_maintenance_min_postings_at_capacity_to_run = if (root.object.get("auto_posting_maintenance_min_postings_at_capacity_to_run")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
+        .auto_posting_maintenance_max_boundary_reassignments = if (root.object.get("auto_posting_maintenance_max_boundary_reassignments")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
+        .auto_posting_maintenance_allow_overfull_reassignment = if (root.object.get("auto_posting_maintenance_allow_overfull_reassignment")) |value|
+            value.bool
+        else
+            false,
+        .auto_posting_maintenance_max_overfull_reassignment_postings = if (root.object.get("auto_posting_maintenance_max_overfull_reassignment_postings")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            std.math.maxInt(usize),
+        .auto_posting_maintenance_max_over_capacity_reassignment_members = if (root.object.get("auto_posting_maintenance_max_over_capacity_reassignment_members")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            std.math.maxInt(usize),
+        .auto_posting_maintenance_boundary_reassignment_min_improvement = if (root.object.get("auto_posting_maintenance_boundary_reassignment_min_improvement")) |value|
+            switch (value) {
+                .float => @floatCast(value.float),
+                .integer => @floatFromInt(value.integer),
+                else => return error.InvalidIndexConfig,
+            }
+        else
+            0.0,
         .centroid_directory_mode = if (root.object.get("centroid_directory_mode")) |value|
             try parseCentroidDirectoryMode(value.string)
         else
             .hbc,
+        .posting_storage_mode = if (root.object.get("posting_storage_mode")) |value|
+            try parsePostingStorageMode(value.string)
+        else
+            .packed_hbc,
         .flat_centroid_block_size = if (root.object.get("flat_centroid_block_size")) |value|
             std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
         else
-            8192,
+            128,
         .flat_centroid_probe_count = if (root.object.get("flat_centroid_probe_count")) |value|
             std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
         else
             0,
+        .flat_centroid_block_probe_count = if (root.object.get("flat_centroid_block_probe_count")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
+        .max_posting_overlay_cache_bytes = if (root.object.get("max_posting_overlay_cache_bytes")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            8 * 1024 * 1024,
+        .max_posting_overlay_cache_entry_bytes = if (root.object.get("max_posting_overlay_cache_entry_bytes")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
     };
+    errdefer cfg.deinit(alloc);
+    if (cfg.auto_posting_maintenance_allow_overfull_reassignment and
+        (cfg.auto_posting_maintenance_max_overfull_reassignment_postings == std.math.maxInt(usize) or
+            cfg.auto_posting_maintenance_max_over_capacity_reassignment_members == std.math.maxInt(usize)))
+    {
+        return error.InvalidIndexConfig;
+    }
+    if (!cfg.auto_posting_maintenance_allow_overfull_reassignment) {
+        cfg.auto_posting_maintenance_max_overfull_reassignment_postings = 0;
+        cfg.auto_posting_maintenance_max_over_capacity_reassignment_members = 0;
+    }
+    return cfg;
 }
 
 fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
@@ -12404,6 +12752,14 @@ fn parseDenseRerankPolicy(raw: []const u8) !hbc_mod.HBCConfig.RerankPolicy {
 fn parseCentroidDirectoryMode(raw: []const u8) !hbc_mod.HBCConfig.CentroidDirectoryMode {
     if (std.mem.eql(u8, raw, "hbc")) return .hbc;
     if (std.mem.eql(u8, raw, "flat_rabitq")) return .flat_rabitq;
+    if (std.mem.eql(u8, raw, "two_level_rabitq")) return .two_level_rabitq;
+    return error.InvalidIndexConfig;
+}
+
+fn parsePostingStorageMode(raw: []const u8) !hbc_mod.HBCConfig.PostingStorageMode {
+    if (std.mem.eql(u8, raw, "packed_hbc")) return .packed_hbc;
+    if (std.mem.eql(u8, raw, "shadow_base_delta")) return .shadow_base_delta;
+    if (std.mem.eql(u8, raw, "base_delta")) return .base_delta;
     return error.InvalidIndexConfig;
 }
 
@@ -12825,6 +13181,10 @@ fn nowNs() u64 {
 
 fn elapsedSince(start_ns: u64) u64 {
     return nowNs() - start_ns;
+}
+
+fn densePostingMaintenanceBudgetExpired(start_ns: u64, max_elapsed_ns: u64) bool {
+    return max_elapsed_ns != 0 and elapsedSince(start_ns) >= max_elapsed_ns;
 }
 
 var open_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
@@ -14046,9 +14406,34 @@ test "parseDenseConfig accepts HBC tuning knobs" {
         \\  "max_cached_metadata": 8192,
         \\  "lazy_posting_maintenance": true,
         \\  "auto_posting_maintenance_max_postings": 17,
-        \\  "centroid_directory_mode": "flat_rabitq",
+        \\  "auto_posting_maintenance_fold_delta_tails": false,
+        \\  "auto_posting_maintenance_min_delta_records_to_fold": 99,
+        \\  "auto_posting_maintenance_min_tombstone_records_to_fold": 11,
+        \\  "auto_posting_maintenance_min_delta_to_base_ratio_bps": 3750,
+        \\  "auto_posting_maintenance_max_delta_tail_postings": 21,
+        \\  "auto_posting_maintenance_min_dirty_postings": 7,
+        \\  "auto_posting_maintenance_max_dirty_version_age": 13,
+        \\  "auto_posting_maintenance_min_delta_records_to_run": 19,
+        \\  "auto_posting_maintenance_min_tombstone_records_to_run": 2,
+        \\  "auto_posting_maintenance_min_delta_to_base_ratio_bps_to_run": 4500,
+        \\  "auto_posting_maintenance_min_centroid_version_lag": 3,
+        \\  "auto_posting_maintenance_min_payload_version_lag": 4,
+        \\  "auto_posting_maintenance_max_layout_changes": 5,
+        \\  "auto_posting_maintenance_split_full_postings": true,
+        \\  "auto_posting_maintenance_min_overfull_postings_to_run": 6,
+        \\  "auto_posting_maintenance_min_postings_at_capacity_to_run": 8,
+        \\  "auto_posting_maintenance_max_boundary_reassignments": 23,
+        \\  "auto_posting_maintenance_allow_overfull_reassignment": true,
+        \\  "auto_posting_maintenance_max_overfull_reassignment_postings": 2,
+        \\  "auto_posting_maintenance_max_over_capacity_reassignment_members": 3,
+        \\  "auto_posting_maintenance_boundary_reassignment_min_improvement": 0.125,
+        \\  "centroid_directory_mode": "two_level_rabitq",
+        \\  "posting_storage_mode": "shadow_base_delta",
         \\  "flat_centroid_block_size": 1024,
-        \\  "flat_centroid_probe_count": 33
+        \\  "flat_centroid_probe_count": 33,
+        \\  "flat_centroid_block_probe_count": 5,
+        \\  "max_posting_overlay_cache_bytes": 65536,
+        \\  "max_posting_overlay_cache_entry_bytes": 4096
         \\}
     ;
 
@@ -14075,9 +14460,79 @@ test "parseDenseConfig accepts HBC tuning knobs" {
     try std.testing.expectEqual(@as(usize, 8192), cfg.max_cached_metadata);
     try std.testing.expectEqual(true, cfg.lazy_posting_maintenance);
     try std.testing.expectEqual(@as(usize, 17), cfg.auto_posting_maintenance_max_postings);
-    try std.testing.expectEqual(hbc_mod.HBCConfig.CentroidDirectoryMode.flat_rabitq, cfg.centroid_directory_mode);
+    try std.testing.expectEqual(false, cfg.auto_posting_maintenance_fold_delta_tails);
+    try std.testing.expectEqual(@as(usize, 99), cfg.auto_posting_maintenance_min_delta_records_to_fold);
+    try std.testing.expectEqual(@as(usize, 11), cfg.auto_posting_maintenance_min_tombstone_records_to_fold);
+    try std.testing.expectEqual(@as(u32, 3750), cfg.auto_posting_maintenance_min_delta_to_base_ratio_bps);
+    try std.testing.expectEqual(@as(usize, 21), cfg.auto_posting_maintenance_max_delta_tail_postings);
+    try std.testing.expectEqual(@as(usize, 7), cfg.auto_posting_maintenance_min_dirty_postings);
+    try std.testing.expectEqual(@as(u64, 13), cfg.auto_posting_maintenance_max_dirty_version_age);
+    try std.testing.expectEqual(@as(usize, 19), cfg.auto_posting_maintenance_min_delta_records_to_run);
+    try std.testing.expectEqual(@as(usize, 2), cfg.auto_posting_maintenance_min_tombstone_records_to_run);
+    try std.testing.expectEqual(@as(u32, 4500), cfg.auto_posting_maintenance_min_delta_to_base_ratio_bps_to_run);
+    try std.testing.expectEqual(@as(u64, 3), cfg.auto_posting_maintenance_min_centroid_version_lag);
+    try std.testing.expectEqual(@as(u64, 4), cfg.auto_posting_maintenance_min_payload_version_lag);
+    try std.testing.expectEqual(@as(usize, 5), cfg.auto_posting_maintenance_max_layout_changes);
+    try std.testing.expectEqual(true, cfg.auto_posting_maintenance_split_full_postings);
+    try std.testing.expectEqual(@as(usize, 6), cfg.auto_posting_maintenance_min_overfull_postings_to_run);
+    try std.testing.expectEqual(@as(usize, 8), cfg.auto_posting_maintenance_min_postings_at_capacity_to_run);
+    try std.testing.expectEqual(@as(usize, 23), cfg.auto_posting_maintenance_max_boundary_reassignments);
+    try std.testing.expectEqual(true, cfg.auto_posting_maintenance_allow_overfull_reassignment);
+    try std.testing.expectEqual(@as(usize, 2), cfg.auto_posting_maintenance_max_overfull_reassignment_postings);
+    try std.testing.expectEqual(@as(usize, 3), cfg.auto_posting_maintenance_max_over_capacity_reassignment_members);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.125), cfg.auto_posting_maintenance_boundary_reassignment_min_improvement, 0.0001);
+    try std.testing.expectEqual(hbc_mod.HBCConfig.CentroidDirectoryMode.two_level_rabitq, cfg.centroid_directory_mode);
+    try std.testing.expectEqual(hbc_mod.HBCConfig.PostingStorageMode.shadow_base_delta, cfg.posting_storage_mode);
     try std.testing.expectEqual(@as(usize, 1024), cfg.flat_centroid_block_size);
     try std.testing.expectEqual(@as(usize, 33), cfg.flat_centroid_probe_count);
+    try std.testing.expectEqual(@as(usize, 5), cfg.flat_centroid_block_probe_count);
+    try std.testing.expectEqual(@as(usize, 65536), cfg.max_posting_overlay_cache_bytes);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.max_posting_overlay_cache_entry_bytes);
+}
+
+test "parseDenseConfig rejects unbounded overfull reassignment policy" {
+    const alloc = std.testing.allocator;
+
+    const disabled = try parseDenseConfig(alloc,
+        \\{
+        \\  "field": "embedding",
+        \\  "dims": 2
+        \\}
+    );
+    defer disabled.deinit(alloc);
+    try std.testing.expect(!disabled.auto_posting_maintenance_allow_overfull_reassignment);
+    try std.testing.expectEqual(@as(usize, 0), disabled.auto_posting_maintenance_max_overfull_reassignment_postings);
+    try std.testing.expectEqual(@as(usize, 0), disabled.auto_posting_maintenance_max_over_capacity_reassignment_members);
+
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseConfig(alloc,
+        \\{
+        \\  "field": "embedding",
+        \\  "dims": 2,
+        \\  "auto_posting_maintenance_allow_overfull_reassignment": true
+        \\}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseConfig(alloc,
+        \\{
+        \\  "field": "embedding",
+        \\  "dims": 2,
+        \\  "auto_posting_maintenance_allow_overfull_reassignment": true,
+        \\  "auto_posting_maintenance_max_overfull_reassignment_postings": 2
+        \\}
+    ));
+
+    const cfg = try parseDenseConfig(alloc,
+        \\{
+        \\  "field": "embedding",
+        \\  "dims": 2,
+        \\  "auto_posting_maintenance_allow_overfull_reassignment": true,
+        \\  "auto_posting_maintenance_max_overfull_reassignment_postings": 2,
+        \\  "auto_posting_maintenance_max_over_capacity_reassignment_members": 3
+        \\}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expect(cfg.auto_posting_maintenance_allow_overfull_reassignment);
+    try std.testing.expectEqual(@as(usize, 2), cfg.auto_posting_maintenance_max_overfull_reassignment_postings);
+    try std.testing.expectEqual(@as(usize, 3), cfg.auto_posting_maintenance_max_over_capacity_reassignment_members);
 }
 
 test "parseDenseConfig accepts external embedding indexes" {

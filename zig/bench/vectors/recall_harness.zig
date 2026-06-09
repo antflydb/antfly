@@ -39,6 +39,14 @@ const Config = struct {
     dataset_filter: ?[]const u8 = null,
     bulk_build: bool = false,
     centroid_only_routing: bool = false,
+    centroid_directory_mode: hbc.HBCConfig.CentroidDirectoryMode = .hbc,
+    posting_storage_mode: hbc.HBCConfig.PostingStorageMode = .packed_hbc,
+    flat_centroid_block_size: usize = 128,
+    flat_centroid_probe_count: usize = 0,
+    flat_centroid_block_probe_count: usize = 0,
+    max_posting_overlay_cache_bytes: usize = 8 * 1024 * 1024,
+    max_posting_overlay_cache_entry_bytes: usize = 0,
+    repair_postings_after_build: bool = false,
     dump_query_index: ?usize = null,
     dump_metric: ?vec.DistanceMetric = null,
     dump_limit: usize = 30,
@@ -119,6 +127,24 @@ fn parseArgs(args_in: std.process.Args) !Config {
             cfg.bulk_build = true;
         } else if (std.mem.eql(u8, arg, "--centroid-only-routing")) {
             cfg.centroid_only_routing = true;
+        } else if (std.mem.eql(u8, arg, "--centroid-directory")) {
+            const raw = args.next() orelse return error.InvalidArgument;
+            cfg.centroid_directory_mode = std.meta.stringToEnum(hbc.HBCConfig.CentroidDirectoryMode, raw) orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--posting-storage")) {
+            const raw = args.next() orelse return error.InvalidArgument;
+            cfg.posting_storage_mode = std.meta.stringToEnum(hbc.HBCConfig.PostingStorageMode, raw) orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--flat-centroid-block-size")) {
+            cfg.flat_centroid_block_size = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArgument, 10);
+        } else if (std.mem.eql(u8, arg, "--flat-centroid-probe-count")) {
+            cfg.flat_centroid_probe_count = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArgument, 10);
+        } else if (std.mem.eql(u8, arg, "--flat-centroid-block-probe-count")) {
+            cfg.flat_centroid_block_probe_count = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArgument, 10);
+        } else if (std.mem.eql(u8, arg, "--max-posting-overlay-cache-bytes")) {
+            cfg.max_posting_overlay_cache_bytes = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArgument, 10);
+        } else if (std.mem.eql(u8, arg, "--max-posting-overlay-cache-entry-bytes")) {
+            cfg.max_posting_overlay_cache_entry_bytes = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArgument, 10);
+        } else if (std.mem.eql(u8, arg, "--repair-postings-after-build")) {
+            cfg.repair_postings_after_build = true;
         } else if (std.mem.eql(u8, arg, "--dump-query-index")) {
             cfg.dump_query_index = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArgument, 10);
         } else if (std.mem.eql(u8, arg, "--dump-metric")) {
@@ -361,9 +387,9 @@ fn runHBCCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config, dataset_path: [
         if (cfg.dump_randomize) |want_randomize| {
             if (case.randomize != want_randomize) {
                 return .{
-                    .euclidean = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .l2_squared, cfg.bulk_build, cfg.centroid_only_routing),
-                    .inner_product = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .inner_product, cfg.bulk_build, cfg.centroid_only_routing),
-                    .cosine = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .cosine, cfg.bulk_build, cfg.centroid_only_routing),
+                    .euclidean = 100.0 * try calculateHBCRecallMetric(alloc, cfg, case.dataset, split, case.top_k, case.randomize, .l2_squared),
+                    .inner_product = 100.0 * try calculateHBCRecallMetric(alloc, cfg, case.dataset, split, case.top_k, case.randomize, .inner_product),
+                    .cosine = 100.0 * try calculateHBCRecallMetric(alloc, cfg, case.dataset, split, case.top_k, case.randomize, .cosine),
                 };
             }
         }
@@ -372,36 +398,35 @@ fn runHBCCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config, dataset_path: [
             "frontier_dump dataset={s} randomize={any} metric={s} query_index={d}\n",
             .{ dataset_path, case.randomize, @tagName(metric), query_index },
         );
-        try dumpHBCFrontier(alloc, split, case.top_k, case.randomize, metric, cfg.bulk_build, cfg.centroid_only_routing, query_index, cfg.dump_limit);
+        try dumpHBCFrontier(alloc, cfg, split, case.top_k, case.randomize, metric, query_index, cfg.dump_limit);
     }
 
     if (cfg.per_query_metric) |metric| {
         if (cfg.dump_randomize == null or case.randomize == cfg.dump_randomize.?) {
-            try dumpHBCPerQueryRecall(alloc, split, case.top_k, case.randomize, metric, cfg.bulk_build, cfg.centroid_only_routing, dataset_path);
+            try dumpHBCPerQueryRecall(alloc, cfg, split, case.top_k, case.randomize, metric, dataset_path);
         }
     }
 
-    const euclidean = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .l2_squared, cfg.bulk_build, cfg.centroid_only_routing);
-    const inner_product = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .inner_product, cfg.bulk_build, cfg.centroid_only_routing);
-    const cosine = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .cosine, cfg.bulk_build, cfg.centroid_only_routing);
+    const euclidean = 100.0 * try calculateHBCRecallMetric(alloc, cfg, case.dataset, split, case.top_k, case.randomize, .l2_squared);
+    const inner_product = 100.0 * try calculateHBCRecallMetric(alloc, cfg, case.dataset, split, case.top_k, case.randomize, .inner_product);
+    const cosine = 100.0 * try calculateHBCRecallMetric(alloc, cfg, case.dataset, split, case.top_k, case.randomize, .cosine);
     return .{ .euclidean = euclidean, .inner_product = inner_product, .cosine = cosine };
 }
 
 fn calculateHBCRecallMetric(
     alloc: std.mem.Allocator,
+    cfg: Config,
     dataset_label: []const u8,
     split: common.SplitDataset,
     top_k: usize,
     randomize: bool,
     metric: vec.DistanceMetric,
-    bulk_build: bool,
-    centroid_only_routing: bool,
 ) !f64 {
     std.debug.print(
         "recall_harness_metric_start suite=hbc dataset={s} randomize={any} metric={s} data={d} queries={d}\n",
         .{ dataset_label, randomize, @tagName(metric), split.data.count, split.queries.count },
     );
-    var built = buildHBCIndex(alloc, split, randomize, metric, bulk_build, centroid_only_routing) catch |err| {
+    var built = buildHBCIndex(alloc, cfg, split, randomize, metric) catch |err| {
         std.debug.print(
             "recall_harness_build_error suite=hbc dataset={s} randomize={any} metric={s} err={s}\n",
             .{ dataset_label, randomize, @tagName(metric), @errorName(err) },
@@ -501,11 +526,10 @@ const BuiltHBC = struct {
 
 fn buildHBCIndex(
     alloc: std.mem.Allocator,
+    cfg: Config,
     split: common.SplitDataset,
     randomize: bool,
     metric: vec.DistanceMetric,
-    bulk_build: bool,
-    centroid_only_routing: bool,
 ) !BuiltHBC {
     var data_owned = try common.cloneSet(alloc, split.data);
     errdefer data_owned.deinit(alloc);
@@ -532,6 +556,13 @@ fn buildHBCIndex(
         .rerank_policy = .always,
         .quantizer_seed = 42,
         .use_random_ortho_trans = randomize,
+        .centroid_directory_mode = cfg.centroid_directory_mode,
+        .posting_storage_mode = cfg.posting_storage_mode,
+        .flat_centroid_block_size = cfg.flat_centroid_block_size,
+        .flat_centroid_probe_count = cfg.flat_centroid_probe_count,
+        .flat_centroid_block_probe_count = cfg.flat_centroid_block_probe_count,
+        .max_posting_overlay_cache_bytes = cfg.max_posting_overlay_cache_bytes,
+        .max_posting_overlay_cache_entry_bytes = cfg.max_posting_overlay_cache_entry_bytes,
         .max_cached_nodes = 10_000,
         .max_cached_vectors = 10_000,
     });
@@ -550,10 +581,13 @@ fn buildHBCIndex(
             .metadata = try std.fmt.allocPrint(alloc, "data_{d}", .{i + 1}),
         };
     }
-    if (bulk_build) {
+    if (cfg.bulk_build) {
         try idx.bulkBuildWithMetadata(items);
     } else {
-        try idx.batchInsertWithMetadataOptions(items, .{ .centroid_only_routing = centroid_only_routing });
+        try idx.batchInsertWithMetadataOptions(items, .{ .centroid_only_routing = cfg.centroid_only_routing });
+    }
+    if (cfg.repair_postings_after_build) {
+        _ = try idx.repairDirtyPostings();
     }
 
     return .{
@@ -566,16 +600,15 @@ fn buildHBCIndex(
 
 fn dumpHBCFrontier(
     alloc: std.mem.Allocator,
+    cfg: Config,
     split: common.SplitDataset,
     top_k: usize,
     randomize: bool,
     metric: vec.DistanceMetric,
-    bulk_build: bool,
-    centroid_only_routing: bool,
     query_index: usize,
     dump_limit: usize,
 ) !void {
-    var built = try buildHBCIndex(alloc, split, randomize, metric, bulk_build, centroid_only_routing);
+    var built = try buildHBCIndex(alloc, cfg, split, randomize, metric);
     defer built.deinit();
 
     const data = built.data();
@@ -694,15 +727,14 @@ fn debugGlobalApprox(
 
 fn dumpHBCPerQueryRecall(
     alloc: std.mem.Allocator,
+    cfg: Config,
     split: common.SplitDataset,
     top_k: usize,
     randomize: bool,
     metric: vec.DistanceMetric,
-    bulk_build: bool,
-    centroid_only_routing: bool,
     dataset_path: []const u8,
 ) !void {
-    var built = try buildHBCIndex(alloc, split, randomize, metric, bulk_build, centroid_only_routing);
+    var built = try buildHBCIndex(alloc, cfg, split, randomize, metric);
     defer built.deinit();
 
     const data = built.data();

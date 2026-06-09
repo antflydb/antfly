@@ -361,6 +361,22 @@ pub const DenseSearchProfile = struct {
     hbc_scratch_acquire_ns: u64 = 0,
     hbc_node_cache_lookup_ns: u64 = 0,
     hbc_quantized_cache_lookup_ns: u64 = 0,
+    hbc_posting_overlay_ns: u64 = 0,
+    hbc_posting_overlay_calls: u64 = 0,
+    hbc_posting_overlay_base_members: u64 = 0,
+    hbc_posting_overlay_delta_records: u64 = 0,
+    hbc_posting_overlay_delta_scan_skips: u64 = 0,
+    hbc_posting_overlay_materialized_members: u64 = 0,
+    hbc_posting_overlay_fallbacks: u64 = 0,
+    hbc_posting_overlay_cache_hits: u64 = 0,
+    hbc_posting_overlay_cache_misses: u64 = 0,
+    hbc_posting_overlay_cache_evictions: u64 = 0,
+    hbc_posting_overlay_cache_admission_skips: u64 = 0,
+    hbc_posting_overlay_cache_member_bytes: u64 = 0,
+    hbc_centroid_directory_blocks_scanned: u64 = 0,
+    hbc_centroid_directory_blocks_selected: u64 = 0,
+    hbc_centroid_directory_block_centroids_scored: u64 = 0,
+    hbc_centroid_directory_posting_centroids_scored: u64 = 0,
     resolved_search_width: u32 = 0,
     resolved_epsilon: f32 = 0,
     hbc_nodes_visited: u64 = 0,
@@ -4466,6 +4482,22 @@ fn searchDenseInternal(
         profile.hbc_scratch_acquire_ns = profiled.profile.scratch_acquire_ns;
         profile.hbc_node_cache_lookup_ns = profiled.profile.node_cache_lookup_ns;
         profile.hbc_quantized_cache_lookup_ns = profiled.profile.quantized_cache_lookup_ns;
+        profile.hbc_posting_overlay_ns = profiled.profile.posting_overlay_ns;
+        profile.hbc_posting_overlay_calls = profiled.profile.posting_overlay_calls;
+        profile.hbc_posting_overlay_base_members = profiled.profile.posting_overlay_base_members;
+        profile.hbc_posting_overlay_delta_records = profiled.profile.posting_overlay_delta_records;
+        profile.hbc_posting_overlay_delta_scan_skips = profiled.profile.posting_overlay_delta_scan_skips;
+        profile.hbc_posting_overlay_materialized_members = profiled.profile.posting_overlay_materialized_members;
+        profile.hbc_posting_overlay_fallbacks = profiled.profile.posting_overlay_fallbacks;
+        profile.hbc_posting_overlay_cache_hits = profiled.profile.posting_overlay_cache_hits;
+        profile.hbc_posting_overlay_cache_misses = profiled.profile.posting_overlay_cache_misses;
+        profile.hbc_posting_overlay_cache_evictions = profiled.profile.posting_overlay_cache_evictions;
+        profile.hbc_posting_overlay_cache_admission_skips = profiled.profile.posting_overlay_cache_admission_skips;
+        profile.hbc_posting_overlay_cache_member_bytes = profiled.profile.posting_overlay_cache_member_bytes;
+        profile.hbc_centroid_directory_blocks_scanned = profiled.profile.centroid_directory_blocks_scanned;
+        profile.hbc_centroid_directory_blocks_selected = profiled.profile.centroid_directory_blocks_selected;
+        profile.hbc_centroid_directory_block_centroids_scored = profiled.profile.centroid_directory_block_centroids_scored;
+        profile.hbc_centroid_directory_posting_centroids_scored = profiled.profile.centroid_directory_posting_centroids_scored;
         profile.hbc_nodes_visited = profiled.profile.nodes_visited;
         profile.hbc_leaves_explored = profiled.profile.leaves_explored;
         profile.hbc_approx_vectors_scored = profiled.profile.approx_vectors_scored;
@@ -4800,6 +4832,34 @@ fn logBenchDenseQueryProfile(
             profile.inline_metadata_hits,
             profile.fetched_metadata_hits,
             profile.lookup_doc_key_hits,
+        },
+    );
+    std.log.info(
+        "antfly_bench_dense_query_hbc_overlay index={s} overlay_us={d} calls={d} base_members={d} delta_records={d} delta_scan_skips={d} materialized_members={d} fallbacks={d} cache_hits={d} cache_misses={d} cache_evictions={d} cache_admission_skips={d} cache_member_bytes={d}",
+        .{
+            req.index_name orelse "",
+            nsToUs(profile.hbc_posting_overlay_ns),
+            profile.hbc_posting_overlay_calls,
+            profile.hbc_posting_overlay_base_members,
+            profile.hbc_posting_overlay_delta_records,
+            profile.hbc_posting_overlay_delta_scan_skips,
+            profile.hbc_posting_overlay_materialized_members,
+            profile.hbc_posting_overlay_fallbacks,
+            profile.hbc_posting_overlay_cache_hits,
+            profile.hbc_posting_overlay_cache_misses,
+            profile.hbc_posting_overlay_cache_evictions,
+            profile.hbc_posting_overlay_cache_admission_skips,
+            profile.hbc_posting_overlay_cache_member_bytes,
+        },
+    );
+    std.log.info(
+        "antfly_bench_dense_query_hbc_centroid_directory index={s} blocks_scanned={d} blocks_selected={d} block_centroids_scored={d} posting_centroids_scored={d}",
+        .{
+            req.index_name orelse "",
+            profile.hbc_centroid_directory_blocks_scanned,
+            profile.hbc_centroid_directory_blocks_selected,
+            profile.hbc_centroid_directory_block_centroids_scored,
+            profile.hbc_centroid_directory_posting_centroids_scored,
         },
     );
 }

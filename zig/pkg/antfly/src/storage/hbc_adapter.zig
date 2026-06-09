@@ -42,6 +42,7 @@ const lmdb = if (supports_lmdb) @import("lmdb.zig") else struct {
     pub const Error = error{NotFound};
 };
 const lsm_backend = @import("lsm_backend/mod.zig");
+const storage_sim = @import("sim_runtime.zig");
 const platform_time = @import("../platform/time.zig");
 const vec = @import("antfly_vector").vector;
 const proto = @import("antfly_vector").proto;
@@ -1295,6 +1296,7 @@ pub const HBCIndex = struct {
     external_vector_batch_scratch_loader: ?ExternalVectorBatchScratchLoader = null,
     external_vector_batch_transformed_matrix_loader: ?ExternalVectorBatchTransformedMatrixLoader = null,
     external_vector_batch_distance_loader: ?ExternalVectorBatchDistanceLoader = null,
+    external_vector_metadata_required: bool = true,
 
     const EnvOwner = hbc_backend.OpenedBackend;
     pub const ExternalVectorLoader = *const fn (ctx: *anyopaque, alloc: Allocator, vector_id: u64, metadata: []const u8) anyerror![]f32;
@@ -2114,6 +2116,10 @@ pub const HBCIndex = struct {
         self.external_vector_batch_distance_loader = loader;
     }
 
+    pub fn setExternalVectorMetadataRequired(self: *HBCIndex, required: bool) void {
+        self.external_vector_metadata_required = required;
+    }
+
     pub fn hasExternalVectorLoader(self: *const HBCIndex) bool {
         return self.external_vector_ctx != null and
             (self.external_vector_loader != null or self.external_vector_scratch_loader != null or self.external_vector_batch_scratch_loader != null or self.external_vector_batch_transformed_matrix_loader != null or self.external_vector_batch_distance_loader != null);
@@ -2660,6 +2666,7 @@ pub const HBCIndex = struct {
         switch (Child) {
             vectorindex_store.NamespaceReadTxn,
             vectorindex_store.NamespaceWriteTxn,
+            vectorindex_store.NamespaceBatch,
             => return try txn.openCursor(namespace),
             else => @compileError("expected vectorindex namespace transaction"),
         }
@@ -3488,6 +3495,10 @@ pub const HBCIndex = struct {
         vectorindex_hbc_runtime.releaseSearchScratch(self, handle);
     }
 
+    pub fn clearSearchScratchCache(self: *HBCIndex) void {
+        vectorindex_hbc_runtime.clearSearchScratchCache(self);
+    }
+
     pub fn refreshSearchScratchAccounting(self: *HBCIndex, handle: *ScratchHandle) void {
         vectorindex_hbc_runtime.refreshSearchScratchAccounting(self, handle);
     }
@@ -3605,7 +3616,9 @@ pub const HBCIndex = struct {
                 try txn.put(.nodes, key, value);
                 self.noteNamespacePut(.nodes, key.len, value.len, false);
             } else {
-                try txn.delete(.nodes, key);
+                txn.delete(.nodes, key) catch |err| {
+                    if (!isNotFound(err)) return err;
+                };
                 self.noteNamespaceDelete(.nodes, key.len);
             }
         }
@@ -3615,7 +3628,6 @@ pub const HBCIndex = struct {
 
     pub fn publishDeferredNodeKeysForBatchFinishTxn(self: *HBCIndex, txn: anytype, options: BatchInsertOptions) !void {
         if (!options.bulk_ingest) return;
-        if (self.bulk_ingest_session_depth > 0 and self.config.centroid_directory_mode == .flat_rabitq) return;
         if (self.shouldDeferLeafSplitToBulkFinish(options)) return;
         if (self.shouldDeferQuantizedRebuildToBulkFinish(options)) return;
         try self.publishDeferredNodeKeysForBulkFinishTxn(txn);
@@ -3998,6 +4010,7 @@ pub const HBCIndex = struct {
                 return err;
             };
             defer node.deinit(self.alloc);
+            try vectorindex_hbc_index.overlayBaseDeltaMembersForLoadedNode(self, txn, &node);
             try self.ensurePinnedNode(&node);
             try self.ensurePinnedQuantized(txn, &node);
             if (!node.is_leaf and item.depth < self.config.pinned_tree_depth) {
@@ -4026,6 +4039,9 @@ pub const HBCIndex = struct {
 
         var seen = std.AutoHashMapUnmanaged(u64, void).empty;
         defer seen.deinit(alloc);
+        var seen_vectors = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer seen_vectors.deinit(alloc);
+        var live_member_count: u64 = 0;
 
         while (pending.pop()) |node_id| {
             if (node_id == 0) return error.Corrupted;
@@ -4033,15 +4049,40 @@ pub const HBCIndex = struct {
             if (gop.found_existing) continue;
 
             var node = try self.loadNodeFromStorage(&txn, node_id);
-            defer node.deinit(alloc);
+            defer node.deinit(self.alloc);
+            try vectorindex_hbc_index.overlayBaseDeltaMembersForLoadedNode(self, &txn, &node);
 
             if (node.is_leaf) {
                 if (node.members.len == 0) return error.Corrupted;
+                if (self.config.posting_storage_mode == .base_delta) {
+                    var centroid_record = try vectorindex_posting.PostingStore.loadCentroidDirectoryRecord(self, &txn, node.id, isNotFound);
+                    defer centroid_record.deinit(self.alloc);
+                    if (centroid_record.posting_id != node.id) return error.Corrupted;
+                    if (centroid_record.centroid.len != self.config.dims) return error.Corrupted;
+                    if (centroid_record.member_count == 0) return error.Corrupted;
+                    if (!node.posting_state.dirty and centroid_record.member_count != node.members.len) return error.Corrupted;
+
+                    for (node.members) |vector_id| {
+                        const vector_gop = try seen_vectors.getOrPut(alloc, vector_id);
+                        if (vector_gop.found_existing) return error.Corrupted;
+                        live_member_count += 1;
+
+                        const assignment = try vectorindex_posting.AssignmentMap.getRecord(self, &txn, vector_id, isNotFound);
+                        if (assignment.posting_id != node.id) return error.Corrupted;
+                        if (assignment.vector_ref != vector_id) return error.Corrupted;
+                        if ((assignment.flags & vectorindex_posting.AssignmentFormat.current_flag) == 0) return error.Corrupted;
+
+                        const legacy_leaf = try vectorindex_posting.AssignmentMap.get(self, &txn, vector_id);
+                        if (legacy_leaf != node.id) return error.Corrupted;
+                    }
+                }
                 continue;
             }
             if (node.children.len == 0) return error.Corrupted;
             try pending.appendSlice(alloc, node.children);
         }
+
+        if (self.config.posting_storage_mode == .base_delta and live_member_count != self.metadata.active_count) return error.Corrupted;
     }
 
     fn collectNamespaceKeys(
@@ -4128,7 +4169,9 @@ pub const HBCIndex = struct {
     pub fn getNodePtr(self: *HBCIndex, txn: anytype, node_id: u64) !*const Node {
         if (self.getCachedNodePtr(node_id)) |cached| return cached;
 
-        const loaded = try self.loadNodeFromStorage(txn, node_id);
+        var loaded = try self.loadNodeFromStorage(txn, node_id);
+        errdefer loaded.deinit(self.alloc);
+        try vectorindex_hbc_index.overlayBaseDeltaMembersForLoadedNode(self, txn, &loaded);
         return try self.cacheNodeOwned(loaded);
     }
 
@@ -4138,7 +4181,9 @@ pub const HBCIndex = struct {
         }
 
         const start = nowNs();
-        const loaded = try self.loadNodeFromStorage(txn, node_id);
+        var loaded = try self.loadNodeFromStorage(txn, node_id);
+        errdefer loaded.deinit(self.alloc);
+        try vectorindex_hbc_index.overlayBaseDeltaMembersForLoadedNode(self, txn, &loaded);
         const cached = try self.cacheNodeOwned(loaded);
         profile.node_cache_miss_ns += elapsedSince(start);
         profile.node_cache_misses += 1;
@@ -4328,19 +4373,32 @@ pub const HBCIndex = struct {
 
         const metadata = try self.alloc.alloc(?[]const u8, vector_ids.len);
         defer self.alloc.free(metadata);
-        try self.getMetadataManySortedInTxnWithScratch(
-            txn,
-            vector_ids,
-            metadata,
-            lookup_storage,
-            key_views_storage,
-            values_storage,
-        );
+        if (self.external_vector_metadata_required) {
+            try self.getMetadataManySortedInTxnWithScratch(
+                txn,
+                vector_ids,
+                metadata,
+                lookup_storage,
+                key_views_storage,
+                values_storage,
+            );
+        } else {
+            @memset(metadata, null);
+            clearExternalVectorMetadataScratch(vector_ids.len, key_views_storage, values_storage);
+        }
         loader(ctx, vector_ids, metadata, vector_views[0..vector_ids.len], batch_scratch, scratch.len) catch |err| switch (err) {
             error.Unsupported => return false,
             else => return err,
         };
         return true;
+    }
+
+    fn clearExternalVectorMetadataScratch(count: usize, key_views: [][]const u8, values: []?[]const u8) void {
+        const safe_count = @min(count, @min(key_views.len, values.len));
+        for (0..safe_count) |i| {
+            key_views[i] = &.{};
+            values[i] = null;
+        }
     }
 
     fn transformExternalVectorForMatrix(index: *HBCIndex, original: []const f32, transformed: []f32) []const f32 {
@@ -4400,14 +4458,19 @@ pub const HBCIndex = struct {
 
         const metadata = try self.alloc.alloc(?[]const u8, vector_ids.len);
         defer self.alloc.free(metadata);
-        try self.getMetadataManySortedInTxnWithScratch(
-            txn,
-            vector_ids,
-            metadata,
-            lookup_storage,
-            key_views_storage,
-            values_storage,
-        );
+        if (self.external_vector_metadata_required) {
+            try self.getMetadataManySortedInTxnWithScratch(
+                txn,
+                vector_ids,
+                metadata,
+                lookup_storage,
+                key_views_storage,
+                values_storage,
+            );
+        } else {
+            @memset(metadata, null);
+            clearExternalVectorMetadataScratch(vector_ids.len, key_views_storage, values_storage);
+        }
         loader(
             ctx,
             vector_ids,
@@ -4508,14 +4571,19 @@ pub const HBCIndex = struct {
 
         const metadata = metadata_storage[0..rerank_positions.len];
         const metadata_start = platform_time.monotonicNs();
-        try self.getMetadataManySortedInTxnWithScratch(
-            txn,
-            vector_ids,
-            metadata,
-            lookup_storage,
-            key_views_storage,
-            values_storage,
-        );
+        if (self.external_vector_metadata_required) {
+            try self.getMetadataManySortedInTxnWithScratch(
+                txn,
+                vector_ids,
+                metadata,
+                lookup_storage,
+                key_views_storage,
+                values_storage,
+            );
+        } else {
+            @memset(metadata, null);
+            clearExternalVectorMetadataScratch(rerank_positions.len, key_views_storage, values_storage);
+        }
         if (profile) |p| p.rerank_metadata_lookup_ns += platform_time.monotonicNs() - metadata_start;
         loader(
             ctx,
@@ -4607,12 +4675,12 @@ pub const HBCIndex = struct {
     fn loadExternalVector(self: *HBCIndex, txn: anytype, vector_id: u64) ![]f32 {
         const loader = self.external_vector_loader orelse return error.NotFound;
         const ctx = self.external_vector_ctx orelse return error.NotFound;
-        const metadata = (try self.loadMetadataRaw(txn, vector_id)) orelse return error.NotFound;
+        const metadata = try self.loadExternalVectorMetadata(txn, vector_id);
         return try loader(ctx, self.alloc, vector_id, metadata);
     }
 
     fn loadExternalVectorIntoScratch(self: *HBCIndex, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
-        const metadata = (try self.loadMetadataRaw(txn, vector_id)) orelse return error.NotFound;
+        const metadata = try self.loadExternalVectorMetadata(txn, vector_id);
         if (self.external_vector_scratch_loader) |loader| {
             const ctx = self.external_vector_ctx orelse return error.NotFound;
             return try loader(ctx, vector_id, metadata, scratch);
@@ -4622,6 +4690,11 @@ pub const HBCIndex = struct {
         if (vector.len > scratch.len) return error.BufferTooSmall;
         @memcpy(scratch[0..vector.len], vector);
         return scratch[0..vector.len];
+    }
+
+    fn loadExternalVectorMetadata(self: *HBCIndex, txn: anytype, vector_id: u64) ![]const u8 {
+        if (!self.external_vector_metadata_required) return "";
+        return (try self.loadMetadataRaw(txn, vector_id)) orelse error.NotFound;
     }
 
     fn loadExternalVectorCachedIntoScratch(self: *HBCIndex, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
@@ -4649,6 +4722,10 @@ pub const HBCIndex = struct {
     /// Store vector-to-leaf mapping.
     pub fn putVecLeaf(self: *HBCIndex, txn: anytype, vector_id: u64, leaf_id: u64) !void {
         try vectorindex_hbc_index.putVecLeaf(self, txn, vector_id, leaf_id);
+    }
+
+    pub fn deleteVecLeaf(self: *HBCIndex, txn: anytype, vector_id: u64) !void {
+        try vectorindex_hbc_index.deleteVecLeaf(self, txn, vector_id);
     }
 
     /// Get which leaf a vector belongs to.
@@ -5121,6 +5198,14 @@ pub const HBCIndex = struct {
         try vectorindex_hbc_index.bulkBuildPreparedInputsTxnOptions(self, txn, inputs, options, nowNs, elapsedSince);
     }
 
+    pub fn bulkBuildExternalSequentialWithMetadataOptions(
+        self: *HBCIndex,
+        count: usize,
+        options: BulkBuildOptions,
+    ) !void {
+        try vectorindex_hbc_index.bulkBuildExternalSequentialWithMetadataOptions(self, count, options, nowNs, elapsedSince);
+    }
+
     pub fn bulkBuildWithMetadataTxnOptions(
         self: *HBCIndex,
         txn: anytype,
@@ -5387,6 +5472,7 @@ pub const HBCIndex = struct {
                 return err;
             };
             defer fresh_node.deinit(self.alloc);
+            try vectorindex_hbc_index.overlayBaseDeltaMembersForLoadedNode(self, txn, &fresh_node);
             if (fresh_node.is_leaf) return node_id;
             if (fresh_node.children.len == 0) return error.Corrupted;
 
@@ -5400,6 +5486,7 @@ pub const HBCIndex = struct {
                     return err;
                 };
                 defer child.deinit(self.alloc);
+                try vectorindex_hbc_index.overlayBaseDeltaMembersForLoadedNode(self, txn, &child);
                 const dist = vec.distanceToQuery(query, query_measure, child.centroid, self.config.metric);
                 if (dist < best_dist) {
                     best_dist = dist;
@@ -5714,9 +5801,10 @@ pub const HBCIndex = struct {
     }
 
     pub fn repairDirtyPostingsWithOptions(self: *HBCIndex, options: PostingMaintenanceOptions) !PostingMaintenanceResult {
-        var txn = try self.beginWriteTxn();
+        var txn = try self.beginRuntimeWriteTxn();
         errdefer txn.abort();
         const result = try vectorindex_hbc_index.repairDirtyPostingsTxnWithOptions(self, &txn, options);
+        try self.flushMetadata(&txn);
         const commit_start = nowNs();
         self.beginPublishedSearchStateRefresh();
         errdefer self.abortPublishedSearchStateRefresh();
@@ -6173,7 +6261,7 @@ test "hbc routing scratch reports bytes to resource manager" {
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
     var idx = try HBCIndex.open(alloc, path, .{
         .dims = 2,
-        .leaf_size = 2,
+        .leaf_size = 4,
         .branching_factor = 2,
         .search_width = 8,
     });
@@ -6357,7 +6445,7 @@ test "flat rabitq centroid directory searches leaf postings" {
 
     var idx = try HBCIndex.open(alloc, path, .{
         .dims = 2,
-        .leaf_size = 2,
+        .leaf_size = 8,
         .branching_factor = 2,
         .search_width = 4,
         .use_quantization = true,
@@ -6388,6 +6476,103 @@ test "flat rabitq centroid directory searches leaf postings" {
     try std.testing.expectEqual(@as(u64, 3), hits[0].vector_id);
     try std.testing.expect(profiled.profile.approx_nodes_expanded > 0);
     try std.testing.expect(profiled.profile.leaves_explored > 0);
+}
+
+test "two-level rabitq centroid directory prunes posting blocks" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .centroid_directory_mode = .two_level_rabitq,
+        .flat_centroid_block_size = 1,
+        .flat_centroid_probe_count = 8,
+        .flat_centroid_block_probe_count = 1,
+    });
+    defer idx.close();
+
+    const items = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:a" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.2, 0.0 }, .metadata = "doc:b" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 10.0, 10.0 }, .metadata = "doc:c" },
+        .{ .vector_id = 4, .vector = &[_]f32{ 10.2, 10.0 }, .metadata = "doc:d" },
+        .{ .vector_id = 5, .vector = &[_]f32{ 20.0, 20.0 }, .metadata = "doc:e" },
+        .{ .vector_id = 6, .vector = &[_]f32{ 20.2, 20.0 }, .metadata = "doc:f" },
+        .{ .vector_id = 7, .vector = &[_]f32{ 30.0, 30.0 }, .metadata = "doc:g" },
+        .{ .vector_id = 8, .vector = &[_]f32{ 30.2, 30.0 }, .metadata = "doc:h" },
+    };
+    try idx.bulkBuildWithMetadata(&items);
+
+    var profiled = try idx.searchProfiledRequest(.{
+        .query = &[_]f32{ 30.0, 30.0 },
+        .k = 1,
+        .search_width = 8,
+        .load_metadata = false,
+    });
+    defer profiled.results.deinit();
+
+    const hits = profiled.results.getHits();
+    try std.testing.expectEqual(@as(usize, 1), hits.len);
+    try std.testing.expectEqual(@as(u64, 7), hits[0].vector_id);
+    try std.testing.expect(profiled.profile.centroid_directory_blocks_scanned > 1);
+    try std.testing.expectEqual(@as(u64, 1), profiled.profile.centroid_directory_blocks_selected);
+    try std.testing.expectEqual(@as(u64, 1), profiled.profile.centroid_directory_posting_centroids_scored);
+    try std.testing.expectEqual(@as(u64, 1), profiled.profile.centroid_directory_posting_centroid_estimates);
+    try std.testing.expect(profiled.profile.centroid_directory_posting_centroid_estimates < profiled.profile.centroid_directory_blocks_scanned);
+}
+
+test "two-level rabitq default block probes cover requested posting probes" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .centroid_directory_mode = .two_level_rabitq,
+        .flat_centroid_block_size = 1,
+        .flat_centroid_probe_count = 4,
+        .flat_centroid_block_probe_count = 0,
+    });
+    defer idx.close();
+
+    const items = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:a" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.2, 0.0 }, .metadata = "doc:b" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 10.0, 10.0 }, .metadata = "doc:c" },
+        .{ .vector_id = 4, .vector = &[_]f32{ 10.2, 10.0 }, .metadata = "doc:d" },
+        .{ .vector_id = 5, .vector = &[_]f32{ 20.0, 20.0 }, .metadata = "doc:e" },
+        .{ .vector_id = 6, .vector = &[_]f32{ 20.2, 20.0 }, .metadata = "doc:f" },
+        .{ .vector_id = 7, .vector = &[_]f32{ 30.0, 30.0 }, .metadata = "doc:g" },
+        .{ .vector_id = 8, .vector = &[_]f32{ 30.2, 30.0 }, .metadata = "doc:h" },
+    };
+    try idx.bulkBuildWithMetadata(&items);
+
+    var profiled = try idx.searchProfiledRequest(.{
+        .query = &[_]f32{ 30.0, 30.0 },
+        .k = 1,
+        .search_width = 8,
+        .load_metadata = false,
+    });
+    defer profiled.results.deinit();
+
+    const hits = profiled.results.getHits();
+    try std.testing.expectEqual(@as(usize, 1), hits.len);
+    try std.testing.expectEqual(@as(u64, 7), hits[0].vector_id);
+    try std.testing.expectEqual(@as(u64, 4), profiled.profile.centroid_directory_blocks_scanned);
+    try std.testing.expectEqual(@as(u64, 4), profiled.profile.centroid_directory_blocks_selected);
+    try std.testing.expectEqual(@as(u64, 4), profiled.profile.centroid_directory_posting_centroids_scored);
+    try std.testing.expectEqual(@as(u64, 4), profiled.profile.centroid_directory_posting_centroid_estimates);
 }
 
 test "searchProfiled records phase timings and counters" {
@@ -7086,7 +7271,7 @@ test "flat centroid search ignores staged bulk ingest nodes until publish" {
 
     var idx = try HBCIndex.open(alloc, path, .{
         .dims = 2,
-        .leaf_size = 8,
+        .leaf_size = 2,
         .branching_factor = 2,
         .search_width = 4,
         .use_quantization = true,
@@ -7138,6 +7323,70 @@ test "flat centroid search ignores staged bulk ingest nodes until publish" {
     defer published.deinit();
     try std.testing.expectEqual(@as(usize, 1), published.getHits().len);
     try std.testing.expectEqual(@as(u64, 99), published.getHits()[0].vector_id);
+}
+
+test "flat base delta bulk ingest routes multiple batches within session" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 8,
+        .search_width = 8,
+        .use_quantization = true,
+        .centroid_directory_mode = .flat_rabitq,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+        .flat_centroid_block_size = 8,
+        .flat_centroid_probe_count = 8,
+    });
+    defer idx.close();
+
+    var vectors: [32][2]f32 = undefined;
+    var items: [32]BatchInsertItem = undefined;
+    for (&items, 0..) |*item, i| {
+        const cluster: f32 = @floatFromInt(i / 8);
+        const offset: f32 = @floatFromInt(i % 8);
+        vectors[i] = .{ cluster * 10.0 + offset * 0.1, cluster * 10.0 };
+        item.* = .{
+            .vector_id = @intCast(i + 1),
+            .vector = vectors[i][0..],
+            .metadata = "",
+        };
+    }
+
+    const options: BatchInsertOptions = .{
+        .assume_absent_ids = true,
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+        .bulk_ingest = true,
+    };
+
+    try idx.beginBulkIngestSession();
+    var session_open = true;
+    errdefer if (session_open) idx.abortBulkIngestSession();
+
+    try idx.batchInsertWithMetadataOptions(items[0..8], options);
+    try idx.batchInsertWithMetadataOptions(items[8..16], options);
+    try idx.batchInsertWithMetadataOptions(items[16..24], options);
+    try idx.batchInsertWithMetadataOptions(items[24..32], options);
+
+    try idx.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    session_open = false;
+
+    try std.testing.expectEqual(@as(u64, 32), idx.stats().active_count);
+    var profiled = try idx.searchProfiledRequest(.{
+        .query = vectors[25][0..],
+        .k = 3,
+        .load_metadata = false,
+    });
+    defer profiled.results.deinit();
+    try std.testing.expect(profiled.results.getHits().len > 0);
+    try std.testing.expect(profiled.profile.centroid_directory_blocks_scanned > 0);
 }
 
 test "bulk build creates searchable index and persists metadata" {
@@ -8619,7 +8868,11 @@ test "posting backlog stats report lazy dirty leaves with std Io writer" {
     try std.testing.expectEqual(@as(u64, 1), stats.dirty_postings);
     try std.testing.expectEqual(@as(u64, 1), stats.centroid_dirty_postings);
     try std.testing.expectEqual(@as(u64, 0), stats.payload_dirty_postings);
+    try std.testing.expectEqual(stats.max_mutation_version, stats.min_dirty_mutation_version);
+    try std.testing.expectEqual(@as(u64, 0), stats.max_dirty_version_age);
     try std.testing.expectEqual(@as(u64, 1), stats.max_centroid_version_lag);
+    try std.testing.expectEqual(@as(u64, 0), stats.overfull_postings);
+    try std.testing.expectEqual(@as(u64, 0), stats.max_over_capacity_members);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -8627,6 +8880,8 @@ test "posting backlog stats report lazy dirty leaves with std Io writer" {
     const rendered = out.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, rendered, "dirty_postings=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "centroid_dirty_postings=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "max_dirty_version_age=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "overfull_postings=0") != null);
 }
 
 test "dirty quantized posting payloads are scored exactly" {
@@ -8703,6 +8958,605 @@ test "auto posting maintenance repairs bounded lazy backlog before commit" {
     const profile = idx.getWriteProfile();
     try std.testing.expect(profile.posting_lazy_centroid_deferrals > 0);
     try std.testing.expect(profile.posting_maintenance_repaired_postings > 0);
+}
+
+test "auto posting maintenance respects backlog threshold gates" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .use_quantization = false,
+        .lazy_posting_maintenance = true,
+        .auto_posting_maintenance_max_postings = 1,
+        .auto_posting_maintenance_min_dirty_postings = 99,
+    });
+    defer idx.close();
+
+    try idx.insert(1, &[_]f32{ 1.0, 0.0 });
+    idx.resetWriteProfile();
+    try idx.insert(2, &[_]f32{ 3.0, 0.0 });
+
+    var stats = try idx.postingBacklogStats();
+    try std.testing.expect(stats.needsRepair());
+    try std.testing.expectEqual(@as(u64, 1), stats.dirty_postings);
+    try std.testing.expectEqual(@as(u64, 0), idx.getWriteProfile().posting_maintenance_repaired_postings);
+
+    idx.config.auto_posting_maintenance_min_dirty_postings = 1;
+    idx.resetWriteProfile();
+    try idx.insert(3, &[_]f32{ 5.0, 0.0 });
+
+    stats = try idx.postingBacklogStats();
+    try std.testing.expect(!stats.needsRepair());
+    try std.testing.expectEqual(@as(u64, 0), stats.dirty_postings);
+    try std.testing.expect(idx.getWriteProfile().posting_maintenance_repaired_postings > 0);
+}
+
+test "auto posting maintenance can trigger on base delta tail debt" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .use_quantization = false,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+        .auto_posting_maintenance_max_postings = 1,
+        .auto_posting_maintenance_min_dirty_postings = 99,
+        .auto_posting_maintenance_min_delta_records_to_run = 1,
+        .auto_posting_maintenance_min_delta_records_to_fold = 99,
+        .auto_posting_maintenance_min_tombstone_records_to_fold = 99,
+        .auto_posting_maintenance_min_delta_to_base_ratio_bps = 0,
+    });
+    defer idx.close();
+
+    try idx.insert(1, &[_]f32{ 1.0, 0.0 });
+    idx.resetWriteProfile();
+    try idx.insert(2, &[_]f32{ 3.0, 0.0 });
+
+    const profile = idx.getWriteProfile();
+    try std.testing.expect(profile.posting_maintenance_repaired_postings > 0);
+    try std.testing.expectEqual(@as(u64, 1), profile.posting_maintenance_delta_fold_attempts);
+    try std.testing.expectEqual(@as(u64, 1), profile.posting_maintenance_delta_fold_skipped);
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_maintenance_delta_fold_records);
+
+    const stats = try idx.postingBacklogStats();
+    try std.testing.expect(stats.needsRepair());
+    try std.testing.expectEqual(@as(u64, 1), stats.delta_tail_postings);
+    try std.testing.expectEqual(@as(u64, 1), stats.max_delta_tail_records);
+    try std.testing.expectEqual(@as(u64, 0), stats.max_tombstone_tail_records);
+    try std.testing.expect(stats.max_delta_to_base_ratio_bps > 0);
+
+    idx.resetWriteProfile();
+    const folded = try idx.repairDirtyPostingsWithOptions(.{
+        .max_postings = 1,
+        .min_delta_records_to_fold = 1,
+        .min_tombstone_records_to_fold = 99,
+        .min_delta_to_base_ratio_bps = 0,
+    });
+    try std.testing.expectEqual(@as(u64, 0), folded.repaired_postings);
+    try std.testing.expectEqual(@as(u64, 1), folded.delta_fold_attempts);
+    try std.testing.expectEqual(@as(u64, 0), folded.delta_fold_skipped);
+    try std.testing.expect(folded.delta_fold_records >= 1);
+
+    const clean_stats = try idx.postingBacklogStats();
+    try std.testing.expect(!clean_stats.needsRepair());
+    try std.testing.expectEqual(@as(u64, 0), clean_stats.delta_tail_postings);
+}
+
+test "base delta grouped insert writes one multi-record delta per posting" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 16,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    });
+    defer idx.close();
+
+    const items = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 0.2, 0.0 }, .metadata = "doc:3" },
+    };
+
+    idx.resetWriteProfile();
+    try idx.batchInsertWithMetadataOptions(&items, .{
+        .assume_absent_ids = true,
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    const profile = idx.getWriteProfile();
+    try std.testing.expectEqual(@as(u64, 1), profile.posting_delta_append_calls);
+    try std.testing.expectEqual(@as(u64, items.len), profile.posting_delta_records);
+
+    const posting_id = (try idx.debugLeafForVector(1)).?;
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    const deltas = try PostingStore.loadDeltaTail(&idx, &txn, posting_id);
+    defer alloc.free(deltas);
+    try std.testing.expectEqual(@as(usize, items.len), deltas.len);
+}
+
+test "base delta mixed batch avoids same-posting replacement deltas" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 16,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    });
+    defer idx.close();
+
+    const initial = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 0.2, 0.0 }, .metadata = "doc:3" },
+        .{ .vector_id = 4, .vector = &[_]f32{ 0.3, 0.0 }, .metadata = "doc:4" },
+    };
+    try idx.batchInsertWithMetadataOptions(&initial, .{
+        .assume_absent_ids = true,
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    const posting_id = (try idx.debugLeafForVector(1)).?;
+    const writes = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.01, 0.0 }, .metadata = "doc:1a" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.11, 0.0 }, .metadata = "doc:2a" },
+    };
+    const deletes = [_]u64{4};
+
+    idx.resetWriteProfile();
+    try idx.batchApplyOptions(&writes, &deletes, .{
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    const profile = idx.getWriteProfile();
+    try std.testing.expectEqual(@as(u64, 1), profile.posting_delta_append_calls);
+    try std.testing.expectEqual(@as(u64, 1), profile.posting_delta_records);
+    try std.testing.expectEqual(@as(u64, 3), profile.posting_lazy_centroid_deferrals);
+    try std.testing.expectEqual(@as(u64, 2), profile.posting_lazy_payload_deferrals);
+
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    const deltas = try PostingStore.loadDeltaTail(&idx, &txn, posting_id);
+    defer alloc.free(deltas);
+    var saw_replace = false;
+    for (deltas) |delta| {
+        if (delta.op == .replace and (delta.vector_id == 1 or delta.vector_id == 2)) saw_replace = true;
+    }
+    try std.testing.expect(!saw_replace);
+
+    var results = try idx.search(&[_]f32{ 0.11, 0.0 }, 3);
+    defer results.deinit();
+    var found_updated = false;
+    var found_deleted = false;
+    for (results.getHits()) |hit| {
+        if (hit.vector_id == 2) found_updated = true;
+        if (hit.vector_id == 4) found_deleted = true;
+    }
+    try std.testing.expect(found_updated);
+    try std.testing.expect(!found_deleted);
+}
+
+test "base delta overwrite batch avoids same-posting replacement deltas" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 16,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    });
+    defer idx.close();
+
+    const initial = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 0.2, 0.0 }, .metadata = "doc:3" },
+        .{ .vector_id = 4, .vector = &[_]f32{ 0.3, 0.0 }, .metadata = "doc:4" },
+    };
+    try idx.batchInsertWithMetadataOptions(&initial, .{
+        .assume_absent_ids = true,
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    const posting_id = (try idx.debugLeafForVector(1)).?;
+    const writes = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.01, 0.0 }, .metadata = "doc:1a" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.11, 0.0 }, .metadata = "doc:2a" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 0.21, 0.0 }, .metadata = "doc:3a" },
+    };
+
+    idx.resetWriteProfile();
+    try idx.batchApplyOptions(&writes, &.{}, .{
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    const profile = idx.getWriteProfile();
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_delta_append_calls);
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_delta_records);
+    try std.testing.expectEqual(@as(u64, writes.len), profile.posting_lazy_centroid_deferrals);
+    try std.testing.expectEqual(@as(u64, writes.len), profile.posting_lazy_payload_deferrals);
+
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    const deltas = try PostingStore.loadDeltaTail(&idx, &txn, posting_id);
+    defer alloc.free(deltas);
+    var saw_replace = false;
+    for (writes) |write| {
+        for (deltas) |delta| {
+            if (delta.op == .replace and delta.vector_id == write.vector_id) {
+                saw_replace = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(!saw_replace);
+}
+
+test "base delta lazy overwrite does not reroute into full target posting" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 1,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    });
+    defer idx.close();
+
+    const initial = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 10.0, 0.0 }, .metadata = "doc:2" },
+    };
+    try idx.batchInsertWithMetadataOptions(&initial, .{
+        .assume_absent_ids = true,
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    const source_posting = (try idx.debugLeafForVector(1)).?;
+    const target_posting = (try idx.debugLeafForVector(2)).?;
+    if (source_posting == target_posting) return error.SkipZigTest;
+
+    const update = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 10.05, 0.0 }, .metadata = "doc:1a" },
+    };
+    idx.resetWriteProfile();
+    try idx.batchApplyOptions(&update, &.{}, .{
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    try std.testing.expectEqual(source_posting, (try idx.debugLeafForVector(1)).?);
+    const profile = idx.getWriteProfile();
+    try std.testing.expectEqual(@as(u64, 0), profile.existing_vector_reroutes);
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_delta_append_calls);
+
+    const stats = try idx.postingBacklogStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.overfull_postings);
+    try std.testing.expectEqual(@as(u64, 0), stats.max_over_capacity_members);
+}
+
+test "base delta batched reroutes write ordered compact posting delta values" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    });
+    defer idx.close();
+
+    const initial = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 0.2, 0.0 }, .metadata = "doc:3" },
+        .{ .vector_id = 4, .vector = &[_]f32{ 0.3, 0.0 }, .metadata = "doc:4" },
+        .{ .vector_id = 5, .vector = &[_]f32{ 0.4, 0.0 }, .metadata = "doc:5" },
+        .{ .vector_id = 6, .vector = &[_]f32{ 100.0, 0.0 }, .metadata = "doc:6" },
+        .{ .vector_id = 7, .vector = &[_]f32{ 100.1, 0.0 }, .metadata = "doc:7" },
+        .{ .vector_id = 8, .vector = &[_]f32{ 100.2, 0.0 }, .metadata = "doc:8" },
+        .{ .vector_id = 9, .vector = &[_]f32{ 100.3, 0.0 }, .metadata = "doc:9" },
+        .{ .vector_id = 10, .vector = &[_]f32{ 100.4, 0.0 }, .metadata = "doc:10" },
+    };
+    try idx.batchInsertWithMetadataOptions(&initial, .{
+        .assume_absent_ids = true,
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    const source_posting = (try idx.debugLeafForVector(1)).?;
+    const target_posting = (try idx.debugLeafForVector(6)).?;
+    if (source_posting == target_posting) return error.SkipZigTest;
+    for ([_]u64{ 2, 3 }) |vector_id| {
+        try std.testing.expectEqual(source_posting, (try idx.debugLeafForVector(vector_id)).?);
+    }
+    for ([_]u64{ 7, 8, 9, 10 }) |vector_id| {
+        try std.testing.expectEqual(target_posting, (try idx.debugLeafForVector(vector_id)).?);
+    }
+
+    var before_txn = try idx.beginReadTxn();
+    defer before_txn.abort();
+    const target_deltas_before = try PostingStore.loadDeltaTail(&idx, &before_txn, target_posting);
+    defer alloc.free(target_deltas_before);
+    var matching_target_records_before: usize = 0;
+    for (target_deltas_before) |delta| {
+        if (delta.op == .insert and delta.vector_id >= 1 and delta.vector_id <= 3) matching_target_records_before += 1;
+    }
+
+    const updates = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 100.05, 0.0 }, .metadata = "doc:1a" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 100.15, 0.0 }, .metadata = "doc:2a" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 100.25, 0.0 }, .metadata = "doc:3a" },
+    };
+
+    idx.resetWriteProfile();
+    try idx.batchApplyOptions(&updates, &.{}, .{
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    for ([_]u64{ 1, 2, 3 }) |vector_id| {
+        try std.testing.expectEqual(target_posting, (try idx.debugLeafForVector(vector_id)).?);
+    }
+
+    const profile = idx.getWriteProfile();
+    try std.testing.expectEqual(@as(u64, updates.len), profile.existing_vector_reroutes);
+    try std.testing.expectEqual(@as(u64, 2), profile.posting_delta_append_calls);
+    try std.testing.expectEqual(@as(u64, updates.len * 2), profile.posting_delta_records);
+    try std.testing.expectEqual(@as(u64, 2 * (17 + updates.len * 13)), profile.posting_delta_value_bytes);
+
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    const target_deltas = try PostingStore.loadDeltaTail(&idx, &txn, target_posting);
+    defer alloc.free(target_deltas);
+
+    var matched_target_records: usize = 0;
+    var matched_new_target_records: usize = 0;
+    var previous_sequence: u64 = 0;
+    for (target_deltas) |delta| {
+        if (delta.op != .insert or delta.vector_id < 1 or delta.vector_id > 3) continue;
+        matched_target_records += 1;
+        if (matched_target_records <= matching_target_records_before) continue;
+        if (matched_new_target_records != 0) try std.testing.expect(delta.sequence > previous_sequence);
+        previous_sequence = delta.sequence;
+        matched_new_target_records += 1;
+    }
+    try std.testing.expectEqual(matching_target_records_before + updates.len, matched_target_records);
+    try std.testing.expectEqual(@as(usize, updates.len), matched_new_target_records);
+}
+
+test "base delta coalesced same-leaf overwrite avoids replacement delta keys" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 16,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    });
+    defer idx.close();
+
+    const initial = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 0.2, 0.0 }, .metadata = "doc:3" },
+    };
+    try idx.batchInsertWithMetadataOptions(&initial, .{
+        .assume_absent_ids = true,
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    const posting_id = (try idx.debugLeafForVector(1)).?;
+    idx.resetWriteProfile();
+
+    const updates = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.01, 0.0 }, .metadata = "doc:1a" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.11, 0.0 }, .metadata = "doc:2a" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 0.21, 0.0 }, .metadata = "doc:3a" },
+    };
+    try idx.batchApplyOptions(&updates, &.{}, .{
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    const profile = idx.getWriteProfile();
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_delta_append_calls);
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_delta_records);
+    try std.testing.expect(profile.save_node_calls <= 1);
+
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    const deltas = try PostingStore.loadDeltaTail(&idx, &txn, posting_id);
+    defer alloc.free(deltas);
+    try std.testing.expectEqual(@as(usize, initial.len), deltas.len);
+
+    var results = try idx.search(&[_]f32{ 0.21, 0.0 }, 1);
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+    try std.testing.expectEqual(@as(u64, 3), results.getHits()[0].vector_id);
+}
+
+test "base delta coalesced metadata overwrite skips routing delta keys" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 16,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    });
+    defer idx.close();
+
+    const initial = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 0.2, 0.0 }, .metadata = "doc:3" },
+    };
+    try idx.batchInsertWithMetadataOptions(&initial, .{
+        .assume_absent_ids = true,
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    idx.resetWriteProfile();
+    const updates = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1b" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2b" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 0.2, 0.0 }, .metadata = "doc:3b" },
+    };
+    try idx.batchApplyOptions(&updates, &.{}, .{
+        .coalesce_leaf_writes = true,
+        .defer_quantized_rebuild = true,
+        .skip_vector_store = false,
+    });
+
+    const profile = idx.getWriteProfile();
+    try std.testing.expectEqual(@as(u64, 3), profile.existing_same_vector_coalesces);
+    try std.testing.expectEqual(@as(u64, 18), profile.ns_vecs_value_bytes);
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_delta_append_calls);
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_delta_records);
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_lazy_centroid_deferrals);
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_lazy_payload_deferrals);
+    try std.testing.expectEqual(@as(u64, 0), profile.assignment_map_put_calls);
+}
+
+test "auto posting maintenance defers small base delta folds by policy" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .use_quantization = false,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+        .auto_posting_maintenance_max_postings = 1,
+        .auto_posting_maintenance_min_delta_records_to_fold = 99,
+        .auto_posting_maintenance_min_tombstone_records_to_fold = 99,
+        .auto_posting_maintenance_min_delta_to_base_ratio_bps = 0,
+    });
+    defer idx.close();
+
+    try idx.insert(1, &[_]f32{ 1.0, 0.0 });
+    idx.resetWriteProfile();
+    try idx.insert(2, &[_]f32{ 3.0, 0.0 });
+
+    const profile = idx.getWriteProfile();
+    try std.testing.expect(profile.posting_maintenance_repaired_postings > 0);
+    try std.testing.expectEqual(@as(u64, 1), profile.posting_maintenance_delta_fold_attempts);
+    try std.testing.expectEqual(@as(u64, 1), profile.posting_maintenance_delta_fold_skipped);
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_maintenance_delta_fold_records);
+
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    const deltas = try PostingStore.loadDeltaTail(&idx, &txn, idx.metadata.root_node);
+    defer alloc.free(deltas);
+    try std.testing.expect(deltas.len > 0);
+    try std.testing.expect(deltas.len < idx.config.auto_posting_maintenance_min_delta_records_to_fold);
+}
+
+test "auto posting maintenance folds small base delta tails to honor tail cap" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .use_quantization = false,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+        .auto_posting_maintenance_max_postings = 1,
+        .auto_posting_maintenance_min_dirty_postings = 99,
+        .auto_posting_maintenance_min_delta_records_to_fold = 99,
+        .auto_posting_maintenance_min_tombstone_records_to_fold = 99,
+        .auto_posting_maintenance_min_delta_to_base_ratio_bps = 0,
+        .auto_posting_maintenance_max_delta_tail_postings = 0,
+    });
+    defer idx.close();
+
+    try idx.insert(1, &[_]f32{ 1.0, 0.0 });
+    idx.resetWriteProfile();
+    try idx.insert(2, &[_]f32{ 3.0, 0.0 });
+
+    const profile = idx.getWriteProfile();
+    try std.testing.expectEqual(@as(u64, 1), profile.posting_maintenance_delta_fold_attempts);
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_maintenance_delta_fold_skipped);
+    try std.testing.expect(profile.posting_maintenance_delta_fold_records > 0);
+
+    const stats = try idx.postingBacklogStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.delta_tail_postings);
 }
 
 test "manual posting repair honors explicit bound when auto repair is configured" {
@@ -8795,6 +9649,815 @@ test "posting dirty state survives reopen and bounded repair makes progress" {
         try std.testing.expectEqual(@as(u64, 1), repaired.repaired_postings);
         const clean_stats = try idx.postingBacklogStats();
         try std.testing.expectEqual(@as(u64, 0), clean_stats.dirty_postings);
+    }
+}
+
+test "base delta posting families survive reopen and materialize current members" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var posting_id: u64 = 0;
+    {
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 4,
+            .search_width = 8,
+            .use_quantization = false,
+            .posting_storage_mode = .base_delta,
+            .lazy_posting_maintenance = true,
+        });
+        defer idx.close();
+
+        try idx.insert(1, &[_]f32{ 1.0, 0.0 });
+        try idx.insert(2, &[_]f32{ 2.0, 0.0 });
+        try idx.insert(3, &[_]f32{ 3.0, 0.0 });
+        posting_id = (try idx.debugLeafForVector(2)).?;
+        try idx.insert(2, &[_]f32{ 30.0, 0.0 });
+        try idx.delete(1);
+    }
+
+    {
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 4,
+            .search_width = 8,
+            .use_quantization = false,
+            .posting_storage_mode = .base_delta,
+            .lazy_posting_maintenance = true,
+        });
+        defer idx.close();
+
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+
+        var base = try PostingStore.loadBase(&idx, &txn, posting_id, isNotFound);
+        defer base.deinit(alloc);
+        try std.testing.expectEqual(posting_id, base.posting_id);
+        try std.testing.expect(base.members.len > 0);
+
+        const deltas = try PostingStore.loadDeltaTail(&idx, &txn, posting_id);
+        defer alloc.free(deltas);
+        try std.testing.expect(deltas.len > 0);
+
+        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, posting_id, isNotFound);
+        defer alloc.free(materialized);
+        try std.testing.expectEqual(@as(usize, 2), materialized.len);
+        var saw_deleted = false;
+        var saw_updated = false;
+        var saw_retained = false;
+        for (materialized) |member_id| {
+            saw_deleted = saw_deleted or member_id == 1;
+            saw_updated = saw_updated or member_id == 2;
+            saw_retained = saw_retained or member_id == 3;
+        }
+        try std.testing.expect(!saw_deleted);
+        try std.testing.expect(saw_updated);
+        try std.testing.expect(saw_retained);
+
+        const assignment = try AssignmentMap.getRecord(&idx, &txn, 2, isNotFound);
+        try std.testing.expectEqual(posting_id, assignment.posting_id);
+        try std.testing.expectEqual(@as(u64, 2), assignment.vector_ref);
+
+        var centroid_record = try PostingStore.loadCentroidDirectoryRecord(&idx, &txn, posting_id, isNotFound);
+        defer centroid_record.deinit(alloc);
+        try std.testing.expectEqual(posting_id, centroid_record.posting_id);
+        try std.testing.expect(centroid_record.member_count >= materialized.len);
+
+        var results = try idx.search(&[_]f32{ 30.0, 0.0 }, 1);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+        try std.testing.expectEqual(@as(u64, 2), results.getHits()[0].vector_id);
+    }
+}
+
+test "base delta folded posting generation survives reopen with clean tail" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var posting_id: u64 = 0;
+    {
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 4,
+            .search_width = 8,
+            .use_quantization = false,
+            .posting_storage_mode = .base_delta,
+            .lazy_posting_maintenance = true,
+        });
+        defer idx.close();
+
+        try idx.insert(1, &[_]f32{ 1.0, 0.0 });
+        try idx.insert(2, &[_]f32{ 2.0, 0.0 });
+        try idx.insert(3, &[_]f32{ 3.0, 0.0 });
+        posting_id = (try idx.debugLeafForVector(2)).?;
+        try idx.insert(2, &[_]f32{ 30.0, 0.0 });
+        try idx.delete(1);
+
+        const repaired = try idx.repairDirtyPostingsWithOptions(.{
+            .max_postings = 1,
+            .min_delta_records_to_fold = 1,
+        });
+        try std.testing.expect(repaired.delta_fold_records > 0);
+    }
+
+    {
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 4,
+            .search_width = 8,
+            .use_quantization = false,
+            .posting_storage_mode = .base_delta,
+            .lazy_posting_maintenance = true,
+        });
+        defer idx.close();
+
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+
+        const deltas = try PostingStore.loadDeltaTail(&idx, &txn, posting_id);
+        defer alloc.free(deltas);
+        try std.testing.expectEqual(@as(usize, 0), deltas.len);
+
+        var base = try PostingStore.loadBase(&idx, &txn, posting_id, isNotFound);
+        defer base.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), base.members.len);
+
+        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, posting_id, isNotFound);
+        defer alloc.free(materialized);
+        try std.testing.expectEqualSlices(u64, base.members, materialized);
+
+        var results = try idx.search(&[_]f32{ 30.0, 0.0 }, 1);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+        try std.testing.expectEqual(@as(u64, 2), results.getHits()[0].vector_id);
+    }
+}
+
+test "base delta clean tail debt folds after reopen" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var posting_id: u64 = 0;
+    {
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 4,
+            .search_width = 8,
+            .use_quantization = false,
+            .posting_storage_mode = .base_delta,
+            .lazy_posting_maintenance = true,
+            .auto_posting_maintenance_max_postings = 1,
+            .auto_posting_maintenance_min_dirty_postings = 99,
+            .auto_posting_maintenance_min_delta_records_to_run = 1,
+            .auto_posting_maintenance_min_delta_records_to_fold = 99,
+            .auto_posting_maintenance_min_tombstone_records_to_fold = 99,
+            .auto_posting_maintenance_min_delta_to_base_ratio_bps = 0,
+        });
+        defer idx.close();
+
+        try idx.insert(1, &[_]f32{ 1.0, 0.0 });
+        posting_id = (try idx.debugLeafForVector(1)).?;
+        try idx.insert(2, &[_]f32{ 3.0, 0.0 });
+
+        const stats = try idx.postingBacklogStats();
+        try std.testing.expectEqual(@as(u64, 0), stats.dirty_postings);
+        try std.testing.expect(stats.delta_tail_postings > 0);
+        try std.testing.expect(stats.needsRepair());
+    }
+
+    {
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 4,
+            .search_width = 8,
+            .use_quantization = false,
+            .posting_storage_mode = .base_delta,
+            .lazy_posting_maintenance = true,
+        });
+        defer idx.close();
+
+        const reopened_stats = try idx.postingBacklogStats();
+        try std.testing.expectEqual(@as(u64, 0), reopened_stats.dirty_postings);
+        try std.testing.expect(reopened_stats.delta_tail_postings > 0);
+        try std.testing.expect(reopened_stats.needsRepair());
+
+        const folded = try idx.repairDirtyPostingsWithOptions(.{
+            .max_postings = 1,
+            .min_delta_records_to_fold = 1,
+            .min_tombstone_records_to_fold = 99,
+        });
+        try std.testing.expectEqual(@as(u64, 0), folded.repaired_postings);
+        try std.testing.expectEqual(@as(u64, 1), folded.delta_fold_attempts);
+        try std.testing.expectEqual(@as(u64, 0), folded.delta_fold_skipped);
+        try std.testing.expect(folded.delta_fold_records > 0);
+
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+
+        const deltas = try PostingStore.loadDeltaTail(&idx, &txn, posting_id);
+        defer alloc.free(deltas);
+        try std.testing.expectEqual(@as(usize, 0), deltas.len);
+
+        var base = try PostingStore.loadBase(&idx, &txn, posting_id, isNotFound);
+        defer base.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), base.members.len);
+
+        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, posting_id, isNotFound);
+        defer alloc.free(materialized);
+        try std.testing.expectEqualSlices(u64, base.members, materialized);
+
+        var results = try idx.search(&[_]f32{ 3.0, 0.0 }, 1);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+        try std.testing.expectEqual(@as(u64, 2), results.getHits()[0].vector_id);
+    }
+}
+
+test "base delta posting families survive modeled lsm crash after committed writes" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var modeled_device = storage_sim.ModeledDevice.init(alloc);
+    defer modeled_device.deinit();
+    const lsm_options = hbc_backend.LsmOptions{
+        .storage = modeled_device.storage(),
+        .backend_options = .{
+            .flush_threshold = 1,
+        },
+    };
+    const config = HBCConfig{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .storage_backend = .lsm,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    };
+
+    var posting_id: u64 = 0;
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        try idx.insert(1, &[_]f32{ 1.0, 0.0 });
+        try idx.insert(2, &[_]f32{ 2.0, 0.0 });
+        try idx.insert(3, &[_]f32{ 3.0, 0.0 });
+        posting_id = (try idx.debugLeafForVector(2)).?;
+        try idx.insert(2, &[_]f32{ 30.0, 0.0 });
+        try idx.delete(1);
+        try idx.sync(true);
+
+        try modeled_device.device().crash();
+        idx.env_owner.lsm.backend.options.backend.read_only = true;
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+
+        const deltas = try PostingStore.loadDeltaTail(&idx, &txn, posting_id);
+        defer alloc.free(deltas);
+        try std.testing.expect(deltas.len > 0);
+
+        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, posting_id, isNotFound);
+        defer alloc.free(materialized);
+        try std.testing.expectEqual(@as(usize, 2), materialized.len);
+        try std.testing.expect(std.mem.indexOfScalar(u64, materialized, 1) == null);
+        try std.testing.expect(std.mem.indexOfScalar(u64, materialized, 2) != null);
+        try std.testing.expect(std.mem.indexOfScalar(u64, materialized, 3) != null);
+
+        try std.testing.expectError(error.NotFound, AssignmentMap.getRecord(&idx, &txn, 1, isNotFound));
+        const updated_assignment = try AssignmentMap.getRecord(&idx, &txn, 2, isNotFound);
+        try std.testing.expectEqual(posting_id, updated_assignment.posting_id);
+        try std.testing.expectEqual(@as(u64, 2), updated_assignment.vector_ref);
+        try std.testing.expectEqual(@as(u64, 1), updated_assignment.version);
+        {
+            var assignment_key_buf: [10]u8 = undefined;
+            try std.testing.expectError(
+                error.NotFound,
+                idx.getNamespaced(&txn, .vecs, vectorindex_hbc.encodeAssignmentKey(&assignment_key_buf, 2)),
+            );
+        }
+        const retained_assignment = try AssignmentMap.getRecord(&idx, &txn, 3, isNotFound);
+        try std.testing.expectEqual(posting_id, retained_assignment.posting_id);
+
+        var centroid_record = try PostingStore.loadCentroidDirectoryRecord(&idx, &txn, posting_id, isNotFound);
+        defer centroid_record.deinit(alloc);
+        try std.testing.expectEqual(posting_id, centroid_record.posting_id);
+        try std.testing.expect(centroid_record.member_count >= materialized.len);
+        try std.testing.expect(centroid_record.centroid.len == idx.config.dims);
+
+        var results = try idx.search(&[_]f32{ 30.0, 0.0 }, 1);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+        try std.testing.expectEqual(@as(u64, 2), results.getHits()[0].vector_id);
+        try idx.validateStoredStructure(alloc);
+
+        const repaired = try idx.repairDirtyPostingsWithOptions(.{
+            .max_postings = 1,
+            .min_delta_records_to_fold = 1,
+        });
+        try std.testing.expect(repaired.delta_fold_records > 0);
+        try idx.sync(true);
+
+        try modeled_device.device().crash();
+        idx.env_owner.lsm.backend.options.backend.read_only = true;
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+
+        const deltas = try PostingStore.loadDeltaTail(&idx, &txn, posting_id);
+        defer alloc.free(deltas);
+        try std.testing.expectEqual(@as(usize, 0), deltas.len);
+
+        var base = try PostingStore.loadBase(&idx, &txn, posting_id, isNotFound);
+        defer base.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), base.members.len);
+
+        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, posting_id, isNotFound);
+        defer alloc.free(materialized);
+        try std.testing.expectEqualSlices(u64, base.members, materialized);
+
+        try std.testing.expectError(error.NotFound, AssignmentMap.getRecord(&idx, &txn, 1, isNotFound));
+        const updated_assignment = try AssignmentMap.getRecord(&idx, &txn, 2, isNotFound);
+        try std.testing.expectEqual(posting_id, updated_assignment.posting_id);
+        try std.testing.expectEqual(@as(u64, 2), updated_assignment.vector_ref);
+        const retained_assignment = try AssignmentMap.getRecord(&idx, &txn, 3, isNotFound);
+        try std.testing.expectEqual(posting_id, retained_assignment.posting_id);
+
+        var centroid_record = try PostingStore.loadCentroidDirectoryRecord(&idx, &txn, posting_id, isNotFound);
+        defer centroid_record.deinit(alloc);
+        try std.testing.expectEqual(posting_id, centroid_record.posting_id);
+        try std.testing.expect(centroid_record.member_count >= materialized.len);
+        try std.testing.expect(centroid_record.centroid.len == idx.config.dims);
+
+        var results = try idx.search(&[_]f32{ 30.0, 0.0 }, 1);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+        try std.testing.expectEqual(@as(u64, 2), results.getHits()[0].vector_id);
+        try idx.validateStoredStructure(alloc);
+    }
+}
+
+test "base delta multi-posting batch survives modeled lsm crash" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var modeled_device = storage_sim.ModeledDevice.init(alloc);
+    defer modeled_device.deinit();
+    const lsm_options = hbc_backend.LsmOptions{
+        .storage = modeled_device.storage(),
+        .backend_options = .{
+            .flush_threshold = 1,
+        },
+    };
+    const config = HBCConfig{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .storage_backend = .lsm,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    };
+
+    var first_update: u64 = 0;
+    var first_delete: u64 = 0;
+    var second_update: u64 = 0;
+    var second_delete: u64 = 0;
+    var first_posting: u64 = 0;
+    var second_posting: u64 = 0;
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        const initial = [_]BatchInsertItem{
+            .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+            .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+            .{ .vector_id = 3, .vector = &[_]f32{ 0.2, 0.0 }, .metadata = "doc:3" },
+            .{ .vector_id = 4, .vector = &[_]f32{ 0.3, 0.0 }, .metadata = "doc:4" },
+            .{ .vector_id = 5, .vector = &[_]f32{ 10.0, 0.0 }, .metadata = "doc:5" },
+            .{ .vector_id = 6, .vector = &[_]f32{ 10.1, 0.0 }, .metadata = "doc:6" },
+            .{ .vector_id = 7, .vector = &[_]f32{ 10.2, 0.0 }, .metadata = "doc:7" },
+            .{ .vector_id = 8, .vector = &[_]f32{ 10.3, 0.0 }, .metadata = "doc:8" },
+            .{ .vector_id = 9, .vector = &[_]f32{ 0.0, 10.0 }, .metadata = "doc:9" },
+            .{ .vector_id = 10, .vector = &[_]f32{ 0.1, 10.0 }, .metadata = "doc:10" },
+            .{ .vector_id = 11, .vector = &[_]f32{ 0.2, 10.0 }, .metadata = "doc:11" },
+            .{ .vector_id = 12, .vector = &[_]f32{ 0.3, 10.0 }, .metadata = "doc:12" },
+        };
+        try idx.bulkBuildWithMetadata(&initial);
+
+        first_update = 1;
+        first_posting = (try idx.debugLeafForVector(first_update)).?;
+        var candidate: u64 = 2;
+        while (candidate <= 12 and first_delete == 0) : (candidate += 1) {
+            if ((try idx.debugLeafForVector(candidate)) == first_posting) first_delete = candidate;
+        }
+        try std.testing.expect(first_delete != 0);
+
+        candidate = 2;
+        while (candidate <= 12 and second_update == 0) : (candidate += 1) {
+            const posting_id = (try idx.debugLeafForVector(candidate)).?;
+            if (posting_id != first_posting) {
+                second_update = candidate;
+                second_posting = posting_id;
+            }
+        }
+        try std.testing.expect(second_update != 0);
+
+        candidate = 1;
+        while (candidate <= 12 and second_delete == 0) : (candidate += 1) {
+            if (candidate == second_update) continue;
+            if ((try idx.debugLeafForVector(candidate)) == second_posting) second_delete = candidate;
+        }
+        try std.testing.expect(second_delete != 0);
+
+        const writes = [_]BatchInsertItem{
+            .{ .vector_id = first_update, .vector = &[_]f32{ 100.0, 0.0 }, .metadata = "doc:first-update" },
+            .{ .vector_id = second_update, .vector = &[_]f32{ 0.0, 100.0 }, .metadata = "doc:second-update" },
+        };
+        const deletes = [_]u64{ first_delete, second_delete };
+        try idx.batchApplyOptions(&writes, &deletes, .{
+            .coalesce_leaf_writes = true,
+            .defer_quantized_rebuild = true,
+            .skip_vector_store = false,
+        });
+        try idx.sync(true);
+
+        try modeled_device.device().crash();
+        idx.env_owner.lsm.backend.options.backend.read_only = true;
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+
+        for (&[_]u64{ first_update, second_update }) |vector_id| {
+            const mapped_leaf = try idx.debugLeafForVector(vector_id);
+            try std.testing.expect(mapped_leaf != null);
+            const assignment = try AssignmentMap.getRecord(&idx, &txn, vector_id, isNotFound);
+            try std.testing.expectEqual(mapped_leaf.?, assignment.posting_id);
+
+            const members = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, mapped_leaf.?, isNotFound);
+            defer alloc.free(members);
+            try std.testing.expect(std.mem.indexOfScalar(u64, members, vector_id) != null);
+
+            var centroid_record = try PostingStore.loadCentroidDirectoryRecord(&idx, &txn, mapped_leaf.?, isNotFound);
+            defer centroid_record.deinit(alloc);
+            try std.testing.expectEqual(mapped_leaf.?, centroid_record.posting_id);
+            if (centroid_record.member_count != members.len) {
+                try std.testing.expect((centroid_record.flags & vectorindex_posting.CentroidDirectoryFormat.dirty_flag) != 0);
+            }
+            try std.testing.expect(centroid_record.centroid.len == idx.config.dims);
+        }
+
+        for (&[_]u64{ first_delete, second_delete }) |vector_id| {
+            try std.testing.expectError(error.NotFound, AssignmentMap.getRecord(&idx, &txn, vector_id, isNotFound));
+            try std.testing.expectEqual(@as(?u64, null), try idx.debugLeafForVector(vector_id));
+        }
+
+        for (&[_]u64{ first_posting, second_posting }) |posting_id| {
+            const members = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, posting_id, isNotFound);
+            defer alloc.free(members);
+            try std.testing.expect(std.mem.indexOfScalar(u64, members, first_delete) == null);
+            try std.testing.expect(std.mem.indexOfScalar(u64, members, second_delete) == null);
+        }
+
+        try idx.validateStoredStructure(alloc);
+    }
+}
+
+test "base delta compact grouped tail survives modeled lsm crash and folds" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var modeled_device = storage_sim.ModeledDevice.init(alloc);
+    defer modeled_device.deinit();
+    const lsm_options = hbc_backend.LsmOptions{
+        .storage = modeled_device.storage(),
+        .backend_options = .{
+            .flush_threshold = 1,
+        },
+    };
+    const config = HBCConfig{
+        .dims = 2,
+        .leaf_size = 16,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .storage_backend = .lsm,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    };
+
+    var posting_id: u64 = 0;
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        const items = [_]BatchInsertItem{
+            .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+            .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+            .{ .vector_id = 3, .vector = &[_]f32{ 0.2, 0.0 }, .metadata = "doc:3" },
+        };
+        try idx.batchInsertWithMetadataOptions(&items, .{
+            .assume_absent_ids = true,
+            .coalesce_leaf_writes = true,
+            .defer_quantized_rebuild = true,
+            .skip_vector_store = false,
+        });
+        posting_id = (try idx.debugLeafForVector(1)).?;
+        try idx.sync(true);
+
+        try modeled_device.device().crash();
+        idx.env_owner.lsm.backend.options.backend.read_only = true;
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+
+        const deltas = try PostingStore.loadDeltaTail(&idx, &txn, posting_id);
+        defer alloc.free(deltas);
+        try std.testing.expectEqual(@as(usize, 3), deltas.len);
+        try std.testing.expect(deltas[1].sequence > deltas[0].sequence);
+        try std.testing.expect(deltas[2].sequence > deltas[1].sequence);
+
+        var delta_key_buf: [18]u8 = undefined;
+        const raw_delta = try idx.getNamespaced(&txn, .nodes, vectorindex_hbc.encodePostingDeltaKey(&delta_key_buf, posting_id, deltas[0].sequence));
+        try std.testing.expectEqual(vectorindex_posting.PostingFormat.delta_compact_version, raw_delta[4]);
+        try std.testing.expectEqual(@as(usize, 17 + deltas.len * 13), raw_delta.len);
+
+        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, posting_id, isNotFound);
+        defer alloc.free(materialized);
+        try std.testing.expectEqual(@as(usize, 3), materialized.len);
+        for (&[_]u64{ 1, 2, 3 }) |vector_id| {
+            try std.testing.expect(std.mem.indexOfScalar(u64, materialized, vector_id) != null);
+            const assignment = try AssignmentMap.getRecord(&idx, &txn, vector_id, isNotFound);
+            try std.testing.expectEqual(posting_id, assignment.posting_id);
+        }
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        const folded = try idx.repairDirtyPostingsWithOptions(.{
+            .max_postings = 1,
+            .min_delta_records_to_fold = 1,
+        });
+        try std.testing.expectEqual(@as(u64, 3), folded.delta_fold_records);
+        try idx.sync(true);
+
+        try modeled_device.device().crash();
+        idx.env_owner.lsm.backend.options.backend.read_only = true;
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+
+        const deltas = try PostingStore.loadDeltaTail(&idx, &txn, posting_id);
+        defer alloc.free(deltas);
+        try std.testing.expectEqual(@as(usize, 0), deltas.len);
+
+        var base = try PostingStore.loadBase(&idx, &txn, posting_id, isNotFound);
+        defer base.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 3), base.members.len);
+
+        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, posting_id, isNotFound);
+        defer alloc.free(materialized);
+        try std.testing.expectEqualSlices(u64, base.members, materialized);
+        try idx.validateStoredStructure(alloc);
+    }
+}
+
+test "base delta failed fold write recovers pending tail after modeled crash" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var modeled_device = storage_sim.ModeledDevice.init(alloc);
+    defer modeled_device.deinit();
+    const lsm_options = hbc_backend.LsmOptions{
+        .storage = modeled_device.storage(),
+        .backend_options = .{
+            .flush_threshold = 1,
+        },
+    };
+    const config = HBCConfig{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .storage_backend = .lsm,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    };
+
+    var posting_id: u64 = 0;
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        try idx.insert(1, &[_]f32{ 1.0, 0.0 });
+        try idx.insert(2, &[_]f32{ 2.0, 0.0 });
+        try idx.insert(3, &[_]f32{ 3.0, 0.0 });
+        posting_id = (try idx.debugLeafForVector(2)).?;
+        try idx.insert(2, &[_]f32{ 30.0, 0.0 });
+        try idx.delete(1);
+        try idx.sync(true);
+
+        modeled_device.injectWriteFailure();
+        try std.testing.expectError(error.InjectedWriteFault, idx.repairDirtyPostingsWithOptions(.{
+            .max_postings = 1,
+            .min_delta_records_to_fold = 1,
+        }));
+
+        try modeled_device.device().crash();
+        idx.env_owner.lsm.backend.options.backend.read_only = true;
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+
+        const deltas = try PostingStore.loadDeltaTail(&idx, &txn, posting_id);
+        defer alloc.free(deltas);
+        try std.testing.expect(deltas.len > 0);
+
+        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, posting_id, isNotFound);
+        defer alloc.free(materialized);
+        try std.testing.expectEqual(@as(usize, 2), materialized.len);
+        try std.testing.expect(std.mem.indexOfScalar(u64, materialized, 1) == null);
+        try std.testing.expect(std.mem.indexOfScalar(u64, materialized, 2) != null);
+        try std.testing.expect(std.mem.indexOfScalar(u64, materialized, 3) != null);
+
+        try std.testing.expectError(error.NotFound, AssignmentMap.getRecord(&idx, &txn, 1, isNotFound));
+        const updated_assignment = try AssignmentMap.getRecord(&idx, &txn, 2, isNotFound);
+        try std.testing.expectEqual(posting_id, updated_assignment.posting_id);
+        try std.testing.expectEqual(@as(u64, 2), updated_assignment.vector_ref);
+        const retained_assignment = try AssignmentMap.getRecord(&idx, &txn, 3, isNotFound);
+        try std.testing.expectEqual(posting_id, retained_assignment.posting_id);
+
+        var centroid_record = try PostingStore.loadCentroidDirectoryRecord(&idx, &txn, posting_id, isNotFound);
+        defer centroid_record.deinit(alloc);
+        try std.testing.expectEqual(posting_id, centroid_record.posting_id);
+        try std.testing.expect(centroid_record.member_count >= materialized.len);
+        try std.testing.expect(centroid_record.centroid.len == idx.config.dims);
+
+        var results = try idx.search(&[_]f32{ 30.0, 0.0 }, 1);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+        try std.testing.expectEqual(@as(u64, 2), results.getHits()[0].vector_id);
+        try idx.validateStoredStructure(alloc);
+    }
+}
+
+test "base delta failed foreground mutations recover previous state after modeled crash" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var modeled_device = storage_sim.ModeledDevice.init(alloc);
+    defer modeled_device.deinit();
+    const lsm_options = hbc_backend.LsmOptions{
+        .storage = modeled_device.storage(),
+        .backend_options = .{
+            .flush_threshold = 1,
+        },
+    };
+    const config = HBCConfig{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .storage_backend = .lsm,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    };
+
+    var posting_id: u64 = 0;
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        try idx.insert(1, &[_]f32{ 1.0, 0.0 });
+        try idx.insert(2, &[_]f32{ 2.0, 0.0 });
+        try idx.insert(3, &[_]f32{ 3.0, 0.0 });
+        posting_id = (try idx.debugLeafForVector(2)).?;
+        try idx.sync(true);
+
+        modeled_device.injectWriteFailure();
+        try std.testing.expectError(error.InjectedWriteFault, idx.insert(2, &[_]f32{ 30.0, 0.0 }));
+
+        try modeled_device.device().crash();
+        idx.env_owner.lsm.backend.options.backend.read_only = true;
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+
+        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, posting_id, isNotFound);
+        defer alloc.free(materialized);
+        try std.testing.expectEqual(@as(usize, 3), materialized.len);
+        try std.testing.expect(std.mem.indexOfScalar(u64, materialized, 1) != null);
+        try std.testing.expect(std.mem.indexOfScalar(u64, materialized, 2) != null);
+        try std.testing.expect(std.mem.indexOfScalar(u64, materialized, 3) != null);
+
+        const assignment = try AssignmentMap.getRecord(&idx, &txn, 2, isNotFound);
+        try std.testing.expectEqual(posting_id, assignment.posting_id);
+
+        var old_results = try idx.search(&[_]f32{ 2.0, 0.0 }, 1);
+        defer old_results.deinit();
+        try std.testing.expectEqual(@as(usize, 1), old_results.getHits().len);
+        try std.testing.expectEqual(@as(u64, 2), old_results.getHits()[0].vector_id);
+
+        var new_results = try idx.search(&[_]f32{ 30.0, 0.0 }, 1);
+        defer new_results.deinit();
+        try std.testing.expectEqual(@as(usize, 1), new_results.getHits().len);
+        try std.testing.expectEqual(@as(u64, 3), new_results.getHits()[0].vector_id);
+        try idx.validateStoredStructure(alloc);
+
+        modeled_device.injectWriteFailure();
+        try std.testing.expectError(error.InjectedWriteFault, idx.delete(1));
+
+        try modeled_device.device().crash();
+        idx.env_owner.lsm.backend.options.backend.read_only = true;
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+
+        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, posting_id, isNotFound);
+        defer alloc.free(materialized);
+        try std.testing.expectEqual(@as(usize, 3), materialized.len);
+        try std.testing.expect(std.mem.indexOfScalar(u64, materialized, 1) != null);
+        try std.testing.expect(std.mem.indexOfScalar(u64, materialized, 2) != null);
+        try std.testing.expect(std.mem.indexOfScalar(u64, materialized, 3) != null);
+
+        const assignment = try AssignmentMap.getRecord(&idx, &txn, 1, isNotFound);
+        try std.testing.expectEqual(posting_id, assignment.posting_id);
+
+        var results = try idx.search(&[_]f32{ 1.0, 0.0 }, 1);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+        try std.testing.expectEqual(@as(u64, 1), results.getHits()[0].vector_id);
+        try idx.validateStoredStructure(alloc);
     }
 }
 
@@ -8893,6 +10556,19 @@ test "posting maintenance can split and merge postings as bounded layout work" {
     });
     try std.testing.expectEqual(@as(u64, 1), split_result.split_postings);
     try std.testing.expect(idx.stats().node_count >= 3);
+    {
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        var node_id: u64 = 1;
+        while (node_id <= idx.metadata.node_count) : (node_id += 1) {
+            var node = idx.loadNode(&txn, node_id) catch |err| {
+                if (isNotFound(err)) continue;
+                return err;
+            };
+            defer node.deinit(alloc);
+            if (node.is_leaf) try std.testing.expect(node.members.len <= idx.config.leaf_size);
+        }
+    }
 
     for (1..9) |vector_id_usize| {
         const vector_id: u64 = @intCast(vector_id_usize);
@@ -8915,6 +10591,378 @@ test "posting maintenance can split and merge postings as bounded layout work" {
     var results = try idx.search(&[_]f32{ 102.0, 0.0 }, 4);
     defer results.deinit();
     try std.testing.expect(results.getHits().len > 0);
+}
+
+test "posting maintenance capacity-balances deferred overfull leaf splits" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 100,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .lazy_posting_maintenance = true,
+        .kmeans_min_balance_pct = 1,
+    });
+    defer idx.close();
+
+    for (0..8) |i| {
+        const vector_id: u64 = @intCast(i + 1);
+        try idx.insert(vector_id, &[_]f32{ @as(f32, @floatFromInt(i)) * 0.01, 0.0 });
+    }
+    try idx.insert(9, &[_]f32{ 1000.0, 0.0 });
+
+    idx.config.leaf_size = 5;
+    const before = try idx.postingBacklogStats();
+    try std.testing.expectEqual(@as(u64, 1), before.overfull_postings);
+    try std.testing.expectEqual(@as(u64, 4), before.max_over_capacity_members);
+
+    const split_result = try idx.repairDirtyPostingsWithOptions(.{
+        .max_postings = 8,
+        .rebalance_layout = true,
+        .max_layout_changes = 1,
+    });
+    try std.testing.expectEqual(@as(u64, 1), split_result.split_postings);
+
+    const after = try idx.postingBacklogStats();
+    try std.testing.expectEqual(@as(u64, 0), after.overfull_postings);
+    try std.testing.expectEqual(@as(u64, 0), after.max_over_capacity_members);
+}
+
+test "posting maintenance result reports remaining capacity debt after bounded split budget" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 4,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .lazy_posting_maintenance = true,
+        .kmeans_min_balance_pct = 1,
+    });
+    defer idx.close();
+
+    for (0..16) |i| {
+        const vector_id: u64 = @intCast(i + 1);
+        const cluster: f32 = if (i < 8) 0.0 else 100.0;
+        try idx.insert(vector_id, &[_]f32{ cluster + @as(f32, @floatFromInt(i % 8)) * 0.01, 0.0 });
+    }
+
+    idx.config.leaf_size = 2;
+    const before = try idx.postingBacklogStats();
+    try std.testing.expect(before.overfull_postings > 1);
+
+    const split_result = try idx.repairDirtyPostingsWithOptions(.{
+        .max_postings = 32,
+        .rebalance_layout = true,
+        .max_layout_changes = 1,
+    });
+    try std.testing.expectEqual(@as(u64, 1), split_result.split_postings);
+    try std.testing.expect(split_result.limit_reached);
+    try std.testing.expect(split_result.remaining_overfull_postings > 0);
+    try std.testing.expect(split_result.remaining_max_over_capacity_members > 0);
+}
+
+test "base delta layout split survives modeled crash with assignment and centroid records" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var modeled_device = storage_sim.ModeledDevice.init(alloc);
+    defer modeled_device.deinit();
+    const lsm_options = hbc_backend.LsmOptions{
+        .storage = modeled_device.storage(),
+        .backend_options = .{
+            .flush_threshold = 1,
+        },
+    };
+    const initial_config = HBCConfig{
+        .dims = 2,
+        .leaf_size = 100,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .storage_backend = .lsm,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    };
+    var reopened_config = initial_config;
+    reopened_config.leaf_size = 4;
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, initial_config, lsm_options);
+        defer idx.close();
+
+        for (0..8) |i| {
+            const vector_id: u64 = @intCast(i + 1);
+            const x: f32 = if (i < 4) @floatFromInt(i) else 100.0 + @as(f32, @floatFromInt(i));
+            try idx.insert(vector_id, &[_]f32{ x, 0.0 });
+        }
+
+        idx.config.leaf_size = reopened_config.leaf_size;
+        const split_result = try idx.repairDirtyPostingsWithOptions(.{
+            .max_postings = 8,
+            .rebalance_layout = true,
+            .max_layout_changes = 1,
+            .max_boundary_reassignments = 8,
+        });
+        try std.testing.expectEqual(@as(u64, 1), split_result.split_postings);
+        try idx.sync(true);
+
+        try modeled_device.device().crash();
+        idx.env_owner.lsm.backend.options.backend.read_only = true;
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, reopened_config, lsm_options);
+        defer idx.close();
+
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+
+        for (1..9) |vector_id_usize| {
+            const vector_id: u64 = @intCast(vector_id_usize);
+            const mapped_leaf = try idx.debugLeafForVector(vector_id);
+            try std.testing.expect(mapped_leaf != null);
+
+            const assignment = try AssignmentMap.getRecord(&idx, &txn, vector_id, isNotFound);
+            try std.testing.expectEqual(mapped_leaf.?, assignment.posting_id);
+
+            const members = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, mapped_leaf.?, isNotFound);
+            defer alloc.free(members);
+            try std.testing.expect(std.mem.indexOfScalar(u64, members, vector_id) != null);
+            try std.testing.expect(members.len <= idx.config.leaf_size);
+
+            var centroid_record = try PostingStore.loadCentroidDirectoryRecord(&idx, &txn, mapped_leaf.?, isNotFound);
+            defer centroid_record.deinit(alloc);
+            try std.testing.expectEqual(mapped_leaf.?, centroid_record.posting_id);
+            try std.testing.expectEqual(@as(u32, @intCast(members.len)), centroid_record.member_count);
+            try std.testing.expect(centroid_record.centroid.len == idx.config.dims);
+        }
+
+        const stats = try idx.postingBacklogStats();
+        try std.testing.expectEqual(@as(u64, 0), stats.overfull_postings);
+        try std.testing.expectEqual(@as(u64, 0), stats.max_over_capacity_members);
+
+        var results = try idx.search(&[_]f32{ 102.0, 0.0 }, 4);
+        defer results.deinit();
+        try std.testing.expect(results.getHits().len > 0);
+        try idx.validateStoredStructure(alloc);
+    }
+}
+
+test "base delta quantized routing payload self-heals after reopen" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var modeled_device = storage_sim.ModeledDevice.init(alloc);
+    defer modeled_device.deinit();
+    const lsm_options = hbc_backend.LsmOptions{
+        .storage = modeled_device.storage(),
+        .backend_options = .{
+            .flush_threshold = 1,
+        },
+    };
+    const config = HBCConfig{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = false,
+    };
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        const items = [_]BatchInsertItem{
+            .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+            .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+            .{ .vector_id = 3, .vector = &[_]f32{ 10.0, 0.0 }, .metadata = "doc:3" },
+            .{ .vector_id = 4, .vector = &[_]f32{ 10.1, 0.0 }, .metadata = "doc:4" },
+            .{ .vector_id = 5, .vector = &[_]f32{ 0.0, 10.0 }, .metadata = "doc:5" },
+            .{ .vector_id = 6, .vector = &[_]f32{ 0.0, 10.1 }, .metadata = "doc:6" },
+        };
+        try idx.bulkBuildWithMetadataOptions(&items, .{});
+        try std.testing.expect(idx.stats().root_node != 0);
+
+        var read_txn = try idx.beginReadTxn();
+        defer read_txn.abort();
+        var root = try idx.loadNode(&read_txn, idx.stats().root_node);
+        defer root.deinit(alloc);
+        try std.testing.expect(!root.is_leaf);
+        try std.testing.expect(root.children.len > 0);
+
+        var key_buf: [10]u8 = undefined;
+        var write_txn = try idx.beginWriteTxn();
+        errdefer write_txn.abort();
+        try idx.deleteNamespaced(&write_txn, .quant, encodeQuantKey(&key_buf, idx.stats().root_node));
+        idx.invalidateQuantizedCache(idx.stats().root_node);
+        try idx.finishWriteTxn(&write_txn);
+        try idx.sync(true);
+
+        try modeled_device.device().crash();
+        idx.env_owner.lsm.backend.options.backend.read_only = true;
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        var first = try idx.searchProfiled(&[_]f32{ 10.0, 0.0 }, 2);
+        defer first.results.deinit();
+        try std.testing.expect(first.results.getHits().len > 0);
+        try std.testing.expect(first.profile.quantized_internal_cache_misses > 0);
+        try std.testing.expectEqual(@as(u64, 0), first.profile.quantized_leaf_cache_misses);
+
+        var second = try idx.searchProfiled(&[_]f32{ 10.0, 0.0 }, 2);
+        defer second.results.deinit();
+        try std.testing.expect(second.results.getHits().len > 0);
+        try std.testing.expectEqual(@as(u64, 0), second.profile.quantized_internal_cache_misses);
+        try std.testing.expectEqual(@as(u64, 0), second.profile.quantized_leaf_cache_misses);
+    }
+}
+
+test "base delta corrupt leaf quantized payload self-heals after reopen" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var modeled_device = storage_sim.ModeledDevice.init(alloc);
+    defer modeled_device.deinit();
+    const lsm_options = hbc_backend.LsmOptions{
+        .storage = modeled_device.storage(),
+        .backend_options = .{
+            .flush_threshold = 1,
+        },
+    };
+    const config = HBCConfig{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = false,
+    };
+
+    var leaf_id: u64 = 0;
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        const items = [_]BatchInsertItem{
+            .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:1" },
+            .{ .vector_id = 2, .vector = &[_]f32{ 0.1, 0.0 }, .metadata = "doc:2" },
+            .{ .vector_id = 3, .vector = &[_]f32{ 10.0, 0.0 }, .metadata = "doc:3" },
+            .{ .vector_id = 4, .vector = &[_]f32{ 10.1, 0.0 }, .metadata = "doc:4" },
+            .{ .vector_id = 5, .vector = &[_]f32{ 0.0, 10.0 }, .metadata = "doc:5" },
+            .{ .vector_id = 6, .vector = &[_]f32{ 0.0, 10.1 }, .metadata = "doc:6" },
+        };
+        try idx.bulkBuildWithMetadataOptions(&items, .{});
+        const repaired = try idx.repairDirtyPostingsWithOptions(.{ .max_postings = 16 });
+        try std.testing.expect(repaired.repaired_postings > 0);
+        leaf_id = (try idx.debugLeafForVector(3)).?;
+        try std.testing.expect(leaf_id != idx.stats().root_node);
+        {
+            var read_txn = try idx.beginReadTxn();
+            defer read_txn.abort();
+            var leaf = try idx.loadNode(&read_txn, leaf_id);
+            defer leaf.deinit(alloc);
+            try std.testing.expect(!leaf.posting_state.payload_dirty);
+        }
+
+        var key_buf: [10]u8 = undefined;
+        var write_txn = try idx.beginWriteTxn();
+        errdefer write_txn.abort();
+        try idx.putNamespaced(&write_txn, .quant, encodeQuantKey(&key_buf, leaf_id), "corrupt quantized payload");
+        idx.invalidateQuantizedCache(leaf_id);
+        try idx.finishWriteTxn(&write_txn);
+        try idx.sync(true);
+
+        try modeled_device.device().crash();
+        idx.env_owner.lsm.backend.options.backend.read_only = true;
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        var first = try idx.searchProfiled(&[_]f32{ 10.0, 0.0 }, 2);
+        defer first.results.deinit();
+        try std.testing.expect(first.results.getHits().len > 0);
+        try std.testing.expect(first.profile.quantized_leaf_cache_misses > 0);
+        try std.testing.expect(first.profile.approx_leaves_scored > 0);
+
+        var saw_three = false;
+        for (first.results.getHits()) |hit| saw_three = saw_three or hit.vector_id == 3;
+        try std.testing.expect(saw_three);
+
+        var second = try idx.searchProfiled(&[_]f32{ 10.0, 0.0 }, 2);
+        defer second.results.deinit();
+        try std.testing.expect(second.results.getHits().len > 0);
+        try std.testing.expectEqual(@as(u64, 0), second.profile.quantized_leaf_cache_misses);
+        try std.testing.expect(second.profile.approx_leaves_scored > 0);
+    }
+}
+
+test "posting maintenance can split full postings when capacity policy allows" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 100,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+    });
+    defer idx.close();
+
+    for (0..4) |i| {
+        const vector_id: u64 = @intCast(i + 1);
+        try idx.insert(vector_id, &[_]f32{ @floatFromInt(i), 0.0 });
+    }
+
+    idx.config.leaf_size = 4;
+    const before = try idx.postingBacklogStats();
+    try std.testing.expectEqual(@as(u64, 0), before.overfull_postings);
+    try std.testing.expectEqual(@as(u64, 1), before.postings_at_capacity);
+
+    const skipped = try idx.repairDirtyPostingsWithOptions(.{
+        .rebalance_layout = true,
+        .max_layout_changes = 1,
+    });
+    try std.testing.expectEqual(@as(u64, 0), skipped.split_postings);
+
+    const split = try idx.repairDirtyPostingsWithOptions(.{
+        .rebalance_layout = true,
+        .split_full_postings = true,
+        .max_layout_changes = 1,
+    });
+    try std.testing.expectEqual(@as(u64, 1), split.split_postings);
+
+    const after = try idx.postingBacklogStats();
+    try std.testing.expectEqual(@as(u64, 0), after.overfull_postings);
+    try std.testing.expect(after.postings_at_capacity < before.postings_at_capacity);
 }
 
 test "bulk replay recomputes same-leaf existing members once per leaf" {
@@ -9184,6 +11232,59 @@ test "getVectorScratch can bypass external vector cache during replay sessions" 
     try std.testing.expectEqual(@as(u64, 0), idx.hbcCacheStats().vector.used_bytes);
 }
 
+test "getVectorScratch can load external vectors without dense metadata when optional" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    const LoaderCtx = struct {
+        load_calls: usize = 0,
+
+        fn loadScratch(ctx_ptr: *anyopaque, vector_id: u64, metadata: []const u8, scratch: []f32) ![]const f32 {
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            ctx.load_calls += 1;
+            try std.testing.expectEqual(@as(usize, 0), metadata.len);
+            const vector: []const f32 = switch (vector_id) {
+                7 => &[_]f32{ 7.0, 8.0, 9.0 },
+                else => return error.NotFound,
+            };
+            if (vector.len > scratch.len) return error.BufferTooSmall;
+            @memcpy(scratch[0..vector.len], vector);
+            return scratch[0..vector.len];
+        }
+    };
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 3,
+        .max_cached_vectors = 0,
+    });
+    defer idx.close();
+
+    var loader_ctx = LoaderCtx{};
+    idx.setExternalVectorScratchLoader(&loader_ctx, LoaderCtx.loadScratch);
+    idx.setExternalVectorMetadataRequired(false);
+    idx.setBypassExternalVectorCache(true);
+    defer idx.setBypassExternalVectorCache(false);
+
+    const items = [_]BatchInsertItem{
+        .{ .vector_id = 7, .vector = &[_]f32{ 7.0, 8.0, 9.0 }, .metadata = "" },
+    };
+    try idx.batchInsertWithMetadataOptions(&items, .{
+        .assume_absent_ids = true,
+        .skip_vector_store = true,
+    });
+
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+
+    var scratch: [3]f32 = undefined;
+    const loaded = try idx.getVectorScratch(&txn, 7, &scratch);
+
+    try std.testing.expectEqual(@as(usize, 1), loader_ctx.load_calls);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 7.0, 8.0, 9.0 }, loaded);
+}
+
 test "skip vector store writes do not seed retained vector cache when bypassed" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -9317,6 +11418,121 @@ test "reinserting the same vector without metadata is a no-op" {
     const stored = try idx.getVector(&txn, 7);
     defer alloc.free(stored);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0, 3.0 }, stored);
+}
+
+test "base delta same-vector metadata overwrite does not dirty posting maintenance" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 3,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+    });
+    defer idx.close();
+
+    try idx.insertWithMetadata(7, &[_]f32{ 1.0, 2.0, 3.0 }, "doc:7-a");
+    _ = try idx.repairDirtyPostings();
+    idx.resetWriteProfile();
+
+    try idx.batchApplyOptions(&[_]BatchInsertItem{.{
+        .vector_id = 7,
+        .vector = &[_]f32{ 1.0, 2.0, 3.0 },
+        .metadata = "doc:7-b",
+    }}, &.{}, .{ .coalesce_leaf_writes = true });
+    const after_write = idx.getWriteProfile();
+    try std.testing.expectEqual(@as(u64, 1), after_write.existing_same_vector_coalesces);
+    try std.testing.expectEqual(@as(u64, 7), after_write.ns_vecs_value_bytes);
+    try std.testing.expectEqual(@as(u64, 0), after_write.posting_delta_records);
+    try std.testing.expectEqual(@as(u64, 0), after_write.posting_lazy_centroid_deferrals);
+    try std.testing.expectEqual(@as(u64, 0), after_write.posting_lazy_payload_deferrals);
+
+    const backlog = try idx.postingBacklogStats();
+    try std.testing.expectEqual(@as(u64, 0), backlog.dirty_postings);
+    try std.testing.expectEqual(@as(u64, 0), backlog.delta_tail_postings);
+
+    const repaired = try idx.repairDirtyPostingsWithOptions(.{
+        .split_full_postings = true,
+        .max_layout_changes = 4,
+    });
+    try std.testing.expectEqual(@as(u64, 0), repaired.repaired_postings);
+    try std.testing.expectEqual(@as(u64, 0), repaired.split_postings);
+    try std.testing.expectEqual(@as(u64, 0), repaired.delta_fold_records);
+}
+
+test "base delta repair can use metadata-optional external scratch loader" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    const LoaderCtx = struct {
+        load_calls: usize = 0,
+
+        fn loadScratch(ctx_ptr: *anyopaque, vector_id: u64, metadata: []const u8, scratch: []f32) ![]const f32 {
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            ctx.load_calls += 1;
+            try std.testing.expectEqual(@as(usize, 0), metadata.len);
+            const vector: []const f32 = switch (vector_id) {
+                1 => &[_]f32{ 1.0, 0.0 },
+                2 => &[_]f32{ 2.0, 0.0 },
+                else => return error.NotFound,
+            };
+            if (vector.len > scratch.len) return error.BufferTooSmall;
+            @memcpy(scratch[0..vector.len], vector);
+            return scratch[0..vector.len];
+        }
+    };
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .use_quantization = false,
+        .posting_storage_mode = .base_delta,
+        .lazy_posting_maintenance = true,
+        .max_cached_vectors = 0,
+    });
+    defer idx.close();
+
+    var loader_ctx = LoaderCtx{};
+    idx.setExternalVectorScratchLoader(&loader_ctx, LoaderCtx.loadScratch);
+    idx.setExternalVectorMetadataRequired(false);
+    idx.setBypassExternalVectorCache(true);
+    defer idx.setBypassExternalVectorCache(false);
+
+    const seed_items = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 1.0, 0.0 }, .metadata = "" },
+    };
+    try idx.batchInsertWithMetadataOptions(&seed_items, .{
+        .assume_absent_ids = true,
+        .skip_vector_store = true,
+        .coalesce_leaf_writes = true,
+    });
+
+    const append_items = [_]BatchInsertItem{
+        .{ .vector_id = 2, .vector = &[_]f32{ 2.0, 0.0 }, .metadata = "" },
+    };
+    try idx.batchInsertWithMetadataOptions(&append_items, .{
+        .assume_absent_ids = true,
+        .skip_vector_store = true,
+        .coalesce_leaf_writes = true,
+    });
+
+    const backlog_before = try idx.postingBacklogStats();
+    try std.testing.expect(backlog_before.needsRepair());
+
+    const repaired = try idx.repairDirtyPostingsWithOptions(.{
+        .min_delta_records_to_fold = 1,
+        .max_delta_tail_postings = 0,
+    });
+    try std.testing.expect(repaired.repaired_postings > 0 or repaired.delta_fold_records > 0);
+    try std.testing.expect(loader_ctx.load_calls > 0);
+
+    const backlog_after = try idx.postingBacklogStats();
+    try std.testing.expectEqual(@as(u64, 0), backlog_after.dirty_postings);
+    try std.testing.expectEqual(@as(u64, 0), backlog_after.delta_tail_postings);
 }
 
 test "bulk ingest existing vector update can stay on existing leaf without reroute" {
@@ -9813,6 +12029,11 @@ test "bulk ingest defers oversized root leaf until finish" {
 
     try std.testing.expectEqual(@as(u64, 0), idx.getWriteProfile().split_leaf_calls);
     try std.testing.expectEqual(@as(u32, 1), idx.deferred_oversized_leaves.count());
+
+    const overfull_stats = try idx.postingBacklogStats();
+    try std.testing.expectEqual(@as(u64, 1), overfull_stats.overfull_postings);
+    try std.testing.expectEqual(@as(u64, 1), overfull_stats.postings_at_capacity);
+    try std.testing.expect(overfull_stats.max_over_capacity_members > 0);
 
     {
         var read_txn = try idx.beginReadTxn();

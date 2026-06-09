@@ -1326,6 +1326,13 @@ pub fn build(b: *std.Build) void {
     });
     vectorindex_mod.addImport("antfly_vector", vector_mod);
     vectorindex_mod.addImport("antfly_platform", platform_mod);
+    const vectorindex_posting_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/vectorindex/src/posting.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vectorindex_posting_test_mod.addImport("antfly_vector", vector_mod);
+    vectorindex_posting_test_mod.addImport("antfly_platform", platform_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, vectorindex_mod, target);
         vectorindex_mod.linkFramework("Foundation", .{});
@@ -3735,6 +3742,63 @@ pub fn build(b: *std.Build) void {
     const lib_storage_test_step = b.step("lib-storage-test", "Run root-module storage tests only");
     lib_storage_test_step.dependOn(&run_lib_storage_tests.step);
 
+    const spfresh_recovery_vectorindex_filters = [_][]const u8{
+        "posting base delta centroid and assignment families agree after recovered fold",
+        "posting store scans materializes and folds delta tail into a new base",
+        "posting store query member copy overlays base and delta tail in shadow mode",
+        "posting store query member copy skips delta scan when canonical base is current",
+        "posting store delete artifacts removes base centroid and delta tail families",
+    };
+    const spfresh_recovery_vectorindex_tests = b.addTest(.{
+        .root_module = vectorindex_posting_test_mod,
+        .filters = &spfresh_recovery_vectorindex_filters,
+    });
+    const run_spfresh_recovery_vectorindex_tests = b.addRunArtifact(spfresh_recovery_vectorindex_tests);
+
+    const spfresh_recovery_storage_filters = [_][]const u8{
+        "base delta posting families survive reopen and materialize current members",
+        "base delta folded posting generation survives reopen with clean tail",
+        "base delta clean tail debt folds after reopen",
+        "base delta posting families survive modeled lsm crash after committed writes",
+        "base delta multi-posting batch survives modeled lsm crash",
+        "base delta compact grouped tail survives modeled lsm crash and folds",
+        "base delta failed fold write recovers pending tail after modeled crash",
+        "base delta failed foreground mutations recover previous state after modeled crash",
+        "posting maintenance result reports remaining capacity debt after bounded split budget",
+        "base delta layout split survives modeled crash with assignment and centroid records",
+    };
+    const spfresh_recovery_storage_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &spfresh_recovery_storage_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_spfresh_recovery_storage_tests = b.addRunArtifact(spfresh_recovery_storage_tests);
+    const spfresh_recovery_test_step = b.step("spfresh-recovery-test", "Run focused SPFresh/base-delta crash and reopen invariant tests");
+    spfresh_recovery_test_step.dependOn(&run_spfresh_recovery_vectorindex_tests.step);
+    spfresh_recovery_test_step.dependOn(&run_spfresh_recovery_storage_tests.step);
+
+    const spfresh_production_runtime_filters = [_][]const u8{
+        "db runUntilIdle drains lazy dense posting maintenance",
+        "db runUntilIdle repeats bounded dense posting maintenance while debt remains",
+        "db dense posting maintenance",
+    };
+    const spfresh_production_runtime_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &spfresh_production_runtime_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_spfresh_production_runtime_tests = b.addRunArtifact(spfresh_production_runtime_tests);
+    const spfresh_production_test_step = b.step("spfresh-production-test", "Run SPFresh/base-delta recovery plus runtime/resource-manager integration tests");
+    spfresh_production_test_step.dependOn(&run_spfresh_recovery_vectorindex_tests.step);
+    spfresh_production_test_step.dependOn(&run_spfresh_recovery_storage_tests.step);
+    spfresh_production_test_step.dependOn(&run_spfresh_production_runtime_tests.step);
+
     const lib_storage_progress_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &lib_storage_default_filters),
@@ -5290,6 +5354,12 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_write_bench",
         .root_module = hbc_write_bench_mod,
     });
+    const hbc_write_bench_tests = b.addTest(.{
+        .root_module = hbc_write_bench_mod,
+    });
+    const run_hbc_write_bench_tests = b.addRunArtifact(hbc_write_bench_tests);
+    const hbc_write_bench_test_step = b.step("hbc-write-bench-test", "Run HBC write bench unit tests");
+    hbc_write_bench_test_step.dependOn(&run_hbc_write_bench_tests.step);
 
     const run_hbc_write_bench = b.addRunArtifact(hbc_write_bench);
     if (b.args) |args| {

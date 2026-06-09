@@ -109,6 +109,13 @@ pub fn encodeVecLeafKey(buf: *[10]u8, vector_id: u64) []u8 {
     return buf;
 }
 
+pub fn encodeAssignmentKey(buf: *[10]u8, vector_id: u64) []u8 {
+    buf[0] = 'A';
+    buf[1] = 'M';
+    buf[2..10].* = @bitCast(std.mem.nativeToBig(u64, vector_id));
+    return buf;
+}
+
 pub fn encodeVecMetaKey(buf: *[10]u8, vector_id: u64) []u8 {
     buf[0] = 'm';
     buf[1] = ':';
@@ -121,6 +128,51 @@ pub fn encodeQuantKey(buf: *[10]u8, node_id: u64) []u8 {
     buf[1] = ':';
     buf[2..10].* = @bitCast(std.mem.nativeToBig(u64, node_id));
     return buf;
+}
+
+pub fn encodePostingBaseKey(buf: *[10]u8, posting_id: u64) []u8 {
+    buf[0] = 'P';
+    buf[1] = 'B';
+    buf[2..10].* = @bitCast(std.mem.nativeToBig(u64, posting_id));
+    return buf;
+}
+
+pub fn encodePostingDeltaKey(buf: *[18]u8, posting_id: u64, sequence: u64) []u8 {
+    buf[0] = 'P';
+    buf[1] = 'D';
+    buf[2..10].* = @bitCast(std.mem.nativeToBig(u64, posting_id));
+    buf[10..18].* = @bitCast(std.mem.nativeToBig(u64, sequence));
+    return buf;
+}
+
+pub fn encodePostingDeltaPrefix(buf: *[10]u8, posting_id: u64) []u8 {
+    buf[0] = 'P';
+    buf[1] = 'D';
+    buf[2..10].* = @bitCast(std.mem.nativeToBig(u64, posting_id));
+    return buf;
+}
+
+pub fn encodeCentroidDirectoryKey(buf: *[10]u8, posting_id: u64) []u8 {
+    buf[0] = 'C';
+    buf[1] = 'D';
+    buf[2..10].* = @bitCast(std.mem.nativeToBig(u64, posting_id));
+    return buf;
+}
+
+pub fn encodeCentroidDirectoryPrefix(buf: *[2]u8) []u8 {
+    buf[0] = 'C';
+    buf[1] = 'D';
+    return buf;
+}
+
+pub fn centroidDirectoryKeyMatches(key: []const u8) bool {
+    return key.len == 10 and key[0] == 'C' and key[1] == 'D';
+}
+
+pub fn postingDeltaKeyMatchesPosting(key: []const u8, posting_id: u64) bool {
+    if (key.len != 18) return false;
+    var prefix_buf: [10]u8 = undefined;
+    return std.mem.eql(u8, key[0..10], encodePostingDeltaPrefix(&prefix_buf, posting_id));
 }
 
 pub const NodeHeader = struct {
@@ -215,4 +267,46 @@ fn readU64LE(data: []const u8, pos: *usize) u64 {
     const val = std.mem.readInt(u64, data[pos.*..][0..8], .little);
     pos.* += 8;
     return val;
+}
+
+test "posting delta keys sort by posting id then sequence" {
+    var a: [18]u8 = undefined;
+    var b: [18]u8 = undefined;
+    var c: [18]u8 = undefined;
+    const key_a = encodePostingDeltaKey(&a, 7, 1);
+    const key_b = encodePostingDeltaKey(&b, 7, 2);
+    const key_c = encodePostingDeltaKey(&c, 8, 0);
+    try std.testing.expect(std.mem.order(u8, key_a, key_b) == .lt);
+    try std.testing.expect(std.mem.order(u8, key_b, key_c) == .lt);
+}
+
+test "posting delta key matcher accepts only current exact key shape" {
+    var key_buf: [18]u8 = undefined;
+    const key = encodePostingDeltaKey(&key_buf, 7, 1);
+    try std.testing.expect(postingDeltaKeyMatchesPosting(key, 7));
+    try std.testing.expect(!postingDeltaKeyMatchesPosting(key, 8));
+    try std.testing.expect(!postingDeltaKeyMatchesPosting(key[0..17], 7));
+
+    var extended: [19]u8 = undefined;
+    @memcpy(extended[0..18], key);
+    extended[18] = 0;
+    try std.testing.expect(!postingDeltaKeyMatchesPosting(extended[0..], 7));
+}
+
+test "centroid directory keys are distinct from posting base keys" {
+    var centroid_key_buf: [10]u8 = undefined;
+    var base_key_buf: [10]u8 = undefined;
+    const centroid_key = encodeCentroidDirectoryKey(&centroid_key_buf, 7);
+    const base_key = encodePostingBaseKey(&base_key_buf, 7);
+    try std.testing.expectEqualSlices(u8, "CD", centroid_key[0..2]);
+    try std.testing.expect(!std.mem.eql(u8, centroid_key, base_key));
+}
+
+test "assignment keys are distinct from legacy vector leaf keys" {
+    var assignment_key_buf: [10]u8 = undefined;
+    var legacy_key_buf: [10]u8 = undefined;
+    const assignment_key = encodeAssignmentKey(&assignment_key_buf, 7);
+    const legacy_key = encodeVecLeafKey(&legacy_key_buf, 7);
+    try std.testing.expectEqualSlices(u8, "AM", assignment_key[0..2]);
+    try std.testing.expect(!std.mem.eql(u8, assignment_key, legacy_key));
 }
