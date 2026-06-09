@@ -1959,6 +1959,8 @@ test "table runtime snapshot cache summarizes replay debt" {
             .indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 2),
             .dense_posting_maintenance = .{
                 .runs = 2,
+                .idle_runs = 1,
+                .catch_up_runs = 1,
                 .total_steps = 10,
                 .total_limit_reached_indexes = 2,
                 .total_elapsed_ns = 100,
@@ -2001,6 +2003,7 @@ test "table runtime snapshot cache summarizes replay debt" {
             .indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1),
             .dense_posting_maintenance = .{
                 .runs = 1,
+                .idle_runs = 1,
                 .total_steps = 7,
                 .total_limit_reached_indexes = 3,
                 .total_elapsed_ns = 50,
@@ -2065,6 +2068,8 @@ test "table runtime snapshot cache summarizes replay debt" {
     try std.testing.expectEqual(@as(u64, 6), summary.outstanding_replay_sequences);
     try std.testing.expectEqual(@as(u64, 3), summary.max_index_replay_backlog);
     try std.testing.expectEqual(@as(u64, 3), summary.dense_posting_maintenance.runs);
+    try std.testing.expectEqual(@as(u64, 2), summary.dense_posting_maintenance.idle_runs);
+    try std.testing.expectEqual(@as(u64, 1), summary.dense_posting_maintenance.catch_up_runs);
     try std.testing.expectEqual(@as(u64, 17), summary.dense_posting_maintenance.total_steps);
     try std.testing.expectEqual(@as(u64, 5), summary.dense_posting_maintenance.total_limit_reached_indexes);
     try std.testing.expectEqual(@as(u64, 150), summary.dense_posting_maintenance.total_elapsed_ns);

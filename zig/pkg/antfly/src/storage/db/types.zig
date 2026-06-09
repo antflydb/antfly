@@ -1354,6 +1354,8 @@ pub const DBStats = struct {
 
 pub const DensePostingMaintenanceStats = struct {
     runs: u64 = 0,
+    idle_runs: u64 = 0,
+    catch_up_runs: u64 = 0,
     total_steps: u64 = 0,
     total_scanned_indexes: u64 = 0,
     total_attempted_indexes: u64 = 0,
@@ -1934,6 +1936,8 @@ fn minNonZeroU64(lhs: u64, rhs: u64) u64 {
 
 pub fn accumulateDensePostingMaintenanceStats(dst: *DensePostingMaintenanceStats, src: DensePostingMaintenanceStats) void {
     dst.runs += src.runs;
+    dst.idle_runs += src.idle_runs;
+    dst.catch_up_runs += src.catch_up_runs;
     dst.total_steps += src.total_steps;
     dst.total_scanned_indexes += src.total_scanned_indexes;
     dst.total_attempted_indexes += src.total_attempted_indexes;

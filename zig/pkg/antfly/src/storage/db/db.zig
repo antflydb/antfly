@@ -265,6 +265,8 @@ const AsyncContext = struct {
     deferred_external_bulk_notify_sequence: AtomicU64 = AtomicU64.init(0),
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
+    dense_posting_maintenance_stats_mutex: ?*std.atomic.Mutex = null,
+    dense_posting_maintenance_stats: ?*types.DensePostingMaintenanceStats = null,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
@@ -2709,6 +2711,8 @@ pub const DB = struct {
             .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
             .index_manager = async_resources.index_manager,
             .apply_mutex = async_resources.apply_mutex,
+            .dense_posting_maintenance_stats_mutex = &self.dense_posting_maintenance_stats_mutex,
+            .dense_posting_maintenance_stats = &self.dense_posting_maintenance_stats,
             .io = self.backend_runtime.io(),
             .require_graph_resolution_contract = true,
             .query_visibility_hook = null,
@@ -7037,7 +7041,7 @@ pub const DB = struct {
             const result: index_manager_mod.IndexManager.DensePostingMaintenanceResult = .{
                 .stopped_by_query_guardrail = true,
             };
-            self.recordDensePostingMaintenanceResult(result);
+            self.recordDensePostingMaintenanceResult(result, .idle);
             return result;
         }
         const result = try self.core.index_manager.runDensePostingMaintenanceProfiled(.{
@@ -7055,7 +7059,7 @@ pub const DB = struct {
             .max_indexes = densePostingIdleMaxIndexesPerRun(),
             .max_elapsed_ns = @intCast(densePostingIdleMaxElapsedNs()),
         });
-        self.recordDensePostingMaintenanceResult(result);
+        self.recordDensePostingMaintenanceResult(result, .idle);
         return result;
     }
 
@@ -8581,17 +8585,28 @@ pub const DB = struct {
         return self.doc_set_planning_stats.snapshot();
     }
 
-    fn lockDensePostingMaintenanceStats(self: *DB) void {
-        while (!self.dense_posting_maintenance_stats_mutex.tryLock()) {
+    const DensePostingMaintenanceSource = enum {
+        idle,
+        catch_up,
+    };
+
+    fn lockDensePostingMaintenanceStats(mutex: *std.atomic.Mutex) void {
+        while (!mutex.tryLock()) {
             std.atomic.spinLoopHint();
         }
     }
 
-    fn recordDensePostingMaintenanceResult(self: *DB, result: index_manager_mod.IndexManager.DensePostingMaintenanceResult) void {
-        self.lockDensePostingMaintenanceStats();
-        defer self.dense_posting_maintenance_stats_mutex.unlock();
-        var current = self.dense_posting_maintenance_stats;
+    fn recordDensePostingMaintenanceResultLocked(
+        maintenance_stats: *types.DensePostingMaintenanceStats,
+        result: index_manager_mod.IndexManager.DensePostingMaintenanceResult,
+        source: DensePostingMaintenanceSource,
+    ) void {
+        var current = maintenance_stats.*;
         current.runs += 1;
+        switch (source) {
+            .idle => current.idle_runs += 1,
+            .catch_up => current.catch_up_runs += 1,
+        }
         current.total_steps += @intCast(result.total_steps);
         current.total_scanned_indexes += @intCast(result.scanned_indexes);
         current.total_attempted_indexes += @intCast(result.attempted_indexes);
@@ -8620,11 +8635,35 @@ pub const DB = struct {
         current.last_stopped_by_elapsed_budget = result.stopped_by_elapsed_budget;
         current.last_stopped_by_resource_budget = result.stopped_by_resource_budget;
         current.last_stopped_by_query_guardrail = result.stopped_by_query_guardrail;
-        self.dense_posting_maintenance_stats = current;
+        maintenance_stats.* = current;
+    }
+
+    fn recordDensePostingMaintenanceResult(
+        self: *DB,
+        result: index_manager_mod.IndexManager.DensePostingMaintenanceResult,
+        source: DensePostingMaintenanceSource,
+    ) void {
+        recordDensePostingMaintenanceResultShared(
+            &self.dense_posting_maintenance_stats_mutex,
+            &self.dense_posting_maintenance_stats,
+            result,
+            source,
+        );
+    }
+
+    fn recordDensePostingMaintenanceResultShared(
+        mutex: *std.atomic.Mutex,
+        maintenance_stats: *types.DensePostingMaintenanceStats,
+        result: index_manager_mod.IndexManager.DensePostingMaintenanceResult,
+        source: DensePostingMaintenanceSource,
+    ) void {
+        lockDensePostingMaintenanceStats(mutex);
+        defer mutex.unlock();
+        recordDensePostingMaintenanceResultLocked(maintenance_stats, result, source);
     }
 
     fn recordDensePostingMaintenanceConvergenceLimit(self: *DB) void {
-        self.lockDensePostingMaintenanceStats();
+        lockDensePostingMaintenanceStats(&self.dense_posting_maintenance_stats_mutex);
         defer self.dense_posting_maintenance_stats_mutex.unlock();
         var current = self.dense_posting_maintenance_stats;
         current.convergence_limit_runs += 1;
@@ -8639,7 +8678,7 @@ pub const DB = struct {
     }
 
     fn snapshotDensePostingMaintenanceStats(self: *DB) types.DensePostingMaintenanceStats {
-        self.lockDensePostingMaintenanceStats();
+        lockDensePostingMaintenanceStats(&self.dense_posting_maintenance_stats_mutex);
         defer self.dense_posting_maintenance_stats_mutex.unlock();
         var result = self.dense_posting_maintenance_stats;
         result.profiled_dense_search_observations = self.profiled_dense_search_observations.load(.monotonic);
@@ -15375,6 +15414,56 @@ fn noteDenseCatchUpMaintenanceRun(ctx: *AsyncContext, index_name: []const u8, no
     gop.value_ptr.* = now_ns;
 }
 
+const DenseCatchUpPostingMaintenanceAttempt = struct {
+    attempted: bool = false,
+    steps: usize = 0,
+    elapsed_ns: u64 = 0,
+};
+
+fn runBestEffortDenseCatchUpPostingMaintenance(ctx: *AsyncContext, index_name: []const u8) !DenseCatchUpPostingMaintenanceAttempt {
+    const maintenance_step_budget = denseCatchUpMaintenanceSteps();
+    if (maintenance_step_budget == 0) return .{};
+
+    const maintenance_score = try ctx.index_manager.densePostingMaintenanceScoreByName(index_name);
+    const maintenance_now_ns = monotonicTimeNs();
+    if (maintenance_score < denseCatchUpMaintenanceMinScore() or
+        !shouldRunDenseCatchUpMaintenance(ctx, index_name, maintenance_score, maintenance_now_ns))
+    {
+        return .{};
+    }
+
+    setDenseCatchUpPhase(ctx, .posting_maintenance);
+    const maintenance_start_ns = monotonicTimeNs();
+    const maintenance_result = try ctx.index_manager.runDensePostingMaintenanceProfiled(.{
+        .index_name = index_name,
+        .max_indexes = 1,
+        .max_postings_per_index = maintenance_step_budget,
+        .fold_delta_tails = false,
+        .min_delta_records_to_fold = dense_posting_idle_default_min_delta_records_to_fold,
+        .min_tombstone_records_to_fold = dense_posting_idle_default_min_tombstone_records_to_fold,
+        .min_delta_to_base_ratio_bps = 0,
+        .max_delta_tail_postings = dense_posting_idle_default_max_delta_tail_postings,
+        .max_layout_changes_per_index = dense_posting_idle_default_max_layout_changes_per_index,
+        .split_full_postings = false,
+        .min_overfull_postings_to_run = densePostingIdleMinOverfullPostingsToRun(),
+        .min_postings_at_capacity_to_run = 0,
+        .max_boundary_reassignments_per_index = densePostingIdleMaxBoundaryReassignmentsPerIndex(),
+        .max_elapsed_ns = @intCast(densePostingIdleMaxElapsedNs()),
+    });
+    const maintenance_ns = elapsedSince(maintenance_start_ns);
+    if (ctx.dense_posting_maintenance_stats_mutex) |mutex| {
+        if (ctx.dense_posting_maintenance_stats) |stats| {
+            DB.recordDensePostingMaintenanceResultShared(mutex, stats, maintenance_result, .catch_up);
+        }
+    }
+    try noteDenseCatchUpMaintenanceRun(ctx, index_name, maintenance_now_ns);
+    return .{
+        .attempted = true,
+        .steps = maintenance_result.total_steps,
+        .elapsed_ns = maintenance_ns,
+    };
+}
+
 test "async context dense catch-up session tracking suppresses local bulk sessions" {
     var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
     var ctx = AsyncContext{
@@ -15511,6 +15600,72 @@ test "dense catch-up maintenance cooldown skips light repeated maintenance" {
     try std.testing.expect(!shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
     try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", denseCatchUpMaintenanceUrgentScore(), now_ns + 1));
     try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs()));
+}
+
+test "dense catch-up posting maintenance records global source stats" {
+    const alloc = std.testing.allocator;
+
+    dense_catch_up_maintenance_min_score_cache.store(2, .release);
+    defer dense_catch_up_maintenance_min_score_cache.store(0, .release);
+    dense_catch_up_maintenance_cooldown_ns_cache.store(1, .release);
+    defer dense_catch_up_maintenance_cooldown_ns_cache.store(0, .release);
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false,\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" },
+            .{ .key = "doc:b", .value = "{\"embedding\":[3.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    {
+        const entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try entry.index.loadNode(&txn, entry.index.metadata.root_node);
+        defer root.deinit(alloc);
+        try root.ensureUnbacked(alloc);
+        root.posting_state.noteMembersChanged(root.members.len);
+        try entry.index.saveNode(&txn, &root);
+        try entry.index.finishWriteTxn(&txn);
+        entry.index.invalidateNodeCache(root.id);
+    }
+
+    const resources = db.core.asyncResources();
+    var ctx = AsyncContext{
+        .alloc = alloc,
+        .store = resources.store,
+        .index_manager = resources.index_manager,
+        .apply_mutex = resources.apply_mutex,
+        .dense_posting_maintenance_stats_mutex = &db.dense_posting_maintenance_stats_mutex,
+        .dense_posting_maintenance_stats = &db.dense_posting_maintenance_stats,
+    };
+    defer ctx.deinit(alloc);
+
+    const attempt = try runBestEffortDenseCatchUpPostingMaintenance(&ctx, "dv_v1");
+    try std.testing.expect(attempt.attempted);
+    try std.testing.expect(attempt.steps > 0);
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.runs);
+    try std.testing.expectEqual(@as(u64, 0), stats.dense_posting_maintenance.idle_runs);
+    try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.catch_up_runs);
+    try std.testing.expect(stats.dense_posting_maintenance.last_steps > 0);
+    try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].hbc_posting.dirty_postings);
 }
 
 fn readEnvUsize(name: [:0]const u8, default_value: usize) usize {
@@ -19223,37 +19378,13 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, finish_options);
     const finalize_ns = elapsedSince(finalize_start_ns);
 
-    var maintenance_steps: usize = 0;
-    var maintenance_ns: u64 = 0;
-    const maintenance_step_budget = denseCatchUpMaintenanceSteps();
-    const maintenance_score = try ctx.index_manager.densePostingMaintenanceScoreByName(index_ref.name);
-    const maintenance_now_ns = monotonicTimeNs();
-    if (maintenance_step_budget != 0 and
-        maintenance_score >= denseCatchUpMaintenanceMinScore() and
-        shouldRunDenseCatchUpMaintenance(ctx, index_ref.name, maintenance_score, maintenance_now_ns))
-    {
-        setDenseCatchUpPhase(ctx, .posting_maintenance);
-        const maintenance_start_ns = monotonicTimeNs();
-        const maintenance_result = try ctx.index_manager.runDensePostingMaintenanceProfiled(.{
-            .index_name = index_ref.name,
-            .max_indexes = 1,
-            .max_postings_per_index = maintenance_step_budget,
-            .fold_delta_tails = false,
-            .min_delta_records_to_fold = dense_posting_idle_default_min_delta_records_to_fold,
-            .min_tombstone_records_to_fold = dense_posting_idle_default_min_tombstone_records_to_fold,
-            .min_delta_to_base_ratio_bps = 0,
-            .max_delta_tail_postings = dense_posting_idle_default_max_delta_tail_postings,
-            .max_layout_changes_per_index = dense_posting_idle_default_max_layout_changes_per_index,
-            .split_full_postings = false,
-            .min_overfull_postings_to_run = densePostingIdleMinOverfullPostingsToRun(),
-            .min_postings_at_capacity_to_run = 0,
-            .max_boundary_reassignments_per_index = densePostingIdleMaxBoundaryReassignmentsPerIndex(),
-            .max_elapsed_ns = @intCast(densePostingIdleMaxElapsedNs()),
+    const maintenance_attempt = runBestEffortDenseCatchUpPostingMaintenance(ctx, index_ref.name) catch |err| blk: {
+        std.log.warn("dense catch-up posting maintenance skipped after finish index={s} err={s}", .{
+            index_ref.name,
+            @errorName(err),
         });
-        maintenance_ns = elapsedSince(maintenance_start_ns);
-        maintenance_steps = maintenance_result.total_steps;
-        try noteDenseCatchUpMaintenanceRun(ctx, index_ref.name, maintenance_now_ns);
-    }
+        break :blk DenseCatchUpPostingMaintenanceAttempt{};
+    };
 
     setDenseCatchUpPhase(ctx, .applied_sequence_flush);
     var published_visibility = false;
@@ -19276,10 +19407,12 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     atomicMaxU64(&ctx.stats.dense_catch_up.max_finish_ns, finish_ns);
     _ = ctx.stats.dense_catch_up.finalize_ns.fetchAdd(finalize_ns, .monotonic);
     atomicMaxU64(&ctx.stats.dense_catch_up.max_finalize_ns, finalize_ns);
-    _ = ctx.stats.dense_catch_up.maintenance_calls.fetchAdd(1, .monotonic);
-    _ = ctx.stats.dense_catch_up.maintenance_steps.fetchAdd(@intCast(maintenance_steps), .monotonic);
-    _ = ctx.stats.dense_catch_up.maintenance_ns.fetchAdd(maintenance_ns, .monotonic);
-    atomicMaxU64(&ctx.stats.dense_catch_up.max_maintenance_ns, maintenance_ns);
+    if (maintenance_attempt.attempted) {
+        _ = ctx.stats.dense_catch_up.maintenance_calls.fetchAdd(1, .monotonic);
+        _ = ctx.stats.dense_catch_up.maintenance_steps.fetchAdd(@intCast(maintenance_attempt.steps), .monotonic);
+        _ = ctx.stats.dense_catch_up.maintenance_ns.fetchAdd(maintenance_attempt.elapsed_ns, .monotonic);
+        atomicMaxU64(&ctx.stats.dense_catch_up.max_maintenance_ns, maintenance_attempt.elapsed_ns);
+    }
     var dense_window_result = resource_manager_mod.DenseReplayWindowResult{ .finish_ns = finish_ns };
     if (before_lsm_stats) |before| if (after_lsm_stats) |after| {
         const delta = denseLsmWriteStatsDelta(after, before);
@@ -28480,7 +28613,7 @@ test "db runUntilIdle drains lazy dense posting maintenance" {
         try std.testing.expectEqual(@as(usize, 0), skipped.scanned_indexes);
         try std.testing.expectEqual(@as(usize, 0), skipped.attempted_indexes);
         try std.testing.expect(skipped.stopped_by_max_indexes);
-        db.recordDensePostingMaintenanceResult(skipped);
+        db.recordDensePostingMaintenanceResult(skipped, .idle);
         const stats = try db.diagnosticStats(alloc);
         defer types.freeDBStats(alloc, stats);
         try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].hbc_posting.dirty_postings);
@@ -28488,6 +28621,8 @@ test "db runUntilIdle drains lazy dense posting maintenance" {
         try std.testing.expectEqual(@as(u64, 0), stats.dense_posting_maintenance.last_scanned_indexes);
         try std.testing.expect(stats.dense_posting_maintenance.last_stopped_by_max_indexes);
         try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.budget_stop_max_indexes_runs);
+        try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.idle_runs);
+        try std.testing.expectEqual(@as(u64, 0), stats.dense_posting_maintenance.catch_up_runs);
     }
 
     try db.runUntilIdle();
@@ -28498,6 +28633,8 @@ test "db runUntilIdle drains lazy dense posting maintenance" {
         try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].hbc_posting.dirty_postings);
         try std.testing.expect(stats.indexes[0].hbc_posting.maintenance_repaired_postings > 0);
         try std.testing.expect(stats.dense_posting_maintenance.runs >= 2);
+        try std.testing.expect(stats.dense_posting_maintenance.idle_runs >= 2);
+        try std.testing.expectEqual(@as(u64, 0), stats.dense_posting_maintenance.catch_up_runs);
         try std.testing.expect(stats.dense_posting_maintenance.last_steps > 0);
         try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.budget_stop_max_indexes_runs);
     }
