@@ -877,6 +877,8 @@ fn appendOptionalDenseStorageFormatFields(
     }
     if (root.get("version")) |version| {
         if (version != .integer) return error.InvalidCreateTableRequest;
+        if (version.integer == 0) return;
+        if (version.integer < 0) return error.InvalidCreateTableRequest;
         try out.appendSlice(alloc, ",\"version\":");
         const version_json = try std.fmt.allocPrint(alloc, "{d}", .{version.integer});
         defer alloc.free(version_json);
@@ -2225,6 +2227,20 @@ test "managed embedder translates dense storage format and version" {
 
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"format\":\"segments_base_delta\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"version\":1") != null);
+}
+
+test "managed embedder treats dense storage version zero as unspecified" {
+    var local = TestLocalDenseProvider{ .dimensions = 384 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","field":"body","dimension":384,"format":"segments_base_delta","version":0,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+    , .{});
+    defer parsed.deinit();
+
+    const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() });
+    defer std.testing.allocator.free(config_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"format\":\"segments_base_delta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"version\"") == null);
 }
 
 test "managed embedder translates managed embeddings config with probed dimension" {
