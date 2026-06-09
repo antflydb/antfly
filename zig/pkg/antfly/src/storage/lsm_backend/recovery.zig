@@ -149,6 +149,11 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         defer finishOpenPhase(BackendType, backend, .mounting_runs, phase_start);
         compaction_mod.sortRuns(backend.runs.items);
     }
+    if (@hasDecl(BackendType, "cleanupRecoveredRunFilesForManifest")) {
+         _ = backend.cleanupRecoveredRunFilesForManifest() catch |err| {
+            std.log.warn("lsm backend open skipped recovered run cleanup root={?s} err={}", .{ backend.root_dir, err });
+        };
+    }
     if (@hasDecl(BackendType, "refreshMaintenanceDebtHint")) {
         backend.refreshMaintenanceDebtHint();
     }

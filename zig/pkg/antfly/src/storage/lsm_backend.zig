@@ -3664,6 +3664,78 @@ pub const Backend = struct {
         _ = self.refreshCachedMaintenanceHintLocked();
     }
 
+    fn parseRunIdFromTableFileName(name: []const u8) ?u64 {
+        if (!std.mem.endsWith(u8, name, ".tbl")) return null;
+        const stem = name[0 .. name.len - ".tbl".len];
+        if (stem.len == 0) return null;
+        return std.fmt.parseUnsigned(u64, stem, 10) catch null;
+    }
+
+    fn runIdTrackedByManifestLocked(self: *Backend, run_id: u64) bool {
+        for (self.runs.items) |run| {
+            if (run.id == run_id) return true;
+        }
+        return false;
+    }
+
+    fn pathTrackedByManifestLocked(self: *Backend, path: []const u8) bool {
+        for (self.runs.items) |run| {
+            if (run.path) |active| {
+                if (std.mem.eql(u8, active, path)) return true;
+            }
+        }
+        for (self.obsolete_paths.items) |obsolete| {
+            if (std.mem.eql(u8, obsolete.path, path)) return true;
+        }
+        return false;
+    }
+
+    pub fn cleanupRecoveredRunFilesForManifest(self: *Backend) !bool {
+        var cleaned = try self.cleanupOrphanedRunFilesForManifest();
+        if (self.hasReclaimableObsoletePathsLocked()) {
+            try self.persistManifest();
+            cleaned = true;
+        }
+        return cleaned;
+    }
+
+    fn cleanupOrphanedRunFilesForManifest(self: *Backend) !bool {
+        const root_dir = self.root_dir orelse return false;
+        if (self.storage == null or self.options.backend.read_only) return false;
+        if (!std.fs.path.isAbsolute(root_dir)) return false;
+
+        const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
+        defer self.allocator.free(runs_dir);
+
+        var io_impl = std.Io.Threaded.init(self.allocator, .{});
+        defer io_impl.deinit();
+
+        var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer dir.close(io_impl.io());
+
+        var deleted = false;
+        var it = dir.iterate();
+        while (try it.next(io_impl.io())) |entry| {
+            if (entry.kind != .file) continue;
+            const run_id = parseRunIdFromTableFileName(entry.name) orelse continue;
+            if (self.runIdTrackedByManifestLocked(run_id)) continue;
+
+            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
+            defer self.allocator.free(path);
+            if (self.pathTrackedByManifestLocked(path)) continue;
+
+            repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            deleted = true;
+        }
+        return deleted;
+    }
+
     fn reconcileObsoletePathsForManifest(self: *Backend) !bool {
         const now_ns = self.nowNs();
         var needs_follow_up = false;
@@ -7796,7 +7868,7 @@ test "lsm backend bulk publish checkpoints wal without requiring compaction" {
     const stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(usize, 0), backend.compaction_stats.compactions);
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
-    try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
+    try std.testing.expect(stats.sorted_ingest_runs > 0);
     try std.testing.expect(stats.wal_resets > 0);
     try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_segments);
     try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
@@ -12562,6 +12634,119 @@ test "lsm backend ignores orphaned committed run files not referenced by manifes
         try std.testing.expectError(error.NotFound, txn.get("doc:orphan"));
     }
 }
+test "lsm backend removes orphaned committed run files on reopen" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "orphan-run-cleanup");
+    defer repository_mod.cleanupTmp(path);
+
+    const root_dir = std.mem.span(path);
+    const orphan_path = try repository_mod.runPath(std.testing.allocator, root_dir, 9999);
+    defer std.testing.allocator.free(orphan_path);
+
+    {
+        var backend = try Backend.open(std.testing.allocator, root_dir, .{
+            .flush_threshold = 1,
+            .compact_threshold_runs = 2,
+        });
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    const orphan_entries = [_]lsm_table_file.Entry{
+        .{ .namespace_name = "docs", .key = "doc:orphan", .value = "O", .tombstone = false },
+    };
+    const encoded = try lsm_table_file.encodeAlloc(std.testing.allocator, &orphan_entries);
+    defer std.testing.allocator.free(encoded);
+    try repository_mod.writeFileAbsolute(orphan_path, encoded);
+
+    {
+        var reopened = try Backend.open(std.testing.allocator, root_dir, .{
+            .flush_threshold = 1,
+            .compact_threshold_runs = 2,
+        });
+        defer reopened.close();
+
+        try std.testing.expectEqual(@as(usize, 1), reopened.runs.items.len);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, orphan_path, .{}));
+
+        var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings("A", try txn.get("doc:a"));
+        try std.testing.expectError(error.NotFound, txn.get("doc:orphan"));
+    }
+}
+
+test "lsm backend removes expired obsolete run files on reopen" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "obsolete-run-cleanup");
+    defer repository_mod.cleanupTmp(path);
+
+    const root_dir = std.mem.span(path);
+    const obsolete_path = try repository_mod.runPath(std.testing.allocator, root_dir, 9999);
+    defer std.testing.allocator.free(obsolete_path);
+
+    {
+        var backend = try Backend.open(std.testing.allocator, root_dir, .{
+            .flush_threshold = 1,
+            .compact_threshold_runs = 2,
+        });
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+
+        const obsolete_entries = [_]lsm_table_file.Entry{
+            .{ .namespace_name = "docs", .key = "doc:obsolete", .value = "O", .tombstone = false },
+        };
+        const encoded = try lsm_table_file.encodeAlloc(std.testing.allocator, &obsolete_entries);
+        defer std.testing.allocator.free(encoded);
+        try repository_mod.writeFileAbsolute(obsolete_path, encoded);
+
+        const obsolete = [_]ObsoletePath{.{ .path = obsolete_path, .delete_after_ns = 0 }};
+        _ = try repository_mod.persistManifestWithStorageCount(
+            backend.storage.?,
+            std.testing.allocator,
+            root_dir,
+            backend.next_run_id,
+            backend.runs.items,
+            &obsolete,
+        );
+    }
+
+    {
+        var reopened = try Backend.open(std.testing.allocator, root_dir, .{
+            .flush_threshold = 1,
+            .compact_threshold_runs = 2,
+        });
+        defer reopened.close();
+
+        try std.testing.expectEqual(@as(usize, 1), reopened.runs.items.len);
+        try std.testing.expectEqual(@as(usize, 0), reopened.obsolete_paths.items.len);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{}));
+
+        var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings("A", try txn.get("doc:a"));
+        try std.testing.expectError(error.NotFound, txn.get("doc:obsolete"));
+    }
+}
+
 test "lsm backend mutable read snapshot retirement allocation failure keeps snapshot cleanup reachable" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();

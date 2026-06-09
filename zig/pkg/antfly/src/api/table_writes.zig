@@ -3487,6 +3487,34 @@ pub const ProvisionedTableWriteSource = struct {
                 self.markWriteCacheDirty(table_name);
                 self.local_db_mutex.unlock();
             },
+            .publish_blocking => {
+                if (db) |managed_db| {
+                    if (self.runtime_status_cache) |snapshot_cache| {
+                        publishRuntimeStatusSnapshotConsistent(self, snapshot_cache.alloc, table_name, group_id, managed_db) catch |err| {
+                            std.log.warn("managed runtime status blocking publish failed table={s} group_id={} err={s}", .{
+                                table_name,
+                                group_id,
+                                @errorName(err),
+                            });
+                            self.invalidateRuntimeStatusCache(table_name);
+                            lockAtomic(&self.local_db_mutex);
+                            self.markWriteCacheDirty(table_name);
+                            self.local_db_mutex.unlock();
+                            self.invalidateReadCache(table_name);
+                            self.notifyLocalChange(table_name, .data);
+                            return;
+                        };
+                        self.invalidateReadCache(table_name);
+                        self.clearDirtyWriteTable(table_name);
+                        self.notifyLocalChange(table_name, .data);
+                        return;
+                    }
+                }
+                self.invalidateRuntimeStatusCache(table_name);
+                lockAtomic(&self.local_db_mutex);
+                self.markWriteCacheDirty(table_name);
+                self.local_db_mutex.unlock();
+            },
             .invalidate => {},
         }
         self.invalidateReadCache(table_name);
@@ -16126,7 +16154,7 @@ test "provisioned table write source consistent visibility refreshes stale dense
         .writes = &.{.{ .key = "doc:b", .value = "{\"_embeddings\":{\"dense_idx\":[0,1]}}" }},
         .sync_level = .full_index,
     });
-    hook.notify(.publish_consistent);
+    hook.notify(.publish_blocking);
 
     var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer published.deinit(alloc);

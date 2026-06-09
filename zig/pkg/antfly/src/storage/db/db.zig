@@ -208,6 +208,7 @@ pub const QueryVisibilityChange = enum {
     invalidate,
     publish,
     publish_consistent,
+    publish_blocking,
 };
 
 pub const QueryVisibilityHook = struct {
@@ -18963,8 +18964,9 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     }
     finishDenseCatchUpSessionTracked(ctx, index_ref.name);
     catch_up_tracked = false;
-    if (!published_visibility) {
-        if (ctx.query_visibility_hook) |hook| hook.notify(.publish_consistent);
+    if (ctx.query_visibility_hook) |hook| {
+        if (!published_visibility) hook.notify(.publish_consistent);
+        hook.notify(.publish_blocking);
     }
 }
 
@@ -39273,7 +39275,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
         fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, change: QueryVisibilityChange) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             switch (change) {
-                .publish, .publish_consistent => self.publish_calls += 1,
+                .publish, .publish_consistent, .publish_blocking => self.publish_calls += 1,
                 .invalidate => self.invalidate_calls += 1,
             }
         }

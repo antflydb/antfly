@@ -59,7 +59,7 @@ pub const PrimaryBackend = union(enum) {
 pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 32 * 1024 * 1024,
     .read_snapshot_rotate_mutable_bytes = 32 * 1024 * 1024,
-    .bulk_ingest_flush_threshold_bytes_multiplier = 8,
+    .bulk_ingest_flush_threshold_bytes_multiplier = 2,
     .local_block_cache_enabled = false,
     .l0_soft_limit_runs = 32,
     .l0_hard_limit_runs = 128,
@@ -442,6 +442,7 @@ test "index lsm profiles preserve current flush profiles" {
     const primary_opts = primary_lsm_options_default;
     try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), primary_opts.flush_threshold_bytes);
     try std.testing.expectEqual(primary_opts.flush_threshold_bytes, primary_opts.read_snapshot_rotate_mutable_bytes);
+    try std.testing.expectEqual(@as(usize, 2), primary_opts.bulk_ingest_flush_threshold_bytes_multiplier);
     try std.testing.expectEqual(@as(usize, 32), primary_opts.l0_soft_limit_runs);
     try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), primary_opts.level_target_bytes_base);
     try std.testing.expectEqual(@as(usize, 10), primary_opts.level_target_bytes_multiplier);
