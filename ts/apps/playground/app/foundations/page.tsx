@@ -711,15 +711,18 @@ export default function FoundationsPage() {
           file="components/brand/anty/anty-pixel.tsx"
         />
         <p className="max-w-2xl text-sm text-muted-foreground">
-          Pixel-sprite Anty mark for loud brand chrome. Two variants: <strong>square</strong>{" "}
-          (12×12 resolution, sharp notches at top-right and bottom-left) and{" "}
-          <strong>diagonal</strong> (24×24 with stair-step notches). Amber halo glow, stepped eye
-          blink. Pair with Kicker; never use inside in-product chrome.
+          Pixel-sprite Anty mark for loud brand chrome. <strong>Diagonal</strong> (24×24) is the
+          high-fidelity silhouette: <strong>rounded top-left and bottom-right</strong> corners with
+          thin <strong>diagonal slits</strong> at top-right and bottom-left splitting the ring into
+          two interlocking brackets, plus inward triangle eyes — the logo's converging arrowheads.{" "}
+          <strong>Square</strong> (12×12) is a simplified low-res mark — a square ring with a single
+          diagonal corner notch at top-left mirrored at bottom-right, with simple rectangle eyes.
+          Amber halo glow, stepped eye blink. Pair with Kicker; never use inside in-product chrome.
         </p>
 
         <div className="grid gap-6 md:grid-cols-2">
           <div className="space-y-4 border-[1.5px] border-border-strong bg-card p-6">
-            <Kicker>Square — 12×12</Kicker>
+            <Kicker>Square — 12×12 · low-res</Kicker>
             <div className="flex items-end gap-6">
               {(["sm", "md", "lg", "xl"] as const).map((s) => (
                 <div key={s} className="flex flex-col items-center gap-2">
@@ -731,7 +734,7 @@ export default function FoundationsPage() {
           </div>
 
           <div className="space-y-4 border-[1.5px] border-border-strong bg-card p-6">
-            <Kicker>Diagonal — 24×24 stair-step</Kicker>
+            <Kicker>Diagonal — 24×24 · high-fidelity</Kicker>
             <div className="flex items-end gap-6">
               {(["sm", "md", "lg", "xl"] as const).map((s) => (
                 <div key={s} className="flex flex-col items-center gap-2">
