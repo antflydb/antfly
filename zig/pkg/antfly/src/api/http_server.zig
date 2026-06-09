@@ -5544,6 +5544,25 @@ pub const ApiHttpServer = struct {
                     },
                 };
                 if (restored_via_metadata) {
+                    if (self.cfg.swarm_mode) {
+                        self.restoreLocalTableDataFromManifest(table_name, location, table_backup_id) catch |err| {
+                            std.log.err("cluster restore local data apply failed table={s} backup_id={s} err={}", .{
+                                table_name,
+                                table_backup_id,
+                                err,
+                            });
+                            statuses[i].@"error" = switch (err) {
+                                error.UnsupportedOperation => "method not allowed",
+                                error.UnsupportedBackupFormat => "restore does not support this backup layout",
+                                error.UnsupportedBackupMigrationState => "restore does not support active schema migration",
+                                error.TableAlreadyExists => "table already exists",
+                                error.TableNotFound => "not found",
+                                error.InvalidBackupRequest => "invalid restore request",
+                                else => "restore failed",
+                            };
+                            continue;
+                        };
+                    }
                     statuses[i].status = "triggered";
                     continue;
                 }
