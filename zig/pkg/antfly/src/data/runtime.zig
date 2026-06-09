@@ -844,7 +844,7 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_abort_calls_total", "counter", "Dense catch-up session aborts", stats.dense_catch_up.abort_calls);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_active", "gauge", "Whether a dense catch-up session is actively replaying", if (stats.dense_catch_up.active) 1 else 0);
     try health_metrics.appendPromMetricHeader(writer, "antfly_async_index_dense_catch_up_phase", "gauge", "One-hot dense catch-up phase");
-    inline for ([_]antfly.db.types.DenseCatchUpStats.Phase{ .idle, .replay, .bulk_finish, .bulk_split, .bulk_publish, .applied_sequence_flush }) |phase| {
+    inline for ([_]antfly.db.types.DenseCatchUpStats.Phase{ .idle, .replay, .bulk_finish, .bulk_split, .bulk_publish, .posting_maintenance, .applied_sequence_flush }) |phase| {
         try health_metrics.appendPromSampleLabeled(writer, "antfly_async_index_dense_catch_up_phase", &.{
             .{ .name = "phase", .value = switch (phase) {
                 .idle => "idle",
@@ -852,6 +852,7 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
                 .bulk_finish => "bulk_finish",
                 .bulk_split => "bulk_split",
                 .bulk_publish => "bulk_publish",
+                .posting_maintenance => "posting_maintenance",
                 .applied_sequence_flush => "applied_sequence_flush",
             } },
         }, if (stats.dense_catch_up.phase == phase) 1 else 0);
