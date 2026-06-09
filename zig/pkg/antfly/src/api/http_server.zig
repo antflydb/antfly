@@ -1077,19 +1077,20 @@ pub const ApiHttpServer = struct {
             items.deinit(self.alloc);
         }
 
+        var read_needs_refresh = false;
         if (self.table_reads) |source| {
             if (try source.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
+                read_needs_refresh = runtimeStatusesNeedDenseVisibilityRefresh(owned.items);
                 try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, .append);
             }
-        } else {
-            if (self.table_writes) |source| {
-                if (try source.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
-                    var owned = statuses;
-                    errdefer owned.deinit(self.alloc);
-                    try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, .append);
-                }
+        }
+        if ((self.table_reads == null or read_needs_refresh) and self.table_writes != null) {
+            if (try self.table_writes.?.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
+                var owned = statuses;
+                errdefer owned.deinit(self.alloc);
+                try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, if (read_needs_refresh) .replace_existing else .append);
             }
         }
         if (snapshot) |admin_snapshot| {
@@ -1100,6 +1101,29 @@ pub const ApiHttpServer = struct {
             return null;
         }
         return .{ .items = try items.toOwnedSlice(self.alloc) };
+    }
+
+    fn indexHasDenseVisibilityFacts(item: db_mod.types.DBIndexStats) bool {
+        return item.doc_count > 0 or item.term_count > 0 or item.edge_count > 0 or item.node_count > 0 or item.root_node > 0;
+    }
+
+    fn runtimeStatusNeedsDenseVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
+        const has_primary_facts = status.stats.doc_identity.live_ordinals != 0 or status.stats.doc_count != 0;
+        for (status.stats.indexes) |item| {
+            if (item.kind != .dense_vector) continue;
+            if (indexHasDenseVisibilityFacts(item)) continue;
+            if (item.replay_applied_sequence != 0 or item.replay_target_sequence != 0) continue;
+            if (has_primary_facts) return true;
+            return status.metadata.source == .live_writer_publish;
+        }
+        return false;
+    }
+
+    fn runtimeStatusesNeedDenseVisibilityRefresh(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
+        for (statuses) |status| {
+            if (runtimeStatusNeedsDenseVisibilityRefresh(status)) return true;
+        }
+        return false;
     }
 
     const LocalRuntimeAppendMode = enum {

@@ -295,6 +295,12 @@ pub const TableRuntimeSnapshotCache = struct {
         try self.upsertGroupStatusInEntries(&self.entries, table_name, owned);
     }
 
+    pub fn upsertGroupStatusPreservingMetadata(self: *@This(), table_name: []const u8, status: LocalTableRuntimeStatus) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.upsertGroupStatusInEntries(&self.entries, table_name, status);
+    }
+
     fn upsertGroupStatusLocked(self: *@This(), table_name: []const u8, status: LocalTableRuntimeStatus) !void {
         try self.upsertGroupStatusInEntries(&self.entries, table_name, status);
     }
