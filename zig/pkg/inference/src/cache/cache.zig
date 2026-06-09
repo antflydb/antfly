@@ -18,12 +18,14 @@
 const std = @import("std");
 
 // Monotonic nanosecond timestamp for cache entry TTL bookkeeping. The pre-0.17
-// code used clock_gettime(CLOCK_MONOTONIC) via @cImport; @cImport is gone, but
-// std.posix.clock_gettime gives the same monotonic source. Wall-clock
-// std.time.nanoTimestamp() is avoided here so an NTP/manual clock jump can't
+// code used clock_gettime(CLOCK_MONOTONIC) via @cImport; @cImport is gone, and
+// std.posix.clock_gettime / std.time.Instant were removed in 0.17 (clocks moved
+// behind std.Io). std.c.clock_gettime gives the same monotonic source without an
+// Io handle. Wall-clock time is avoided here so an NTP/manual clock jump can't
 // corrupt expiry math.
 fn nowNs() i64 {
-    const ts = std.posix.clock_gettime(std.posix.CLOCK.MONOTONIC) catch return 0;
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 

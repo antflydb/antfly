@@ -57,6 +57,13 @@ pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
     arguments: []const u8,
+
+    pub fn deinit(self: *ToolCall, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+        allocator.free(self.arguments);
+        self.* = undefined;
+    }
 };
 
 pub const ChatMessage = struct {
@@ -68,10 +75,13 @@ pub const ChatMessage = struct {
 
 pub const GenerateResult = struct {
     content: []const u8,
+    tool_calls: []ToolCall = &.{},
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *GenerateResult) void {
         self.allocator.free(self.content);
+        for (self.tool_calls) |*tool_call| tool_call.deinit(self.allocator);
+        if (self.tool_calls.len > 0) self.allocator.free(self.tool_calls);
         self.* = undefined;
     }
 };
@@ -113,6 +123,8 @@ pub const GeneratorConfig = struct {
     project_id: ?[]const u8 = null,
     location: ?[]const u8 = null,
     credentials_path: ?[]const u8 = null,
+    tools_json: ?[]const u8 = null,
+    tool_choice_json: ?[]const u8 = null,
 
     pub fn clone(self: GeneratorConfig, alloc: std.mem.Allocator) !GeneratorConfig {
         return .{
@@ -123,6 +135,8 @@ pub const GeneratorConfig = struct {
             .project_id = if (self.project_id) |value| try alloc.dupe(u8, value) else null,
             .location = if (self.location) |value| try alloc.dupe(u8, value) else null,
             .credentials_path = if (self.credentials_path) |value| try alloc.dupe(u8, value) else null,
+            .tools_json = if (self.tools_json) |value| try alloc.dupe(u8, value) else null,
+            .tool_choice_json = if (self.tool_choice_json) |value| try alloc.dupe(u8, value) else null,
         };
     }
 
@@ -133,6 +147,8 @@ pub const GeneratorConfig = struct {
         if (self.project_id) |value| alloc.free(value);
         if (self.location) |value| alloc.free(value);
         if (self.credentials_path) |value| alloc.free(value);
+        if (self.tools_json) |value| alloc.free(value);
+        if (self.tool_choice_json) |value| alloc.free(value);
         self.* = undefined;
     }
 

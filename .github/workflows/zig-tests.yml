@@ -254,6 +254,7 @@ jobs:
   full-default:
     if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
+    timeout-minutes: 60
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
@@ -279,7 +280,46 @@ jobs:
         run: zig version
 
       - name: Run full Zig unit tests
-        run: make zig-test
+        run: make zig-unit-test
+
+      - name: Run Zig simulation tests
+        working-directory: zig
+        run: zig build sim-test
+
+      - name: Run Zig integration tests
+        working-directory: zig
+        run: zig build integration-test
+
+      - name: Run Zig recall tests
+        working-directory: zig
+        run: zig build recall-test
+
+      - name: Run Zig recall harness sweep
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          datasets=(
+            images-512d-10k.gob
+            random-20d-1k.gob
+            fashionminst-784d-1k.gob
+            fashionminst-784d-10k.gob
+            laionclip-768d-1k.gob
+            laiongemini-1408d-1k.gob
+            laiongemini-512d-10k.gob
+            dbpedia-1536d-1k.gob
+            random-2048d-1k.gob
+            random-4096d-1k.gob
+            wikiarticles-768d-10k.gob
+          )
+          for dataset in "${datasets[@]}"; do
+            echo "::group::recall-harness ${dataset}"
+            zig build recall-harness -- --dataset-dir testdata/vectorsets --dataset "${dataset}"
+            echo "::endgroup::"
+          done
+
+      - name: Run Zig chaos tests
+        working-directory: zig
+        run: zig build chaos-test
 
   e2e-base:
     needs: changes
@@ -373,4 +413,6 @@ jobs:
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_DOWNLOAD: "1"
+          ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: openai-community/gpt2
         run: uv run --project e2e/inference pytest -q -x e2e/inference

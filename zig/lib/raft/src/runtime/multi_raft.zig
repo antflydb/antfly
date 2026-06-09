@@ -812,6 +812,7 @@ const PeerBatchBuilder = struct {
 
 const TransportOutbox = struct {
     items: std.ArrayListUnmanaged(OutboundMessage) = .empty,
+    approx_bytes: usize = 0,
 
     fn deinit(self: *TransportOutbox, alloc: std.mem.Allocator) void {
         for (self.items.items) |*item| item.message.deinit(alloc);
@@ -825,10 +826,12 @@ const TransportOutbox = struct {
         group_id: core.types.GroupId,
         msg: core.Message,
     ) !void {
+        const msg_bytes = approxMessagesSize(&.{msg});
         try self.items.append(alloc, .{
             .group_id = group_id,
             .message = try msg.clone(alloc),
         });
+        self.approx_bytes += msg_bytes;
     }
 
     fn appendMessages(
@@ -839,10 +842,12 @@ const TransportOutbox = struct {
     ) !void {
         try self.items.ensureUnusedCapacity(alloc, messages.len);
         for (messages) |msg| {
+            const msg_bytes = approxMessagesSize(&.{msg});
             self.items.appendAssumeCapacity(.{
                 .group_id = group_id,
                 .message = try msg.clone(alloc),
             });
+            self.approx_bytes += msg_bytes;
         }
     }
 
@@ -850,13 +855,13 @@ const TransportOutbox = struct {
         if (self.items.items.len == 0) return;
         try dst.items.ensureUnusedCapacity(alloc, self.items.items.len);
         for (self.items.items) |item| dst.items.appendAssumeCapacity(item);
+        dst.approx_bytes += self.approx_bytes;
         self.items.clearRetainingCapacity();
+        self.approx_bytes = 0;
     }
 
     fn approxBytes(self: *const TransportOutbox) usize {
-        var total: usize = 0;
-        for (self.items.items) |item| total += approxMessagesSize(&.{item.message});
-        return total;
+        return self.approx_bytes;
     }
 
     fn flush(self: *TransportOutbox, alloc: std.mem.Allocator, hooks: RuntimeHooks) !TransportFlushStats {
@@ -994,7 +999,6 @@ const TransportOutbox = struct {
             if (count >= max_messages) break;
             const msg_bytes = approxMessagesSize(&.{item.message});
             if (count > 0 and used_bytes + msg_bytes > max_bytes) break;
-            if (count == 0 and msg_bytes > max_bytes) break;
             used_bytes += msg_bytes;
             count += 1;
         }
@@ -1006,11 +1010,17 @@ const TransportOutbox = struct {
         errdefer out.deinit(alloc);
 
         try out.items.ensureTotalCapacity(alloc, count);
-        for (self.items.items[0..count]) |item| out.items.appendAssumeCapacity(item);
+        var taken_bytes: usize = 0;
+        for (self.items.items[0..count]) |item| {
+            out.items.appendAssumeCapacity(item);
+            taken_bytes += approxMessagesSize(&.{item.message});
+        }
+        out.approx_bytes = taken_bytes;
 
         const remaining = self.items.items.len - count;
         std.mem.copyForwards(OutboundMessage, self.items.items[0..remaining], self.items.items[count..]);
         self.items.items.len = remaining;
+        self.approx_bytes -= taken_bytes;
 
         return out;
     }
@@ -1018,6 +1028,7 @@ const TransportOutbox = struct {
     fn clear(self: *TransportOutbox, alloc: std.mem.Allocator) void {
         for (self.items.items) |*item| item.message.deinit(alloc);
         self.items.clearRetainingCapacity();
+        self.approx_bytes = 0;
     }
 };
 

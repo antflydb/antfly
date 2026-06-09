@@ -19,8 +19,11 @@ const platform_time = @import("../platform/time.zig");
 const tracing = @import("../tracing/mod.zig");
 pub const catalog = @import("catalog.zig");
 const backup_restore = @import("storage/backup_restore.zig");
+const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const peer_resolver = @import("peer_resolver.zig");
 const transport = @import("transport/mod.zig");
+
+pub const default_max_inbound_messages_per_round: usize = 1024;
 
 pub const ReplicaStateBackend = enum {
     file_image,
@@ -134,9 +137,25 @@ pub const HostMetrics = struct {
     inbound_message_drains: usize = 0,
     pending_inbound_messages: usize = 0,
     runtime_rounds: usize = 0,
+    runtime_ticked_groups: usize = 0,
+    runtime_processed_groups: usize = 0,
+    runtime_transport_message_sends: usize = 0,
+    runtime_pending_outbound_messages: usize = 0,
+    runtime_pending_outbound_bytes: usize = 0,
+    runtime_pending_apply_tasks: usize = 0,
+    runtime_pending_apply_bytes: usize = 0,
+    runtime_transport_queue_denials: usize = 0,
+    runtime_apply_queue_denials: usize = 0,
     backup_bootstrap_attempts: usize = 0,
     backup_bootstrap_failures: usize = 0,
     backup_bootstrap_successes: usize = 0,
+    async_send_enqueued: u64 = 0,
+    async_send_failed: u64 = 0,
+    async_send_retried: u64 = 0,
+    async_send_dropped: u64 = 0,
+    async_send_queue_full: u64 = 0,
+    async_send_peer_queue_full: u64 = 0,
+    async_send_pending: usize = 0,
 };
 
 pub const HttpHostConfig = struct {
@@ -151,6 +170,7 @@ pub const HttpHostDeps = struct {
     snapshot_store: ?transport.http_server.SnapshotStore = null,
     snapshot_resolver: ?transport.http_snapshot.SnapshotTargetResolver = null,
     request_executor: ?transport.RequestExecutor = null,
+    backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
 };
 
 pub const Host = struct {
@@ -404,9 +424,19 @@ pub const Host = struct {
     }
 
     pub fn metricsSnapshot(self: *const Host) HostMetrics {
+        const runtime_metrics = self.runtime_host.metricsSnapshot();
         var snapshot = self.metrics;
-        snapshot.hosted_groups = self.runtime_host.metricsSnapshot().group_count;
-        snapshot.runtime_rounds = self.runtime_host.metricsSnapshot().rounds;
+        snapshot.hosted_groups = runtime_metrics.group_count;
+        snapshot.runtime_rounds = runtime_metrics.rounds;
+        snapshot.runtime_ticked_groups = runtime_metrics.ticked_groups;
+        snapshot.runtime_processed_groups = runtime_metrics.processed_groups;
+        snapshot.runtime_transport_message_sends = runtime_metrics.transport_message_sends;
+        snapshot.runtime_pending_outbound_messages = runtime_metrics.pending_outbound_messages;
+        snapshot.runtime_pending_outbound_bytes = runtime_metrics.pending_outbound_bytes;
+        snapshot.runtime_pending_apply_tasks = runtime_metrics.pending_apply_tasks;
+        snapshot.runtime_pending_apply_bytes = runtime_metrics.pending_apply_bytes;
+        snapshot.runtime_transport_queue_denials = runtime_metrics.transport_queue_denials;
+        snapshot.runtime_apply_queue_denials = runtime_metrics.apply_queue_denials;
         return snapshot;
     }
 
@@ -415,7 +445,16 @@ pub const Host = struct {
     }
 
     pub fn runRound(self: *Host, max_tick_groups: usize, max_ready_groups: usize) !raft_engine.runtime.multi_raft.HostRound {
-        _ = try self.drainInboundMessages();
+        return try self.runRoundBounded(default_max_inbound_messages_per_round, max_tick_groups, max_ready_groups);
+    }
+
+    pub fn runRoundBounded(
+        self: *Host,
+        max_inbound_messages: usize,
+        max_tick_groups: usize,
+        max_ready_groups: usize,
+    ) !raft_engine.runtime.multi_raft.HostRound {
+        _ = try self.drainInboundMessages(max_inbound_messages);
         return try self.runtime_host.runRound(max_tick_groups, max_ready_groups);
     }
 
@@ -454,10 +493,34 @@ pub const Host = struct {
         }
     }
 
-    fn drainInboundMessages(self: *Host) !usize {
+    fn drainInboundMessages(self: *Host, max_messages: usize) !usize {
+        if (max_messages == 0) return 0;
         var pending = std.ArrayListUnmanaged(PendingInboundMessage).empty;
+        errdefer {
+            for (pending.items) |*item| item.deinit(self.alloc);
+            pending.deinit(self.alloc);
+        }
+
         self.lockInbound();
-        std.mem.swap(std.ArrayListUnmanaged(PendingInboundMessage), &pending, &self.pending_inbound);
+        const drain_count = @min(max_messages, self.pending_inbound.items.len);
+        if (drain_count > 0) {
+            pending.ensureTotalCapacity(self.alloc, drain_count) catch |err| {
+                self.inbound_mutex.unlock();
+                return err;
+            };
+            pending.appendSliceAssumeCapacity(self.pending_inbound.items[0..drain_count]);
+            if (drain_count < self.pending_inbound.items.len) {
+                const remaining = self.pending_inbound.items.len - drain_count;
+                std.mem.copyForwards(
+                    PendingInboundMessage,
+                    self.pending_inbound.items[0..remaining],
+                    self.pending_inbound.items[drain_count..],
+                );
+                self.pending_inbound.items.len = remaining;
+            } else {
+                self.pending_inbound.clearRetainingCapacity();
+            }
+        }
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
         self.inbound_mutex.unlock();
         defer {
@@ -635,7 +698,15 @@ pub const HttpHost = struct {
         const request_executor = if (deps.request_executor) |override| override else blk: {
             const owned = try alloc.create(transport.StdHttpExecutor);
             errdefer alloc.destroy(owned);
-            owned.initInPlace(alloc, cfg.executor);
+            if (deps.backend_runtime) |backend_runtime| {
+                if (backend_runtime.raftOutboundIoImpl()) |io_impl| {
+                    owned.initSharedInPlace(alloc, cfg.executor, io_impl);
+                } else {
+                    owned.initInPlace(alloc, cfg.executor);
+                }
+            } else {
+                owned.initInPlace(alloc, cfg.executor);
+            }
             errdefer owned.deinit();
             executor = owned;
             break :blk owned.executor();
@@ -643,10 +714,12 @@ pub const HttpHost = struct {
 
         const transport_stack = try alloc.create(transport.HttpTransportStack);
         errdefer alloc.destroy(transport_stack);
+        const transport_io = if (deps.backend_runtime) |runtime| runtime.raftOutboundIo() else null;
         transport_stack.* = try transport.HttpTransportStack.init(
             alloc,
             cfg.transport,
             request_executor,
+            transport_io,
             deps.snapshot_resolver,
         );
         errdefer transport_stack.deinit();
@@ -684,7 +757,13 @@ pub const HttpHost = struct {
 
         const listener = try alloc.create(transport.StdHttpListener);
         errdefer alloc.destroy(listener);
-        listener.* = transport.StdHttpListener.init(alloc, cfg.listener, server.executor());
+        listener.* = if (deps.backend_runtime) |backend_runtime|
+            if (backend_runtime.raftInboundIoImpl()) |io_impl|
+                transport.StdHttpListener.initShared(alloc, cfg.listener, server.executor(), io_impl)
+            else
+                transport.StdHttpListener.init(alloc, cfg.listener, server.executor())
+        else
+            transport.StdHttpListener.init(alloc, cfg.listener, server.executor());
 
         return .{
             .alloc = alloc,
@@ -734,7 +813,16 @@ pub const HttpHost = struct {
     }
 
     pub fn metricsSnapshot(self: *const HttpHost) HostMetrics {
-        return self.host.metricsSnapshot();
+        var snapshot = self.host.metricsSnapshot();
+        const async_send = self.transport_stack.asyncSendMetricsSnapshot();
+        snapshot.async_send_enqueued = async_send.enqueued;
+        snapshot.async_send_failed = async_send.failed;
+        snapshot.async_send_retried = async_send.retried;
+        snapshot.async_send_dropped = async_send.dropped;
+        snapshot.async_send_queue_full = async_send.queue_full;
+        snapshot.async_send_peer_queue_full = async_send.peer_queue_full;
+        snapshot.async_send_pending = async_send.pending;
+        return snapshot;
     }
 
     pub fn status(self: *HttpHost, group_id: u64) HostedReplicaStatus {
@@ -771,6 +859,15 @@ pub const HttpHost = struct {
 
     pub fn runRound(self: *HttpHost, max_tick_groups: usize, max_ready_groups: usize) !raft_engine.runtime.multi_raft.HostRound {
         return try self.host.runRound(max_tick_groups, max_ready_groups);
+    }
+
+    pub fn runRoundBounded(
+        self: *HttpHost,
+        max_inbound_messages: usize,
+        max_tick_groups: usize,
+        max_ready_groups: usize,
+    ) !raft_engine.runtime.multi_raft.HostRound {
+        return try self.host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_groups);
     }
 
     pub fn campaignGroup(self: *HttpHost, group_id: u64) !void {
@@ -953,7 +1050,13 @@ test "host drops stale inbound peer batch groups without leaking pending storage
         .local_node_id = 1,
     });
 
-    const known_msg = raft_engine.core.Message{
+    const known_msg_a = raft_engine.core.Message{
+        .msg_type = .heartbeat,
+        .from = 2,
+        .to = 1,
+        .term = 1,
+    };
+    const known_msg_b = raft_engine.core.Message{
         .msg_type = .heartbeat,
         .from = 2,
         .to = 1,
@@ -970,7 +1073,7 @@ test "host drops stale inbound peer batch groups without leaking pending storage
         .groups = (&[_]raft_engine.runtime.transport_iface.GroupMessageBatch{
             .{
                 .group_id = 41,
-                .messages = (&[_]raft_engine.core.Message{known_msg})[0..],
+                .messages = (&[_]raft_engine.core.Message{ known_msg_a, known_msg_b })[0..],
             },
             .{
                 .group_id = 99,
@@ -979,8 +1082,16 @@ test "host drops stale inbound peer batch groups without leaking pending storage
         })[0..],
     });
 
-    try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_enqueues);
+    try std.testing.expectEqual(@as(usize, 2), host.metrics.inbound_message_enqueues);
+    try std.testing.expectEqual(@as(usize, 2), host.metrics.pending_inbound_messages);
+
+    _ = try host.runRoundBounded(1, 1, 1);
+    try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_drains);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.pending_inbound_messages);
+
+    _ = try host.runRoundBounded(1, 1, 1);
+    try std.testing.expectEqual(@as(usize, 2), host.metrics.inbound_message_drains);
+    try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_messages);
 }
 
 test "host invokes backup restore bootstrapper before creating a replica" {

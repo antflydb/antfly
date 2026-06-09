@@ -86,7 +86,7 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = b.sysroot orelse
+    const sdk_root =
         std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         b.graph.environ_map.get("SDK_PATH") orelse
         return;

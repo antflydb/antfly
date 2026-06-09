@@ -3585,25 +3585,36 @@ pub fn searchTextQuery(
         const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
         const id = hit.id orelse {
             const stored = snapshot.storedDoc(hit.doc_id) orelse return error.StoredDocMissing;
-            hits[i] = .{
+            var materialized = types.SearchHit{
                 .id = try alloc.dupe(u8, stored.id),
                 .doc_ordinal = doc_ordinal,
                 .score = hit.score,
                 .stored_data = null,
             };
+            var assigned = false;
+            errdefer if (!assigned) materialized.deinit(alloc);
+            materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
+            hits[i] = materialized;
+            assigned = true;
             initialized += 1;
             continue;
         };
 
-        hits[i] = .{
+        var materialized = types.SearchHit{
             .id = try alloc.dupe(u8, id),
             .doc_ordinal = doc_ordinal,
             .score = hit.score,
-            .stored_data = if (effective_req.include_stored and hit.stored_data != null)
-                try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
-            else
-                null,
+            .stored_data = null,
         };
+        var assigned = false;
+        errdefer if (!assigned) materialized.deinit(alloc);
+        materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
+        materialized.stored_data = if (effective_req.include_stored and hit.stored_data != null)
+            try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
+        else
+            null;
+        hits[i] = materialized;
+        assigned = true;
         initialized += 1;
     }
     const hits_ns = if (bench_query_profile) platform_time.monotonicNs() - hits_start_ns else 0;

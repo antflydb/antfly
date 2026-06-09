@@ -744,6 +744,62 @@ pub fn forcedFunctionName(choice: ParsedToolChoice) ?[]const u8 {
     };
 }
 
+pub fn synthesizeForcedFunctionToolCallFromJsonContent(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    choice: ParsedToolChoice,
+) !?[]ToolCall {
+    const forced_name = forcedFunctionName(choice) orelse return null;
+    const json_content = stripJsonFence(content);
+    if (json_content.len == 0) return null;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_content, .{}) catch return null;
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .object, .array => {},
+        else => return null,
+    }
+
+    const arguments = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+    errdefer allocator.free(arguments);
+    const id = try allocator.dupe(u8, "call_forced_0");
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, forced_name);
+    errdefer allocator.free(name);
+    const calls = try allocator.alloc(ToolCall, 1);
+    calls[0] = .{
+        .id = id,
+        .type = "function",
+        .function = .{
+            .name = name,
+            .arguments = arguments,
+        },
+    };
+    return calls;
+}
+
+pub fn freeToolCalls(allocator: std.mem.Allocator, calls: []ToolCall) void {
+    for (calls) |*call| call.deinit(allocator);
+    allocator.free(calls);
+}
+
+fn stripJsonFence(content: []const u8) []const u8 {
+    var text = std.mem.trim(u8, content, &std.ascii.whitespace);
+    if (!std.mem.startsWith(u8, text, "```")) return text;
+    text = text[3..];
+    if (std.mem.indexOfScalar(u8, text, '\n')) |newline| {
+        const tag = std.mem.trim(u8, text[0..newline], &std.ascii.whitespace);
+        if (tag.len == 0 or std.ascii.eqlIgnoreCase(tag, "json")) {
+            text = text[newline + 1 ..];
+        }
+    }
+    text = std.mem.trim(u8, text, &std.ascii.whitespace);
+    if (std.mem.endsWith(u8, text, "```")) {
+        text = std.mem.trim(u8, text[0 .. text.len - 3], &std.ascii.whitespace);
+    }
+    return text;
+}
+
 pub fn toolCallsEnabled(choice: ParsedToolChoice) bool {
     return switch (choice) {
         .none => false,
@@ -1694,4 +1750,33 @@ test "json parser accepts openai style function wrapper" {
     try std.testing.expectEqualStrings("call_123", calls[0].id);
     try std.testing.expectEqualStrings("lookup", calls[0].function.name);
     try std.testing.expectEqualStrings("{\"id\":42}", calls[0].function.arguments);
+}
+
+test "forced tool call fallback accepts plain and fenced json content" {
+    const allocator = std.testing.allocator;
+    const plain = try synthesizeForcedFunctionToolCallFromJsonContent(
+        allocator,
+        "{\"relations\":[]}",
+        .{ .function = "emit_relations" },
+    ) orelse return error.TestUnexpectedResult;
+    defer freeToolCalls(allocator, plain);
+    try std.testing.expectEqual(@as(usize, 1), plain.len);
+    try std.testing.expectEqualStrings("emit_relations", plain[0].function.name);
+    try std.testing.expectEqualStrings("{\"relations\":[]}", plain[0].function.arguments);
+
+    const fenced = try synthesizeForcedFunctionToolCallFromJsonContent(
+        allocator,
+        "```json\n{\"relations\":[{\"type\":\"mentioned in\"}]}\n```",
+        .{ .function = "emit_relations" },
+    ) orelse return error.TestUnexpectedResult;
+    defer freeToolCalls(allocator, fenced);
+    try std.testing.expectEqual(@as(usize, 1), fenced.len);
+    try std.testing.expectEqualStrings("emit_relations", fenced[0].function.name);
+
+    const skipped = try synthesizeForcedFunctionToolCallFromJsonContent(
+        allocator,
+        "{\"relations\":[]}",
+        .auto,
+    );
+    try std.testing.expectEqual(@as(?[]ToolCall, null), skipped);
 }

@@ -237,6 +237,77 @@
             color: #888;
         }
 
+        .graph-panel {
+            background: white;
+            border-radius: 8px;
+            padding: 18px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 5px rgba(0,0,0,0.08);
+        }
+
+        .graph-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: baseline;
+            margin-bottom: 12px;
+        }
+
+        .graph-title {
+            font-size: 1rem;
+            font-weight: 600;
+            color: #1a1a2e;
+        }
+
+        .graph-meta {
+            color: #777;
+            font-size: 0.82rem;
+        }
+
+        .graph-canvas {
+            width: 100%;
+            height: 360px;
+            border: 1px solid #e1e5ec;
+            border-radius: 6px;
+            background: #fbfcfe;
+            display: block;
+        }
+
+        .graph-empty {
+            color: #777;
+            font-size: 0.9rem;
+            padding: 24px 0 6px;
+        }
+
+        .graph-node {
+            fill: #ffffff;
+            stroke: #4a90d9;
+            stroke-width: 1.5;
+            cursor: pointer;
+        }
+
+        .graph-node.seed {
+            fill: #e8f4e8;
+            stroke: #2d6a2d;
+        }
+
+        .graph-edge {
+            stroke: #a8b3c2;
+            stroke-width: 1.3;
+        }
+
+        .graph-label {
+            fill: #1a1a2e;
+            font-size: 11px;
+            pointer-events: none;
+        }
+
+        .graph-edge-label {
+            fill: #617089;
+            font-size: 10px;
+            pointer-events: none;
+        }
+
         .examples {
             margin-top: 20px;
             padding: 15px;
@@ -332,6 +403,15 @@
             Found {{.Total}} results for "{{.Query}}" ({{.Took}})
         </div>
 
+        <div class="graph-panel" data-query="{{.Query}}">
+            <div class="graph-header">
+                <div class="graph-title">Relation graph</div>
+                <div class="graph-meta" id="graph-meta">Loading...</div>
+            </div>
+            <svg class="graph-canvas" id="graph-canvas" role="img" aria-label="Relation graph"></svg>
+            <div class="graph-empty" id="graph-empty" hidden>No graph edges found for this search.</div>
+        </div>
+
         {{if .Results}}
             {{range .Results}}
             <div class="result-card">
@@ -374,5 +454,159 @@
             Documents sourced from <a href="https://archive.org/details/combined-all-epstein-files">Internet Archive</a> and <a href="https://www.justice.gov/epstein">DOJ</a>
         </p>
     </footer>
+    <script>
+        (function () {
+            const panel = document.querySelector(".graph-panel[data-query]");
+            if (!panel) return;
+
+            const svg = document.getElementById("graph-canvas");
+            const meta = document.getElementById("graph-meta");
+            const empty = document.getElementById("graph-empty");
+            const query = panel.getAttribute("data-query") || "";
+
+            fetch("/api/graph?q=" + encodeURIComponent(query))
+                .then((resp) => {
+                    if (!resp.ok) throw new Error(resp.statusText || "graph request failed");
+                    return resp.json();
+                })
+                .then((graph) => renderGraph(svg, meta, empty, graph))
+                .catch((err) => {
+                    meta.textContent = "Unavailable";
+                    empty.hidden = false;
+                    empty.textContent = err.message || "Graph data is unavailable.";
+                    svg.setAttribute("hidden", "hidden");
+                });
+
+            function renderGraph(svg, meta, empty, graph) {
+                const nodes = Array.isArray(graph.nodes) ? graph.nodes.slice(0, 40) : [];
+                const nodeIds = new Set(nodes.map((node) => node.id));
+                const edges = (Array.isArray(graph.edges) ? graph.edges : [])
+                    .filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target))
+                    .slice(0, 80);
+
+                meta.textContent = `${nodes.length} nodes, ${edges.length} edges`;
+                if (nodes.length === 0 || edges.length === 0) {
+                    empty.hidden = false;
+                    svg.setAttribute("hidden", "hidden");
+                    return;
+                }
+
+                empty.hidden = true;
+                svg.removeAttribute("hidden");
+                const width = svg.clientWidth || 860;
+                const height = svg.clientHeight || 360;
+                svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+                svg.textContent = "";
+
+                const state = layout(nodes, edges, width, height);
+                for (const edge of edges) {
+                    const source = state.get(edge.source);
+                    const target = state.get(edge.target);
+                    if (!source || !target) continue;
+                    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+                    line.setAttribute("class", "graph-edge");
+                    line.setAttribute("x1", source.x);
+                    line.setAttribute("y1", source.y);
+                    line.setAttribute("x2", target.x);
+                    line.setAttribute("y2", target.y);
+                    svg.appendChild(line);
+
+                    const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+                    label.setAttribute("class", "graph-edge-label");
+                    label.setAttribute("x", (source.x + target.x) / 2);
+                    label.setAttribute("y", (source.y + target.y) / 2 - 4);
+                    label.setAttribute("text-anchor", "middle");
+                    label.textContent = edge.type || "related";
+                    svg.appendChild(label);
+                }
+
+                for (const node of nodes) {
+                    const point = state.get(node.id);
+                    if (!point) continue;
+                    const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+                    if (node.url) {
+                        group.addEventListener("click", () => window.open(node.url, "_blank", "noopener"));
+                    }
+                    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+                    circle.setAttribute("class", "graph-node" + (node.depth === 0 ? " seed" : ""));
+                    circle.setAttribute("cx", point.x);
+                    circle.setAttribute("cy", point.y);
+                    circle.setAttribute("r", node.depth === 0 ? 10 : 8);
+                    group.appendChild(circle);
+
+                    const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+                    title.textContent = [node.label, node.subtitle].filter(Boolean).join("\n");
+                    group.appendChild(title);
+
+                    const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+                    label.setAttribute("class", "graph-label");
+                    label.setAttribute("x", point.x + 12);
+                    label.setAttribute("y", point.y + 4);
+                    label.textContent = shortLabel(node.label || node.id);
+                    group.appendChild(label);
+                    svg.appendChild(group);
+                }
+            }
+
+            function layout(nodes, edges, width, height) {
+                const state = new Map();
+                const radius = Math.max(80, Math.min(width, height) * 0.34);
+                nodes.forEach((node, i) => {
+                    const angle = (2 * Math.PI * i) / Math.max(nodes.length, 1);
+                    state.set(node.id, {
+                        x: width / 2 + Math.cos(angle) * radius,
+                        y: height / 2 + Math.sin(angle) * radius,
+                        vx: 0,
+                        vy: 0,
+                    });
+                });
+                for (let step = 0; step < 180; step++) {
+                    for (let i = 0; i < nodes.length; i++) {
+                        const a = state.get(nodes[i].id);
+                        for (let j = i + 1; j < nodes.length; j++) {
+                            const b = state.get(nodes[j].id);
+                            const dx = a.x - b.x || 0.1;
+                            const dy = a.y - b.y || 0.1;
+                            const d2 = dx * dx + dy * dy;
+                            const force = Math.min(1400 / d2, 0.08);
+                            a.vx += dx * force;
+                            a.vy += dy * force;
+                            b.vx -= dx * force;
+                            b.vy -= dy * force;
+                        }
+                    }
+                    for (const edge of edges) {
+                        const a = state.get(edge.source);
+                        const b = state.get(edge.target);
+                        if (!a || !b) continue;
+                        const dx = b.x - a.x;
+                        const dy = b.y - a.y;
+                        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                        const force = (dist - 95) * 0.006;
+                        const fx = (dx / dist) * force;
+                        const fy = (dy / dist) * force;
+                        a.vx += fx;
+                        a.vy += fy;
+                        b.vx -= fx;
+                        b.vy -= fy;
+                    }
+                    for (const point of state.values()) {
+                        point.vx += (width / 2 - point.x) * 0.004;
+                        point.vy += (height / 2 - point.y) * 0.004;
+                        point.x = Math.max(20, Math.min(width - 140, point.x + point.vx));
+                        point.y = Math.max(24, Math.min(height - 24, point.y + point.vy));
+                        point.vx *= 0.72;
+                        point.vy *= 0.72;
+                    }
+                }
+                return state;
+            }
+
+            function shortLabel(value) {
+                value = String(value || "").replace(/\s+/g, " ").trim();
+                return value.length > 44 ? value.slice(0, 41) + "..." : value;
+            }
+        })();
+    </script>
 </body>
 </html>

@@ -47,6 +47,22 @@ const Config = struct {
     per_query_only: bool = false,
 };
 
+const Heartbeat = struct {
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *Heartbeat) void {
+        var elapsed_ms: u64 = 0;
+        while (!self.stop.load(.acquire)) {
+            sleepMs(1_000);
+            elapsed_ms += 1_000;
+            if (elapsed_ms >= 30_000 and !self.stop.load(.acquire)) {
+                std.debug.print("recall_harness_heartbeat alive\n", .{});
+                elapsed_ms = 0;
+            }
+        }
+    }
+};
+
 const RecallCase = recall_cases.RecallCase;
 
 pub fn main(init: std.process.Init) !void {
@@ -55,6 +71,22 @@ pub fn main(init: std.process.Init) !void {
     const alloc = gpa_state.allocator();
 
     const cfg = try parseArgs(init.minimal.args);
+    std.debug.print("recall_harness_start dataset_dir={s} dataset_filter={s} suite={s}\n", .{
+        cfg.dataset_dir,
+        cfg.dataset_filter orelse "<all>",
+        @tagName(cfg.suite),
+    });
+
+    var heartbeat = Heartbeat{};
+    const heartbeat_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Heartbeat.run, .{&heartbeat}) catch |err| blk: {
+        std.debug.print("recall_harness_heartbeat_disabled err={s}\n", .{@errorName(err)});
+        break :blk null;
+    };
+    defer {
+        heartbeat.stop.store(true, .release);
+        if (heartbeat_thread) |thread| thread.join();
+    }
+
     var ok = true;
     if (cfg.per_query_metric != null and cfg.per_query_only) {
         _ = try runSuite(init.io, alloc, cfg, "hbc-per-query", &recall_cases.hbc_cases, runHBCCase);
@@ -141,7 +173,17 @@ fn runSuite(
         const dataset_path = try joinConvertedDatasetPath(alloc, cfg.dataset_dir, case.dataset);
         defer alloc.free(dataset_path);
 
-        const actual = try runner(io, alloc, cfg, dataset_path, case);
+        std.debug.print(
+            "recall_harness_case_start suite={s} dataset={s} randomize={any} count={d} topk={d}\n",
+            .{ suite_name, case.dataset, case.randomize, case.count, case.top_k },
+        );
+        const actual = runner(io, alloc, cfg, dataset_path, case) catch |err| {
+            std.debug.print(
+                "recall_harness_case_error suite={s} dataset={s} path={s} randomize={any} count={d} topk={d} err={s}\n",
+                .{ suite_name, case.dataset, dataset_path, case.randomize, case.count, case.top_k, @errorName(err) },
+            );
+            return err;
+        };
         const case_ok = compareMetrics(case, actual);
         all_ok = all_ok and case_ok;
 
@@ -191,31 +233,46 @@ fn convertedDatasetName(alloc: std.mem.Allocator, gob_name: []const u8) ![]u8 {
 
 fn runQuantizerCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config, dataset_path: []const u8, case: RecallCase) !common.MetricStats {
     _ = cfg;
+    std.debug.print("recall_harness_load_start suite=quantizer dataset={s} path={s}\n", .{ case.dataset, dataset_path });
     var loaded = try common.loadVectorSet(io, alloc, dataset_path);
     defer loaded.deinit(alloc);
+    std.debug.print(
+        "recall_harness_load_done suite=quantizer dataset={s} dims={d} count={d}\n",
+        .{ case.dataset, loaded.dims, loaded.count },
+    );
 
     var working = try common.cloneSet(alloc, loaded.asSet());
     defer working.deinit(alloc);
 
     const split = try common.splitDataset(working.asSet(), case.count);
+    std.debug.print(
+        "recall_harness_split suite=quantizer dataset={s} data={d} queries={d}\n",
+        .{ case.dataset, split.data.count, split.queries.count },
+    );
     if (case.randomize) {
+        std.debug.print("recall_harness_randomize_start suite=quantizer dataset={s}\n", .{case.dataset});
         try common.applyRandomTransformInPlace(alloc, split.data, 42);
         try common.applyRandomTransformInPlace(alloc, split.queries, 42);
+        std.debug.print("recall_harness_randomize_done suite=quantizer dataset={s}\n", .{case.dataset});
     }
 
-    return .{
-        .euclidean = 100.0 * try calculateQuantizerRecallMetric(alloc, split, case.top_k, .l2_squared),
-        .inner_product = 100.0 * try calculateQuantizerRecallMetric(alloc, split, case.top_k, .inner_product),
-        .cosine = 100.0 * try calculateQuantizerRecallMetric(alloc, split, case.top_k, .cosine),
-    };
+    const euclidean = 100.0 * try calculateQuantizerRecallMetric(alloc, case.dataset, split, case.top_k, .l2_squared);
+    const inner_product = 100.0 * try calculateQuantizerRecallMetric(alloc, case.dataset, split, case.top_k, .inner_product);
+    const cosine = 100.0 * try calculateQuantizerRecallMetric(alloc, case.dataset, split, case.top_k, .cosine);
+    return .{ .euclidean = euclidean, .inner_product = inner_product, .cosine = cosine };
 }
 
 fn calculateQuantizerRecallMetric(
     alloc: std.mem.Allocator,
+    dataset_label: []const u8,
     split: common.SplitDataset,
     top_k: usize,
     metric: vec.DistanceMetric,
 ) !f64 {
+    std.debug.print(
+        "recall_harness_metric_start suite=quantizer dataset={s} metric={s} data={d} queries={d}\n",
+        .{ dataset_label, @tagName(metric), split.data.count, split.queries.count },
+    );
     var data_owned = try common.cloneSet(alloc, split.data);
     defer data_owned.deinit(alloc);
     var query_owned = try common.cloneSet(alloc, split.queries);
@@ -249,32 +306,64 @@ fn calculateQuantizerRecallMetric(
 
     var recall_sum: f64 = 0;
     for (0..queries.count) |query_idx| {
+        const query_number = query_idx + 1;
+        if (shouldLogQueryProgress(query_number, queries.count)) {
+            std.debug.print(
+                "recall_harness_query_progress suite=quantizer dataset={s} metric={s} query={d}/{d}\n",
+                .{ dataset_label, @tagName(metric), query_number, queries.count },
+            );
+        }
         const query = queries.atConst(query_idx);
-        try quantizer.estimateDistancesWithScratch(&quantized, query, estimated, error_bounds, &scratch);
+        quantizer.estimateDistancesWithScratch(&quantized, query, estimated, error_bounds, &scratch) catch |err| {
+            std.debug.print(
+                "recall_harness_query_error suite=quantizer dataset={s} metric={s} query={d}/{d} phase=estimate err={s}\n",
+                .{ dataset_label, @tagName(metric), query_number, queries.count, @errorName(err) },
+            );
+            return err;
+        };
         for (prediction, 0..) |*slot, i| slot.* = i;
         std.mem.sort(usize, prediction, commonDistanceCtx(estimated), distanceLessThan);
 
-        const truth = try common.calculateTruth(alloc, top_k, metric, query, data);
+        const truth = common.calculateTruth(alloc, top_k, metric, query, data) catch |err| {
+            std.debug.print(
+                "recall_harness_query_error suite=quantizer dataset={s} metric={s} query={d}/{d} phase=truth err={s}\n",
+                .{ dataset_label, @tagName(metric), query_number, queries.count, @errorName(err) },
+            );
+            return err;
+        };
         defer alloc.free(truth);
         recall_sum += common.calculateRecall(prediction[0..top_k], truth);
     }
+    std.debug.print(
+        "recall_harness_metric_done suite=quantizer dataset={s} metric={s} recall={d:.4}\n",
+        .{ dataset_label, @tagName(metric), recall_sum / @as(f64, @floatFromInt(queries.count)) },
+    );
     return recall_sum / @as(f64, @floatFromInt(queries.count));
 }
 
 fn runHBCCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config, dataset_path: []const u8, case: RecallCase) !common.MetricStats {
+    std.debug.print("recall_harness_load_start suite=hbc dataset={s} path={s}\n", .{ case.dataset, dataset_path });
     var loaded = try common.loadVectorSet(io, alloc, dataset_path);
     defer loaded.deinit(alloc);
+    std.debug.print(
+        "recall_harness_load_done suite=hbc dataset={s} dims={d} count={d}\n",
+        .{ case.dataset, loaded.dims, loaded.count },
+    );
 
     const loaded_set = loaded.asSet();
     const split = try common.splitDataset(loaded_set, case.count);
+    std.debug.print(
+        "recall_harness_split suite=hbc dataset={s} data={d} queries={d}\n",
+        .{ case.dataset, split.data.count, split.queries.count },
+    );
 
     if (cfg.dump_query_index) |query_index| {
         if (cfg.dump_randomize) |want_randomize| {
             if (case.randomize != want_randomize) {
                 return .{
-                    .euclidean = 100.0 * try calculateHBCRecallMetric(alloc, split, case.top_k, case.randomize, .l2_squared, cfg.bulk_build, cfg.centroid_only_routing),
-                    .inner_product = 100.0 * try calculateHBCRecallMetric(alloc, split, case.top_k, case.randomize, .inner_product, cfg.bulk_build, cfg.centroid_only_routing),
-                    .cosine = 100.0 * try calculateHBCRecallMetric(alloc, split, case.top_k, case.randomize, .cosine, cfg.bulk_build, cfg.centroid_only_routing),
+                    .euclidean = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .l2_squared, cfg.bulk_build, cfg.centroid_only_routing),
+                    .inner_product = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .inner_product, cfg.bulk_build, cfg.centroid_only_routing),
+                    .cosine = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .cosine, cfg.bulk_build, cfg.centroid_only_routing),
                 };
             }
         }
@@ -292,15 +381,15 @@ fn runHBCCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config, dataset_path: [
         }
     }
 
-    return .{
-        .euclidean = 100.0 * try calculateHBCRecallMetric(alloc, split, case.top_k, case.randomize, .l2_squared, cfg.bulk_build, cfg.centroid_only_routing),
-        .inner_product = 100.0 * try calculateHBCRecallMetric(alloc, split, case.top_k, case.randomize, .inner_product, cfg.bulk_build, cfg.centroid_only_routing),
-        .cosine = 100.0 * try calculateHBCRecallMetric(alloc, split, case.top_k, case.randomize, .cosine, cfg.bulk_build, cfg.centroid_only_routing),
-    };
+    const euclidean = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .l2_squared, cfg.bulk_build, cfg.centroid_only_routing);
+    const inner_product = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .inner_product, cfg.bulk_build, cfg.centroid_only_routing);
+    const cosine = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .cosine, cfg.bulk_build, cfg.centroid_only_routing);
+    return .{ .euclidean = euclidean, .inner_product = inner_product, .cosine = cosine };
 }
 
 fn calculateHBCRecallMetric(
     alloc: std.mem.Allocator,
+    dataset_label: []const u8,
     split: common.SplitDataset,
     top_k: usize,
     randomize: bool,
@@ -308,15 +397,42 @@ fn calculateHBCRecallMetric(
     bulk_build: bool,
     centroid_only_routing: bool,
 ) !f64 {
-    var built = try buildHBCIndex(alloc, split, randomize, metric, bulk_build, centroid_only_routing);
+    std.debug.print(
+        "recall_harness_metric_start suite=hbc dataset={s} randomize={any} metric={s} data={d} queries={d}\n",
+        .{ dataset_label, randomize, @tagName(metric), split.data.count, split.queries.count },
+    );
+    var built = buildHBCIndex(alloc, split, randomize, metric, bulk_build, centroid_only_routing) catch |err| {
+        std.debug.print(
+            "recall_harness_build_error suite=hbc dataset={s} randomize={any} metric={s} err={s}\n",
+            .{ dataset_label, randomize, @tagName(metric), @errorName(err) },
+        );
+        return err;
+    };
     defer built.deinit();
+    std.debug.print(
+        "recall_harness_build_done suite=hbc dataset={s} randomize={any} metric={s}\n",
+        .{ dataset_label, randomize, @tagName(metric) },
+    );
     const data = built.data();
     const queries = built.queries();
 
     var recall_sum: f64 = 0;
     for (0..queries.count) |query_idx| {
+        const query_number = query_idx + 1;
+        if (shouldLogQueryProgress(query_number, queries.count)) {
+            std.debug.print(
+                "recall_harness_query_progress suite=hbc dataset={s} randomize={any} metric={s} query={d}/{d}\n",
+                .{ dataset_label, randomize, @tagName(metric), query_number, queries.count },
+            );
+        }
         const query = queries.atConst(query_idx);
-        var results = try built.idx.search(query, top_k);
+        var results = built.idx.search(query, top_k) catch |err| {
+            std.debug.print(
+                "recall_harness_query_error suite=hbc dataset={s} randomize={any} metric={s} query={d}/{d} phase=search err={s}\n",
+                .{ dataset_label, randomize, @tagName(metric), query_number, queries.count, @errorName(err) },
+            );
+            return err;
+        };
         defer results.deinit();
 
         const hits = results.getHits();
@@ -326,11 +442,37 @@ fn calculateHBCRecallMetric(
             slot.* = @intCast(hits[i].vector_id - 1);
         }
 
-        const truth = try common.calculateTruth(alloc, top_k, metric, query, data);
+        const truth = common.calculateTruth(alloc, top_k, metric, query, data) catch |err| {
+            std.debug.print(
+                "recall_harness_query_error suite=hbc dataset={s} randomize={any} metric={s} query={d}/{d} phase=truth err={s}\n",
+                .{ dataset_label, randomize, @tagName(metric), query_number, queries.count, @errorName(err) },
+            );
+            return err;
+        };
         defer alloc.free(truth);
         recall_sum += common.calculateRecall(prediction, truth);
     }
+    std.debug.print(
+        "recall_harness_metric_done suite=hbc dataset={s} randomize={any} metric={s} recall={d:.4}\n",
+        .{ dataset_label, randomize, @tagName(metric), recall_sum / @as(f64, @floatFromInt(queries.count)) },
+    );
     return recall_sum / @as(f64, @floatFromInt(queries.count));
+}
+
+fn shouldLogQueryProgress(query_number: usize, total_queries: usize) bool {
+    return query_number == 1 or query_number == total_queries or query_number % 25 == 0;
+}
+
+fn sleepMs(ms: u64) void {
+    var req = std.posix.timespec{
+        .sec = @intCast(ms / std.time.ms_per_s),
+        .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
+    };
+    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => return,
+    };
 }
 
 const BuiltHBC = struct {

@@ -39,6 +39,8 @@ pub const Provider = struct {
     http: *httpx.Client,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
+    tools_json: ?[]const u8 = null,
+    tool_choice_json: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -67,6 +69,11 @@ pub const Provider = struct {
             self.allocator.free(h[1]);
         }
         self.auth_header = .{ "Authorization", try self.allocator.dupe(u8, auth_header) };
+    }
+
+    pub fn setToolOptions(self: *Provider, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) void {
+        self.tools_json = tools_json;
+        self.tool_choice_json = tool_choice_json;
     }
 
     fn authHeaders(self: *const Provider) ?[]const [2][]const u8 {
@@ -170,6 +177,11 @@ pub const Provider = struct {
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
         var values = std.json.Array.init(alloc);
         defer values.deinit();
+        var encoded_buffers = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (encoded_buffers.items) |buf| alloc.free(buf);
+            encoded_buffers.deinit(alloc);
+        }
 
         for (parts) |part| {
             switch (part) {
@@ -194,11 +206,16 @@ pub const Provider = struct {
                 .binary => |binary_part| {
                     const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
                     const encoded = try alloc.alloc(u8, encoded_len);
-                    defer alloc.free(encoded);
+                    errdefer alloc.free(encoded);
                     _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
+                    try encoded_buffers.append(alloc, encoded);
 
                     var obj = std.json.ObjectMap.empty;
-                    errdefer obj.deinit(alloc);
+                    errdefer {
+                        obj.deinit(alloc);
+                        _ = encoded_buffers.pop();
+                        alloc.free(encoded);
+                    }
                     try obj.put(alloc, "type", .{ .string = "media" });
                     try obj.put(alloc, "data", .{ .string = encoded });
                     try obj.put(alloc, "mime_type", .{ .string = binary_part.mime_type });
@@ -278,13 +295,23 @@ pub const Provider = struct {
             choices: []const struct {
                 message: struct {
                     content: ?[]const u8 = null,
+                    tool_calls: ?[]const struct {
+                        id: ?[]const u8 = null,
+                        function: struct {
+                            name: []const u8,
+                            arguments: []const u8,
+                        },
+                    } = null,
                 },
             },
         };
 
         const url = try std.fmt.allocPrint(self.allocator, "{s}/generate", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try inference.chatRequestJsonAlloc(self.allocator, model, messages, .termite_native);
+        const json_body = try inference.chatRequestJsonWithOptionsAlloc(self.allocator, model, messages, .termite_native, .{
+            .tools_json = self.tools_json,
+            .tool_choice_json = self.tool_choice_json,
+        });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
             .json = json_body,
@@ -298,12 +325,38 @@ pub const Provider = struct {
         defer parsed.deinit();
         const choices = parsed.value.choices;
         if (choices.len == 0) return error.EmptyResponse;
-        const content = choices[0].message.content orelse return error.EmptyResponse;
+        var tool_calls = try cloneOpenAIToolCalls(alloc, choices[0].message.tool_calls);
+        errdefer freeToolCalls(alloc, tool_calls);
+        const content = choices[0].message.content orelse "";
+        if (tool_calls.len == 0 and content.len > 0) {
+            tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, content, self.tools_json, self.tool_choice_json);
+        }
+        if (content.len == 0 and tool_calls.len == 0) return error.EmptyResponse;
 
         return .{
             .content = try alloc.dupe(u8, content),
+            .tool_calls = tool_calls,
             .allocator = alloc,
         };
+    }
+
+    fn cloneOpenAIToolCalls(alloc: std.mem.Allocator, maybe_calls: anytype) ![]inference.ToolCall {
+        const calls = maybe_calls orelse return &.{};
+        const out = try alloc.alloc(inference.ToolCall, calls.len);
+        errdefer alloc.free(out);
+        for (calls, 0..) |call, i| {
+            out[i] = .{
+                .id = try alloc.dupe(u8, call.id orelse ""),
+                .name = try alloc.dupe(u8, call.function.name),
+                .arguments = try alloc.dupe(u8, call.function.arguments),
+            };
+        }
+        return out;
+    }
+
+    fn freeToolCalls(alloc: std.mem.Allocator, calls: []inference.ToolCall) void {
+        for (calls) |*call| call.deinit(alloc);
+        if (calls.len > 0) alloc.free(calls);
     }
 
     fn rerankImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, query: []const u8, documents: []const []const u8) anyerror!inference.RerankResult {
@@ -390,6 +443,68 @@ test "antfly embed request omits nullable generated fields" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"encoding_format\":\"float\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"dimensions\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "null") == null);
+}
+
+test "antfly embed parts preserves binary base64 until request serialization" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Assert = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqual(httpx.Method.POST, req.method);
+            try std.testing.expectEqualStrings("/embed", req.path);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"media\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"data\":\"AQID\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"mime_type\":\"image/png\"") != null);
+        }
+    };
+
+    var ts = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/embed", .assert_request = Assert.request, .respond = .{
+            .body = "{\"data\":[{\"embedding\":[0.25,0.5,0.75]}]}",
+            .content_type = "application/json",
+        } },
+    });
+    defer ts.deinit();
+
+    var group = std.Io.Group.init;
+    var result_ok: bool = false;
+    var result_dim: usize = 0;
+    var result_err: anyerror = error.None;
+
+    const Fiber = struct {
+        fn run(a: std.mem.Allocator, test_io: std.Io, base: []const u8, ok_out: *bool, dim_out: *usize, err_out: *anyerror) std.Io.Cancelable!void {
+            var client = httpx.Client.initWithConfig(a, test_io, .{ .keep_alive = false });
+            defer client.deinit();
+
+            var provider = Provider.init(a, &client, base);
+            defer provider.deinit();
+
+            var result = provider.embedParts(a, "clipclap", &.{
+                .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{ 1, 2, 3 } } },
+            }) catch |e| {
+                err_out.* = e;
+                return;
+            };
+            defer result.deinit();
+
+            ok_out.* = true;
+            dim_out.* = result.dimension;
+        }
+    };
+
+    group.concurrent(io, Fiber.run, .{ alloc, io, ts.baseUrl(), &result_ok, &result_dim, &result_err }) catch return;
+
+    try ts.handleOne();
+    group.await(io) catch {};
+
+    if (!result_ok) {
+        std.debug.print("embed parts fiber error: {}\n", .{result_err});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(usize, 3), result_dim);
 }
 
 test "antfly generate round trip" {

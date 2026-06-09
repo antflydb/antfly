@@ -14,11 +14,12 @@
 
 const std = @import("std");
 const raft_engine = @import("raft_engine");
+const common_http = @import("../../common/http/mod.zig");
 const common = @import("http_common.zig");
 const routes = @import("routes.zig");
 
 pub const HttpServerConfig = struct {
-    max_request_bytes: usize = 1 << 20,
+    max_request_bytes: usize = common_http.default_max_request_bytes,
 };
 
 pub const BatchHandler = struct {

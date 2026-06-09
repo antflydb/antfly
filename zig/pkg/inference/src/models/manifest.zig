@@ -332,6 +332,9 @@ pub const ModelManifest = struct {
 
 /// ONNX file candidates in priority order.
 const onnx_candidates = [_][]const u8{
+    "text_model.onnx",
+    "text_model_f16.onnx",
+    "text_model_i8.onnx",
     "model.onnx",
     "model_f16.onnx",
     "model_i8.onnx",
@@ -343,9 +346,6 @@ const onnx_candidates = [_][]const u8{
     "decoder_model_merged_quantized.onnx",
     "decoder_model_merged_q4.onnx",
     "decoder_model_merged_q4f16.onnx",
-    "text_model.onnx",
-    "text_model_f16.onnx",
-    "text_model_i8.onnx",
     "encoder.onnx",
 };
 
@@ -427,10 +427,7 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
         parseInferenceBundleJson(&manifest, allocator, model_dir_path, bundle_bytes) catch {};
     } else |_| {}
     if (shouldParseClipclapGgufVariant(allocator, model_dir_path)) {
-        if (c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_variants.json")) |variants_bytes| {
-            defer allocator.free(variants_bytes);
-            parseInferenceVariantsJson(&manifest, allocator, model_dir_path, variants_bytes) catch {};
-        } else |_| {}
+        parseInferenceVariantsFile(&manifest, allocator, model_dir_path) catch {};
     }
 
     // Try to parse gliner_config.json (for GLiNER NER models)
@@ -551,10 +548,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         defer allocator.free(bundle_bytes);
         parseInferenceBundleJson(&manifest, allocator, model_dir_path, bundle_bytes) catch {};
     } else |_| {}
-    if (c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_variants.json")) |variants_bytes| {
-        defer allocator.free(variants_bytes);
-        parseInferenceVariantsJson(&manifest, allocator, model_dir_path, variants_bytes) catch {};
-    } else |_| {}
+    parseInferenceVariantsFile(&manifest, allocator, model_dir_path) catch {};
 
     if (c_file.readFileFromDir(allocator, model_dir_path, "gliner_config.json")) |gliner_bytes| {
         defer allocator.free(gliner_bytes);
@@ -634,6 +628,11 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         }
     }
 
+    if (hasRerankPathHint(model_dir_path) and (manifest.model_type == .embedder or manifest.model_type == .classifier)) {
+        manifest.model_type = .reranker;
+        return;
+    }
+
     if (inferModelTypeFromTasks(manifest.tasks)) |task_model_type| {
         manifest.model_type = task_model_type;
         return;
@@ -666,10 +665,10 @@ fn inferModelTypeFromTasks(tasks: []const []const u8) ?ModelType {
         if (std.mem.eql(u8, task, "recognize") or std.mem.eql(u8, task, "extract")) return .recognizer;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "classify")) return .classifier;
+        if (std.mem.eql(u8, task, "rerank")) return .reranker;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "rerank")) return .reranker;
+        if (std.mem.eql(u8, task, "classify")) return .classifier;
     }
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "read")) return .reader;
@@ -714,6 +713,14 @@ fn hasGlinerPathHint(model_dir_path: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, model_dir_path, "/\\");
     while (it.next()) |component| {
         if (containsAsciiIgnoreCase(component, "gliner")) return true;
+    }
+    return false;
+}
+
+fn hasRerankPathHint(model_dir_path: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, model_dir_path, "/\\");
+    while (it.next()) |component| {
+        if (containsAsciiIgnoreCase(component, "rerank")) return true;
     }
     return false;
 }
@@ -933,7 +940,9 @@ fn isGgufProjectorFileName(name: []const u8) bool {
 }
 
 fn isGlinerHeadGgufFileName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "gliner_head.gguf");
+    return std.mem.eql(u8, name, "gliner_head.gguf") or
+        std.mem.eql(u8, name, "gliner2-head.gguf") or
+        (std.mem.startsWith(u8, name, "gliner2-head.") and std.mem.endsWith(u8, name, ".gguf"));
 }
 
 fn findFirstGgufInDir(allocator: std.mem.Allocator, base_dir: []const u8, want_projector: bool) !?[]const u8 {
@@ -1386,6 +1395,25 @@ fn parseInferenceBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocat
         }
     }
     if (family) |bundle_family| {
+        if (std.mem.eql(u8, bundle_family, "gliner2_split_bundle/v1")) {
+            if (obj.get("encoder")) |encoder| {
+                if (encoder == .string and encoder.string.len > 0) {
+                    setOptionalPath(allocator, &manifest.gguf_path, try resolveBundlePath(allocator, model_dir_path, encoder.string));
+                }
+            }
+            if (obj.get("head")) |head| {
+                if (head == .string and head.string.len > 0) {
+                    const head_path = try resolveBundlePath(allocator, model_dir_path, head.string);
+                    if (std.mem.endsWith(u8, head.string, ".gguf")) {
+                        setOptionalPath(allocator, &manifest.gliner_head_gguf_path, head_path);
+                    } else {
+                        setOptionalPath(allocator, &manifest.gliner_head_safetensors_path, head_path);
+                    }
+                }
+            }
+            manifest.model_type = .recognizer;
+            try setManifestInputs(allocator, manifest, &.{"text"});
+        }
         if (std.mem.eql(u8, bundle_family, "clipclap_gguf_bundle/v1")) {
             if (obj.get("clip")) |clip| {
                 if (clip == .string and clip.string.len > 0) {
@@ -1438,7 +1466,11 @@ fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Alloc
 
     const obj = parsed.value.object;
     const variants_family = obj.get("family") orelse return;
-    if (variants_family != .string or !std.mem.eql(u8, variants_family.string, "clipclap_variants/v1")) return;
+    if (variants_family != .string) return;
+    if (std.mem.eql(u8, variants_family.string, "gliner2_variants/v1")) {
+        return parseGliner2InferenceVariantsJson(manifest, allocator, model_dir_path, obj);
+    }
+    if (!std.mem.eql(u8, variants_family.string, "clipclap_variants/v1")) return;
     const variants = obj.get("variants") orelse return;
     if (variants != .array) return;
 
@@ -1482,6 +1514,61 @@ fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Alloc
     try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
 }
 
+fn parseInferenceVariantsFile(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8) !void {
+    const variants_bytes = try c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_variants.json");
+    defer allocator.free(variants_bytes);
+    try parseInferenceVariantsJson(manifest, allocator, model_dir_path, variants_bytes);
+}
+
+fn parseGliner2InferenceVariantsJson(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+    obj: std.json.ObjectMap,
+) !void {
+    const variants = obj.get("variants") orelse return;
+    if (variants != .array) return;
+
+    var selected: ?ResolvedGliner2GgufPair = null;
+    errdefer if (selected) |*pair| pair.deinit(allocator);
+    for (variants.array.items) |variant| {
+        if (!isGliner2GgufVariant(variant)) continue;
+        var pair = (try resolveExistingGliner2GgufVariant(allocator, model_dir_path, variant)) orelse continue;
+        if (variant.object.get("format")) |format| {
+            if (format == .string and std.mem.eql(u8, format.string, "Q4_K")) {
+                if (selected) |*old| old.deinit(allocator);
+                selected = pair;
+                break;
+            }
+        }
+        if (selected == null) {
+            selected = pair;
+        } else {
+            pair.deinit(allocator);
+        }
+    }
+
+    var pair = selected orelse return;
+    selected = null;
+    errdefer pair.deinit(allocator);
+
+    const family = try allocator.dupe(u8, "gliner2_split_bundle/v1");
+    errdefer allocator.free(family);
+    const wrapper = try allocator.dupe(u8, "gliner2");
+    errdefer allocator.free(wrapper);
+
+    if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
+    manifest.inference_bundle_family = family;
+    if (manifest.gliner_model_type.len > 0) allocator.free(manifest.gliner_model_type);
+    manifest.gliner_model_type = wrapper;
+    setOptionalPath(allocator, &manifest.gguf_path, pair.encoder_path);
+    pair.encoder_path = "";
+    setOptionalPath(allocator, &manifest.gliner_head_gguf_path, pair.head_path);
+    pair.head_path = "";
+    manifest.model_type = .recognizer;
+    try setManifestInputs(allocator, manifest, &.{"text"});
+}
+
 fn setManifestInputs(allocator: std.mem.Allocator, manifest: *ModelManifest, inputs: []const []const u8) !void {
     if (manifest.inputs.len > 0) {
         for (manifest.inputs) |input| allocator.free(input);
@@ -1514,6 +1601,17 @@ const ResolvedClipclapGgufPair = struct {
     }
 };
 
+const ResolvedGliner2GgufPair = struct {
+    encoder_path: []const u8,
+    head_path: []const u8,
+
+    fn deinit(self: *ResolvedGliner2GgufPair, allocator: std.mem.Allocator) void {
+        if (self.encoder_path.len > 0) allocator.free(self.encoder_path);
+        if (self.head_path.len > 0) allocator.free(self.head_path);
+        self.* = .{ .encoder_path = "", .head_path = "" };
+    }
+};
+
 fn resolveExistingClipclapGgufVariant(
     allocator: std.mem.Allocator,
     model_dir_path: []const u8,
@@ -1536,6 +1634,28 @@ fn resolveExistingClipclapGgufVariant(
     return .{ .clip_path = clip_path, .clap_path = clap_path };
 }
 
+fn resolveExistingGliner2GgufVariant(
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+    variant: std.json.Value,
+) !?ResolvedGliner2GgufPair {
+    const encoder = variant.object.get("encoder") orelse return null;
+    const head = variant.object.get("head") orelse return null;
+    if (encoder != .string or encoder.string.len == 0) return null;
+    if (head != .string or head.string.len == 0) return null;
+
+    const encoder_path = try resolveBundlePath(allocator, model_dir_path, encoder.string);
+    errdefer allocator.free(encoder_path);
+    const head_path = try resolveBundlePath(allocator, model_dir_path, head.string);
+    errdefer allocator.free(head_path);
+    if (!c_file.fileExists(allocator, encoder_path) or !c_file.fileExists(allocator, head_path)) {
+        allocator.free(encoder_path);
+        allocator.free(head_path);
+        return null;
+    }
+    return .{ .encoder_path = encoder_path, .head_path = head_path };
+}
+
 fn isClipclapGgufVariant(variant: std.json.Value) bool {
     if (variant != .object) return false;
     const target = variant.object.get("target") orelse return false;
@@ -1543,6 +1663,15 @@ fn isClipclapGgufVariant(variant: std.json.Value) bool {
     const clip = variant.object.get("clip") orelse return false;
     const clap = variant.object.get("clap") orelse return false;
     return clip == .string and clip.string.len > 0 and clap == .string and clap.string.len > 0;
+}
+
+fn isGliner2GgufVariant(variant: std.json.Value) bool {
+    if (variant != .object) return false;
+    const target = variant.object.get("target") orelse return false;
+    if (target != .string or !std.mem.eql(u8, target.string, "gguf")) return false;
+    const encoder = variant.object.get("encoder") orelse return false;
+    const head = variant.object.get("head") orelse return false;
+    return encoder == .string and encoder.string.len > 0 and head == .string and head.string.len > 0;
 }
 
 fn resolveBundlePath(allocator: std.mem.Allocator, model_dir_path: []const u8, path: []const u8) ![]const u8 {
@@ -1620,6 +1749,15 @@ fn parseTokenizerJsonSpecialTokens(manifest: *ModelManifest, allocator: std.mem.
 
 test "inferModelTypeFromPath detects classifier directory" {
     try std.testing.expectEqual(@as(?ModelType, .classifier), inferModelTypeFromPath("/tmp/models/classifiers/cross-encoder/nli-distilroberta-base"));
+}
+
+test "rerank model name overrides sequence classifier config" {
+    var manifest = ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .classifier,
+    };
+    applyImplicitModelTypeHints(&manifest, "/tmp/models/mixedbread-ai/mxbai-rerank-base-v1");
+    try std.testing.expectEqual(ModelType.reranker, manifest.model_type);
 }
 
 test "inferModelTypeFromPath detects recognizer directory" {
@@ -2012,6 +2150,33 @@ test "manifest discovers clip onnx variants and prefers f16 over i8" {
     try std.testing.expect(std.mem.endsWith(u8, manifest.visual_projection_path.?, "/visual_projection.onnx"));
 }
 
+test "manifest prefers split clip text model over combined model" {
+    const allocator = std.testing.allocator;
+    const model_dir = try testScratchDir(allocator, "manifest-clip-text-model-before-combined");
+    defer {
+        compat.cwd().deleteTree(compat.io(), model_dir) catch {};
+        allocator.free(model_dir);
+    }
+
+    const files = [_][]const u8{
+        "model.onnx",
+        "text_model.onnx",
+        "vision_model.onnx",
+    };
+    for (files) |file_name| {
+        const path = try std.fs.path.join(allocator, &.{ model_dir, file_name });
+        defer allocator.free(path);
+        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+    }
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+    try std.testing.expect(manifest.onnx_path != null);
+    try std.testing.expect(manifest.visual_model_path != null);
+    try std.testing.expect(std.mem.endsWith(u8, manifest.onnx_path.?, "/text_model.onnx"));
+    try std.testing.expect(std.mem.endsWith(u8, manifest.visual_model_path.?, "/vision_model.onnx"));
+}
+
 test "manifest discovers clip i8 onnx fallback variants" {
     const allocator = std.testing.allocator;
     const model_dir = try testScratchDir(allocator, "manifest-clip-onnx-i8-fallback");
@@ -2078,6 +2243,64 @@ test "manifest parses clipclap variants gguf pair" {
     try std.testing.expect(manifest.hasInput("text"));
     try std.testing.expect(manifest.hasInput("image"));
     try std.testing.expect(manifest.hasInput("audio"));
+}
+
+test "manifest loads canonical antfly clipclap variants before first gguf fallback" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-clipclap-canonical-variants");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const clip_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clip.Q4_K.gguf" });
+    defer allocator.free(clip_path);
+    const clap_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clap.Q4_K.gguf" });
+    defer allocator.free(clap_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clip_path, .data = "GGUFstub" });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clap_path, .data = "GGUFstub" });
+
+    const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
+    defer allocator.free(model_manifest_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = model_manifest_path,
+        .data = "{\"type\":\"embedder\",\"tasks\":[\"embed\"],\"inputs\":[\"text\",\"image\",\"audio\"]}",
+    });
+
+    const clip_config_path = try std.fs.path.join(allocator, &.{ dir_path, "clip_config.json" });
+    defer allocator.free(clip_config_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = clip_config_path,
+        .data = "{\"model_type\":\"clipclap\",\"text_config\":{\"max_position_embeddings\":77}}",
+    });
+
+    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
+    defer allocator.free(variants_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = variants_path,
+        .data =
+        \\{
+        \\  "family": "clipclap_variants/v1",
+        \\  "variants": [
+        \\    {
+        \\      "id": "gguf-Q4_K",
+        \\      "target": "gguf",
+        \\      "format": "Q4_K",
+        \\      "clip": "clipclap-clip.Q4_K.gguf",
+        \\      "clap": "clipclap-clap.Q4_K.gguf"
+        \\    }
+        \\  ]
+        \\}
+        ,
+    });
+
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expect(manifest.isClipclapGgufBundle());
+    try std.testing.expectEqual(NativeArchHint.clip, manifest.native_arch_hint);
+    try std.testing.expectEqualStrings("clipclap", manifest.config_model_arch);
+    try std.testing.expectEqualStrings(clip_path, manifest.gguf_path.?);
+    try std.testing.expectEqualStrings(clap_path, manifest.audio_model_path.?);
 }
 
 test "manifest ignores stale clipclap variants with missing gguf files" {
@@ -2153,6 +2376,46 @@ test "manifest falls back to first existing clipclap variant when preferred pair
     try std.testing.expect(manifest.isClipclapGgufBundle());
     try std.testing.expectEqualStrings(clip_path, manifest.gguf_path.?);
     try std.testing.expectEqualStrings(clap_path, manifest.audio_model_path.?);
+}
+
+test "manifest parses gliner2 variants gguf pair" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-gliner2-variants-gguf");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const encoder_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner2-encoder.Q4_K.gguf" });
+    defer allocator.free(encoder_path);
+    const head_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner2-head.Q4_K.gguf" });
+    defer allocator.free(head_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = encoder_path, .data = "GGUFstub" });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = head_path, .data = "GGUFstub" });
+
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseInferenceVariantsJson(&manifest, allocator, dir_path,
+        \\{
+        \\  "family": "gliner2_variants/v1",
+        \\  "variants": [
+        \\    {
+        \\      "id": "gguf-Q4_K",
+        \\      "target": "gguf",
+        \\      "format": "Q4_K",
+        \\      "encoder": "gliner2-encoder.Q4_K.gguf",
+        \\      "head": "gliner2-head.Q4_K.gguf"
+        \\    }
+        \\  ]
+        \\}
+    );
+
+    try std.testing.expect(manifest.isSplitGlinerBundle());
+    try std.testing.expectEqualStrings("gliner2_split_bundle/v1", manifest.inference_bundle_family);
+    try std.testing.expectEqualStrings("gliner2", manifest.gliner_model_type);
+    try std.testing.expectEqualStrings(encoder_path, manifest.gguf_path.?);
+    try std.testing.expectEqualStrings(head_path, manifest.gliner_head_gguf_path.?);
+    try std.testing.expect(manifest.hasInput("text"));
 }
 
 test "manifest uses clipclap variants when default ONNX bundle is partial" {
@@ -2351,6 +2614,34 @@ test "listing manifest detects gguf assets without gguf metadata parse" {
     try std.testing.expectEqual(ModelType.generator, manifest.model_type);
     try std.testing.expect(manifest.hasTask("generate"));
     try std.testing.expect(manifest.hasInput("image"));
+    try std.testing.expect(manifest.gguf_path != null);
+    try std.testing.expect(manifest.gguf_projector_path != null);
+}
+
+test "manifest treats gemma4 unified config as generator" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{"model_type":"gemma4_unified","text_config":{"model_type":"gemma4_unified_text"}}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "gemma-4-12B-it-Q4_K_M.gguf", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mmproj-gemma-4-12B-it-bf16.gguf", .data = "" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try std.testing.expectEqualStrings("gemma4_unified", manifest.config_model_arch);
     try std.testing.expect(manifest.gguf_path != null);
     try std.testing.expect(manifest.gguf_projector_path != null);
 }

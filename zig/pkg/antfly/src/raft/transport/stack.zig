@@ -30,16 +30,35 @@ pub const HttpTransportStack = struct {
     driver: *http_driver.HttpFrameDriver,
     transport_host: raft_engine.runtime.CodecTransportHost,
     snapshot_transport: http_snapshot.HttpSnapshotTransport,
+    owned_io_impl: ?*std.Io.Threaded = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
         cfg: HttpTransportStackConfig,
         executor: http_common.RequestExecutor,
+        io: ?std.Io,
         snapshot_resolver: ?http_snapshot.SnapshotTargetResolver,
     ) !HttpTransportStack {
+        var owned_io_impl: ?*std.Io.Threaded = null;
+        errdefer if (owned_io_impl) |io_impl| {
+            io_impl.deinit();
+            alloc.destroy(io_impl);
+        };
+        const driver_io = io orelse blk: {
+            const io_impl = try alloc.create(std.Io.Threaded);
+            errdefer alloc.destroy(io_impl);
+            io_impl.* = std.Io.Threaded.init(alloc, .{});
+            owned_io_impl = io_impl;
+            break :blk io_impl.io();
+        };
+
         const driver = try alloc.create(http_driver.HttpFrameDriver);
         errdefer alloc.destroy(driver);
-        driver.* = http_driver.HttpFrameDriver.init(alloc, cfg.driver, executor);
+        if (io != null) {
+            try driver.initAsyncInPlace(alloc, cfg.driver, executor, driver_io);
+        } else {
+            driver.* = http_driver.HttpFrameDriver.init(alloc, cfg.driver, executor, driver_io);
+        }
         return .{
             .alloc = alloc,
             .driver = driver,
@@ -55,12 +74,18 @@ pub const HttpTransportStack = struct {
                 executor,
                 snapshot_resolver,
             ),
+            .owned_io_impl = owned_io_impl,
         };
     }
 
     pub fn deinit(self: *HttpTransportStack) void {
         self.transport_host.deinit();
+        self.driver.deinit();
         self.alloc.destroy(self.driver);
+        if (self.owned_io_impl) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+        }
         self.* = undefined;
     }
 
@@ -69,6 +94,10 @@ pub const HttpTransportStack = struct {
             .transport = self.transport_host.transport(),
             .snapshot_transport = self.snapshot_transport.transport(),
         };
+    }
+
+    pub fn asyncSendMetricsSnapshot(self: *HttpTransportStack) http_driver.AsyncSendMetricsSnapshot {
+        return self.driver.metricsSnapshot();
     }
 
     pub fn makeServer(
@@ -110,7 +139,7 @@ test "http transport stack compiles" {
     var executor = Executor{};
     var stack = try HttpTransportStack.init(std.testing.allocator, .{
         .snapshot = .{ .root_dir = "/tmp" },
-    }, executor.iface(), null);
+    }, executor.iface(), null, null);
     defer stack.deinit();
 
     const hooks = stack.runtimeHooks();

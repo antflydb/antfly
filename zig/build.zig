@@ -164,6 +164,7 @@ const DelegatedPackageStep = struct {
 
 const DelegatedInferenceBuildSteps = struct {
     inference_test: *std.Build.Step,
+    inference_finetune_test: *std.Build.Step,
 };
 
 fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) void {
@@ -254,6 +255,7 @@ fn addDelegatedInferenceBuildSteps(
     blas_root: ?[]const u8,
 ) DelegatedInferenceBuildSteps {
     var test_step: ?*std.Build.Step = null;
+    var finetune_test_step: ?*std.Build.Step = null;
     for (inference_delegated_steps) |step_name| {
         const delegated = addDelegatedPackageStep(b, "inference", "pkg/inference", step_name, "pkg/inference");
         const run = delegated.run;
@@ -261,10 +263,13 @@ fn addDelegatedInferenceBuildSteps(
         forwardBuildArgs(run);
         if (std.mem.eql(u8, step_name, "test")) {
             test_step = delegated.step;
+        } else if (std.mem.eql(u8, step_name, "test-finetune")) {
+            finetune_test_step = delegated.step;
         }
     }
     return .{
         .inference_test = test_step.?,
+        .inference_finetune_test = finetune_test_step.?,
     };
 }
 
@@ -3353,6 +3358,7 @@ pub fn build(b: *std.Build) void {
             "api table reads reject stale doc identity before multigroup fanout",
             "distributed table reads reject stale doc identity before multigroup fanout",
             "api public table query rejects only top-level internal fields",
+            "single embeddings index encoder scopes isolated enrichment failure to one index",
             "api query contract rejects doc identity control fields when with relaxes schema",
             "api query contract public parser rejects internal shard doc identity controls",
             "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
@@ -3542,6 +3548,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache reserves retirement slots when pruning multiple leased generations",
+            "primary lookup adopts seeded write cache across visible generation bump",
             "provisioned table write source coalesces same-group waiters",
             "provisioned table write coalescer isolates failed waiters",
         },
@@ -3554,6 +3561,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
+            "parseRemoteSearchResult preserves fused index scores",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4042,6 +4050,8 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
+    unit_test_step.dependOn(delegated_inference_steps.inference_test);
+    unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_swarm_runtime_test_step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
@@ -5985,6 +5995,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_recall_harness = b.addRunArtifact(recall_harness);
+    run_recall_harness.stdio = .inherit;
     run_recall_harness.addPassthruArgs();
     const recall_harness_step = b.step("recall-harness", "Run Zig recall suites against exported vector datasets");
     recall_harness_step.dependOn(&run_recall_harness.step);
@@ -6002,6 +6013,7 @@ pub fn build(b: *std.Build) void {
         mod.addImport("raft_engine", raft_engine_mod);
         mod.addImport("structlog", structlog_mod);
         mod.addImport("antfly_platform", platform_mod);
+        mod.addImport("handlebars", handlebars_mod);
         mod.addOptions("build_options", build_options);
         break :blk mod;
     } else blk: {
@@ -6056,6 +6068,7 @@ pub fn build(b: *std.Build) void {
     antfly_step.dependOn(&run_antfly.step);
 
     const run_recall_harness_default = b.addRunArtifact(recall_harness);
+    run_recall_harness_default.stdio = .inherit;
     run_recall_harness_default.addArgs(&.{
         "--dataset-dir",
         "testdata/vectorsets",

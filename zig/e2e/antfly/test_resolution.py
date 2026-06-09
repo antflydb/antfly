@@ -46,6 +46,7 @@ from conftest import (
 from test_scaling import MultiNodeScalingCluster
 
 AUTOGRAPH_E2E_TIMEOUT_S = 115.0
+AUTOGRAPH_CLUSTER_STARTUP_TIMEOUT_S = 115.0
 AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S = 5.0
 POLL_INTERVAL_S = 0.5
 POLL_REQUEST_TIMEOUT_S = 5.0
@@ -99,14 +100,14 @@ def resolution_cluster():
         pytest.skip(f"Antfly binary not found: {binary} (set ANTFLY_BIN)")
     if Path(binary).name != "antfly":
         pytest.skip("distributed autograph e2e requires the antfly binary")
-    deadline = _Deadline(AUTOGRAPH_E2E_TIMEOUT_S)
+    startup_deadline = _Deadline(AUTOGRAPH_CLUSTER_STARTUP_TIMEOUT_S)
     cluster = MultiNodeScalingCluster(
         binary,
         initial_data_node_count=3,
-        startup_deadline_at=deadline.expires_at,
+        startup_deadline_at=startup_deadline.expires_at,
     )
     try:
-        yield cluster, deadline
+        yield cluster
     finally:
         cluster.stop(timeout_s=AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S)
 
@@ -173,11 +174,59 @@ class _Api:
     def query_table(self, table: str, payload: dict, *, timeout: float = 30.0) -> dict:
         return self._check(self.s.post(f"{self.url}/tables/{table}/query", json=payload, timeout=timeout))
 
+    def diagnostic(self, *, graph_payload: dict | None = None) -> str:
+        parts: list[str] = []
+        for label, path in (
+            ("documents table", "/tables/documents"),
+            ("relations graph index", "/tables/documents/indexes/relations_graph"),
+            ("entities table", "/tables/entities"),
+        ):
+            try:
+                response = self.s.get(f"{self.url}{path}", timeout=5)
+                parts.append(f"[{label}] {response.status_code} {response.text[:4000]}")
+            except requests.RequestException as exc:
+                parts.append(f"[{label}] unavailable: {exc!r}")
+        if graph_payload is not None:
+            parts.append(self._graph_probe_diagnostic(graph_payload))
+        parts.append(f"[metadata snapshot]\n{self._server.metadata_snapshot_diagnostic()}")
+        parts.append(f"[logs]\n{self._server.debug_logs()}")
+        return "\n".join(parts)
+
+    def _graph_probe_diagnostic(self, payload: dict) -> str:
+        parts: list[str] = ["[graph query probes]"]
+        for index, base_url in enumerate(self._server.data_api_urls):
+            url = base_url.rstrip("/")
+            try:
+                status = self.s.get(
+                    f"{url}/tables/documents/indexes/relations_graph",
+                    timeout=5,
+                )
+                parts.append(
+                    f"[data {index} graph index] {status.status_code} {status.text[:3000]}"
+                )
+            except requests.RequestException as exc:
+                parts.append(f"[data {index} graph index] unavailable: {exc!r}")
+
+            try:
+                query = self.s.post(
+                    f"{url}/tables/documents/query",
+                    json=payload,
+                    timeout=5,
+                )
+                parts.append(f"[data {index} graph query] {query.status_code} {query.text[:3000]}")
+            except requests.RequestException as exc:
+                parts.append(f"[data {index} graph query] unavailable: {exc!r}")
+        return "\n".join(parts)
+
 
 class _Deadline:
     def __init__(self, timeout_s: float):
         self.timeout_s = timeout_s
+        self.started_at = time.monotonic()
         self.expires_at = time.monotonic() + timeout_s
+
+    def elapsed(self) -> float:
+        return max(0.0, time.monotonic() - self.started_at)
 
     def remaining(self) -> float:
         return max(0.0, self.expires_at - time.monotonic())
@@ -222,7 +271,8 @@ def _wait_for_entities(api: _Api, expected_names: dict[str, str], *, deadline: _
 
     raise AssertionError(
         f"entities were not promoted within {deadline.timeout_s}s "
-        f"(pending={sorted(pending)!r}, last={last!r}, last_error={last_error!r})"
+        f"(elapsed={deadline.elapsed():.1f}s, pending={sorted(pending)!r}, "
+        f"last={last!r}, last_error={last_error!r})\n{api.diagnostic()}"
     )
 
 
@@ -310,12 +360,15 @@ def _wait_for_mention_hydration(
         deadline.sleep()
     raise AssertionError(
         f"mention graph did not hydrate promoted entities within {deadline.timeout_s}s "
-        f"(start_node={start_node!r}, expected={expected_names!r}, last={last!r}, last_error={last_error!r})"
+        f"(elapsed={deadline.elapsed():.1f}s, start_node={start_node!r}, "
+        f"expected={expected_names!r}, last={last!r}, last_error={last_error!r})\n"
+        f"{api.diagnostic(graph_payload=payload)}"
     )
 
 
 def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_cluster):
-    cluster, deadline = resolution_cluster
+    cluster = resolution_cluster
+    deadline = _Deadline(AUTOGRAPH_E2E_TIMEOUT_S)
     api = _Api(cluster.data_api_urls[0], cluster)
 
     # Entities live in their own table (own shard group); documents are spread

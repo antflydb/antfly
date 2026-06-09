@@ -524,7 +524,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (!has_vlm_wrapper) {
         if (obj.get("model_type")) |v| {
             if (v == .string and obj.get("text_config") != null) {
-                if (std.mem.eql(u8, v.string, "gemma4") or std.mem.eql(u8, v.string, "qwen3_5")) {
+                if (isGemma4ModelType(v.string) or std.mem.eql(u8, v.string, "qwen3_5")) {
                     config.weight_prefix = "model.language_model";
                 }
             }
@@ -829,10 +829,16 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (model_obj.get("boi_token_index")) |v| if (jsonI32(v)) |val| {
         config.boi_token_index = val;
     };
+    if (model_obj.get("boi_token_id")) |v| if (jsonI32(v)) |val| {
+        config.boi_token_index = val;
+    };
     if (model_obj.get("vision_start_token_id")) |v| if (jsonI32(v)) |val| {
         config.boi_token_index = val;
     };
     if (model_obj.get("eoi_token_index")) |v| if (jsonI32(v)) |val| {
+        config.eoi_token_index = val;
+    };
+    if (model_obj.get("eoi_token_id")) |v| if (jsonI32(v)) |val| {
         config.eoi_token_index = val;
     };
     if (model_obj.get("vision_end_token_id")) |v| if (jsonI32(v)) |val| {
@@ -1245,7 +1251,10 @@ fn detectFamily(model_type: []const u8) ModelFamily {
         .{ "gemma3_text", ModelFamily.gemma },
         .{ "gemma4", ModelFamily.gemma },
         .{ "gemma4_text", ModelFamily.gemma },
+        .{ "gemma4_unified", ModelFamily.gemma },
+        .{ "gemma4_unified_text", ModelFamily.gemma },
         .{ "gemma4_assistant", ModelFamily.gemma },
+        .{ "gemma4_unified_assistant", ModelFamily.gemma },
         .{ "bitnet", ModelFamily.bitnet },
         .{ "bitnet-b1.58", ModelFamily.bitnet },
         .{ "falcon", ModelFamily.falcon },
@@ -1261,7 +1270,10 @@ fn detectFamily(model_type: []const u8) ModelFamily {
 fn isGemma4ModelType(model_type: []const u8) bool {
     return std.mem.eql(u8, model_type, "gemma4") or
         std.mem.eql(u8, model_type, "gemma4_text") or
-        std.mem.eql(u8, model_type, "gemma4_assistant");
+        std.mem.eql(u8, model_type, "gemma4_unified") or
+        std.mem.eql(u8, model_type, "gemma4_unified_text") or
+        std.mem.eql(u8, model_type, "gemma4_assistant") or
+        std.mem.eql(u8, model_type, "gemma4_unified_assistant");
 }
 
 fn applyFamilyDefaults(config: *Config) void {
@@ -2151,6 +2163,74 @@ test "parse gemma4 text-only config defaults" {
     try std.testing.expectEqual(@as(u32, 256), config.effectiveHeadDimForLayer(0));
     try std.testing.expectEqual(@as(u32, 8), config.maxKvHeads());
     try std.testing.expectEqual(@as(u32, 256), config.maxHeadDim());
+}
+
+test "parse gemma4 12b unified config aliases" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "model_type": "gemma4_unified",
+        \\  "image_token_id": 258880,
+        \\  "boi_token_id": 255999,
+        \\  "eoi_token_id": 258882,
+        \\  "text_config": {
+        \\    "model_type": "gemma4_unified_text",
+        \\    "hidden_size": 3840,
+        \\    "num_hidden_layers": 48,
+        \\    "num_attention_heads": 16,
+        \\    "num_key_value_heads": 8,
+        \\    "num_global_key_value_heads": 1,
+        \\    "head_dim": 256,
+        \\    "global_head_dim": 512,
+        \\    "intermediate_size": 15360,
+        \\    "max_position_embeddings": 262144,
+        \\    "sliding_window": 1024,
+        \\    "tie_word_embeddings": true,
+        \\    "vocab_size": 262144,
+        \\    "hidden_activation": "gelu_pytorch_tanh",
+        \\    "layer_types": [
+        \\      "sliding_attention", "sliding_attention", "sliding_attention",
+        \\      "sliding_attention", "sliding_attention", "full_attention"
+        \\    ],
+        \\    "rope_parameters": {
+        \\      "full_attention": {
+        \\        "partial_rotary_factor": 0.25,
+        \\        "rope_theta": 1000000.0
+        \\      },
+        \\      "sliding_attention": {
+        \\        "rope_theta": 10000.0
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const config = try parseConfig(allocator, json);
+    try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expectEqualStrings("model.language_model", config.weight_prefix);
+    try std.testing.expectEqual(@as(i32, 258880), config.image_token_index);
+    try std.testing.expectEqual(@as(i32, 255999), config.boi_token_index);
+    try std.testing.expectEqual(@as(i32, 258882), config.eoi_token_index);
+    try std.testing.expectEqual(@as(u32, 3840), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 48), config.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 16), config.num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 8), config.num_key_value_heads);
+    try std.testing.expectEqual(@as(u32, 1), config.num_global_key_value_heads);
+    try std.testing.expectEqual(@as(u32, 256), config.attention_head_dim);
+    try std.testing.expectEqual(@as(u32, 512), config.global_head_dim);
+    try std.testing.expectEqual(@as(u32, 15360), config.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 262144), config.max_position_embeddings);
+    try std.testing.expectEqual(@as(u32, 262144), config.vocab_size);
+    try std.testing.expectEqual(@as(u32, 1024), config.sliding_window);
+    try std.testing.expectEqual(@as(u32, 6), config.sliding_window_pattern);
+    try std.testing.expectEqual(@as(f32, 0.25), config.rope_partial_factor);
+    try std.testing.expectEqual(@as(f32, 1000000.0), config.rope_theta);
+    try std.testing.expectEqual(@as(f32, 10000.0), config.rope_local_theta);
+    try std.testing.expectEqual(@as(u32, 8), config.effectiveKVHeadsForLayer(0));
+    try std.testing.expectEqual(@as(u32, 1), config.effectiveKVHeadsForLayer(5));
+    try std.testing.expectEqual(@as(u32, 256), config.effectiveHeadDimForLayer(0));
+    try std.testing.expectEqual(@as(u32, 512), config.effectiveHeadDimForLayer(5));
+    try std.testing.expectEqual(@as(u32, 512), config.maxHeadDim());
+    try std.testing.expect(config.weight_tying);
 }
 
 test "parse gemma4 moe fields from text_config" {

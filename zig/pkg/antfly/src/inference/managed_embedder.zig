@@ -69,6 +69,12 @@ pub const AntflyProvider = struct {
         model: []const u8,
         texts: []const []const u8,
     ) anyerror![]db_embedder.SparseEmbedding,
+    embed_dense_parts: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        parts: []const template_mod.ContentPart,
+    ) anyerror![][]f32 = null,
     rerank_texts: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -121,6 +127,11 @@ pub const InitOptions = struct {
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_key: ?[]const u8 = null,
+};
+
+const DimensionProbeValidation = enum {
+    strict,
+    defer_probe,
 };
 
 pub const QueryTemplateError = error{
@@ -809,7 +820,10 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     defer if (embedder_json) |raw| alloc.free(raw);
     if (!external and embedder_json == null and chunker_json == null) return error.InvalidCreateTableRequest;
 
-    const dims = try resolveDeclaredEmbeddingDimensionsRequired(cfg);
+    const dims = if (embedder_value) |embedder|
+        try resolveEmbeddingDimensionsForManagedConfig(alloc, index_name, cfg, embedder, options)
+    else
+        try resolveDeclaredEmbeddingDimensionsRequired(cfg);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -873,22 +887,28 @@ pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
     defer parsed_cfg.deinit();
     const cfg = parsed_cfg.value;
     const sparse = cfg.sparse orelse false;
+    const validation_value = root.get("validation");
+    const validation = try parseDimensionProbeValidation(root);
 
     const external = cfg.external orelse false;
     const embedder_value = root.get("embedder");
     if (external) {
+        if (validation_value != null) return error.InvalidCreateTableRequest;
         if (!sparse) _ = try resolveDeclaredEmbeddingDimensionsRequired(cfg);
         return null;
     }
     const embedder = embedder_value orelse return error.InvalidCreateTableRequest;
 
     if (sparse) {
+        if (validation_value != null) return error.InvalidCreateTableRequest;
         try validateSparseEmbeddingForManagedConfig(alloc, index_name, cfg, embedder, options);
         return null;
     }
 
-    const dims = try resolveEmbeddingDimensionsForManagedConfig(alloc, index_name, cfg, embedder, options);
-    if (cfg.dimension != null) return null;
+    const declared_dims = try resolveDeclaredEmbeddingDimensions(cfg);
+    if (validation == .defer_probe and declared_dims == null) return error.InvalidCreateTableRequest;
+    const dims = try resolveEmbeddingDimensionsForManagedConfigWithValidation(alloc, index_name, cfg, embedder, options, validation);
+    if (cfg.dimension != null and validation_value == null) return null;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -897,6 +917,7 @@ pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
     var it = root.iterator();
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "dimension")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "validation")) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
@@ -938,7 +959,8 @@ fn parseManagedEmbeddingEntry(
     const sparse = cfg.sparse orelse false;
 
     const embedder = root.get("embedder") orelse return null;
-    return try buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, if (sparse) 0 else try resolveDeclaredEmbeddingDimensionsRequired(cfg));
+    const dims = if (sparse) 0 else try resolveEmbeddingDimensionsForManagedConfig(alloc, index_name, cfg, embedder, options);
+    return try buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, dims);
 }
 
 fn shouldUseAntflyProvider(embedder: embeddings_types.Config, options: InitOptions) bool {
@@ -1048,6 +1070,14 @@ fn resolveDeclaredEmbeddingDimensionsRequired(cfg: indexes_openapi.EmbeddingsInd
     return (try resolveDeclaredEmbeddingDimensions(cfg)) orelse error.InvalidCreateTableRequest;
 }
 
+fn parseDimensionProbeValidation(root: std.json.ObjectMap) !DimensionProbeValidation {
+    const value = root.get("validation") orelse return .strict;
+    if (value != .string) return error.InvalidCreateTableRequest;
+    if (std.mem.eql(u8, value.string, "strict")) return .strict;
+    if (std.mem.eql(u8, value.string, "defer_probe")) return .defer_probe;
+    return error.InvalidCreateTableRequest;
+}
+
 fn resolveEmbeddingDimensionsForManagedConfig(
     alloc: std.mem.Allocator,
     index_name: []const u8,
@@ -1055,13 +1085,32 @@ fn resolveEmbeddingDimensionsForManagedConfig(
     embedder: std.json.Value,
     options: InitOptions,
 ) !u32 {
-    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, (try resolveDeclaredEmbeddingDimensions(cfg)) orelse 0) catch |err| switch (err) {
+    if (try resolveDeclaredEmbeddingDimensions(cfg)) |declared| return declared;
+    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
         error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
     };
     defer managed.deinit(alloc);
     return try resolveEmbeddingDimensionsForEntry(alloc, cfg, &managed);
+}
+
+fn resolveEmbeddingDimensionsForManagedConfigWithValidation(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    cfg: indexes_openapi.EmbeddingsIndexConfig,
+    embedder: std.json.Value,
+    options: InitOptions,
+    validation: DimensionProbeValidation,
+) !u32 {
+    const declared = try resolveDeclaredEmbeddingDimensions(cfg);
+    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, declared orelse 0) catch |err| switch (err) {
+        error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
+        error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
+        else => return err,
+    };
+    defer managed.deinit(alloc);
+    return try resolveEmbeddingDimensionsForEntryWithValidation(alloc, &managed, declared, validation);
 }
 
 fn validateSparseEmbeddingForManagedConfig(
@@ -1103,16 +1152,36 @@ fn resolveEmbeddingDimensionsForEntry(
     entry: *const ManagedEmbeddingEntry,
 ) !u32 {
     const declared = try resolveDeclaredEmbeddingDimensions(cfg);
+    return try resolveEmbeddingDimensionsForEntryWithValidation(alloc, entry, declared, .strict);
+}
+
+fn resolveEmbeddingDimensionsForEntryWithValidation(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    declared: ?u32,
+    validation: DimensionProbeValidation,
+) !u32 {
     const probe_dims = inferEmbeddingDimensionsFromEntry(alloc, entry, declared orelse 0) catch |err| switch (err) {
         error.InvalidEmbeddingDimensions,
         error.EmptyEmbeddingResponse,
         error.InvalidEmbeddingResponse,
-        error.EmbedRateLimited,
-        error.EmbedTransientFailure,
         error.EmbedRequestFailed,
         => return error.InvalidCreateTableRequest,
+        error.EmbedRateLimited,
+        error.EmbedTransientFailure,
+        => if (validation == .defer_probe) {
+            return declared orelse error.InvalidCreateTableRequest;
+        } else {
+            return error.EmbeddingProbeUnavailable;
+        },
         error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
-        else => return err,
+        else => {
+            if (isOperationalEmbeddingProbeError(err)) {
+                if (validation == .defer_probe) return declared orelse error.InvalidCreateTableRequest;
+                return error.EmbeddingProbeUnavailable;
+            }
+            return err;
+        },
     };
     if (probe_dims == 0) return error.InvalidCreateTableRequest;
     if (declared) |declared_dims| {
@@ -1120,6 +1189,24 @@ fn resolveEmbeddingDimensionsForEntry(
         return declared_dims;
     }
     return probe_dims;
+}
+
+fn isOperationalEmbeddingProbeError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.ConnectionTimedOut,
+        error.Timeout,
+        error.NetworkUnreachable,
+        error.HostLacksNetworkAddresses,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.UnexpectedReadFailure,
+        error.SendFailed,
+        error.RecvFailed,
+        => true,
+        else => false,
+    };
 }
 
 fn inferEmbeddingDimensionsFromEntry(
@@ -1459,7 +1546,15 @@ fn embedWithEntryParts(
     }
 
     if (isAntflyProvider(entry.provider) and (entry.multimodal or partsContainMedia(parts))) {
-        if (entry.antfly_provider != null) {
+        if (entry.antfly_provider) |local| {
+            if (local.embed_dense_parts) |embed_parts| {
+                waitForEntryPacer(entry);
+                const vectors = try embed_parts(local.ptr, alloc, entry.model, parts);
+                defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+                if (vectors.len == 0) return error.EmptyEmbeddingResponse;
+                if (dims > 0 and vectors[0].len != dims) return error.InvalidEmbeddingDimensions;
+                return try alloc.dupe(f32, vectors[0]);
+            }
             return error.UnsupportedEmbeddingProvider;
         }
         waitForEntryPacer(entry);
@@ -2112,6 +2207,20 @@ test "managed embedder translates managed embeddings config into db generator co
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"generator\":{\"kind\":\"dense_embedding\"") != null);
 }
 
+test "managed embedder translates managed embeddings config with probed dimension" {
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","field":"body","embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+    , .{});
+    defer parsed.deinit();
+
+    const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() });
+    defer std.testing.allocator.free(config_json);
+
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"dims\":3") != null);
+}
+
 test "managed embedder normalizes missing dimension from probe result" {
     var local = TestLocalDenseProvider{ .dimensions = 3 };
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
@@ -2599,6 +2708,10 @@ test "managed embedder calls ollama compatible embeddings endpoint" {
 }
 
 test "managed embedder rejects embedding dimension mismatch" {
+    try testManagedEmbedderRejectsEmbeddingDimensionMismatch();
+}
+
+fn testManagedEmbedderRejectsEmbeddingDimensionMismatch() !void {
     const FakeApp = struct {
         fn executor() http_common.RequestExecutor {
             return .{
@@ -2640,6 +2753,129 @@ test "managed embedder rejects embedding dimension mismatch" {
     defer parsed.deinit();
 
     try std.testing.expectError(error.InvalidCreateTableRequest, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{}));
+}
+
+test "managed embedder defers operational dimension probe failure with explicit dimension" {
+    try testManagedEmbedderDefersOperationalDimensionProbeFailure();
+}
+
+test "managed embedder strict dimension probe failure is retryable" {
+    try testManagedEmbedderStrictDimensionProbeFailureIsRetryable();
+}
+
+pub fn testDimensionProbeValidationModes() !void {
+    try testManagedEmbedderRejectsEmbeddingDimensionMismatch();
+    try testManagedEmbedderDefersOperationalDimensionProbeFailure();
+    try testManagedEmbedderDeferProbeRequiresDeclaredDimension();
+    try testManagedEmbedderStrictDimensionProbeFailureIsRetryable();
+}
+
+fn testManagedEmbedderDefersOperationalDimensionProbeFailure() !void {
+    const FakeApp = struct {
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return .{
+                .status = 429,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, "{}"),
+            };
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeApp.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    const index_json = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"type":"embeddings","field":"body","dimension":3,"validation":"defer_probe","embedder":{{"provider":"openai","model":"text-embedding-3-small","url":"{s}"}}}}
+    , .{base_uri});
+    defer std.testing.allocator.free(index_json);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        index_json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const normalized = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{})).?;
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"dimension\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"validation\"") == null);
+
+    var normalized_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, normalized, .{});
+    defer normalized_parsed.deinit();
+    const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", normalized_parsed.value, .{});
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"dims\":3") != null);
+}
+
+fn testManagedEmbedderDeferProbeRequiresDeclaredDimension() !void {
+    const index_json =
+        \\{"type":"embeddings","field":"body","validation":"defer_probe","embedder":{"provider":"openai","model":"text-embedding-3-small","url":"http://127.0.0.1:9"}}
+    ;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        index_json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.InvalidCreateTableRequest, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{}));
+}
+
+fn testManagedEmbedderStrictDimensionProbeFailureIsRetryable() !void {
+    const FakeApp = struct {
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return .{
+                .status = 429,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, "{}"),
+            };
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeApp.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    const index_json = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"text-embedding-3-small","url":"{s}"}}}}
+    , .{base_uri});
+    defer std.testing.allocator.free(index_json);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        index_json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.EmbeddingProbeUnavailable, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{}));
 }
 
 test "managed embedder routes antfly model to local provider" {
@@ -2788,6 +3024,60 @@ test "managed embedder routes antfly with api_url to antfly endpoint" {
     const vector = try managed.embedQuery(std.testing.allocator, "semantic_idx", "alpha concept");
     defer std.testing.allocator.free(vector);
     try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, vector);
+}
+
+test "managed embedder sends antfly media parts when local provider is configured" {
+    const Local = struct {
+        saw_parts: bool = false,
+
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+
+        fn parts(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, parts_slice: []const template_mod.ContentPart) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("local-model", model);
+            try std.testing.expectEqual(@as(usize, 3), parts_slice.len);
+            try std.testing.expectEqualStrings("caption", parts_slice[0].text);
+            try std.testing.expectEqualStrings("data:image/png;base64,aaa", parts_slice[1].media_url);
+            try std.testing.expectEqualStrings("image/png", parts_slice[2].binary.mime_type);
+            try std.testing.expectEqualStrings(&[_]u8{ 1, 2, 3 }, parts_slice[2].binary.data);
+            self.saw_parts = true;
+
+            const vectors = try alloc.alloc([]f32, 1);
+            errdefer alloc.free(vectors);
+            vectors[0] = try alloc.dupe(f32, &.{ 0.25, 0.5, 0.75 });
+            return vectors;
+        }
+    };
+
+    var local = Local{};
+    const provider = AntflyProvider{
+        .ptr = &local,
+        .embed_dense_texts = Local.dense,
+        .embed_sparse_texts = Local.sparse,
+        .embed_dense_parts = Local.parts,
+    };
+
+    const indexes_json =
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model","multimodal":true}}}
+    ;
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, indexes_json, provider);
+    defer managed.deinit();
+
+    const parts = [_]template_mod.ContentPart{
+        .{ .text = "caption" },
+        .{ .media_url = "data:image/png;base64,aaa" },
+        .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{ 1, 2, 3 } } },
+    };
+    const vector = try embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3);
+    defer std.testing.allocator.free(vector);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5, 0.75 }, vector);
+    try std.testing.expect(local.saw_parts);
 }
 
 test "managed embedder preserves antfly api_url path for shared antfly endpoint" {

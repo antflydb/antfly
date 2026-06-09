@@ -104,8 +104,9 @@ pub const Runtime = struct {
     }
 
     fn generate(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
-        var cfg = try generating_runtime.parseConfigFromSlice(alloc, request.config_json);
-        defer cfg.deinit(alloc);
+        var parsed_cfg = try parseGeneratorProducerConfig(alloc, request.config_json);
+        defer parsed_cfg.deinit(alloc);
+        const cfg = parsed_cfg.generator;
         var parts: ?[]generating_runtime.ContentPart = null;
         defer if (parts) |items| freeGeneratorContentParts(alloc, items);
         const content: generating_runtime.ChatMessageContent = if (request.source_parts_json) |raw_parts| blk: {
@@ -121,6 +122,9 @@ pub const Runtime = struct {
             .{ .role = .user, .content = content },
         });
         defer result.deinit();
+        if (parsed_cfg.tool_output == .arguments) {
+            return try toolCallArgumentsOutputAlloc(alloc, result.tool_calls, parsed_cfg.tool_name);
+        }
         return try alloc.dupe(u8, result.content);
     }
 
@@ -236,6 +240,118 @@ pub const Runtime = struct {
         return try alloc.dupe(u8, response.json);
     }
 };
+
+const GeneratorToolOutput = enum {
+    arguments,
+    content,
+};
+
+const GeneratorProducerConfig = struct {
+    generator: generating_runtime.GeneratorConfig,
+    parsed: std.json.Parsed(std.json.Value),
+    tool_choice: ?std.json.Value = null,
+    tool_name: ?[]const u8 = null,
+    tool_output: GeneratorToolOutput = .content,
+
+    fn deinit(self: *GeneratorProducerConfig, alloc: Allocator) void {
+        self.generator.deinit(alloc);
+        self.parsed.deinit();
+        self.* = undefined;
+    }
+};
+
+fn parseGeneratorProducerConfig(alloc: Allocator, raw: []const u8) !GeneratorProducerConfig {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    errdefer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGeneratorConfig;
+
+    var cfg = try generatorConfigFromValue(alloc, parsed.value);
+    errdefer cfg.deinit(alloc);
+
+    const tools = parsed.value.object.get("tools");
+    const tool_choice = parsed.value.object.get("tool_choice");
+    const tool_name = if (parsed.value.object.get("tool_name")) |value|
+        if (value == .string) value.string else null
+    else
+        forcedToolName(tool_choice);
+    const tool_output = if (parsed.value.object.get("tool_output")) |value| blk: {
+        if (value != .string) return error.InvalidGeneratorToolConfig;
+        if (std.mem.eql(u8, value.string, "arguments")) break :blk GeneratorToolOutput.arguments;
+        if (std.mem.eql(u8, value.string, "content")) break :blk GeneratorToolOutput.content;
+        return error.InvalidGeneratorToolConfig;
+    } else if (tools != null) GeneratorToolOutput.arguments else GeneratorToolOutput.content;
+
+    return .{
+        .generator = cfg,
+        .parsed = parsed,
+        .tool_choice = tool_choice,
+        .tool_name = tool_name,
+        .tool_output = tool_output,
+    };
+}
+
+fn generatorConfigFromValue(alloc: Allocator, value: std.json.Value) !generating_runtime.GeneratorConfig {
+    if (value != .object) return error.InvalidGeneratorConfig;
+    const provider_value = value.object.get("provider") orelse return error.InvalidGeneratorConfig;
+    if (provider_value != .string) return error.InvalidGeneratorConfig;
+    const provider = generatorProviderFromString(provider_value.string) orelse return error.UnsupportedGeneratorProvider;
+
+    const model = jsonStringField(value, "model") orelse "";
+    const url = jsonStringField(value, "url") orelse jsonStringField(value, "api_url") orelse "";
+    var cfg = generating_runtime.GeneratorConfig{
+        .provider = provider,
+        .model = if (model.len > 0) try alloc.dupe(u8, model) else "",
+        .url = if (url.len > 0) try alloc.dupe(u8, url) else "",
+        .api_key = if (jsonStringField(value, "api_key")) |text| try alloc.dupe(u8, text) else null,
+        .project_id = if (jsonStringField(value, "project_id")) |text| try alloc.dupe(u8, text) else null,
+        .location = if (jsonStringField(value, "location")) |text| try alloc.dupe(u8, text) else null,
+        .credentials_path = if (jsonStringField(value, "credentials_path")) |text| try alloc.dupe(u8, text) else null,
+        .tools_json = if (value.object.get("tools")) |tools| try std.json.Stringify.valueAlloc(alloc, tools, .{}) else null,
+        .tool_choice_json = if (value.object.get("tool_choice")) |tool_choice| try std.json.Stringify.valueAlloc(alloc, tool_choice, .{}) else null,
+    };
+    errdefer cfg.deinit(alloc);
+    try cfg.validate();
+    return cfg;
+}
+
+fn generatorProviderFromString(value: []const u8) ?generating_runtime.Provider {
+    if (std.mem.eql(u8, value, "gemini")) return .gemini;
+    if (std.mem.eql(u8, value, "vertex")) return .vertex;
+    if (std.mem.eql(u8, value, "openai")) return .openai;
+    if (std.mem.eql(u8, value, "ollama")) return .ollama;
+    if (std.mem.eql(u8, value, "antfly")) return .antfly;
+    if (std.mem.eql(u8, value, "mock")) return .mock;
+    return null;
+}
+
+fn jsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return if (found == .string) found.string else null;
+}
+
+fn forcedToolName(tool_choice: ?std.json.Value) ?[]const u8 {
+    const choice = tool_choice orelse return null;
+    switch (choice) {
+        .object => |obj| {
+            const function = obj.get("function") orelse return null;
+            if (function != .object) return null;
+            const name = function.object.get("name") orelse return null;
+            return if (name == .string) name.string else null;
+        },
+        else => return null,
+    }
+}
+
+fn toolCallArgumentsOutputAlloc(alloc: Allocator, calls: []const generating_runtime.ToolCall, expected_name: ?[]const u8) ![]u8 {
+    for (calls) |call| {
+        if (expected_name) |name| {
+            if (!std.mem.eql(u8, call.name, name)) continue;
+        }
+        return try alloc.dupe(u8, call.arguments);
+    }
+    return error.MissingToolCall;
+}
 
 fn isLocalReaderProvider(provider: readers.Provider, url: ?[]const u8) bool {
     return provider == .antfly and url == null;
@@ -527,6 +643,127 @@ test "asset producer runtime passes rendered media parts to generators" {
     if (run_err) |err| return err;
     defer alloc.free(result.?);
     try std.testing.expectEqualStrings("vision result", result.?);
+}
+
+fn expectOpenAiToolGeneratorRequest(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqual(.POST, req.method);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"tools\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"tool_choice\":{\"type\":\"function\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"name\":\"emit_relations\"") != null);
+}
+
+test "asset producer runtime stores generator tool call arguments" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/chat/completions", .assert_request = expectOpenAiToolGeneratorRequest, .respond = .{
+            .body =
+            \\{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"emit_relations","arguments":"{\"relations\":[{\"type\":\"signed\",\"target\":{\"id\":\"Ada\"}}]}"}}]}}]}
+            ,
+        } },
+    });
+    defer server.deinit();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.init(alloc, &client);
+    const producer = runtime.producer();
+
+    const cfg_json = try std.fmt.allocPrint(alloc,
+        \\{{"provider":"openai","model":"gemma4","url":"{s}","tool_output":"arguments","tool_name":"emit_relations","tool_choice":{{"type":"function","function":{{"name":"emit_relations"}}}},"tools":[{{"type":"function","function":{{"name":"emit_relations","parameters":{{"type":"object"}}}}}}]}}
+    , .{server.baseUrl()});
+    defer alloc.free(cfg_json);
+
+    var result: ?[]u8 = null;
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+
+    const Fiber = struct {
+        fn run(
+            a: Allocator,
+            p: asset_producer.Producer,
+            cfg: []const u8,
+            out: *?[]u8,
+            err_out: *?anyerror,
+        ) std.Io.Cancelable!void {
+            out.* = p.produce(a, .{
+                .producer_type = .generator,
+                .config_json = cfg,
+                .source_text = "signed by Ada",
+                .content_type = "application/json",
+            }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    try group.concurrent(io, Fiber.run, .{ alloc, producer, cfg_json, &result, &run_err });
+    try server.handleOne();
+    try group.await(io);
+    if (run_err) |err| return err;
+    defer alloc.free(result.?);
+    try std.testing.expectEqualStrings("{\"relations\":[{\"type\":\"signed\",\"target\":{\"id\":\"Ada\"}}]}", result.?);
+}
+
+test "asset producer runtime stores forced tool arguments from plain json content" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/chat/completions", .assert_request = expectOpenAiToolGeneratorRequest, .respond = .{
+            .body =
+            \\{"choices":[{"message":{"role":"assistant","content":"{\"relations\":[{\"type\":\"mentioned in\",\"target\":{\"id\":\"Ada\"}}]}"}}]}
+            ,
+        } },
+    });
+    defer server.deinit();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.init(alloc, &client);
+    const producer = runtime.producer();
+
+    const cfg_json = try std.fmt.allocPrint(alloc,
+        \\{{"provider":"openai","model":"gemma4","url":"{s}","tool_output":"arguments","tool_name":"emit_relations","tool_choice":{{"type":"function","function":{{"name":"emit_relations"}}}},"tools":[{{"type":"function","function":{{"name":"emit_relations","parameters":{{"type":"object"}}}}}}]}}
+    , .{server.baseUrl()});
+    defer alloc.free(cfg_json);
+
+    var result: ?[]u8 = null;
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+
+    const Fiber = struct {
+        fn run(
+            a: Allocator,
+            p: asset_producer.Producer,
+            cfg: []const u8,
+            out: *?[]u8,
+            err_out: *?anyerror,
+        ) std.Io.Cancelable!void {
+            out.* = p.produce(a, .{
+                .producer_type = .generator,
+                .config_json = cfg,
+                .source_text = "mentioned Ada",
+                .content_type = "application/json",
+            }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    try group.concurrent(io, Fiber.run, .{ alloc, producer, cfg_json, &result, &run_err });
+    try server.handleOne();
+    try group.await(io);
+    if (run_err) |err| return err;
+    defer alloc.free(result.?);
+    try std.testing.expectEqualStrings("{\"relations\":[{\"type\":\"mentioned in\",\"target\":{\"id\":\"Ada\"}}]}", result.?);
 }
 
 test "asset producer runtime routes antfly reader without url to local provider" {

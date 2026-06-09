@@ -228,7 +228,9 @@ fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iter
 
 fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const ref = args.next() orelse {
-        std.debug.print("usage: antfly inference pull <model-ref> [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>]\n", .{});
+        std.debug.print("usage: antfly inference pull <model-ref> [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>] [--projector <auto|none|Q8_0|filename>]\n", .{});
+        std.debug.print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
+        std.debug.print("CLIP/CLAP v0.2 example: antfly inference pull antflydb/clipclap:gguf:Q4_K\n", .{});
         return;
     };
 
@@ -236,6 +238,7 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var tasks_csv: ?[]const u8 = null;
     var capabilities_csv: ?[]const u8 = null;
+    var projector_selection: inference.registry.download.ProjectorSelection = .auto;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--token")) {
             token = args.next();
@@ -245,6 +248,9 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             tasks_csv = args.next();
         } else if (std.mem.eql(u8, arg, "--capabilities")) {
             capabilities_csv = args.next();
+        } else if (std.mem.eql(u8, arg, "--projector")) {
+            const value = args.next() orelse return error.InvalidArguments;
+            projector_selection = inference.registry.download.parseProjectorSelection(value) orelse return error.InvalidArguments;
         }
     }
 
@@ -257,7 +263,7 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
 
     var reg = inference.registry.ModelRegistry.init(alloc, models_dir);
     defer reg.deinit();
-    try reg.pull(io, ref, token, tasks_csv, capabilities_csv);
+    try reg.pull(io, ref, token, tasks_csv, capabilities_csv, projector_selection);
 
     std.debug.print("done.\n", .{});
 }

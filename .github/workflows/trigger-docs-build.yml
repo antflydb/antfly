@@ -9,6 +9,11 @@ on:
       - 'examples/**'
       - 'docs/**'
       - 'go/pkg/operator/docs/**'
+      - 'go/pkg/termite/registry/index.json'
+      - 'specs/openapi/**'
+  release:
+    types: [published]
+  workflow_dispatch:
 
 jobs:
   trigger:
@@ -20,3 +25,4 @@ jobs:
           token: ${{ secrets.COLONY_DISPATCH_TOKEN }}
           repository: antflydb/colony
           event-type: antfly-docs-updated
+          client-payload: '{"ref":"${{ github.ref_name }}","sha":"${{ github.sha }}","event":"${{ github.event_name }}"}'

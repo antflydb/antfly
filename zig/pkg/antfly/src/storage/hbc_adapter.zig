@@ -121,6 +121,12 @@ fn defaultRetainedVectorCacheEnabled() bool {
     return true;
 }
 
+fn hbcRuntimeBatchMode(in_bulk_session: bool, lsm_direct_bulk_ingest_enabled: ?bool) vectorindex_store.BatchMode {
+    if (!in_bulk_session) return .default;
+    const direct_bulk_ingest_enabled = lsm_direct_bulk_ingest_enabled orelse return .default;
+    return if (direct_bulk_ingest_enabled) .default else .bulk_ingest;
+}
+
 // ============================================================================
 // Index metadata (serialized to LMDB)
 // ============================================================================
@@ -2696,15 +2702,24 @@ pub const HBCIndex = struct {
             self.apply_workspace_split_bytes = 0;
             self.observeApplyWorkspaceBytes();
         }
+        const in_bulk_session = self.bulk_ingest_session_depth > 0;
         // HBC mutation batches rewrite nodes, ranges, and quantized payloads
-        // heavily. The outer bulk-ingest session still defers manifests and
-        // compaction, but each mutation batch must use normal mutable-state
-        // coalescing instead of direct sorted-run ingestion. Otherwise every
-        // stale internal rewrite becomes durable table bytes during large loads.
+        // heavily. Keep mutable-state coalescing, but preserve bulk transaction
+        // mode when the LSM profile disables direct bulk ingest so LSM defers
+        // batch-exit maintenance until the session boundary. Direct-bulk LSM
+        // profiles and non-LSM backends stay in default mode; otherwise stale
+        // internal rewrites can become durable table bytes during large loads.
         return try self.store.beginBatchWithOptions(.{
-            .mode = .default,
-            .defer_commit_flush = self.bulk_ingest_session_depth > 0,
+            .mode = self.runtimeBatchMode(in_bulk_session),
+            .defer_commit_flush = in_bulk_session,
         });
+    }
+
+    fn runtimeBatchMode(self: *const HBCIndex, in_bulk_session: bool) vectorindex_store.BatchMode {
+        return switch (self.env_owner) {
+            .lsm => |handle| hbcRuntimeBatchMode(in_bulk_session, handle.backend.options.direct_bulk_ingest),
+            .lmdb => hbcRuntimeBatchMode(in_bulk_session, null),
+        };
     }
 
     fn commitTxn(txn: anytype) !void {
@@ -10790,6 +10805,16 @@ test "scoreLeafMembers does not use-after-free when cache evicts during member s
     defer results.deinit();
     try std.testing.expect(ctx.fired);
     try std.testing.expect(results.getHits().len > 0);
+}
+
+test "HBC runtime batch mode preserves bulk only for non-direct LSM bulk sessions" {
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(false, false));
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(false, true));
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(false, null));
+
+    try std.testing.expectEqual(vectorindex_store.BatchMode.bulk_ingest, hbcRuntimeBatchMode(true, false));
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(true, true));
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(true, null));
 }
 
 // ============================================================================

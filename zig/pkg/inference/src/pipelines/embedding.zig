@@ -37,6 +37,21 @@ const resident_ops = @import("../graph/resident_ops.zig");
 
 const qwen3_embedding_resident_override_level = 4;
 
+const TextInputTensorSet = struct {
+    items: [3]Tensor = undefined,
+    len: usize = 0,
+    token_type_tensor: ?Tensor = null,
+
+    fn slice(self: *const TextInputTensorSet) []const Tensor {
+        return self.items[0..self.len];
+    }
+
+    fn deinit(self: *TextInputTensorSet) void {
+        if (self.token_type_tensor) |*tensor| tensor.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const PoolingStrategy = enum {
     mean,
     cls,
@@ -199,9 +214,15 @@ pub const EmbeddingPipeline = struct {
     /// Caller owns the returned slices and must free them with the allocator.
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
         if (texts.len == 0) return try self.allocator.alloc([]f32, 0);
+        const text_session = self.textEncodingSession();
+        if (text_session.backend() == .onnx and texts.len > 1) {
+            return try self.embedSerial(texts);
+        }
 
         const alloc = self.allocator;
-        const max_len = self.config.max_length;
+        const input_info = text_session.inputInfo();
+        const max_len = textSequenceLengthForInputs(input_info, self.config.max_length);
+        const fixed_len = hasFixedTextSequenceLength(input_info);
         const batch = texts.len;
 
         const encoded = try alloc.alloc(EncodeResult, batch);
@@ -211,7 +232,7 @@ pub const EmbeddingPipeline = struct {
             for (encoded[0..encoded_count]) |*result| result.deinit();
         }
 
-        var effective_len: usize = if (self.config.trim_padding_to_batch_max) 1 else max_len;
+        var effective_len: usize = if (self.config.trim_padding_to_batch_max and !fixed_len) 1 else max_len;
         for (texts, 0..) |text, i| {
             const token_text = if (self.config.text_prefix.len > 0)
                 try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.config.text_prefix, text })
@@ -221,7 +242,7 @@ pub const EmbeddingPipeline = struct {
 
             encoded[i] = try self.tok.encodeForModel(alloc, token_text, max_len);
             encoded_count += 1;
-            if (self.config.trim_padding_to_batch_max) {
+            if (self.config.trim_padding_to_batch_max and !fixed_len) {
                 effective_len = @max(effective_len, activeTokenLength(encoded[i].attention_mask));
             }
         }
@@ -254,27 +275,9 @@ pub const EmbeddingPipeline = struct {
         var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape, mask_i64);
         defer attention_mask_tensor.deinit();
 
-        // Check if model expects token_type_ids
-        var token_type_tensor: ?Tensor = null;
-        defer if (token_type_tensor) |*t| t.deinit();
-
-        const input_info = self.session.inputInfo();
-        var needs_token_type = false;
-        for (input_info) |info| {
-            if (std.mem.eql(u8, info.name, "token_type_ids")) {
-                needs_token_type = true;
-                break;
-            }
-        }
-
-        const inputs = if (needs_token_type) blk: {
-            // Create zeros tensor for token_type_ids
-            const zeros = try alloc.alloc(i64, batch * effective_len);
-            defer alloc.free(zeros);
-            @memset(zeros, 0);
-            token_type_tensor = try Tensor.initInt64(alloc, "token_type_ids", &shape, zeros);
-            break :blk &[_]Tensor{ input_ids_tensor, attention_mask_tensor, token_type_tensor.? };
-        } else &[_]Tensor{ input_ids_tensor, attention_mask_tensor };
+        var input_set = try textInputTensorSet(alloc, input_info, input_ids_tensor, attention_mask_tensor, &shape);
+        defer input_set.deinit();
+        const inputs = input_set.slice();
 
         if (self.text_projection) |proj| {
             if (try self.tryEmbedTextResidentProjection(inputs, all_mask, batch, effective_len, proj)) |resident_embeddings| {
@@ -286,7 +289,7 @@ pub const EmbeddingPipeline = struct {
 
         // Run inference
         const encoder_start = embedTimingStart(self.print_timing);
-        var outputs = try self.session.run(inputs, alloc);
+        var outputs = try text_session.run(inputs, alloc);
         logEmbedTiming("text.encoder", batch, encoder_start);
         defer {
             for (outputs) |*o| o.deinit();
@@ -308,6 +311,40 @@ pub const EmbeddingPipeline = struct {
 
         if (self.text_projection) |proj| {
             try self.projectEmbeddings(embeddings, proj);
+        }
+
+        return embeddings;
+    }
+
+    fn textEncodingSession(self: *const EmbeddingPipeline) backends.Session {
+        if (self.vision_session) |vs| {
+            if (session_factory.getClapConfig(self.session) != null and
+                session_factory.getClipConfig(vs) != null and
+                sessionHasInput(vs, "input_ids"))
+            {
+                return vs;
+            }
+        }
+        return self.session;
+    }
+
+    fn embedSerial(self: *EmbeddingPipeline, texts: []const []const u8) anyerror![][]f32 {
+        const embeddings = try self.allocator.alloc([]f32, texts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (embeddings[0..initialized]) |embedding| self.allocator.free(embedding);
+            self.allocator.free(embeddings);
+        }
+
+        for (texts, 0..) |_, idx| {
+            const single = try self.embed(texts[idx .. idx + 1]);
+            if (single.len != 1) {
+                freeEmbeddingSlices(self.allocator, single);
+                return error.UnexpectedOutputShape;
+            }
+            embeddings[idx] = single[0];
+            self.allocator.free(single);
+            initialized += 1;
         }
 
         return embeddings;
@@ -1457,6 +1494,112 @@ pub const EmbeddingPipeline = struct {
         return embeddings;
     }
 };
+
+fn textInputTensorSet(
+    alloc: std.mem.Allocator,
+    input_info: []const backends.TensorInfo,
+    input_ids_tensor: Tensor,
+    attention_mask_tensor: Tensor,
+    shape: []const i64,
+) !TextInputTensorSet {
+    var needs_attention_mask = false;
+    var needs_token_type = false;
+    for (input_info) |info| {
+        if (std.mem.eql(u8, info.name, "attention_mask")) needs_attention_mask = true;
+        if (std.mem.eql(u8, info.name, "token_type_ids")) needs_token_type = true;
+    }
+
+    var set = TextInputTensorSet{};
+    set.items[set.len] = input_ids_tensor;
+    set.len += 1;
+
+    if (needs_attention_mask) {
+        set.items[set.len] = attention_mask_tensor;
+        set.len += 1;
+    }
+
+    if (needs_token_type) {
+        const total = try shapeNumelUsize(shape);
+        const zeros = try alloc.alloc(i64, total);
+        defer alloc.free(zeros);
+        @memset(zeros, 0);
+        set.token_type_tensor = try Tensor.initInt64(alloc, "token_type_ids", shape, zeros);
+        set.items[set.len] = set.token_type_tensor.?;
+        set.len += 1;
+    }
+
+    return set;
+}
+
+fn shapeNumelUsize(shape: []const i64) !usize {
+    var total: usize = 1;
+    for (shape) |dim| {
+        if (dim < 0) return error.InvalidInputShape;
+        total = std.math.mul(usize, total, @intCast(dim)) catch return error.InvalidInputShape;
+    }
+    return total;
+}
+
+fn expectTextInputNames(input_info: []const backends.TensorInfo, expected: []const []const u8) !void {
+    const alloc = std.testing.allocator;
+    const shape = [_]i64{ 1, 2 };
+    var input_ids = try Tensor.initInt64(alloc, "input_ids", &shape, &.{ 101, 102 });
+    defer input_ids.deinit();
+    var attention_mask = try Tensor.initInt64(alloc, "attention_mask", &shape, &.{ 1, 1 });
+    defer attention_mask.deinit();
+
+    var set = try textInputTensorSet(alloc, input_info, input_ids, attention_mask, &shape);
+    defer set.deinit();
+
+    const inputs = set.slice();
+    try std.testing.expectEqual(expected.len, inputs.len);
+    for (expected, 0..) |name, i| {
+        try std.testing.expectEqualStrings(name, inputs[i].name);
+    }
+}
+
+fn textSequenceLengthForInputs(input_info: []const backends.TensorInfo, default_len: usize) usize {
+    for (input_info) |info| {
+        if (!std.mem.eql(u8, info.name, "input_ids")) continue;
+        if (info.shape.len < 2 or info.shape[1] <= 0) return default_len;
+        return @intCast(info.shape[1]);
+    }
+    return default_len;
+}
+
+fn hasFixedTextSequenceLength(input_info: []const backends.TensorInfo) bool {
+    for (input_info) |info| {
+        if (!std.mem.eql(u8, info.name, "input_ids")) continue;
+        return info.shape.len >= 2 and info.shape[1] > 0;
+    }
+    return false;
+}
+
+test "embedding text inputs follow declared model arity" {
+    try expectTextInputNames(&.{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+    }, &.{"input_ids"});
+
+    try expectTextInputNames(&.{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+        .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } },
+    }, &.{ "input_ids", "attention_mask" });
+
+    try expectTextInputNames(&.{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+        .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } },
+        .{ .name = "token_type_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+    }, &.{ "input_ids", "attention_mask", "token_type_ids" });
+}
+
+test "embedding text length follows fixed input_ids sequence dimension" {
+    const input_info = [_]backends.TensorInfo{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, 77 } },
+        .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, 77 } },
+    };
+    try std.testing.expect(hasFixedTextSequenceLength(&input_info));
+    try std.testing.expectEqual(@as(usize, 77), textSequenceLengthForInputs(&input_info, 512));
+}
 
 fn sessionHasInput(session: backends.Session, name: []const u8) bool {
     for (session.inputInfo()) |info| {

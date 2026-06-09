@@ -82,6 +82,30 @@ const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
 const parseOwnedJsonObjectMapAlloc = json_helpers.parseOwnedJsonObjectMapAlloc;
 
+const ParsedGlobalQueryTable = struct {
+    parsed: std.json.Parsed(metadata_openapi.QueryRequest),
+    table_name: []const u8,
+
+    fn deinit(self: *@This()) void {
+        self.parsed.deinit();
+    }
+};
+
+fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
+    var parsed = metadata_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
+    errdefer parsed.deinit();
+    return .{
+        .parsed = parsed,
+        .table_name = parsed.value.table orelse "",
+    };
+}
+
+fn isNdjsonContentType(content_type: ?[]const u8) bool {
+    const value = content_type orelse return false;
+    const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, value, ';')) |idx| value[0..idx] else value, " \t");
+    return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
+}
+
 const TestSseEvent = struct {
     event: []const u8,
     data: []const u8,
@@ -3120,6 +3144,7 @@ pub const ApiHttpServer = struct {
                     },
                 ) catch |err| switch (err) {
                     error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
+                    error.EmbeddingProbeUnavailable => return try textResponse(self.alloc, 503, "table index validation probe unavailable"),
                     else => return err,
                 };
                 if (create_req.indexes_json) |old_indexes_json| self.alloc.free(old_indexes_json);
@@ -3413,7 +3438,7 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableQuery(uri_parts.path)) |query_route| {
-                return try self.handlePublicTableQuery(query_route.table_name, req.body, authenticated_identity);
+                return try self.handlePublicTableQueryWithContentType(query_route.table_name, req.body, req.content_type, authenticated_identity);
             }
         }
         if (req.method == .POST) {
@@ -4981,10 +5006,34 @@ pub const ApiHttpServer = struct {
         if (row_filter_json) |value| {
             injectRowFilterIntoSearchRequest(alloc, &query_req.req, value) catch return error.InvalidQueryRequest;
         }
-        return (source.query(alloc, table_name, query_req.req, .read_index) catch |err| {
-            std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
-            return err;
-        }) orelse error.TableNotFound;
+        return (try queryWithTransientReadRetry(alloc, source, table_name, query_req.req, .read_index)) orelse error.TableNotFound;
+    }
+
+    fn queryWithTransientReadRetry(
+        alloc: std.mem.Allocator,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?query_api.QueryResponse {
+        const retry_timeout_ns = 5 * std.time.ns_per_s;
+        const retry_poll_ns = 25 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        var attempts: u32 = 0;
+        while (true) : (attempts += 1) {
+            return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
+                error.EndOfStream => {
+                    std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
+                    if (platform_time.monotonicNs() -| start_ns >= retry_timeout_ns) return err;
+                    sleepNs(retry_poll_ns);
+                    continue;
+                },
+                else => {
+                    std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
+                    return err;
+                },
+            };
+        }
     }
 
     fn stringifyJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -5163,6 +5212,7 @@ pub const ApiHttpServer = struct {
             },
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             else => return error.InternalFailure,
         };
         defer alloc.free(normalized_index_json);
@@ -5174,6 +5224,7 @@ pub const ApiHttpServer = struct {
             .inference_api_key = self.cfg.inference_api_key,
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             else => return error.InternalFailure,
         };
 
@@ -5198,6 +5249,7 @@ pub const ApiHttpServer = struct {
         if (self.table_writes) |table_writes_source| {
             _ = table_writes_source.createIndex(alloc, table_name, index_name, normalized_index_json) catch |err| switch (err) {
                 error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+                error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
                 else => {
                     std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
                 },
@@ -5460,6 +5512,23 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    pub fn handlePublicTableQueryWithContentType(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        content_type: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        if (isNdjsonContentType(content_type)) {
+            return try self.handlePublicTableMultiQuery(table_name, body, authenticated_identity);
+        }
+        return try self.handlePublicTableQuery(table_name, body, authenticated_identity);
+    }
+
+    pub fn handlePublicGlobalMultiQuery(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+        return try self.handlePublicTableMultiQuery(null, body, authenticated_identity);
+    }
+
     pub fn handlePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
@@ -5487,6 +5556,84 @@ pub const ApiHttpServer = struct {
         defer arena_impl.deinit();
         const parsed = try parseJsonResponseBody(metadata_openapi.QueryResponses, arena_impl.allocator(), response_body);
         return try jsonResponse(self.alloc, parsed);
+    }
+
+    fn handlePublicTableMultiQuery(
+        self: *ApiHttpServer,
+        route_table_name: ?[]const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"responses\":[");
+        var emitted: usize = 0;
+
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0) continue;
+
+            const table_name = if (route_table_name) |name| name else blk: {
+                var parsed_table = parseGlobalQueryTable(arena, line) catch {
+                    return try textResponse(self.alloc, 400, "invalid query request");
+                };
+                defer parsed_table.deinit();
+                if (parsed_table.table_name.len == 0) {
+                    return try textResponse(self.alloc, 400, "invalid query request");
+                }
+                break :blk parsed_table.table_name;
+            };
+
+            const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+            defer if (row_filter_json) |value| self.alloc.free(value);
+
+            const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+            const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
+                self.alloc,
+                source,
+                table_name,
+                line,
+                row_filter_json,
+                authenticated_identity,
+            ) catch |err| switch (err) {
+                error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
+                error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                else => {
+                    std.log.err("public table multiquery execution failed table={s} err={}", .{ table_name, err });
+                    return try textResponse(self.alloc, 500, "query failed");
+                },
+            };
+            defer self.alloc.free(response_body);
+
+            var parsed = std.json.parseFromSlice(std.json.Value, arena, response_body, .{
+                .allocate = .alloc_always,
+            }) catch return try textResponse(self.alloc, 500, "query failed");
+            defer parsed.deinit();
+            const object = switch (parsed.value) {
+                .object => |object| object,
+                else => return try textResponse(self.alloc, 500, "query failed"),
+            };
+            const responses_value = object.get("responses") orelse return try textResponse(self.alloc, 500, "query failed");
+            const responses = switch (responses_value) {
+                .array => |array| array.items,
+                else => return try textResponse(self.alloc, 500, "query failed"),
+            };
+            for (responses) |response_value| {
+                if (emitted > 0) try out.writer.writeByte(',');
+                try std.json.Stringify.value(response_value, .{}, &out.writer);
+                emitted += 1;
+            }
+        }
+
+        if (emitted == 0) return try textResponse(self.alloc, 400, "invalid query request");
+        try out.writer.writeAll("]}");
+        return try jsonBodyResponseWithStatus(self.alloc, 200, out.written());
     }
 
     pub fn handlePublicTableListIndexes(self: *ApiHttpServer, table_name: []const u8) !http_common.HttpResponse {
@@ -12080,6 +12227,90 @@ test "api http server maps public query doc identity mismatch to unavailable" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+}
+
+test "api http server retries transient query EndOfStream before returning 500" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeReads = struct {
+        attempts: u32 = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.attempts += 1;
+            if (self.attempts == 1) return error.EndOfStream;
+            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[]}") };
+        }
+    };
+
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
+    defer server.deinit();
+
+    var resp = try server.handlePublicTableQuery("docs",
+        \\{"query":{"match_all":{}}}
+    , null);
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"responses\"") != null);
 }
 
 test "api http server serves internal group transaction routes" {

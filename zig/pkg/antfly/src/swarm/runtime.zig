@@ -80,6 +80,7 @@ const ResolvedPaths = struct {
 
 const SwarmHealthSource = struct {
     data_server: *antfly.data.runtime.DataServer,
+    unified_api_ready: *const std.atomic.Value(bool),
 
     fn readiness(self: *SwarmHealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
@@ -97,8 +98,10 @@ const SwarmHealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *SwarmHealthSource = @ptrCast(@alignCast(ptr));
-        var data_health = antfly.data.runtime.HealthSource{ .data_server = self.data_server };
-        return data_health.readiness().check();
+        return swarmReadyFromState(
+            self.data_server.http_server != null,
+            self.unified_api_ready.load(.acquire),
+        );
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
@@ -107,6 +110,10 @@ const SwarmHealthSource = struct {
         try data_health.metricsWriter().writeMetrics(writer);
     }
 };
+
+fn swarmReadyFromState(api_server_initialized: bool, unified_api_ready: bool) bool {
+    return api_server_initialized and unified_api_ready;
+}
 
 const LocalSwarmMetadata = struct {
     alloc: std.mem.Allocator,
@@ -726,6 +733,7 @@ pub fn runFromIterator(
 
     const bind_host = public_listener.bind_host;
     const bind_port = public_listener.bind_port;
+    var unified_api_ready = std.atomic.Value(bool).init(false);
 
     const thread = std.Thread.spawn(.{}, serveUnified, .{
         alloc,
@@ -734,6 +742,7 @@ pub fn runFromIterator(
         &handler,
         &antfly_node,
         api_server,
+        &unified_api_ready,
     }) catch |err| {
         std.log.err("swarm startup failed step=spawn_unified_http err={}", .{err});
         return err;
@@ -745,6 +754,7 @@ pub fn runFromIterator(
 
     var swarm_health = SwarmHealthSource{
         .data_server = &data_server,
+        .unified_api_ready = &unified_api_ready,
     };
     const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
     const health_port = if (health_enabled)
@@ -786,6 +796,7 @@ fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_em
         .ptr = node,
         .embed_dense_texts = localAntflyEmbedDenseTexts,
         .embed_sparse_texts = localAntflyEmbedSparseTexts,
+        .embed_dense_parts = localAntflyEmbedDenseParts,
         .rerank_texts = localAntflyRerankTexts,
         .generate_text = localAntflyGenerateText,
         .generate_messages = localAntflyGenerateMessages,
@@ -803,6 +814,65 @@ fn localAntflyEmbedDenseTexts(
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     return try node.embedDenseTextsDirect(alloc, model, texts);
+}
+
+fn localAntflyEmbedDenseParts(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const antfly.template.ContentPart,
+) anyerror![][]f32 {
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
+    var values = std.json.Array.init(alloc);
+    defer values.deinit();
+    var encoded_buffers = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (encoded_buffers.items) |buf| alloc.free(buf);
+        encoded_buffers.deinit(alloc);
+    }
+
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| {
+                var obj = std.json.ObjectMap.empty;
+                errdefer obj.deinit(alloc);
+                try obj.put(alloc, "type", .{ .string = "text" });
+                try obj.put(alloc, "text", .{ .string = text });
+                try values.append(.{ .object = obj });
+            },
+            .media_url => |url| {
+                var image_url = std.json.ObjectMap.empty;
+                errdefer image_url.deinit(alloc);
+                try image_url.put(alloc, "url", .{ .string = url });
+
+                var obj = std.json.ObjectMap.empty;
+                errdefer obj.deinit(alloc);
+                try obj.put(alloc, "type", .{ .string = "image_url" });
+                try obj.put(alloc, "image_url", .{ .object = image_url });
+                try values.append(.{ .object = obj });
+            },
+            .binary => |binary_part| {
+                const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
+                const encoded = try alloc.alloc(u8, encoded_len);
+                errdefer alloc.free(encoded);
+                _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
+                try encoded_buffers.append(alloc, encoded);
+
+                var obj = std.json.ObjectMap.empty;
+                errdefer {
+                    obj.deinit(alloc);
+                    _ = encoded_buffers.pop();
+                    alloc.free(encoded);
+                }
+                try obj.put(alloc, "type", .{ .string = "media" });
+                try obj.put(alloc, "data", .{ .string = encoded });
+                try obj.put(alloc, "mime_type", .{ .string = binary_part.mime_type });
+                try values.append(.{ .object = obj });
+            },
+        }
+    }
+
+    return try node.embedDenseJsonInputDirect(alloc, model, .{ .array = values });
 }
 
 fn localAntflyEmbedSparseTexts(
@@ -1097,8 +1167,10 @@ fn serveUnified(
     handler: *AntflyApiHandler,
     antfly_node: ?*inference.server.Node,
     api_server: *antfly.public_api.http_server.ApiHttpServer,
+    unified_api_ready: *std.atomic.Value(bool),
 ) void {
-    serveUnifiedInner(alloc, bind_host, bind_port, handler, antfly_node, api_server) catch |err| {
+    serveUnifiedInner(alloc, bind_host, bind_port, handler, antfly_node, api_server, unified_api_ready) catch |err| {
+        unified_api_ready.store(false, .release);
         std.debug.print("unified server error: {}\n", .{err});
     };
 }
@@ -1110,6 +1182,7 @@ fn serveUnifiedInner(
     handler: *AntflyApiHandler,
     antfly_node: ?*inference.server.Node,
     api_server: *antfly.public_api.http_server.ApiHttpServer,
+    unified_api_ready: *std.atomic.Value(bool),
 ) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1142,6 +1215,7 @@ fn serveUnifiedInner(
     try registerAntfarmRoutes(&server);
 
     try server.bind();
+    unified_api_ready.store(true, .release);
 
     if (server.boundAddress()) |addr| {
         std.debug.print("swarm public api listening on http://{}\n", .{addr});
@@ -2060,6 +2134,13 @@ test "swarm public api caps keep alive request reuse" {
 
 test "swarm public api body limit matches common http listener" {
     try std.testing.expectEqual(antfly.common.http.default_max_request_bytes, public_api_max_body_size);
+}
+
+test "swarm readiness follows api initialization and unified listener" {
+    try std.testing.expect(!swarmReadyFromState(false, false));
+    try std.testing.expect(!swarmReadyFromState(false, true));
+    try std.testing.expect(!swarmReadyFromState(true, false));
+    try std.testing.expect(swarmReadyFromState(true, true));
 }
 
 test "parse cli accepts inference budget overrides" {

@@ -34,6 +34,7 @@ const public_table_http = @import("public_table_http.zig");
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
 const table_reads = @import("table_reads.zig");
+const table_writes = @import("table_writes.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const transactions_api = @import("transactions.zig");
 const distributed_txn = @import("distributed_txn.zig");
@@ -73,6 +74,12 @@ fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlob
         .parsed = parsed,
         .table_name = parsed.value.table orelse "",
     };
+}
+
+fn isNdjsonContentType(content_type: ?[]const u8) bool {
+    const value = content_type orelse return false;
+    const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, value, ';')) |idx| value[0..idx] else value, " \t");
+    return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
 }
 
 pub const AntflyApiHandler = struct {
@@ -1144,6 +1151,13 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
+        if (isNdjsonContentType(ctx.header("content-type"))) {
+            var resp = try self.api_server.handlePublicGlobalMultiQuery(
+                body_data,
+                authenticated_identity,
+            );
+            return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+        }
         var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data) catch {
             _ = ctx.status(400);
             return ctx.text("invalid query request");
@@ -1482,6 +1496,28 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid create table request");
         };
         defer create_req.deinit(alloc);
+        const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+            alloc,
+            create_req.indexes_json orelse tables_api.default_indexes_json,
+            .{
+                .antfly_provider = self.api_server.antfly_provider,
+                .secret_store = self.api_server.cfg.secret_store,
+                .remote_content = self.api_server.cfg.remote_content,
+                .inference_api_key = self.api_server.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => {
+                _ = ctx.status(400);
+                return ctx.text("unsupported table index configuration");
+            },
+            error.EmbeddingProbeUnavailable => {
+                _ = ctx.status(503);
+                return ctx.text("table index validation probe unavailable");
+            },
+            else => return err,
+        };
+        if (create_req.indexes_json) |old_indexes_json| alloc.free(old_indexes_json);
+        create_req.indexes_json = normalized_indexes_json;
         tables_api.validatePublicAlgebraicIndexesJson(alloc, create_req.indexes_json orelse tables_api.default_indexes_json) catch {
             _ = ctx.status(400);
             return ctx.text("unsupported table index configuration");
@@ -1517,6 +1553,10 @@ pub const AntflyApiHandler = struct {
                 error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => {
                     _ = ctx.status(400);
                     return ctx.text("unsupported table index configuration");
+                },
+                error.EmbeddingProbeUnavailable => {
+                    _ = ctx.status(503);
+                    return ctx.text("table index validation probe unavailable");
                 },
                 else => {
                     std.log.err("public create table local create failed table={s} err={}", .{ table_name, err });
@@ -1632,9 +1672,10 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        var resp = try self.api_server.handlePublicTableQuery(
+        var resp = try self.api_server.handlePublicTableQueryWithContentType(
             table_name,
             body_data,
+            ctx.header("content-type"),
             authenticated_identity,
         );
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
@@ -3107,6 +3148,74 @@ test "httpx global query table name comes from request body" {
     defer parsed_table.deinit();
 
     try std.testing.expectEqualStrings("files", parsed_table.table_name);
+}
+
+test "httpx query endpoints accept ndjson multiquery bodies" {
+    const alloc = std.testing.allocator;
+    const db_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-httpx-handler-ndjson-query-{d}", .{platform_time.monotonicNs()});
+    defer alloc.free(db_path);
+
+    var fs_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer fs_io.deinit();
+    std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
+
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
+    }
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value = "{\"title\":\"alpha\",\"body\":\"hello\"}",
+            },
+        },
+        .timestamp_ns = 4321,
+    });
+
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var source = LookupStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
+
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const table_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/query", .{base_url});
+    defer alloc.free(table_url);
+    const global_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/query", .{base_url});
+    defer alloc.free(global_url);
+    const headers = [_][2][]const u8{.{ "content-type", "application/x-ndjson" }};
+
+    const table_body =
+        \\{"fields":["title"],"limit":1}
+        \\{"fields":["title"],"limit":1}
+    ;
+    var table_resp = try requestWithRetry(&client, client_io.io(), .POST, table_url, table_body, &headers, 20);
+    defer table_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), table_resp.status.code);
+    var table_parsed = try std.json.parseFromSlice(std.json.Value, alloc, table_resp.body.?, .{ .ignore_unknown_fields = true });
+    defer table_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), table_parsed.value.object.get("responses").?.array.items.len);
+
+    const global_body =
+        \\{"table":"docs","fields":["title"],"limit":1}
+        \\{"table":"docs","fields":["title"],"limit":1}
+    ;
+    var global_resp = try requestWithRetry(&client, client_io.io(), .POST, global_url, global_body, &headers, 20);
+    defer global_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), global_resp.status.code);
+    var global_parsed = try std.json.parseFromSlice(std.json.Value, alloc, global_resp.body.?, .{ .ignore_unknown_fields = true });
+    defer global_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), global_parsed.value.object.get("responses").?.array.items.len);
 }
 
 test "httpx antfly cluster restore preserves backup location validation" {

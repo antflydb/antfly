@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
+from urllib.parse import quote
 
 import pytest
 import requests
@@ -124,7 +126,9 @@ def test_multi_shard_batch_commit(stateful_api):
         timeout_s=10.0,
         interval_s=0.1,
     )
-    assert visible_initial == initial_docs
+    assert visible_initial == initial_docs, _visibility_diagnostic(
+        stateful_api, table_name, initial_docs, visible_initial
+    )
 
     updated_docs = {
         "0_account_a": {"name": "Alice", "balance": 1100},
@@ -140,7 +144,9 @@ def test_multi_shard_batch_commit(stateful_api):
         timeout_s=10.0,
         interval_s=0.1,
     )
-    assert visible_updated == updated_docs
+    assert visible_updated == updated_docs, _visibility_diagnostic(
+        stateful_api, table_name, updated_docs, visible_updated
+    )
 
 
 def test_atomic_multi_key_update_preserves_balance_sum(stateful_api):
@@ -966,6 +972,92 @@ def _create_tables(stateful_api, prefix: str) -> tuple[str, str]:
     assert created_b["name"] == table_b
 
     return table_a, table_b
+
+
+def _visibility_diagnostic(
+    stateful_api,
+    table_name: str,
+    expected: dict[str, dict],
+    observed: dict[str, dict] | None,
+) -> str:
+    parts = [
+        f"[table] {table_name}",
+        f"[expected]\n{_format_json(expected)}",
+        f"[observed]\n{_format_json(observed)}",
+    ]
+    _append_response_diagnostic(parts, stateful_api, "public status", "GET", "/status")
+    _append_response_diagnostic(parts, stateful_api, "table status", "GET", f"/tables/{table_name}")
+    _append_response_diagnostic(parts, stateful_api, "table indexes", "GET", f"/tables/{table_name}/indexes")
+    for key in expected:
+        escaped_key = quote(key, safe="")
+        path = f"/tables/{table_name}/lookup/{escaped_key}"
+        _append_response_diagnostic(parts, stateful_api, f"lookup {key}", "GET", path)
+
+    server = getattr(stateful_api, "_server", None)
+    metadata_admin_url = getattr(server, "metadata_admin_url", None)
+    if metadata_admin_url:
+        try:
+            response = requests.get(f"{metadata_admin_url}/metadata/v1/status", timeout=5)
+        except Exception as exc:  # pragma: no cover - failure diagnostics only
+            parts.append(f"[metadata status]\nrequest error: {exc!r}")
+        else:
+            parts.append(
+                f"[metadata status]\nGET /metadata/v1/status\n"
+                f"{response.status_code} {response.reason} {response.url}\n"
+                f"{_format_body(response.text)}"
+            )
+
+    if server is not None:
+        try:
+            logs = server.debug_logs()
+        except Exception as exc:  # pragma: no cover - failure diagnostics only
+            parts.append(f"[server logs]\nread error: {exc!r}")
+        else:
+            parts.append(f"[server logs]\n{_tail(logs.strip(), 12000)}")
+    return "\n\n".join(parts)
+
+
+def _append_response_diagnostic(
+    parts: list[str],
+    stateful_api,
+    label: str,
+    method: str,
+    path: str,
+) -> None:
+    try:
+        response = stateful_api._request(method, path)
+    except Exception as exc:  # pragma: no cover - failure diagnostics only
+        parts.append(f"[{label}]\nrequest error: {exc!r}")
+        return
+    parts.append(
+        f"[{label}]\n{method} {path}\n"
+        f"{response.status_code} {response.reason} {response.url}\n"
+        f"{_format_body(response.text)}"
+    )
+
+
+def _format_body(text: str, limit: int = 4000) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return "<empty>"
+    try:
+        decoded = json.loads(stripped)
+    except json.JSONDecodeError:
+        return _tail(stripped, limit)
+    return _tail(_format_json(decoded), limit)
+
+
+def _format_json(value: object) -> str:
+    try:
+        return json.dumps(value, indent=2, sort_keys=True)
+    except TypeError:
+        return repr(value)
+
+
+def _tail(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return f"... truncated {len(value) - limit} chars ...\n{value[-limit:]}"
 
 
 def _lookup_with_version(stateful_api, table_name: str, key: str) -> tuple[dict, str | None] | None:

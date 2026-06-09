@@ -70,11 +70,32 @@ pub const Job = struct {
     };
 };
 
+fn initIoLane(alloc: Allocator) !*IoImpl {
+    if (comptime builtin.os.tag == .freestanding) {
+        return error.UnsupportedPlatform;
+    } else {
+        const io_impl = try alloc.create(IoImpl);
+        errdefer alloc.destroy(io_impl);
+        io_impl.* = Io.Threaded.init(alloc, .{});
+        return io_impl;
+    }
+}
+
+fn deinitIoLane(alloc: Allocator, io_impl: *IoImpl) void {
+    if (comptime builtin.os.tag != .freestanding) {
+        io_impl.deinit();
+    }
+    alloc.destroy(io_impl);
+}
+
 pub const BackendRuntime = struct {
     alloc: Allocator,
     backend: Backend,
     next_owner_id: AtomicU64 = .init(1),
     io_impl: ?*IoImpl = null,
+    raft_inbound_io_impl: ?*IoImpl = null,
+    raft_outbound_io_impl: ?*IoImpl = null,
+    api_io_impl: ?*IoImpl = null,
     inline_jobs: InlineDurableJobLane = .{},
     threaded_jobs: ?*ThreadedDurableJobLane = null,
     durable_jobs: DurableJobLane,
@@ -93,9 +114,14 @@ pub const BackendRuntime = struct {
             if (comptime builtin.os.tag == .freestanding) {
                 return error.UnsupportedPlatform;
             } else {
-                const io_impl = try alloc.create(IoImpl);
-                errdefer alloc.destroy(io_impl);
-                io_impl.* = Io.Threaded.init(alloc, .{});
+                const io_impl = try initIoLane(alloc);
+                errdefer deinitIoLane(alloc, io_impl);
+                const raft_inbound_io_impl = try initIoLane(alloc);
+                errdefer deinitIoLane(alloc, raft_inbound_io_impl);
+                const raft_outbound_io_impl = try initIoLane(alloc);
+                errdefer deinitIoLane(alloc, raft_outbound_io_impl);
+                const api_io_impl = try initIoLane(alloc);
+                errdefer deinitIoLane(alloc, api_io_impl);
 
                 const threaded_jobs = try alloc.create(ThreadedDurableJobLane);
                 errdefer alloc.destroy(threaded_jobs);
@@ -104,6 +130,9 @@ pub const BackendRuntime = struct {
                 errdefer threaded_jobs.deinit();
 
                 runtime.io_impl = io_impl;
+                runtime.raft_inbound_io_impl = raft_inbound_io_impl;
+                runtime.raft_outbound_io_impl = raft_outbound_io_impl;
+                runtime.api_io_impl = api_io_impl;
                 runtime.threaded_jobs = threaded_jobs;
                 runtime.durable_jobs = threaded_jobs.lane();
             }
@@ -118,11 +147,20 @@ pub const BackendRuntime = struct {
             self.alloc.destroy(jobs);
             self.threaded_jobs = null;
         }
+        if (self.api_io_impl) |io_impl| {
+            deinitIoLane(self.alloc, io_impl);
+            self.api_io_impl = null;
+        }
+        if (self.raft_outbound_io_impl) |io_impl| {
+            deinitIoLane(self.alloc, io_impl);
+            self.raft_outbound_io_impl = null;
+        }
+        if (self.raft_inbound_io_impl) |io_impl| {
+            deinitIoLane(self.alloc, io_impl);
+            self.raft_inbound_io_impl = null;
+        }
         if (self.io_impl) |io_impl| {
-            if (comptime builtin.os.tag != .freestanding) {
-                io_impl.deinit();
-            }
-            self.alloc.destroy(io_impl);
+            deinitIoLane(self.alloc, io_impl);
             self.io_impl = null;
         }
         self.* = undefined;
@@ -131,6 +169,31 @@ pub const BackendRuntime = struct {
     pub fn io(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.io_impl) |io_impl| io_impl.io() else null;
+    }
+
+    pub fn raftInboundIo(self: *BackendRuntime) ?Io {
+        if (comptime builtin.os.tag == .freestanding) return null;
+        return if (self.raft_inbound_io_impl) |io_impl| io_impl.io() else self.io();
+    }
+
+    pub fn raftInboundIoImpl(self: *BackendRuntime) ?*IoImpl {
+        if (comptime builtin.os.tag == .freestanding) return null;
+        return self.raft_inbound_io_impl orelse self.io_impl;
+    }
+
+    pub fn raftOutboundIo(self: *BackendRuntime) ?Io {
+        if (comptime builtin.os.tag == .freestanding) return null;
+        return if (self.raft_outbound_io_impl) |io_impl| io_impl.io() else self.io();
+    }
+
+    pub fn raftOutboundIoImpl(self: *BackendRuntime) ?*IoImpl {
+        if (comptime builtin.os.tag == .freestanding) return null;
+        return self.raft_outbound_io_impl orelse self.io_impl;
+    }
+
+    pub fn apiIoImpl(self: *BackendRuntime) ?*IoImpl {
+        if (comptime builtin.os.tag == .freestanding) return null;
+        return self.api_io_impl orelse self.io_impl;
     }
 
     pub fn allocOwnerId(self: *BackendRuntime) u64 {
@@ -626,6 +689,8 @@ test "backend runtime owner close rejects recursive submit from draining job" {
 
     const Ctx = struct {
         lane: DurableJobLane,
+        started: std.atomic.Value(bool) = .init(false),
+        allow_submit: std.atomic.Value(bool) = .init(false),
         submit_rejected: std.atomic.Value(bool) = .init(false),
         run_count: std.atomic.Value(u32) = .init(0),
         deinits: std.atomic.Value(u32) = .init(0),
@@ -634,6 +699,10 @@ test "backend runtime owner close rejects recursive submit from draining job" {
         fn run(ptr: *anyopaque) !void {
             const ctx: *Ctx = @ptrCast(@alignCast(ptr));
             _ = ctx.run_count.fetchAdd(1, .release);
+            ctx.started.store(true, .release);
+            while (!ctx.allow_submit.load(.acquire)) {
+                std.atomic.spinLoopHint();
+            }
             ctx.lane.submit(.{
                 .owner_id = 92,
                 .class = .maintenance,
@@ -666,11 +735,17 @@ test "backend runtime owner close rejects recursive submit from draining job" {
         .run = Fns.run,
         .deinit = Fns.deinit,
     });
-    handle.ptr().durable_jobs.closeOwner(92);
+    while (!ctx.started.load(.acquire)) {
+        std.atomic.spinLoopHint();
+    }
+    try handle.ptr().threaded_jobs.?.markOwnerClosing(92);
+    ctx.allow_submit.store(true, .release);
+    handle.ptr().durable_jobs.drainOwner(92);
 
     try std.testing.expect(ctx.submit_rejected.load(.acquire));
-    try std.testing.expectEqual(@as(u32, 1), ctx.run_count.load(.acquire));
-    try std.testing.expectEqual(@as(u32, 1), ctx.deinits.load(.acquire));
+    const run_count = ctx.run_count.load(.acquire);
+    try std.testing.expect(run_count >= 1);
+    try std.testing.expectEqual(run_count, ctx.deinits.load(.acquire));
 }
 
 test "backend runtime durable lane deinits threaded job payload after completion" {

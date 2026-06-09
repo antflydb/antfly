@@ -44,6 +44,7 @@ const runtime_status_refresh_max_db_opens_per_run: usize = 16;
 const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_s;
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
 const provisioned_startup_catch_up_interval_ms: u64 = std.time.ms_per_s;
+const metrics_lsm_maintenance_snapshot_ttl_ns: u64 = 60 * std.time.ns_per_s;
 const data_raft_batch_leader_wait_ns: u64 = 25 * std.time.ns_per_s;
 const data_raft_batch_leader_retry_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const data_raft_metadata_resync_interval_ns: u64 = 500 * std.time.ns_per_ms;
@@ -317,12 +318,24 @@ const RaftTableApplyStateMachine = struct {
     }
 };
 
-/// Backs the standalone data server's health/metrics endpoints. The data
-/// server has no local raft, so readiness is delegated to its remote
-/// metadata status source (which mirrors the existing `/readyz` logic on
-/// the main API port) and metrics export a minimal up gauge.
+/// Backs the standalone data server's health/metrics endpoints. Readiness is
+/// local-only so Kubernetes probes cannot block indefinitely behind a wedged
+/// remote metadata API.
 pub const HealthSource = struct {
     data_server: *DataServer,
+    lsm_maintenance_metrics_mutex: std.atomic.Mutex = .unlocked,
+    lsm_maintenance_metrics_stats: lsm_backend_mod.Backend.MaintenanceStats = .{},
+    lsm_maintenance_metrics_built_at_ns: u64 = 0,
+    lsm_maintenance_metrics_last_refresh_duration_ns: u64 = 0,
+    lsm_maintenance_metrics_refreshes: u64 = 0,
+    lsm_maintenance_metrics_refreshing: bool = false,
+
+    const CachedLsmMaintenanceStats = struct {
+        stats: lsm_backend_mod.Backend.MaintenanceStats,
+        age_ns: u64,
+        last_refresh_duration_ns: u64,
+        refreshes: u64,
+    };
 
     pub fn readiness(self: *HealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
@@ -340,8 +353,7 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
-        _ = self.data_server.status_source.status() catch return false;
-        return true;
+        return self.data_server.http_server != null and self.data_server.listener != null;
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
@@ -468,13 +480,62 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_bulk_deferred_total", "counter", "Data server LSM maintenance background wake cycles deferred behind active bulk ingest", self.data_server.lsm_maintenance_bulk_deferred.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_lock_deferred_total", "counter", "Data server LSM maintenance background wake cycles deferred behind foreground locks", self.data_server.lsm_maintenance_lock_deferred.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_next_eligible_ns", "gauge", "Monotonic timestamp when background LSM maintenance can next run", self.data_server.lsm_maintenance_next_eligible_ns.load(.monotonic));
-        try writeLsmMaintenanceMetrics(writer, self.data_server.write_source.lsmMaintenanceStatsBestEffort());
+        const lsm_maintenance_stats = self.cachedLsmMaintenanceStats();
+        try writeLsmMaintenanceSnapshotMetrics(writer, lsm_maintenance_stats);
+        try writeLsmMaintenanceMetrics(writer, lsm_maintenance_stats.stats);
         try writeLsmWriteMetrics(writer, self.data_server.write_source.lsmWriteStatsBestEffort());
         try writeTextMergeMetrics(writer, self.data_server.write_source.textMergeStatsBestEffort());
         try writeAsyncIndexingMetrics(writer, self.data_server.write_source.asyncIndexingStatsBestEffort());
         try antfly.db.query_metrics.writePrometheus(writer);
     }
+
+    fn cachedLsmMaintenanceStats(self: *HealthSource) CachedLsmMaintenanceStats {
+        const now_ns: u64 = @intCast(platform_time.monotonicNs());
+        var should_refresh = false;
+        lockAtomic(&self.lsm_maintenance_metrics_mutex);
+        if ((self.lsm_maintenance_metrics_built_at_ns == 0 or ageSinceNs(now_ns, self.lsm_maintenance_metrics_built_at_ns) >= metrics_lsm_maintenance_snapshot_ttl_ns) and !self.lsm_maintenance_metrics_refreshing) {
+            self.lsm_maintenance_metrics_refreshing = true;
+            should_refresh = true;
+        }
+        const cached = self.lsmMaintenanceStatsSnapshotLocked(now_ns);
+        self.lsm_maintenance_metrics_mutex.unlock();
+        if (!should_refresh) return cached;
+
+        const refresh_started_ns: u64 = @intCast(platform_time.monotonicNs());
+        const refreshed_stats = self.data_server.write_source.lsmMaintenanceStatsBestEffort();
+        const refresh_finished_ns: u64 = @intCast(platform_time.monotonicNs());
+
+        lockAtomic(&self.lsm_maintenance_metrics_mutex);
+        self.lsm_maintenance_metrics_stats = refreshed_stats;
+        self.lsm_maintenance_metrics_built_at_ns = refresh_finished_ns;
+        self.lsm_maintenance_metrics_last_refresh_duration_ns = refresh_finished_ns - refresh_started_ns;
+        self.lsm_maintenance_metrics_refreshes += 1;
+        self.lsm_maintenance_metrics_refreshing = false;
+        const refreshed = self.lsmMaintenanceStatsSnapshotLocked(refresh_finished_ns);
+        self.lsm_maintenance_metrics_mutex.unlock();
+        return refreshed;
+    }
+
+    fn lsmMaintenanceStatsSnapshotLocked(self: *const HealthSource, now_ns: u64) CachedLsmMaintenanceStats {
+        return .{
+            .stats = self.lsm_maintenance_metrics_stats,
+            .age_ns = ageSinceNs(now_ns, self.lsm_maintenance_metrics_built_at_ns),
+            .last_refresh_duration_ns = self.lsm_maintenance_metrics_last_refresh_duration_ns,
+            .refreshes = self.lsm_maintenance_metrics_refreshes,
+        };
+    }
 };
+
+fn ageSinceNs(now_ns: u64, built_at_ns: u64) u64 {
+    if (built_at_ns == 0 or now_ns < built_at_ns) return 0;
+    return now_ns - built_at_ns;
+}
+
+fn writeLsmMaintenanceSnapshotMetrics(writer: *std.Io.Writer, snapshot: HealthSource.CachedLsmMaintenanceStats) !void {
+    try health_metrics.appendPromMetric(writer, "antfly_metrics_lsm_snapshot_age_seconds", "gauge", "Age of the cached LSM maintenance metrics snapshot", snapshot.age_ns / std.time.ns_per_s);
+    try health_metrics.appendPromMetric(writer, "antfly_metrics_lsm_snapshot_refreshes_total", "counter", "Cached LSM maintenance metrics snapshot refreshes completed", snapshot.refreshes);
+    try health_metrics.appendPromMetric(writer, "antfly_metrics_lsm_snapshot_last_refresh_duration_ns", "gauge", "Duration of the most recent LSM maintenance metrics snapshot refresh in monotonic nanoseconds", snapshot.last_refresh_duration_ns);
+}
 
 fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.MaintenanceStats) !void {
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_entries", "gauge", "Cached write LSM active mutable memtable entries", stats.mutable_entries);
@@ -1914,27 +1975,31 @@ pub const DataServer = struct {
             self.data_raft_base_uri = try raft.baseUri(self.alloc);
         }
         if (self.listener == null) {
-            self.listener = antfly.raft.transport.std_http_listener.StdHttpListener.init(
-                self.alloc,
-                self.listener_cfg,
-                self.http_server.?.executor(),
-            );
+            self.listener = if (self.backend_runtime) |runtime|
+                if (runtime.apiIoImpl()) |io_impl|
+                    antfly.raft.transport.std_http_listener.StdHttpListener.initShared(
+                        self.alloc,
+                        self.listener_cfg,
+                        self.http_server.?.executor(),
+                        io_impl,
+                    )
+                else
+                    antfly.raft.transport.std_http_listener.StdHttpListener.init(
+                        self.alloc,
+                        self.listener_cfg,
+                        self.http_server.?.executor(),
+                    )
+            else
+                antfly.raft.transport.std_http_listener.StdHttpListener.init(
+                    self.alloc,
+                    self.listener_cfg,
+                    self.http_server.?.executor(),
+                );
         }
         self.listener.?.setStreamingExecutor(self.http_server.?.streamingExecutor());
         try self.listener.?.start();
         if (self.store_registration != null) {
             self.store_status_dirty = true;
-            self.registerNodeIfConfigured() catch |err| switch (err) {
-                error.HttpConnectionClosing,
-                error.ConnectionResetByPeer,
-                error.ConnectionRefused,
-                error.BrokenPipe,
-                error.EndOfStream,
-                error.UnexpectedHttpStatus,
-                error.NotListening,
-                => std.log.warn("data node registration deferred err={}", .{err}),
-                else => return err,
-            };
         }
         self.requestRuntimeStatusRefresh() catch |err| switch (err) {
             error.ThreadQuotaExceeded,
@@ -5486,6 +5551,10 @@ pub const DataServer = struct {
         remote_metadata.* = try RemoteMetadataSource.init(alloc, metadata_api_urls);
         errdefer remote_metadata.deinit();
 
+        var owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null;
+        errdefer if (owned_backend_runtime) |*runtime| runtime.deinit();
+        var backend_runtime = cfg.backend_runtime;
+
         var data_raft_store: ?*raft_engine.core.MemoryStorage = null;
         errdefer if (data_raft_store) |store| {
             store.deinit();
@@ -5509,6 +5578,12 @@ pub const DataServer = struct {
 
         if (cfg.enable_data_raft) {
             if (cfg.store_registration) |registration| {
+                if (backend_runtime == null) {
+                    owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+                    backend_runtime = owned_backend_runtime.?.ptr();
+                }
+                const raft_backend_runtime = backend_runtime.?;
+
                 data_raft_store = try alloc.create(raft_engine.core.MemoryStorage);
                 data_raft_store.?.* = raft_engine.core.MemoryStorage.init(alloc);
 
@@ -5520,7 +5595,7 @@ pub const DataServer = struct {
                     alloc,
                     cfg.replica_root_dir,
                     remote_metadata.catalogSource(),
-                    cfg.backend_runtime,
+                    raft_backend_runtime,
                 );
 
                 data_raft = try alloc.create(antfly.raft.ManagedHttpHostService);
@@ -5544,6 +5619,7 @@ pub const DataServer = struct {
                     },
                 }, .{
                     .http = .{
+                        .backend_runtime = raft_backend_runtime,
                         .host = .{
                             .descriptor_factory = data_raft_factory.?.iface(),
                             .runtime_hooks = .{
@@ -5557,7 +5633,7 @@ pub const DataServer = struct {
             }
         }
 
-        return .{
+        const server = DataServer{
             .alloc = alloc,
             .remote_metadata = remote_metadata,
             .data_raft = data_raft,
@@ -5581,9 +5657,12 @@ pub const DataServer = struct {
             .status_source = remote_metadata.statusSource(),
             .api_server_cfg = cfg.api_server_cfg,
             .query_async_limit = cfg.query_async_limit,
-            .backend_runtime = cfg.backend_runtime,
+            .backend_runtime = backend_runtime,
+            .owned_backend_runtime = owned_backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
+        owned_backend_runtime = null;
+        return server;
     }
 };
 
@@ -12971,6 +13050,9 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_provisioned_read_cache_misses_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_provisioned_write_cache_hits_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_provisioned_write_cache_misses_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_metrics_lsm_snapshot_age_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_metrics_lsm_snapshot_refreshes_total 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_metrics_lsm_snapshot_last_refresh_duration_ns") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_mutable_bytes 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_immutable_memtables 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_immutable_bytes 0") != null);

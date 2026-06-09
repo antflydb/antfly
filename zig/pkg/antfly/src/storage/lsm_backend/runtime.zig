@@ -2195,9 +2195,11 @@ fn readManyCurrentSortedPointByRunLocked(
 
             const maybe_value = if (run.state) |*present_state| blk: {
                 if (!runMayContain(run.*, namespace, keys[key_index])) break :blk null;
-                if (!lsm_table_file.maybeContains(try run.ensureBloomFilter(backend.allocator), namespace.name, keys[key_index])) {
-                    backend.recordBloomNegative();
-                    break :blk null;
+                if (try ensureRunBloomFilterForRead(backend, run)) |filter| {
+                    if (!lsm_table_file.maybeContains(filter, namespace.name, keys[key_index])) {
+                        backend.recordBloomNegative();
+                        break :blk null;
+                    }
                 }
                 state = present_state;
                 break :blk state.?;
@@ -4274,7 +4276,7 @@ fn getFromRunIndices(
                     continue;
                 }
             }
-            const run_filter_checked = run.bloom_filter != null or run.encoded_bloom_filter != null;
+            const run_filter_checked = run.bloom_filter != null or run.path != null;
             if (run_filter_checked and !try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, backend_locked)) continue;
             if (backend.options.cache != null) {
                 const located = if (batch_run_indexes) |indexes|
@@ -4402,11 +4404,12 @@ fn getFromCachedRunStates(
     namespace: backend_types.Namespace,
     key: []const u8,
 ) !CachedPointLookupResult {
+    _ = allocator;
     for (run_indices) |run_index| {
         const run = &runs[run_index];
         if (!runMayContain(run.*, namespace, key)) continue;
-        if (!lsm_table_file.maybeContains(try run.ensureBloomFilter(allocator), namespace.name, key)) {
-            continue;
+        if (try ensureRunBloomFilterForRead(backend, run)) |filter| {
+            if (!lsm_table_file.maybeContains(filter, namespace.name, key)) continue;
         }
         const state = if (run.state) |*present|
             present
@@ -5260,40 +5263,26 @@ fn runMayContainWithFilterMaybeLocked(
 
 fn ensureRunBloomFilterForRead(backend: anytype, run: *Run) !?bloom.OwnedFilter {
     if (run.bloom_filter) |filter| return filter;
-    if (run.encoded_bloom_filter == null) return null;
 
     const locked = lockBackend(@TypeOf(backend.*), backend);
     defer unlockBackend(@TypeOf(backend.*), backend, locked);
-
-    if (@hasField(@TypeOf(backend.*), "runs")) {
-        for (backend.runs.items) |*source_run| {
-            if (source_run.id != run.id) continue;
-            if (!sameRunPath(source_run.path, run.path)) continue;
-
-            const filter = try source_run.ensureBloomFilter(backend.allocator);
-            if (source_run != run) {
-                run.bloom_filter = filter;
-                run.owns_bloom_filter = false;
-            }
-            return filter;
-        }
-    }
-
-    return try run.ensureBloomFilter(backend.allocator);
+    return try ensureRunBloomFilterForReadLocked(backend, run, locked);
 }
 
 fn ensureRunBloomFilterForReadMaybeLocked(backend: anytype, run: *Run, backend_locked: bool) !?bloom.OwnedFilter {
     if (!backend_locked) return try ensureRunBloomFilterForRead(backend, run);
+    return try ensureRunBloomFilterForReadLocked(backend, run, true);
+}
 
+fn ensureRunBloomFilterForReadLocked(backend: anytype, run: *Run, backend_locked: bool) !?bloom.OwnedFilter {
     if (run.bloom_filter) |filter| return filter;
-    if (run.encoded_bloom_filter == null) return null;
 
     if (@hasField(@TypeOf(backend.*), "runs")) {
         for (backend.runs.items) |*source_run| {
             if (source_run.id != run.id) continue;
             if (!sameRunPath(source_run.path, run.path)) continue;
 
-            const filter = try source_run.ensureBloomFilter(backend.allocator);
+            const filter = try materializeRunBloomFilterForRead(backend, source_run, backend_locked);
             if (source_run != run) {
                 run.bloom_filter = filter;
                 run.owns_bloom_filter = false;
@@ -5302,7 +5291,24 @@ fn ensureRunBloomFilterForReadMaybeLocked(backend: anytype, run: *Run, backend_l
         }
     }
 
-    return try run.ensureBloomFilter(backend.allocator);
+    return try materializeRunBloomFilterForRead(backend, run, backend_locked);
+}
+
+fn materializeRunBloomFilterForRead(backend: anytype, run: *Run, backend_locked: bool) !?bloom.OwnedFilter {
+    if (run.bloom_filter) |filter| return filter;
+    if (run.path == null) return null;
+
+    const filter = if (backend.options.cache != null) blk: {
+        var handle = try loadRunTableIndexHandle(backend, run);
+        defer handle.release();
+        break :blk try handle.runTableIndex().borrowFilter().clone(backend.allocator);
+    } else blk: {
+        const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
+        break :blk try index.borrowFilter().clone(backend.allocator);
+    };
+    run.bloom_filter = filter;
+    run.owns_bloom_filter = true;
+    return run.bloom_filter.?;
 }
 
 fn sameRunPath(lhs: ?[]const u8, rhs: ?[]const u8) bool {
