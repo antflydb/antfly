@@ -65,6 +65,16 @@ pub const LsmStorageStatus = struct {
     level_overflow_bytes: u64 = 0,
     obsolete_path_count: u64 = 0,
     current_manifest_bytes: u64 = 0,
+    mutable_entry_count: u64 = 0,
+    mutable_bytes: u64 = 0,
+    immutable_memtable_count: u64 = 0,
+    immutable_entry_count: u64 = 0,
+    immutable_bytes: u64 = 0,
+    mutable_snapshot_clone_count: u64 = 0,
+    mutable_snapshot_clone_bytes: u64 = 0,
+    mutable_snapshot_clone_peak_bytes: u64 = 0,
+    read_snapshot_mutable_rotation_count: u64 = 0,
+    read_snapshot_mutable_rotation_bytes: u64 = 0,
     wal_retained_bytes: u64 = 0,
     compaction_backlog_bytes: u64 = 0,
     active_readers: u64 = 0,
@@ -90,7 +100,18 @@ pub const LsmStorageStatus = struct {
     direct_bulk_ingest_attempt_count: u64 = 0,
     direct_bulk_ingest_success_count: u64 = 0,
     direct_bulk_ingest_entry_count: u64 = 0,
+    bulk_append_attempt_count: u64 = 0,
+    bulk_append_entry_count: u64 = 0,
+    bulk_append_direct_success_count: u64 = 0,
+    bulk_append_direct_entry_count: u64 = 0,
+    bulk_append_fallback_backend_pending_count: u64 = 0,
+    bulk_append_fallback_below_threshold_count: u64 = 0,
+    bulk_append_fallback_duplicate_key_count: u64 = 0,
+    bulk_append_fallback_to_mutable_entry_count: u64 = 0,
     direct_bulk_ingest_direct_entry_count: u64 = 0,
+    direct_bulk_ingest_fallback_unsupported_count: u64 = 0,
+    direct_bulk_ingest_fallback_backend_mutable_count: u64 = 0,
+    direct_bulk_ingest_fallback_below_threshold_count: u64 = 0,
 };
 
 pub const TableStorageStatus = struct {
@@ -122,6 +143,16 @@ pub fn lsmStorageStatusFromStats(stats: table_reads.LsmStorageStats) LsmStorageS
         .level_overflow_bytes = maintenance.level_overflow_bytes,
         .obsolete_path_count = maintenance.obsolete_paths,
         .current_manifest_bytes = maintenance.current_manifest_bytes,
+        .mutable_entry_count = maintenance.mutable_entries,
+        .mutable_bytes = maintenance.mutable_bytes,
+        .immutable_memtable_count = maintenance.immutable_memtables,
+        .immutable_entry_count = maintenance.immutable_entries,
+        .immutable_bytes = maintenance.immutable_bytes,
+        .mutable_snapshot_clone_count = maintenance.mutable_snapshot_clone_calls,
+        .mutable_snapshot_clone_bytes = maintenance.mutable_snapshot_clone_bytes_total,
+        .mutable_snapshot_clone_peak_bytes = maintenance.mutable_snapshot_clone_peak_bytes,
+        .read_snapshot_mutable_rotation_count = maintenance.read_snapshot_mutable_rotations,
+        .read_snapshot_mutable_rotation_bytes = maintenance.read_snapshot_mutable_rotation_bytes_total,
         .wal_retained_bytes = maintenance.wal_retained_bytes,
         .compaction_backlog_bytes = maintenance.compaction_scheduler_remembered_pending_bytes,
         .active_readers = maintenance.active_readers,
@@ -144,10 +175,21 @@ pub fn lsmStorageStatusFromStats(stats: table_reads.LsmStorageStats) LsmStorageS
         .write_pressure_overload_l0_run_debt = write.write_pressure_overload_l0_run_debt,
         .immutable_rotation_count = write.immutable_rotations,
         .immutable_flush_count = write.immutable_flushes,
+        .bulk_append_attempt_count = write.bulk_append_attempts,
+        .bulk_append_entry_count = write.bulk_append_entries,
+        .bulk_append_direct_success_count = write.bulk_append_direct_successes,
+        .bulk_append_direct_entry_count = write.bulk_append_direct_entries,
+        .bulk_append_fallback_backend_pending_count = write.bulk_append_fallback_backend_pending,
+        .bulk_append_fallback_below_threshold_count = write.bulk_append_fallback_below_threshold,
+        .bulk_append_fallback_duplicate_key_count = write.bulk_append_fallback_duplicate_keys,
+        .bulk_append_fallback_to_mutable_entry_count = write.bulk_append_fallback_to_mutable_entries,
         .direct_bulk_ingest_attempt_count = write.direct_bulk_ingest_attempts,
         .direct_bulk_ingest_success_count = write.direct_bulk_ingest_successes,
         .direct_bulk_ingest_entry_count = write.direct_bulk_ingest_entries,
         .direct_bulk_ingest_direct_entry_count = write.direct_bulk_ingest_entries_direct,
+        .direct_bulk_ingest_fallback_unsupported_count = write.direct_bulk_ingest_fallback_unsupported,
+        .direct_bulk_ingest_fallback_backend_mutable_count = write.direct_bulk_ingest_fallback_backend_mutable,
+        .direct_bulk_ingest_fallback_below_threshold_count = write.direct_bulk_ingest_fallback_below_threshold,
     };
 }
 
@@ -176,6 +218,16 @@ fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStora
         .level_overflow_bytes = u64ToI64(status.level_overflow_bytes),
         .obsolete_path_count = u64ToI64(status.obsolete_path_count),
         .current_manifest_bytes = u64ToI64(status.current_manifest_bytes),
+        .mutable_entry_count = u64ToI64(status.mutable_entry_count),
+        .mutable_bytes = u64ToI64(status.mutable_bytes),
+        .immutable_memtable_count = u64ToI64(status.immutable_memtable_count),
+        .immutable_entry_count = u64ToI64(status.immutable_entry_count),
+        .immutable_bytes = u64ToI64(status.immutable_bytes),
+        .mutable_snapshot_clone_count = u64ToI64(status.mutable_snapshot_clone_count),
+        .mutable_snapshot_clone_bytes = u64ToI64(status.mutable_snapshot_clone_bytes),
+        .mutable_snapshot_clone_peak_bytes = u64ToI64(status.mutable_snapshot_clone_peak_bytes),
+        .read_snapshot_mutable_rotation_count = u64ToI64(status.read_snapshot_mutable_rotation_count),
+        .read_snapshot_mutable_rotation_bytes = u64ToI64(status.read_snapshot_mutable_rotation_bytes),
         .wal_retained_bytes = u64ToI64(status.wal_retained_bytes),
         .compaction_backlog_bytes = u64ToI64(status.compaction_backlog_bytes),
         .active_readers = u64ToI64(status.active_readers),
@@ -198,10 +250,21 @@ fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStora
         .write_pressure_overload_l0_run_debt = u64ToI64(status.write_pressure_overload_l0_run_debt),
         .immutable_rotation_count = u64ToI64(status.immutable_rotation_count),
         .immutable_flush_count = u64ToI64(status.immutable_flush_count),
+        .bulk_append_attempt_count = u64ToI64(status.bulk_append_attempt_count),
+        .bulk_append_entry_count = u64ToI64(status.bulk_append_entry_count),
+        .bulk_append_direct_success_count = u64ToI64(status.bulk_append_direct_success_count),
+        .bulk_append_direct_entry_count = u64ToI64(status.bulk_append_direct_entry_count),
+        .bulk_append_fallback_backend_pending_count = u64ToI64(status.bulk_append_fallback_backend_pending_count),
+        .bulk_append_fallback_below_threshold_count = u64ToI64(status.bulk_append_fallback_below_threshold_count),
+        .bulk_append_fallback_duplicate_key_count = u64ToI64(status.bulk_append_fallback_duplicate_key_count),
+        .bulk_append_fallback_to_mutable_entry_count = u64ToI64(status.bulk_append_fallback_to_mutable_entry_count),
         .direct_bulk_ingest_attempt_count = u64ToI64(status.direct_bulk_ingest_attempt_count),
         .direct_bulk_ingest_success_count = u64ToI64(status.direct_bulk_ingest_success_count),
         .direct_bulk_ingest_entry_count = u64ToI64(status.direct_bulk_ingest_entry_count),
         .direct_bulk_ingest_direct_entry_count = u64ToI64(status.direct_bulk_ingest_direct_entry_count),
+        .direct_bulk_ingest_fallback_unsupported_count = u64ToI64(status.direct_bulk_ingest_fallback_unsupported_count),
+        .direct_bulk_ingest_fallback_backend_mutable_count = u64ToI64(status.direct_bulk_ingest_fallback_backend_mutable_count),
+        .direct_bulk_ingest_fallback_below_threshold_count = u64ToI64(status.direct_bulk_ingest_fallback_below_threshold_count),
     };
 }
 
@@ -2045,6 +2108,16 @@ test "metadata.table status encoder honors storage status overrides" {
             .level_overflow_bytes = 14,
             .obsolete_path_count = 15,
             .current_manifest_bytes = 16,
+            .mutable_entry_count = 17,
+            .mutable_bytes = 18,
+            .immutable_memtable_count = 19,
+            .immutable_entry_count = 20,
+            .immutable_bytes = 21,
+            .mutable_snapshot_clone_count = 22,
+            .mutable_snapshot_clone_bytes = 23,
+            .mutable_snapshot_clone_peak_bytes = 24,
+            .read_snapshot_mutable_rotation_count = 25,
+            .read_snapshot_mutable_rotation_bytes = 26,
             .wal_retained_bytes = 55,
             .compaction_backlog_bytes = 10,
             .active_readers = 2,
@@ -2067,10 +2140,21 @@ test "metadata.table status encoder honors storage status overrides" {
             .write_pressure_overload_l0_run_debt = 112,
             .immutable_rotation_count = 113,
             .immutable_flush_count = 114,
+            .bulk_append_attempt_count = 119,
+            .bulk_append_entry_count = 120,
+            .bulk_append_direct_success_count = 121,
+            .bulk_append_direct_entry_count = 122,
+            .bulk_append_fallback_backend_pending_count = 123,
+            .bulk_append_fallback_below_threshold_count = 124,
+            .bulk_append_fallback_duplicate_key_count = 125,
+            .bulk_append_fallback_to_mutable_entry_count = 126,
             .direct_bulk_ingest_attempt_count = 115,
             .direct_bulk_ingest_success_count = 116,
             .direct_bulk_ingest_entry_count = 117,
             .direct_bulk_ingest_direct_entry_count = 118,
+            .direct_bulk_ingest_fallback_unsupported_count = 127,
+            .direct_bulk_ingest_fallback_backend_mutable_count = 128,
+            .direct_bulk_ingest_fallback_below_threshold_count = 129,
         },
     }};
 
@@ -2088,6 +2172,12 @@ test "metadata.table status encoder honors storage status overrides" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"level_overflow_run_count\":13") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_path_count\":15") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_manifest_bytes\":16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mutable_entry_count\":17") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mutable_bytes\":18") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_memtable_count\":19") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_bytes\":21") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mutable_snapshot_clone_count\":22") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"read_snapshot_mutable_rotation_count\":25") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":55") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_backlog_bytes\":10") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_readers\":2") != null);
@@ -2110,10 +2200,16 @@ test "metadata.table status encoder honors storage status overrides" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_overload_l0_run_debt\":112") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_rotation_count\":113") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_flush_count\":114") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"bulk_append_attempt_count\":119") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"bulk_append_direct_success_count\":121") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"bulk_append_fallback_backend_pending_count\":123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"bulk_append_fallback_below_threshold_count\":124") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_attempt_count\":115") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_success_count\":116") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_entry_count\":117") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_direct_entry_count\":118") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_fallback_backend_mutable_count\":128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_fallback_below_threshold_count\":129") != null);
 }
 
 test "metadata.table status encoder canonicalizes embeddings indexes without inline names" {

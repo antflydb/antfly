@@ -107,6 +107,11 @@ fn canBorrowActiveMutableValues(backend: anytype) bool {
     return false;
 }
 
+fn shouldRetainActiveMutableValueReader(backend: anytype) bool {
+    if (@hasDecl(@TypeOf(backend.*), "bulkIngestActive") and backend.bulkIngestActive()) return false;
+    return true;
+}
+
 fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
@@ -2546,7 +2551,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             errdefer releaseReadReader(BackendType, backend);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             const stable_point_view = backend.mutable.entries.items.len == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
-            const active_mutable_value_reader_retained = if (!stable_point_view) retainActiveMutableValueReader(backend) else false;
+            const active_mutable_value_reader_retained = if (!stable_point_view and shouldRetainActiveMutableValueReader(backend)) retainActiveMutableValueReader(backend) else false;
             errdefer releaseActiveMutableValueReader(backend, active_mutable_value_reader_retained);
             return .{
                 .allocator = runtimeScratchAllocator(backend.allocator),
@@ -5615,6 +5620,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         metadata_allocator: Allocator,
         backend: *BackendType,
         mutable: ActiveMemTable,
+        bulk_appends: State = .{},
         cursor_overlay: ?State = null,
         cursor_base_mutable: ?State = null,
         cursor_immutable_memtables: []const *const State = &.{},
@@ -5649,6 +5655,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             if (self.closed) return;
             const backend = self.backend;
             self.mutable.deinit(self.allocator);
+            self.bulk_appends.deinit(self.allocator);
             self.invalidateCursorSnapshot();
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
@@ -5666,12 +5673,15 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             errdefer if (release_on_error) {
                 self.mutable.deinit(self.allocator);
                 self.mutable = .{};
+                self.bulk_appends.deinit(self.allocator);
+                self.bulk_appends = .{};
                 self.invalidateCursorSnapshot();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
                 self.backend.releaseReader();
                 self.closed = true;
             };
+            const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
             if (!try self.tryCommitDirectBulkIngest()) {
                 const mutated = self.mutable.entries.items.len > 0;
                 if (mutated) try prepareMutableForWrite(self.backend);
@@ -5689,7 +5699,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
-                if (mutated) notePotentialMaintenanceDebtLocked(self.backend);
+                if (mutated or direct_ingested_bulk_appends) notePotentialMaintenanceDebtLocked(self.backend);
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 if (!self.batch_options.defer_commit_flush) {
                     try self.backend.maybeFlushMutable();
@@ -5709,6 +5719,77 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 finalize_err = err;
             };
             if (finalize_err) |err| return err;
+        }
+
+        fn tryCommitDirectBulkAppends(self: *@This()) !bool {
+            var entries = self.bulk_appends.entries.items.len;
+            if (entries == 0) return false;
+            if (self.batch_options.mode != .bulk_ingest) {
+                if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackNonBulk")) self.backend.recordBulkAppendFallbackNonBulk(entries);
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+            if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
+                if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackUnsupported")) self.backend.recordBulkAppendFallbackUnsupported(entries);
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+            if (self.backend.mutable.entries.items.len != 0 and @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest")) {
+                if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
+                    if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+                    if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
+                    try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                    return false;
+                }
+            }
+            if (self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) {
+                if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+            if (self.mutable.entries.items.len > 0) {
+                try state_mod.applyMutableMoveToMutable(&self.bulk_appends, self.allocator, &self.mutable);
+                entries = self.bulk_appends.entries.items.len;
+            }
+            if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+
+            const sort_start_ns = platform_time.monotonicNs();
+            state_mod.sortStateEntries(&self.bulk_appends);
+            const sort_ns = elapsedNs(sort_start_ns);
+            if (!bulkStateEntriesAreUnique(&self.bulk_appends)) {
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, sort_ns);
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+            if (!self.backend.shouldDirectIngestBulkState(&self.bulk_appends)) {
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackBelowThreshold")) self.backend.recordBulkAppendFallbackBelowThreshold(entries, sort_ns);
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+
+            if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&self.bulk_appends);
+            if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                try self.backend.ingestOwnedSortedState(&self.bulk_appends);
+            } else {
+                try self.backend.ingestSortedState(&self.bulk_appends);
+            }
+            if (@hasDecl(BackendType, "recordBulkAppendSuccess")) self.backend.recordBulkAppendSuccess(entries, sort_ns);
+            self.bulk_appends.deinit(self.allocator);
+            self.bulk_appends = .{};
+            return true;
+        }
+
+        fn bulkStateEntriesAreUnique(state: *const State) bool {
+            if (state.entries.items.len <= 1) return true;
+            var previous = state.entries.items[0];
+            for (state.entries.items[1..]) |entry| {
+                if (compareEntryTo(previous, state_mod.namespaceOf(entry), entry.key) == .eq) return false;
+                previous = entry;
+            }
+            return true;
         }
 
         fn tryCommitDirectBulkIngest(self: *@This()) !bool {
@@ -5777,6 +5858,15 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn get(self: *@This(), namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
+            var bulk_idx = self.bulk_appends.entries.items.len;
+            while (bulk_idx > 0) {
+                bulk_idx -= 1;
+                const entry = self.bulk_appends.entries.items[bulk_idx];
+                if (compareEntryTo(entry, namespace, key) == .eq) {
+                    if (entry.tombstone) return error.NotFound;
+                    return entry.value;
+                }
+            }
             if (self.mutable.findIndex(namespace, key)) |idx| {
                 const entry = self.mutable.entries.items[idx];
                 if (entry.tombstone) return error.NotFound;
@@ -5797,6 +5887,12 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn appendPut(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
+            if (self.batch_options.mode == .bulk_ingest) {
+                const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
+                try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, namespace, key, value, false));
+                self.invalidateCursorSnapshot();
+                return;
+            }
             try self.mutable.appendUpsert(self.allocator, namespace, key, value, false);
             self.invalidateCursorSnapshot();
         }
@@ -5819,6 +5915,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
             var overlay = try self.mutable.clone(self.allocator);
             errdefer overlay.deinit(self.allocator);
+            try state_mod.applyState(&overlay, self.allocator, &self.bulk_appends);
 
             var base_mutable: State = .{};
             errdefer base_mutable.deinit(self.allocator);

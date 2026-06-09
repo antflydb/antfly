@@ -6463,6 +6463,55 @@ test "lsm backend probe borrows active mutable point values across later writes"
     try std.testing.expectEqual(@as(u64, 0), after.point_value_copies - before.point_value_copies);
 }
 
+test "lsm backend probe copies active mutable point values during bulk ingest" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1000,
+        .wal_enabled = false,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+    var probe = try runtime.beginProbe();
+    errdefer probe.abort();
+
+    const before = backend.snapshotReadStats();
+    const copied_a = try probe.get("doc:a");
+    try std.testing.expectEqualStrings("A", copied_a);
+    try std.testing.expectEqual(@as(usize, 0), backend.active_mutable_value_readers);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+
+    {
+        var txn = try runtime.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put("doc:a", "B");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqualStrings("A", copied_a);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+
+    const after = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 0), after.point_value_borrows - before.point_value_borrows);
+    try std.testing.expectEqual(@as(u64, 1), after.point_value_copies - before.point_value_copies);
+
+    probe.abort();
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = false });
+    bulk_active = false;
+}
+
 test "lsm backend wal backed entry threshold defers commit flush to maintenance" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
@@ -7271,6 +7320,11 @@ test "lsm backend runtime namespace store forwards bulk ingest batch options" {
     }
 
     const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.bulk_append_attempts);
+    try std.testing.expectEqual(@as(u64, 4), stats.bulk_append_entries);
+    try std.testing.expectEqual(@as(u64, 1), stats.bulk_append_direct_successes);
+    try std.testing.expectEqual(@as(u64, 4), stats.bulk_append_direct_entries);
+    try std.testing.expectEqual(@as(u64, 0), stats.direct_bulk_ingest_attempts);
     try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
