@@ -11905,6 +11905,16 @@ components:
             old.
         distance_metric:
           $ref: '#/components/schemas/DistanceMetric'
+        format:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - lsm_packed
+            - segments_base_delta
+          default: lsm_packed
+          description: Dense vector index storage format. lsm_packed is the legacy packed HBC posting
+            store. segments_base_delta stores immutable posting base records with append-only delta segments.
+            Ignored for sparse indexes.
         mem_only:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -12062,8 +12072,10 @@ components:
         version:
           x-go-type-skip-optional-pointer: true
           type: integer
-          default: 0
-          description: Version of the index implementation. Defaults to 0.
+          minimum: 1
+          default: 1
+          description: Version of the selected index implementation or storage format. For dense embeddings
+            indexes, this is scoped to the format value. Defaults to 1.
         enrichments:
           type: array
           items:

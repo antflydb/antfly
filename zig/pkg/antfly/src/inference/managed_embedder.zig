@@ -832,6 +832,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try appendJsonString(alloc, &out, metric);
     try out.appendSlice(alloc, ",\"embedding_name\":");
     try appendJsonString(alloc, &out, index_name);
+    try appendOptionalDenseStorageFormatFields(alloc, &out, root);
 
     if (!external) {
         try out.appendSlice(alloc, ",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":");
@@ -862,6 +863,25 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendOptionalDenseStorageFormatFields(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    root: std.json.ObjectMap,
+) !void {
+    if (root.get("format")) |format| {
+        if (format != .string) return error.InvalidCreateTableRequest;
+        try out.appendSlice(alloc, ",\"format\":");
+        try appendJsonString(alloc, out, format.string);
+    }
+    if (root.get("version")) |version| {
+        if (version != .integer) return error.InvalidCreateTableRequest;
+        try out.appendSlice(alloc, ",\"version\":");
+        const version_json = try std.fmt.allocPrint(alloc, "{d}", .{version.integer});
+        defer alloc.free(version_json);
+        try out.appendSlice(alloc, version_json);
+    }
 }
 
 pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
@@ -2191,6 +2211,20 @@ test "managed embedder translates managed embeddings config into db generator co
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"dims\":384") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding_name\":\"semantic_idx\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"generator\":{\"kind\":\"dense_embedding\"") != null);
+}
+
+test "managed embedder translates dense storage format and version" {
+    var local = TestLocalDenseProvider{ .dimensions = 384 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","field":"body","dimension":384,"format":"segments_base_delta","version":1,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+    , .{});
+    defer parsed.deinit();
+
+    const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() });
+    defer std.testing.allocator.free(config_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"format\":\"segments_base_delta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"version\":1") != null);
 }
 
 test "managed embedder translates managed embeddings config with probed dimension" {

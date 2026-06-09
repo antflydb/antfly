@@ -5068,6 +5068,8 @@ pub const EmbeddingsIndexConfig = struct {
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
+    /// Dense vector index storage format. lsm_packed is the legacy packed HBC posting store. segments_base_delta stores immutable posting base records with append-only delta segments. Ignored for sparse indexes.
+    format: ?[]const u8 = null,
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
@@ -5155,7 +5157,7 @@ pub const IndexConfig = struct {
     /// Optional description of the index and its purpose
     description: ?[]const u8 = null,
     type: IndexType,
-    /// Version of the index implementation. Defaults to 0.
+    /// Version of the selected index implementation or storage format. For dense embeddings indexes, this is scoped to the format value. Defaults to 1.
     version: ?i64 = null,
     /// List of enrichment names to apply to documents before indexing. Enrichments must be defined at the table level.
     enrichments: ?[]const []const u8 = null,

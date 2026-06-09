@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.distance_metric import DistanceMetric
+from ..models.embeddings_index_config_format import EmbeddingsIndexConfigFormat
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -38,6 +39,9 @@ class EmbeddingsIndexConfig:
             distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
                 models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
                 product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
+            format_ (EmbeddingsIndexConfigFormat | Unset): Dense vector index storage format. lsm_packed is the legacy
+                packed HBC posting store. segments_base_delta stores immutable posting base records with append-only delta
+                segments. Ignored for sparse indexes. Default: EmbeddingsIndexConfigFormat.LSM_PACKED.
             mem_only (bool | Unset): Whether to use in-memory only storage (dense only)
             embedder (EmbedderConfig | Unset): A unified configuration for an embedding provider.
 
@@ -228,6 +232,7 @@ class EmbeddingsIndexConfig:
     field: str | Unset = UNSET
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
+    format_: EmbeddingsIndexConfigFormat | Unset = EmbeddingsIndexConfigFormat.LSM_PACKED
     mem_only: bool | Unset = UNSET
     embedder: EmbedderConfig | Unset = UNSET
     summarizer: GeneratorConfig | Unset = UNSET
@@ -251,6 +256,10 @@ class EmbeddingsIndexConfig:
         distance_metric: str | Unset = UNSET
         if not isinstance(self.distance_metric, Unset):
             distance_metric = self.distance_metric.value
+
+        format_: str | Unset = UNSET
+        if not isinstance(self.format_, Unset):
+            format_ = self.format_.value
 
         mem_only = self.mem_only
 
@@ -287,6 +296,8 @@ class EmbeddingsIndexConfig:
             field_dict["template"] = template
         if distance_metric is not UNSET:
             field_dict["distance_metric"] = distance_metric
+        if format_ is not UNSET:
+            field_dict["format"] = format_
         if mem_only is not UNSET:
             field_dict["mem_only"] = mem_only
         if embedder is not UNSET:
@@ -328,6 +339,13 @@ class EmbeddingsIndexConfig:
         else:
             distance_metric = DistanceMetric(_distance_metric)
 
+        _format_ = d.pop("format", UNSET)
+        format_: EmbeddingsIndexConfigFormat | Unset
+        if isinstance(_format_, Unset):
+            format_ = UNSET
+        else:
+            format_ = EmbeddingsIndexConfigFormat(_format_)
+
         mem_only = d.pop("mem_only", UNSET)
 
         _embedder = d.pop("embedder", UNSET)
@@ -364,6 +382,7 @@ class EmbeddingsIndexConfig:
             field=field,
             template=template,
             distance_metric=distance_metric,
+            format_=format_,
             mem_only=mem_only,
             embedder=embedder,
             summarizer=summarizer,

@@ -2329,7 +2329,7 @@ export interface components {
          * @description MongoDB-style update operator
          * @enum {string}
          */
-        TransformOpType: "$set" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$pop" | "$mul" | "$min" | "$max" | "$currentDate" | "$rename";
+        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$pop" | "$mul" | "$min" | "$max" | "$currentDate" | "$rename";
         TransformOp: {
             op: components["schemas"]["TransformOpType"];
             /**
@@ -2337,7 +2337,7 @@ export interface components {
              * @example $.views
              */
             path: string;
-            /** @description Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set, etc.) */
+            /** @description Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.) */
             value?: unknown;
         };
         /**
@@ -6091,6 +6091,12 @@ export interface components {
              */
             template?: string;
             distance_metric?: components["schemas"]["DistanceMetric"];
+            /**
+             * @description Dense vector index storage format. lsm_packed is the legacy packed HBC posting store. segments_base_delta stores immutable posting base records with append-only delta segments. Ignored for sparse indexes.
+             * @default lsm_packed
+             * @enum {string}
+             */
+            format?: "lsm_packed" | "segments_base_delta";
             /** @description Whether to use in-memory only storage (dense only) */
             mem_only?: boolean;
             /** @description Configuration for the embeddings plugin (managed indexes only; not allowed when external=true) */
@@ -6189,8 +6195,8 @@ export interface components {
             description?: string;
             type: components["schemas"]["IndexType"];
             /**
-             * @description Version of the index implementation. Defaults to 0.
-             * @default 0
+             * @description Version of the selected index implementation or storage format. For dense embeddings indexes, this is scoped to the format value. Defaults to 1.
+             * @default 1
              */
             version?: number;
             /**
