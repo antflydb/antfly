@@ -1384,7 +1384,8 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.bulk_ingest_session_open) continue;
             if (entry.db.hasActiveDenseBulkWork()) continue;
-            const score = if (best_effort) entry.db.lsmMaintenanceDebtHint() else entry.db.lsmMaintenanceScore();
+            const raw_score = if (best_effort) entry.db.lsmMaintenanceDebtHint() else entry.db.lsmMaintenanceScore();
+            const score = if (raw_score != 0) raw_score else versionPinnedObsoleteScore(entry);
             if (score > best_score) {
                 best_score = score;
                 best_entry = entry;
@@ -1392,6 +1393,11 @@ pub const ProvisionedTableWriteCache = struct {
         }
         if (best_score == 0) return null;
         return self.leaseEntryLocked(best_entry.?);
+    }
+
+    fn versionPinnedObsoleteScore(entry: *Entry) u64 {
+        const stats = entry.db.trySnapshotLsmMaintenanceStats() orelse return 0;
+        return if (stats.obsolete_paths_pinned_by_versions != 0) 1 else 0;
     }
 
     fn leaseLsmObsoleteReclaimDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
@@ -1428,7 +1434,8 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.bulk_ingest_session_open) continue;
             if (entry.db.hasActiveDenseBulkWork()) continue;
-            score = @max(score, entry.db.lsmMaintenanceDebtHint());
+            const raw_score = entry.db.lsmMaintenanceDebtHint();
+            score = @max(score, if (raw_score != 0) raw_score else versionPinnedObsoleteScore(entry));
         }
         return score;
     }
@@ -3983,6 +3990,8 @@ pub const ProvisionedTableWriteSource = struct {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
             const cache = self.write_cache orelse return false;
+            if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
+            if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
             if (cache.maxLsmMaintenanceScoreLocked() == 0) return false;
             break :blk cache.leaseLsmMaintenanceRoundLocked() orelse return false;
         };
@@ -3990,7 +3999,16 @@ pub const ProvisionedTableWriteSource = struct {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
             leased.deinit(release_alloc);
         }
-        return try leased.db.runLsmMaintenanceStep();
+        const maintenance_table_name = if (leased.entry) |entry| entry.table_name else null;
+        const progressed = try leased.db.runLsmMaintenanceStep();
+        if (maintenance_table_name) |table_name| {
+            const should_invalidate_read_cache = progressed or blk: {
+                const stats = leased.db.trySnapshotLsmMaintenanceStats() orelse break :blk false;
+                break :blk stats.obsolete_paths_pinned_by_versions != 0;
+            };
+            if (should_invalidate_read_cache) self.invalidateReadCache(table_name);
+        }
+        return progressed;
     }
 
     pub fn runLsmMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !bool {
@@ -3999,13 +4017,10 @@ pub const ProvisionedTableWriteSource = struct {
         var leased = blk: {
             defer self.local_db_mutex.unlock();
             const cache = self.write_cache orelse return false;
+            if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
+            if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
             if (cache.maxLsmMaintenanceScoreLocked() != 0) {
                 if (cache.leaseLsmMaintenanceRoundBestEffortLocked()) |lease| break :blk lease;
-            }
-            if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
-            if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| {
-                primary_only = true;
-                break :blk lease;
             }
             if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return false;
             primary_only = true;
@@ -4015,10 +4030,19 @@ pub const ProvisionedTableWriteSource = struct {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
             leased.deinit(release_alloc);
         }
-        return if (primary_only)
+        const maintenance_table_name = if (leased.entry) |entry| entry.table_name else null;
+        const progressed = if (primary_only)
             try leased.db.runPrimaryLsmMaintenanceStepBestEffort()
         else
             try leased.db.runLsmMaintenanceStepBestEffort();
+        if (maintenance_table_name) |table_name| {
+            const should_invalidate_read_cache = progressed or blk: {
+                const stats = leased.db.trySnapshotLsmMaintenanceStats() orelse break :blk false;
+                break :blk stats.obsolete_paths_pinned_by_versions != 0;
+            };
+            if (should_invalidate_read_cache) self.invalidateReadCache(table_name);
+        }
+        return progressed;
     }
 
     pub fn finishExpiredAutoBulkIngestBestEffort(self: *ProvisionedTableWriteSource) bool {

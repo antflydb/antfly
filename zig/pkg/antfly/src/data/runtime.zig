@@ -593,6 +593,12 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_level_overflow_runs", "gauge", "Cached write LSM lower-level runs over configured level targets", stats.level_overflow_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_level_overflow_bytes", "gauge", "Cached write LSM lower-level bytes over configured level targets", stats.level_overflow_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths", "gauge", "Cached write LSM obsolete table paths waiting for cleanup", stats.obsolete_paths);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths_pinned_by_readers", "gauge", "Cached write LSM obsolete table paths retained by active readers", stats.obsolete_paths_pinned_by_readers);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths_pinned_by_versions", "gauge", "Cached write LSM obsolete table paths retained by active versions", stats.obsolete_paths_pinned_by_versions);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths_waiting_for_retry", "gauge", "Cached write LSM obsolete table paths waiting for delete retry or grace delay", stats.obsolete_paths_waiting_for_retry);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths_reclaimable", "gauge", "Cached write LSM obsolete table paths currently eligible for deletion", stats.obsolete_paths_reclaimable);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_delete_failures_total", "counter", "Cached write LSM obsolete table file delete failures", stats.obsolete_delete_failures);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_delete_retries_total", "counter", "Cached write LSM obsolete table file delete retries scheduled", stats.obsolete_delete_retries);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_active_readers", "gauge", "Cached write LSM readers currently retaining run or memtable snapshots", stats.active_readers);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_active_bulk_ingest_batches", "gauge", "Cached write LSM active bulk-ingest session batches", stats.active_bulk_ingest_batches);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_retained_segments", "gauge", "Cached write LSM WAL segments still retained for replay", stats.wal_retained_segments);
@@ -12728,6 +12734,12 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .level_overflow_runs = 1,
         .level_overflow_bytes = 256,
         .obsolete_paths = 1,
+        .obsolete_paths_pinned_by_readers = 2,
+        .obsolete_paths_pinned_by_versions = 3,
+        .obsolete_paths_waiting_for_retry = 4,
+        .obsolete_paths_reclaimable = 5,
+        .obsolete_delete_failures = 6,
+        .obsolete_delete_retries = 7,
         .active_readers = 6,
         .manifest_dirty = true,
         .obsolete_manifest_dirty = true,
@@ -12759,6 +12771,12 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_write_stall_l0_byte_debt 16384") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_level_overflow_runs 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_pinned_by_readers 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_pinned_by_versions 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_waiting_for_retry 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_reclaimable 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_delete_failures_total 6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_delete_retries_total 7") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers 6") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_manifest_dirty 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_active_oldest_age_ns 99") != null);

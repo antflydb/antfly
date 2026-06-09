@@ -1456,11 +1456,13 @@ pub const Backend = struct {
         defer self.maintenance_io_budget_remaining = null;
         const before_compactions = self.compaction_stats.compactions;
         const before_manifest_writes = self.write_stats.manifest_writes;
+        const before_obsolete_paths = self.obsolete_paths.items.len;
 
         if (self.root_dir != null and self.hasReclaimableObsoletePathsLocked()) {
             try self.persistManifest();
             _ = self.refreshCachedMaintenanceHintLocked();
-            return self.write_stats.manifest_writes != before_manifest_writes;
+            return self.write_stats.manifest_writes != before_manifest_writes or
+                self.obsolete_paths.items.len != before_obsolete_paths;
         }
 
         if (self.shouldFlushMutable() or try self.shouldFlushMutableForWalPressureLocked()) {
@@ -1486,7 +1488,8 @@ pub const Backend = struct {
         _ = self.refreshCachedMaintenanceHintLocked();
 
         return self.compaction_stats.compactions != before_compactions or
-            self.write_stats.manifest_writes != before_manifest_writes;
+            self.write_stats.manifest_writes != before_manifest_writes or
+            self.obsolete_paths.items.len != before_obsolete_paths;
     }
 
     pub fn activeImmutableMemtableCount(self: *const Backend) usize {
@@ -2468,12 +2471,13 @@ pub const Backend = struct {
         const root_dir = self.root_dir orelse return;
         const start_ns = self.writeStatsNowNs();
 
-        const clean_publish = !self.manifest_dirty and !self.obsolete_manifest_dirty;
+        const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
+        const clean_publish = !self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths;
         if (clean_publish and self.durableManifestHasNewerRunIdLocked(root_dir)) return;
 
         try self.writeManifestSnapshotLocked(root_dir, start_ns);
 
-        if (self.hasReclaimableObsoletePathsLocked()) {
+        if (reclaimable_obsolete_paths) {
             self.obsolete_manifest_dirty = false;
             const needs_follow_up = try self.reconcileObsoletePathsForManifest();
             const removed_or_retried = self.obsolete_manifest_dirty;
@@ -3906,7 +3910,7 @@ pub const Backend = struct {
                 continue;
             }
 
-repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, obsolete.path) catch |err| switch (err) {
+            repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, obsolete.path) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => {
                     self.obsolete_delete_failures +|= 1;

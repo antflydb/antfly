@@ -3424,15 +3424,14 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const primary_raw_score = self.core.primary_store_owner.lsmMaintenanceScore();
+        if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
-        const primary_score = if (primary_raw_score != 0 or !primary_reclaim_due) primary_raw_score else 1;
-        const index_raw_score = self.core.index_manager.lsmMaintenanceScore();
-        const index_reclaim_due = if (self.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
-        const index_score = if (index_raw_score != 0 or !index_reclaim_due) index_raw_score else 1;
+        if (primary_reclaim_due) {
+            if (try self.core.primary_store_owner.runLsmMaintenanceStep()) return true;
+        }
+
+        const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
+        const index_score = self.core.index_manager.lsmMaintenanceScore();
         if (primary_score == 0 and index_score == 0) {
             self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
             self.core.index_manager.refreshLsmMaintenanceDebtHint();
@@ -3445,12 +3444,14 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
-        if (!self.core.tryLockApplyExclusive()) return false;
-        defer self.core.unlockApply();
+        if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
+        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        if (primary_reclaim_due) {
+            if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
+        }
 
         const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
-        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
-        if (primary_score > 0 or primary_reclaim_due) {
+        if (primary_score > 0) {
             if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
         }
         if (try self.core.index_manager.runLsmMaintenanceStepBestEffort()) return true;
@@ -3461,9 +3462,6 @@ pub const DB = struct {
     }
 
     pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
-        if (!self.core.tryLockApplyExclusive()) return false;
-        defer self.core.unlockApply();
-
         const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_score == 0 and !primary_reclaim_due) return false;
@@ -3482,6 +3480,83 @@ pub const DB = struct {
             steps += 1;
         }
         return steps;
+    }
+
+    test "db lsm maintenance reclaims due index obsolete paths before primary compaction" {
+        const alloc = std.testing.allocator;
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .primary_backend = .{ .lsm = .{
+                .flush_threshold = 1,
+                .defer_flush_on_commit = true,
+                .l0_soft_limit_runs = 100,
+                .obsolete_retention_ns = 0,
+            } },
+            .index_backends = .{
+                .dense_lsm_options = .{
+                    .flush_threshold = 1,
+                    .defer_flush_on_commit = true,
+                    .l0_soft_limit_runs = 100,
+                    .obsolete_retention_ns = 0,
+                },
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        });
+
+        var key_buf: [16]u8 = undefined;
+        for (0..4) |i| {
+            const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+            try db.batch(.{
+                .writes = &.{.{ .key = key, .value = "{\"embedding\":[1,2]}" }},
+                .sync_level = .write,
+            });
+            switch (db.core.primary_store_owner) {
+                .lsm => |*owner| try owner.handle.backend.sync(true),
+                else => return error.SkipZigTest,
+            }
+        }
+
+        switch (db.core.primary_store_owner) {
+            .lsm => |*owner| try owner.handle.backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true }),
+            else => return error.SkipZigTest,
+        }
+
+        switch (db.core.primary_store_owner) {
+            .lsm => |*owner| owner.handle.backend.options.l0_soft_limit_runs = 1,
+            else => return error.SkipZigTest,
+        }
+
+        const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
+        const dense_backend = switch (dense_entry.index.env_owner) {
+            .lsm => |*handle| handle.backend,
+            else => return error.SkipZigTest,
+        };
+        const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
+        const obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
+        defer alloc.free(obsolete_path);
+
+        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, obsolete_path, "obsolete");
+        {
+            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
+            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
+            try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+            dense_backend.manifest_dirty = false;
+        }
+
+        try std.testing.expectEqual(@as(u64, 1), dense_backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
+        try std.testing.expect(try db.runLsmMaintenanceStepBestEffort());
+        try std.testing.expectEqual(@as(u64, 0), dense_backend.snapshotMaintenanceStats().obsolete_paths);
+        try std.testing.expectError(error.FileNotFound, dense_backend.storage.?.readFileAlloc(alloc, obsolete_path, 1024));
     }
 
     pub fn batch(self: *DB, req: types.BatchRequest) anyerror!void {
