@@ -25,6 +25,8 @@ const build_options = @import("build_options");
 pub const link_libc = build_options.link_libc;
 
 pub const c = if (build_options.link_libc) @cImport({
+    // glibc's _FORTIFY_SOURCE wrappers (bits/fcntl2.h) fail under translate-c
+    @cUndef("_FORTIFY_SOURCE");
     @cInclude("fcntl.h");
     @cInclude("unistd.h");
     @cInclude("sys/stat.h");

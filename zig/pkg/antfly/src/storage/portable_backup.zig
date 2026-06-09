@@ -437,6 +437,7 @@ fn appendEdgeBatchEntry(
 pub const ImportOptions = struct {
     identity_namespace: ?doc_identity.Namespace = null,
     prefer_existing_identity_namespace: bool = false,
+    import_derived_indexes: bool = true,
 };
 
 /// Import AFB data into the DocStore.
@@ -459,8 +460,8 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
                 try importIdentityBatch(alloc, store, block.payload);
                 imported_identity = true;
             },
-            .embedding_batch => try importEmbeddingBatch(alloc, store, block.payload),
-            .edge_batch => try importEdgeBatch(alloc, store, block.payload),
+            .embedding_batch => if (opts.import_derived_indexes) try importEmbeddingBatch(alloc, store, block.payload),
+            .edge_batch => if (opts.import_derived_indexes) try importEdgeBatch(alloc, store, block.payload),
             // Skip: sparse, summary, chunk, transaction (rebuilt by enrichment)
             .cluster_manifest, .table_manifest, .shard_header, .shard_footer, .file_footer => {},
             else => {},
@@ -502,7 +503,12 @@ fn importDocumentBatch(alloc: Allocator, store: *DocStore, payload: []const u8) 
     for (entries) |e| {
         const store_key = try internal_keys.documentKeyAlloc(alloc, e.key);
         try owned_keys.append(alloc, store_key);
-        try writes.append(alloc, .{ .key = store_key, .value = e.value });
+        const value = if (e.value_flags & backup_codec.doc_value_flag_compressed != 0)
+            try backup_codec.decompressZstd(alloc, e.value)
+        else
+            try alloc.dupe(u8, e.value);
+        try owned_keys.append(alloc, value);
+        try writes.append(alloc, .{ .key = store_key, .value = value });
     }
 
     if (writes.items.len > 0) {

@@ -5043,6 +5043,27 @@ pub const DB = struct {
         return try readRestoreStateForPathAlloc(alloc, path);
     }
 
+    pub fn markRestoreCompleteForPath(
+        alloc: Allocator,
+        path: []const u8,
+        backup_id: []const u8,
+        location: []const u8,
+        snapshot_path: []const u8,
+        group_id: u64,
+    ) !void {
+        var state = try restoreStateAlloc(alloc, backup_id, location, snapshot_path, group_id, "complete", true, true, "");
+        defer state.deinit(alloc);
+        try writeRestoreStateForPath(alloc, path, state);
+        const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
+        defer alloc.free(repair_marker_path);
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+            .sub_path = repair_marker_path,
+            .data = "done\n",
+        });
+    }
+
     fn markRestorePrimaryRestored(
         alloc: Allocator,
         path: []const u8,

@@ -510,10 +510,7 @@ pub fn readManifest(
     const body = try readFileAbsoluteAlloc(alloc, path, 16 * 1024 * 1024);
     defer alloc.free(body);
 
-    var parsed = try std.json.parseFromSlice(TableBackupManifest, alloc, body, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-    if (parsed.value.format_version != format_version) return error.UnsupportedBackupFormat;
-    return try cloneTableBackupManifest(alloc, parsed.value);
+    return parseTableBackupManifestOrPortable(alloc, body, backup_id);
 }
 
 pub fn writeManifestToLocation(
@@ -545,12 +542,150 @@ pub fn readManifestFromLocation(
             defer alloc.free(suffix);
             const body = try store.readBytesAlloc(alloc, trimLeftSlash(suffix));
             defer alloc.free(body);
-            var parsed = try std.json.parseFromSlice(TableBackupManifest, alloc, body, .{ .allocate = .alloc_always });
-            defer parsed.deinit();
-            if (parsed.value.format_version != format_version) return error.UnsupportedBackupFormat;
-            return try cloneTableBackupManifest(alloc, parsed.value);
+            return parseTableBackupManifestOrPortable(alloc, body, backup_id);
         },
     }
+}
+
+fn parseTableBackupManifestOrPortable(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    backup_id: []const u8,
+) !TableBackupManifest {
+    if (std.json.parseFromSlice(TableBackupManifest, alloc, body, .{ .allocate = .alloc_always })) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.format_version != format_version) return error.UnsupportedBackupFormat;
+        return try cloneTableBackupManifest(alloc, parsed.value);
+    } else |_| {
+        return try parseGoPortableTableManifest(alloc, body, backup_id);
+    }
+}
+
+const PortableShard = struct {
+    group_id: u64,
+    shard_id: []u8,
+    start_key: []u8,
+    end_key: ?[]u8,
+    snapshot_path: []u8,
+
+    fn deinit(self: PortableShard, alloc: std.mem.Allocator) void {
+        alloc.free(self.shard_id);
+        alloc.free(self.start_key);
+        if (self.end_key) |end| alloc.free(end);
+        alloc.free(self.snapshot_path);
+    }
+};
+
+fn parseGoPortableTableManifest(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    backup_id: []const u8,
+) !TableBackupManifest {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+    const table_name = switch (root.get("name") orelse return error.InvalidBackupRequest) {
+        .string => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    const schema_value = root.get("schema") orelse return error.InvalidBackupRequest;
+    // Go portable backups include legacy derived-index metadata/artifacts whose
+    // exact runtime configuration is not always parseable by the Zig index
+    // manager. Import the primary table data first; indexes can be recreated or
+    // rebuilt from the restored documents after the table is readable.
+    const indexes_json = try alloc.dupe(u8, "{}");
+    errdefer alloc.free(indexes_json);
+    const shards_value = switch (root.get("shards") orelse return error.InvalidBackupRequest) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+
+    var shards_list = std.ArrayListUnmanaged(PortableShard).empty;
+    defer {
+        for (shards_list.items) |shard| shard.deinit(alloc);
+        shards_list.deinit(alloc);
+    }
+
+    var it = shards_value.iterator();
+    while (it.next()) |entry| {
+        const shard_object = switch (entry.value_ptr.*) {
+            .object => |object| object,
+            else => return error.InvalidBackupRequest,
+        };
+        const raw_group_id = try std.fmt.parseInt(u64, entry.key_ptr.*, 16);
+        const byte_range = switch (shard_object.get("byte_range") orelse return error.InvalidBackupRequest) {
+            .array => |array| array,
+            else => return error.InvalidBackupRequest,
+        };
+        if (byte_range.items.len != 2) return error.InvalidBackupRequest;
+        const start_encoded = switch (byte_range.items[0]) {
+            .string => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        const end_encoded = switch (byte_range.items[1]) {
+            .string => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        const start_key = try decodePortableByteRangeBoundary(alloc, start_encoded);
+        errdefer alloc.free(start_key);
+        const end_key = if (end_encoded.len > 0) try decodePortableByteRangeBoundary(alloc, end_encoded) else null;
+        errdefer if (end_key) |value| alloc.free(value);
+        const snapshot_path = try std.fmt.allocPrint(alloc, "{s}-{s}.afb", .{ backup_id, entry.key_ptr.* });
+        errdefer alloc.free(snapshot_path);
+        try shards_list.append(alloc, .{
+            .group_id = group_ids.dataGroupIdFromHash(raw_group_id),
+            .shard_id = try alloc.dupe(u8, entry.key_ptr.*),
+            .start_key = start_key,
+            .end_key = end_key,
+            .snapshot_path = snapshot_path,
+        });
+    }
+    std.mem.sort(PortableShard, shards_list.items, {}, portableShardLessThan);
+
+    const shards = try alloc.alloc(ShardSnapshot, shards_list.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (shards[0..initialized]) |shard| shard.deinit(alloc);
+        alloc.free(shards);
+    }
+    for (shards_list.items, 0..) |portable_shard, i| {
+        shards[i] = .{
+            .group_id = portable_shard.group_id,
+            .start_key = try alloc.dupe(u8, portable_shard.start_key),
+            .end_key = if (portable_shard.end_key) |value| try alloc.dupe(u8, value) else null,
+            .snapshot_path = try alloc.dupe(u8, portable_shard.snapshot_path),
+        };
+        initialized += 1;
+    }
+
+    return .{
+        .backup_id = try alloc.dupe(u8, backup_id),
+        .table_name = try alloc.dupe(u8, table_name),
+        .description = try alloc.dupe(u8, ""),
+        .schema_json = try stringifyJsonAlloc(alloc, schema_value),
+        .read_schema_json = try alloc.dupe(u8, ""),
+        .indexes_json = indexes_json,
+        .replication_sources_json = try alloc.dupe(u8, "[]"),
+        .shards = shards,
+    };
+}
+
+fn portableShardLessThan(_: void, a: PortableShard, b: PortableShard) bool {
+    const start_order = std.mem.order(u8, a.start_key, b.start_key);
+    if (start_order != .eq) return start_order == .lt;
+    return a.group_id < b.group_id;
+}
+
+fn decodePortableByteRangeBoundary(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    if (encoded.len == 0) return try alloc.dupe(u8, "");
+    const size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+    const out = try alloc.alloc(u8, size);
+    errdefer alloc.free(out);
+    try std.base64.standard.Decoder.decode(out, encoded);
+    return out;
 }
 
 pub fn metadataPath(alloc: std.mem.Allocator, backup_root: []const u8, backup_id: []const u8) ![]u8 {
@@ -903,6 +1038,26 @@ pub fn copyDirectoryFromLocation(
             try copyDirectoryRecursive(alloc, src_root, dest_path);
         },
         .remote => |*store| try store.downloadDirectoryRecursive(alloc, snapshot_path, dest_path),
+    }
+}
+
+pub fn copyFileFromLocation(
+    alloc: std.mem.Allocator,
+    location: *BackupLocation,
+    snapshot_path: []const u8,
+    dest_path: []const u8,
+) !void {
+    switch (location.*) {
+        .file => |backup_root| {
+            const src_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
+            defer alloc.free(src_path);
+            try copyFileAbsolute(src_path, dest_path);
+        },
+        .remote => |*store| {
+            const body = try store.readBytesAlloc(alloc, trimLeftSlash(snapshot_path));
+            defer alloc.free(body);
+            try writeFileAbsolute(dest_path, body);
+        },
     }
 }
 
@@ -1260,6 +1415,41 @@ test "backup manifest round trips through remote objectstore location" {
     try std.testing.expectEqualStrings("docs", loaded.table_name);
     try std.testing.expectEqual(@as(usize, 1), loaded.shards.len);
     try std.testing.expectEqual(@as(u64, 7), loaded.shards[0].group_id);
+}
+
+test "go portable metadata parses as table backup manifest" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/go-portable-manifest", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    try ensureDirPath(root);
+
+    const backup_id = "portable-snap";
+    const path = try metadataPath(std.testing.allocator, root, backup_id);
+    defer std.testing.allocator.free(path);
+    try writeFileAbsolute(path,
+        \\{
+        \\  "name": "docs",
+        \\  "schema": {"default_type":"doc"},
+        \\  "indexes": {"legacy_vec":{"type":"embeddings","embedder":{"provider":"termite"}}},
+        \\  "shards": {
+        \\    "0000000000000001": {"byte_range":["","Qw=="]}
+        \\  }
+        \\}
+    );
+
+    var manifest = try readManifest(std.testing.allocator, root, backup_id);
+    defer manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(backup_id, manifest.backup_id);
+    try std.testing.expectEqualStrings("docs", manifest.table_name);
+    try std.testing.expectEqualStrings("{\"default_type\":\"doc\"}", manifest.schema_json);
+    try std.testing.expectEqualStrings("{}", manifest.indexes_json);
+    try std.testing.expectEqual(@as(usize, 1), manifest.shards.len);
+    try std.testing.expectEqual(group_ids.dataGroupIdFromHash(1), manifest.shards[0].group_id);
+    try std.testing.expectEqualStrings("", manifest.shards[0].start_key);
+    try std.testing.expectEqualStrings("C", manifest.shards[0].end_key.?);
+    try std.testing.expectEqualStrings("portable-snap-0000000000000001.afb", manifest.shards[0].snapshot_path);
 }
 
 test "backup remote location normalizes gcs alias" {

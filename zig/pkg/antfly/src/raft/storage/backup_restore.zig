@@ -18,6 +18,7 @@ const backups_api = @import("../../api/backups.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const lsm_table_file = @import("../../storage/lsm/table_file.zig");
+const portable_backup = @import("../../storage/portable_backup.zig");
 
 pub const RestoreSource = struct {
     backup_id: []const u8,
@@ -169,6 +170,11 @@ fn applyRestoreSnapshot(
         break :blk shard.snapshot_path;
     };
 
+    if (std.mem.endsWith(u8, snapshot_path, ".afb")) {
+        try applyPortableRestore(alloc, path, group_id, restore, snapshot_path, &manifest, options);
+        return;
+    }
+
     const snapshot_root = try stageRestoreSnapshot(alloc, path, &location, snapshot_path);
     defer switch (location) {
         .file => alloc.free(snapshot_root),
@@ -206,6 +212,8 @@ fn restoreSnapshotDocCount(alloc: std.mem.Allocator, restore: RestoreSource) !u6
         },
     };
 
+    if (std.mem.endsWith(u8, restore.snapshot_path, ".afb")) return try portableSnapshotDocCount(alloc, snapshot_root);
+
     const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/store.bin", .{snapshot_root});
     defer alloc.free(snapshot_path);
 
@@ -217,6 +225,78 @@ fn restoreSnapshotDocCount(alloc: std.mem.Allocator, restore: RestoreSource) !u6
     var decoded = try lsm_table_file.decodeAlloc(alloc, raw);
     defer decoded.deinit(alloc);
     return @intCast(decoded.entries.len);
+}
+
+fn applyPortableRestore(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+    snapshot_path: []const u8,
+    manifest: *const backups_api.TableBackupManifest,
+    options: RestoreOptions,
+) !void {
+    _ = manifest;
+    var location = try backups_api.openBackupLocation(alloc, restore.location);
+    defer location.deinit(alloc);
+    const afb_path = try stageRestoreFile(alloc, path, &location, snapshot_path);
+    defer switch (location) {
+        .file => alloc.free(afb_path),
+        .remote => {
+            destroyPathIfExists(afb_path);
+            alloc.free(afb_path);
+        },
+    };
+
+    const afb_data = try readFileAlloc(alloc, afb_path, 16 * 1024 * 1024 * 1024);
+    defer alloc.free(afb_data);
+
+    try resetLocalTablePath(path);
+    var db = try db_mod.DB.open(alloc, path, .{
+        .identity_namespace = options.expected_identity_namespace,
+        .start_index_workers = false,
+    });
+    var db_closed = false;
+    defer if (!db_closed) db.close();
+    try portable_backup.importPortableWithOptions(alloc, db.core.store, afb_data, .{
+        .identity_namespace = options.expected_identity_namespace,
+        .prefer_existing_identity_namespace = true,
+        .import_derived_indexes = false,
+    });
+    // Go portable AFBs may contain derived index artifacts encoded with the old
+    // backend layout. Restore the primary documents first and leave runtime
+    // indexes to normal rebuild/catch-up paths; partially importing/reconciling
+    // legacy index artifacts can make the table unreadable.
+    const indexes_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{path});
+    defer alloc.free(indexes_path);
+    db.close();
+    db_closed = true;
+    destroyPathIfExists(indexes_path);
+    try db_mod.DB.markRestoreCompleteForPath(alloc, path, restore.backup_id, restore.location, snapshot_path, group_id);
+}
+
+fn portableSnapshotDocCount(alloc: std.mem.Allocator, afb_path: []const u8) !u64 {
+    const afb_data = try readFileAlloc(alloc, afb_path, 16 * 1024 * 1024 * 1024);
+    defer alloc.free(afb_data);
+    var reader = @import("../../storage/backup_codec.zig").SliceReader.init(afb_data);
+    _ = try reader.readHeader();
+    var count: u64 = 0;
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type == .document_batch) {
+            const entries = try @import("../../storage/backup_codec.zig").decodeDocumentBatch(alloc, block.payload);
+            defer {
+                for (entries) |entry| {
+                    alloc.free(entry.key);
+                    alloc.free(entry.value);
+                }
+                alloc.free(entries);
+            }
+            count += @intCast(entries.len);
+        }
+    }
+    return count;
 }
 
 fn stageRestoreSnapshot(
@@ -233,6 +313,26 @@ fn stageRestoreSnapshot(
             destroyPathIfExists(staging_root);
             try backups_api.copyDirectoryFromLocation(alloc, location, snapshot_path, staging_root);
             break :blk staging_root;
+        },
+    };
+}
+
+fn stageRestoreFile(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    location: *backups_api.BackupLocation,
+    snapshot_path: []const u8,
+) ![]u8 {
+    return switch (location.*) {
+        .file => |backup_root| try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path }),
+        .remote => blk: {
+            const staging_path = try std.fmt.allocPrint(alloc, "{s}.restore-staging/{s}", .{ path, std.fs.path.basename(snapshot_path) });
+            errdefer alloc.free(staging_path);
+            const staging_dir = std.fs.path.dirname(staging_path) orelse return error.InvalidBackupRequest;
+            destroyPathIfExists(staging_dir);
+            try ensureDirPath(staging_dir);
+            try backups_api.copyFileFromLocation(alloc, location, snapshot_path, staging_path);
+            break :blk staging_path;
         },
     };
 }
@@ -336,13 +436,20 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
             },
         }
 
-        const config_json = try extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);
+        const config_json = extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*) catch |err| {
+            std.log.warn("restore skipped index config index={s} err={}", .{ entry.key_ptr.*, err });
+            continue;
+        };
         defer alloc.free(config_json);
-        try db.addIndex(.{
+        db.addIndex(.{
             .name = entry.key_ptr.*,
             .kind = kind,
             .config_json = config_json,
-        });
+        }) catch |err| {
+            _ = db.deleteIndex(entry.key_ptr.*) catch false;
+            std.log.warn("restore skipped index create index={s} err={}", .{ entry.key_ptr.*, err });
+            continue;
+        };
         added += 1;
     }
     return added;

@@ -191,6 +191,7 @@ const LocalSwarmMetadata = struct {
                 .cached_admin_snapshot = cachedAdminSnapshot,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
                 .create_table = createTable,
+                .restore_table = restoreTable,
                 .drop_table = dropTable,
                 .update_schema = updateSchema,
                 .create_index = createIndex,
@@ -296,6 +297,30 @@ const LocalSwarmMetadata = struct {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
         const table = antfly.public_api.tables.deriveTableRecord(table_name, req);
         const ranges = try antfly.public_api.tables.deriveInitialRanges(alloc, table);
+        defer {
+            for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
+            alloc.free(ranges);
+        }
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
+        try self.manager.upsertTable(table);
+        for (ranges) |range| try self.manager.upsertRange(range);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        var location = try antfly.public_api.backups.openBackupLocation(alloc, location_uri);
+        defer location.deinit(alloc);
+        var manifest = antfly.public_api.backups.readManifestFromLocation(alloc, &location, backup_id) catch return error.InvalidBackupRequest;
+        defer manifest.deinit(alloc);
+        if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+        const table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, &manifest);
+        defer antfly.metadata.table_manager.freeTable(alloc, table);
+        const ranges = try antfly.public_api.backups.deriveRestoreRanges(alloc, table.table_id, location_uri, &manifest);
         defer {
             for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
             alloc.free(ranges);

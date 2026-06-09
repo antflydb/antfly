@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runtime_build = @import("build/runtime.zig");
 const finetune_common = @import("build/finetune/common.zig");
 const finetune_tests = @import("build/finetune/tests.zig");
@@ -182,7 +183,17 @@ fn configureNativeTool(
 }
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
+    // link against the host distro's crt startup objects. Newer glibc/binutils
+    // builds may include .sframe sections with relocation types that Zig's
+    // linker cannot yet handle. Defaulting Linux builds to an explicit GNU
+    // target keeps user-supplied -Dtarget overrides intact while making the
+    // no-argument path use Zig's bundled libc startup objects.
+    const default_target: std.Target.Query = if (builtin.os.tag == .linux)
+        .{ .cpu_arch = builtin.cpu.arch, .os_tag = .linux, .abi = .gnu }
+    else
+        .{};
+    const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
     const shared_lib_root = resolveSharedLibRoot(b);
 
