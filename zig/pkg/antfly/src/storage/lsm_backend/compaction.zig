@@ -1365,7 +1365,6 @@ fn testRun(id: u64, level: u32, smallest_key: []const u8, largest_key: []const u
         .largest_key = @constCast(largest_key),
         .entry_count = 1,
         .bloom_filter = null,
-        .encoded_bloom_filter = null,
         .owns_metadata = false,
         .owns_bloom_filter = false,
         .state = null,
@@ -1689,7 +1688,6 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 .largest_key = largest_key,
                 .entry_count = @intCast(persisted.entry_count),
                 .bloom_filter = persisted.filter,
-                .encoded_bloom_filter = null,
                 .state = null,
             };
         }
@@ -2066,7 +2064,6 @@ pub fn makeRunAtLevel(comptime BackendType: type, backend: *BackendType, state: 
             &state,
             backend.options.bloom,
         ),
-        .encoded_bloom_filter = null,
         .state = state,
     };
     errdefer if (run.bloom_filter) |*filter| filter.deinit(backend.allocator);
@@ -2154,7 +2151,6 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
         .largest_key = largest_key,
         .entry_count = @intCast(persisted.entry_count),
         .bloom_filter = persisted.filter,
-        .encoded_bloom_filter = null,
         .state = null,
     };
 }
@@ -2229,7 +2225,6 @@ fn disarmRun(run: *Run) void {
         .largest_key = &.{},
         .entry_count = 0,
         .bloom_filter = null,
-        .encoded_bloom_filter = null,
         .owns_metadata = false,
         .owns_bloom_filter = false,
         .cached_state_index = null,

@@ -19,8 +19,9 @@
 //
 //   1. Build schema prefix: ( [P] entities ( [E] label1 [E] label2 ... ) ) [SEP_TEXT]
 //   2. Tokenize text words individually, tracking word→sub-token mapping
-//   3. Construct input tensors: input_ids, attention_mask, words_mask, span_idx
-//   4. Run ONNX inference → [1, num_spans, num_labels] logits
+//   3. Construct input tensors for legacy words_mask models or official
+//      text_positions/schema_positions ONNX exports
+//   4. Run inference → span logits/scores
 //   5. Apply sigmoid, threshold, and flat NER deduplication
 //
 // Matches Go inference's lib/pipelines/gliner.go (GLiNER2 path).
@@ -260,6 +261,8 @@ pub const GlinerPipeline = struct {
         input_ids: []i64,
         attention_mask: []i64,
         words_mask: []i64,
+        text_positions: []i64,
+        schema_positions: []i64,
         span_idx: []i64,
         word_starts: []usize,
         word_ends: []usize,
@@ -270,10 +273,17 @@ pub const GlinerPipeline = struct {
             alloc.free(self.input_ids);
             alloc.free(self.attention_mask);
             alloc.free(self.words_mask);
+            alloc.free(self.text_positions);
+            alloc.free(self.schema_positions);
             alloc.free(self.span_idx);
             alloc.free(self.word_starts);
             alloc.free(self.word_ends);
         }
+    };
+
+    const GlinerOutputLayout = enum {
+        word_major_logits,
+        label_major_scores,
     };
 
     fn recognizeWithLabelTokenBatch(
@@ -291,6 +301,10 @@ pub const GlinerPipeline = struct {
 
         if (self.config.token_p == 0 or label_token == 0 or self.config.token_sep_text == 0)
             return error.MissingSpecialTokenIds;
+
+        if (self.session.backend() == .onnx and texts.len > 1) {
+            return self.recognizeWithLabelTokenBatchSerial(texts, labels, label_token, threshold, flat_ner);
+        }
 
         const results = try alloc.alloc([]Entity, texts.len);
         @memset(results, &.{});
@@ -327,6 +341,34 @@ pub const GlinerPipeline = struct {
                 row.* = try alloc.alloc(Entity, 0);
                 initialized_results += 1;
             }
+            for (prepared[0..prepared_len]) |*row| row.deinit(alloc);
+            alloc.free(prepared);
+            return results;
+        }
+
+        if (self.usesOfficialOnnxGlinerContract()) {
+            const session_start_ns = glinerProfileStart(profile_enabled);
+            for (prepared[0..prepared_len], 0..) |row, i| {
+                results[i] = try self.recognizeOfficialOnnxGlinerSingle(row, labels, threshold, flat_ner);
+                initialized_results += 1;
+            }
+            const session_decode_ms = glinerProfileElapsedMs(session_start_ns);
+            if (profile_enabled) {
+                std.debug.print(
+                    "gliner_pipeline_profile: official_onnx=1 batch={d} labels={d} seq_len={d} num_words={d} max_width={d} prepare_ms={d:.3} session_decode_ms={d:.3} total_ms={d:.3}\n",
+                    .{
+                        texts.len,
+                        labels.len,
+                        max_seq_len,
+                        max_num_words,
+                        max_width,
+                        prepare_ms,
+                        session_decode_ms,
+                        glinerProfileElapsedMs(total_start_ns),
+                    },
+                );
+            }
+
             for (prepared[0..prepared_len]) |*row| row.deinit(alloc);
             alloc.free(prepared);
             return results;
@@ -424,6 +466,7 @@ pub const GlinerPipeline = struct {
                 num_labels_dim,
                 threshold,
                 flat_ner,
+                .word_major_logits,
             );
             initialized_results += 1;
         }
@@ -449,6 +492,108 @@ pub const GlinerPipeline = struct {
         for (prepared[0..prepared_len]) |*row| row.deinit(alloc);
         alloc.free(prepared);
         return results;
+    }
+
+    fn recognizeWithLabelTokenBatchSerial(
+        self: *GlinerPipeline,
+        texts: []const []const u8,
+        labels: []const []const u8,
+        label_token: i32,
+        threshold: f32,
+        flat_ner: bool,
+    ) anyerror![][]Entity {
+        const alloc = self.allocator;
+        const results = try alloc.alloc([]Entity, texts.len);
+        @memset(results, &.{});
+        var initialized_results: usize = 0;
+        errdefer {
+            for (results[0..initialized_results]) |entities| {
+                for (entities) |entity| alloc.free(entity.text);
+                alloc.free(entities);
+            }
+            alloc.free(results);
+        }
+
+        for (texts, 0..) |_, i| {
+            const single = try self.recognizeWithLabelTokenBatch(texts[i .. i + 1], labels, label_token, threshold, flat_ner);
+            if (single.len != 1) {
+                for (single) |entities| {
+                    for (entities) |entity| alloc.free(entity.text);
+                    alloc.free(entities);
+                }
+                alloc.free(single);
+                return error.UnexpectedOutputShape;
+            }
+            results[i] = single[0];
+            alloc.free(single);
+            initialized_results += 1;
+        }
+
+        return results;
+    }
+
+    fn recognizeOfficialOnnxGlinerSingle(
+        self: *GlinerPipeline,
+        row: PreparedGlinerInput,
+        labels: []const []const u8,
+        threshold: f32,
+        flat_ner: bool,
+    ) ![]Entity {
+        const alloc = self.allocator;
+        const seq: i64 = @intCast(row.input_ids.len);
+        const shape_2d = [_]i64{ 1, seq };
+        var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape_2d, row.input_ids);
+        defer input_ids_tensor.deinit();
+        var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape_2d, row.attention_mask);
+        defer attention_mask_tensor.deinit();
+
+        const text_positions_shape = [_]i64{@intCast(row.text_positions.len)};
+        var text_positions_tensor = try Tensor.initInt64(alloc, "text_positions", &text_positions_shape, row.text_positions);
+        defer text_positions_tensor.deinit();
+
+        const schema_positions_shape = [_]i64{@intCast(row.schema_positions.len)};
+        var schema_positions_tensor = try Tensor.initInt64(alloc, "schema_positions", &schema_positions_shape, row.schema_positions);
+        defer schema_positions_tensor.deinit();
+
+        const span_shape = [_]i64{ 1, @intCast(row.num_spans), 2 };
+        var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, row.span_idx);
+        defer span_idx_tensor.deinit();
+
+        const outputs = try self.session.run(&.{
+            input_ids_tensor,
+            attention_mask_tensor,
+            text_positions_tensor,
+            schema_positions_tensor,
+            span_idx_tensor,
+        }, alloc);
+        defer {
+            for (outputs) |*o| o.deinit();
+            alloc.free(outputs);
+        }
+        if (outputs.len == 0) return error.NoOutputTensors;
+
+        const output = outputs[0];
+        const scores = output.asFloat32();
+        const output_shape = output.shape;
+        if (output_shape.len != 4 and output_shape.len != 3) return error.UnexpectedOutputShape;
+
+        const dim_offset: usize = if (output_shape.len == 4) 1 else 0;
+        var num_labels_dim: usize = @intCast(output_shape[dim_offset]);
+        if (num_labels_dim > labels.len) num_labels_dim = labels.len;
+        const output_num_words: usize = @intCast(output_shape[dim_offset + 1]);
+        const output_max_width: usize = @intCast(output_shape[dim_offset + 2]);
+
+        return self.decodeEntitiesFromLogits(
+            row,
+            labels,
+            scores,
+            output_num_words,
+            output_max_width,
+            num_labels_dim,
+            threshold,
+            flat_ner,
+            .label_major_scores,
+        );
     }
 
     fn prepareGlinerInput(
@@ -477,6 +622,8 @@ pub const GlinerPipeline = struct {
         // Regular text parts are tokenized normally.
         var schema_ids = std.ArrayListUnmanaged(i32).empty;
         defer schema_ids.deinit(alloc);
+        var schema_positions = std.ArrayListUnmanaged(i64).empty;
+        errdefer schema_positions.deinit(alloc);
 
         // "("
         {
@@ -485,6 +632,7 @@ pub const GlinerPipeline = struct {
             try schema_ids.appendSlice(alloc, ids);
         }
         // [P]
+        try schema_positions.append(alloc, @intCast(schema_ids.items.len));
         try schema_ids.append(alloc, self.config.token_p);
         // "entities"
         {
@@ -501,6 +649,7 @@ pub const GlinerPipeline = struct {
 
         for (labels) |label| {
             // [E] special token
+            try schema_positions.append(alloc, @intCast(schema_ids.items.len));
             try schema_ids.append(alloc, label_token);
 
             // Label text (tokenized normally)
@@ -554,6 +703,11 @@ pub const GlinerPipeline = struct {
         errdefer alloc.free(attention_mask_buf);
         const words_mask_buf = try alloc.alloc(i64, seq_len);
         errdefer alloc.free(words_mask_buf);
+        @memset(input_ids_buf, 0);
+        @memset(attention_mask_buf, 0);
+        @memset(words_mask_buf, 0);
+        var text_positions = std.ArrayListUnmanaged(i64).empty;
+        errdefer text_positions.deinit(alloc);
 
         // Fill schema tokens
         for (0..@min(schema_len, seq_len)) |j| {
@@ -570,6 +724,7 @@ pub const GlinerPipeline = struct {
             const count = word_token_counts[wi];
             if (pos + count > seq_len) break;
 
+            try text_positions.append(alloc, @intCast(pos));
             for (0..count) |ti| {
                 if (pos >= seq_len) break;
                 input_ids_buf[pos] = @intCast(text_ids.items[token_offset + ti]);
@@ -603,12 +758,18 @@ pub const GlinerPipeline = struct {
         const word_starts_owned = try word_starts.toOwnedSlice(alloc);
         errdefer alloc.free(word_starts_owned);
         const word_ends_owned = try word_ends.toOwnedSlice(alloc);
+        errdefer alloc.free(word_ends_owned);
+        const text_positions_owned = try text_positions.toOwnedSlice(alloc);
+        errdefer alloc.free(text_positions_owned);
+        const schema_positions_owned = try schema_positions.toOwnedSlice(alloc);
 
         return .{
             .text = text,
             .input_ids = input_ids_buf,
             .attention_mask = attention_mask_buf,
             .words_mask = words_mask_buf,
+            .text_positions = text_positions_owned,
+            .schema_positions = schema_positions_owned,
             .span_idx = span_idx_buf,
             .word_starts = word_starts_owned,
             .word_ends = word_ends_owned,
@@ -627,6 +788,7 @@ pub const GlinerPipeline = struct {
         num_labels_dim: usize,
         threshold: f32,
         flat_ner: bool,
+        output_layout: GlinerOutputLayout,
     ) ![]Entity {
         const alloc = self.allocator;
         var entities = std.ArrayListUnmanaged(Entity).empty;
@@ -644,10 +806,16 @@ pub const GlinerPipeline = struct {
                 const span_base = w * output_max_width * num_labels_dim + wi * num_labels_dim;
 
                 for (0..num_labels_dim) |li| {
-                    const logit_idx = span_base + li;
-                    if (logit_idx >= logits.len) continue;
+                    const output_idx = switch (output_layout) {
+                        .word_major_logits => span_base + li,
+                        .label_major_scores => li * output_num_words * output_max_width + w * output_max_width + wi,
+                    };
+                    if (output_idx >= logits.len) continue;
 
-                    const score = sigmoid(logits[logit_idx]);
+                    const score = switch (output_layout) {
+                        .word_major_logits => sigmoid(logits[output_idx]),
+                        .label_major_scores => logits[output_idx],
+                    };
                     if (score >= threshold) {
                         const char_start = row.word_starts[w];
                         const char_end = row.word_ends[end_word];
@@ -708,6 +876,19 @@ pub const GlinerPipeline = struct {
         }.lessThan);
 
         return try dedupEntitiesByLabelText(alloc, try entities.toOwnedSlice(alloc));
+    }
+
+    fn usesOfficialOnnxGlinerContract(self: *const GlinerPipeline) bool {
+        return self.session.backend() == .onnx and
+            self.hasSessionInput("text_positions") and
+            self.hasSessionInput("schema_positions");
+    }
+
+    fn hasSessionInput(self: *const GlinerPipeline, name: []const u8) bool {
+        for (self.session.inputInfo()) |input| {
+            if (std.mem.eql(u8, input.name, name)) return true;
+        }
+        return false;
     }
 
     fn extractRelationsSingle(

@@ -796,6 +796,7 @@ fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_em
         .ptr = node,
         .embed_dense_texts = localAntflyEmbedDenseTexts,
         .embed_sparse_texts = localAntflyEmbedSparseTexts,
+        .embed_dense_parts = localAntflyEmbedDenseParts,
         .rerank_texts = localAntflyRerankTexts,
         .generate_text = localAntflyGenerateText,
         .generate_messages = localAntflyGenerateMessages,
@@ -813,6 +814,65 @@ fn localAntflyEmbedDenseTexts(
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     return try node.embedDenseTextsDirect(alloc, model, texts);
+}
+
+fn localAntflyEmbedDenseParts(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const antfly.template.ContentPart,
+) anyerror![][]f32 {
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
+    var values = std.json.Array.init(alloc);
+    defer values.deinit();
+    var encoded_buffers = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (encoded_buffers.items) |buf| alloc.free(buf);
+        encoded_buffers.deinit(alloc);
+    }
+
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| {
+                var obj = std.json.ObjectMap.empty;
+                errdefer obj.deinit(alloc);
+                try obj.put(alloc, "type", .{ .string = "text" });
+                try obj.put(alloc, "text", .{ .string = text });
+                try values.append(.{ .object = obj });
+            },
+            .media_url => |url| {
+                var image_url = std.json.ObjectMap.empty;
+                errdefer image_url.deinit(alloc);
+                try image_url.put(alloc, "url", .{ .string = url });
+
+                var obj = std.json.ObjectMap.empty;
+                errdefer obj.deinit(alloc);
+                try obj.put(alloc, "type", .{ .string = "image_url" });
+                try obj.put(alloc, "image_url", .{ .object = image_url });
+                try values.append(.{ .object = obj });
+            },
+            .binary => |binary_part| {
+                const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
+                const encoded = try alloc.alloc(u8, encoded_len);
+                errdefer alloc.free(encoded);
+                _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
+                try encoded_buffers.append(alloc, encoded);
+
+                var obj = std.json.ObjectMap.empty;
+                errdefer {
+                    obj.deinit(alloc);
+                    _ = encoded_buffers.pop();
+                    alloc.free(encoded);
+                }
+                try obj.put(alloc, "type", .{ .string = "media" });
+                try obj.put(alloc, "data", .{ .string = encoded });
+                try obj.put(alloc, "mime_type", .{ .string = binary_part.mime_type });
+                try values.append(.{ .object = obj });
+            },
+        }
+    }
+
+    return try node.embedDenseJsonInputDirect(alloc, model, .{ .array = values });
 }
 
 fn localAntflyEmbedSparseTexts(

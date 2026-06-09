@@ -494,6 +494,7 @@ fn modelKindFromManifestType(model_type: manifest_mod.ModelType) ModelKind {
 }
 
 fn inferModelKindFromPath(path: []const u8) ModelKind {
+    var hinted_kind: ?ModelKind = null;
     var it = std.mem.tokenizeAny(u8, path, "/\\");
     while (it.next()) |component| {
         if (std.mem.eql(u8, component, "embedders")) return .embedder;
@@ -506,8 +507,20 @@ fn inferModelKindFromPath(path: []const u8) ModelKind {
         if (std.mem.eql(u8, component, "readers")) return .reader;
         if (std.mem.eql(u8, component, "transcribers")) return .transcriber;
         if (std.mem.eql(u8, component, "extractors")) return .extractor;
+        if (containsAsciiIgnoreCase(component, "rerank")) hinted_kind = .reranker;
     }
-    return .embedder;
+    return hinted_kind orelse .embedder;
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 fn modelTypeName(model_type: manifest_mod.ModelType) []const u8 {
@@ -755,10 +768,10 @@ fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.Model
             std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .recognizer;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "classify") or std.mem.eql(u8, task, "classifiers")) return .classifier;
+        if (std.mem.eql(u8, task, "rerank") or std.mem.eql(u8, task, "rerankers")) return .reranker;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "rerank") or std.mem.eql(u8, task, "rerankers")) return .reranker;
+        if (std.mem.eql(u8, task, "classify") or std.mem.eql(u8, task, "classifiers")) return .classifier;
     }
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "read") or std.mem.eql(u8, task, "readers")) return .reader;
@@ -1005,6 +1018,33 @@ test "synthesized pulled manifest accepts plural task directory hints" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"read\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"image\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\"") == null);
+}
+
+test "synthesized pulled manifest treats rerank-named sequence classifiers as rerankers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/mixedbread-ai/mxbai-rerank-base-v1/onnx");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/mixedbread-ai/mxbai-rerank-base-v1/config.json",
+        .data = "{\"architectures\":[\"XLMRobertaForSequenceClassification\"],\"model_type\":\"xlm-roberta\"}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/mixedbread-ai/mxbai-rerank-base-v1/onnx/model.onnx",
+        .data = "",
+    });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/mixedbread-ai/mxbai-rerank-base-v1" });
+    defer allocator.free(model_dir);
+
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, io, model_dir, null, null);
+    defer allocator.free(manifest_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"reranker\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"rerank\"]") != null);
 }
 
 test "synthesized pulled manifest preserves explicit sparse capability" {

@@ -4484,7 +4484,6 @@ fn cloneRunForBackend(dest: *Backend, source: Run) !Run {
         .largest_key = largest_key,
         .entry_count = source.entry_count,
         .bloom_filter = if (source.bloom_filter) |filter| try filter.clone(dest.allocator) else null,
-        .encoded_bloom_filter = if (source.encoded_bloom_filter) |encoded| try dest.allocator.dupe(u8, encoded) else null,
         .state = null,
     };
     errdefer run.deinit(dest.allocator);
@@ -4614,7 +4613,6 @@ fn appendSyntheticLevelRunsForTest(backend: *Backend, level: u32, count: usize, 
             .largest_key = &.{},
             .entry_count = 1,
             .bloom_filter = null,
-            .encoded_bloom_filter = null,
             .owns_metadata = false,
             .state = null,
         });

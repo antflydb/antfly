@@ -8258,6 +8258,9 @@ pub const DB = struct {
 
         const target_sequence = self.core.nextDerivedSequence();
         for (runtime_stats.indexes) |*item| {
+            if (self.enrichment_runtime) |runtime| {
+                item.enrichment_failed = runtime.indexHasIsolatedFailure(item.name);
+            }
             const dense_catch_up = item.kind == .dense_vector and runtime_stats.async_indexing.dense_catch_up.active;
             if (!dense_catch_up) if (self.executor.appliedSequence(item.name)) |live_applied| {
                 item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
@@ -28102,6 +28105,74 @@ test "db runUntilIdle drains enrichment and derived indexing" {
 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db generated enrichment backfill drains stored docs beyond first replay chunk" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "embedded-worker",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    const total_docs: usize = 129;
+    const writes = try alloc.alloc(types.BatchWrite, total_docs);
+    defer {
+        for (writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        alloc.free(writes);
+    }
+    for (writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i}),
+            .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"doc {d}\",\"body\":\"generated vector text {d}\"}}", .{ i, i }),
+        };
+    }
+    try db.batch(.{
+        .writes = writes,
+        .sync_level = .write,
+    });
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+    try db.runUntilIdle();
+
+    const pending_after = db.pendingWorkStats();
+    try std.testing.expectEqual(pending_after.enrichment.target_sequence, pending_after.enrichment.applied_sequence);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "generated vector text 128", 3);
+    defer alloc.free(query_vec);
+
+    var result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = query_vec,
+            .k = 5,
+        },
+    }, 1);
+    defer result.deinit();
+    try std.testing.expect(result.total_hits > 0);
+    var found_last = false;
+    for (result.hits) |hit| {
+        if (std.mem.eql(u8, hit.id, "doc:128")) {
+            found_last = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_last);
 }
 
 test "db runUntilIdle drains lazy dense posting maintenance" {

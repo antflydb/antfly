@@ -4434,7 +4434,7 @@ fn getFromRunIndices(
                     continue;
                 }
             }
-            const run_filter_checked = run.bloom_filter != null or run.encoded_bloom_filter != null or run.path != null;
+            const run_filter_checked = run.bloom_filter != null or run.path != null;
             if (run_filter_checked and !try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, backend_locked)) continue;
             if (backend.options.cache != null) {
                 const located = if (batch_run_indexes) |indexes|
@@ -5454,11 +5454,6 @@ fn ensureRunBloomFilterForReadLocked(backend: anytype, run: *Run, backend_locked
 
 fn materializeRunBloomFilterForRead(backend: anytype, run: *Run, backend_locked: bool) !?bloom.OwnedFilter {
     if (run.bloom_filter) |filter| return filter;
-    if (run.encoded_bloom_filter) |encoded| {
-        run.bloom_filter = try bloom.OwnedFilter.decodeAlloc(backend.allocator, encoded);
-        run.owns_bloom_filter = true;
-        return run.bloom_filter.?;
-    }
     if (run.path == null) return null;
 
     const filter = if (backend.options.cache != null) blk: {

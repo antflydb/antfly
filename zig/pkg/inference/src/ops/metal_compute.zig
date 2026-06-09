@@ -4030,6 +4030,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return resolved;
     }
 
+    fn concreteShapeOrDeclared(input_buf: *const Buf, declared_shape: []const i64, scratch: *[metal_tensor_mod.max_dims]i64) []const i64 {
+        if (resolveConcreteShape(input_buf, declared_shape)) |resolved| {
+            scratch.* = resolved;
+            return scratch[0..declared_shape.len];
+        } else |_| {
+            return declared_shape;
+        }
+    }
+
     fn resolveShapeRightmostUnknown(declared_shape: []const i64, elem_count: usize) ![metal_tensor_mod.max_dims]i64 {
         if (declared_shape.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
         var resolved: [metal_tensor_mod.max_dims]i64 = undefined;
@@ -5134,9 +5143,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var native_ctx = try HostFallbackNative.init(self.allocator);
         defer native_ctx.deinit();
 
-        const n_input = try self.importCtToHostNative(&native_ctx, input, input_shape);
+        const input_buf = toBuf(input);
+        var input_shape_scratch: [metal_tensor_mod.max_dims]i64 = undefined;
+        const resolved_input_shape = concreteShapeOrDeclared(input_buf, input_shape, &input_shape_scratch);
+
+        const n_input = try self.importCtToHostNative(&native_ctx, input, resolved_input_shape);
         defer native_ctx.cb.free(n_input);
-        const n_output = try native_ctx.cb.primArgMax(n_input, axis, keepdims, input_shape);
+        const n_output = try native_ctx.cb.primArgMax(n_input, axis, keepdims, resolved_input_shape);
         defer native_ctx.cb.free(n_output);
         return self.exportCtFromHostNative(&native_ctx, n_output, null);
     }
@@ -5287,11 +5300,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var native_ctx = try HostFallbackNative.init(self.allocator);
         defer native_ctx.deinit();
 
-        const n_a = try self.importCtToHostNative(&native_ctx, a, a_shape);
+        const a_buf = toBuf(a);
+        const b_buf = toBuf(b);
+        var a_shape_scratch: [metal_tensor_mod.max_dims]i64 = undefined;
+        var b_shape_scratch: [metal_tensor_mod.max_dims]i64 = undefined;
+        const resolved_a_shape = concreteShapeOrDeclared(a_buf, a_shape, &a_shape_scratch);
+        const resolved_b_shape = concreteShapeOrDeclared(b_buf, b_shape, &b_shape_scratch);
+
+        const n_a = try self.importCtToHostNative(&native_ctx, a, resolved_a_shape);
         defer native_ctx.cb.free(n_a);
-        const n_b = try self.importCtToHostNative(&native_ctx, b, b_shape);
+        const n_b = try self.importCtToHostNative(&native_ctx, b, resolved_b_shape);
         defer native_ctx.cb.free(n_b);
-        const n_output = try native_ctx.cb.primConcatPrim(n_a, n_b, axis, a_shape, b_shape);
+        const n_output = try native_ctx.cb.primConcatPrim(n_a, n_b, axis, resolved_a_shape, resolved_b_shape);
         defer native_ctx.cb.free(n_output);
         return self.exportCtFromHostNative(&native_ctx, n_output, null);
     }
@@ -19509,6 +19529,68 @@ test "metal_compute: native provider is shared across backend lifetimes" {
     var second = try MetalCompute.init(allocator, &metal_ws, null);
     defer second.deinit();
     try std.testing.expectEqual(first_provider, second.provider_impl);
+}
+
+test "metal_compute: argmax fallback resolves symbolic input shape" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer {
+        deinitSharedNativeProvider(&metal_ws);
+        metal_ws.lazy_weights.deinit(allocator);
+    }
+
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input = try metal_cb.fromFloat32Shape(&.{ 1, 3, 2, 9, 5, 4 }, &.{ 2, 3 });
+    defer metal_cb.free(input);
+
+    const out = try metal_cb.primArgMax(input, 1, false, &.{ -1, 3 });
+    defer metal_cb.free(out);
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{2}, out_shape);
+
+    const values = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, values);
+}
+
+test "metal_compute: concat fallback resolves symbolic input shapes" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer {
+        deinitSharedNativeProvider(&metal_ws);
+        metal_ws.lazy_weights.deinit(allocator);
+    }
+
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs = try metal_cb.fromFloat32Shape(&.{ 1, 2 }, &.{ 2, 1 });
+    defer metal_cb.free(lhs);
+    const rhs = try metal_cb.fromFloat32Shape(&.{ 10, 20 }, &.{ 2, 1 });
+    defer metal_cb.free(rhs);
+
+    const out = try metal_cb.primConcatPrim(lhs, rhs, 1, &.{ -1, 1 }, &.{ -1, 1 });
+    defer metal_cb.free(out);
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, out_shape);
+
+    const values = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 10, 2, 20 }, values);
 }
 
 test "metal_compute: paged decode attention matches native on f32 cache" {

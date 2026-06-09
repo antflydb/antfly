@@ -652,6 +652,7 @@ pub const LoadedModel = struct {
     native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     // Multimodal sessions (CLIP/CLAP/CLIPCLAP)
     embedding_session_lock: std.atomic.Mutex = .unlocked,
+    reranking_session_lock: std.atomic.Mutex = .unlocked,
     vision_session: ?backends.Session = null,
     audio_session: ?backends.Session = null,
     text_projection: ?backends.Session = null,
@@ -769,6 +770,14 @@ pub const LoadedModel = struct {
             .add_bos_token = self.manifest.add_bos_token,
             .distributed = runtime.distributed.configFromEnv(),
         });
+    }
+
+    pub fn lockRerankingSession(self: *LoadedModel) void {
+        spinLock(&self.reranking_session_lock);
+    }
+
+    pub fn unlockRerankingSession(self: *LoadedModel) void {
+        self.reranking_session_lock.unlock();
     }
 
     pub fn classificationPipeline(self: *LoadedModel, allocator: std.mem.Allocator, config: ClassificationConfig) ClassificationPipeline {

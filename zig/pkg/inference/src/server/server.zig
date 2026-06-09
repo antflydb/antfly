@@ -393,6 +393,56 @@ fn deinitDiscoveredModelListings(allocator: std.mem.Allocator, listings: []Disco
     allocator.free(listings);
 }
 
+fn appendLoadedAliasModelListings(
+    allocator: std.mem.Allocator,
+    body: *std.ArrayListUnmanaged(u8),
+    openai_data: *std.ArrayListUnmanaged(u8),
+    openai_data_count: *usize,
+    model_count: *usize,
+    task: []const u8,
+    list_created: i64,
+    discovered: []const registry_mod.ModelEntry,
+    model_manager: *model_manager_mod.ModelManager,
+) !void {
+    // Loaded model cache keys include backend variants such as
+    // "<absolute path>\nbackend=onnx"; only public aliases belong in listings.
+    var it = model_manager.loaded_aliases.iterator();
+    while (it.next()) |entry| {
+        const model = entry.value_ptr.*;
+        const model_task = @tagName(model.manifest.model_type);
+        if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
+
+        var already_listed = false;
+        for (discovered) |d| {
+            if (std.mem.eql(u8, d.path, entry.key_ptr.*)) {
+                already_listed = true;
+                break;
+            }
+        }
+        if (already_listed) continue;
+
+        if (model_count.* > 0) try body.append(allocator, ',');
+        try jsonEncodeString(body, allocator, entry.key_ptr.*);
+        try body.append(allocator, ':');
+        try appendModelInfo(
+            body,
+            allocator,
+            model_task,
+            model.manifest.gliner_model_type,
+            model.manifest.capabilities,
+            model.manifest.inputs,
+            model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
+            model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+        );
+        if (isOpenAiListTask(task)) {
+            if (openai_data_count.* > 0) try openai_data.append(allocator, ',');
+            try appendOpenAiModelEntry(openai_data, allocator, entry.key_ptr.*, list_created);
+            openai_data_count.* += 1;
+        }
+        model_count.* += 1;
+    }
+}
+
 const ModelCounts = struct {
     embedders: usize = 0,
     rerankers: usize = 0,
@@ -545,6 +595,38 @@ pub const Node = struct {
         return try pipeline.embed(texts);
     }
 
+    pub fn embedDenseJsonInputDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        input: std.json.Value,
+    ) ![][]f32 {
+        try self.request_queue.acquire();
+        defer self.releaseSlot();
+        self.metrics.incRequest("embed.local");
+        defer self.metrics.decActive();
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+
+        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
+        const model = try self.model_manager.loadFromDir(model_path);
+        if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+
+        var inputs = try parseDenseEmbedInputs(self, allocator, &model.manifest, input);
+        defer inputs.deinit(allocator);
+        if (inputs.total_count == 0) return error.EmptyEmbeddingResponse;
+
+        try model.ensureEmbeddingAssets(
+            inputs.texts.items.len > 0,
+            inputs.images.items.len > 0,
+            inputs.audio.items.len > 0,
+        );
+
+        var pipeline = model.embeddingPipeline(allocator);
+        return try embedDenseInputs(allocator, &pipeline, &inputs);
+    }
+
     pub fn embedSparseTextsDirect(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -590,6 +672,8 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rerankers");
         const model = try self.model_manager.loadFromDir(model_path);
+        model.lockRerankingSession();
+        defer model.unlockRerankingSession();
         var pipeline = model.rerankingPipeline(allocator);
         return try pipeline.rerank(query, documents);
     }
@@ -1702,6 +1786,8 @@ pub const Node = struct {
         const model = self.model_manager.loadFromDir(model_path) catch |err|
             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
 
+        model.lockRerankingSession();
+        defer model.unlockRerankingSession();
         var pipeline = model.rerankingPipeline(ctx.allocator);
         const scores = pipeline.rerank(body.query, body.prompts) catch |err|
             return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
@@ -1760,6 +1846,8 @@ pub const Node = struct {
             defer ctx.allocator.free(flat_texts);
             for (parsed_docs.items, 0..) |doc, idx| flat_texts[idx] = doc.text;
 
+            model.lockRerankingSession();
+            defer model.unlockRerankingSession();
             var pipeline = model.rerankingPipeline(ctx.allocator);
             const scores = pipeline.rerank(body.query, flat_texts) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
@@ -1813,9 +1901,13 @@ pub const Node = struct {
 
         for (parsed_docs.items, 0..) |doc, idx| {
             if (doc.images.len == 0) {
-                var text_pipeline = model.rerankingPipeline(ctx.allocator);
-                const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                model.lockRerankingSession();
+                const text_scores = blk: {
+                    defer model.unlockRerankingSession();
+                    var text_pipeline = model.rerankingPipeline(ctx.allocator);
+                    break :blk text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
+                        return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                };
                 defer ctx.allocator.free(text_scores);
                 scores[idx] = text_scores[0];
                 continue;
@@ -4626,43 +4718,7 @@ pub const Node = struct {
                 model_count += 1;
             }
 
-            // Add loaded models not yet listed (loaded by path, not discovered by name)
-            var it = self.model_manager.loaded.iterator();
-            while (it.next()) |entry| {
-                const model = entry.value_ptr.*;
-                const model_task = @tagName(model.manifest.model_type);
-                if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
-
-                // Skip if already listed from discovery
-                var already_listed = false;
-                for (discovered) |d| {
-                    if (std.mem.eql(u8, d.path, entry.key_ptr.*)) {
-                        already_listed = true;
-                        break;
-                    }
-                }
-                if (!already_listed) {
-                    if (model_count > 0) try body.append(a, ',');
-                    try jsonEncodeString(&body, a, entry.key_ptr.*);
-                    try body.append(a, ':');
-                    try appendModelInfo(
-                        &body,
-                        a,
-                        model_task,
-                        model.manifest.gliner_model_type,
-                        model.manifest.capabilities,
-                        model.manifest.inputs,
-                        model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
-                        model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
-                    );
-                    if (isOpenAiListTask(task)) {
-                        if (openai_data_count > 0) try openai_data.append(a, ',');
-                        try appendOpenAiModelEntry(&openai_data, a, entry.key_ptr.*, list_created);
-                        openai_data_count += 1;
-                    }
-                    model_count += 1;
-                }
-            }
+            try appendLoadedAliasModelListings(a, &body, &openai_data, &openai_data_count, &model_count, task, list_created, discovered, &self.model_manager);
 
             try body.append(a, '}');
         }
@@ -6231,6 +6287,44 @@ test "download remote content accepts data uri" {
     defer downloaded.deinit(alloc);
     try std.testing.expectEqualStrings("text/plain", downloaded.content_type);
     try std.testing.expectEqualStrings("hello", downloaded.data);
+}
+
+test "model listing emits loaded aliases instead of backend variant cache keys" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const alloc = arena_impl.allocator();
+
+    var manager = model_manager_mod.ModelManager.init(alloc, backends_mod.SessionManager.init(alloc));
+    const model = try alloc.create(model_manager_mod.LoadedModel);
+    model.* = .{
+        .manifest = .{
+            .allocator = alloc,
+            .model_type = .embedder,
+        },
+        .hf_tok = null,
+        .sp_tok = null,
+        .session = undefined,
+        .session_manager = &manager.session_manager,
+        .model_dir = "/tmp/models/owner/model",
+        .allocator = alloc,
+    };
+
+    try manager.loaded.put(alloc, "/tmp/models/owner/model\nbackend=onnx", model);
+    try manager.loaded_aliases.put(alloc, "owner/model", model);
+
+    var body = std.ArrayListUnmanaged(u8).empty;
+    var openai_data = std.ArrayListUnmanaged(u8).empty;
+    var openai_count: usize = 0;
+    var model_count: usize = 0;
+    try appendLoadedAliasModelListings(alloc, &body, &openai_data, &openai_count, &model_count, "embedders", 123, &.{}, &manager);
+
+    try std.testing.expectEqual(@as(usize, 1), model_count);
+    try std.testing.expectEqual(@as(usize, 1), openai_count);
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"owner/model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openai_data.items, "\"id\":\"owner/model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "backend=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, openai_data.items, "backend=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "/tmp/models/owner/model") == null);
 }
 
 test "download remote content blocks private ip urls when configured" {
