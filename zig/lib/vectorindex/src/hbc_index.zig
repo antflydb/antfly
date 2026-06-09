@@ -3685,19 +3685,14 @@ fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
             var parent = try loadNode(self, txn, leaf.parent);
             defer parent.deinit(self.alloc);
             try parent.ensureUnbacked(self.alloc);
-            var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-            var wi_child: usize = 0;
-            for (parent.children) |cid| {
-                if (cid == leaf_id) continue;
-                new_children[wi_child] = cid;
-                wi_child += 1;
+            if (try removeChildLink(self, &parent, leaf_id)) {
+                try recomputeInternalCentroid(self, txn, &parent);
+                try self.saveNode(txn, &parent);
+                try deleteNode(self, txn, leaf_id);
+                try collapseSingleChildParents(self, txn, leaf.parent);
+            } else {
+                try deleteNode(self, txn, leaf_id);
             }
-            self.alloc.free(parent.children);
-            parent.children = new_children;
-            try recomputeInternalCentroid(self, txn, &parent);
-            try self.saveNode(txn, &parent);
-            try deleteNode(self, txn, leaf_id);
-            try collapseSingleChildParents(self, txn, leaf.parent);
         } else {
             try self.saveNode(txn, &leaf);
         }
@@ -3713,6 +3708,36 @@ fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
         self.metadata.active_count -|= @intCast(removed_count);
         group_start = group_end;
     }
+}
+
+/// Removes leaf_id from parent.children, replacing the slice. Returns false
+/// — leaving the parent untouched — when the recorded parent does not
+/// actually reference the leaf. That happens when a stale parent link
+/// survives tree maintenance; rebuilding children with len-1 in that state
+/// used to overrun the new array and panic the whole process.
+fn removeChildLink(self: anytype, parent: anytype, leaf_id: u64) !bool {
+    var contains = false;
+    for (parent.children) |cid| {
+        if (cid == leaf_id) {
+            contains = true;
+            break;
+        }
+    }
+    if (!contains) {
+        std.log.warn("hbc: leaf {d} not referenced by its recorded parent; skipping unlink", .{leaf_id});
+        return false;
+    }
+    var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
+    errdefer self.alloc.free(new_children);
+    var wi_child: usize = 0;
+    for (parent.children) |cid| {
+        if (cid == leaf_id) continue;
+        new_children[wi_child] = cid;
+        wi_child += 1;
+    }
+    self.alloc.free(parent.children);
+    parent.children = new_children;
+    return true;
 }
 
 pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
@@ -3740,19 +3765,14 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
         var parent = try loadNode(self, txn, leaf.parent);
         defer parent.deinit(self.alloc);
         try parent.ensureUnbacked(self.alloc);
-        var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-        var wi_child: usize = 0;
-        for (parent.children) |cid| {
-            if (cid == leaf_id) continue;
-            new_children[wi_child] = cid;
-            wi_child += 1;
+        if (try removeChildLink(self, &parent, leaf_id)) {
+            try recomputeInternalCentroid(self, txn, &parent);
+            try self.saveNode(txn, &parent);
+            try deleteNode(self, txn, leaf_id);
+            try collapseSingleChildParents(self, txn, leaf.parent);
+        } else {
+            try deleteNode(self, txn, leaf_id);
         }
-        self.alloc.free(parent.children);
-        parent.children = new_children;
-        try recomputeInternalCentroid(self, txn, &parent);
-        try self.saveNode(txn, &parent);
-        try deleteNode(self, txn, leaf_id);
-        try collapseSingleChildParents(self, txn, leaf.parent);
     } else {
         try self.saveNode(txn, &leaf);
 
@@ -3789,19 +3809,14 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
                 try self.saveNode(txn, &sibling);
                 for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
-                var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-                var wi_child: usize = 0;
-                for (parent.children) |cid| {
-                    if (cid == leaf_id) continue;
-                    new_children[wi_child] = cid;
-                    wi_child += 1;
+                if (try removeChildLink(self, &parent, leaf_id)) {
+                    try recomputeInternalCentroid(self, txn, &parent);
+                    try self.saveNode(txn, &parent);
+                    try deleteNode(self, txn, leaf_id);
+                    try collapseSingleChildParents(self, txn, leaf.parent);
+                } else {
+                    try deleteNode(self, txn, leaf_id);
                 }
-                self.alloc.free(parent.children);
-                parent.children = new_children;
-                try recomputeInternalCentroid(self, txn, &parent);
-                try self.saveNode(txn, &parent);
-                try deleteNode(self, txn, leaf_id);
-                try collapseSingleChildParents(self, txn, leaf.parent);
             }
         }
     }
@@ -4280,20 +4295,14 @@ pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64)
         var parent = try loadNode(self, txn, leaf.parent);
         defer parent.deinit(self.alloc);
         try parent.ensureUnbacked(self.alloc);
-        var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-        errdefer self.alloc.free(new_children);
-        var wi_child: usize = 0;
-        for (parent.children) |cid| {
-            if (cid == leaf_id) continue;
-            new_children[wi_child] = cid;
-            wi_child += 1;
+        if (try removeChildLink(self, &parent, leaf_id)) {
+            try recomputeInternalCentroid(self, txn, &parent);
+            try self.saveNodeWithOptionsMode(txn, &parent, .{}, false);
+            try deleteNode(self, txn, leaf_id);
+            try collapseSingleChildParents(self, txn, leaf.parent);
+        } else {
+            try deleteNode(self, txn, leaf_id);
         }
-        self.alloc.free(parent.children);
-        parent.children = new_children;
-        try recomputeInternalCentroid(self, txn, &parent);
-        try self.saveNodeWithOptionsMode(txn, &parent, .{}, false);
-        try deleteNode(self, txn, leaf_id);
-        try collapseSingleChildParents(self, txn, leaf.parent);
         return;
     }
 
@@ -4333,20 +4342,14 @@ pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64)
             try self.saveNodeWithOptionsMode(txn, &sibling, .{}, false);
             for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
-            var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-            errdefer self.alloc.free(new_children);
-            var wi_child: usize = 0;
-            for (parent.children) |cid| {
-                if (cid == leaf_id) continue;
-                new_children[wi_child] = cid;
-                wi_child += 1;
+            if (try removeChildLink(self, &parent, leaf_id)) {
+                try recomputeInternalCentroid(self, txn, &parent);
+                try self.saveNodeWithOptionsMode(txn, &parent, .{}, false);
+                try deleteNode(self, txn, leaf_id);
+                try collapseSingleChildParents(self, txn, leaf.parent);
+            } else {
+                try deleteNode(self, txn, leaf_id);
             }
-            self.alloc.free(parent.children);
-            parent.children = new_children;
-            try recomputeInternalCentroid(self, txn, &parent);
-            try self.saveNodeWithOptionsMode(txn, &parent, .{}, false);
-            try deleteNode(self, txn, leaf_id);
-            try collapseSingleChildParents(self, txn, leaf.parent);
         }
     }
 }
