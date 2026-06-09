@@ -131,10 +131,9 @@ pub const dense_hbc_lsm_options_default = lsm_backend_mod.Options{
     // HBC mutation streams rewrite nodes/ranges/quantized payloads. Direct
     // sorted ingest is reserved for a true final-unique bulk builder.
     .direct_bulk_ingest = false,
-    // Dense indexes are opened by write, query, status, and startup catch-up
-    // handles. Keep obsolete run files long enough for those independent LSM
-    // manifest snapshots to finish using them.
-    .obsolete_retention_ns = 5 * std.time.ns_per_min,
+    // Open DB handles pin manifest run files through LSM version refs; obsolete
+    // files are eligible as soon as those refs and active readers drain.
+    .obsolete_retention_ns = 250 * std.time.ns_per_ms,
 };
 
 pub const graph_reverse_lsm_options_default = lsm_backend_mod.Options{
@@ -423,7 +422,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(index_wal_hard_limit_bytes, opts.dense_lsm_options.wal_hard_limit_bytes);
     try std.testing.expectEqual(@as(@TypeOf(opts.dense_lsm_options.table_prefix_extractor), .none), opts.dense_lsm_options.table_prefix_extractor);
     try std.testing.expectEqual(false, opts.dense_lsm_options.direct_bulk_ingest);
-    try std.testing.expect(opts.dense_lsm_options.obsolete_retention_ns > 0);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), opts.dense_lsm_options.obsolete_retention_ns);
     try std.testing.expectEqual(sparse_mod.SparseBackend.lsm, opts.sparse_backend);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), opts.sparse_lsm_options.flush_threshold_bytes);
     try std.testing.expectEqual(opts.sparse_lsm_options.flush_threshold_bytes, opts.sparse_lsm_options.read_snapshot_rotate_mutable_bytes);
@@ -472,5 +471,5 @@ test "index lsm profiles inherit shared cache root generation and overrides" {
     try std.testing.expectEqual(@as(u64, 9), resolved.text_main_lsm_options.root_generation);
     try std.testing.expectEqual(@as(u64, 9), resolved.dense_lsm_options.root_generation);
     try std.testing.expectEqual(@as(u64, 9), resolved.sparse_lsm_options.root_generation);
-    try std.testing.expect(resolved.dense_lsm_options.obsolete_retention_ns > 0);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), resolved.dense_lsm_options.obsolete_retention_ns);
 }

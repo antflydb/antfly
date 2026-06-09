@@ -48,6 +48,57 @@ const compareNamespace = state_mod.compareNamespace;
 const compareEntryTo = state_mod.compareEntryTo;
 const CounterU64 = platform.atomic.Value(u64);
 
+const ObsoletePathRef = struct {
+    path: []u8,
+    count: u64,
+};
+
+const ObsoletePathRefRegistry = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    refs: std.ArrayListUnmanaged(ObsoletePathRef) = .empty,
+
+    fn retain(self: *ObsoletePathRefRegistry, path: []const u8) !void {
+        lockWorkerMutex(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.refs.items) |*ref| {
+            if (!std.mem.eql(u8, ref.path, path)) continue;
+            ref.count +|= 1;
+            return;
+        }
+        const owned = try std.heap.page_allocator.dupe(u8, path);
+        errdefer std.heap.page_allocator.free(owned);
+        try self.refs.append(std.heap.page_allocator, .{ .path = owned, .count = 1 });
+    }
+
+    fn release(self: *ObsoletePathRefRegistry, path: []const u8) void {
+        lockWorkerMutex(&self.mutex);
+        defer self.mutex.unlock();
+        var i: usize = 0;
+        while (i < self.refs.items.len) : (i += 1) {
+            const ref = &self.refs.items[i];
+            if (!std.mem.eql(u8, ref.path, path)) continue;
+            if (ref.count > 1) {
+                ref.count -= 1;
+                return;
+            }
+            std.heap.page_allocator.free(ref.path);
+            _ = self.refs.swapRemove(i);
+            return;
+        }
+    }
+
+    fn isRetained(self: *ObsoletePathRefRegistry, path: []const u8) bool {
+        lockWorkerMutex(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.refs.items) |ref| {
+            if (std.mem.eql(u8, ref.path, path) and ref.count > 0) return true;
+        }
+        return false;
+    }
+};
+
+var obsolete_path_refs = ObsoletePathRefRegistry{};
+
 pub const MutableSnapshotReason = enum(u8) {
     bound_read_txn,
     namespace_read_txn,
@@ -149,7 +200,8 @@ pub const Options = struct {
     wal_soft_limit_bytes: u64 = 0,
     wal_hard_limit_bytes: u64 = 0,
     root_generation: u64 = 0,
-    obsolete_retention_ns: u64 = 5 * std.time.ns_per_min,
+    obsolete_retention_ns: u64 = 250 * std.time.ns_per_ms,
+    obsolete_delete_retry_ns: u64 = 250 * std.time.ns_per_ms,
     read_snapshot_rotate_mutable_bytes: u64 = 256 * 1024,
     // Per-scan cap; 0 disables bulk current-scan mutable cloning.
     bulk_ingest_current_scan_clone_max_bytes: u64 = 256 * 1024 * 1024,
@@ -362,6 +414,12 @@ pub const Backend = struct {
         level_overflow_bytes: u64 = 0,
         obsolete_paths: u64 = 0,
         current_manifest_bytes: u64 = 0,
+        obsolete_paths_pinned_by_readers: u64 = 0,
+        obsolete_paths_pinned_by_versions: u64 = 0,
+        obsolete_paths_waiting_for_retry: u64 = 0,
+        obsolete_paths_reclaimable: u64 = 0,
+        obsolete_delete_failures: u64 = 0,
+        obsolete_delete_retries: u64 = 0,
         active_readers: u64 = 0,
         active_bulk_ingest_batches: u64 = 0,
         wal_retained_segments: u64 = 0,
@@ -445,6 +503,12 @@ pub const Backend = struct {
         dst.level_overflow_runs +|= src.level_overflow_runs;
         dst.level_overflow_bytes +|= src.level_overflow_bytes;
         dst.obsolete_paths +|= src.obsolete_paths;
+        dst.obsolete_paths_pinned_by_readers +|= src.obsolete_paths_pinned_by_readers;
+        dst.obsolete_paths_pinned_by_versions +|= src.obsolete_paths_pinned_by_versions;
+        dst.obsolete_paths_waiting_for_retry +|= src.obsolete_paths_waiting_for_retry;
+        dst.obsolete_paths_reclaimable +|= src.obsolete_paths_reclaimable;
+        dst.obsolete_delete_failures +|= src.obsolete_delete_failures;
+        dst.obsolete_delete_retries +|= src.obsolete_delete_retries;
         dst.current_manifest_bytes +|= src.current_manifest_bytes;
         dst.active_readers +|= src.active_readers;
         dst.active_bulk_ingest_batches +|= src.active_bulk_ingest_batches;
@@ -803,6 +867,8 @@ pub const Backend = struct {
     manifest_dirty: bool = false,
     obsolete_paths: std.ArrayListUnmanaged(ObsoletePath) = .empty,
     obsolete_manifest_dirty: bool = false,
+    obsolete_delete_failures: u64 = 0,
+    obsolete_delete_retries: u64 = 0,
     obsolete_runs: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Run)) = .empty,
     run_state_cache: std.ArrayListUnmanaged(CachedRunState) = .empty,
     run_index_cache: std.ArrayListUnmanaged(CachedRunIndex) = .empty,
@@ -1031,7 +1097,21 @@ pub const Backend = struct {
             .hard_limit_l0_bytes = self.options.l0_hard_limit_bytes,
             .manifest_dirty = self.manifest_dirty,
             .obsolete_manifest_dirty = self.obsolete_manifest_dirty,
+            .obsolete_delete_failures = self.obsolete_delete_failures,
+            .obsolete_delete_retries = self.obsolete_delete_retries,
         };
+        const obsolete_now_ns = self.nowNs();
+        for (self.obsolete_paths.items) |obsolete| {
+            if (self.active_readers != 0) {
+                stats.obsolete_paths_pinned_by_readers +|= 1;
+            } else if (self.pathTrackedByActiveRunsLocked(obsolete.path) or self.obsoletePathPinnedByOpenVersion(obsolete.path)) {
+                stats.obsolete_paths_pinned_by_versions +|= 1;
+            } else if (obsolete.delete_after_ns > obsolete_now_ns) {
+                stats.obsolete_paths_waiting_for_retry +|= 1;
+            } else {
+                stats.obsolete_paths_reclaimable +|= 1;
+            }
+        }
         for (self.activeImmutableMemtables()) |state| {
             stats.immutable_entries += @intCast(state.entries.items.len);
             stats.immutable_bytes += estimateStateBytes(state);
@@ -2387,7 +2467,48 @@ pub const Backend = struct {
     pub fn persistManifest(self: *Backend) !void {
         const root_dir = self.root_dir orelse return;
         const start_ns = self.writeStatsNowNs();
-        self.obsolete_manifest_dirty = try self.reconcileObsoletePathsForManifest();
+
+        const clean_publish = !self.manifest_dirty and !self.obsolete_manifest_dirty;
+        if (clean_publish and self.durableManifestHasNewerRunIdLocked(root_dir)) return;
+
+        try self.writeManifestSnapshotLocked(root_dir, start_ns);
+
+        if (self.hasReclaimableObsoletePathsLocked()) {
+            self.obsolete_manifest_dirty = false;
+            const needs_follow_up = try self.reconcileObsoletePathsForManifest();
+            const removed_or_retried = self.obsolete_manifest_dirty;
+            if (removed_or_retried) try self.writeManifestSnapshotLocked(root_dir, start_ns);
+            self.obsolete_manifest_dirty = needs_follow_up;
+        }
+    }
+
+    fn durableManifestHasNewerRunIdLocked(self: *Backend, root_dir: []const u8) bool {
+        const storage = self.storage orelse return false;
+        var manifest_backing: ?[]u8 = null;
+        defer if (manifest_backing) |backing| self.allocator.free(backing);
+
+        var durable_next_run_id: u64 = 0;
+        var durable_runs = std.ArrayListUnmanaged(Run).empty;
+        defer durable_runs.deinit(self.allocator);
+        var durable_obsolete = std.ArrayListUnmanaged(ObsoletePath).empty;
+        defer {
+            for (durable_obsolete.items) |*obsolete| obsolete.deinit(self.allocator);
+            durable_obsolete.deinit(self.allocator);
+        }
+
+        const found = repository_mod.loadManifestIfPresentWithStorage(
+            storage,
+            self.allocator,
+            root_dir,
+            &manifest_backing,
+            &durable_next_run_id,
+            &durable_runs,
+            &durable_obsolete,
+        ) catch return false;
+        return found and durable_next_run_id > self.next_run_id;
+    }
+
+    fn writeManifestSnapshotLocked(self: *Backend, root_dir: []const u8, start_ns: u64) !void {
         try validateRunLayoutForManifest(self.runs.items);
         const bytes = try repository_mod.persistManifestWithStorageCount(
             self.storage.?,
@@ -2403,6 +2524,7 @@ pub const Backend = struct {
         self.current_manifest_bytes = bytes;
         try self.maybeCheckpointWalAfterManifestPublish();
         self.manifest_dirty = false;
+        self.obsolete_manifest_dirty = false;
     }
 
     pub fn appendWalForState(self: *Backend, state: *const State) !void {
@@ -2723,6 +2845,27 @@ pub const Backend = struct {
         return index < self.run_state_cache.items.len and
             self.run_state_cache.items[index].run_id == run_id and
             std.mem.eql(u8, self.run_state_cache.items[index].path, path);
+    }
+
+    pub fn registerOpenManifestRunRefs(self: *Backend) !void {
+        for (self.runs.items) |*run| {
+            if (run.version_ref_pinned) continue;
+            const path = run.path orelse continue;
+            try obsolete_path_refs.retain(path);
+            run.version_ref_pinned = true;
+        }
+    }
+
+    pub fn releaseRunVersionRef(self: *Backend, run: *Run) void {
+        _ = self;
+        if (!run.version_ref_pinned) return;
+        if (run.path) |path| obsolete_path_refs.release(path);
+        run.version_ref_pinned = false;
+    }
+
+    fn obsoletePathPinnedByOpenVersion(self: *Backend, path: []const u8) bool {
+        _ = self;
+        return obsolete_path_refs.isRetained(path);
     }
 
     pub fn retainReader(self: *Backend) void {
@@ -3225,6 +3368,7 @@ pub const Backend = struct {
             for (runs.items) |*run| {
                 // File retention is tracked separately by obsolete_paths; this only releases local cache handles.
                 if (run.path) |path| self.evictLocalCachesForRun(path, run.id);
+                self.releaseRunVersionRef(run);
                 run.deinit(self.allocator);
             }
             runs.deinit(self.allocator);
@@ -3557,6 +3701,9 @@ pub const Backend = struct {
                 _ = self.refreshCachedMaintenanceHintLocked();
             }
             self.active_bulk_ingest_batches -= 1;
+            if (self.active_bulk_ingest_batches == 0 and self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
+                try self.persistManifest();
+            }
             return;
         }
         self.active_bulk_ingest_batches -= 1;
@@ -3678,12 +3825,17 @@ pub const Backend = struct {
         return false;
     }
 
-    fn pathTrackedByManifestLocked(self: *Backend, path: []const u8) bool {
+    fn pathTrackedByActiveRunsLocked(self: *Backend, path: []const u8) bool {
         for (self.runs.items) |run| {
             if (run.path) |active| {
                 if (std.mem.eql(u8, active, path)) return true;
             }
         }
+        return false;
+    }
+
+    fn pathTrackedByManifestLocked(self: *Backend, path: []const u8) bool {
+        if (self.pathTrackedByActiveRunsLocked(path)) return true;
         for (self.obsolete_paths.items) |obsolete| {
             if (std.mem.eql(u8, obsolete.path, path)) return true;
         }
@@ -3691,12 +3843,8 @@ pub const Backend = struct {
     }
 
     pub fn cleanupRecoveredRunFilesForManifest(self: *Backend) !bool {
-        var cleaned = try self.cleanupOrphanedRunFilesForManifest();
-        if (self.hasReclaimableObsoletePathsLocked()) {
-            try self.persistManifest();
-            cleaned = true;
-        }
-        return cleaned;
+        _ = self;
+        return false;
     }
 
     fn cleanupOrphanedRunFilesForManifest(self: *Backend) !bool {
@@ -3725,7 +3873,7 @@ pub const Backend = struct {
 
             const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
             defer self.allocator.free(path);
-            if (self.pathTrackedByManifestLocked(path)) continue;
+            if (self.pathTrackedByManifestLocked(path) or self.obsoletePathPinnedByOpenVersion(path)) continue;
 
             repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path) catch |err| switch (err) {
                 error.FileNotFound => {},
@@ -3741,33 +3889,48 @@ pub const Backend = struct {
         var needs_follow_up = false;
         var i: usize = 0;
         while (i < self.obsolete_paths.items.len) {
-            const obsolete = self.obsolete_paths.items[i];
+            const obsolete = &self.obsolete_paths.items[i];
             if (self.active_readers != 0) {
                 needs_follow_up = true;
                 i += 1;
                 continue;
             }
-
+            if (self.pathTrackedByActiveRunsLocked(obsolete.path) or self.obsoletePathPinnedByOpenVersion(obsolete.path)) {
+                needs_follow_up = true;
+                i += 1;
+                continue;
+            }
             if (obsolete.delete_after_ns > now_ns) {
+                needs_follow_up = true;
                 i += 1;
                 continue;
             }
 
-            repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, obsolete.path) catch |err| switch (err) {
+repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, obsolete.path) catch |err| switch (err) {
                 error.FileNotFound => {},
-                else => return err,
+                else => {
+                    self.obsolete_delete_failures +|= 1;
+                    self.obsolete_delete_retries +|= 1;
+                    obsolete.delete_after_ns = now_ns +| self.options.obsolete_delete_retry_ns;
+                    self.obsolete_manifest_dirty = true;
+                    needs_follow_up = true;
+                    i += 1;
+                    continue;
+                },
             };
             var removed = self.obsolete_paths.orderedRemove(i);
             removed.deinit(self.allocator);
+            self.obsolete_manifest_dirty = true;
         }
         return needs_follow_up;
     }
 
     fn hasReclaimableObsoletePathsLocked(self: *Backend) bool {
-        if (self.active_readers != 0 or self.obsolete_paths.items.len == 0) return false;
+        if (self.active_readers != 0 or self.bulkIngestActive() or self.obsolete_paths.items.len == 0) return false;
         if (self.root_dir == null or self.storage == null or self.options.backend.read_only) return false;
         const now_ns = self.nowNs();
         for (self.obsolete_paths.items) |obsolete| {
+            if (self.pathTrackedByActiveRunsLocked(obsolete.path) or self.obsoletePathPinnedByOpenVersion(obsolete.path)) continue;
             if (obsolete.delete_after_ns <= now_ns) return true;
         }
         return false;
@@ -3788,6 +3951,7 @@ pub const Backend = struct {
         var delay_ns: ?u64 = null;
         var due_now = false;
         for (self.obsolete_paths.items) |obsolete| {
+            if (self.pathTrackedByActiveRunsLocked(obsolete.path) or self.obsoletePathPinnedByOpenVersion(obsolete.path)) continue;
             const candidate = if (obsolete.delete_after_ns <= now_ns) 0 else obsolete.delete_after_ns - now_ns;
             if (candidate == 0) due_now = true;
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
@@ -8247,6 +8411,7 @@ test "lsm backend obsolete run cleanup does not invalidate shared cache by path"
         .flush_threshold = 1,
         .compact_threshold_runs = 1,
         .foreground_soft_compaction = true,
+        .obsolete_retention_ns = 0,
     });
     defer backend.close();
 
@@ -8293,7 +8458,7 @@ test "lsm backend obsolete run cleanup does not invalidate shared cache by path"
         after.run_table_block.invalidations;
     try std.testing.expectEqual(invalidations_before, invalidations_after);
     try std.testing.expectEqual(@as(usize, 0), backend.obsolete_runs.items.len);
-    try std.testing.expect(backend.obsolete_paths.items.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
 }
 
 test "lsm backend cache namespaces entries by root generation" {
@@ -10813,12 +10978,12 @@ test "lsm backend write txns retain reader guards until completion" {
     }
 }
 
-test "lsm backend close leaves queued obsolete files on disk" {
+test "lsm backend close reclaims eligible queued obsolete files" {
     var path_buf: [256]u8 = undefined;
     const path = repository_mod.tmpPath(&path_buf, "obsolete-retain");
     defer repository_mod.cleanupTmp(path);
 
-    var backend = try Backend.open(std.testing.allocator, std.mem.span(path), .{});
+    var backend = try Backend.open(std.testing.allocator, std.mem.span(path), .{ .obsolete_retention_ns = 0 });
     const obsolete_path = try repository_mod.runPath(std.testing.allocator, std.mem.span(path), 9999);
     defer std.testing.allocator.free(obsolete_path);
     try repository_mod.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
@@ -10827,9 +10992,7 @@ test "lsm backend close leaves queued obsolete files on disk" {
 
     var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
     defer native.deinit();
-    const bytes = try native.storage().readFileAlloc(std.testing.allocator, obsolete_path, 1024);
-    defer std.testing.allocator.free(bytes);
-    try std.testing.expectEqualStrings("obsolete", bytes);
+    try std.testing.expectError(error.FileNotFound, native.storage().readFileAlloc(std.testing.allocator, obsolete_path, 1024));
 }
 
 test "lsm repository run readers request cap above 64 MiB" {
@@ -11502,6 +11665,65 @@ test "lsm backend reclaims obsolete run files when last reader releases" {
         &obsolete_paths,
     ));
     try std.testing.expectEqual(@as(usize, 0), obsolete_paths.items.len);
+}
+
+test "lsm backend open manifest version refs pin obsolete files across handles" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-version-ref-obsolete-gc";
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 1);
+    defer alloc.free(obsolete_path);
+
+    var writer = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1,
+        .foreground_soft_compaction = true,
+        .obsolete_retention_ns = 0,
+    });
+    defer writer.close();
+
+    {
+        var runtime = try writer.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    var reader = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .backend = .{ .read_only = true },
+        .obsolete_retention_ns = 0,
+    });
+
+    {
+        var runtime = try writer.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginWrite();
+        try txn.delete("doc:a");
+        try txn.put("doc:b", "B");
+        try txn.commit();
+    }
+
+    var stats = writer.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.obsolete_paths);
+    try std.testing.expectEqual(@as(u64, 1), stats.obsolete_paths_pinned_by_versions);
+    try std.testing.expectEqual(@as(u64, 0), stats.obsolete_paths_reclaimable);
+    {
+        const bytes = try backing.storage().readFileAlloc(alloc, obsolete_path, 1024);
+        defer alloc.free(bytes);
+        try std.testing.expect(bytes.len > 0);
+    }
+
+    reader.close();
+    try std.testing.expect(try writer.runMaintenanceStep());
+    stats = writer.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.obsolete_paths);
+    try std.testing.expectEqual(@as(u64, 0), stats.obsolete_paths_pinned_by_versions);
+    try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
 }
 
 test "lsm backend reader release reclaims expired clean obsolete paths" {
@@ -12634,7 +12856,7 @@ test "lsm backend ignores orphaned committed run files not referenced by manifes
         try std.testing.expectError(error.NotFound, txn.get("doc:orphan"));
     }
 }
-test "lsm backend removes orphaned committed run files on reopen" {
+test "lsm backend leaves orphaned committed run files to explicit repair" {
     var path_buf: [256]u8 = undefined;
     const path = repository_mod.tmpPath(&path_buf, "orphan-run-cleanup");
     defer repository_mod.cleanupTmp(path);
@@ -12673,7 +12895,7 @@ test "lsm backend removes orphaned committed run files on reopen" {
         defer reopened.close();
 
         try std.testing.expectEqual(@as(usize, 1), reopened.runs.items.len);
-        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, orphan_path, .{}));
+        try std.Io.Dir.cwd().access(std.testing.io, orphan_path, .{});
 
         var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
         defer runtime.deinit();
@@ -12734,6 +12956,9 @@ test "lsm backend removes expired obsolete run files on reopen" {
         defer reopened.close();
 
         try std.testing.expectEqual(@as(usize, 1), reopened.runs.items.len);
+        try std.testing.expectEqual(@as(usize, 1), reopened.obsolete_paths.items.len);
+        try std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{});
+        try std.testing.expect(try reopened.runMaintenanceStep());
         try std.testing.expectEqual(@as(usize, 0), reopened.obsolete_paths.items.len);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{}));
 

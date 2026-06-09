@@ -64,6 +64,7 @@ pub const Run = struct {
     cached_index_index: ?usize = null,
     cached_table_index: ?usize = null,
     table_index: ?lsm_table_file.TableIndex = null,
+    version_ref_pinned: bool = false,
     state: ?state_mod.State,
 
     pub fn deinit(self: *Run, allocator: Allocator) void {
@@ -99,6 +100,7 @@ pub const Run = struct {
             .cached_index_index = null,
             .cached_table_index = null,
             .table_index = null,
+            .version_ref_pinned = false,
             .state = null,
         };
     }
@@ -575,7 +577,9 @@ pub fn loadRunTableIndexAllocWithStorage(
     path: []const u8,
 ) !lsm_table_file.TableIndex {
     const footer_bytes = storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len) catch |err| switch (err) {
-        error.EndOfStream, error.FileNotFound => null,
+        error.EndOfStream, error.FileNotFound => blk: {
+    break :blk null;
+        },
         else => return err,
     };
     defer if (footer_bytes) |bytes| allocator.free(bytes);
