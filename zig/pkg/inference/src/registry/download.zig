@@ -1226,7 +1226,7 @@ fn probeDownloadSize(
 }
 
 /// List all files in a HuggingFace model repo.
-fn listModelFiles(
+pub fn listModelFiles(
     allocator: std.mem.Allocator,
     io: std.Io,
     owner: []const u8,
@@ -1321,6 +1321,54 @@ fn listModelFiles(
     }
 
     return try files.toOwnedSlice(allocator);
+}
+
+pub fn readModelFileAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    owner: []const u8,
+    name: []const u8,
+    filename: []const u8,
+    config: HubConfig,
+    max_bytes: usize,
+) ![]u8 {
+    const url = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/resolve/main/{s}", .{ config.base_url, owner, name, filename });
+    defer allocator.free(url);
+
+    var client = httpx.Client.initWithConfig(allocator, io, .{
+        .keep_alive = false,
+        .max_response_size = max_bytes,
+        .retry_policy = httpx.RetryPolicy.aggressive(),
+    });
+    defer client.deinit();
+
+    var headers_buf: [3][2][]const u8 = undefined;
+    var n_headers: usize = 0;
+    var auth_header: ?[]u8 = null;
+    defer if (auth_header) |auth| allocator.free(auth);
+    headers_buf[n_headers] = .{ "Connection", "close" };
+    n_headers += 1;
+    headers_buf[n_headers] = .{ "Accept-Encoding", "identity" };
+    n_headers += 1;
+    if (config.token) |token| {
+        auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+        headers_buf[n_headers] = .{ "Authorization", auth_header.? };
+        n_headers += 1;
+    }
+
+    var resp = try client.get(url, .{
+        .headers = headers_buf[0..n_headers],
+        .follow_redirects = true,
+        .timeout_ms = 300_000,
+    });
+    defer resp.deinit();
+
+    if (!resp.ok()) {
+        std.debug.print("hub download failed for {s}/{s}/{s}: HTTP {d}\n", .{ owner, name, filename, resp.status.code });
+        return error.DownloadFailed;
+    }
+    const body = resp.body orelse return error.EmptyResponse;
+    return try allocator.dupe(u8, body);
 }
 
 fn resolveRedirectUrl(allocator: std.mem.Allocator, base_url: []const u8, location: []const u8) ![]u8 {

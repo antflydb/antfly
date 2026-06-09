@@ -59,6 +59,10 @@ const onnx_decoder_only_vlm = @import("../pipelines/onnx_decoder_only_vlm.zig");
 const tool_parser_mod = @import("../pipelines/tool_parser.zig");
 const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
+const tabular_registry_mod = @import("../tabular/registry.zig");
+const tabular_discovery_mod = @import("../tabular/discovery.zig");
+const tabular_http_mod = @import("../tabular/http.zig");
+const ml_tabular = @import("ml_tabular");
 const c_file = @import("../util/c_file.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
@@ -73,6 +77,30 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 };
 pub const metrics_mod = @import("metrics.zig");
 const request_queue_mod = @import("request_queue.zig");
+
+// ---------------------------------------------------------------------------
+// Tabular predictor helpers shared by the /ml/v1/predict handler on Node.
+// ---------------------------------------------------------------------------
+
+fn taskTypeToApi(t: ml_tabular.ir.TaskType) api.PredictorTask {
+    return switch (t) {
+        .regression => .regression,
+        .binary_classification => .binary_classification,
+        .multiclass => .multiclass,
+        .ranking => .ranking,
+    };
+}
+
+fn mapTabularHttpErrorPredict(ctx: *httpx.Context, err: tabular_http_mod.HttpError) !httpx.Response {
+    return switch (err) {
+        error.InvalidJson => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "malformed predict body" }),
+        error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "no predictor by that name" }),
+        error.BatchTooLarge => ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = "max batch size is 10000" }),
+        error.FeatureMismatch => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "feature-count mismatch" }),
+        error.LoadFailed => ctx.status(500).json(.{ .@"error" = "LOAD_FAILED", .message = "predictor failed to load" }),
+        error.OutOfMemory => ctx.status(500).json(.{ .@"error" = "OOM" }),
+    };
+}
 
 pub const BudgetOverrides = struct {
     host_limit_bytes: usize = 0,
@@ -94,6 +122,7 @@ pub const BudgetOverrides = struct {
 
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
+    ml_dir: []const u8 = "./ml",
     content_security: ?scraping.ContentSecurityConfig = null,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
     allow_downloads: bool = true,
@@ -105,6 +134,7 @@ pub const NodeConfig = struct {
 };
 
 pub const public_api_prefix = "/ai/v1";
+pub const public_ml_api_prefix = "/ml/v1";
 
 const GenerateBackendSelection = struct {
     native_choice: native_backend_choice.Choice = .auto,
@@ -541,6 +571,7 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
     request_queue: request_queue_mod.RequestQueue,
+    tabular_registry: tabular_registry_mod.Registry,
 
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
 
@@ -554,6 +585,7 @@ pub const Node = struct {
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
             .request_queue = request_queue_mod.RequestQueue.init(config.max_concurrent_requests),
+            .tabular_registry = tabular_registry_mod.Registry.init(allocator),
         };
     }
 
@@ -561,6 +593,23 @@ pub const Node = struct {
         self.model_manager.deinit();
         self.registry.deinit();
         self.embed_cache.deinit();
+        self.tabular_registry.deinit();
+    }
+
+    /// Convenience for callers that want to seed the builtin iris classifier
+    /// and scan the Traditional ML directory at startup.
+    pub fn seedAndDiscoverPredictors(self: *Node, io: std.Io) void {
+        std.Io.Dir.cwd().createDirPath(io, self.config.ml_dir) catch {};
+        tabular_discovery_mod.seedBuiltins(io, self.config.ml_dir) catch {};
+        self.discoverPredictorsIn(self.config.ml_dir, io);
+    }
+
+    fn discoverPredictors(self: *Node, io: std.Io) void {
+        self.discoverPredictorsIn(self.config.ml_dir, io);
+    }
+
+    fn discoverPredictorsIn(self: *Node, predictors_dir: []const u8, io: std.Io) void {
+        _ = tabular_discovery_mod.discover(io, self.allocator, &self.tabular_registry, predictors_dir) catch 0;
     }
 
     pub fn embedDenseTextsDirect(
@@ -1605,6 +1654,51 @@ pub const Node = struct {
         const http_response = try ctx.json(response);
         logEmbedTiming("embed.response_json", inputs.total_count, response_json_start);
         return http_response;
+    }
+
+    // -----------------------------------------------------------------------
+    // Tabular predictors (POST /ml/v1/predict).
+    // -----------------------------------------------------------------------
+
+    pub fn predict(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var parsed = (try ctx.parseJson(api.PredictRequest)) orelse
+            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        defer parsed.deinit();
+        const body = parsed.value;
+
+        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
+
+        self.metrics.incRequest("predict");
+        defer self.metrics.decActive();
+
+        const req: tabular_http_mod.PredictRequest = .{
+            .model = body.model,
+            .input = body.input,
+        };
+        const result = tabular_http_mod.predict(ctx.io, ctx.allocator, &self.tabular_registry, req) catch |err| switch (err) {
+            error.ModelNotFound => blk: {
+                self.discoverPredictors(ctx.io);
+                break :blk tabular_http_mod.predict(ctx.io, ctx.allocator, &self.tabular_registry, req) catch |retry_err| {
+                    self.metrics.incPredictError();
+                    self.metrics.incError();
+                    return mapTabularHttpErrorPredict(ctx, retry_err);
+                };
+            },
+            else => {
+                self.metrics.incPredictError();
+                self.metrics.incError();
+                return mapTabularHttpErrorPredict(ctx, err);
+            },
+        };
+
+        const task = taskTypeToApi(result.task);
+        return ctx.json(api.PredictResponse{
+            .model = result.model,
+            .task = task,
+            .predictions = result.predictions,
+        });
     }
 
     pub fn chunkText(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -4711,6 +4805,7 @@ pub const Node = struct {
 
             try body.append(a, '}');
         }
+
         try buf.appendSlice(a, "{\"object\":\"list\",\"data\":[");
         try buf.appendSlice(a, openai_data.items);
         try buf.appendSlice(a, "],\"allow_downloads\":");
@@ -4732,6 +4827,55 @@ pub const Node = struct {
         try buf.appendSlice(a, if (build_options.enable_wasm) "true" else "false");
         try buf.appendSlice(a, "},");
         try buf.appendSlice(a, body.items);
+        try buf.append(a, '}');
+
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(buf.items);
+        return ctx.response.build();
+    }
+
+    fn appendPredictorCatalog(self: *Node, io: std.Io, a: std.mem.Allocator, body: *std.ArrayListUnmanaged(u8)) !void {
+        self.discoverPredictors(io);
+        try body.appendSlice(a, "\"predictors\":{");
+        const predictor_infos = try self.tabular_registry.list(a);
+        defer a.free(predictor_infos);
+        for (predictor_infos, 0..) |info, i| {
+            if (i > 0) try body.append(a, ',');
+            try jsonEncodeString(body, a, info.name);
+            try body.appendSlice(a, ":{\"task\":\"");
+            try body.appendSlice(a, ml_tabular.ir.taskTypeToString(info.task));
+            try body.appendSlice(a, "\",\"num_features\":");
+            const nf_str = try std.fmt.allocPrint(a, "{d}", .{info.num_features});
+            defer a.free(nf_str);
+            try body.appendSlice(a, nf_str);
+            try body.appendSlice(a, ",\"num_outputs\":");
+            const no_str = try std.fmt.allocPrint(a, "{d}", .{info.num_outputs});
+            defer a.free(no_str);
+            try body.appendSlice(a, no_str);
+            if (info.source_framework.len > 0) {
+                try body.appendSlice(a, ",\"source_framework\":");
+                try jsonEncodeString(body, a, info.source_framework);
+            }
+            if (info.feature_names.len > 0) {
+                try body.appendSlice(a, ",\"feature_names\":[");
+                for (info.feature_names, 0..) |feature_name, feature_idx| {
+                    if (feature_idx > 0) try body.append(a, ',');
+                    try jsonEncodeString(body, a, feature_name);
+                }
+                try body.append(a, ']');
+            }
+            try body.append(a, '}');
+        }
+        try body.append(a, '}');
+    }
+
+    pub fn listPredictors(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const a = ctx.allocator;
+        var buf = std.ArrayListUnmanaged(u8).empty;
+        defer buf.deinit(a);
+
+        try buf.appendSlice(a, "{\"object\":\"list\",");
+        try self.appendPredictorCatalog(ctx.io, a, &buf);
         try buf.append(a, '}');
 
         try ctx.setHeader("content-type", "application/json");
@@ -5957,11 +6101,19 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         inner: *Inner,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.inner.post(prefix ++ path, handler);
+            if (comptime (std.mem.eql(u8, prefix, public_api_prefix) and std.mem.eql(u8, path, "/predict"))) {
+                try self.inner.post(public_ml_api_prefix ++ path, handler);
+            } else {
+                try self.inner.post(prefix ++ path, handler);
+            }
         }
 
         pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.inner.get(prefix ++ path, handler);
+            if (comptime (std.mem.eql(u8, prefix, public_api_prefix) and std.mem.eql(u8, path, "/predictors"))) {
+                try self.inner.get(public_ml_api_prefix ++ "/models", handler);
+            } else {
+                try self.inner.get(prefix ++ path, handler);
+            }
         }
 
         pub fn put(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
@@ -6066,7 +6218,13 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
 
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embed"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embeddings"));
+    try std.testing.expect(server.hasRoute(.post, public_ml_api_prefix ++ "/predict"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/predict"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/predict/upload"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/predict/convert"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.get, public_ml_api_prefix ++ "/models"));
+    try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/predictors"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
@@ -6123,7 +6281,9 @@ test "registerRoutesOn supports alternate prefixes through the shared router" {
 
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embed"));
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embeddings"));
+    try std.testing.expect(server.hasRoute(.post, "/custom/v9/predict"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/models"));
+    try std.testing.expect(server.hasRoute(.get, "/custom/v9/predictors"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/metrics"));
 }
 
@@ -6271,6 +6431,7 @@ test "download remote content accepts data uri" {
         .embed_cache = undefined,
         .metrics = undefined,
         .request_queue = undefined,
+        .tabular_registry = undefined,
     };
     var downloaded = try downloadRemoteContent(&node, alloc, "data:text/plain;base64,aGVsbG8=");
     defer downloaded.deinit(alloc);
@@ -6327,6 +6488,7 @@ test "download remote content blocks private ip urls when configured" {
         .embed_cache = undefined,
         .metrics = undefined,
         .request_queue = undefined,
+        .tabular_registry = undefined,
     };
     try std.testing.expectError(error.PrivateIpBlocked, downloadRemoteContent(&node, alloc, "http://127.0.0.1/test.png"));
 }
@@ -6343,6 +6505,7 @@ test "download remote content blocks hosts outside allowlist" {
         .embed_cache = undefined,
         .metrics = undefined,
         .request_queue = undefined,
+        .tabular_registry = undefined,
     };
     try std.testing.expectError(error.HostNotAllowed, downloadRemoteContent(&node, alloc, "https://example.com/a.png"));
 }
