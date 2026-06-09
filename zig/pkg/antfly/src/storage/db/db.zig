@@ -360,6 +360,7 @@ const dense_catch_up_default_deferred_hbc_leaf_split_members_per_publish: usize 
 const dense_catch_up_default_maintenance_steps: usize = 8;
 const dense_catch_up_default_maintenance_cooldown_ns: u64 = 250 * std.time.ns_per_ms;
 const dense_catch_up_default_maintenance_urgent_score: u64 = 1_000_000;
+const dense_catch_up_default_maintenance_min_score: u64 = dense_catch_up_default_maintenance_urgent_score;
 const dense_catch_up_startup_max_records_default: usize = 32;
 const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const dense_catch_up_startup_cache_nodes_default: usize = 2048;
@@ -2406,6 +2407,7 @@ pub const DB = struct {
     identity_visibility_summary_cache: ?doc_identity.VisibilitySummary = null,
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
+    dense_posting_maintenance_stats_mutex: std.atomic.Mutex = .unlocked,
     dense_posting_maintenance_stats: types.DensePostingMaintenanceStats = .{},
     profiled_dense_search_observations: AtomicU64 = AtomicU64.init(0),
     profiled_dense_search_last_ns: AtomicU64 = AtomicU64.init(0),
@@ -7022,7 +7024,7 @@ pub const DB = struct {
             if (result.stoppedBySchedulerBudget()) return;
             if (result.total_steps == 0) return;
         }
-        return error.RunUntilIdleDidNotConverge;
+        self.recordDensePostingMaintenanceConvergenceLimit();
     }
 
     pub fn runDensePostingMaintenanceForIdleProfiled(self: *DB) !index_manager_mod.IndexManager.DensePostingMaintenanceResult {
@@ -8501,6 +8503,7 @@ pub const DB = struct {
                 .promotion = self.promotionStageStats(),
                 .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
                 .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
+                .dense_posting_maintenance = self.snapshotDensePostingMaintenanceStats(),
             };
         }
         defer self.core.unlockApplyShared();
@@ -8578,7 +8581,15 @@ pub const DB = struct {
         return self.doc_set_planning_stats.snapshot();
     }
 
+    fn lockDensePostingMaintenanceStats(self: *DB) void {
+        while (!self.dense_posting_maintenance_stats_mutex.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
     fn recordDensePostingMaintenanceResult(self: *DB, result: index_manager_mod.IndexManager.DensePostingMaintenanceResult) void {
+        self.lockDensePostingMaintenanceStats();
+        defer self.dense_posting_maintenance_stats_mutex.unlock();
         var current = self.dense_posting_maintenance_stats;
         current.runs += 1;
         current.total_steps += @intCast(result.total_steps);
@@ -8612,6 +8623,15 @@ pub const DB = struct {
         self.dense_posting_maintenance_stats = current;
     }
 
+    fn recordDensePostingMaintenanceConvergenceLimit(self: *DB) void {
+        self.lockDensePostingMaintenanceStats();
+        defer self.dense_posting_maintenance_stats_mutex.unlock();
+        var current = self.dense_posting_maintenance_stats;
+        current.convergence_limit_runs += 1;
+        current.last_needs_more_work = true;
+        self.dense_posting_maintenance_stats = current;
+    }
+
     fn recordProfiledDenseSearch(self: *DB, profile: db_query_search.DenseSearchProfile) void {
         _ = self.profiled_dense_search_observations.fetchAdd(1, .monotonic);
         self.profiled_dense_search_last_ns.store(profile.total_ns, .monotonic);
@@ -8619,6 +8639,8 @@ pub const DB = struct {
     }
 
     fn snapshotDensePostingMaintenanceStats(self: *DB) types.DensePostingMaintenanceStats {
+        self.lockDensePostingMaintenanceStats();
+        defer self.dense_posting_maintenance_stats_mutex.unlock();
         var result = self.dense_posting_maintenance_stats;
         result.profiled_dense_search_observations = self.profiled_dense_search_observations.load(.monotonic);
         result.profiled_dense_search_last_ns = self.profiled_dense_search_last_ns.load(.monotonic);
@@ -14937,6 +14959,7 @@ var dense_catch_up_bulk_rebuild_hbc_leaf_min_members_cache = std.atomic.Value(us
 var dense_catch_up_maintenance_steps_cache = std.atomic.Value(usize).init(0);
 var dense_catch_up_maintenance_cooldown_ns_cache = AtomicU64.init(0);
 var dense_catch_up_maintenance_urgent_score_cache = AtomicU64.init(0);
+var dense_catch_up_maintenance_min_score_cache = AtomicU64.init(0);
 var dense_catch_up_startup_max_records_cache = std.atomic.Value(usize).init(0);
 var dense_catch_up_startup_max_chunk_bytes_cache = AtomicU64.init(0);
 var dense_catch_up_startup_cache_nodes_cache = std.atomic.Value(usize).init(0);
@@ -15048,6 +15071,14 @@ fn denseCatchUpMaintenanceUrgentScore() u64 {
         &dense_catch_up_maintenance_urgent_score_cache,
         "ANTFLY_DENSE_CATCH_UP_MAINTENANCE_URGENT_SCORE",
         dense_catch_up_default_maintenance_urgent_score,
+    );
+}
+
+fn denseCatchUpMaintenanceMinScore() u64 {
+    return cachedEnvU64(
+        &dense_catch_up_maintenance_min_score_cache,
+        "ANTFLY_DENSE_CATCH_UP_MAINTENANCE_MIN_SCORE",
+        dense_catch_up_default_maintenance_min_score,
     );
 }
 
@@ -19179,10 +19210,8 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     const finish_start_ns = monotonicTimeNs();
     const before_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
 
-    // Keep async dense catch-up finishes bounded and durable, but leave LSM maintenance
-    // to the explicit maintenance paths instead of paying it on every replay catch-up finish.
-    const maintenance_steps: usize = 0;
-    const maintenance_ns: u64 = 0;
+    // Keep async dense catch-up finishes bounded and durable. Posting maintenance
+    // may run below, but it is scoped to this index and capped by catch-up policy.
     // Dense catch-up finish needs a durable watermark for the completed dense index itself.
     // Flushing every unrelated pending index here turns one dense session close into a
     // source-wide sync storm. Leave other indexes on the normal coalesced flush path.
@@ -19193,6 +19222,39 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     const finalize_start_ns = monotonicTimeNs();
     try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, finish_options);
     const finalize_ns = elapsedSince(finalize_start_ns);
+
+    var maintenance_steps: usize = 0;
+    var maintenance_ns: u64 = 0;
+    const maintenance_step_budget = denseCatchUpMaintenanceSteps();
+    const maintenance_score = try ctx.index_manager.densePostingMaintenanceScoreByName(index_ref.name);
+    const maintenance_now_ns = monotonicTimeNs();
+    if (maintenance_step_budget != 0 and
+        maintenance_score >= denseCatchUpMaintenanceMinScore() and
+        shouldRunDenseCatchUpMaintenance(ctx, index_ref.name, maintenance_score, maintenance_now_ns))
+    {
+        setDenseCatchUpPhase(ctx, .posting_maintenance);
+        const maintenance_start_ns = monotonicTimeNs();
+        const maintenance_result = try ctx.index_manager.runDensePostingMaintenanceProfiled(.{
+            .index_name = index_ref.name,
+            .max_indexes = 1,
+            .max_postings_per_index = maintenance_step_budget,
+            .fold_delta_tails = false,
+            .min_delta_records_to_fold = dense_posting_idle_default_min_delta_records_to_fold,
+            .min_tombstone_records_to_fold = dense_posting_idle_default_min_tombstone_records_to_fold,
+            .min_delta_to_base_ratio_bps = 0,
+            .max_delta_tail_postings = dense_posting_idle_default_max_delta_tail_postings,
+            .max_layout_changes_per_index = dense_posting_idle_default_max_layout_changes_per_index,
+            .split_full_postings = false,
+            .min_overfull_postings_to_run = densePostingIdleMinOverfullPostingsToRun(),
+            .min_postings_at_capacity_to_run = 0,
+            .max_boundary_reassignments_per_index = densePostingIdleMaxBoundaryReassignmentsPerIndex(),
+            .max_elapsed_ns = @intCast(densePostingIdleMaxElapsedNs()),
+        });
+        maintenance_ns = elapsedSince(maintenance_start_ns);
+        maintenance_steps = maintenance_result.total_steps;
+        try noteDenseCatchUpMaintenanceRun(ctx, index_ref.name, maintenance_now_ns);
+    }
+
     setDenseCatchUpPhase(ctx, .applied_sequence_flush);
     var published_visibility = false;
     if (ctx.applied_sequence_mutex.tryLock()) {

@@ -2194,6 +2194,7 @@ pub const IndexManager = struct {
         boundary_reassignment_min_improvement: f32 = 0.0,
         max_indexes: usize = std.math.maxInt(usize),
         max_elapsed_ns: u64 = 0,
+        index_name: ?[]const u8 = null,
     };
 
     pub const DensePostingMaintenanceResult = struct {
@@ -2289,6 +2290,9 @@ pub const IndexManager = struct {
 
     pub fn runDensePostingMaintenanceProfiled(self: *IndexManager, options: DensePostingMaintenanceOptions) !DensePostingMaintenanceResult {
         var result = DensePostingMaintenanceResult{};
+        if (options.index_name) |name| {
+            _ = self.denseIndex(name) orelse return error.IndexNotFound;
+        }
         if (options.max_indexes == 0) {
             result.stopped_by_max_indexes = self.dense_indexes.items.len != 0;
             return result;
@@ -2296,6 +2300,9 @@ pub const IndexManager = struct {
 
         const start_ns = if (options.max_elapsed_ns != 0) nowNs() else 0;
         for (self.dense_indexes.items) |*entry| {
+            if (options.index_name) |name| {
+                if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            }
             if (result.attempted_indexes >= options.max_indexes) {
                 result.stopped_by_max_indexes = true;
                 break;
@@ -2356,6 +2363,16 @@ pub const IndexManager = struct {
         }
         result.elapsed_ns = if (options.max_elapsed_ns != 0) elapsedSince(start_ns) else 0;
         return result;
+    }
+
+    pub fn densePostingMaintenanceScoreByName(self: *IndexManager, name: []const u8) !u64 {
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        const backlog = try entry.index.postingBacklogStats();
+        return backlog.dirty_postings +|
+            backlog.delta_tail_postings +|
+            backlog.overfull_postings +|
+            backlog.postings_at_capacity +|
+            backlog.max_over_capacity_members;
     }
 
     pub fn denseLsmMaintenanceScoreByName(self: *IndexManager, name: []const u8) !u64 {

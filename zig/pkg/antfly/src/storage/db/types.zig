@@ -1366,6 +1366,7 @@ pub const DensePostingMaintenanceStats = struct {
     budget_stop_elapsed_runs: u64 = 0,
     budget_stop_resource_runs: u64 = 0,
     query_guardrail_stop_runs: u64 = 0,
+    convergence_limit_runs: u64 = 0,
     profiled_dense_search_observations: u64 = 0,
     profiled_dense_search_last_ns: u64 = 0,
     profiled_dense_search_max_ns: u64 = 0,
@@ -1720,6 +1721,7 @@ pub const DenseCatchUpStats = struct {
         bulk_split = 3,
         bulk_publish = 4,
         applied_sequence_flush = 5,
+        posting_maintenance = 6,
     };
 
     begin_calls: u64 = 0,
@@ -1944,6 +1946,7 @@ pub fn accumulateDensePostingMaintenanceStats(dst: *DensePostingMaintenanceStats
     dst.budget_stop_elapsed_runs += src.budget_stop_elapsed_runs;
     dst.budget_stop_resource_runs += src.budget_stop_resource_runs;
     dst.query_guardrail_stop_runs += src.query_guardrail_stop_runs;
+    dst.convergence_limit_runs += src.convergence_limit_runs;
     dst.profiled_dense_search_observations += src.profiled_dense_search_observations;
     dst.profiled_dense_search_last_ns = @max(dst.profiled_dense_search_last_ns, src.profiled_dense_search_last_ns);
     dst.profiled_dense_search_max_ns = @max(dst.profiled_dense_search_max_ns, src.profiled_dense_search_max_ns);

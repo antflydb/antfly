@@ -422,7 +422,14 @@ run_bench() {
   printf 'spfresh_comparison label=%s\n' "${label}" >&2
   local tmp
   tmp="$(mktemp "${RESULT_DIR}/${label}.XXXXXX")"
-  "$@" > "${tmp}"
+  if "$@" > "${tmp}"; then
+    :
+  else
+    local status=$?
+    printf 'spfresh_comparison label=%s failed status=%s tmp=%s\n' "${label}" "${status}" "${tmp}" >&2
+    rm -f "${tmp}"
+    return 0
+  fi
   while IFS= read -r line || [[ -n "${line}" ]]; do
     if [[ "${line}" == \{* ]]; then
       printf '{"comparison_label":"%s",%s\n' "${label}" "${line#\{}" >> "${RESULT_FILE}"

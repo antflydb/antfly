@@ -781,18 +781,18 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 ),
                 "overlay_cache_evictions": preferred_mean(
                     group,
-                    "post_write_profile_posting_overlay_cache_evictions",
                     "post_write_warm_profile_posting_overlay_cache_evictions",
+                    "post_write_profile_posting_overlay_cache_evictions",
                 ),
                 "overlay_cache_admission_skips": preferred_mean(
                     group,
-                    "post_write_profile_posting_overlay_cache_admission_skips",
                     "post_write_warm_profile_posting_overlay_cache_admission_skips",
+                    "post_write_profile_posting_overlay_cache_admission_skips",
                 ),
                 "overlay_cache_member_bytes": preferred_mean(
                     group,
-                    "post_write_profile_posting_overlay_cache_member_bytes",
                     "post_write_warm_profile_posting_overlay_cache_member_bytes",
+                    "post_write_profile_posting_overlay_cache_member_bytes",
                 ),
                 "post_centroid_blocks_scanned": preferred_mean(
                     group,
