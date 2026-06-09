@@ -16,9 +16,10 @@ export * from "./components/brand/mono-label";
 export * from "./components/brand/text";
 export * from "./components/brand/type-on";
 export * from "./components/brand/wordmark";
-export * from "./components/compound/data-table";
 export * from "./components/compound/dashboard-page";
+export * from "./components/compound/data-table";
 export * from "./components/compound/empty-state";
+export * from "./components/compound/file-upload";
 export * from "./components/compound/multi-select";
 export * from "./components/compound/page-header";
 // Compound components
