@@ -24,8 +24,8 @@ pub const Op = enum {
     max,
 
     pub fn parse(text: []const u8) ?Op {
-        inline for (std.meta.fields(Op)) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (@typeInfo(Op).@"enum".field_names, @typeInfo(Op).@"enum".field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, text, field_name)) return @enumFromInt(field_value);
         }
         return null;
     }

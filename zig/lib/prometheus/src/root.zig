@@ -40,7 +40,7 @@ pub fn initializeNoop(comptime T: type) T {
     switch (@typeInfo(T)) {
         .@"struct" => |struct_info| {
             var m: T = undefined;
-            inline for (struct_info.fields) |field| {
+            inline for (_reflFields(struct_info)) |field| {
                 switch (@typeInfo(field.type)) {
                     .@"union" => @field(m, field.name) = .{ .noop = {} },
                     else => {
@@ -59,7 +59,7 @@ pub fn initializeNoop(comptime T: type) T {
 
 pub fn write(metrics: anytype, writer: *std.Io.Writer) !void {
     const S = @typeInfo(@TypeOf(metrics)).pointer.child;
-    const fields = @typeInfo(S).@"struct".fields;
+    const fields = _reflFields(@typeInfo(S).@"struct");
 
     inline for (fields) |f| {
         switch (@typeInfo(f.type)) {
@@ -167,4 +167,26 @@ test "metrics: write" {
             \\
         , buf);
     }
+}
+// --- Zig 0.17 reflection compatibility helper (file-local) ---
+// Reproduces the pre-0.17 `.fields` slice (with `.name`/`.type`/`.value`/`.is_comptime`/
+// `.default_value_ptr`) on top of the parallel-array `@typeInfo` reflection API.
+const _ReflField = struct {
+    name: [:0]const u8,
+    type: type = void,
+    value: comptime_int = 0,
+    is_comptime: bool = false,
+    default_value_ptr: ?*const anyopaque = null,
+};
+fn _reflFields(comptime info: anytype) [info.field_names.len]_ReflField {
+    const InfoT = @TypeOf(info);
+    var out: [info.field_names.len]_ReflField = undefined;
+    if (@hasField(InfoT, "field_values")) {
+        for (info.field_names, info.field_values, 0..) |fn_, fv_, fi_| out[fi_] = .{ .name = fn_, .value = fv_ };
+    } else if (@hasField(InfoT, "is_tuple")) {
+        for (info.field_names, info.field_types, info.field_attrs, 0..) |fn_, ft_, fa_, fi_| out[fi_] = .{ .name = fn_, .type = ft_, .is_comptime = fa_.@"comptime", .default_value_ptr = fa_.default_value_ptr };
+    } else {
+        for (info.field_names, info.field_types, 0..) |fn_, ft_, fi_| out[fi_] = .{ .name = fn_, .type = ft_ };
+    }
+    return out;
 }

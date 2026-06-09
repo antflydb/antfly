@@ -186,7 +186,7 @@ pub const Cache = struct {
             };
         }
 
-        fn snapshot(self: *const AtomicStats, used_bytes: usize, entry_count: usize, kind_bytes: [@typeInfo(Kind).@"enum".fields.len]usize) Stats {
+        fn snapshot(self: *const AtomicStats, used_bytes: usize, entry_count: usize, kind_bytes: [@typeInfo(Kind).@"enum".field_names.len]usize) Stats {
             var run_state = self.run_state.snapshot();
             var run_table_raw = self.run_table_raw.snapshot();
             var run_table_index = self.run_table_index.snapshot();
@@ -214,7 +214,7 @@ pub const Cache = struct {
     shards: []Shard,
     used_bytes: std.atomic.Value(usize) = .init(0),
     entry_count: std.atomic.Value(usize) = .init(0),
-    kind_bytes: [@typeInfo(Kind).@"enum".fields.len]std.atomic.Value(usize) = .{
+    kind_bytes: [@typeInfo(Kind).@"enum".field_names.len]std.atomic.Value(usize) = .{
         .init(0),
         .init(0),
         .init(0),
@@ -273,7 +273,7 @@ pub const Cache = struct {
     }
 
     pub fn snapshotStats(self: *const Cache) Stats {
-        var by_kind: [@typeInfo(Kind).@"enum".fields.len]usize = undefined;
+        var by_kind: [@typeInfo(Kind).@"enum".field_names.len]usize = undefined;
         inline for (0..by_kind.len) |i| by_kind[i] = self.kind_bytes[i].load(.monotonic);
         return self.stats.snapshot(self.currentBytes(), self.entryCount(), by_kind);
     }

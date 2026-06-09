@@ -69,7 +69,7 @@ pub const Slice = enum(u8) {
     }
 };
 
-pub const slice_count: usize = @typeInfo(Slice).@"enum".fields.len;
+pub const slice_count: usize = @typeInfo(Slice).@"enum".field_names.len;
 
 pub const Budget = struct {
     soft_limit_bytes: u64 = 0,

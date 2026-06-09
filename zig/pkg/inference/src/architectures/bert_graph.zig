@@ -278,7 +278,7 @@ fn layerParam(bld: *Builder, layer: u32, suffix: []const u8, dims: anytype) !Nod
     const owned_name = try bld.graph.allocator.dupe(u8, name);
 
     const d = dims;
-    const shape = switch (@typeInfo(@TypeOf(d)).@"struct".fields.len) {
+    const shape = switch (@typeInfo(@TypeOf(d)).@"struct".field_names.len) {
         1 => Shape.init(.f32, &.{@intCast(d[0])}),
         2 => Shape.init(.f32, &.{ @intCast(d[0]), @intCast(d[1]) }),
         else => @compileError("layerParam: only 1-D or 2-D dims supported"),

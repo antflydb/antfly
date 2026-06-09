@@ -21,8 +21,8 @@ pub const Bucket = enum {
     month,
 
     pub fn parse(text: []const u8) ?Bucket {
-        inline for (std.meta.fields(Bucket)) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (@typeInfo(Bucket).@"enum".field_names, @typeInfo(Bucket).@"enum".field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, text, field_name)) return @enumFromInt(field_value);
         }
         return null;
     }

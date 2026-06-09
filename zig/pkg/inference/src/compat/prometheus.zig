@@ -77,8 +77,8 @@ fn writeMetric(writer: *std.Io.Writer, metric: anytype) !void {
 }
 
 pub fn write(metrics: anytype, writer: *std.Io.Writer) !void {
-    inline for (std.meta.fields(@TypeOf(metrics.*))) |field| {
-        try writeMetric(writer, &@field(metrics, field.name));
+    inline for (@typeInfo(@TypeOf(metrics.*)).@"struct".field_names) |field_name| {
+        try writeMetric(writer, &@field(metrics, field_name));
     }
 }
 

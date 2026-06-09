@@ -54,7 +54,7 @@ pub const MutableSnapshotReason = enum(u8) {
     other,
 };
 
-pub const mutable_snapshot_reason_count = @typeInfo(MutableSnapshotReason).@"enum".fields.len;
+pub const mutable_snapshot_reason_count = @typeInfo(MutableSnapshotReason).@"enum".field_names.len;
 
 pub const MutableSnapshotCloneReasonStats = struct {
     calls: u64 = 0,
@@ -463,11 +463,11 @@ pub const Backend = struct {
     }
 
     pub fn accumulateWriteStats(dst: *WriteStats, src: WriteStats) void {
-        inline for (@typeInfo(WriteStats).@"struct".fields) |field| {
-            if (comptime std.mem.eql(u8, field.name, "table_file_compression_codec_mask")) {
-                @field(dst, field.name) |= @field(src, field.name);
+        inline for (@typeInfo(WriteStats).@"struct".field_names) |field_name| {
+            if (comptime std.mem.eql(u8, field_name, "table_file_compression_codec_mask")) {
+                @field(dst, field_name) |= @field(src, field_name);
             } else {
-                @field(dst, field.name) +|= @field(src, field.name);
+                @field(dst, field_name) +|= @field(src, field_name);
             }
         }
     }

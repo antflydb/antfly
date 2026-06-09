@@ -2142,9 +2142,9 @@ fn denseLsmWriteStatsSnapshot(ctx: *AsyncContext, index_name: []const u8) ?hbc_m
 
 fn denseLsmWriteStatsDelta(after: hbc_mod.LsmWriteStats, before: hbc_mod.LsmWriteStats) hbc_mod.LsmWriteStats {
     var delta = after;
-    inline for (std.meta.fields(hbc_mod.LsmWriteStats)) |field| {
-        if (field.type == u64) {
-            @field(delta, field.name) = @field(after, field.name) -| @field(before, field.name);
+    inline for (@typeInfo(hbc_mod.LsmWriteStats).@"struct".field_names, @typeInfo(hbc_mod.LsmWriteStats).@"struct".field_types) |field_name, field_type| {
+        if (field_type == u64) {
+            @field(delta, field_name) = @field(after, field_name) -| @field(before, field_name);
         }
     }
     return delta;

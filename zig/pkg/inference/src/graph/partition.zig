@@ -195,7 +195,7 @@ pub const CapabilityReason = enum {
 };
 
 pub const CapabilityDiagnostics = struct {
-    counts: [@typeInfo(CapabilityReason).@"enum".fields.len]usize = @splat(0),
+    counts: [@typeInfo(CapabilityReason).@"enum".field_names.len]usize = @splat(0),
     operator_stats: operator_plan.Stats = .{},
 
     pub fn record(self: *CapabilityDiagnostics, decision: CapabilityDecision) void {

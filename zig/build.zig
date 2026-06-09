@@ -613,7 +613,7 @@ const AntflyRootImports = struct {
 };
 
 fn addSnowballModule(b: *std.Build, lib_mod: *std.Build.Module) void {
-    const snowball_mod = b.addModule("snowball", .{
+    const snowball_mod = b.createModule(.{
         .root_source_file = b.path(snowball_generated_root ++ "/root.zig"),
     });
 

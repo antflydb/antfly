@@ -90,5 +90,5 @@ pub const Session = struct {
 test "session vtable layout" {
     // Ensure the vtable has all required function pointers.
     const info = @typeInfo(Session.VTable);
-    try std.testing.expectEqual(@as(usize, 7), info.@"struct".fields.len);
+    try std.testing.expectEqual(@as(usize, 7), info.@"struct".field_names.len);
 }

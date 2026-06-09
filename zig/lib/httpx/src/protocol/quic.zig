@@ -624,11 +624,11 @@ pub const TransportParameters = struct {
         var out = std.ArrayListUnmanaged(u8).empty;
         errdefer out.deinit(allocator);
 
-        inline for (@typeInfo(TransportParameters).@"struct".fields) |field| {
-            const param_id = @intFromEnum(@field(TransportParameter, field.name));
-            const value = @field(self, field.name);
+        inline for (@typeInfo(TransportParameters).@"struct".field_names, @typeInfo(TransportParameters).@"struct".field_types) |field_name, field_type| {
+            const param_id = @intFromEnum(@field(TransportParameter, field_name));
+            const value = @field(self, field_name);
 
-            if (field.type == bool) {
+            if (field_type == bool) {
                 if (value) {
                     var buf: [16]u8 = undefined;
                     const id_len = try encodeVarInt(param_id, &buf);

@@ -803,7 +803,7 @@ fn RepeatedLists(comptime T: type) type {
     const map = T._pb_field_map;
     comptime var field_names: [map.len][]const u8 = undefined;
     comptime var field_types: [map.len]type = undefined;
-    comptime var field_attrs: [map.len]std.builtin.Type.StructField.Attributes = undefined;
+    comptime var field_attrs: [map.len]std.builtin.Type.Struct.FieldAttributes = undefined;
     inline for (map, 0..) |fd, i| {
         const FieldT = @FieldType(T, fd.name);
         const ListT: type = switch (fd.encoding) {

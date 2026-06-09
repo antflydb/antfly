@@ -168,8 +168,8 @@ fn parseArgs(init: std.process.Init) !BenchConfig {
 }
 
 fn parseQuantMode(value: []const u8) ?QuantMode {
-    inline for (@typeInfo(QuantMode).@"enum".fields) |field| {
-        if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(QuantMode).@"enum".field_names, @typeInfo(QuantMode).@"enum".field_values) |field_name, field_value| {
+        if (std.ascii.eqlIgnoreCase(value, field_name)) return @enumFromInt(field_value);
     }
     return null;
 }

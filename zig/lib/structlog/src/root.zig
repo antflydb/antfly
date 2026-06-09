@@ -195,7 +195,7 @@ pub const Logger = struct {
         const extra_info = @typeInfo(ExtraType);
         switch (extra_info) {
             .@"struct" => |s| {
-                inline for (s.fields) |f| {
+                inline for (_reflFields(s)) |f| {
                     const field = structFieldToLogField(f.name, @field(extra_fields, f.name));
                     try writer.writeAll(",\"");
                     try writer.writeAll(field.key);
@@ -247,7 +247,7 @@ pub const Logger = struct {
         const extra_info = @typeInfo(ExtraType);
         switch (extra_info) {
             .@"struct" => |s| {
-                inline for (s.fields) |f| {
+                inline for (_reflFields(s)) |f| {
                     const field = structFieldToLogField(f.name, @field(extra_fields, f.name));
                     try writer.writeByte(' ');
                     try writer.writeAll(field.key);
@@ -323,4 +323,26 @@ test "logFn compatibility" {
 
     // This simulates what std.log would call
     logFn(.info, .test_scope, "table={s} count={d}", .{ "users", 42 });
+}
+// --- Zig 0.17 reflection compatibility helper (file-local) ---
+// Reproduces the pre-0.17 `.fields` slice (with `.name`/`.type`/`.value`/`.is_comptime`/
+// `.default_value_ptr`) on top of the parallel-array `@typeInfo` reflection API.
+const _ReflField = struct {
+    name: [:0]const u8,
+    type: type = void,
+    value: comptime_int = 0,
+    is_comptime: bool = false,
+    default_value_ptr: ?*const anyopaque = null,
+};
+fn _reflFields(comptime info: anytype) [info.field_names.len]_ReflField {
+    const InfoT = @TypeOf(info);
+    var out: [info.field_names.len]_ReflField = undefined;
+    if (@hasField(InfoT, "field_values")) {
+        for (info.field_names, info.field_values, 0..) |fn_, fv_, fi_| out[fi_] = .{ .name = fn_, .value = fv_ };
+    } else if (@hasField(InfoT, "is_tuple")) {
+        for (info.field_names, info.field_types, info.field_attrs, 0..) |fn_, ft_, fa_, fi_| out[fi_] = .{ .name = fn_, .type = ft_, .is_comptime = fa_.@"comptime", .default_value_ptr = fa_.default_value_ptr };
+    } else {
+        for (info.field_names, info.field_types, 0..) |fn_, ft_, fi_| out[fi_] = .{ .name = fn_, .type = ft_ };
+    }
+    return out;
 }

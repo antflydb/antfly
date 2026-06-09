@@ -1365,8 +1365,8 @@ pub const ApiHttpServer = struct {
     }
 
     fn parseRemoteRuntimeFreshness(freshness: []const u8) runtime_status.RuntimeStatusFreshness {
-        inline for (@typeInfo(runtime_status.RuntimeStatusFreshness).@"enum".fields) |field| {
-            if (std.mem.eql(u8, freshness, field.name)) return @enumFromInt(field.value);
+        inline for (@typeInfo(runtime_status.RuntimeStatusFreshness).@"enum".field_names, @typeInfo(runtime_status.RuntimeStatusFreshness).@"enum".field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, freshness, field_name)) return @enumFromInt(field_value);
         }
         return .remote_unknown;
     }

@@ -144,7 +144,7 @@ pub const Value = union(enum) {
         // Structs → map
         if (info == .@"struct") {
             var m: ValueMap = .{};
-            inline for (info.@"struct".fields) |field| {
+            inline for (_reflFields(info.@"struct")) |field| {
                 const fv = @field(val, field.name);
                 try m.put(arena, field.name, try from(arena, fv));
             }
@@ -1109,7 +1109,7 @@ fn testRender(arena: Allocator, template: []const u8, context: Value) ![]const u
 
 fn makeCtx(arena: Allocator, entries: anytype) !Value {
     var m: ValueMap = .{};
-    inline for (@typeInfo(@TypeOf(entries)).@"struct".fields) |field| {
+    inline for (_reflFields(@typeInfo(@TypeOf(entries)).@"struct")) |field| {
         const val = @field(entries, field.name);
         try m.put(arena, field.name, val);
     }
@@ -2339,4 +2339,26 @@ test "eval @root in each" {
 
     const result = try testRender(arena, "{{#each items}}{{@root.sep}}{{this}}{{/each}}", .{ .map = m });
     try std.testing.expectEqualStrings("|x", result);
+}
+// --- Zig 0.17 reflection compatibility helper (file-local) ---
+// Reproduces the pre-0.17 `.fields` slice (with `.name`/`.type`/`.value`/`.is_comptime`/
+// `.default_value_ptr`) on top of the parallel-array `@typeInfo` reflection API.
+const _ReflField = struct {
+    name: [:0]const u8,
+    type: type = void,
+    value: comptime_int = 0,
+    is_comptime: bool = false,
+    default_value_ptr: ?*const anyopaque = null,
+};
+fn _reflFields(comptime info: anytype) [info.field_names.len]_ReflField {
+    const InfoT = @TypeOf(info);
+    var out: [info.field_names.len]_ReflField = undefined;
+    if (@hasField(InfoT, "field_values")) {
+        for (info.field_names, info.field_values, 0..) |fn_, fv_, fi_| out[fi_] = .{ .name = fn_, .value = fv_ };
+    } else if (@hasField(InfoT, "is_tuple")) {
+        for (info.field_names, info.field_types, info.field_attrs, 0..) |fn_, ft_, fa_, fi_| out[fi_] = .{ .name = fn_, .type = ft_, .is_comptime = fa_.@"comptime", .default_value_ptr = fa_.default_value_ptr };
+    } else {
+        for (info.field_names, info.field_types, 0..) |fn_, ft_, fi_| out[fi_] = .{ .name = fn_, .type = ft_ };
+    }
+    return out;
 }

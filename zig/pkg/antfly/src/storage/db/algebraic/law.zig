@@ -38,8 +38,8 @@ pub const Id = enum {
     provenance_semiring,
 
     pub fn parse(text: []const u8) ?Id {
-        inline for (std.meta.fields(Id)) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (@typeInfo(Id).@"enum".field_names, @typeInfo(Id).@"enum".field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, text, field_name)) return @enumFromInt(field_value);
         }
         return null;
     }

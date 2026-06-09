@@ -634,8 +634,8 @@ pub const TableManager = struct {
 };
 
 pub fn parsePlacementClass(role: []const u8) ?PlacementClass {
-    inline for (comptime std.meta.fields(PlacementClass)) |field| {
-        if (std.mem.eql(u8, role, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(PlacementClass).@"enum".field_names, @typeInfo(PlacementClass).@"enum".field_values) |field_name, field_value| {
+        if (std.mem.eql(u8, role, field_name)) return @enumFromInt(field_value);
     }
     return null;
 }

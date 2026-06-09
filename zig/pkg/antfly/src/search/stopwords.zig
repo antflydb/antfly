@@ -466,8 +466,8 @@ const finnish_stops = std.StaticStringMap(void).initComptime(.{
 // ============================================================================
 
 test "all languages have non-empty stop word maps" {
-    inline for (std.meta.fields(Language)) |field| {
-        const lang: Language = @enumFromInt(field.value);
+    inline for (@typeInfo(Language).@"enum".field_values) |field_value| {
+        const lang: Language = @enumFromInt(field_value);
         const stops = getStopWords(lang);
         try std.testing.expect(stops.keys().len > 0);
     }

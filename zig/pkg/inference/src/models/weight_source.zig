@@ -86,7 +86,7 @@ pub const QuantizedStorage = struct {
     };
 
     pub const PreparedQuantCache = struct {
-        const layout_count = @typeInfo(PreparedQuantLayout).@"enum".fields.len;
+        const layout_count = @typeInfo(PreparedQuantLayout).@"enum".field_names.len;
 
         entries: [layout_count]?PreparedQuantBuffer = @as([layout_count]?PreparedQuantBuffer, @splat(null)),
 

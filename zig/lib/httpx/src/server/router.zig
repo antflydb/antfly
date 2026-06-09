@@ -43,7 +43,7 @@ const Segment = union(enum) {
 };
 
 /// Number of method variants used for per-method route partitioning.
-const method_count = @typeInfo(types.Method).@"enum".fields.len;
+const method_count = @typeInfo(types.Method).@"enum".field_names.len;
 
 /// HTTP Router with path parameter support.
 /// Routes are partitioned by HTTP method for O(R/M) lookup instead of O(R).

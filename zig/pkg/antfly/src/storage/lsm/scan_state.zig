@@ -21,5 +21,5 @@ pub const ScanState = enum {
 };
 
 test "scan state enum remains stable" {
-    try @import("std").testing.expectEqual(@as(usize, 5), @typeInfo(ScanState).@"enum".fields.len);
+    try @import("std").testing.expectEqual(@as(usize, 5), @typeInfo(ScanState).@"enum".field_names.len);
 }

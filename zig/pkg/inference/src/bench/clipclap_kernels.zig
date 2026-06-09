@@ -108,9 +108,9 @@ fn filterMatchesShape(cfg: BenchConfig, rows: usize, in_dim: usize, out_dim: usi
 }
 
 fn parseBenchKind(value: []const u8) !tensor_types.KnownTensorType {
-    inline for (@typeInfo(tensor_types.KnownTensorType).@"enum".fields) |field| {
-        if (std.mem.eql(u8, value, field.name)) {
-            return @enumFromInt(field.value);
+    inline for (@typeInfo(tensor_types.KnownTensorType).@"enum".field_names, @typeInfo(tensor_types.KnownTensorType).@"enum".field_values) |field_name, field_value| {
+        if (std.mem.eql(u8, value, field_name)) {
+            return @enumFromInt(field_value);
         }
     }
     return error.InvalidArgument;

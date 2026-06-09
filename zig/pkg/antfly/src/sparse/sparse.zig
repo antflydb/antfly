@@ -105,15 +105,15 @@ pub const WriteProfile = struct {
 
     pub fn delta(after: WriteProfile, before: WriteProfile) WriteProfile {
         var out: WriteProfile = .{};
-        inline for (std.meta.fields(WriteProfile)) |field| {
-            @field(out, field.name) = @field(after, field.name) -| @field(before, field.name);
+        inline for (@typeInfo(WriteProfile).@"struct".field_names) |field_name| {
+            @field(out, field_name) = @field(after, field_name) -| @field(before, field_name);
         }
         return out;
     }
 
     pub fn add(self: *WriteProfile, other: WriteProfile) void {
-        inline for (std.meta.fields(WriteProfile)) |field| {
-            @field(self.*, field.name) += @field(other, field.name);
+        inline for (@typeInfo(WriteProfile).@"struct".field_names) |field_name| {
+            @field(self.*, field_name) += @field(other, field_name);
         }
     }
 };

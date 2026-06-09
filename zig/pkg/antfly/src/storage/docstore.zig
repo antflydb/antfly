@@ -72,8 +72,8 @@ fn replayHintOrdinal(hint: change_journal_mod.TargetHint) u8 {
 
 fn replayHintFromSingleMask(mask: u8) ?change_journal_mod.TargetHint {
     if (mask == 0 or (mask & (mask - 1)) != 0) return null;
-    inline for (std.meta.fields(change_journal_mod.TargetHint)) |field| {
-        if (mask == (@as(u8, 1) << @intCast(field.value))) return @enumFromInt(field.value);
+    inline for (@typeInfo(change_journal_mod.TargetHint).@"enum".field_values) |field_value| {
+        if (mask == (@as(u8, 1) << @intCast(field_value))) return @enumFromInt(field_value);
     }
     return null;
 }

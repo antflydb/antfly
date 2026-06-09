@@ -83,7 +83,7 @@ pub fn MetricVec(comptime L: type) type {
         @compileError("Vec type must be a struct, got: " ++ @typeName(L));
     }
 
-    const fields = ti.@"struct".fields;
+    const fields = _reflFields(ti.@"struct");
     inline for (fields) |f| {
         validateLabel(f.name, f.type);
     }
@@ -398,7 +398,7 @@ fn HashContext(comptime K: type) type {
     return struct {
         const Self = @This();
 
-        const fields = @typeInfo(K).@"struct".fields;
+        const fields = _reflFields(@typeInfo(K).@"struct");
 
         pub fn hash(_: Self, key: K) u64 {
             var hasher = Wyhash.init(0);
@@ -730,4 +730,26 @@ test "numberOfDigits" {
     try t.expectEqual(10, numberOfDigits(@as(u33, 1234567890)));
     try t.expectEqual(19, numberOfDigits(@as(usize, 9223372036854775807)));
     try t.expectEqual(20, numberOfDigits(@as(i64, -9223372036854775808)));
+}
+// --- Zig 0.17 reflection compatibility helper (file-local) ---
+// Reproduces the pre-0.17 `.fields` slice (with `.name`/`.type`/`.value`/`.is_comptime`/
+// `.default_value_ptr`) on top of the parallel-array `@typeInfo` reflection API.
+const _ReflField = struct {
+    name: [:0]const u8,
+    type: type = void,
+    value: comptime_int = 0,
+    is_comptime: bool = false,
+    default_value_ptr: ?*const anyopaque = null,
+};
+fn _reflFields(comptime info: anytype) [info.field_names.len]_ReflField {
+    const InfoT = @TypeOf(info);
+    var out: [info.field_names.len]_ReflField = undefined;
+    if (@hasField(InfoT, "field_values")) {
+        for (info.field_names, info.field_values, 0..) |fn_, fv_, fi_| out[fi_] = .{ .name = fn_, .value = fv_ };
+    } else if (@hasField(InfoT, "is_tuple")) {
+        for (info.field_names, info.field_types, info.field_attrs, 0..) |fn_, ft_, fa_, fi_| out[fi_] = .{ .name = fn_, .type = ft_, .is_comptime = fa_.@"comptime", .default_value_ptr = fa_.default_value_ptr };
+    } else {
+        for (info.field_names, info.field_types, 0..) |fn_, ft_, fi_| out[fi_] = .{ .name = fn_, .type = ft_ };
+    }
+    return out;
 }
