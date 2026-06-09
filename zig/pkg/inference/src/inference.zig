@@ -29,6 +29,7 @@ pub const server = if (build_options.skip_openapi) struct {} else @import("serve
 pub const cache = @import("cache/cache.zig");
 pub const singleflight = @import("cache/singleflight.zig");
 pub const registry = @import("registry/registry.zig");
+pub const tabular = @import("tabular/root.zig");
 pub const models = @import("models/models.zig");
 pub const gguf = @import("gguf/root.zig");
 pub const runtime = @import("runtime/root.zig");

@@ -6,6 +6,11 @@ pub const server = @import("server.zig");
 pub const ServerRouter = server.ServerRouter;
 
 pub const Error = types.Error;
+pub const PredictRequest = types.PredictRequest;
+pub const PredictResponse = types.PredictResponse;
+pub const PredictorTask = types.PredictorTask;
+pub const PredictorInfo = types.PredictorInfo;
+pub const PredictorsResponse = types.PredictorsResponse;
 pub const TextContentPart = types.TextContentPart;
 pub const ImageURL = types.ImageURL;
 pub const ImageURLContentPart = types.ImageURLContentPart;

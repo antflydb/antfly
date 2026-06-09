@@ -1,5 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const useSystemChrome = process.env.ANTFARM_PLAYWRIGHT_USE_SYSTEM_CHROME === "1";
+
 /**
  * Read environment variables from file.
  * https://github.com/motdotla/dotenv
@@ -43,7 +45,7 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      use: { ...devices["Desktop Chrome"], ...(useSystemChrome ? { channel: "chrome" } : {}) },
     },
 
     {

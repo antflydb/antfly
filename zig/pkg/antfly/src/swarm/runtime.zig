@@ -47,6 +47,7 @@ const CliConfig = struct {
     local_node_id: ?u64 = null,
     auth_enabled: ?bool = null,
     inference_models_dir: ?[]const u8 = null,
+    inference_ml_dir: ?[]const u8 = null,
     inference_host_budget_mb: usize = 0,
     inference_backend_budget_mb: usize = 0,
     inference_combined_budget_mb: usize = 0,
@@ -612,6 +613,8 @@ pub fn runFromIterator(
     var antfly_node_cfg = inference.server.NodeConfig{
         .models_dir = resolveInferenceModelsDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
             antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir),
+        .ml_dir = resolveInferenceMlDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
+            antfly.inference_runtime.defaultMlDirForDataDir(alloc, data_dir),
         .generation_budget_overrides = resolveInferenceBudgetOverrides(cli),
     };
     if (loaded_config) |*cfg| {
@@ -620,6 +623,7 @@ pub fn runFromIterator(
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
     defer antfly_node.deinit();
+    antfly_node.seedAndDiscoverPredictors(init.io);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -796,6 +800,7 @@ fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_em
         .ptr = node,
         .embed_dense_texts = localAntflyEmbedDenseTexts,
         .embed_sparse_texts = localAntflyEmbedSparseTexts,
+        .embed_dense_parts = localAntflyEmbedDenseParts,
         .rerank_texts = localAntflyRerankTexts,
         .generate_text = localAntflyGenerateText,
         .generate_messages = localAntflyGenerateMessages,
@@ -813,6 +818,65 @@ fn localAntflyEmbedDenseTexts(
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     return try node.embedDenseTextsDirect(alloc, model, texts);
+}
+
+fn localAntflyEmbedDenseParts(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const antfly.template.ContentPart,
+) anyerror![][]f32 {
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
+    var values = std.json.Array.init(alloc);
+    defer values.deinit();
+    var encoded_buffers = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (encoded_buffers.items) |buf| alloc.free(buf);
+        encoded_buffers.deinit(alloc);
+    }
+
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| {
+                var obj = std.json.ObjectMap.empty;
+                errdefer obj.deinit(alloc);
+                try obj.put(alloc, "type", .{ .string = "text" });
+                try obj.put(alloc, "text", .{ .string = text });
+                try values.append(.{ .object = obj });
+            },
+            .media_url => |url| {
+                var image_url = std.json.ObjectMap.empty;
+                errdefer image_url.deinit(alloc);
+                try image_url.put(alloc, "url", .{ .string = url });
+
+                var obj = std.json.ObjectMap.empty;
+                errdefer obj.deinit(alloc);
+                try obj.put(alloc, "type", .{ .string = "image_url" });
+                try obj.put(alloc, "image_url", .{ .object = image_url });
+                try values.append(.{ .object = obj });
+            },
+            .binary => |binary_part| {
+                const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
+                const encoded = try alloc.alloc(u8, encoded_len);
+                errdefer alloc.free(encoded);
+                _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
+                try encoded_buffers.append(alloc, encoded);
+
+                var obj = std.json.ObjectMap.empty;
+                errdefer {
+                    obj.deinit(alloc);
+                    _ = encoded_buffers.pop();
+                    alloc.free(encoded);
+                }
+                try obj.put(alloc, "type", .{ .string = "media" });
+                try obj.put(alloc, "data", .{ .string = encoded });
+                try obj.put(alloc, "mime_type", .{ .string = binary_part.mime_type });
+                try values.append(.{ .object = obj });
+            },
+        }
+    }
+
+    return try node.embedDenseJsonInputDirect(alloc, model, .{ .array = values });
 }
 
 fn localAntflyEmbedSparseTexts(
@@ -1566,6 +1630,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.inference_models_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ml-dir")) {
+            cfg.inference_ml_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--inference-host-budget-mb")) {
             cfg.inference_host_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
@@ -1785,6 +1853,12 @@ fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.C
     return null;
 }
 
+fn resolveInferenceMlDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
+    if (cli.inference_ml_dir) |value| return value;
+    if (cfg) |loaded| return loaded.inference.ml_dir;
+    return null;
+}
+
 fn resolveInferenceBudgetOverrides(cli: CliConfig) antfly.inference_runtime.ServerBudgetOverrides {
     return .{
         .host_limit_bytes = mbToBytes(cli.inference_host_budget_mb),
@@ -1811,7 +1885,8 @@ fn printUsage() void {
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
         \\  --tick-ms <ms>                        Sleep interval while serving (default: 25)
-        \\  --models-dir <path>                   Embedded inference models directory (default: ~/.antfly/inference/models)
+        \\  --models-dir <path>                   Embedded AI models directory (default: ~/.antfly/inference/models)
+        \\  --ml-dir <path>                       Embedded Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --inference-host-budget-mb <n>        Embedded inference native generation host budget override
         \\  --inference-backend-budget-mb <n>     Embedded inference native generation backend budget override
         \\  --inference-combined-budget-mb <n>    Embedded inference native generation combined budget override
@@ -2023,6 +2098,8 @@ test "parse cli accepts canonical host port and models dir flags" {
         "8080",
         "--models-dir",
         "/tmp/models",
+        "--ml-dir",
+        "/tmp/ml",
         "--data-dir",
         "/tmp/antfly-data",
     };
@@ -2031,6 +2108,7 @@ test "parse cli accepts canonical host port and models dir flags" {
     try std.testing.expectEqualStrings("127.0.0.1", cfg.bind_host.?);
     try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference_models_dir.?);
+    try std.testing.expectEqualStrings("/tmp/ml", cfg.inference_ml_dir.?);
     try std.testing.expectEqualStrings("/tmp/antfly-data", cfg.data_dir.?);
 }
 
@@ -2055,15 +2133,18 @@ test "antfly config uses cli override before common config" {
         .inference = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:9000"),
             .models_dir = try alloc.dupe(u8, "/tmp/from-config"),
+            .ml_dir = try alloc.dupe(u8, "/tmp/ml-from-config"),
         },
     };
     defer cfg.deinit();
 
     const cli = CliConfig{
         .inference_models_dir = "/tmp/from-cli",
+        .inference_ml_dir = "/tmp/ml-from-cli",
         .inference_backend_budget_mb = 8192,
     };
     try std.testing.expectEqualStrings("/tmp/from-cli", resolveInferenceModelsDir(cli, &cfg).?);
+    try std.testing.expectEqualStrings("/tmp/ml-from-cli", resolveInferenceMlDir(cli, &cfg).?);
     try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), resolveInferenceBudgetOverrides(cli).backend_limit_bytes);
 }
 
@@ -2115,11 +2196,13 @@ test "inference config falls back to common config" {
         .inference = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
+            .ml_dir = try alloc.dupe(u8, "/tmp/antfly-ml"),
         },
     };
     defer cfg.deinit();
 
     try std.testing.expectEqualStrings("/tmp/antfly-models", resolveInferenceModelsDir(.{}, &cfg).?);
+    try std.testing.expectEqualStrings("/tmp/antfly-ml", resolveInferenceMlDir(.{}, &cfg).?);
 }
 
 test "swarm runtime resolves paths from common storage base dir" {

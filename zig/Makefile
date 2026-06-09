@@ -139,18 +139,26 @@ ifndef TRACE_FILES
 endif
 	@set -e; \
 	validated=0; \
-	tmpfiles=""; \
-	trap 'rm -f $$tmpfiles' EXIT; \
+	tmpfiles=""; tmpdirs=""; \
+	trap 'rm -f $$tmpfiles; rm -rf $$tmpdirs' EXIT; \
 	for f in $(TRACE_FILES); do \
 	  filtered=$$(mktemp); \
 	  tmpfiles="$$tmpfiles $$filtered"; \
 	  python3 ../scripts/tla-filter-txn-trace.py < "$$f" > "$$filtered"; \
 	  if [ -s "$$filtered" ]; then \
-	    bash ../scripts/tla-validate-trace.sh -S \
-	      -s specs/tla/TraceAntflyTransaction.tla \
-	      -c specs/tla/TraceAntflyTransaction.cfg \
-	      "$$filtered"; \
-	    validated=$$((validated + 1)); \
+	    segdir=$$(mktemp -d); \
+	    tmpdirs="$$tmpdirs $$segdir"; \
+	    python3 ../scripts/tla-segment-txn-trace.py "$$filtered" "$$segdir"; \
+	    segments=$$(find "$$segdir" -name '*.ndjson' -size +0c | sort); \
+	    if [ -n "$$segments" ]; then \
+	      bash ../scripts/tla-validate-trace.sh -S \
+	        -s specs/tla/TraceAntflyTransaction.tla \
+	        -c specs/tla/TraceAntflyTransaction.cfg \
+	        $$segments; \
+	      validated=$$((validated + 1)); \
+	    else \
+	      echo "SKIP $$f (no non-empty transaction trace segments)"; \
+	    fi; \
 	  else \
 	    echo "SKIP $$f (no spec-compatible transactions after filtering)"; \
 	  fi; \

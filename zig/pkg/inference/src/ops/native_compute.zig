@@ -838,21 +838,36 @@ fn materializeViewData(buf: *Buf) !void {
     const view_strides = buf.view_strides orelse return;
     if (logical_shape.len != view_strides.len) return error.InvalidTensorShape;
 
-    const out_len = if (logical_shape.len == 0) @as(usize, 1) else safeShapeNumel(logical_shape) orelse return error.InvalidTensorShape;
-    maybeLogLargeTensor("materialize_view", out_len, logical_shape);
+    var resolved_shape_buf: [8]i64 = undefined;
+    const materialized_shape: []const i64 = blk: {
+        if (logical_shape.len == 0 or safeShapeNumel(logical_shape) != null) break :blk logical_shape;
+        const available = if (buf.view_base_offset <= buf.data.len) buf.data.len - buf.view_base_offset else return error.InvalidTensorShape;
+        const resolved = resolveShapeFromDataLen(logical_shape, available) orelse return error.InvalidTensorShape;
+        for (0..logical_shape.len) |i| resolved_shape_buf[i] = resolved[i];
+        break :blk resolved_shape_buf[0..logical_shape.len];
+    };
+
+    var replacement_shape: ?[]i64 = null;
+    errdefer if (replacement_shape) |shape| buf.allocator.free(shape);
+    if (materialized_shape.ptr != logical_shape.ptr) {
+        replacement_shape = try buf.allocator.dupe(i64, materialized_shape);
+    }
+
+    const out_len = if (materialized_shape.len == 0) @as(usize, 1) else safeShapeNumel(materialized_shape) orelse return error.InvalidTensorShape;
+    maybeLogLargeTensor("materialize_view", out_len, materialized_shape);
     const output = try buf.allocator.alloc(f32, out_len);
     errdefer buf.allocator.free(output);
 
-    if (logical_shape.len == 0) {
+    if (materialized_shape.len == 0) {
         if (buf.view_base_offset >= buf.data.len) return error.InvalidTensorShape;
         output[0] = buf.data[buf.view_base_offset];
     } else {
         var out_strides: [8]usize = undefined;
-        computeStrides(logical_shape, out_strides[0..logical_shape.len]);
+        computeStrides(materialized_shape, out_strides[0..materialized_shape.len]);
         for (0..out_len) |flat_out| {
             var remaining = flat_out;
             var flat_in = buf.view_base_offset;
-            for (0..logical_shape.len) |d| {
+            for (0..materialized_shape.len) |d| {
                 const coord = remaining / out_strides[d];
                 remaining %= out_strides[d];
                 flat_in += coord * view_strides[d];
@@ -873,6 +888,12 @@ fn materializeViewData(buf: *Buf) !void {
     }
 
     releaseOwnedDenseData(buf);
+    if (replacement_shape) |shape| {
+        releaseLogicalShape(buf);
+        buf.logical_shape = shape;
+        buf.logical_shape_inline = false;
+        replacement_shape = null;
+    }
     const refcount = try buf.allocator.create(usize);
     refcount.* = 1;
     buf.data = output;
@@ -2306,6 +2327,7 @@ fn resolveShapeFromTensorMetadata(tensor: CT, shape: []const i64, data_len: usiz
     const buf = toBuf(tensor);
     const view_strides = buf.view_strides orelse return null;
     if (view_strides.len != shape.len) return null;
+    if (resolveShapeFromViewStrides(shape, view_strides, data_len)) |resolved| return resolved;
 
     var resolved: [8]i64 = undefined;
     var infer_index: ?usize = null;
@@ -2332,6 +2354,34 @@ fn resolveShapeFromTensorMetadata(tensor: CT, shape: []const i64, data_len: usiz
         if (known_product == 0 or data_len % known_product != 0) return null;
         resolved[idx] = @intCast(data_len / known_product);
         return resolved;
+    }
+
+    if (known_product != data_len) return null;
+    return resolved;
+}
+
+fn resolveShapeFromViewStrides(shape: []const i64, view_strides: []const usize, data_len: usize) ?[8]i64 {
+    if (shape.len == 0 or shape.len > 8 or view_strides.len != shape.len) return null;
+
+    var resolved: [8]i64 = undefined;
+    var known_product: usize = 1;
+    for (0..shape.len) |i| {
+        if (shape[i] > 0) {
+            resolved[i] = shape[i];
+        } else if (view_strides[i] == 0) {
+            resolved[i] = 1;
+        } else if (i == 0 and data_len % view_strides[i] == 0) {
+            resolved[i] = @intCast(data_len / view_strides[i]);
+        } else if (i > 0 and view_strides[i] > 0 and view_strides[i - 1] % view_strides[i] == 0) {
+            resolved[i] = @intCast(view_strides[i - 1] / view_strides[i]);
+        } else if (i == shape.len - 1 and known_product > 0 and data_len % known_product == 0) {
+            resolved[i] = @intCast(data_len / known_product);
+        } else {
+            return null;
+        }
+
+        if (resolved[i] <= 0) return null;
+        known_product = std.math.mul(usize, known_product, @intCast(resolved[i])) catch return null;
     }
 
     if (known_product != data_len) return null;
@@ -35989,6 +36039,10 @@ fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []
             for (0..effective_input_shape.len) |i| resolved_shape_buf[i] = resolved[i];
             break :blk .{ resolved_shape_buf[0..effective_input_shape.len], perm, effective_input_shape.len };
         }
+        if (resolveShapeFromTensorMetadata(input, effective_input_shape, input_buf.data.len)) |resolved| {
+            for (0..effective_input_shape.len) |i| resolved_shape_buf[i] = resolved[i];
+            break :blk .{ resolved_shape_buf[0..effective_input_shape.len], perm, effective_input_shape.len };
+        }
         const plan = collapseLeadingDynamicDimsForTranspose(effective_input_shape, perm, input_buf.data.len) orelse {
             std.log.warn("transpose symbolic shape unsupported shape={any} perm={any} len={d}", .{
                 effective_input_shape,
@@ -44736,6 +44790,69 @@ test "transpose resolves clip text attention shape" {
     const input_index = h * 77 * 64 + s * 64 + d;
     const output_index = h * 64 * 77 + d * 77 + s;
     try std.testing.expectEqual(input_data[input_index], out_data[output_index]);
+}
+
+test "transpose resolves zero metadata shape from view strides" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+
+    const batch = 2;
+    const seq = 3;
+    const hidden = 4;
+    const elem_count = batch * seq * hidden;
+    const input_data = try allocator.alloc(f32, elem_count);
+    for (input_data, 0..) |*value, i| value.* = @floatFromInt(i);
+
+    const raw = try compute.makeBuf(input_data, true);
+    defer freeTensor(&compute, raw);
+
+    const view = try makeDenseViewAlias(
+        &compute,
+        raw,
+        &.{ 0, 0, 0 },
+        &.{ seq * hidden, hidden, 1 },
+        0,
+    );
+    defer freeTensor(&compute, view);
+
+    const out = try primTransposeOp(&compute, view, &.{ 0, 2, 1 }, &.{ 0, 0, 0 });
+    defer freeTensor(&compute, out);
+
+    try std.testing.expectEqualSlices(i64, &.{ batch, hidden, seq }, tensorStoredShape(out).?);
+    const out_data = getData(out);
+    try std.testing.expectEqual(@as(usize, elem_count), out_data.len);
+
+    const input_index = 1 * seq * hidden + 2 * hidden + 3;
+    const output_index = 1 * hidden * seq + 3 * seq + 2;
+    try std.testing.expectEqual(input_data[input_index], out_data[output_index]);
+}
+
+test "materialize view resolves symbolic logical shape" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+
+    const elem_count = 8 * 77 * 64;
+    const input_data = try allocator.alloc(f32, elem_count);
+    for (input_data, 0..) |*value, i| value.* = @floatFromInt(i);
+
+    const raw = try compute.makeBuf(input_data, true);
+    defer freeTensor(&compute, raw);
+
+    const view = try makeDenseViewAlias(
+        &compute,
+        raw,
+        &.{ -1, -1, 64 },
+        &.{ 77 * 64, 64, 1 },
+        0,
+    );
+    defer freeTensor(&compute, view);
+
+    const out_data = getData(view);
+    try std.testing.expectEqual(@as(usize, elem_count), out_data.len);
+    try std.testing.expectEqualSlices(i64, &.{ 8, 77, 64 }, tensorStoredShape(view).?);
+    try std.testing.expectEqual(input_data[17], out_data[17]);
 }
 
 test "whereSelect preserves inferred attention cube shape" {

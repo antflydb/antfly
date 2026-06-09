@@ -276,6 +276,13 @@ from .inference_models_response_recognizers import InferenceModelsResponseRecogn
 from .inference_models_response_rerankers import InferenceModelsResponseRerankers
 from .inference_models_response_rewriters import InferenceModelsResponseRewriters
 from .inference_models_response_transcribers import InferenceModelsResponseTranscribers
+from .inference_predict_request import InferencePredictRequest
+from .inference_predict_response import InferencePredictResponse
+from .inference_predictor_info import InferencePredictorInfo
+from .inference_predictor_task import InferencePredictorTask
+from .inference_predictors_response import InferencePredictorsResponse
+from .inference_predictors_response_object import InferencePredictorsResponseObject
+from .inference_predictors_response_predictors import InferencePredictorsResponsePredictors
 from .inference_read_object import InferenceReadObject
 from .inference_read_object_object import InferenceReadObjectObject
 from .inference_read_request import InferenceReadRequest
@@ -779,6 +786,13 @@ __all__ = (
     "InferenceModelsResponseRerankers",
     "InferenceModelsResponseRewriters",
     "InferenceModelsResponseTranscribers",
+    "InferencePredictorInfo",
+    "InferencePredictorsResponse",
+    "InferencePredictorsResponseObject",
+    "InferencePredictorsResponsePredictors",
+    "InferencePredictorTask",
+    "InferencePredictRequest",
+    "InferencePredictResponse",
     "InferenceReadObject",
     "InferenceReadObjectObject",
     "InferenceReadRequest",

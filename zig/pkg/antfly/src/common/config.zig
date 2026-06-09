@@ -99,6 +99,7 @@ pub const Config = struct {
         api_url: ?[]u8 = null,
         api_key: ?[]u8 = null,
         models_dir: ?[]u8 = null,
+        ml_dir: ?[]u8 = null,
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
 
@@ -106,6 +107,7 @@ pub const Config = struct {
             if (self.api_url) |value| alloc.free(value);
             if (self.api_key) |value| alloc.free(value);
             if (self.models_dir) |value| alloc.free(value);
+            if (self.ml_dir) |value| alloc.free(value);
             if (self.content_security) |*security| security.deinit(alloc);
             if (self.s3_credentials) |*credentials| credentials.deinit(alloc);
             self.* = undefined;
@@ -236,6 +238,7 @@ pub const Config = struct {
                 .api_url = if (inference.api_url.len > 0) try alloc.dupe(u8, inference.api_url) else null,
                 .api_key = try rawOptionalStringField(alloc, raw_root.get("inference"), "api_key"),
                 .models_dir = if (inference.models_dir) |value| try alloc.dupe(u8, value) else null,
+                .ml_dir = if (inference.ml_dir) |value| try alloc.dupe(u8, value) else null,
                 .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
             } else .{},
@@ -804,6 +807,7 @@ test "common config extracts antfly settings" {
         \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
+        \\    "ml_dir": "/tmp/ml",
         \\    "content_security": {
         \\      "allowed_hosts": ["models.example.com"],
         \\      "block_private_ips": true
@@ -825,6 +829,7 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("antflydb", cfg.storage.local_base_dir.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
+    try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
     try std.testing.expectEqualStrings("models.example.com", cfg.inference.content_security.?.allowed_hosts.?[0]);
     try std.testing.expectEqual(@as(?bool, true), cfg.inference.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.inference.s3_credentials.?.endpoint.?);

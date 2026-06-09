@@ -202,6 +202,10 @@ pub const ClientGenerator = struct {
             try shared.getRequestBodyType(self.arena, self.resolver, self.type_gen, rb_or)
         else
             null;
+        const is_binary_request = if (op.request_body) |rb_or|
+            shared.hasOctetStreamRequestBody(self.resolver, rb_or)
+        else
+            false;
 
         // Method signature
         {
@@ -214,7 +218,9 @@ pub const ClientGenerator = struct {
             }
 
             // Request body parameter
-            if (body_type) |bt| {
+            if (is_binary_request) {
+                try sig.appendSlice(self.arena, ", body: []const u8");
+            } else if (body_type) |bt| {
                 try sig.print(self.arena, ", body: {s}", .{bt});
             }
 
@@ -243,13 +249,15 @@ pub const ClientGenerator = struct {
         }
 
         // Build request body
-        if (body_type != null) {
+        if (!is_binary_request and body_type != null) {
             try self.w.line("const json_body = try httpx.json.Json.stringify(self.allocator, body);", .{});
             try self.w.line("defer self.allocator.free(json_body);", .{});
         }
 
         // Make request
-        if (body_type != null) {
+        if (is_binary_request) {
+            try self.w.line("var resp = try self.http.{s}(url, .{{ .body = body, .headers = self.authHeaders() }});", .{http_method});
+        } else if (body_type != null) {
             try self.w.line("var resp = try self.http.{s}(url, .{{ .json = json_body, .headers = self.authHeaders() }});", .{http_method});
         } else {
             try self.w.line("var resp = try self.http.{s}(url, .{{ .headers = self.authHeaders() }});", .{http_method});

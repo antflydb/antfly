@@ -2242,6 +2242,7 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
     return .{
         ._id = hit.id,
         ._score = hit.score orelse 0,
+        ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
         ._source = if (hit.stored_data) |stored_data|
             if (req.defer_stored_projection)
                 try document_query.projectLookupJsonValue(alloc, stored_data, .{
@@ -2253,6 +2254,35 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         else
             null,
     };
+}
+
+fn indexScoresJsonValue(alloc: std.mem.Allocator, scores: []const fusion_mod.IndexScore) !?std.json.Value {
+    if (scores.len == 0) return null;
+    var obj = std.json.ObjectMap.empty;
+    errdefer obj.deinit(alloc);
+    for (scores) |score| {
+        try obj.put(alloc, score.index_name, .{ .float = score.score });
+    }
+    return .{ .object = obj };
+}
+
+test "api query contract serializes fused index scores" {
+    const alloc = std.testing.allocator;
+    const scores = [_]fusion_mod.IndexScore{
+        .{ .index_name = "text_idx", .score = 0.75 },
+        .{ .index_name = "semantic_idx", .score = 0.25 },
+    };
+
+    var value = (try indexScoresJsonValue(alloc, &scores)).?;
+    defer switch (value) {
+        .object => |*obj| obj.deinit(alloc),
+        else => {},
+    };
+
+    const object = value.object;
+    try std.testing.expectEqual(@as(usize, 2), object.count());
+    try std.testing.expectEqual(@as(f64, 0.75), object.get("text_idx").?.float);
+    try std.testing.expectEqual(@as(f64, 0.25), object.get("semantic_idx").?.float);
 }
 
 fn parseStoredSourceValue(alloc: std.mem.Allocator, stored_data: []const u8) !std.json.Value {

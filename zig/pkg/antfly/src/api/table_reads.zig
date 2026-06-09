@@ -52,6 +52,7 @@ const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const platform_time = @import("../platform/time.zig");
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
+const fusion_mod = @import("../search/fusion.zig");
 const regex_mod = @import("../search/regex.zig");
 const httpx = @import("httpx");
 const Io = std.Io;
@@ -12477,6 +12478,7 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
         hits[i] = .{
             .id = try alloc.dupe(u8, item._id),
             .score = item._score,
+            .index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores),
             .stored_data = if (item._source) |value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}) else null,
         };
         initialized += 1;
@@ -12493,6 +12495,62 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
         .total_hits = @intCast(hits_obj.total orelse 0),
         .graph_results = graph_results,
     };
+}
+
+fn parseRemoteIndexScoresAlloc(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+) ![]fusion_mod.IndexScore {
+    const value = maybe_value orelse return &.{};
+    if (value != .object) return &.{};
+    const object = value.object;
+    if (object.count() == 0) return &.{};
+
+    var scores = try alloc.alloc(fusion_mod.IndexScore, object.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (scores[0..initialized]) |score| alloc.free(score.index_name);
+        alloc.free(scores);
+    }
+
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const score: f64 = switch (entry.value_ptr.*) {
+            .float => |v| v,
+            .integer => |v| @floatFromInt(v),
+            .number_string => |v| std.fmt.parseFloat(f64, v) catch continue,
+            else => continue,
+        };
+        scores[initialized] = .{
+            .index_name = try alloc.dupe(u8, entry.key_ptr.*),
+            .score = score,
+        };
+        initialized += 1;
+    }
+
+    if (initialized == 0) {
+        alloc.free(scores);
+        return &.{};
+    }
+    if (initialized == scores.len) return scores;
+    const trimmed = try alloc.realloc(scores, initialized);
+    return trimmed;
+}
+
+test "parseRemoteSearchResult preserves fused index scores" {
+    const alloc = std.testing.allocator;
+    var result = try parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:a","_score":0.9,"_index_scores":{"full_text":0.75,"semantic_idx":0.25},"_source":{"title":"alpha"}}],"max_score":0.9},"took":1,"status":200,"table":"docs"}]}
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 2), result.hits[0].index_scores.len);
+    try std.testing.expectEqualStrings("full_text", result.hits[0].index_scores[0].index_name);
+    try std.testing.expectEqual(@as(f64, 0.75), result.hits[0].index_scores[0].score);
+    try std.testing.expectEqualStrings("semantic_idx", result.hits[0].index_scores[1].index_name);
+    try std.testing.expectEqual(@as(f64, 0.25), result.hits[0].index_scores[1].score);
 }
 
 fn parseRemoteGraphResults(

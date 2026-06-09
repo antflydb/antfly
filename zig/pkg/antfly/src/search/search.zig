@@ -381,6 +381,7 @@ pub const SearchResult = struct {
     pub fn deinit(self: *SearchResult) void {
         for (self.hits) |*hit| {
             if (hit.stored_data) |d| self.alloc.free(d);
+            freeIndexScores(self.alloc, hit.index_scores);
         }
         self.alloc.free(self.hits);
         freeAggResults(self.alloc, self.aggregations);
@@ -391,6 +392,29 @@ pub const SearchResult = struct {
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
     }
 };
+
+fn freeIndexScores(alloc: Allocator, scores: []fusion_mod.IndexScore) void {
+    for (scores) |score| alloc.free(score.index_name);
+    if (scores.len > 0) alloc.free(scores);
+}
+
+fn cloneIndexScores(alloc: Allocator, scores: []const fusion_mod.IndexScore) ![]fusion_mod.IndexScore {
+    if (scores.len == 0) return &.{};
+    const cloned = try alloc.alloc(fusion_mod.IndexScore, scores.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |score| alloc.free(score.index_name);
+        alloc.free(cloned);
+    }
+    for (scores, 0..) |score, i| {
+        cloned[i] = .{
+            .index_name = try alloc.dupe(u8, score.index_name),
+            .score = score.score,
+        };
+        initialized += 1;
+    }
+    return cloned;
+}
 
 fn freeAggResults(alloc: Allocator, aggs: []const NamedAggResult) void {
     for (aggs) |agg| {
@@ -424,6 +448,7 @@ pub const ScoredHit = struct {
     score: f32,
     id: ?[]const u8,
     stored_data: ?[]u8,
+    index_scores: []fusion_mod.IndexScore = &.{},
 };
 
 // ============================================================================
@@ -2193,7 +2218,14 @@ fn executeHybrid(
     // Convert fused results back to ScoredHits
     const result_count = @min(fused.len, request.k);
     var hits = try alloc.alloc(ScoredHit, result_count);
-    errdefer alloc.free(hits);
+    var initialized: usize = 0;
+    errdefer {
+        for (hits[0..initialized]) |*hit| {
+            if (hit.stored_data) |data| alloc.free(data);
+            freeIndexScores(alloc, hit.index_scores);
+        }
+        alloc.free(hits);
+    }
 
     for (fused[0..result_count], 0..) |fh, i| {
         const doc_id = std.fmt.parseInt(u32, fh.doc_id, 10) catch 0;
@@ -2202,7 +2234,9 @@ fn executeHybrid(
             .score = @floatCast(fh.score),
             .id = null,
             .stored_data = null,
+            .index_scores = try cloneIndexScores(alloc, fh.index_scores),
         };
+        errdefer freeIndexScores(alloc, hit.index_scores);
         if (request.include_stored) {
             if (try snap.storedDocDecompressed(doc_id)) |stored| {
                 hit.id = stored.id;
@@ -2210,6 +2244,7 @@ fn executeHybrid(
             }
         }
         hits[i] = hit;
+        initialized += 1;
     }
 
     return .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(result_count) };

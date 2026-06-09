@@ -427,10 +427,7 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
         parseInferenceBundleJson(&manifest, allocator, model_dir_path, bundle_bytes) catch {};
     } else |_| {}
     if (shouldParseClipclapGgufVariant(allocator, model_dir_path)) {
-        if (c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_variants.json")) |variants_bytes| {
-            defer allocator.free(variants_bytes);
-            parseInferenceVariantsJson(&manifest, allocator, model_dir_path, variants_bytes) catch {};
-        } else |_| {}
+        parseInferenceVariantsFile(&manifest, allocator, model_dir_path) catch {};
     }
 
     // Try to parse gliner_config.json (for GLiNER NER models)
@@ -551,10 +548,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         defer allocator.free(bundle_bytes);
         parseInferenceBundleJson(&manifest, allocator, model_dir_path, bundle_bytes) catch {};
     } else |_| {}
-    if (c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_variants.json")) |variants_bytes| {
-        defer allocator.free(variants_bytes);
-        parseInferenceVariantsJson(&manifest, allocator, model_dir_path, variants_bytes) catch {};
-    } else |_| {}
+    parseInferenceVariantsFile(&manifest, allocator, model_dir_path) catch {};
 
     if (c_file.readFileFromDir(allocator, model_dir_path, "gliner_config.json")) |gliner_bytes| {
         defer allocator.free(gliner_bytes);
@@ -1520,6 +1514,12 @@ fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Alloc
     try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
 }
 
+fn parseInferenceVariantsFile(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8) !void {
+    const variants_bytes = try c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_variants.json");
+    defer allocator.free(variants_bytes);
+    try parseInferenceVariantsJson(manifest, allocator, model_dir_path, variants_bytes);
+}
+
 fn parseGliner2InferenceVariantsJson(
     manifest: *ModelManifest,
     allocator: std.mem.Allocator,
@@ -2243,6 +2243,64 @@ test "manifest parses clipclap variants gguf pair" {
     try std.testing.expect(manifest.hasInput("text"));
     try std.testing.expect(manifest.hasInput("image"));
     try std.testing.expect(manifest.hasInput("audio"));
+}
+
+test "manifest loads canonical antfly clipclap variants before first gguf fallback" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-clipclap-canonical-variants");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const clip_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clip.Q4_K.gguf" });
+    defer allocator.free(clip_path);
+    const clap_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clap.Q4_K.gguf" });
+    defer allocator.free(clap_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clip_path, .data = "GGUFstub" });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clap_path, .data = "GGUFstub" });
+
+    const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
+    defer allocator.free(model_manifest_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = model_manifest_path,
+        .data = "{\"type\":\"embedder\",\"tasks\":[\"embed\"],\"inputs\":[\"text\",\"image\",\"audio\"]}",
+    });
+
+    const clip_config_path = try std.fs.path.join(allocator, &.{ dir_path, "clip_config.json" });
+    defer allocator.free(clip_config_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = clip_config_path,
+        .data = "{\"model_type\":\"clipclap\",\"text_config\":{\"max_position_embeddings\":77}}",
+    });
+
+    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
+    defer allocator.free(variants_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = variants_path,
+        .data =
+        \\{
+        \\  "family": "clipclap_variants/v1",
+        \\  "variants": [
+        \\    {
+        \\      "id": "gguf-Q4_K",
+        \\      "target": "gguf",
+        \\      "format": "Q4_K",
+        \\      "clip": "clipclap-clip.Q4_K.gguf",
+        \\      "clap": "clipclap-clap.Q4_K.gguf"
+        \\    }
+        \\  ]
+        \\}
+        ,
+    });
+
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expect(manifest.isClipclapGgufBundle());
+    try std.testing.expectEqual(NativeArchHint.clip, manifest.native_arch_hint);
+    try std.testing.expectEqualStrings("clipclap", manifest.config_model_arch);
+    try std.testing.expectEqualStrings(clip_path, manifest.gguf_path.?);
+    try std.testing.expectEqualStrings(clap_path, manifest.audio_model_path.?);
 }
 
 test "manifest ignores stale clipclap variants with missing gguf files" {
