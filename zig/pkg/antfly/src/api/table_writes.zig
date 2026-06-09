@@ -3466,12 +3466,14 @@ pub const ProvisionedTableWriteSource = struct {
             .publish_consistent => {
                 if (db) |managed_db| {
                     if (self.runtime_status_cache) |snapshot_cache| {
-                        publishRuntimeStatusSnapshot(self, snapshot_cache.alloc, table_name, group_id, managed_db) catch |err| {
-                            std.log.warn("managed runtime status publish failed table={s} group_id={} err={s}", .{
-                                table_name,
-                                group_id,
-                                @errorName(err),
-                            });
+                        publishRuntimeStatusSnapshotConsistentIfAvailable(self, snapshot_cache.alloc, table_name, group_id, managed_db) catch |err| {
+                            if (err != error.WriterLocked) {
+                                std.log.warn("managed runtime status publish failed table={s} group_id={} err={s}", .{
+                                    table_name,
+                                    group_id,
+                                    @errorName(err),
+                                });
+                            }
                         };
                         self.invalidateReadCache(table_name);
                         lockAtomic(&self.local_db_mutex);
@@ -8474,6 +8476,24 @@ fn publishRuntimeStatusSnapshotConsistent(
     );
 }
 
+fn publishRuntimeStatusSnapshotConsistentIfAvailable(
+    source: *ProvisionedTableWriteSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    group_id: u64,
+    db: *db_mod.DB,
+) !void {
+    try publishRuntimeStatusSnapshotWithStartupPhaseMode(
+        source,
+        alloc,
+        table_name,
+        group_id,
+        if (source.startup_catch_up_active.load(.monotonic)) .startup_catch_up else .idle,
+        .consistent_if_available,
+        db,
+    );
+}
+
 fn publishRuntimeStatusSnapshotWithStartupPhase(
     source: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
@@ -8488,6 +8508,7 @@ fn publishRuntimeStatusSnapshotWithStartupPhase(
 const RuntimeStatusSnapshotMode = enum {
     best_effort,
     consistent,
+    consistent_if_available,
 };
 
 fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
@@ -8534,6 +8555,20 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
                 };
                 status_initialized = true;
             },
+            .consistent_if_available => {
+                const disk_bytes = cached_status.disk_bytes;
+                const created_at_millis = cached_status.created_at_millis;
+                var discard = cached_status;
+                discard.deinit(alloc);
+                const fresh_stats = (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return error.WriterLocked;
+                status = .{
+                    .group_id = group_id,
+                    .disk_bytes = disk_bytes,
+                    .created_at_millis = created_at_millis,
+                    .stats = fresh_stats,
+                };
+                status_initialized = true;
+            },
         }
         markRuntimeStatusFromDb(source, &status, phase);
     }
@@ -8543,6 +8578,7 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
             .stats = switch (mode) {
                 .best_effort => try db.stats(alloc),
                 .consistent => try db.runtimeStatusStatsConsistent(alloc),
+                .consistent_if_available => (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return error.WriterLocked,
             },
         };
         status_initialized = true;
@@ -16051,11 +16087,53 @@ test "provisioned table write source consistent visibility hook does not block o
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(&source, "docs", 7001, &db, .publish_consistent);
     db.core.unlockApplyExclusive();
 
-    try std.testing.expect(source.isWriteCacheDirtyForTable("docs"));
+    const published = try snapshot_cache.snapshot(alloc, "docs");
+    try std.testing.expect(published == null);
+}
+
+test "provisioned table write source consistent visibility refreshes stale dense status" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-consistent-dense-refresh", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    var db = try openManagedDbWithIndexesJson(
+        alloc,
+        path,
+        "{\"dense_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+    );
+    defer db.close();
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    source.runtime_status_cache = &snapshot_cache;
+    const hook = source.managedDerivedVisibilityHook("docs", 7001, &db);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
+        .sync_level = .full_index,
+    });
+    hook.notify(.publish);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"_embeddings\":{\"dense_idx\":[0,1]}}" }},
+        .sync_level = .full_index,
+    });
+    hook.notify(.publish_consistent);
+
     var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer published.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), published.items.len);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, published.items[0].metadata.source);
+    try std.testing.expectEqual(@as(usize, 1), published.items[0].stats.indexes.len);
+    try std.testing.expectEqual(@as(u64, 2), published.items[0].stats.indexes[0].doc_count);
+    try std.testing.expectEqual(@as(u64, 2), published.items[0].stats.doc_count);
 }
 
 test "provisioned table write source promotes synthetic placeholder when publishing live db status" {

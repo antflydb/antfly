@@ -8391,6 +8391,17 @@ pub const DB = struct {
         return try self.statsLocked(alloc);
     }
 
+    pub fn runtimeStatusStatsConsistentIfAvailable(self: *DB, alloc: Allocator) !?types.DBStats {
+        if (self.open_mode == .status_only) {
+            return try self.statusOnlyStats(alloc);
+        }
+
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+
+        return try self.statsLocked(alloc);
+    }
+
     pub fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: doc_identity.Namespace) !void {
         if (self.open_mode == .status_only) return error.UnsupportedOperation;
         lockApply(self);
