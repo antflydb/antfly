@@ -2362,6 +2362,14 @@ pub const DataServer = struct {
                 }
             }
             if (completed) _ = self.lsm_maintenance_completed.fetchAdd(1, .monotonic);
+            // Bulk loads can leave leaf postings with stale quantized payloads
+            // (deferred splits), which forces exact member scoring on every
+            // query that visits them. Drain a bounded amount of that repair
+            // work alongside the regular LSM maintenance.
+            const posting_steps = self.write_source.runDensePostingMaintenanceRoundBestEffort() catch 0;
+            if (posting_steps > 0) {
+                std.log.info("dense posting maintenance repaired steps={d}", .{posting_steps});
+            }
             self.lsm_maintenance_active.store(false, .release);
         }
         self.lsm_maintenance_active.store(false, .release);

@@ -367,6 +367,8 @@ pub const DenseSearchProfile = struct {
     hbc_leaves_explored: u64 = 0,
     hbc_approx_vectors_scored: u64 = 0,
     hbc_exact_vectors_scored: u64 = 0,
+    hbc_leaf_payload_stale: u64 = 0,
+    hbc_leaf_payload_missing: u64 = 0,
     hbc_reranked_vectors: u64 = 0,
     hbc_approx_candidate_count: u64 = 0,
     hbc_rerank_candidate_count: u64 = 0,
@@ -4487,6 +4489,8 @@ fn searchDenseInternal(
         profile.hbc_leaves_explored = profiled.profile.leaves_explored;
         profile.hbc_approx_vectors_scored = profiled.profile.approx_vectors_scored;
         profile.hbc_exact_vectors_scored = profiled.profile.exact_vectors_scored;
+        profile.hbc_leaf_payload_stale = profiled.profile.leaf_payload_stale;
+        profile.hbc_leaf_payload_missing = profiled.profile.leaf_payload_missing;
         profile.hbc_reranked_vectors = profiled.profile.reranked_vectors;
         profile.hbc_approx_candidate_count = profiled.profile.approx_candidate_count;
         profile.hbc_rerank_candidate_count = profiled.profile.rerank_candidate_count;
@@ -4787,13 +4791,15 @@ fn logBenchDenseQueryProfile(
         },
     );
     std.log.info(
-        "antfly_bench_dense_query_hbc index={s} nodes_visited={d} leaves={d} approx_vectors={d} exact_vectors={d} reranked={d} approx_candidates={d} rerank_candidates={d} ambiguous_top_k={d} ambiguous_boundary={d} distance_over_hits={d} distance_under_hits={d} full_rerank={any} top_k_count={d} min_distance_gap={d:.6} min_interval_gap={d:.6} rerank_vector_load_us={d} rerank_metadata_us={d} rerank_artifact_key_us={d} rerank_artifact_read_us={d} rerank_artifact_decode_us={d} rerank_artifact_distance_us={d} rerank_lsm_cache_hits={d} rerank_lsm_cache_misses={d} rerank_distance_us={d} inline_meta={d} fetched_meta={d} lookup_doc_key={d}",
+        "antfly_bench_dense_query_hbc index={s} nodes_visited={d} leaves={d} approx_vectors={d} exact_vectors={d} payload_stale={d} payload_missing={d} reranked={d} approx_candidates={d} rerank_candidates={d} ambiguous_top_k={d} ambiguous_boundary={d} distance_over_hits={d} distance_under_hits={d} full_rerank={any} top_k_count={d} min_distance_gap={d:.6} min_interval_gap={d:.6} rerank_vector_load_us={d} rerank_metadata_us={d} rerank_artifact_key_us={d} rerank_artifact_read_us={d} rerank_artifact_decode_us={d} rerank_artifact_distance_us={d} rerank_lsm_cache_hits={d} rerank_lsm_cache_misses={d} rerank_distance_us={d} inline_meta={d} fetched_meta={d} lookup_doc_key={d}",
         .{
             req.index_name orelse "",
             profile.hbc_nodes_visited,
             profile.hbc_leaves_explored,
             profile.hbc_approx_vectors_scored,
             profile.hbc_exact_vectors_scored,
+            profile.hbc_leaf_payload_stale,
+            profile.hbc_leaf_payload_missing,
             profile.hbc_reranked_vectors,
             profile.hbc_approx_candidate_count,
             profile.hbc_rerank_candidate_count,

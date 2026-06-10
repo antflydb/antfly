@@ -75,6 +75,10 @@ pub const SearchProfile = struct {
     approx_leaves_scored: u64 = 0,
     approx_vectors_scored: u64 = 0,
     exact_vectors_scored: u64 = 0,
+    // Leaves that fell back to exact member scoring because their quantized
+    // payload was stale (payload_dirty) or absent from storage.
+    leaf_payload_stale: u64 = 0,
+    leaf_payload_missing: u64 = 0,
     reranked_vectors: u64 = 0,
     approx_candidate_count: u64 = 0,
     rerank_candidate_count: u64 = 0,

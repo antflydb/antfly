@@ -2101,6 +2101,14 @@ fn scoreLeafMemberIds(
         }
     }
 
+    if (self.config.use_quantization) {
+        if (!leaf_has_fresh_stored_payload) {
+            profile.leaf_payload_stale += 1;
+        } else {
+            profile.leaf_payload_missing += 1;
+        }
+    }
+
     const fetch_member_ids = scratch.member_ids[0..member_ids.len];
     var fetch_count: usize = 0;
     for (member_ids) |member_id| {
