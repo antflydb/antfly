@@ -36,6 +36,7 @@ pub const replay_meta_next_sequence_key = [_]u8{ replay_namespace, 0xff, 0x02 };
 pub const replay_meta_latest_sequence_kind: u8 = 0x03;
 pub const artifact_presence_key = [_]u8{ replay_namespace, 0xff, 0x20 };
 pub const asset_artifact_source_index_kind: u8 = 0x21;
+pub const document_child_range_outbox_kind: u8 = 0x22;
 pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
 pub const identity_ordinal_state_kind: u8 = 0x03;
@@ -260,6 +261,24 @@ pub fn assetArtifactSourceIndexKeyAlloc(alloc: Allocator, source_artifact: []con
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, asset_artifact_source_index_kind });
     try appendEncodedComponent(&list, alloc, source_artifact);
     try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentChildRangeOutboxRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, document_child_range_outbox_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentChildRangeOutboxKeyAlloc(alloc: Allocator, sequence: u64, ordinal: u32) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, document_child_range_outbox_kind });
+    const sequence_be = std.mem.nativeToBig(u64, sequence);
+    try list.appendSlice(alloc, std.mem.asBytes(&sequence_be));
+    const ordinal_be = std.mem.nativeToBig(u32, ordinal);
+    try list.appendSlice(alloc, std.mem.asBytes(&ordinal_be));
     return try list.toOwnedSlice(alloc);
 }
 

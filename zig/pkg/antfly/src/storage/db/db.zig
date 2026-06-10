@@ -220,6 +220,20 @@ pub const DocumentArtifactChildRangeDispatch = struct {
     child_batch: DocumentArtifactChildRangeApplyBatch,
 };
 
+pub const DocumentArtifactChildRangeOutboxDrainResult = struct {
+    scanned: usize = 0,
+    dispatched: usize = 0,
+    deleted: usize = 0,
+};
+
+const DocumentArtifactChildRangeOutboxRecord = struct {
+    version: u16 = 1,
+    owner_group_id: u64,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    child_batch: DocumentArtifactChildRangeApplyBatch,
+};
+
 pub const DocumentArtifactChildRangeDispatcher = struct {
     ptr: *anyopaque,
     apply: *const fn (ptr: *anyopaque, alloc: Allocator, dispatch: DocumentArtifactChildRangeDispatch) anyerror!void,
@@ -3525,6 +3539,53 @@ pub const DB = struct {
         }
     }
 
+    pub fn drainDocumentArtifactChildRangeOutbox(
+        self: *DB,
+        dispatcher: DocumentArtifactChildRangeDispatcher,
+        limit: usize,
+    ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+
+        const prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(self.alloc);
+        defer self.alloc.free(prefix);
+
+        lockApply(self);
+        var apply_mutex_held = true;
+        errdefer if (apply_mutex_held) self.core.unlockApply();
+        const scanned = try self.core.scanStorePrefix(self.alloc, prefix);
+        self.core.unlockApply();
+        apply_mutex_held = false;
+        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+        var result = DocumentArtifactChildRangeOutboxDrainResult{};
+        const max_entries = if (limit == 0 or limit > scanned.len) scanned.len else limit;
+        for (scanned[0..max_entries]) |entry| {
+            result.scanned += 1;
+            var parsed = try std.json.parseFromSlice(DocumentArtifactChildRangeOutboxRecord, self.alloc, entry.value, .{
+                .allocate = .alloc_always,
+            });
+            defer parsed.deinit();
+            if (parsed.value.version != 1) return error.InvalidDocumentChildRangeOutboxRecord;
+            try dispatcher.applyDispatch(self.alloc, .{
+                .owner_group_id = parsed.value.owner_group_id,
+                .doc_key = parsed.value.doc_key,
+                .artifact_name = parsed.value.artifact_name,
+                .child_batch = parsed.value.child_batch,
+            });
+            result.dispatched += 1;
+            try self.deleteDocumentArtifactChildRangeOutboxEntry(entry.key);
+            result.deleted += 1;
+        }
+        return result;
+    }
+
+    fn deleteDocumentArtifactChildRangeOutboxEntry(self: *DB, key: []const u8) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        const deletes = [_][]const u8{key};
+        try self.core.store.putBatch(&.{}, deletes[0..]);
+    }
+
     pub fn batchWithoutRangeValidation(self: *DB, req: types.BatchRequest) anyerror!void {
         try self.batchInternal(req, null, .{ .validate_range_ownership = false });
     }
@@ -4049,6 +4110,16 @@ pub const DB = struct {
             for (remote_child_range_dispatches.items) |*dispatch| dispatch.deinit(self.alloc);
             remote_child_range_dispatches.deinit(self.alloc);
         }
+        var owned_child_range_outbox_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_child_range_outbox_keys.items) |key| self.alloc.free(key);
+            owned_child_range_outbox_keys.deinit(self.alloc);
+        }
+        var owned_child_range_outbox_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_child_range_outbox_values.items) |value| self.alloc.free(value);
+            owned_child_range_outbox_values.deinit(self.alloc);
+        }
         var materialized_graph_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
         defer {
             for (materialized_graph_artifact_writes.items) |write| {
@@ -4155,6 +4226,15 @@ pub const DB = struct {
         }
         const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
         try store_writes.appendSlice(self.alloc, identity_writes.items);
+        try appendDocumentChildRangeOutboxWrites(
+            self.alloc,
+            sequence,
+            remote_child_range_dispatches.items,
+            effective_req.sync_level,
+            &store_writes,
+            &owned_child_range_outbox_keys,
+            &owned_child_range_outbox_values,
+        );
         const build_derived_start_ns = monotonicTimeNs();
         const replay_payload = if (use_thin_replay_fast_path)
             try encodeThinReplayRecordPayload(
@@ -4230,9 +4310,7 @@ pub const DB = struct {
         self.core.unlockApply();
         apply_mutex_held = false;
         if (opts.document_child_range_dispatcher) |dispatcher| {
-            for (remote_child_range_dispatches.items) |dispatch_group| {
-                try dispatcher.applyDispatch(self.alloc, dispatch_group.dispatch(effective_req.sync_level));
-            }
+            _ = try self.drainDocumentArtifactChildRangeOutbox(dispatcher, 0);
         }
         var pressure_ctx = self.batchContext();
         const backlog_pressure_start_ns = monotonicTimeNs();
@@ -15665,6 +15743,41 @@ const DocumentChildRangeDispatchGroup = struct {
         };
     }
 };
+
+fn appendDocumentChildRangeOutboxWrites(
+    alloc: Allocator,
+    sequence: u64,
+    groups: []const DocumentChildRangeDispatchGroup,
+    sync_level: types.SyncLevel,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) !void {
+    for (groups, 0..) |group, i| {
+        const key = try internal_keys.documentChildRangeOutboxKeyAlloc(alloc, sequence, @intCast(i));
+        errdefer alloc.free(key);
+        const value = try encodeDocumentChildRangeOutboxRecordAlloc(alloc, group.dispatch(sync_level));
+        errdefer alloc.free(value);
+        try owned_keys.append(alloc, key);
+        try owned_values.append(alloc, value);
+        try writes.append(alloc, .{
+            .key = key,
+            .value = value,
+        });
+    }
+}
+
+fn encodeDocumentChildRangeOutboxRecordAlloc(
+    alloc: Allocator,
+    dispatch: DocumentArtifactChildRangeDispatch,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, DocumentArtifactChildRangeOutboxRecord{
+        .owner_group_id = dispatch.owner_group_id,
+        .doc_key = dispatch.doc_key,
+        .artifact_name = dispatch.artifact_name,
+        .child_batch = dispatch.child_batch,
+    }, .{});
+}
 
 const DocumentChildRangeRoute = struct {
     owner_group_id: u64,
@@ -30423,6 +30536,117 @@ test "db dispatches generated document child range artifacts to remote owner" {
     try std.testing.expect(std.mem.indexOf(u8, capture.first_value.?, "\"_artifact_route_status\":\"remote_committed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture.first_value.?, "\"_artifact_owner_group_id\":7002") != null);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, remote_unit_key));
+}
+
+test "db retries remote document child range dispatch from durable outbox" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expect(try db.updateDocumentArtifactChildRangePlacement(alloc, "doc:a", "document_units_v1", .{
+        .range_id = "range:000000",
+        .placement = "remote",
+        .owner_group_id = 7002,
+        .placement_generation = 7,
+        .route_status = "remote_committed",
+        .split_eligible = true,
+    }));
+
+    var moved = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer moved.deinit(alloc);
+    const remote_unit_key = try alloc.dupe(u8, moved.child_ranges[0].start_key);
+    defer alloc.free(remote_unit_key);
+
+    const local_deletes = [_][]const u8{remote_unit_key};
+    _ = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_delete_keys = local_deletes[0..],
+        .sync_level = .write,
+    });
+
+    const FlakyCapture = struct {
+        fail_next: bool = true,
+        calls: usize = 0,
+        owner_group_id: u64 = 0,
+        artifact_writes: usize = 0,
+        first_key: ?[]u8 = null,
+
+        fn deinit(self: *@This(), allocator: Allocator) void {
+            if (self.first_key) |key| allocator.free(key);
+        }
+
+        fn dispatcher(self: *@This()) DocumentArtifactChildRangeDispatcher {
+            return .{ .ptr = self, .apply = apply };
+        }
+
+        fn apply(ptr: *anyopaque, allocator: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.fail_next) {
+                self.fail_next = false;
+                return error.IntentionalDispatchFailure;
+            }
+            self.owner_group_id = dispatch.owner_group_id;
+            self.artifact_writes += dispatch.child_batch.artifact_writes.len;
+            if (self.first_key == null and dispatch.child_batch.artifact_writes.len > 0) {
+                self.first_key = try allocator.dupe(u8, dispatch.child_batch.artifact_writes[0].key);
+            }
+        }
+    };
+
+    var capture = FlakyCapture{};
+    defer capture.deinit(alloc);
+
+    try std.testing.expectError(error.IntentionalDispatchFailure, db.batchWithDocumentArtifactChildRangeDispatcher(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YmV0YQ==\"}",
+        }},
+        .sync_level = .full_index,
+    }, capture.dispatcher()));
+
+    const outbox_prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(alloc);
+    defer alloc.free(outbox_prefix);
+    const pending = try db.core.scanStorePrefix(alloc, outbox_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, remote_unit_key));
+
+    const drained = try db.drainDocumentArtifactChildRangeOutbox(capture.dispatcher(), 0);
+    try std.testing.expectEqual(@as(usize, 1), drained.scanned);
+    try std.testing.expectEqual(@as(usize, 1), drained.dispatched);
+    try std.testing.expectEqual(@as(usize, 1), drained.deleted);
+    try std.testing.expectEqual(@as(usize, 2), capture.calls);
+    try std.testing.expectEqual(@as(u64, 7002), capture.owner_group_id);
+    try std.testing.expectEqual(@as(usize, 1), capture.artifact_writes);
+    try std.testing.expectEqualStrings(remote_unit_key, capture.first_key.?);
+
+    const after = try db.core.scanStorePrefix(alloc, outbox_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
 }
 
 test "db document extraction manifest inspection and reprocess API" {
