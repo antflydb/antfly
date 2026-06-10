@@ -30106,6 +30106,44 @@ test "db document unit payload preserves pdf page provenance" {
     try std.testing.expect(!format_provenance.get("ocr_used").?.bool);
 }
 
+test "db document unit payload marks scanned pdf pages as pending OCR" {
+    const alloc = std.testing.allocator;
+    const unit = document_extraction_mod.Unit{
+        .unit_id = @constCast("page:000002"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(""),
+        .method = @constCast("pdf_ocr_pending"),
+        .extraction_status = @constCast("pending_ocr"),
+        .ocr_used = false,
+        .page_number = 2,
+        .page_label = @constCast("2"),
+        .page_bbox = .{ 0, 0, 612, 792 },
+        .char_start = 5,
+        .char_end = 5,
+    };
+
+    const payload = try documentUnitPayloadAlloc(alloc, "doc:a", "document_units_v1", unit, "data:application/pdf;base64,AA==", "application/pdf", .{ .range_id = "range:000000" });
+    defer alloc.free(payload);
+    const fingerprint = try documentExtractionUnitFingerprintAlloc(alloc, unit);
+    defer alloc.free(fingerprint);
+    try std.testing.expectEqual(@as(usize, 64), fingerprint.len);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+    const provenance = parsed.value.object.get("provenance").?.object;
+    try std.testing.expectEqualStrings("pending_ocr", parsed.value.object.get("extraction_status").?.string);
+    try std.testing.expectEqualStrings("pdf_ocr_pending", provenance.get("method").?.string);
+    try std.testing.expectEqualStrings("pending_ocr", provenance.get("extraction_status").?.string);
+    try std.testing.expect(!provenance.get("ocr_used").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), provenance.get("page_number").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), provenance.get("char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), provenance.get("char_end").?.integer);
+    const format_provenance = provenance.get("format_provenance").?.object;
+    try std.testing.expectEqualStrings("pdf_ocr_pending", format_provenance.get("extraction_method").?.string);
+    try std.testing.expectEqualStrings("pending_ocr", format_provenance.get("extraction_status").?.string);
+    try std.testing.expect(!format_provenance.get("ocr_used").?.bool);
+}
+
 test "db document extraction asset materializes unit artifacts from data url" {
     const alloc = std.testing.allocator;
 

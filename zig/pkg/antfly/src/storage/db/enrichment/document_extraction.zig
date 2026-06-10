@@ -453,8 +453,11 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         errdefer if (unit_id) |value| alloc.free(value);
         var unit_type: ?[]u8 = try alloc.dupe(u8, "page");
         errdefer if (unit_type) |value| alloc.free(value);
-        var method: ?[]u8 = try alloc.dupe(u8, "pdf_text");
+        const scanned_page = text.len == 0;
+        var method: ?[]u8 = try alloc.dupe(u8, if (scanned_page) "pdf_ocr_pending" else "pdf_text");
         errdefer if (method) |value| alloc.free(value);
+        var extraction_status: ?[]u8 = if (scanned_page) try alloc.dupe(u8, "pending_ocr") else null;
+        errdefer if (extraction_status) |value| alloc.free(value);
         var page_label: ?[]u8 = try std.fmt.allocPrint(alloc, "{d}", .{page_num});
         errdefer if (page_label) |value| alloc.free(value);
         units[initialized] = .{
@@ -462,6 +465,8 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
             .unit_type = unit_type.?,
             .text = text,
             .method = method.?,
+            .extraction_status = extraction_status,
+            .ocr_used = false,
             .page_number = @intCast(page_num),
             .page_label = page_label.?,
             .page_bbox = if (page_box) |box| .{ box.min_x, box.min_y, box.max_x, box.max_y } else null,
@@ -471,6 +476,7 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         unit_id = null;
         unit_type = null;
         method = null;
+        extraction_status = null;
         page_label = null;
         cursor += text.len;
         initialized += 1;
