@@ -14653,6 +14653,17 @@ fn appendDocumentExtractionRangeDescriptors(
     try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "chunk", "derived_chunks", chunk_keys, &.{}, previous_child_ranges);
 }
 
+fn appendDocumentExtractionRangePolicy(alloc: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldU64(alloc, out, &first, "policy_version", 1);
+    try appendJsonFieldUsize(alloc, out, &first, "unit_target_children", document_extraction_range_target_children);
+    try appendJsonFieldUsize(alloc, out, &first, "unit_target_text_bytes", document_extraction_range_target_text_bytes);
+    try appendJsonFieldUsize(alloc, out, &first, "chunk_target_children", document_extraction_range_target_children);
+    try appendJsonFieldString(alloc, out, &first, "oversized_unit_policy", "single_unit_range");
+    try out.append(alloc, '}');
+}
+
 fn appendDocumentExtractionKeyRanges(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -14899,6 +14910,8 @@ fn documentExtractionManifestPayloadAlloc(
     try out.append(alloc, '[');
     try appendDocumentExtractionRangeDescriptors(alloc, &out, artifact_name, unit_keys, chunk_keys, extraction.units, previous_child_ranges);
     try out.append(alloc, ']');
+    try appendJsonFieldName(alloc, &out, &first, "range_policy");
+    try appendDocumentExtractionRangePolicy(alloc, &out);
     try appendJsonFieldName(alloc, &out, &first, "merge_plan");
     try out.append(alloc, '{');
     var merge_first = true;
@@ -31478,6 +31491,10 @@ test "db document extraction manifest inspection and reprocess API" {
     try std.testing.expectEqual(@as(usize, 1), inspected.child_ranges[0].child_count);
     try std.testing.expect(inspected.child_ranges[0].text_bytes != null);
     try std.testing.expectEqualStrings("chunk", inspected.child_ranges[1].range_kind);
+    try std.testing.expect(std.mem.indexOf(u8, inspected.manifest_json, "\"range_policy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspected.manifest_json, "\"unit_target_children\":256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspected.manifest_json, "\"unit_target_text_bytes\":1048576") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspected.manifest_json, "\"oversized_unit_policy\":\"single_unit_range\"") != null);
     try std.testing.expectEqualStrings("converged", inspected.merge_status);
     try std.testing.expectEqual(@as(u64, 0), inspected.merge_from_generation);
     try std.testing.expectEqual(@as(u64, 1), inspected.merge_to_generation);

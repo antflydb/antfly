@@ -4555,6 +4555,17 @@ fn appendDocumentExtractionRangeDescriptors(
     try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "chunk", "derived_chunks", chunk_keys, &.{}, previous_child_ranges);
 }
 
+fn appendDocumentExtractionRangePolicy(alloc: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldU64(alloc, out, &first, "policy_version", 1);
+    try appendJsonFieldUsize(alloc, out, &first, "unit_target_children", document_extraction_range_target_children);
+    try appendJsonFieldUsize(alloc, out, &first, "unit_target_text_bytes", document_extraction_range_target_text_bytes);
+    try appendJsonFieldUsize(alloc, out, &first, "chunk_target_children", document_extraction_range_target_children);
+    try appendJsonFieldString(alloc, out, &first, "oversized_unit_policy", "single_unit_range");
+    try out.append(alloc, '}');
+}
+
 fn appendDocumentExtractionKeyRanges(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -4801,6 +4812,8 @@ fn documentExtractionManifestPayloadAlloc(
     try out.append(alloc, '[');
     try appendDocumentExtractionRangeDescriptors(alloc, &out, artifact_name, unit_keys, chunk_keys, extraction.units, previous_child_ranges);
     try out.append(alloc, ']');
+    try appendJsonFieldName(alloc, &out, &first, "range_policy");
+    try appendDocumentExtractionRangePolicy(alloc, &out);
     try appendJsonFieldName(alloc, &out, &first, "merge_plan");
     try out.append(alloc, '{');
     var merge_first = true;
@@ -5626,6 +5639,10 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_kind\":\"unit\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_kind\":\"chunk\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"text_bytes\":11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_policy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_target_children\":256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_target_text_bytes\":1048576") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"oversized_unit_policy\":\"single_unit_range\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"owner_group_id\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"placement_generation\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_status\":\"local_committed\"") != null);
