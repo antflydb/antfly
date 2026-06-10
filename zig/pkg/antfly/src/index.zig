@@ -266,6 +266,17 @@ pub const IndexSnapshot = struct {
     /// Set by replaceSegments for the segments being merged away.
     retired_segments: []SegmentEntry,
     retired_segment_cleanup: ?RetiredSegmentCleanup = null,
+    /// The snapshot that replaced this one, retained at publish time.
+    /// Retired segments are attached to the snapshot that was current when
+    /// the merge ran — but a reader can hold a snapshot from an EARLIER
+    /// generation that still references those segments by value, and its
+    /// refcount does nothing to pin the later snapshot hosting their
+    /// cleanup. Chaining each old snapshot to its successor makes a held
+    /// snapshot transitively pin all later generations (and their retired
+    /// lists) until the holder releases. Observed in the field as a
+    /// layoutStats segfault when a status walk held a snapshot across two
+    /// publishes during a merge storm. Null only on the current snapshot.
+    successor: ?*IndexSnapshot = null,
 
     /// Increment reference count. Returns self for chaining.
     pub fn retain(self: *IndexSnapshot) *IndexSnapshot {
@@ -274,31 +285,44 @@ pub const IndexSnapshot = struct {
     }
 
     /// Decrement reference count. Frees snapshot when count reaches 0.
+    /// A fully-released snapshot also drops its reference on `successor`,
+    /// so a dying chain unwinds in this loop — iteratively, not
+    /// recursively, since a merge storm can chain hundreds of generations.
     pub fn release(self: *IndexSnapshot) void {
-        if (@atomicRmw(u32, &self.ref_count, .Sub, 1, .acq_rel) == 1) {
-            const alloc = self.alloc;
-            // Deinit retired segments (replaced during merge)
-            for (self.retired_segments) |*seg| {
-                var s = seg.*;
-                const seg_id = s.id;
-                s.deinit();
-                if (self.retired_segment_cleanup) |cleanup| cleanup.run(seg_id);
-            }
-            if (self.retired_segments.len > 0) alloc.free(self.retired_segments);
-            alloc.free(self.segments);
-            {
-                const cache_mu = &self.term_doc_freq_cache_mu;
-                while (!cache_mu.tryLock()) {
-                    spinOrYield();
-                }
-                defer cache_mu.unlock();
-                var cache_it = self.term_doc_freq_cache.keyIterator();
-                while (cache_it.next()) |key| alloc.free(key.storage);
-                self.term_doc_freq_cache.deinit(alloc);
-            }
-            self.global_total_field_len.deinit(alloc);
-            alloc.destroy(self);
+        var maybe: ?*IndexSnapshot = self;
+        while (maybe) |snap| {
+            if (@atomicRmw(u32, &snap.ref_count, .Sub, 1, .acq_rel) != 1) return;
+            const succ = snap.successor;
+            snap.freeFinal();
+            maybe = succ;
         }
+    }
+
+    /// Free everything this snapshot owns and destroy it. Only valid once
+    /// the refcount has reached zero.
+    fn freeFinal(self: *IndexSnapshot) void {
+        const alloc = self.alloc;
+        // Deinit retired segments (replaced during merge)
+        for (self.retired_segments) |*seg| {
+            var s = seg.*;
+            const seg_id = s.id;
+            s.deinit();
+            if (self.retired_segment_cleanup) |cleanup| cleanup.run(seg_id);
+        }
+        if (self.retired_segments.len > 0) alloc.free(self.retired_segments);
+        alloc.free(self.segments);
+        {
+            const cache_mu = &self.term_doc_freq_cache_mu;
+            while (!cache_mu.tryLock()) {
+                spinOrYield();
+            }
+            defer cache_mu.unlock();
+            var cache_it = self.term_doc_freq_cache.keyIterator();
+            while (cache_it.next()) |key| alloc.free(key.storage);
+            self.term_doc_freq_cache.deinit(alloc);
+        }
+        self.global_total_field_len.deinit(alloc);
+        alloc.destroy(self);
     }
 
     /// Full cleanup including ALL segment entries. Only for IndexWriter.deinit().
@@ -778,6 +802,12 @@ pub const IndexWriter = struct {
         // when all readers release it.
         old.retired_segments = retired;
         old.retired_segment_cleanup = self.retired_segment_cleanup;
+        // Chain old → new so a reader holding ANY earlier generation keeps
+        // this snapshot — and the retired lists of every generation in
+        // between — alive until it releases. Safe to write without
+        // synchronization: the writer still holds a reference on `old`, so
+        // no reader can be in freeFinal reading `successor` yet.
+        old.successor = new_snap.retain();
 
         // Atomic swap so concurrent readers see a consistent pointer.
         self.publishSnapshot(new_snap);
@@ -904,6 +934,10 @@ pub const IndexWriter = struct {
         };
         self.next_epoch += 1;
 
+        // Chain old → new (see IndexSnapshot.successor): every publish must
+        // link generations, or a holder of an older snapshot loses its
+        // transitive pin on later retired lists.
+        old.successor = new_snap.retain();
         self.publishSnapshot(new_snap);
         old.release();
         owned = null;
@@ -1461,4 +1495,66 @@ test "index writer removeSegments frees staged segment lists when rebuild alloca
     failing.fail_index = std.math.maxInt(usize);
 
     try std.testing.expectEqual(@as(usize, 2), writer.snapshot().segments.len);
+}
+
+test "held snapshot pins segments retired in later generations" {
+    const alloc = std.testing.allocator;
+
+    const Cleaned = struct {
+        ids: std.ArrayListUnmanaged(u64) = .empty,
+        fn record(ptr: *anyopaque, seg_id: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ids.append(std.testing.allocator, seg_id) catch unreachable;
+        }
+    };
+    var cleaned = Cleaned{};
+    defer cleaned.ids.deinit(alloc);
+
+    const seg1 = try buildTestSegment(alloc, &.{
+        .{ .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg1);
+    const seg2 = try buildTestSegment(alloc, &.{
+        .{ .terms = &.{.{ .term = "beta", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg2);
+    const merged = try buildTestSegment(alloc, &.{
+        .{ .terms = &.{.{ .term = "gamma", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(merged);
+
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    writer.setRetiredSegmentCleanup(.{ .ptr = &cleaned, .delete = Cleaned.record });
+
+    try writer.addSegment(seg1);
+
+    // Hold the generation-1 snapshot across two later publishes — the
+    // pattern of a status walk racing a merge storm.
+    const held = writer.acquireSnapshot();
+
+    try writer.addSegment(seg2); // generation 2
+    const id1 = writer.snapshot().segments[0].id;
+    const id2 = writer.snapshot().segments[1].id;
+    // Generation 3: retires both segments, attaching them to generation 2.
+    try writer.replaceSegments(&.{ id1, id2 }, id2 + 1, merged);
+
+    // The held gen-1 snapshot still references seg1 by value. Without the
+    // successor chain, gen 2 dies the moment the writer releases it at the
+    // gen-3 publish and deinits seg1 while we still hold a snapshot
+    // containing it.
+    try std.testing.expectEqual(@as(usize, 0), cleaned.ids.items.len);
+
+    // Walking the held snapshot must read live segment memory.
+    var terms: u64 = 0;
+    for (held.segments) |*seg| {
+        const layout = seg.layoutStats(true);
+        terms +|= layout.inverted_one_hit_terms +| layout.inverted_postings_terms;
+    }
+    try std.testing.expect(terms > 0);
+
+    // Releasing the holder unwinds the chain; only now do the retired
+    // segments get cleaned up.
+    held.release();
+    try std.testing.expectEqual(@as(usize, 2), cleaned.ids.items.len);
 }
