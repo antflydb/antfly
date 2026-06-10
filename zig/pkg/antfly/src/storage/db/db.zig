@@ -12990,6 +12990,11 @@ fn computeDocumentExtractionAssetRequestDerived(
         else => return err,
     };
     defer if (existing_manifest) |value| alloc.free(value);
+    var previous_child_ranges: []types.DocumentArtifactChildRange = &.{};
+    defer freeDocumentArtifactChildRanges(alloc, previous_child_ranges);
+    if (existing_manifest) |value| {
+        previous_child_ranges = try documentArtifactChildRangesFromManifestJsonAlloc(alloc, value);
+    }
 
     const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(alloc, value) else 0;
     const to_generation = from_generation + 1;
@@ -13147,6 +13152,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         desired_unit_keys.items,
         desired_unit_descriptors,
         desired_chunk_keys.items,
+        previous_child_ranges,
         previous_unit_keys,
         previous_unit_descriptors,
         previous_chunk_keys,
@@ -13928,6 +13934,18 @@ fn documentArtifactChildRangesFromJsonAlloc(alloc: Allocator, object: std.json.O
     return out;
 }
 
+fn documentArtifactChildRangesFromManifestJsonAlloc(alloc: Allocator, manifest_json: []const u8) ![]types.DocumentArtifactChildRange {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.alloc(types.DocumentArtifactChildRange, 0);
+    return try documentArtifactChildRangesFromJsonAlloc(alloc, parsed.value.object);
+}
+
+fn freeDocumentArtifactChildRanges(alloc: Allocator, child_ranges: []types.DocumentArtifactChildRange) void {
+    for (child_ranges) |*child_range| child_range.deinit(alloc);
+    if (child_ranges.len > 0) alloc.free(child_ranges);
+}
+
 fn documentArtifactManifestFromJsonAlloc(
     alloc: Allocator,
     doc_key: []const u8,
@@ -14070,11 +14088,12 @@ fn appendDocumentExtractionRangeDescriptors(
     unit_keys: []const []const u8,
     chunk_keys: []const []const u8,
     units: []const document_extraction_mod.Unit,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
 ) !void {
     var first_range = true;
     var range_index: usize = 0;
-    try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "unit", artifact_name, unit_keys, units);
-    try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "chunk", "derived_chunks", chunk_keys, &.{});
+    try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "unit", artifact_name, unit_keys, units, previous_child_ranges);
+    try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "chunk", "derived_chunks", chunk_keys, &.{}, previous_child_ranges);
 }
 
 fn appendDocumentExtractionKeyRanges(
@@ -14086,6 +14105,7 @@ fn appendDocumentExtractionKeyRanges(
     artifact_name: []const u8,
     keys: []const []const u8,
     units: []const document_extraction_mod.Unit,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
 ) !void {
     var start: usize = 0;
     while (start < keys.len) {
@@ -14099,15 +14119,16 @@ fn appendDocumentExtractionKeyRanges(
         try out.append(alloc, '{');
         const range_id = try std.fmt.allocPrint(alloc, "range:{d:0>6}", .{range_index.*});
         defer alloc.free(range_id);
+        const previous_range = findDocumentArtifactChildRange(previous_child_ranges, range_id, range_kind, artifact_name);
         try appendJsonFieldString(alloc, out, &first, "range_id", range_id);
         try appendJsonFieldString(alloc, out, &first, "range_kind", range_kind);
         try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
         try appendJsonFieldString(alloc, out, &first, "split_boundary", "unit");
-        try appendJsonFieldString(alloc, out, &first, "placement", "parent");
-        try appendJsonFieldU64(alloc, out, &first, "owner_group_id", 0);
-        try appendJsonFieldU64(alloc, out, &first, "placement_generation", 0);
-        try appendJsonFieldString(alloc, out, &first, "route_status", "local_committed");
-        try appendJsonFieldBool(alloc, out, &first, "split_eligible", end - start > 1);
+        try appendJsonFieldString(alloc, out, &first, "placement", if (previous_range) |range| range.placement else "parent");
+        try appendJsonFieldU64(alloc, out, &first, "owner_group_id", if (previous_range) |range| range.owner_group_id orelse 0 else 0);
+        try appendJsonFieldU64(alloc, out, &first, "placement_generation", if (previous_range) |range| range.placement_generation orelse 0 else 0);
+        try appendJsonFieldString(alloc, out, &first, "route_status", if (previous_range) |range| range.route_status orelse "local_committed" else "local_committed");
+        try appendJsonFieldBool(alloc, out, &first, "split_eligible", if (previous_range) |range| range.split_eligible orelse (end - start > 1) else end - start > 1);
         try appendJsonFieldString(alloc, out, &first, "start_key", keys[start]);
         try appendJsonFieldString(alloc, out, &first, "end_key_exclusive", if (end < keys.len) keys[end] else "");
         try appendJsonFieldString(alloc, out, &first, "last_key", keys[end - 1]);
@@ -14121,6 +14142,23 @@ fn appendDocumentExtractionKeyRanges(
         range_index.* += 1;
         start = end;
     }
+}
+
+fn findDocumentArtifactChildRange(
+    ranges: []const types.DocumentArtifactChildRange,
+    range_id: []const u8,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+) ?*const types.DocumentArtifactChildRange {
+    for (ranges) |*range| {
+        if (std.mem.eql(u8, range.range_id, range_id) and
+            std.mem.eql(u8, range.range_kind, range_kind) and
+            std.mem.eql(u8, range.artifact_name, artifact_name))
+        {
+            return range;
+        }
+    }
+    return null;
 }
 
 fn countKeysNotIn(keys: []const []const u8, exclude_keys: []const []const u8) usize {
@@ -14240,6 +14278,7 @@ fn documentExtractionManifestPayloadAlloc(
     unit_keys: []const []const u8,
     unit_descriptors: []const DocumentExtractionUnitDescriptor,
     chunk_keys: []const []const u8,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
     previous_unit_keys: []const []const u8,
     previous_unit_descriptors: []const DocumentExtractionUnitDescriptor,
     previous_chunk_keys: []const []const u8,
@@ -14268,7 +14307,7 @@ fn documentExtractionManifestPayloadAlloc(
     try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
     try appendJsonFieldName(alloc, &out, &first, "child_ranges");
     try out.append(alloc, '[');
-    try appendDocumentExtractionRangeDescriptors(alloc, &out, artifact_name, unit_keys, chunk_keys, extraction.units);
+    try appendDocumentExtractionRangeDescriptors(alloc, &out, artifact_name, unit_keys, chunk_keys, extraction.units, previous_child_ranges);
     try out.append(alloc, ']');
     try appendJsonFieldName(alloc, &out, &first, "merge_plan");
     try out.append(alloc, '{');
@@ -29455,6 +29494,7 @@ test "db document extraction manifest classifies unit fingerprint keeps" {
         &unit_keys,
         &desired_descriptors,
         &chunk_keys,
+        &.{},
         &previous_unit_keys,
         &previous_descriptors,
         &previous_chunk_keys,
@@ -29678,6 +29718,10 @@ test "db document extraction manifest inspection and reprocess API" {
     var after = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer after.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), after.generation);
+    try std.testing.expectEqualStrings("remote", after.child_ranges[0].placement);
+    try std.testing.expectEqual(@as(?u64, 7001), after.child_ranges[0].owner_group_id);
+    try std.testing.expectEqual(@as(?u64, 2), after.child_ranges[0].placement_generation);
+    try std.testing.expectEqualStrings("remote_committed", after.child_ranges[0].route_status.?);
     try std.testing.expect(std.mem.indexOf(u8, after.manifest_json, "\"op\":\"keep\"") != null);
 
     try std.testing.expect(!try db.reprocessDocumentArtifact(alloc, "doc:missing", "document_units_v1"));
