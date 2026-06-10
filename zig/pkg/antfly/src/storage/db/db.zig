@@ -18852,6 +18852,7 @@ fn materializeMentionEdgesForResolutionKey(
             &mention_writes,
             changed,
             parsed_key.doc_key,
+            resolution_key,
             raw,
             raw_extraction,
             cfg,
@@ -19110,6 +19111,7 @@ fn appendMentionEvidenceArtifactsFromResolution(
     writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
     changed: *std.ArrayListUnmanaged([]u8),
     doc_key: []const u8,
+    resolution_key: []const u8,
     resolution_raw: []const u8,
     extraction_raw: ?[]const u8,
     cfg: *const index_manager_mod.ResolverConfig,
@@ -19121,6 +19123,8 @@ fn appendMentionEvidenceArtifactsFromResolution(
     else
         null;
     defer if (parsed_extraction) |*parsed| parsed.deinit();
+    const source_artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", cfg.source_artifact);
+    defer alloc.free(source_artifact_key);
 
     for (parsed_resolution.entities) |entity| {
         if (!resolutionDecisionCreatesCanonicalEdge(entity.decision)) continue;
@@ -19132,7 +19136,7 @@ fn appendMentionEvidenceArtifactsFromResolution(
         const key = try resolutionMentionArtifactKeyAlloc(alloc, doc_key, cfg.source_artifact, cfg.resolution_artifact, entity.local_id);
         var key_owned = true;
         errdefer if (key_owned) alloc.free(key);
-        const payload = try mentionEvidencePayloadAlloc(alloc, doc_key, cfg, entity, extraction_entity);
+        const payload = try mentionEvidencePayloadAlloc(alloc, doc_key, key, source_artifact_key, resolution_key, cfg, entity, extraction_entity);
         var payload_owned = true;
         errdefer if (payload_owned) alloc.free(payload);
         try writes.append(alloc, .{ .key = key, .value = payload });
@@ -19145,6 +19149,9 @@ fn appendMentionEvidenceArtifactsFromResolution(
 fn mentionEvidencePayloadAlloc(
     alloc: Allocator,
     doc_key: []const u8,
+    mention_artifact_key: []const u8,
+    source_artifact_key: []const u8,
+    resolution_key: []const u8,
     cfg: *const index_manager_mod.ResolverConfig,
     entity: resolver_lib.ResolvedEntity,
     extraction_entity: ?resolver_lib.ExtractedEntity,
@@ -19156,8 +19163,11 @@ fn mentionEvidencePayloadAlloc(
         ._schema = "antfly.resolution_mention.v1",
         ._parent_doc_key = doc_key,
         ._artifact_kind = "resolution_mention",
+        ._artifact_key = mention_artifact_key,
         .source_artifact = cfg.source_artifact,
+        .source_artifact_key = source_artifact_key,
         .resolution_artifact = cfg.resolution_artifact,
+        .resolution_artifact_key = resolution_key,
         .resolver = cfg.name,
         .resolver_table = cfg.table,
         .config_generation = cfg.config_generation,
@@ -27240,7 +27250,9 @@ test "db materializes doc->entity mention edges as provenance and clears them on
         defer alloc.free(raw);
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"_schema\":\"antfly.resolution_mention.v1\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"source_artifact\":\"relations_v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"source_artifact_key\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"resolution_artifact\":\"resolution_v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"resolution_artifact_key\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"local_id\":\"e0\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"key\":\"person/ada_lovelace\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"text\":\"Ada Lovelace\"") != null);
