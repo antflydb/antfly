@@ -250,7 +250,7 @@ pub const ApiHttpClient = struct {
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?fields={s}", .{
                 routes.Routes.tables_prefix,
                 table_name,
-                routes.Routes.lookup_marker,
+                routes.Routes.documents_marker,
                 key,
                 field_list,
             })
@@ -258,7 +258,7 @@ pub const ApiHttpClient = struct {
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
                 routes.Routes.tables_prefix,
                 table_name,
-                routes.Routes.lookup_marker,
+                routes.Routes.documents_marker,
                 key,
             });
         defer self.alloc.free(path);
@@ -293,7 +293,7 @@ pub const ApiHttpClient = struct {
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?fields={s}", .{
                 routes.Routes.tables_prefix,
                 table_name,
-                routes.Routes.lookup_marker,
+                routes.Routes.documents_marker,
                 key,
                 field_list,
             })
@@ -301,7 +301,7 @@ pub const ApiHttpClient = struct {
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
                 routes.Routes.tables_prefix,
                 table_name,
-                routes.Routes.lookup_marker,
+                routes.Routes.documents_marker,
                 key,
             });
         defer self.alloc.free(suffix);

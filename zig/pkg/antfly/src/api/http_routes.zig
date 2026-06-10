@@ -82,7 +82,6 @@ pub const Routes = struct {
     pub const shard_ops_observe_merge_suffix = "/shard-ops/observe-merge";
     pub const shard_ops_execute_suffix = "/shard-ops/execute";
     pub const lookup_suffix = "/lookup";
-    pub const lookup_marker = "/documents/";
     pub const schema_suffix = "/schema";
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
@@ -329,10 +328,10 @@ pub const Routes = struct {
     pub fn matchTableLookup(path: []const u8) ?TableLookup {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         const rest = path[tables_prefix.len..];
-        const marker_index = std.mem.indexOf(u8, rest, lookup_marker) orelse return null;
+        const marker_index = std.mem.indexOf(u8, rest, documents_marker) orelse return null;
         if (marker_index == 0) return null;
         const table_name = rest[0..marker_index];
-        const key = rest[marker_index + lookup_marker.len ..];
+        const key = rest[marker_index + documents_marker.len ..];
         if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return null;
         return .{
             .table_name = table_name,
@@ -583,10 +582,10 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         const table_rest = rest[tables_prefix.len..];
-        const marker_index = std.mem.indexOf(u8, table_rest, lookup_marker) orelse return null;
+        const marker_index = std.mem.indexOf(u8, table_rest, documents_marker) orelse return null;
         if (marker_index == 0) return null;
         const table_name = table_rest[0..marker_index];
-        const key = table_rest[marker_index + lookup_marker.len ..];
+        const key = table_rest[marker_index + documents_marker.len ..];
         if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name, .key = key };
     }

@@ -583,34 +583,78 @@ pub fn handleDocumentArtifactManifest(
     };
     defer manifest.deinit(alloc);
 
+    const ChildRangeResponse = struct {
+        range_id: []const u8,
+        range_kind: []const u8,
+        artifact_name: []const u8,
+        split_boundary: []const u8,
+        placement: []const u8,
+        start_key: []const u8,
+        end_key_exclusive: []const u8,
+        last_key: []const u8,
+        child_count: usize,
+        text_bytes: ?usize,
+    };
     const Response = struct {
         document_id: []const u8,
         artifact_name: []const u8,
         artifact_id: []const u8,
+        manifest_version: u64,
         generation: u64,
+        source_url: []const u8,
+        source_fingerprint: []const u8,
+        content_type: []const u8,
         route_type: []const u8,
         unsupported_reason: ?[]const u8,
         unit_count: usize,
         chunk_count: usize,
+        child_ranges: []const ChildRangeResponse,
         child_range_count: usize,
         merge_status: []const u8,
+        merge_from_generation: u64,
+        merge_to_generation: u64,
+        merge_operation_granularity: []const u8,
         merge_operation_count: usize,
         manifest_json: []const u8,
         state_json: ?[]const u8,
     };
+    const child_ranges = try alloc.alloc(ChildRangeResponse, manifest.child_ranges.len);
+    defer alloc.free(child_ranges);
+    for (manifest.child_ranges, child_ranges) |child_range, *out| {
+        out.* = .{
+            .range_id = child_range.range_id,
+            .range_kind = child_range.range_kind,
+            .artifact_name = child_range.artifact_name,
+            .split_boundary = child_range.split_boundary,
+            .placement = child_range.placement,
+            .start_key = child_range.start_key,
+            .end_key_exclusive = child_range.end_key_exclusive,
+            .last_key = child_range.last_key,
+            .child_count = child_range.child_count,
+            .text_bytes = child_range.text_bytes,
+        };
+    }
     return .{
         .status = 200,
         .body = try std.json.Stringify.valueAlloc(alloc, Response{
             .document_id = manifest.document_id,
             .artifact_name = manifest.artifact_name,
             .artifact_id = manifest.artifact_id,
+            .manifest_version = manifest.manifest_version,
             .generation = manifest.generation,
+            .source_url = manifest.source_url,
+            .source_fingerprint = manifest.source_fingerprint,
+            .content_type = manifest.content_type,
             .route_type = manifest.route_type,
             .unsupported_reason = manifest.unsupported_reason,
             .unit_count = manifest.unit_count,
             .chunk_count = manifest.chunk_count,
+            .child_ranges = child_ranges,
             .child_range_count = manifest.child_range_count,
             .merge_status = manifest.merge_status,
+            .merge_from_generation = manifest.merge_from_generation,
+            .merge_to_generation = manifest.merge_to_generation,
+            .merge_operation_granularity = manifest.merge_operation_granularity,
             .merge_operation_count = manifest.merge_operation_count,
             .manifest_json = manifest.manifest_json,
             .state_json = manifest.state_json,
@@ -632,17 +676,37 @@ pub fn handleDocumentArtifactManifests(
     };
     defer list.deinit(alloc);
 
+    const ChildRangeResponse = struct {
+        range_id: []const u8,
+        range_kind: []const u8,
+        artifact_name: []const u8,
+        split_boundary: []const u8,
+        placement: []const u8,
+        start_key: []const u8,
+        end_key_exclusive: []const u8,
+        last_key: []const u8,
+        child_count: usize,
+        text_bytes: ?usize,
+    };
     const ManifestResponse = struct {
         document_id: []const u8,
         artifact_name: []const u8,
         artifact_id: []const u8,
+        manifest_version: u64,
         generation: u64,
+        source_url: []const u8,
+        source_fingerprint: []const u8,
+        content_type: []const u8,
         route_type: []const u8,
         unsupported_reason: ?[]const u8,
         unit_count: usize,
         chunk_count: usize,
+        child_ranges: []const ChildRangeResponse,
         child_range_count: usize,
         merge_status: []const u8,
+        merge_from_generation: u64,
+        merge_to_generation: u64,
+        merge_operation_granularity: []const u8,
         merge_operation_count: usize,
         manifest_json: []const u8,
         state_json: ?[]const u8,
@@ -654,18 +718,48 @@ pub fn handleDocumentArtifactManifests(
 
     const artifacts = try alloc.alloc(ManifestResponse, list.artifacts.len);
     defer alloc.free(artifacts);
+    var child_range_sets = std.ArrayListUnmanaged([]ChildRangeResponse).empty;
+    defer {
+        for (child_range_sets.items) |child_ranges| alloc.free(child_ranges);
+        child_range_sets.deinit(alloc);
+    }
     for (list.artifacts, artifacts) |manifest, *out| {
+        const child_ranges = try alloc.alloc(ChildRangeResponse, manifest.child_ranges.len);
+        errdefer alloc.free(child_ranges);
+        for (manifest.child_ranges, child_ranges) |child_range, *child_out| {
+            child_out.* = .{
+                .range_id = child_range.range_id,
+                .range_kind = child_range.range_kind,
+                .artifact_name = child_range.artifact_name,
+                .split_boundary = child_range.split_boundary,
+                .placement = child_range.placement,
+                .start_key = child_range.start_key,
+                .end_key_exclusive = child_range.end_key_exclusive,
+                .last_key = child_range.last_key,
+                .child_count = child_range.child_count,
+                .text_bytes = child_range.text_bytes,
+            };
+        }
+        try child_range_sets.append(alloc, child_ranges);
         out.* = .{
             .document_id = manifest.document_id,
             .artifact_name = manifest.artifact_name,
             .artifact_id = manifest.artifact_id,
+            .manifest_version = manifest.manifest_version,
             .generation = manifest.generation,
+            .source_url = manifest.source_url,
+            .source_fingerprint = manifest.source_fingerprint,
+            .content_type = manifest.content_type,
             .route_type = manifest.route_type,
             .unsupported_reason = manifest.unsupported_reason,
             .unit_count = manifest.unit_count,
             .chunk_count = manifest.chunk_count,
+            .child_ranges = child_ranges,
             .child_range_count = manifest.child_range_count,
             .merge_status = manifest.merge_status,
+            .merge_from_generation = manifest.merge_from_generation,
+            .merge_to_generation = manifest.merge_to_generation,
+            .merge_operation_granularity = manifest.merge_operation_granularity,
             .merge_operation_count = manifest.merge_operation_count,
             .manifest_json = manifest.manifest_json,
             .state_json = manifest.state_json,

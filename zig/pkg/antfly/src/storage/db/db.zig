@@ -13585,6 +13585,43 @@ fn jsonObjectUsize(object: std.json.ObjectMap, field_name: []const u8) !usize {
     return std.math.cast(usize, try jsonObjectU64(object, field_name)) orelse return error.InvalidDocumentExtractionManifest;
 }
 
+fn jsonObjectOptionalUsize(object: std.json.ObjectMap, field_name: []const u8) !?usize {
+    const value = object.get(field_name) orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(usize, value.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn documentArtifactChildRangesFromJsonAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]types.DocumentArtifactChildRange {
+    const value = object.get("child_ranges") orelse return try alloc.alloc(types.DocumentArtifactChildRange, 0);
+    if (value != .array) return try alloc.alloc(types.DocumentArtifactChildRange, 0);
+
+    const out = try alloc.alloc(types.DocumentArtifactChildRange, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*range| range.deinit(alloc);
+        if (out.len > 0) alloc.free(out);
+    }
+
+    for (value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidDocumentExtractionManifest;
+        out[i] = .{
+            .range_id = try jsonObjectStringDup(alloc, item.object, "range_id"),
+            .range_kind = try jsonObjectStringDup(alloc, item.object, "range_kind"),
+            .artifact_name = try jsonObjectStringDup(alloc, item.object, "artifact_name"),
+            .split_boundary = try jsonObjectStringDup(alloc, item.object, "split_boundary"),
+            .placement = try jsonObjectStringDup(alloc, item.object, "placement"),
+            .start_key = try jsonObjectStringDup(alloc, item.object, "start_key"),
+            .end_key_exclusive = try jsonObjectStringDup(alloc, item.object, "end_key_exclusive"),
+            .last_key = try jsonObjectStringDup(alloc, item.object, "last_key"),
+            .child_count = try jsonObjectUsize(item.object, "child_count"),
+            .text_bytes = try jsonObjectOptionalUsize(item.object, "text_bytes"),
+        };
+        initialized += 1;
+    }
+
+    return out;
+}
+
 fn documentArtifactManifestFromJsonAlloc(
     alloc: Allocator,
     doc_key: []const u8,
@@ -13607,27 +13644,41 @@ fn documentArtifactManifestFromJsonAlloc(
     });
     errdefer alloc.free(artifact_id);
 
+    const source_url = try jsonObjectStringDup(alloc, object, "source_url");
+    errdefer if (source_url.len > 0) alloc.free(source_url);
+    const source_fingerprint = try jsonObjectStringDup(alloc, object, "source_fingerprint");
+    errdefer if (source_fingerprint.len > 0) alloc.free(source_fingerprint);
+    const content_type = try jsonObjectStringDup(alloc, object, "content_type");
+    errdefer if (content_type.len > 0) alloc.free(content_type);
     const route_type = try jsonObjectStringDup(alloc, object, "route_type");
     errdefer if (route_type.len > 0) alloc.free(route_type);
     const unsupported_reason = try jsonObjectOptionalStringDup(alloc, object, "unsupported_reason");
     errdefer if (unsupported_reason) |value| alloc.free(value);
 
-    var child_range_count: usize = 0;
-    if (object.get("child_ranges")) |value| {
-        if (value == .array) child_range_count = value.array.items.len;
+    const child_ranges = try documentArtifactChildRangesFromJsonAlloc(alloc, object);
+    errdefer {
+        for (child_ranges) |*child_range| child_range.deinit(alloc);
+        if (child_ranges.len > 0) alloc.free(child_ranges);
     }
 
     var merge_status: []u8 = "";
+    var merge_from_generation: u64 = 0;
+    var merge_to_generation: u64 = 0;
+    var merge_operation_granularity: []u8 = "";
     var merge_operation_count: usize = 0;
     if (object.get("merge_plan")) |value| {
         if (value == .object) {
             merge_status = try jsonObjectStringDup(alloc, value.object, "status");
+            merge_from_generation = try jsonObjectU64(value.object, "from_generation");
+            merge_to_generation = try jsonObjectU64(value.object, "to_generation");
+            merge_operation_granularity = try jsonObjectStringDup(alloc, value.object, "operation_granularity");
             if (value.object.get("operations")) |operations| {
                 if (operations == .array) merge_operation_count = operations.array.items.len;
             }
         }
     }
     errdefer if (merge_status.len > 0) alloc.free(merge_status);
+    errdefer if (merge_operation_granularity.len > 0) alloc.free(merge_operation_granularity);
 
     const owned_doc_key = try alloc.dupe(u8, doc_key);
     errdefer alloc.free(owned_doc_key);
@@ -13640,13 +13691,21 @@ fn documentArtifactManifestFromJsonAlloc(
         .artifact_id = artifact_id,
         .manifest_json = manifest_json,
         .state_json = state_json,
+        .manifest_version = try jsonObjectU64(object, "manifest_version"),
         .generation = try jsonObjectU64(object, "generation"),
+        .source_url = source_url,
+        .source_fingerprint = source_fingerprint,
+        .content_type = content_type,
         .route_type = route_type,
         .unsupported_reason = unsupported_reason,
         .unit_count = try jsonObjectUsize(object, "unit_count"),
         .chunk_count = try jsonObjectUsize(object, "chunk_count"),
-        .child_range_count = child_range_count,
+        .child_ranges = child_ranges,
+        .child_range_count = child_ranges.len,
         .merge_status = merge_status,
+        .merge_from_generation = merge_from_generation,
+        .merge_to_generation = merge_to_generation,
+        .merge_operation_granularity = merge_operation_granularity,
         .merge_operation_count = merge_operation_count,
     };
 }
@@ -28681,12 +28740,26 @@ test "db document extraction manifest inspection and reprocess API" {
     try std.testing.expectEqualStrings("doc:a", inspected.document_id);
     try std.testing.expectEqualStrings("document_units_v1", inspected.artifact_name);
     try std.testing.expect(std.mem.startsWith(u8, inspected.artifact_id, "af1:asset:"));
+    try std.testing.expectEqual(@as(u64, 2), inspected.manifest_version);
     try std.testing.expectEqual(@as(u64, 1), inspected.generation);
+    try std.testing.expectEqualStrings("data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==", inspected.source_url);
+    try std.testing.expectEqual(@as(usize, 64), inspected.source_fingerprint.len);
+    try std.testing.expectEqualStrings("text/plain", inspected.content_type);
     try std.testing.expectEqualStrings("text", inspected.route_type);
     try std.testing.expectEqual(@as(usize, 1), inspected.unit_count);
     try std.testing.expectEqual(@as(usize, 1), inspected.chunk_count);
     try std.testing.expectEqual(@as(usize, 2), inspected.child_range_count);
+    try std.testing.expectEqual(@as(usize, 2), inspected.child_ranges.len);
+    try std.testing.expectEqualStrings("range:000000", inspected.child_ranges[0].range_id);
+    try std.testing.expectEqualStrings("unit", inspected.child_ranges[0].range_kind);
+    try std.testing.expectEqualStrings("document_units_v1", inspected.child_ranges[0].artifact_name);
+    try std.testing.expectEqual(@as(usize, 1), inspected.child_ranges[0].child_count);
+    try std.testing.expect(inspected.child_ranges[0].text_bytes != null);
+    try std.testing.expectEqualStrings("chunk", inspected.child_ranges[1].range_kind);
     try std.testing.expectEqualStrings("converged", inspected.merge_status);
+    try std.testing.expectEqual(@as(u64, 0), inspected.merge_from_generation);
+    try std.testing.expectEqual(@as(u64, 1), inspected.merge_to_generation);
+    try std.testing.expectEqualStrings("unit_fingerprint", inspected.merge_operation_granularity);
     try std.testing.expect(inspected.merge_operation_count > 0);
     try std.testing.expect(inspected.state_json != null);
 

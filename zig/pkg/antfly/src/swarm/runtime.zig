@@ -1493,7 +1493,7 @@ fn registerInternalGroupRoutes(server: anytype) !void {
 
     const get_routes = [_][]const u8{
         group_prefix ++ routes.group_db_median_key_suffix,
-        table_prefix ++ routes.lookup_marker ++ ":key",
+        table_prefix ++ routes.documents_marker ++ ":key",
     };
     inline for (get_routes) |path| {
         try server.get(path, internalBridgeHandler);
@@ -2031,7 +2031,7 @@ test "swarm runtime registers internal group routes explicitly" {
     const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
 
     try std.testing.expect(server.hasRoute(.get, group_prefix ++ routes.group_db_median_key_suffix));
-    try std.testing.expect(server.hasRoute(.get, table_prefix ++ routes.lookup_marker ++ ":key"));
+    try std.testing.expect(server.hasRoute(.get, table_prefix ++ routes.documents_marker ++ ":key"));
 
     try std.testing.expect(server.hasRoute(.post, internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix));
     try std.testing.expect(server.hasRoute(.post, group_prefix ++ routes.shard_ops_observe_split_suffix));

@@ -11952,16 +11952,37 @@ fn lookupRemote(
 }
 
 const RemoteDocumentArtifactManifest = struct {
+    const ChildRange = struct {
+        range_id: []const u8 = "",
+        range_kind: []const u8 = "",
+        artifact_name: []const u8 = "",
+        split_boundary: []const u8 = "",
+        placement: []const u8 = "",
+        start_key: []const u8 = "",
+        end_key_exclusive: []const u8 = "",
+        last_key: []const u8 = "",
+        child_count: usize = 0,
+        text_bytes: ?usize = null,
+    };
+
     document_id: []const u8,
     artifact_name: []const u8,
     artifact_id: []const u8,
+    manifest_version: u64 = 0,
     generation: u64 = 0,
+    source_url: []const u8 = "",
+    source_fingerprint: []const u8 = "",
+    content_type: []const u8 = "",
     route_type: []const u8 = "",
     unsupported_reason: ?[]const u8 = null,
     unit_count: usize = 0,
     chunk_count: usize = 0,
+    child_ranges: []const ChildRange = &.{},
     child_range_count: usize = 0,
     merge_status: []const u8 = "",
+    merge_from_generation: u64 = 0,
+    merge_to_generation: u64 = 0,
+    merge_operation_granularity: []const u8 = "",
     merge_operation_count: usize = 0,
     manifest_json: []const u8,
     state_json: ?[]const u8 = null,
@@ -11972,35 +11993,86 @@ const RemoteDocumentArtifactManifests = struct {
     artifacts: []const RemoteDocumentArtifactManifest,
 };
 
-fn remoteDocumentArtifactManifestAlloc(alloc: std.mem.Allocator, remote: RemoteDocumentArtifactManifest) !db_mod.types.DocumentArtifactManifest {
-    var manifest = blk: {
-        const document_id = try alloc.dupe(u8, remote.document_id);
-        errdefer alloc.free(document_id);
-        const artifact_name = try alloc.dupe(u8, remote.artifact_name);
-        errdefer alloc.free(artifact_name);
-        const artifact_id = try alloc.dupe(u8, remote.artifact_id);
-        errdefer alloc.free(artifact_id);
-        const manifest_json = try alloc.dupe(u8, remote.manifest_json);
-        errdefer alloc.free(manifest_json);
-        break :blk db_mod.types.DocumentArtifactManifest{
-            .document_id = document_id,
-            .artifact_name = artifact_name,
-            .artifact_id = artifact_id,
-            .manifest_json = manifest_json,
-            .generation = remote.generation,
-            .unit_count = remote.unit_count,
-            .chunk_count = remote.chunk_count,
-            .child_range_count = remote.child_range_count,
-            .merge_operation_count = remote.merge_operation_count,
+fn remoteDocumentArtifactChildRangesAlloc(alloc: std.mem.Allocator, remote: []const RemoteDocumentArtifactManifest.ChildRange) ![]db_mod.types.DocumentArtifactChildRange {
+    const child_ranges = try alloc.alloc(db_mod.types.DocumentArtifactChildRange, remote.len);
+    var initialized_child_ranges: usize = 0;
+    errdefer {
+        for (child_ranges[0..initialized_child_ranges]) |*child_range| child_range.deinit(alloc);
+        if (child_ranges.len > 0) alloc.free(child_ranges);
+    }
+    for (remote, child_ranges) |remote_range, *out| {
+        out.* = .{
+            .range_id = try alloc.dupe(u8, remote_range.range_id),
+            .range_kind = try alloc.dupe(u8, remote_range.range_kind),
+            .artifact_name = try alloc.dupe(u8, remote_range.artifact_name),
+            .split_boundary = try alloc.dupe(u8, remote_range.split_boundary),
+            .placement = try alloc.dupe(u8, remote_range.placement),
+            .start_key = try alloc.dupe(u8, remote_range.start_key),
+            .end_key_exclusive = try alloc.dupe(u8, remote_range.end_key_exclusive),
+            .last_key = try alloc.dupe(u8, remote_range.last_key),
+            .child_count = remote_range.child_count,
+            .text_bytes = remote_range.text_bytes,
         };
-    };
-    errdefer manifest.deinit(alloc);
+        initialized_child_ranges += 1;
+    }
+    return child_ranges;
+}
 
-    manifest.state_json = if (remote.state_json) |value| try alloc.dupe(u8, value) else null;
-    manifest.route_type = if (remote.route_type.len > 0) try alloc.dupe(u8, remote.route_type) else "";
-    manifest.unsupported_reason = if (remote.unsupported_reason) |value| try alloc.dupe(u8, value) else null;
-    manifest.merge_status = if (remote.merge_status.len > 0) try alloc.dupe(u8, remote.merge_status) else "";
-    return manifest;
+fn remoteDocumentArtifactManifestAlloc(alloc: std.mem.Allocator, remote: RemoteDocumentArtifactManifest) !db_mod.types.DocumentArtifactManifest {
+    const child_ranges = try remoteDocumentArtifactChildRangesAlloc(alloc, remote.child_ranges);
+    errdefer {
+        for (child_ranges) |*child_range| child_range.deinit(alloc);
+        if (child_ranges.len > 0) alloc.free(child_ranges);
+    }
+
+    const document_id = try alloc.dupe(u8, remote.document_id);
+    errdefer alloc.free(document_id);
+    const artifact_name = try alloc.dupe(u8, remote.artifact_name);
+    errdefer alloc.free(artifact_name);
+    const artifact_id = try alloc.dupe(u8, remote.artifact_id);
+    errdefer alloc.free(artifact_id);
+    const manifest_json = try alloc.dupe(u8, remote.manifest_json);
+    errdefer alloc.free(manifest_json);
+    const state_json = if (remote.state_json) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (state_json) |value| alloc.free(value);
+    const source_url: []u8 = if (remote.source_url.len > 0) try alloc.dupe(u8, remote.source_url) else @constCast("");
+    errdefer if (source_url.len > 0) alloc.free(source_url);
+    const source_fingerprint: []u8 = if (remote.source_fingerprint.len > 0) try alloc.dupe(u8, remote.source_fingerprint) else @constCast("");
+    errdefer if (source_fingerprint.len > 0) alloc.free(source_fingerprint);
+    const content_type: []u8 = if (remote.content_type.len > 0) try alloc.dupe(u8, remote.content_type) else @constCast("");
+    errdefer if (content_type.len > 0) alloc.free(content_type);
+    const route_type: []u8 = if (remote.route_type.len > 0) try alloc.dupe(u8, remote.route_type) else @constCast("");
+    errdefer if (route_type.len > 0) alloc.free(route_type);
+    const unsupported_reason = if (remote.unsupported_reason) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (unsupported_reason) |value| alloc.free(value);
+    const merge_status: []u8 = if (remote.merge_status.len > 0) try alloc.dupe(u8, remote.merge_status) else @constCast("");
+    errdefer if (merge_status.len > 0) alloc.free(merge_status);
+    const merge_operation_granularity: []u8 = if (remote.merge_operation_granularity.len > 0) try alloc.dupe(u8, remote.merge_operation_granularity) else @constCast("");
+    errdefer if (merge_operation_granularity.len > 0) alloc.free(merge_operation_granularity);
+
+    return .{
+        .document_id = document_id,
+        .artifact_name = artifact_name,
+        .artifact_id = artifact_id,
+        .manifest_json = manifest_json,
+        .state_json = state_json,
+        .manifest_version = remote.manifest_version,
+        .generation = remote.generation,
+        .source_url = source_url,
+        .source_fingerprint = source_fingerprint,
+        .content_type = content_type,
+        .route_type = route_type,
+        .unsupported_reason = unsupported_reason,
+        .unit_count = remote.unit_count,
+        .chunk_count = remote.chunk_count,
+        .child_ranges = child_ranges,
+        .child_range_count = if (remote.child_range_count > 0) remote.child_range_count else child_ranges.len,
+        .merge_status = merge_status,
+        .merge_from_generation = remote.merge_from_generation,
+        .merge_to_generation = remote.merge_to_generation,
+        .merge_operation_granularity = merge_operation_granularity,
+        .merge_operation_count = remote.merge_operation_count,
+    };
 }
 
 fn parseRemoteDocumentArtifactManifest(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactManifest {

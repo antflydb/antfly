@@ -1511,6 +1511,51 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ClusterDataGroupStatus"
+    DocumentArtifactChildRange:
+      type: object
+      description: Parsed child-range descriptor from a derived document artifact manifest.
+      required:
+        - range_id
+        - range_kind
+        - artifact_name
+        - split_boundary
+        - placement
+        - start_key
+        - end_key_exclusive
+        - last_key
+        - child_count
+      properties:
+        range_id:
+          type: string
+          description: Stable range identifier within the artifact manifest generation.
+        range_kind:
+          type: string
+          description: Kind of children covered by this range, such as unit or chunk.
+        artifact_name:
+          type: string
+          description: Artifact namespace covered by this range.
+        split_boundary:
+          type: string
+          description: Logical boundary used for splitting this range.
+        placement:
+          type: string
+          description: Current placement summary for the range.
+        start_key:
+          type: string
+          description: Inclusive first internal child key covered by this range.
+        end_key_exclusive:
+          type: string
+          description: Exclusive end internal child key, or empty for the final range.
+        last_key:
+          type: string
+          description: Inclusive last internal child key covered by this range.
+        child_count:
+          type: integer
+          description: Number of child records covered by this range.
+        text_bytes:
+          type: integer
+          nullable: true
+          description: Approximate extracted text bytes covered by this range when available.
     DocumentArtifactManifest:
       type: object
       description: |
@@ -1522,12 +1567,20 @@ components:
         - document_id
         - artifact_name
         - artifact_id
+        - manifest_version
         - generation
+        - source_url
+        - source_fingerprint
+        - content_type
         - route_type
         - unit_count
         - chunk_count
+        - child_ranges
         - child_range_count
         - merge_status
+        - merge_from_generation
+        - merge_to_generation
+        - merge_operation_granularity
         - merge_operation_count
         - manifest_json
       properties:
@@ -1541,10 +1594,23 @@ components:
         artifact_id:
           type: string
           description: Stable identity of this artifact under the document.
+        manifest_version:
+          type: integer
+          format: uint64
+          description: Version of the opaque manifest payload schema.
         generation:
           type: integer
           format: uint64
           description: Monotonic generation for the current artifact state.
+        source_url:
+          type: string
+          description: Source URL or source identifier used to derive this artifact.
+        source_fingerprint:
+          type: string
+          description: Fingerprint of the source bytes and extractor configuration.
+        content_type:
+          type: string
+          description: Effective source content type selected during extraction.
         route_type:
           type: string
           description: Producer route selected for the source content.
@@ -1559,12 +1625,28 @@ components:
         chunk_count:
           type: integer
           description: Number of indexable chunks derived from the units.
+        child_ranges:
+          type: array
+          description: Parsed child range descriptors for this artifact generation.
+          items:
+            $ref: "#/components/schemas/DocumentArtifactChildRange"
         child_range_count:
           type: integer
           description: Number of storage child ranges used by this artifact.
         merge_status:
           type: string
           description: Current materialization or merge status.
+        merge_from_generation:
+          type: integer
+          format: uint64
+          description: Previous artifact generation used by the current merge plan.
+        merge_to_generation:
+          type: integer
+          format: uint64
+          description: Target artifact generation produced by the current merge plan.
+        merge_operation_granularity:
+          type: string
+          description: Granularity used when computing merge-plan operations.
         merge_operation_count:
           type: integer
           description: Number of merge operations recorded for this artifact.

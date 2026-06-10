@@ -9061,9 +9061,9 @@ test "api http server decodes percent-encoded lookup keys" {
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 }
 
-test "api http server serves lookup through mcp tool" {
+test "api http server serves document lookup through mcp tool" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-mcp-lookup";
+    const path = "/tmp/antfly-api-http-mcp-get-document";
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -9117,7 +9117,7 @@ test "api http server serves lookup through mcp tool" {
     };
 
     var source = FakeSource{};
-    const trusted_principal_secret = "mcp-lookup-trusted-principal-secret";
+    const trusted_principal_secret = "mcp-get-document-trusted-principal-secret";
     const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
     const payload = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -9168,14 +9168,15 @@ test "api http server serves lookup through mcp tool" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"get_document\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") == null);
 
     var call_resp = try server.handle(.{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
         .content_type = "application/json",
-        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"lookup\",\"arguments\":{\"tableName\":\"docs\",\"key\":\"docs/getting-started.md\",\"fields\":[\"title\"]}}}",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"get_document\",\"arguments\":{\"tableName\":\"docs\",\"key\":\"docs/getting-started.md\",\"fields\":[\"title\"]}}}",
     });
     defer call_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), call_resp.status);

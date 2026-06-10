@@ -51,34 +51,28 @@ pub const ClusterHealth = enum {
     }
 };
 
-/// Inspection view for a derived document artifact produced from a source table row. The embedded manifest/state JSON fields are intentionally opaque so producers can evolve their internal unit schema without changing this route contract.
-pub const DocumentArtifactManifest = struct {
-    /// Stable identity of the source document.
-    document_id: []const u8,
-    /// Name of the derived artifact.
+/// Parsed child-range descriptor from a derived document artifact manifest.
+pub const DocumentArtifactChildRange = struct {
+    /// Stable range identifier within the artifact manifest generation.
+    range_id: []const u8,
+    /// Kind of children covered by this range, such as unit or chunk.
+    range_kind: []const u8,
+    /// Artifact namespace covered by this range.
     artifact_name: []const u8,
-    /// Stable identity of this artifact under the document.
-    artifact_id: []const u8,
-    /// Monotonic generation for the current artifact state.
-    generation: i64,
-    /// Producer route selected for the source content.
-    route_type: []const u8,
-    /// Reason extraction was skipped, when the source type is unsupported.
-    unsupported_reason: ?[]const u8 = null,
-    /// Number of extracted document units.
-    unit_count: i64,
-    /// Number of indexable chunks derived from the units.
-    chunk_count: i64,
-    /// Number of storage child ranges used by this artifact.
-    child_range_count: i64,
-    /// Current materialization or merge status.
-    merge_status: []const u8,
-    /// Number of merge operations recorded for this artifact.
-    merge_operation_count: i64,
-    /// Opaque JSON manifest for the artifact units and provenance.
-    manifest_json: []const u8,
-    /// Optional opaque JSON state for incremental processing.
-    state_json: ?[]const u8 = null,
+    /// Logical boundary used for splitting this range.
+    split_boundary: []const u8,
+    /// Current placement summary for the range.
+    placement: []const u8,
+    /// Inclusive first internal child key covered by this range.
+    start_key: []const u8,
+    /// Exclusive end internal child key, or empty for the final range.
+    end_key_exclusive: []const u8,
+    /// Inclusive last internal child key covered by this range.
+    last_key: []const u8,
+    /// Number of child records covered by this range.
+    child_count: i64,
+    /// Approximate extracted text bytes covered by this range when available.
+    text_bytes: ?i64 = null,
 };
 
 pub const DocumentArtifactReprocessResponse = struct {
@@ -1315,11 +1309,50 @@ pub const ReplicationTransformOp = struct {
     value: ?std.json.Value = null,
 };
 
-/// Available derived document artifact manifests for a source document.
-pub const DocumentArtifactManifestList = struct {
+/// Inspection view for a derived document artifact produced from a source table row. The embedded manifest/state JSON fields are intentionally opaque so producers can evolve their internal unit schema without changing this route contract.
+pub const DocumentArtifactManifest = struct {
     /// Stable identity of the source document.
     document_id: []const u8,
-    artifacts: []const DocumentArtifactManifest,
+    /// Name of the derived artifact.
+    artifact_name: []const u8,
+    /// Stable identity of this artifact under the document.
+    artifact_id: []const u8,
+    /// Version of the opaque manifest payload schema.
+    manifest_version: i64,
+    /// Monotonic generation for the current artifact state.
+    generation: i64,
+    /// Source URL or source identifier used to derive this artifact.
+    source_url: []const u8,
+    /// Fingerprint of the source bytes and extractor configuration.
+    source_fingerprint: []const u8,
+    /// Effective source content type selected during extraction.
+    content_type: []const u8,
+    /// Producer route selected for the source content.
+    route_type: []const u8,
+    /// Reason extraction was skipped, when the source type is unsupported.
+    unsupported_reason: ?[]const u8 = null,
+    /// Number of extracted document units.
+    unit_count: i64,
+    /// Number of indexable chunks derived from the units.
+    chunk_count: i64,
+    /// Parsed child range descriptors for this artifact generation.
+    child_ranges: []const DocumentArtifactChildRange,
+    /// Number of storage child ranges used by this artifact.
+    child_range_count: i64,
+    /// Current materialization or merge status.
+    merge_status: []const u8,
+    /// Previous artifact generation used by the current merge plan.
+    merge_from_generation: i64,
+    /// Target artifact generation produced by the current merge plan.
+    merge_to_generation: i64,
+    /// Granularity used when computing merge-plan operations.
+    merge_operation_granularity: []const u8,
+    /// Number of merge operations recorded for this artifact.
+    merge_operation_count: i64,
+    /// Opaque JSON manifest for the artifact units and provenance.
+    manifest_json: []const u8,
+    /// Optional opaque JSON state for incremental processing.
+    state_json: ?[]const u8 = null,
 };
 
 /// Typed Zig status view for table data topology and range placement.
@@ -1700,6 +1733,13 @@ pub const ReplicationRoute = struct {
     on_update: ?[]const ReplicationTransformOp = null,
     /// Transform operations for DELETE events on this route. If omitted, auto-derives from this route's `on_update` paths.
     on_delete: ?[]const ReplicationTransformOp = null,
+};
+
+/// Available derived document artifact manifests for a source document.
+pub const DocumentArtifactManifestList = struct {
+    /// Stable identity of the source document.
+    document_id: []const u8,
+    artifacts: []const DocumentArtifactManifest,
 };
 
 pub const ClusterTopology = struct {

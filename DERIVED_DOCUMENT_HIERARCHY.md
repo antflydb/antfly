@@ -408,6 +408,7 @@ Current implementation status:
 - The DB, table read sources, public HTTP handlers, internal group routes, hosted/provisioned routing, generated OpenAPI/httpx routes, and typed Zig clients now expose `GET /db/v1/tables/{table}/documents/{key}/artifacts` to list available artifact manifests for a source document.
 - Generated OpenAPI/httpx routing now includes `GET /db/v1/tables/{table}/documents/{key}/artifacts/{artifact}` and `POST /db/v1/tables/{table}/documents/{key}/artifacts/{artifact}:reprocess`, plus typed Zig client methods for both operations.
 - Public artifact list, manifest inspection, and reprocess routes now apply the caller's effective source-row filter before exposing or mutating artifact control-plane state; hidden source documents return `404` to avoid leaking artifact existence.
+- Artifact inspection responses now expose typed source URL, source fingerprint, content type, manifest version, child range descriptors, and merge-plan generation/granularity summaries in addition to preserving raw manifest/state JSON.
 - Unit payloads are emitted as derived documents for full-text indexes whose source artifact matches the document-unit artifact name.
 - The synchronous precompute path and async enrichment runtime path both use the same artifact key/state contract.
 
@@ -564,7 +565,7 @@ Recommended direction:
 - Add reprocess controls such as `POST /tables/{table}/documents/{key}/artifacts/{artifact}:reprocess`.
 - Add table-level repair/replay commands for an artifact across many source rows.
 
-Implementation note: the DB, bound table-source, local public HTTP, generated OpenAPI/httpx, and hosted/provisioned routing layers now expose per-document manifest listing, per-artifact manifest inspection, and forced reprocess for a specific artifact. These public routes enforce source-document row filters before exposing or mutating artifact control-plane state. The remaining API design work is table-wide repair/backfill controls and how much generation/range detail should be public versus admin-only.
+Implementation note: the DB, bound table-source, local public HTTP, generated OpenAPI/httpx, and hosted/provisioned routing layers now expose per-document manifest listing, per-artifact manifest inspection, and forced reprocess for a specific artifact. These public routes enforce source-document row filters before exposing or mutating artifact control-plane state. Manifest inspection now has typed source/fingerprint/range/merge summaries as well as raw manifest/state JSON. The remaining API design work is table-wide repair/backfill controls, last-error reporting, and how much deeper detail should be public versus admin-only.
 
 The manifest should carry enough state to explain why extraction did or did not rerun.
 
@@ -648,7 +649,7 @@ This gives downstream systems a stable contract without blocking richer extracto
 The high-level model is settled enough to start implementation. The pieces that still need concrete product/API decisions are:
 
 - Query response shape: exact request and response schema for hierarchy rollups, grouped hits, and hydrated ancestors.
-- Inspection API shape: admin-only versus public details, generation/range detail expansion, and table-wide reprocessing controls. Collection listing, single-artifact manifest inspection, source-row row-filter enforcement, and reprocess endpoints now exist and route through hosted/provisioned ownership.
+- Inspection API shape: admin-only versus public deep details, last-error reporting, and table-wide reprocessing controls. Collection listing, single-artifact manifest inspection, typed source/fingerprint/range/merge summaries, source-row row-filter enforcement, and reprocess endpoints now exist and route through hosted/provisioned ownership.
 - Split thresholds: initial default limits for unit count, bytes per range, and exceptional second-level splits under a huge unit.
 - File route config: the internal built-in route array shape and per-row metadata field hydration exist; the remaining decision is whether the first public version exposes them directly or wraps them in presets plus limited overrides.
 - Reprocessing semantics: table-wide backfill controls, priority, concurrency, and failure reporting.
