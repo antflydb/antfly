@@ -1955,8 +1955,13 @@ fn applyLiveAllDocFilterToNativeConstraintsAlloc(
     var owned_filter = filter;
     defer owned_filter.deinit(alloc);
 
+    // The include set came from the live filter itself; re-running the live
+    // filter over it would redo one visibility probe per document.
+    var already_filtered_executor = executor;
+    already_filtered_executor.live_filter_doc_set = null;
+
     const resolved_stored_filters_before_live_filter = out.resolved_stored_filters;
-    try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, &owned_filter, executor);
+    try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, &owned_filter, already_filtered_executor);
     out.resolved_stored_filters = resolved_stored_filters_before_live_filter;
 }
 
