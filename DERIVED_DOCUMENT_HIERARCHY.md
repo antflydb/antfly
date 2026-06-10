@@ -413,7 +413,7 @@ Current implementation status:
 - Public/internal routing now includes a bounded operational table-range repair endpoint, `POST /db/v1/tables/{table}/artifacts/{artifact}:reprocess`, with `from_key`, `to_key`, and `limit` controls plus scanned/reprocessed/skipped/failed counts and per-key failure codes. Hosted/provisioned implementations fan this out to shard-local group handlers and aggregate the bounded pass response.
 - PDF mechanical extraction now emits page-level provenance on units and unit-derived chunks, including `page_number`, a stable `page_label`, `page_bbox`, and source-document character spans. `page_rotation` remains nullable until the PDF reader exposes rotation.
 - Unit payloads are emitted as derived documents for full-text indexes whose source artifact matches the document-unit artifact name.
-- The synchronous precompute path and async enrichment runtime path both use the same artifact key/state contract.
+- The synchronous precompute path and async enrichment runtime path both use the same artifact key/state contract, including unit fingerprints in state.
 
 Still remaining in Phase 1:
 
@@ -469,7 +469,7 @@ Current implementation status:
 - Document extraction manifests now use `manifest_version: 2` and carry a monotonically advancing artifact `generation`.
 - Manifests include deterministic `child_ranges` for unit and chunk child key ranges, including range IDs, start/end keys, child counts, placement, and split-boundary metadata.
 - Document extraction state now stores per-unit fingerprints alongside unit keys, while retaining the older key arrays for cleanup compatibility.
-- Manifests include a converged `merge_plan` with `from_generation`, `to_generation`, `operation_granularity: "unit_fingerprint"`, and idempotent keep/upsert/delete summaries derived from previous state versus desired state.
+- Synchronous precompute and async enrichment runtime manifests include a converged `merge_plan` with `from_generation`, `to_generation`, `operation_granularity: "unit_fingerprint"`, and idempotent keep/upsert/delete summaries derived from previous state versus desired state.
 - Stable units whose unit fingerprint matches previous state can skip local artifact rewrites and embedding regeneration when the stored unit, chunk, and embedding artifacts already exist.
 - Full-text consumers for stable units are still routed through derived-document upserts that read from the stored unit/chunk artifacts. This avoids silent index holes without requiring the producer to prove every text shard already contains the child document.
 - The first implementation records range placement as `parent`; it establishes the parent-owned descriptor contract without moving child writes to separate shards yet.
