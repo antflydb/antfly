@@ -592,11 +592,7 @@ fn parseGoPortableTableManifest(
         else => return error.InvalidBackupRequest,
     };
     const schema_value = root.get("schema") orelse return error.InvalidBackupRequest;
-    // Go portable backups include legacy derived-index metadata/artifacts whose
-    // exact runtime configuration is not always parseable by the Zig index
-    // manager. Import the primary table data first; indexes can be recreated or
-    // rebuilt from the restored documents after the table is readable.
-    const indexes_json = try alloc.dupe(u8, "{}");
+    const indexes_json = try normalizeGoPortableIndexesJson(alloc, root.get("indexes"));
     errdefer alloc.free(indexes_json);
     const shards_value = switch (root.get("shards") orelse return error.InvalidBackupRequest) {
         .object => |object| object,
@@ -671,6 +667,121 @@ fn parseGoPortableTableManifest(
         .replication_sources_json = try alloc.dupe(u8, "[]"),
         .shards = shards,
     };
+}
+
+fn normalizeGoPortableIndexesJson(alloc: std.mem.Allocator, maybe_indexes: ?std.json.Value) ![]u8 {
+    const indexes = maybe_indexes orelse return try alloc.dupe(u8, "{}");
+    const object = switch (indexes) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) return error.InvalidBackupRequest;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonString(alloc, &out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        try appendGoPortableIndexConfigJson(alloc, &out, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendGoPortableIndexConfigJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    index_name: []const u8,
+    value: std.json.Value,
+) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+
+    var has_non_empty_name = false;
+    if (object.get("name")) |name_value| {
+        has_non_empty_name = switch (name_value) {
+            .string => |name| name.len > 0,
+            else => false,
+        };
+    }
+
+    try out.append(alloc, '{');
+    var first = true;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "name") and !has_non_empty_name) continue;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonString(alloc, out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        try appendGoPortableJsonValue(alloc, out, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    if (!has_non_empty_name) {
+        if (!first) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, "name");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, index_name);
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendGoPortableJsonValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    field_name: []const u8,
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .object => |object| {
+            try out.append(alloc, '{');
+            var first = true;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (!first) try out.append(alloc, ',');
+                first = false;
+                try appendJsonString(alloc, out, entry.key_ptr.*);
+                try out.append(alloc, ':');
+                try appendGoPortableJsonValue(alloc, out, entry.key_ptr.*, entry.value_ptr.*);
+            }
+            try out.append(alloc, '}');
+        },
+        .array => |array| {
+            try out.append(alloc, '[');
+            for (array.items, 0..) |item, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try appendGoPortableJsonValue(alloc, out, field_name, item);
+            }
+            try out.append(alloc, ']');
+        },
+        .string => |text| {
+            // Antfly Go 0.1.x portable metadata used the old local inference
+            // provider name "termite"; Zig's public index API calls the same
+            // local inference provider "antfly".
+            if (std.mem.eql(u8, field_name, "provider") and std.mem.eql(u8, text, "termite")) {
+                try appendJsonString(alloc, out, "antfly");
+            } else {
+                try appendJsonString(alloc, out, text);
+            }
+        },
+        else => {
+            const encoded = try stringifyJsonAlloc(alloc, value);
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        },
+    }
+}
+
+fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const encoded = try stringifyJsonAlloc(alloc, value);
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
 }
 
 fn portableShardLessThan(_: void, a: PortableShard, b: PortableShard) bool {
@@ -1444,7 +1555,7 @@ test "go portable metadata parses as table backup manifest" {
     try std.testing.expectEqualStrings(backup_id, manifest.backup_id);
     try std.testing.expectEqualStrings("docs", manifest.table_name);
     try std.testing.expectEqualStrings("{\"default_type\":\"doc\"}", manifest.schema_json);
-    try std.testing.expectEqualStrings("{}", manifest.indexes_json);
+    try std.testing.expectEqualStrings("{\"legacy_vec\":{\"type\":\"embeddings\",\"embedder\":{\"provider\":\"antfly\"},\"name\":\"legacy_vec\"}}", manifest.indexes_json);
     try std.testing.expectEqual(@as(usize, 1), manifest.shards.len);
     try std.testing.expectEqual(group_ids.dataGroupIdFromHash(1), manifest.shards[0].group_id);
     try std.testing.expectEqualStrings("", manifest.shards[0].start_key);

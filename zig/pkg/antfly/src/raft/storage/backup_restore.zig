@@ -236,7 +236,8 @@ fn applyPortableRestore(
     manifest: *const backups_api.TableBackupManifest,
     options: RestoreOptions,
 ) !void {
-    _ = manifest;
+    const embedding_source_fields = try portableEmbeddingSourceFieldsFromIndexesJson(alloc, manifest.indexes_json);
+    defer freePortableEmbeddingSourceFields(alloc, embedding_source_fields);
     var location = try backups_api.openBackupLocation(alloc, restore.location);
     defer location.deinit(alloc);
     const afb_path = try stageRestoreFile(alloc, path, &location, snapshot_path);
@@ -261,18 +262,69 @@ fn applyPortableRestore(
     try portable_backup.importPortableWithOptions(alloc, db.core.store, afb_data, .{
         .identity_namespace = options.expected_identity_namespace,
         .prefer_existing_identity_namespace = true,
-        .import_derived_indexes = false,
+        .import_derived_indexes = true,
+        .embedding_source_fields = embedding_source_fields,
     });
-    // Go portable AFBs may contain derived index artifacts encoded with the old
-    // backend layout. Restore the primary documents first and leave runtime
-    // indexes to normal rebuild/catch-up paths; partially importing/reconciling
-    // legacy index artifacts can make the table unreadable.
+    // Go portable AFBs may contain portable logical artifacts (for example
+    // embedding batches) as well as old on-disk index directories. Keep the
+    // logical artifacts in the DocStore, but drop runtime index directories so
+    // configured indexes are rebuilt by Zig.
     const indexes_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{path});
     defer alloc.free(indexes_path);
     db.close();
     db_closed = true;
     destroyPathIfExists(indexes_path);
-    try db_mod.DB.markRestoreCompleteForPath(alloc, path, restore.backup_id, restore.location, snapshot_path, group_id);
+    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, path, restore.backup_id, restore.location, snapshot_path, group_id);
+}
+
+fn portableEmbeddingSourceFieldsFromIndexesJson(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+) ![]portable_backup.ImportOptions.EmbeddingSourceField {
+    if (indexes_json.len == 0) return &.{};
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return &.{},
+    };
+
+    var fields = std.ArrayListUnmanaged(portable_backup.ImportOptions.EmbeddingSourceField).empty;
+    errdefer {
+        for (fields.items) |field| {
+            alloc.free(field.index_name);
+            alloc.free(field.field_name);
+        }
+        fields.deinit(alloc);
+    }
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const cfg = switch (entry.value_ptr.*) {
+            .object => |cfg| cfg,
+            else => continue,
+        };
+        const type_value = cfg.get("type") orelse continue;
+        if (type_value != .string) continue;
+        if (!std.mem.eql(u8, type_value.string, "embeddings") and !std.mem.eql(u8, type_value.string, "dense_vector")) continue;
+        const field_value = cfg.get("field") orelse continue;
+        if (field_value != .string or field_value.string.len == 0) continue;
+        try fields.append(alloc, .{
+            .index_name = try alloc.dupe(u8, entry.key_ptr.*),
+            .field_name = try alloc.dupe(u8, field_value.string),
+        });
+    }
+    return try fields.toOwnedSlice(alloc);
+}
+
+fn freePortableEmbeddingSourceFields(
+    alloc: std.mem.Allocator,
+    fields: []const portable_backup.ImportOptions.EmbeddingSourceField,
+) void {
+    for (fields) |field| {
+        alloc.free(field.index_name);
+        alloc.free(field.field_name);
+    }
+    if (fields.len > 0) alloc.free(fields);
 }
 
 fn portableSnapshotDocCount(alloc: std.mem.Allocator, afb_path: []const u8) !u64 {
