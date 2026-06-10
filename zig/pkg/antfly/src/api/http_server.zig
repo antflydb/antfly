@@ -5046,7 +5046,10 @@ pub const ApiHttpServer = struct {
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
-                error.EndOfStream => {
+                // FileNotFound surfaces when a read-only replica open races
+                // with the writer reclaiming obsolete LSM runs; reopening
+                // picks up a fresh manifest.
+                error.EndOfStream, error.FileNotFound => {
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
                     if (platform_time.monotonicNs() -| start_ns >= retry_timeout_ns) return err;
                     sleepNs(retry_poll_ns);
