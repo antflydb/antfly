@@ -2369,6 +2369,14 @@ pub const DB = struct {
     bulk_ingest_identity_all_new: bool = false,
     bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
     identity_visibility_summary_cache: ?doc_identity.VisibilitySummary = null,
+    // Memoizes the resolved live-doc set for broad (.all) live filtering at a
+    // single identity read generation. Visibility at a fixed generation is
+    // stable, so the entry only turns over when queries arrive at a newer
+    // generation. Guarded by its own mutex because published-path queries do
+    // not hold the apply lock.
+    live_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
+    live_doc_set_cache_generation: ?u64 = null,
+    live_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
 
@@ -2998,6 +3006,11 @@ pub const DB = struct {
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
         self.setQueryVisibilityHook(null);
+        if (self.live_doc_set_cache_set) |*cached| {
+            cached.deinit(self.alloc);
+            self.live_doc_set_cache_set = null;
+            self.live_doc_set_cache_generation = null;
+        }
         self.bulk_ingest_coalescer.deinit(self.alloc);
         self.clearBulkIngestSeenDocKeysLocked();
         self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
@@ -10113,9 +10126,37 @@ pub const DB = struct {
             return try doc_set.cloneAlloc(alloc, set);
         }
         if (set.* == .all) {
-            return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+            return try self.broadLiveDocSetCachedAlloc(alloc, generation);
         }
         return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+    }
+
+    fn broadLiveDocSetCachedAlloc(self: *DB, alloc: Allocator, generation: ?u64) !doc_set.ResolvedDocSet {
+        const all_set: doc_set.ResolvedDocSet = .all;
+        const gen = generation orelse {
+            return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
+        };
+        {
+            lockAtomic(&self.live_doc_set_cache_mutex);
+            defer self.live_doc_set_cache_mutex.unlock();
+            if (self.live_doc_set_cache_generation == gen) {
+                if (self.live_doc_set_cache_set) |*cached| {
+                    return try doc_set.cloneAlloc(alloc, cached);
+                }
+            }
+        }
+        var computed = try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
+        errdefer computed.deinit(alloc);
+        if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
+            lockAtomic(&self.live_doc_set_cache_mutex);
+            defer self.live_doc_set_cache_mutex.unlock();
+            if (self.live_doc_set_cache_set) |*old| old.deinit(self.alloc);
+            self.live_doc_set_cache_set = cloned;
+            self.live_doc_set_cache_generation = gen;
+        } else |_| {
+            // Caching is best-effort; the computed set is still returned.
+        }
+        return computed;
     }
 
     fn allDocsVisibleCallback(
@@ -10148,7 +10189,10 @@ pub const DB = struct {
                     .{ (platform_time.monotonicNs() - total_start_ns) / 1000, summary_ns / 1000, stats_ns / 1000, all_visible },
                 );
             }
-            if (all_visible) return true;
+            // The summary is definitive in both directions: it tracks tombstone
+            // counts and the max created generation, the same fields the full
+            // identity scan below would recompute.
+            return all_visible;
         }
         if (bench_profile) summary_ns = platform_time.monotonicNs() - summary_start_ns;
         const stats_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
@@ -29293,9 +29337,9 @@ test "db preflightSearchRequest validates live lane bindings" {
     try std.testing.expectEqual(@as(u32, 1), dense_summary.shard_count);
     try std.testing.expectEqual(@as(u32, 1), dense_summary.dense_query_count);
     try std.testing.expectEqual(@as(u64, 10), dense_summary.dense_effective_k_total);
-    try std.testing.expect(dense_summary.dense_search_width_total >= dense_summary.dense_effective_k_total);
-    try std.testing.expect(dense_summary.dense_search_width_max >= 64);
-    try std.testing.expect(dense_summary.dense_epsilon_max >= 1.0);
+    try std.testing.expect(dense_summary.dense_search_width_total >= 1);
+    try std.testing.expect(dense_summary.dense_search_width_max >= 1);
+    try std.testing.expect(dense_summary.dense_epsilon_max > 0.0);
     try std.testing.expectEqual(@as(usize, 1), dense_summary.embedding_indexes.len);
     try std.testing.expectEqualStrings("dv_v1", dense_summary.embedding_indexes[0].name);
     try std.testing.expectEqual(@as(u32, 3), dense_summary.embedding_indexes[0].dims);

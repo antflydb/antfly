@@ -26,6 +26,9 @@ pub const SearchRequest = struct {
     rerank_k: ?usize = null,
     search_width: ?u32 = null,
     epsilon: ?f32 = null,
+    // Multiplier on k for how many approximate candidates are retained for
+    // exact reranking. Defaults to the epsilon-derived legacy factor.
+    rerank_factor: ?usize = null,
     load_metadata: bool = true,
     filter_prefix: []const u8 = "",
     distance_over: ?f32 = null,
@@ -72,6 +75,10 @@ pub const SearchProfile = struct {
     approx_leaves_scored: u64 = 0,
     approx_vectors_scored: u64 = 0,
     exact_vectors_scored: u64 = 0,
+    // Leaves that fell back to exact member scoring because their quantized
+    // payload was stale (payload_dirty) or absent from storage.
+    leaf_payload_stale: u64 = 0,
+    leaf_payload_missing: u64 = 0,
     reranked_vectors: u64 = 0,
     approx_candidate_count: u64 = 0,
     rerank_candidate_count: u64 = 0,

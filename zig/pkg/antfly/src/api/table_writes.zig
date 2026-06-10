@@ -4084,6 +4084,34 @@ pub const ProvisionedTableWriteSource = struct {
         return progressed;
     }
 
+    pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
+        if (!self.local_db_mutex.tryLock()) return 0;
+        var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
+        var lease_alloc: std.mem.Allocator = std.heap.page_allocator;
+        {
+            defer self.local_db_mutex.unlock();
+            const cache = self.write_cache orelse return 0;
+            lease_alloc = cache.alloc;
+            for (cache.entries.items) |entry| {
+                if (entry.bulk_ingest_session_open) continue;
+                if (entry.db.hasActiveDenseBulkWork()) continue;
+                try leases.append(lease_alloc, cache.leaseEntryLocked(entry));
+            }
+        }
+        defer {
+            for (leases.items) |*lease| lease.deinit(lease_alloc);
+            leases.deinit(lease_alloc);
+        }
+        var total_steps: usize = 0;
+        for (leases.items) |lease| {
+            total_steps += lease.db.runDensePostingMaintenanceForIdle() catch |err| blk: {
+                std.log.warn("dense posting maintenance round failed: {}", .{err});
+                break :blk 0;
+            };
+        }
+        return total_steps;
+    }
+
     pub fn finishExpiredAutoBulkIngestBestEffort(self: *ProvisionedTableWriteSource) bool {
         return self.tryFinishExpiredAutoBulkIngest() orelse false;
     }

@@ -645,46 +645,92 @@ pub fn visiblePrimaryDocSetIfCompleteFromStoreAlloc(
     store: *docstore_mod.DocStore,
     generation: ?u64,
 ) !?doc_set.ResolvedDocSet {
-    const State = struct {
-        alloc: Allocator,
-        doc_ids: std.ArrayListUnmanaged([]u8) = .empty,
+    // Three bulk range scans joined through hash maps instead of two LSM point
+    // lookups per document. Intermediate state lives in one arena.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-        fn deinit(self: *@This()) void {
-            for (self.doc_ids.items) |doc_id| self.alloc.free(doc_id);
-            self.doc_ids.deinit(self.alloc);
-            self.* = undefined;
+    const StatesScan = struct {
+        arena: Allocator,
+        states: std.AutoHashMapUnmanaged(DocOrdinal, OrdinalState) = .empty,
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const ordinal = internal_keys.parseIdentityOrdinalKey(key, internal_keys.identity_ordinal_state_kind) orelse return .@"continue";
+            const ordinal_state = decodeOrdinalState(value) catch return .@"continue";
+            try state.states.put(state.arena, ordinal, ordinal_state);
+            return .@"continue";
         }
+    };
+    const state_lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_ordinal_state_kind };
+    const state_upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_ordinal_state_kind + 1 };
+    var states_scan = StatesScan{ .arena = arena };
+    try store.scanWithContext(state_lower[0..], state_upper[0..], .{}, &states_scan, StatesScan.scanEntry);
+
+    const OrdinalsScan = struct {
+        arena: Allocator,
+        ordinals_by_doc: std.StringHashMapUnmanaged(DocOrdinal) = .empty,
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (value.len != @sizeOf(u32)) return error.InvalidDocIdentity;
+            const ordinal = std.mem.readInt(u32, value[0..4], .big);
+            const doc_id = try parseIdentityDocToOrdinalKeyAlloc(state.arena, key);
+            try state.ordinals_by_doc.put(state.arena, doc_id, ordinal);
+            return .@"continue";
+        }
+    };
+    const doc_lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_doc_to_ordinal_kind };
+    const doc_upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_doc_to_ordinal_kind + 1 };
+    var ordinals_scan = OrdinalsScan{ .arena = arena };
+    try store.scanWithContext(doc_lower[0..], doc_upper[0..], .{}, &ordinals_scan, OrdinalsScan.scanEntry);
+
+    // Drive off the primary documents so the result keeps the original
+    // contract: only currently stored docs are included, and a stored doc with
+    // missing identity rows or one not visible at the requested generation
+    // makes the whole derivation inconclusive (null).
+    const PrimaryScan = struct {
+        arena: Allocator,
+        ordinals_by_doc: *const std.StringHashMapUnmanaged(DocOrdinal),
+        states: *const std.AutoHashMapUnmanaged(DocOrdinal, OrdinalState),
+        generation: ?u64,
+        ordinals: std.ArrayListUnmanaged(DocOrdinal) = .empty,
+        inconclusive: bool = false,
 
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             _ = value;
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            const doc_id = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.alloc, key)) orelse return .@"continue";
-            errdefer state.alloc.free(doc_id);
-            try state.doc_ids.append(state.alloc, doc_id);
+            const doc_id = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.arena, key)) orelse return .@"continue";
+            const ordinal = state.ordinals_by_doc.get(doc_id) orelse {
+                state.inconclusive = true;
+                return .stop;
+            };
+            const ordinal_state = state.states.get(ordinal) orelse {
+                state.inconclusive = true;
+                return .stop;
+            };
+            const visible = if (state.generation) |at| ordinal_state.isVisibleAt(at) else ordinal_state.isLive();
+            if (!visible) {
+                state.inconclusive = true;
+                return .stop;
+            }
+            try state.ordinals.append(state.arena, ordinal);
             return .@"continue";
         }
     };
-
     const lower = [_]u8{internal_keys.user_namespace};
     const upper = [_]u8{internal_keys.user_namespace + 1};
-    var state = State{ .alloc = alloc };
-    defer state.deinit();
-    try store.scanWithContext(lower[0..], upper[0..], .{}, &state, State.scanEntry);
+    var primary_scan = PrimaryScan{
+        .arena = arena,
+        .ordinals_by_doc = &ordinals_scan.ordinals_by_doc,
+        .states = &states_scan.states,
+        .generation = generation,
+    };
+    try store.scanWithContext(lower[0..], upper[0..], .{}, &primary_scan, PrimaryScan.scanEntry);
+    if (primary_scan.inconclusive) return null;
 
-    var txn = try store.beginProbeTxn();
-    defer txn.abort();
-
-    var ordinals = std.ArrayListUnmanaged(DocOrdinal).empty;
-    defer ordinals.deinit(alloc);
-    for (state.doc_ids.items) |doc_id| {
-        const ordinal = (try lookupOrdinalTxn(alloc, &txn, doc_id)) orelse return null;
-        const ordinal_state = (try lookupStateTxn(&txn, ordinal)) orelse return null;
-        const visible = if (generation) |at| ordinal_state.isVisibleAt(at) else ordinal_state.isLive();
-        if (!visible) return null;
-        try ordinals.append(alloc, ordinal);
-    }
-
-    return try doc_set.fromOrdinalsAlloc(alloc, ordinals.items);
+    return try doc_set.fromOrdinalsAlloc(alloc, primary_scan.ordinals.items);
 }
 
 const DocOrdinalRow = struct {
