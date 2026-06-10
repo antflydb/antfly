@@ -6931,6 +6931,48 @@ pub const DB = struct {
         return self.persistedReplayStageStats(promotion_runtime_mod.scope_name, false) catch .{};
     }
 
+    fn resolverReplayDiagnosticsLocked(self: *DB, alloc: Allocator) !types.ResolverReplayDiagnostics {
+        const catalog = self.core.index_manager.resolvers.items;
+        var resolvers = try alloc.alloc(types.ResolverReplayDiagnostic, catalog.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (resolvers[0..initialized]) |resolver| {
+                alloc.free(resolver.name);
+                alloc.free(resolver.table);
+                alloc.free(resolver.source_artifact);
+                alloc.free(resolver.resolution_artifact);
+            }
+            if (resolvers.len > 0) alloc.free(resolvers);
+        }
+
+        for (catalog) |cfg| {
+            const name = try alloc.dupe(u8, cfg.name);
+            errdefer alloc.free(name);
+            const table = try alloc.dupe(u8, cfg.table);
+            errdefer alloc.free(table);
+            const source_artifact = try alloc.dupe(u8, cfg.source_artifact);
+            errdefer alloc.free(source_artifact);
+            const resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact);
+            errdefer alloc.free(resolution_artifact);
+            resolvers[initialized] = .{
+                .name = name,
+                .table = table,
+                .source_artifact = source_artifact,
+                .resolution_artifact = resolution_artifact,
+            };
+            initialized += 1;
+        }
+
+        return .{
+            .resolver_count = @intCast(catalog.len),
+            .resolution_runtime_present = self.resolution_runtime != null,
+            .resolution_worker_started = if (self.resolution_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .promotion_runtime_present = self.promotion_runtime != null,
+            .promotion_worker_started = if (self.promotion_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .resolvers = resolvers[0..initialized],
+        };
+    }
+
     fn persistedEnrichmentStats(self: *DB) !types.EnrichmentStats {
         if (!self.core.hasGeneratedEnrichmentTargets()) return .{};
         const resources = self.core.batchExecutionResources();
@@ -8780,6 +8822,7 @@ pub const DB = struct {
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
+            .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot(),
@@ -8948,6 +8991,7 @@ pub const DB = struct {
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try self.persistedEnrichmentStats(),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
+            .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
@@ -9035,6 +9079,7 @@ pub const DB = struct {
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
+            .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .async_indexing = self.async_context.stats.snapshot(),
         };
     }
