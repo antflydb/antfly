@@ -748,8 +748,11 @@ Current slice:
   policy says the accumulated layout debt is worth a repair pass. Profiled
   dense searches also feed a query-pressure guardrail:
   `ANTFLY_DENSE_POSTING_IDLE_MAX_PROFILED_SEARCH_NS=0` disables it, while a
-  non-zero value makes idle posting maintenance skip when the most recent
-  profiled dense query exceeded that latency budget. The profiled
+  non-zero value makes idle posting maintenance skip when a recent profiled
+  dense query exceeded that latency budget. The recency window defaults to one
+  second and is controlled by
+  `ANTFLY_DENSE_POSTING_IDLE_PROFILED_SEARCH_MAX_AGE_NS`, so one cold or slow
+  profiled query cannot suppress idle repair indefinitely. The profiled
   idle-maintenance path reports scanned indexes, repaired indexes, elapsed
   time, and whether the pass stopped on index-count, elapsed-time, resource, or
   query-guardrail budget.

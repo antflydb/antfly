@@ -381,6 +381,7 @@ const dense_posting_idle_default_max_boundary_reassignments_per_index: usize = 6
 const dense_posting_idle_default_max_indexes_per_run: usize = std.math.maxInt(usize) - 1;
 const dense_posting_idle_default_max_elapsed_ns: usize = 0;
 const dense_posting_idle_default_max_profiled_search_ns: u64 = 0;
+const dense_posting_idle_default_profiled_search_max_age_ns: u64 = std.time.ns_per_s;
 const dense_posting_idle_max_convergence_passes: usize = 1024;
 const applied_sequence_flush_interval_ns: u64 = 100 * std.time.ns_per_ms;
 
@@ -2413,6 +2414,7 @@ pub const DB = struct {
     dense_posting_maintenance_stats: types.DensePostingMaintenanceStats = .{},
     profiled_dense_search_observations: AtomicU64 = AtomicU64.init(0),
     profiled_dense_search_last_ns: AtomicU64 = AtomicU64.init(0),
+    profiled_dense_search_last_observed_ns: AtomicU64 = AtomicU64.init(0),
     profiled_dense_search_max_ns: AtomicU64 = AtomicU64.init(0),
 
     const engine_vtable = db_core.Engine.VTable{
@@ -7035,9 +7037,7 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         const query_guardrail_threshold_ns = densePostingIdleMaxProfiledSearchNs();
-        if (query_guardrail_threshold_ns != 0 and
-            self.profiled_dense_search_last_ns.load(.monotonic) > query_guardrail_threshold_ns)
-        {
+        if (self.hasRecentProfiledDenseSearchOverGuardrail(query_guardrail_threshold_ns, platform_time.monotonicNs())) {
             const result: index_manager_mod.IndexManager.DensePostingMaintenanceResult = .{
                 .stopped_by_query_guardrail = true,
             };
@@ -8677,7 +8677,18 @@ pub const DB = struct {
     fn recordProfiledDenseSearch(self: *DB, profile: db_query_search.DenseSearchProfile) void {
         _ = self.profiled_dense_search_observations.fetchAdd(1, .monotonic);
         self.profiled_dense_search_last_ns.store(profile.total_ns, .monotonic);
+        self.profiled_dense_search_last_observed_ns.store(platform_time.monotonicNs(), .monotonic);
         atomicMaxU64(&self.profiled_dense_search_max_ns, profile.total_ns);
+    }
+
+    fn hasRecentProfiledDenseSearchOverGuardrail(self: *DB, threshold_ns: u64, now_ns: u64) bool {
+        if (threshold_ns == 0) return false;
+        if (self.profiled_dense_search_last_ns.load(.monotonic) <= threshold_ns) return false;
+        const observed_ns = self.profiled_dense_search_last_observed_ns.load(.monotonic);
+        if (observed_ns == 0) return false;
+        const max_age_ns = densePostingIdleProfiledSearchMaxAgeNs();
+        if (max_age_ns == 0) return false;
+        return now_ns -| observed_ns <= max_age_ns;
     }
 
     fn snapshotDensePostingMaintenanceStats(self: *DB) types.DensePostingMaintenanceStats {
@@ -15020,6 +15031,7 @@ var dense_posting_idle_max_boundary_reassignments_cache = std.atomic.Value(usize
 var dense_posting_idle_max_indexes_cache = std.atomic.Value(usize).init(0);
 var dense_posting_idle_max_elapsed_ns_cache = std.atomic.Value(usize).init(0);
 var dense_posting_idle_max_profiled_search_ns_cache = AtomicU64.init(0);
+var dense_posting_idle_profiled_search_max_age_ns_cache = AtomicU64.init(0);
 
 fn cachedEnvUsize(cache: *std.atomic.Value(usize), name: [:0]const u8, default_value: usize) usize {
     const cached = cache.load(.acquire);
@@ -15265,6 +15277,14 @@ fn densePostingIdleMaxProfiledSearchNs() u64 {
         &dense_posting_idle_max_profiled_search_ns_cache,
         "ANTFLY_DENSE_POSTING_IDLE_MAX_PROFILED_SEARCH_NS",
         dense_posting_idle_default_max_profiled_search_ns,
+    );
+}
+
+fn densePostingIdleProfiledSearchMaxAgeNs() u64 {
+    return cachedEnvU64(
+        &dense_posting_idle_profiled_search_max_age_ns_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_PROFILED_SEARCH_MAX_AGE_NS",
+        dense_posting_idle_default_profiled_search_max_age_ns,
     );
 }
 
@@ -29015,6 +29035,8 @@ test "db dense posting maintenance query guardrail skips after slow profiled den
 
     dense_posting_idle_max_profiled_search_ns_cache.store(2, .release);
     defer dense_posting_idle_max_profiled_search_ns_cache.store(0, .release);
+    dense_posting_idle_profiled_search_max_age_ns_cache.store(std.time.ns_per_s + 1, .release);
+    defer dense_posting_idle_profiled_search_max_age_ns_cache.store(0, .release);
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -29073,6 +29095,19 @@ test "db dense posting maintenance query guardrail skips after slow profiled den
     try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.query_guardrail_threshold_ns);
     try std.testing.expect(stats.dense_posting_maintenance.last_stopped_by_query_guardrail);
     try std.testing.expectEqual(@as(u64, 1), stats.dense_posting_maintenance.query_guardrail_stop_runs);
+
+    db.profiled_dense_search_last_observed_ns.store(platform_time.monotonicNs() -| std.time.ns_per_ms, .release);
+    dense_posting_idle_profiled_search_max_age_ns_cache.store(2, .release);
+
+    const resumed = try db.runDensePostingMaintenanceForIdleProfiled();
+    try std.testing.expect(!resumed.stopped_by_query_guardrail);
+    try std.testing.expect(resumed.total_steps > 0);
+
+    const resumed_stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, resumed_stats);
+    try std.testing.expectEqual(@as(u64, 0), resumed_stats.indexes[0].hbc_posting.dirty_postings);
+    try std.testing.expectEqual(@as(u64, 1), resumed_stats.dense_posting_maintenance.query_guardrail_stop_runs);
+    try std.testing.expect(!resumed_stats.dense_posting_maintenance.last_stopped_by_query_guardrail);
 }
 
 test "db dense posting maintenance can submit through backend runtime" {
