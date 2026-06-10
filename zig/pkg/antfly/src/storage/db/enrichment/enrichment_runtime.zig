@@ -1847,11 +1847,11 @@ fn processDocumentExtractionAsset(
         runtime.alloc.free(text_indexes);
     }
 
-    const chunk_range_base_index = documentExtractionRangeCount(desired_unit_keys.items.len);
+    const chunk_range_base_index = documentExtractionUnitRangeCount(extraction.units);
     for (extraction.units, 0..) |unit, unit_index| {
         const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, unit.unit_id);
         defer runtime.alloc.free(unit_key);
-        const unit_range_id = try documentExtractionRangeIdAlloc(runtime.alloc, unit_index / document_extraction_range_target_children);
+        const unit_range_id = try documentExtractionRangeIdAlloc(runtime.alloc, documentExtractionUnitRangeIndex(extraction.units, unit_index));
         defer runtime.alloc.free(unit_range_id);
         const unit_route = documentExtractionRangeRoute(previous_child_ranges, unit_range_id, "unit", artifact_name);
         const payload = try documentUnitPayloadAlloc(runtime.alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type, unit_route);
@@ -4375,10 +4375,32 @@ fn documentUnitConfidence(unit: document_extraction_mod.Unit) ?f64 {
 }
 
 const document_extraction_range_target_children = 256;
+const document_extraction_range_target_text_bytes = 1024 * 1024;
 
 fn documentExtractionRangeCount(key_count: usize) usize {
     if (key_count == 0) return 0;
     return (key_count + document_extraction_range_target_children - 1) / document_extraction_range_target_children;
+}
+
+fn documentExtractionUnitRangeCount(units: []const document_extraction_mod.Unit) usize {
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < units.len) {
+        count += 1;
+        start = documentExtractionRangeEnd(units.len, units, start);
+    }
+    return count;
+}
+
+fn documentExtractionUnitRangeIndex(units: []const document_extraction_mod.Unit, unit_index: usize) usize {
+    var range_index: usize = 0;
+    var start: usize = 0;
+    while (start < units.len) : (range_index += 1) {
+        const end = documentExtractionRangeEnd(units.len, units, start);
+        if (unit_index < end) return range_index;
+        start = end;
+    }
+    return range_index;
 }
 
 fn documentExtractionRangeIdAlloc(alloc: Allocator, range_index: usize) ![]u8 {
@@ -4546,7 +4568,7 @@ fn appendDocumentExtractionKeyRanges(
 ) !void {
     var start: usize = 0;
     while (start < keys.len) {
-        const end = @min(start + document_extraction_range_target_children, keys.len);
+        const end = documentExtractionRangeEnd(keys.len, units, start);
         if (first_range.*) {
             first_range.* = false;
         } else {
@@ -4579,6 +4601,25 @@ fn appendDocumentExtractionKeyRanges(
         range_index.* += 1;
         start = end;
     }
+}
+
+fn documentExtractionRangeEnd(
+    key_count: usize,
+    units: []const document_extraction_mod.Unit,
+    start: usize,
+) usize {
+    var end = start;
+    var text_bytes: usize = 0;
+    const use_text_limit = units.len == key_count;
+    while (end < key_count and end - start < document_extraction_range_target_children) {
+        if (use_text_limit) {
+            const unit_bytes = units[end].text.len;
+            if (end > start and text_bytes + unit_bytes > document_extraction_range_target_text_bytes) break;
+            text_bytes += unit_bytes;
+        }
+        end += 1;
+    }
+    return end;
 }
 
 fn findDocumentArtifactChildRange(

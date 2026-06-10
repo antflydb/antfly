@@ -486,6 +486,7 @@ Current implementation status:
 - Split finalization now marks parent-owned, split-eligible child ranges that physically move to the split-off shard as `remote_committed`, assigns the new owner group, advances placement generation, and records the manifest update before the parent shard prunes the moved child rows.
 - Remote child-range dispatch now uses a durable source-shard outbox. Parent commits atomically enqueue remote child batches under replay metadata, dispatcher success deletes the outbox row, and later writes or explicit drains can retry entries that survived a destination-group outage after the parent commit.
 - Manifests now include a durable `coverage_plan` stating that full-text replay remains `stored_artifact_required`, replay suppression is false, and coverage watermarks are required before any future suppression. This keeps stable-unit replay correctness explicit rather than relying on an implicit code-path convention.
+- Child range planning now uses deterministic initial thresholds: unit ranges split at 256 units or 1 MiB of unit text, whichever comes first, while keeping any single oversized unit intact as its own range. Chunk ranges keep the 256-child threshold and are numbered after the computed unit ranges so payload route metadata and manifest descriptors stay aligned in sync and async extraction.
 
 ### Phase 4: Graph extraction over units
 
@@ -690,7 +691,7 @@ The high-level model is settled enough to start implementation. The pieces that 
 
 - Query response shape: exact request and response schema for hierarchy rollups, grouped hits, and hydrated ancestors.
 - Inspection API shape: admin-only versus public deep details, filter-aware/user-facing repair policy, per-shard cursors, and long-running table-wide reprocessing jobs. Collection listing, single-artifact manifest inspection, typed source/fingerprint/range/merge/error summaries, source-row row-filter enforcement for per-document operations, bounded table-range repair, and hosted/provisioned routing now exist.
-- Split thresholds: initial default limits for unit count, bytes per range, and exceptional second-level splits under a huge unit.
+- Split thresholds: the first unit-level defaults are implemented as 256 units or 1 MiB of unit text per range; the remaining decision is the exceptional second-level split policy under a single huge unit.
 - File route config: the internal built-in route array shape and per-row metadata field hydration exist; the remaining decision is whether the first public version exposes them directly or wraps them in presets plus limited overrides.
 - Reprocessing semantics: background job scheduling, priority, concurrency, per-shard cursors, and durable progress reporting beyond the bounded synchronous table-range repair endpoint.
 - Entity resolver contract: how mention artifacts are subscribed into canonical graph/entity namespaces.
