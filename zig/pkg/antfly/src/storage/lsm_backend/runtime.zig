@@ -34,6 +34,39 @@ const namespaceOf = state_mod.namespaceOf;
 const compareNamespace = state_mod.compareNamespace;
 const compareEntryTo = state_mod.compareEntryTo;
 
+fn hashBulkEntryKey(namespace: backend_types.Namespace, key: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    if (namespace.name) |name| hasher.update(name);
+    hasher.update(&.{0});
+    hasher.update(key);
+    return hasher.final();
+}
+
+fn bulkStateHasDuplicateKeys(allocator: Allocator, state: *const State) !bool {
+    var index: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(usize)) = .{};
+    defer {
+        var values = index.valueIterator();
+        while (values.next()) |bucket| bucket.deinit(allocator);
+        index.deinit(allocator);
+    }
+
+    for (state.entries.items, 0..) |entry, idx| {
+        const namespace = namespaceOf(entry);
+        const hash = hashBulkEntryKey(namespace, entry.key);
+        const gop = try index.getOrPut(allocator, hash);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = std.ArrayListUnmanaged(usize).empty;
+        } else {
+            for (gop.value_ptr.items) |existing_idx| {
+                const existing = state.entries.items[existing_idx];
+                if (compareEntryTo(existing, namespace, entry.key) == .eq) return true;
+            }
+        }
+        try gop.value_ptr.append(allocator, idx);
+    }
+    return false;
+}
+
 fn releaseHeldBlocks(held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle), allocator: Allocator) void {
     for (held_blocks.items) |*handle| handle.release();
     held_blocks.deinit(allocator);
@@ -3137,52 +3170,60 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (finalize_err) |err| return err;
         }
 
+        fn drainBulkAppendsToMutable(self: *@This()) !void {
+            if (self.bulk_appends.entries.items.len == 0) return;
+            try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+        }
+
         fn tryCommitDirectBulkAppends(self: *@This()) !bool {
-            var entries = self.bulk_appends.entries.items.len;
+            const entries = self.bulk_appends.entries.items.len;
             if (entries == 0) return false;
             if (self.batch_options.mode != .bulk_ingest) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackNonBulk")) self.backend.recordBulkAppendFallbackNonBulk(entries);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                try self.drainBulkAppendsToMutable();
                 return false;
             }
             if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackUnsupported")) self.backend.recordBulkAppendFallbackUnsupported(entries);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                try self.drainBulkAppendsToMutable();
                 return false;
             }
             if (self.backend.mutable.entries.items.len != 0 and @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest")) {
                 if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
                     if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                     if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
-                    try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                    try self.drainBulkAppendsToMutable();
                     return false;
                 }
             }
             if (self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                try self.drainBulkAppendsToMutable();
                 return false;
             }
             if (self.mutable.entries.items.len > 0) {
-                try state_mod.applyMutableMoveToMutable(&self.bulk_appends, self.allocator, &self.mutable);
-                entries = self.bulk_appends.entries.items.len;
+                try self.drainBulkAppendsToMutable();
+                return false;
             }
             if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+
+            const duplicate_check_start_ns = platform_time.monotonicNs();
+            if (try bulkStateHasDuplicateKeys(self.allocator, &self.bulk_appends)) {
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, elapsedNs(duplicate_check_start_ns));
+                try self.drainBulkAppendsToMutable();
+                return false;
+            }
 
             const sort_start_ns = platform_time.monotonicNs();
             state_mod.sortStateEntries(&self.bulk_appends);
             const sort_ns = elapsedNs(sort_start_ns);
-            if (!bulkStateEntriesAreUnique(&self.bulk_appends)) {
-                if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, sort_ns);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
-                return false;
-            }
+            std.debug.assert(bulkStateEntriesAreUnique(&self.bulk_appends));
             if (!self.backend.shouldDirectIngestBulkState(&self.bulk_appends)) {
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackBelowThreshold")) self.backend.recordBulkAppendFallbackBelowThreshold(entries, sort_ns);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                try self.drainBulkAppendsToMutable();
                 return false;
             }
 
@@ -3414,12 +3455,13 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, self.namespace, key, value, false);
             self.invalidateCursorSnapshot();
         }
 
         pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
-            if (self.batch_options.mode == .bulk_ingest) {
+            if (self.batch_options.mode == .bulk_ingest and self.mutable.entries.items.len == 0) {
                 const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
                 try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, self.namespace, key, value, false));
                 self.invalidateCursorSnapshot();
@@ -3430,6 +3472,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn delete(self: *@This(), key: []const u8) !void {
+            try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, self.namespace, key, "", true);
             self.invalidateCursorSnapshot();
         }
@@ -5716,52 +5759,60 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             if (finalize_err) |err| return err;
         }
 
+        fn drainBulkAppendsToMutable(self: *@This()) !void {
+            if (self.bulk_appends.entries.items.len == 0) return;
+            try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+        }
+
         fn tryCommitDirectBulkAppends(self: *@This()) !bool {
-            var entries = self.bulk_appends.entries.items.len;
+            const entries = self.bulk_appends.entries.items.len;
             if (entries == 0) return false;
             if (self.batch_options.mode != .bulk_ingest) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackNonBulk")) self.backend.recordBulkAppendFallbackNonBulk(entries);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                try self.drainBulkAppendsToMutable();
                 return false;
             }
             if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackUnsupported")) self.backend.recordBulkAppendFallbackUnsupported(entries);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                try self.drainBulkAppendsToMutable();
                 return false;
             }
             if (self.backend.mutable.entries.items.len != 0 and @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest")) {
                 if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
                     if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                     if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
-                    try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                    try self.drainBulkAppendsToMutable();
                     return false;
                 }
             }
             if (self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                try self.drainBulkAppendsToMutable();
                 return false;
             }
             if (self.mutable.entries.items.len > 0) {
-                try state_mod.applyMutableMoveToMutable(&self.bulk_appends, self.allocator, &self.mutable);
-                entries = self.bulk_appends.entries.items.len;
+                try self.drainBulkAppendsToMutable();
+                return false;
             }
             if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+
+            const duplicate_check_start_ns = platform_time.monotonicNs();
+            if (try bulkStateHasDuplicateKeys(self.allocator, &self.bulk_appends)) {
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, elapsedNs(duplicate_check_start_ns));
+                try self.drainBulkAppendsToMutable();
+                return false;
+            }
 
             const sort_start_ns = platform_time.monotonicNs();
             state_mod.sortStateEntries(&self.bulk_appends);
             const sort_ns = elapsedNs(sort_start_ns);
-            if (!bulkStateEntriesAreUnique(&self.bulk_appends)) {
-                if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, sort_ns);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
-                return false;
-            }
+            std.debug.assert(bulkStateEntriesAreUnique(&self.bulk_appends));
             if (!self.backend.shouldDirectIngestBulkState(&self.bulk_appends)) {
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackBelowThreshold")) self.backend.recordBulkAppendFallbackBelowThreshold(entries, sort_ns);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                try self.drainBulkAppendsToMutable();
                 return false;
             }
 
@@ -5877,12 +5928,13 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn put(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
+            try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, namespace, key, value, false);
             self.invalidateCursorSnapshot();
         }
 
         pub fn appendPut(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
-            if (self.batch_options.mode == .bulk_ingest) {
+            if (self.batch_options.mode == .bulk_ingest and self.mutable.entries.items.len == 0) {
                 const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
                 try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, namespace, key, value, false));
                 self.invalidateCursorSnapshot();
@@ -5893,6 +5945,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn delete(self: *@This(), namespace: backend_types.Namespace, key: []const u8) !void {
+            try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, namespace, key, "", true);
             self.invalidateCursorSnapshot();
         }

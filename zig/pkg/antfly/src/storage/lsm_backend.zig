@@ -6361,6 +6361,67 @@ test "lsm backend direct-ingests threshold-sized bulk batches" {
     try std.testing.expectEqualStrings("D", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:d"));
 }
 
+test "lsm backend direct bulk append duplicate keys preserve last write wins" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 2,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.appendPut(.{ .name = "docs" }, "doc:a", "A1");
+        try txn.appendPut(.{ .name = "docs" }, "doc:b", "B");
+        try txn.appendPut(.{ .name = "docs" }, "doc:a", "A2");
+        try std.testing.expectEqualStrings("A2", try txn.get(.{ .name = "docs" }, "doc:a"));
+        try txn.commit();
+    }
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.bulk_append_fallback_duplicate_keys);
+    try std.testing.expectEqualStrings("A2", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("B", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
+}
+
+test "lsm backend bulk append mixed deletes use normal overlay semantics" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 2,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.appendPut(.{ .name = "docs" }, "doc:a", "A");
+        try txn.delete(.{ .name = "docs" }, "doc:a");
+        try std.testing.expectError(error.NotFound, txn.get(.{ .name = "docs" }, "doc:a"));
+        try txn.commit();
+    }
+
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+}
+
+test "lsm runtime bulk append after put preserves write order" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 2,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var txn = try runtime.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put("doc:a", "A1");
+        try txn.appendPut("doc:a", "A2");
+        try std.testing.expectEqualStrings("A2", try txn.get("doc:a"));
+        try txn.commit();
+    }
+
+    try std.testing.expectEqualStrings("A2", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+}
+
 test "lsm backend direct bulk ingest drains existing mutable before threshold batch" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1,

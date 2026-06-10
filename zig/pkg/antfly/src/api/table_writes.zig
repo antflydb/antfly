@@ -64,6 +64,7 @@ const auto_bulk_ingest_max_window_ops: usize = 25_000;
 const auto_bulk_ingest_max_hbc_leaf_splits_per_publish: usize = 256;
 const provisioned_write_coalesce_max_waiters: usize = 64;
 const provisioned_write_coalesce_max_ops: usize = 10_000;
+const startup_obsolete_reclaim_max_steps: usize = 64;
 // Explicit cache bulk sessions are reserved for rebuild/import paths. Normal
 // API uploads no longer start these windows automatically; DB/storage owns
 // online write batching and L0 maintenance for ordinary write traffic.
@@ -3971,6 +3972,7 @@ pub const ProvisionedTableWriteSource = struct {
             break :db_blk &uncached_db.?;
         };
         defer if (uncached_db) |*owned| owned.close();
+        _ = try db.runDueLsmObsoleteReclaimUntilIdle(startup_obsolete_reclaim_max_steps);
         try publishStartupCatchUpRuntimeStatusSnapshot(
             self,
             alloc,
@@ -3986,12 +3988,16 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn runLsmMaintenanceRound(self: *ProvisionedTableWriteSource) !bool {
+        var primary_only = false;
         var leased = blk: {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
             const cache = self.write_cache orelse return false;
             if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
-            if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
+            if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| {
+                primary_only = true;
+                break :blk lease;
+            }
             if (cache.maxLsmMaintenanceScoreLocked() == 0) return false;
             break :blk cache.leaseLsmMaintenanceRoundLocked() orelse return false;
         };
@@ -4000,7 +4006,10 @@ pub const ProvisionedTableWriteSource = struct {
             leased.deinit(release_alloc);
         }
         const maintenance_table_name = if (leased.entry) |entry| entry.table_name else null;
-        const progressed = try leased.db.runLsmMaintenanceStep();
+        const progressed = if (primary_only)
+            try leased.db.runPrimaryLsmMaintenanceStep()
+        else
+            try leased.db.runLsmMaintenanceStep();
         if (maintenance_table_name) |table_name| {
             const should_invalidate_read_cache = progressed or blk: {
                 const stats = leased.db.trySnapshotLsmMaintenanceStats() orelse break :blk false;
@@ -4018,7 +4027,10 @@ pub const ProvisionedTableWriteSource = struct {
             defer self.local_db_mutex.unlock();
             const cache = self.write_cache orelse return false;
             if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
-            if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
+            if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| {
+                primary_only = true;
+                break :blk lease;
+            }
             if (cache.maxLsmMaintenanceScoreLocked() != 0) {
                 if (cache.leaseLsmMaintenanceRoundBestEffortLocked()) |lease| break :blk lease;
             }
@@ -18171,6 +18183,54 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
+}
+
+test "managed startup catch-up reclaims due obsolete primary run files" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-obsolete-reclaim", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+    const indexes_json = "{\"indexes\":[]}";
+
+    var obsolete_path: []u8 = undefined;
+    {
+        var seeded = try openManagedDbWithIndexesJsonAndCacheMode(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null, .default);
+        defer seeded.close();
+
+        const primary_backend = seeded.core.primary_store_owner.lsmBackend() orelse return error.SkipZigTest;
+        const primary_root = primary_backend.root_dir orelse return error.TestUnexpectedResult;
+        obsolete_path = try lsm_backend.repository.runPath(alloc, primary_root, 777_777);
+        errdefer alloc.free(obsolete_path);
+        try lsm_backend.repository.writeFileAbsoluteWithStorage(primary_backend.storage.?, obsolete_path, "obsolete");
+        {
+            const locked = lsm_backend.runtime.lockBackend(lsm_backend.Backend, primary_backend);
+            defer lsm_backend.runtime.unlockBackend(lsm_backend.Backend, primary_backend, locked);
+            try primary_backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+            try primary_backend.persistManifest();
+        }
+    }
+    defer alloc.free(obsolete_path);
+
+    try std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{});
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    source.runtime_status_cache = &snapshot_cache;
+
+    const result = try source.catchUpTableGroupBestEffortWithIndexesJson(alloc, 7001, "docs", indexes_json);
+    try std.testing.expect(!result.busy);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{}));
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(@as(u64, 0), statuses.items[0].lsm_storage_stats.?.obsolete_paths_reclaimable);
 }
 
 test "managed startup catch-up bypasses shared write cache" {
