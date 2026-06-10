@@ -38,6 +38,7 @@ const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const table_catalog = @import("table_catalog.zig");
 const tables_api = @import("tables.zig");
 const table_reads = @import("table_reads.zig");
@@ -1100,19 +1101,20 @@ pub const ApiHttpServer = struct {
             items.deinit(self.alloc);
         }
 
+        var read_needs_refresh = false;
         if (self.table_reads) |source| {
             if (try source.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
+                read_needs_refresh = runtimeStatusesNeedDenseVisibilityRefresh(owned.items);
                 try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, .append);
             }
-        } else {
-            if (self.table_writes) |source| {
-                if (try source.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
-                    var owned = statuses;
-                    errdefer owned.deinit(self.alloc);
-                    try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, .append);
-                }
+        }
+        if ((self.table_reads == null or read_needs_refresh) and self.table_writes != null) {
+            if (try self.table_writes.?.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
+                var owned = statuses;
+                errdefer owned.deinit(self.alloc);
+                try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, if (read_needs_refresh) .replace_existing else .append);
             }
         }
         if (snapshot) |admin_snapshot| {
@@ -1123,6 +1125,29 @@ pub const ApiHttpServer = struct {
             return null;
         }
         return .{ .items = try items.toOwnedSlice(self.alloc) };
+    }
+
+    fn indexHasDenseVisibilityFacts(item: db_mod.types.DBIndexStats) bool {
+        return item.doc_count > 0 or item.term_count > 0 or item.edge_count > 0 or item.node_count > 0 or item.root_node > 0;
+    }
+
+    fn runtimeStatusNeedsDenseVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
+        const has_primary_facts = status.stats.doc_identity.live_ordinals != 0 or status.stats.doc_count != 0;
+        for (status.stats.indexes) |item| {
+            if (item.kind != .dense_vector) continue;
+            if (indexHasDenseVisibilityFacts(item)) continue;
+            if (item.replay_applied_sequence != 0 or item.replay_target_sequence != 0) continue;
+            if (has_primary_facts) return true;
+            return status.metadata.source == .live_writer_publish;
+        }
+        return false;
+    }
+
+    fn runtimeStatusesNeedDenseVisibilityRefresh(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
+        for (statuses) |status| {
+            if (runtimeStatusNeedsDenseVisibilityRefresh(status)) return true;
+        }
+        return false;
     }
 
     const LocalRuntimeAppendMode = enum {
@@ -1436,17 +1461,35 @@ pub const ApiHttpServer = struct {
 
         var doc_count: u64 = 0;
         for (local_statuses.items) |item| doc_count +|= item.stats.doc_count;
+        const direct_lsm_status = try self.bestEffortLsmStorageStatus(table_name);
         return .{
             .table_name = table_name,
             .empty = doc_count == 0,
-            .lsm = try self.bestEffortLsmStorageStatus(table_name),
+            .lsm = direct_lsm_status orelse liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items),
         };
+    }
+
+    fn liveLsmStorageStatusFromRuntimeStatuses(
+        statuses: []const runtime_status.LocalTableRuntimeStatus,
+    ) ?tables_api.LsmStorageStatus {
+        var saw_lsm_stats = false;
+        var aggregate = runtime_status.LsmStorageStats{};
+        for (statuses) |status| {
+            const stats = status.lsm_storage_stats orelse continue;
+            saw_lsm_stats = true;
+            lsm_backend.Backend.accumulateMaintenanceStats(&aggregate.maintenance, stats.maintenance);
+            lsm_backend.Backend.accumulateWriteStats(&aggregate.write, stats.write);
+            aggregate.maintenance_score = @max(aggregate.maintenance_score, stats.maintenance_score);
+            aggregate.maintenance_debt_hint = @max(aggregate.maintenance_debt_hint, stats.maintenance_debt_hint);
+        }
+        if (!saw_lsm_stats) return null;
+        return tables_api.lsmStorageStatusFromStats(aggregate);
     }
 
     fn bestEffortLsmStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.LsmStorageStatus {
         const source = self.table_reads orelse return null;
-        const stats = (try source.lsmStorageStats(table_name)) orelse return null;
-        return tables_api.lsmStorageStatusFromMaintenanceStats(stats.maintenance);
+        const stats = (try source.lsmStorageStats(self.alloc, table_name)) orelse return null;
+        return tables_api.lsmStorageStatusFromStats(stats);
     }
 
     pub fn bestEffortSingleTableStorageStatuses(
@@ -13009,6 +13052,110 @@ test "api http server table status uses runtime stats without probing storage" {
     var parsed = try std.json.parseFromSlice(TableStatusResponse, alloc, resp.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(?bool, false), parsed.value.storage_status.empty);
+}
+
+test "api http server storage status prefers direct lsm stats over runtime cache" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeReads = struct {
+        runtime_status_calls: std.atomic.Value(u32) = .init(0),
+        lsm_status_calls: std.atomic.Value(u32) = .init(0),
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .local_runtime_statuses = localRuntimeStatuses,
+                    .lsm_storage_stats = lsmStorageStats,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn localRuntimeStatuses(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            _ = self.runtime_status_calls.fetchAdd(1, .monotonic);
+            const items = try allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            items[0] = .{
+                .group_id = 7,
+                .stats = .{ .doc_count = 5 },
+                .lsm_storage_stats = .{
+                    .maintenance = .{
+                        .total_runs = 72,
+                        .total_run_bytes = 8246715092,
+                        .obsolete_paths = 133,
+                        .obsolete_paths_pinned_by_readers = 133,
+                    },
+                    .write = .{},
+                    .maintenance_score = 387208,
+                    .maintenance_debt_hint = 387209,
+                },
+            };
+            return .{ .items = items };
+        }
+
+        fn lsmStorageStats(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8) !?table_reads.LsmStorageStats {
+            _ = allocator;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            _ = self.lsm_status_calls.fetchAdd(1, .monotonic);
+            return .{
+                .maintenance = .{
+                    .total_runs = 9,
+                    .total_run_bytes = 4235293264,
+                    .obsolete_paths = 0,
+                    .obsolete_paths_pinned_by_readers = 0,
+                },
+                .write = .{},
+                .maintenance_score = 0,
+                .maintenance_debt_hint = 0,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+
+    const status = (try server.bestEffortSingleTableStorageStatus("docs")).?;
+    try std.testing.expectEqual(@as(u32, 1), reads.runtime_status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), reads.lsm_status_calls.load(.monotonic));
+    try std.testing.expectEqual(false, status.empty);
+    try std.testing.expectEqual(@as(u64, 9), status.lsm.?.run_count);
+    try std.testing.expectEqual(@as(u64, 4235293264), status.lsm.?.run_bytes);
+    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.obsolete_path_count);
+    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.obsolete_paths_pinned_by_readers);
+    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.maintenance_score);
 }
 
 test "api http server serves local index runtime backfill status" {

@@ -3530,6 +3530,7 @@ pub fn build(b: *std.Build) void {
     const api_table_writes_docid_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
+            "api auto bulk ingest does not open sessions for normal online writes",
             "provisioned table write source rejects stale doc identity namespace before write",
             "bound table write source backs up and restores a local table",
             "provisioned table restore rejects mismatched doc identity namespace",
@@ -3538,6 +3539,8 @@ pub fn build(b: *std.Build) void {
             "primary lookup adopts seeded write cache across visible generation bump",
             "provisioned table write source coalesces same-group waiters",
             "provisioned table write coalescer isolates failed waiters",
+            "provisioned table write source consistent visibility hook does not block on busy apply lock",
+            "provisioned table write source consistent visibility refreshes stale dense status",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

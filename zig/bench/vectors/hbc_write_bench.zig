@@ -25,6 +25,8 @@ const platform_time = antfly.platform_time;
 const vec = antfly.vector;
 
 const Config = struct {
+    inspect_root: ?[]const u8 = null,
+    inspect_maintenance_steps: usize = 0,
     samples: usize = 3,
     vectors: usize = 10_000,
     dims: usize = 128,
@@ -163,6 +165,12 @@ const ActiveTableStats = struct {
     active_runs: u64 = 0,
     active_run_bytes: u64 = 0,
     obsolete_paths: u64 = 0,
+    obsolete_file_bytes: u64 = 0,
+    obsolete_due_paths: u64 = 0,
+    obsolete_due_file_bytes: u64 = 0,
+    obsolete_future_paths: u64 = 0,
+    manifest_bytes: u64 = 0,
+    active_bloom_filter_bytes: u64 = 0,
     hbc_quant: NamespaceActiveStats = .{},
     hbc_vecs: NamespaceActiveStats = .{},
     hbc_nodes: NamespaceActiveStats = .{},
@@ -789,6 +797,20 @@ fn allocPrintZ(allocator: Allocator, comptime fmt: []const u8, args: anytype) ![
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.c_allocator;
     const cfg = try parseArgs(allocator, init.minimal.args);
+    defer if (cfg.inspect_root) |root| allocator.free(root);
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const out = &stdout_writer.interface;
+
+    if (cfg.inspect_root) |root| {
+        if (cfg.inspect_maintenance_steps > 0) {
+            try runRootMaintenance(allocator, root, cfg.inspect_maintenance_steps);
+        }
+        try inspectRoot(out, allocator, root);
+        try stdout_writer.flush();
+        return;
+    }
 
     const dataset: []f32 = if (cfg.dataset_mode == .materialized)
         try makeDataset(allocator, cfg)
@@ -800,10 +822,6 @@ pub fn main(init: std.process.Init) !void {
     else
         &.{};
     defer if (cfg.dataset_mode == .materialized) freeItems(allocator, items);
-
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
-    const out = &stdout_writer.interface;
 
     try out.print(
         "hbc write bench samples={d} vectors={d} dims={d} batch_size={d} leaf_size={d} branching_factor={d} search_width={d} storage={s} kmeans_backend={s} kmeans_update_strategy={s} centroid_directory={s} posting_storage={s} flat_centroid_block_size={d} flat_centroid_probe_count={d} flat_centroid_block_probe_count={d} max_posting_overlay_cache_bytes={d} max_posting_overlay_cache_entry_bytes={d} dataset_mode={s} lazy_posting_maintenance={any}",
@@ -2729,11 +2747,17 @@ fn printResult(
     }
     if (active_table_stats) |stats| {
         try writer.print(
-            ",\"active_table_runs\":{d},\"active_table_run_bytes\":{d},\"active_table_obsolete_paths\":{d},\"active_hbc_quant_entries\":{d},\"active_hbc_quant_value_bytes\":{d},\"latest_hbc_quant_entries\":{d},\"latest_hbc_quant_value_bytes\":{d},\"hbc_quant_versions_per_key_bps\":{d},\"active_hbc_vecs_entries\":{d},\"active_hbc_vecs_value_bytes\":{d},\"latest_hbc_vecs_entries\":{d},\"latest_hbc_vecs_value_bytes\":{d},\"active_hbc_nodes_entries\":{d},\"active_hbc_nodes_value_bytes\":{d},\"latest_hbc_nodes_entries\":{d},\"latest_hbc_nodes_value_bytes\":{d},\"active_hbc_meta_entries\":{d},\"active_hbc_meta_value_bytes\":{d},\"latest_hbc_meta_entries\":{d},\"latest_hbc_meta_value_bytes\":{d},\"latest_lsm_keys\":{d}",
+            ",\"active_table_runs\":{d},\"active_table_run_bytes\":{d},\"active_table_obsolete_paths\":{d},\"active_table_obsolete_file_bytes\":{d},\"active_table_obsolete_due_paths\":{d},\"active_table_obsolete_due_file_bytes\":{d},\"active_table_obsolete_future_paths\":{d},\"active_table_manifest_bytes\":{d},\"active_table_bloom_filter_bytes\":{d},\"active_hbc_quant_entries\":{d},\"active_hbc_quant_value_bytes\":{d},\"latest_hbc_quant_entries\":{d},\"latest_hbc_quant_value_bytes\":{d},\"hbc_quant_versions_per_key_bps\":{d},\"active_hbc_vecs_entries\":{d},\"active_hbc_vecs_value_bytes\":{d},\"latest_hbc_vecs_entries\":{d},\"latest_hbc_vecs_value_bytes\":{d},\"active_hbc_nodes_entries\":{d},\"active_hbc_nodes_value_bytes\":{d},\"latest_hbc_nodes_entries\":{d},\"latest_hbc_nodes_value_bytes\":{d},\"active_hbc_meta_entries\":{d},\"active_hbc_meta_value_bytes\":{d},\"latest_hbc_meta_entries\":{d},\"latest_hbc_meta_value_bytes\":{d},\"latest_lsm_keys\":{d}",
             .{
                 stats.active_runs,
                 stats.active_run_bytes,
                 stats.obsolete_paths,
+                stats.obsolete_file_bytes,
+                stats.obsolete_due_paths,
+                stats.obsolete_due_file_bytes,
+                stats.obsolete_future_paths,
+                stats.manifest_bytes,
+                stats.active_bloom_filter_bytes,
                 stats.hbc_quant.all_entries,
                 stats.hbc_quant.all_value_bytes,
                 stats.hbc_quant.latest_entries,
@@ -2849,10 +2873,15 @@ fn printCompactQueryResult(writer: anytype, prefix: []const u8, query: PostWrite
 
 fn analyzeActiveTables(scenario: *Scenario) !?ActiveTableStats {
     if (scenario.storage_kind == .memory) return null;
+    return try analyzeActiveTablesRoot(scenario.allocator, scenario.storage_harness.storage(), scenario.root_dir);
+}
 
-    const allocator = scenario.allocator;
-    const storage = scenario.storage_harness.storage();
-    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/manifest.bin", .{scenario.root_dir});
+fn analyzeActiveTablesRoot(
+    allocator: Allocator,
+    storage: lsm_backend.Storage,
+    root_dir: []const u8,
+) !?ActiveTableStats {
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/manifest.bin", .{root_dir});
     defer allocator.free(manifest_path);
 
     const manifest_bytes = storage.readFileAlloc(allocator, manifest_path, std.math.maxInt(usize)) catch |err| switch (err) {
@@ -2867,8 +2896,30 @@ fn analyzeActiveTables(scenario: *Scenario) !?ActiveTableStats {
     var stats = ActiveTableStats{
         .active_runs = @intCast(manifest.runs.len),
         .obsolete_paths = @intCast(manifest.obsolete_paths.len),
+        .manifest_bytes = @intCast(manifest_bytes.len),
     };
-    for (manifest.runs) |run| stats.active_run_bytes += run.size_bytes;
+    for (manifest.runs) |run| {
+        stats.active_run_bytes += run.size_bytes;
+        const path = try resolveRunPathAlloc(allocator, root_dir, run.path);
+        defer allocator.free(path);
+        var index = try lsm_repository.loadRunTableIndexAllocWithStorage(storage, allocator, path);
+        defer index.deinit(allocator);
+        stats.active_bloom_filter_bytes += index.filter.bytes.len;
+    }
+
+    const now_ns = storage.nowNs();
+    for (manifest.obsolete_paths) |obsolete| {
+        const path = try resolveRunPathAlloc(allocator, root_dir, obsolete.path);
+        defer allocator.free(path);
+        const file_bytes = storage.fileSize(path) catch 0;
+        stats.obsolete_file_bytes += file_bytes;
+        if (obsolete.delete_after_ns <= now_ns) {
+            stats.obsolete_due_paths += 1;
+            stats.obsolete_due_file_bytes += file_bytes;
+        } else {
+            stats.obsolete_future_paths += 1;
+        }
+    }
 
     var latest = std.StringHashMap(LatestEntry).init(allocator);
     defer {
@@ -2878,7 +2929,7 @@ fn analyzeActiveTables(scenario: *Scenario) !?ActiveTableStats {
     }
 
     for (manifest.runs) |run| {
-        const path = try resolveRunPathAlloc(allocator, scenario.root_dir, run.path);
+        const path = try resolveRunPathAlloc(allocator, root_dir, run.path);
         defer allocator.free(path);
         try analyzeRunTable(allocator, storage, path, &stats, &latest);
     }
@@ -2892,6 +2943,66 @@ fn analyzeActiveTables(scenario: *Scenario) !?ActiveTableStats {
     }
 
     return stats;
+}
+
+fn inspectRoot(writer: anytype, allocator: Allocator, root_dir: []const u8) !void {
+    var native = try lsm_backend.storage_io.NativeStorage.init(allocator, .threaded);
+    defer native.deinit();
+
+    const maybe_stats = try analyzeActiveTablesRoot(allocator, native.storage(), root_dir);
+    const stats = maybe_stats orelse return error.FileNotFound;
+    try writer.print(
+        "{{\"inspect_root\":\"{s}\",\"active_table_runs\":{d},\"active_table_run_bytes\":{d},\"active_table_obsolete_paths\":{d},\"active_table_obsolete_file_bytes\":{d},\"active_table_obsolete_due_paths\":{d},\"active_table_obsolete_due_file_bytes\":{d},\"active_table_obsolete_future_paths\":{d},\"active_table_manifest_bytes\":{d},\"active_table_bloom_filter_bytes\":{d},\"active_hbc_quant_entries\":{d},\"active_hbc_quant_value_bytes\":{d},\"latest_hbc_quant_entries\":{d},\"latest_hbc_quant_value_bytes\":{d},\"hbc_quant_versions_per_key_bps\":{d},\"active_hbc_vecs_entries\":{d},\"active_hbc_vecs_value_bytes\":{d},\"latest_hbc_vecs_entries\":{d},\"latest_hbc_vecs_value_bytes\":{d},\"active_hbc_nodes_entries\":{d},\"active_hbc_nodes_value_bytes\":{d},\"latest_hbc_nodes_entries\":{d},\"latest_hbc_nodes_value_bytes\":{d},\"active_hbc_meta_entries\":{d},\"active_hbc_meta_value_bytes\":{d},\"latest_hbc_meta_entries\":{d},\"latest_hbc_meta_value_bytes\":{d},\"latest_lsm_keys\":{d}}}\n",
+        .{
+            root_dir,
+            stats.active_runs,
+            stats.active_run_bytes,
+            stats.obsolete_paths,
+            stats.obsolete_file_bytes,
+            stats.obsolete_due_paths,
+            stats.obsolete_due_file_bytes,
+            stats.obsolete_future_paths,
+            stats.manifest_bytes,
+            stats.active_bloom_filter_bytes,
+            stats.hbc_quant.all_entries,
+            stats.hbc_quant.all_value_bytes,
+            stats.hbc_quant.latest_entries,
+            stats.hbc_quant.latest_value_bytes,
+            stats.quantVersionsPerKeyBps(),
+            stats.hbc_vecs.all_entries,
+            stats.hbc_vecs.all_value_bytes,
+            stats.hbc_vecs.latest_entries,
+            stats.hbc_vecs.latest_value_bytes,
+            stats.hbc_nodes.all_entries,
+            stats.hbc_nodes.all_value_bytes,
+            stats.hbc_nodes.latest_entries,
+            stats.hbc_nodes.latest_value_bytes,
+            stats.hbc_meta.all_entries,
+            stats.hbc_meta.all_value_bytes,
+            stats.hbc_meta.latest_entries,
+            stats.hbc_meta.latest_value_bytes,
+            stats.latest_keys,
+        },
+    );
+}
+
+fn runRootMaintenance(allocator: Allocator, root_dir: []const u8, max_steps: usize) !void {
+    var native = try lsm_backend.storage_io.NativeStorage.init(allocator, .threaded);
+    defer native.deinit();
+
+    var backend = try lsm_backend.Backend.open(allocator, root_dir, .{
+        .backend = .{ .create_if_missing = false },
+        .storage = native.storage(),
+    });
+    defer {
+        backend.options.backend.read_only = true;
+        backend.close();
+    }
+
+    var steps: usize = 0;
+    while (steps < max_steps) : (steps += 1) {
+        if (!try backend.runMaintenanceStep()) break;
+    }
 }
 
 fn analyzeRunTable(
@@ -3970,13 +4081,17 @@ fn freeItems(allocator: Allocator, items: []hbc.BatchInsertItem) void {
 }
 
 fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
-    _ = allocator;
     var cfg = Config{};
     var args = std.process.Args.Iterator.init(proc_args);
     _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--samples")) {
             cfg.samples = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--inspect-root")) {
+            const value = args.next() orelse return error.InvalidArgument;
+            cfg.inspect_root = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, arg, "--maintenance-steps")) {
+            cfg.inspect_maintenance_steps = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--vectors")) {
             cfg.vectors = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--dims")) {

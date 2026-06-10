@@ -85,6 +85,7 @@ const ValuePattern = enum {
 
 const WorkloadSet = enum {
     all,
+    ingest_compact,
     hot_overwrite,
     l0_pressure,
     ingest_compact,
@@ -764,6 +765,14 @@ fn benchL0PressureLoad(scenario: *Scenario, keys: []const []u8, value: []const u
         try scenario.backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true });
         start = end;
     }
+}
+
+fn benchIngestCompact(scenario: *Scenario, keys: []const []u8, value: []const u8) !void {
+    try benchLoad(scenario, keys, value, false);
+    const start = nanotime();
+    while (try scenario.backend.runMaintenanceStep()) {}
+    try scenario.backend.finalizeDeferredStorageWork();
+    scenario.last_finalize_ns +|= nanotime() - start;
 }
 
 fn benchOverwrite(scenario: *Scenario, keys: []const []u8, value: []const u8) !void {
