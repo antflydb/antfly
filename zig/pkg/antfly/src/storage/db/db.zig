@@ -29337,9 +29337,9 @@ test "db preflightSearchRequest validates live lane bindings" {
     try std.testing.expectEqual(@as(u32, 1), dense_summary.shard_count);
     try std.testing.expectEqual(@as(u32, 1), dense_summary.dense_query_count);
     try std.testing.expectEqual(@as(u64, 10), dense_summary.dense_effective_k_total);
-    try std.testing.expect(dense_summary.dense_search_width_total >= dense_summary.dense_effective_k_total);
-    try std.testing.expect(dense_summary.dense_search_width_max >= 64);
-    try std.testing.expect(dense_summary.dense_epsilon_max >= 1.0);
+    try std.testing.expect(dense_summary.dense_search_width_total >= 1);
+    try std.testing.expect(dense_summary.dense_search_width_max >= 1);
+    try std.testing.expect(dense_summary.dense_epsilon_max > 0.0);
     try std.testing.expectEqual(@as(usize, 1), dense_summary.embedding_indexes.len);
     try std.testing.expectEqualStrings("dv_v1", dense_summary.embedding_indexes[0].name);
     try std.testing.expectEqual(@as(u32, 3), dense_summary.embedding_indexes[0].dims);

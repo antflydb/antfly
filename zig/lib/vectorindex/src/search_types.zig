@@ -26,6 +26,9 @@ pub const SearchRequest = struct {
     rerank_k: ?usize = null,
     search_width: ?u32 = null,
     epsilon: ?f32 = null,
+    // Multiplier on k for how many approximate candidates are retained for
+    // exact reranking. Defaults to the epsilon-derived legacy factor.
+    rerank_factor: ?usize = null,
     load_metadata: bool = true,
     filter_prefix: []const u8 = "",
     distance_over: ?f32 = null,
