@@ -483,11 +483,11 @@ Current implementation status:
 - The DB storage layer now has a direct child-range artifact apply primitive that can commit internal artifact writes/deletes plus the derived replay record on a destination shard without reclassifying child artifacts as user source rows.
 - The internal group write API now exposes that child-range apply primitive, including route-scope validation for the parent document/artifact and a hosted/provisioned HTTP client path for remote owner groups.
 - Hosted/provisioned local write execution now partitions generated document child artifacts by `remote_committed` child-range descriptors before the parent shard writes them locally, then dispatches the remote child batch to the recorded owner group. This covers generated artifact writes/deletes and derived document/vector replay payloads for remote-owned unit and chunk ranges.
+- Split finalization now marks parent-owned, split-eligible child ranges that physically move to the split-off shard as `remote_committed`, assigns the new owner group, advances placement generation, and records the manifest update before the parent shard prunes the moved child rows.
 - Manifests now include a durable `coverage_plan` stating that full-text replay remains `stored_artifact_required`, replay suppression is false, and coverage watermarks are required before any future suppression. This keeps stable-unit replay correctness explicit rather than relying on an implicit code-path convention.
 
-Still remaining in Phase 3:
+Future hardening:
 
-- Add the automatic split trigger that calls the durable child-range placement update when an artifact range actually moves away from the parent shard.
 - Add a durable retry/outbox around remote child-range dispatch if generated child writes must survive a destination-group outage after the parent shard has committed its manifest update.
 
 ### Phase 4: Graph extraction over units

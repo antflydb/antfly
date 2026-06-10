@@ -21488,6 +21488,7 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
 
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
+    try markSplitOffDocumentArtifactChildRangesLocked(self, split_state, split_lower);
     try finalizePrimarySplitPreservingIdentity(self, split_lower);
     try ensureReplayFloor(self.core.store, replay_floor);
     try self.core.pruneSplitRangeFromPrimaryIndexes(split_state.split_key, split_state.original_range_end);
@@ -21503,6 +21504,130 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     try self.refreshManagedIndexWorkersLocked();
     try self.closeShadowIndexManager();
     try self.refreshManagedIndexWorkersLocked();
+}
+
+fn markSplitOffDocumentArtifactChildRangesLocked(
+    self: *DB,
+    split_state: shard_mod.SplitState,
+    split_lower: []const u8,
+) !void {
+    if (split_state.new_shard_id == 0) return;
+
+    const parent_lower = try documentRangeLowerAlloc(self.alloc, self.core.byteRange().start);
+    defer self.alloc.free(parent_lower);
+    const parent_upper = split_lower;
+    const split_upper = if (split_state.original_range_end.len > 0)
+        try documentRangeUpperAlloc(self.alloc, split_state.original_range_end)
+    else
+        null;
+    defer if (split_upper) |upper| self.alloc.free(upper);
+
+    const scanned = try self.core.scanStoreRange(self.alloc, parent_lower, parent_upper);
+    defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(self.alloc);
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| self.alloc.free(value);
+        owned_values.deinit(self.alloc);
+    }
+    var changed_artifact_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (changed_artifact_keys.items) |key| self.alloc.free(key);
+        changed_artifact_keys.deinit(self.alloc);
+    }
+
+    for (scanned) |entry| {
+        if (std.mem.indexOf(u8, entry.value, "\"child_ranges\"") == null) continue;
+        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(self.alloc, entry.key)) orelse continue;
+        defer artifact_ref.deinit(self.alloc);
+        if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) continue;
+
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        var manifest_value = try std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, entry.value, .{ .allocate = .alloc_always });
+        if (manifest_value != .object) continue;
+        const child_ranges = manifest_value.object.getPtr("child_ranges") orelse continue;
+        if (child_ranges.* != .array) continue;
+
+        var changed = false;
+        for (child_ranges.array.items) |*item| {
+            if (item.* != .object) continue;
+            if (!documentArtifactChildRangeMovedBySplit(item.object, split_lower, split_upper)) continue;
+            try putLeakyJsonStringField(arena_alloc, &item.object, "placement", "remote");
+            try putLeakyJsonU64Field(arena_alloc, &item.object, "owner_group_id", split_state.new_shard_id);
+            try putLeakyJsonU64Field(arena_alloc, &item.object, "placement_generation", (try jsonObjectOptionalU64(item.object, "placement_generation") orelse 0) + 1);
+            try putLeakyJsonStringField(arena_alloc, &item.object, "route_status", "remote_committed");
+            try item.object.put(arena_alloc, "split_eligible", .{ .bool = false });
+            changed = true;
+        }
+        if (!changed) continue;
+
+        const updated_manifest = try std.json.Stringify.valueAlloc(self.alloc, manifest_value, .{});
+        errdefer self.alloc.free(updated_manifest);
+        try owned_values.append(self.alloc, updated_manifest);
+        try writes.append(self.alloc, .{
+            .key = entry.key,
+            .value = updated_manifest,
+        });
+        try appendUniqueOwnedKey(self.alloc, &changed_artifact_keys, entry.key);
+    }
+
+    if (writes.items.len == 0) return;
+    const sequence = self.core.reserveDerivedAppendSequence();
+    const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
+        .sequence = sequence,
+        .changed_artifact_keys = changed_artifact_keys.items,
+    }, sequence);
+    defer self.alloc.free(replay_payload);
+    try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes.items, &.{}, .{
+        .sequence = sequence,
+        .payload = replay_payload,
+    });
+    if (shouldAppendSplitDelta(self)) {
+        try self.core.appendSplitDelta(currentTimeNs(), writes.items, &.{});
+    }
+    self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+}
+
+fn documentArtifactChildRangeMovedBySplit(
+    object: std.json.ObjectMap,
+    split_lower: []const u8,
+    split_upper: ?[]const u8,
+) bool {
+    const split_eligible = blk: {
+        const value = object.get("split_eligible") orelse break :blk false;
+        if (value != .bool) return false;
+        break :blk value.bool;
+    };
+    if (!split_eligible) return false;
+
+    const placement = object.get("placement") orelse return false;
+    if (placement != .string) return false;
+    if (std.mem.eql(u8, placement.string, "remote")) return false;
+
+    if (object.get("owner_group_id")) |owner| {
+        if (owner == .integer and owner.integer > 0) return false;
+    }
+
+    const route_status = object.get("route_status") orelse null;
+    if (route_status) |status| {
+        if (status != .string) return false;
+        if (std.mem.eql(u8, status.string, "remote_committed")) return false;
+    }
+
+    const start_key = object.get("start_key") orelse return false;
+    if (start_key != .string) return false;
+    if (std.mem.order(u8, start_key.string, split_lower) == .lt) return false;
+    const end_key = object.get("end_key_exclusive") orelse return false;
+    if (end_key != .string) return false;
+    if (split_upper) |upper| {
+        if (end_key.string.len == 0) return false;
+        if (std.mem.order(u8, end_key.string, upper) == .gt) return false;
+    }
+    return true;
 }
 
 fn byteRangesEqual(a: types.ByteRange, b: types.ByteRange) bool {
@@ -43990,6 +44115,103 @@ test "db split state and split deltas are exposed through public api" {
     try std.testing.expectEqual(@as(u64, 0), db.getSplitDeltaSeq());
     try db.clearSplitDeltaFinalSeq();
     try std.testing.expectEqual(@as(u64, 0), try db.getSplitDeltaFinalSeq(alloc));
+}
+
+test "db split finalization marks split-off document child ranges remote" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+            .{ .key = "doc:z", .value = "{\"title\":\"zeta\"}" },
+        },
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const moved_child_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:z", "document_units_v1", "page:000001");
+    defer alloc.free(moved_child_key);
+
+    const ChildRangeJson = struct {
+        range_id: []const u8,
+        range_kind: []const u8,
+        artifact_name: []const u8,
+        split_boundary: []const u8,
+        placement: []const u8,
+        owner_group_id: u64,
+        placement_generation: u64,
+        route_status: []const u8,
+        split_eligible: bool,
+        start_key: []const u8,
+        end_key_exclusive: []const u8,
+        last_key: []const u8,
+        child_count: usize,
+    };
+    const ManifestJson = struct {
+        manifest_version: u64,
+        generation: u64,
+        artifact_name: []const u8,
+        source_url: []const u8,
+        source_fingerprint: []const u8,
+        content_type: []const u8,
+        route_type: []const u8,
+        child_ranges: []const ChildRangeJson,
+    };
+    const child_ranges = [_]ChildRangeJson{.{
+        .range_id = "range:000000",
+        .range_kind = "unit",
+        .artifact_name = "document_units_v1",
+        .split_boundary = "unit",
+        .placement = "parent",
+        .owner_group_id = 0,
+        .placement_generation = 4,
+        .route_status = "local_committed",
+        .split_eligible = true,
+        .start_key = moved_child_key,
+        .end_key_exclusive = "",
+        .last_key = moved_child_key,
+        .child_count = 1,
+    }};
+    const manifest = try std.json.Stringify.valueAlloc(alloc, ManifestJson{
+        .manifest_version = 2,
+        .generation = 1,
+        .artifact_name = "document_units_v1",
+        .source_url = "data:text/plain;base64,YWxwaGE=",
+        .source_fingerprint = "fp",
+        .content_type = "text/plain",
+        .route_type = "text",
+        .child_ranges = child_ranges[0..],
+    }, .{});
+    defer alloc.free(manifest);
+    const child_value = "{\"_parent_doc_key\":\"doc:a\",\"_artifact_name\":\"document_units_v1\",\"unit_id\":\"page:000001\",\"text\":\"moved\"}";
+    try db.core.store.putBatch(&.{
+        .{ .key = manifest_key, .value = manifest },
+        .{ .key = moved_child_key, .value = child_value },
+    }, &.{});
+
+    try db.core.shard_manager.prepareSplit("doc:m");
+    try db.core.shard_manager.split(7002, "doc:m");
+    db.core.index_manager.updateRange(db.core.shard_manager.getByteRange());
+    try db.finalizeSplit(.{ .start = "", .end = "doc:m" });
+
+    const updated = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(updated);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"placement\":\"remote\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"owner_group_id\":7002") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"placement_generation\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"route_status\":\"remote_committed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"split_eligible\":false") != null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, moved_child_key));
 }
 
 test "db shadow index manager backfills split-off range and ignores parent-range live writes after split" {
