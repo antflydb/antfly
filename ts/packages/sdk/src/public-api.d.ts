@@ -4440,6 +4440,15 @@ export interface components {
                 [key: string]: unknown;
             };
             /**
+             * @description Stable ancestry envelope for derived document hierarchy hits. Present when
+             *     the hit is a derived unit/chunk/embedding artifact or when a source-level
+             *     rollup includes child chunks. Standard fields include `level`,
+             *     `parent_doc_key`, optional `parent_unit_id`, `artifact`, and `chunks`.
+             */
+            hierarchy?: {
+                [key: string]: unknown;
+            };
+            /**
              * @description Sort key values for this hit. Pass as search_after or search_before
              *     to paginate to the next/previous page. Only present when order_by is specified.
              */

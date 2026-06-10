@@ -25,6 +25,7 @@ class QueryHit:
         field_score (float): Relevance score of the hit.
         field_index_scores (QueryHitIndexScores | Unset): Scores partitioned by index when using RRF search.
         field_source (QueryHitSource | Unset):
+        field_hierarchy (dict[str, Any] | Unset): Stable ancestry envelope for derived document hierarchy hits.
         field_sort (list[str] | Unset): Sort key values for this hit. Pass as search_after or search_before
             to paginate to the next/previous page. Only present when order_by is specified.
     """
@@ -33,6 +34,7 @@ class QueryHit:
     field_score: float
     field_index_scores: QueryHitIndexScores | Unset = UNSET
     field_source: QueryHitSource | Unset = UNSET
+    field_hierarchy: dict[str, Any] | Unset = UNSET
     field_sort: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -48,6 +50,10 @@ class QueryHit:
         field_source: dict[str, Any] | Unset = UNSET
         if not isinstance(self.field_source, Unset):
             field_source = self.field_source.to_dict()
+
+        field_hierarchy: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.field_hierarchy, Unset):
+            field_hierarchy = self.field_hierarchy
 
         field_sort: list[str] | Unset = UNSET
         if not isinstance(self.field_sort, Unset):
@@ -65,6 +71,8 @@ class QueryHit:
             field_dict["_index_scores"] = field_index_scores
         if field_source is not UNSET:
             field_dict["_source"] = field_source
+        if field_hierarchy is not UNSET:
+            field_dict["hierarchy"] = field_hierarchy
         if field_sort is not UNSET:
             field_dict["_sort"] = field_sort
 
@@ -94,6 +102,8 @@ class QueryHit:
         else:
             field_source = QueryHitSource.from_dict(_field_source)
 
+        field_hierarchy = cast(dict[str, Any], d.pop("hierarchy", UNSET))
+
         field_sort = cast(list[str], d.pop("_sort", UNSET))
 
         query_hit = cls(
@@ -101,6 +111,7 @@ class QueryHit:
             field_score=field_score,
             field_index_scores=field_index_scores,
             field_source=field_source,
+            field_hierarchy=field_hierarchy,
             field_sort=field_sort,
         )
 

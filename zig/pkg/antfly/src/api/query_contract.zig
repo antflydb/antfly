@@ -2241,7 +2241,122 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
                 try parseStoredSourceValue(alloc, stored_data)
         else
             null,
+        .hierarchy = try searchHitHierarchyJsonValue(alloc, req, hit),
     };
+}
+
+fn searchHitHierarchyJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !?std.json.Value {
+    if (hit.artifact_ref == null and hit.chunk_hits.len == 0) return null;
+
+    var obj = std.json.ObjectMap.empty;
+    errdefer obj.deinit(alloc);
+
+    const level = if (hit.artifact_ref) |artifact_ref|
+        artifactRefLevel(artifact_ref)
+    else
+        "source";
+    try putJsonString(alloc, &obj, "level", level);
+
+    if (hit.artifact_ref) |artifact_ref| {
+        try putJsonString(alloc, &obj, "parent_doc_key", artifact_ref.document_id);
+        try obj.put(alloc, try alloc.dupe(u8, "artifact"), try artifactRefJsonValue(alloc, artifact_ref));
+        if (artifact_ref.unit_id) |unit_id| {
+            try putJsonString(alloc, &obj, "parent_unit_id", unit_id);
+        }
+    } else {
+        try putJsonString(alloc, &obj, "parent_doc_key", hit.id);
+    }
+
+    if (hit.chunk_hits.len > 0) {
+        var chunks = try std.json.Array.initCapacity(alloc, hit.chunk_hits.len);
+        errdefer chunks.deinit();
+        for (hit.chunk_hits) |chunk_hit| {
+            try chunks.append(try chunkHitJsonValue(alloc, req, chunk_hit));
+        }
+        try obj.put(alloc, try alloc.dupe(u8, "chunks"), .{ .array = chunks });
+    }
+
+    return .{ .object = obj };
+}
+
+fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.ChunkHit) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    errdefer obj.deinit(alloc);
+
+    try putJsonString(alloc, &obj, "_id", hit.id);
+    try obj.put(alloc, try alloc.dupe(u8, "_score"), .{ .float = hit.score orelse 0 });
+    if (hit.stored_data) |stored_data| {
+        const source = if (req.defer_stored_projection)
+            try document_query.projectLookupJsonValue(alloc, stored_data, .{
+                .fields = req.fields,
+                .include_all_fields = req.include_all_fields,
+            })
+        else
+            try parseStoredSourceValue(alloc, stored_data);
+        try obj.put(alloc, try alloc.dupe(u8, "_source"), source);
+    }
+    if (hit.artifact_ref) |artifact_ref| {
+        var hierarchy = std.json.ObjectMap.empty;
+        errdefer hierarchy.deinit(alloc);
+        try putJsonString(alloc, &hierarchy, "level", artifactRefLevel(artifact_ref));
+        try putJsonString(alloc, &hierarchy, "parent_doc_key", artifact_ref.document_id);
+        if (artifact_ref.unit_id) |unit_id| {
+            try putJsonString(alloc, &hierarchy, "parent_unit_id", unit_id);
+        }
+        try hierarchy.put(alloc, try alloc.dupe(u8, "artifact"), try artifactRefJsonValue(alloc, artifact_ref));
+        try obj.put(alloc, try alloc.dupe(u8, "hierarchy"), .{ .object = hierarchy });
+    }
+
+    return .{ .object = obj };
+}
+
+fn artifactRefJsonValue(alloc: std.mem.Allocator, artifact_ref: db_mod.types.ArtifactRef) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    errdefer obj.deinit(alloc);
+
+    try putJsonString(alloc, &obj, "name", artifact_ref.name);
+    try putJsonString(alloc, &obj, "kind", artifactKindString(artifact_ref.kind));
+    if (artifact_ref.chunk_id) |chunk_id| {
+        try obj.put(alloc, try alloc.dupe(u8, "chunk_id"), .{ .integer = @intCast(chunk_id) });
+    }
+    if (artifact_ref.unit_id) |unit_id| {
+        try putJsonString(alloc, &obj, "unit_id", unit_id);
+    }
+    if (artifact_ref.source) |source| {
+        var source_obj = std.json.ObjectMap.empty;
+        errdefer source_obj.deinit(alloc);
+        try putJsonString(alloc, &source_obj, "name", source.name);
+        try putJsonString(alloc, &source_obj, "kind", artifactKindString(source.kind));
+        if (source.chunk_id) |chunk_id| {
+            try source_obj.put(alloc, try alloc.dupe(u8, "chunk_id"), .{ .integer = @intCast(chunk_id) });
+        }
+        if (source.unit_id) |unit_id| {
+            try putJsonString(alloc, &source_obj, "unit_id", unit_id);
+        }
+        try obj.put(alloc, try alloc.dupe(u8, "source"), .{ .object = source_obj });
+    }
+
+    return .{ .object = obj };
+}
+
+fn artifactRefLevel(artifact_ref: db_mod.types.ArtifactRef) []const u8 {
+    return switch (artifact_ref.kind) {
+        .chunk => "chunk",
+        .asset => if (artifact_ref.unit_id != null) "unit" else "artifact",
+        .embedding => "embedding",
+    };
+}
+
+fn artifactKindString(kind: db_mod.types.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .chunk => "chunk",
+        .asset => "asset",
+        .embedding => "embedding",
+    };
+}
+
+fn putJsonString(alloc: std.mem.Allocator, obj: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try obj.put(alloc, try alloc.dupe(u8, key), .{ .string = try alloc.dupe(u8, value) });
 }
 
 fn indexScoresJsonValue(alloc: std.mem.Allocator, scores: []const fusion_mod.IndexScore) !?std.json.Value {
@@ -2271,6 +2386,56 @@ test "api query contract serializes fused index scores" {
     try std.testing.expectEqual(@as(usize, 2), object.count());
     try std.testing.expectEqual(@as(f64, 0.75), object.get("text_idx").?.float);
     try std.testing.expectEqual(@as(f64, 0.25), object.get("semantic_idx").?.float);
+}
+
+test "api query contract serializes derived hierarchy ancestry" {
+    const alloc = std.testing.allocator;
+
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer result.deinit();
+
+    result.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.8,
+        .chunk_hits = try alloc.alloc(db_mod.types.ChunkHit, 1),
+    };
+    result.hits[0].chunk_hits[0] = .{
+        .id = try alloc.dupe(u8, "af1:chunk:ZG9jOmE:ZG9jdW1lbnRfY2h1bmtzX3Yx:3:unit:cGFnZTowMDAwMDE"),
+        .score = 0.7,
+        .stored_data = try alloc.dupe(u8,
+            \\{"text":"chunk text","_parent_doc_key":"doc:a","_parent_unit_id":"page:000001"}
+        ),
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "document_chunks_v1"),
+            .kind = .chunk,
+            .chunk_id = 3,
+            .unit_id = try alloc.dupe(u8, "page:000001"),
+        },
+    };
+
+    var response = try encodeQueryResponses(alloc, "docs", .{
+        .return_mode = .parent_with_chunks,
+        .include_stored = false,
+    }, .{}, result);
+    defer response.deinit(alloc);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+    defer parsed.deinit();
+    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+    const hierarchy = hit.object.get("hierarchy") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("source", hierarchy.object.get("level").?.string);
+    try std.testing.expectEqualStrings("doc:a", hierarchy.object.get("parent_doc_key").?.string);
+    const chunks = hierarchy.object.get("chunks").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), chunks.len);
+    const chunk_hierarchy = chunks[0].object.get("hierarchy").?.object;
+    try std.testing.expectEqualStrings("chunk", chunk_hierarchy.get("level").?.string);
+    try std.testing.expectEqualStrings("page:000001", chunk_hierarchy.get("parent_unit_id").?.string);
+    try std.testing.expectEqual(@as(i64, 3), chunk_hierarchy.get("artifact").?.object.get("chunk_id").?.integer);
 }
 
 fn parseStoredSourceValue(alloc: std.mem.Allocator, stored_data: []const u8) !std.json.Value {
@@ -4665,9 +4830,9 @@ fn applyPublicHierarchyControls(
         const value = entry.value_ptr.*;
         if (std.mem.eql(u8, key, "return_level")) {
             if (value != .string) return error.InvalidQueryRequest;
-            if (std.mem.eql(u8, value.string, "source") or std.mem.eql(u8, value.string, "chunk")) {
+            if (std.mem.eql(u8, value.string, "source") or std.mem.eql(u8, value.string, "unit") or std.mem.eql(u8, value.string, "chunk")) {
                 return_level = value.string;
-            } else if (std.mem.eql(u8, value.string, "unit") or std.mem.eql(u8, value.string, "mention")) {
+            } else if (std.mem.eql(u8, value.string, "mention")) {
                 return error.UnsupportedQueryRequest;
             } else {
                 return error.InvalidQueryRequest;
@@ -4708,7 +4873,7 @@ fn applyPublicHierarchyControls(
     const wants_no_rollup = if (rollup) |value| std.mem.eql(u8, value, "none") else false;
 
     if (return_level) |level| {
-        if (std.mem.eql(u8, level, "chunk")) {
+        if (std.mem.eql(u8, level, "chunk") or std.mem.eql(u8, level, "unit")) {
             req.return_mode = if (wants_source_rollup or include_chunk or has_child_limit)
                 .parent_with_chunks
             else
@@ -5333,6 +5498,17 @@ test "api query contract parses public hierarchy controls" {
     defer chunk.deinit(alloc);
     try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, chunk.req.return_mode);
     try std.testing.expectEqual(@as(u32, 0), chunk.req.max_chunks_per_parent);
+
+    const unit_body =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"return_level":"unit"}
+        \\}
+    ;
+    var unit = try parseQueryRequest(alloc, null, "docs", unit_body);
+    defer unit.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, unit.req.return_mode);
+    try std.testing.expectEqual(@as(u32, 0), unit.req.max_chunks_per_parent);
 
     const grouped_body =
         \\{

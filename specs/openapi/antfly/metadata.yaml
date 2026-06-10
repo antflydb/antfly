@@ -4957,6 +4957,40 @@ components:
           type: object
           additionalProperties: true # map[string]any for field values
           x-go-name: source
+        hierarchy:
+          type: object
+          additionalProperties: true
+          description: |
+            Stable ancestry envelope for derived document hierarchy hits. Present when
+            the hit is a derived unit/chunk/embedding artifact or when a source-level
+            rollup includes child chunks. Standard fields include `level`,
+            `parent_doc_key`, optional `parent_unit_id`, `artifact`, and `chunks`.
+          properties:
+            level:
+              type: string
+              enum:
+                - source
+                - unit
+                - chunk
+                - artifact
+                - embedding
+              description: Hierarchy level represented by this hit.
+            parent_doc_key:
+              type: string
+              description: Source document key that owns this derived hit.
+            parent_unit_id:
+              type: string
+              description: Unit identifier when the hit is attached to a document unit.
+            artifact:
+              type: object
+              additionalProperties: true
+              description: Artifact identity with `name`, `kind`, and optional `unit_id` or `chunk_id`.
+            chunks:
+              type: array
+              description: Child chunk hits included for source-level rollups.
+              items:
+                type: object
+                additionalProperties: true
         _sort:
           type: array
           items:

@@ -1199,6 +1199,8 @@ pub const QueryHit = struct {
     /// Scores partitioned by index when using RRF search.
     _index_scores: ?std.json.Value = null,
     _source: ?std.json.Value = null,
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, and `chunks`.
+    hierarchy: ?std.json.Value = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Only present when order_by is specified.
     _sort: ?[]const []const u8 = null,
 };
