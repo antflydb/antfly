@@ -13481,6 +13481,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .page_label = unit.page_label,
         .page_bbox = unit.page_bbox,
         .page_rotation = unit.page_rotation,
+        .extraction_method = unit.method,
     });
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
@@ -13693,6 +13694,17 @@ fn documentUnitPayloadAlloc(
             .char_start = unit.char_start,
             .char_end = unit.char_end,
             .source_content_type = content_type,
+            .format_provenance = .{
+                .schema = "antfly.document_format_provenance.v1",
+                .source_content_type = content_type,
+                .coordinate_system = "source_page_points",
+                .extraction_method = unit.method,
+                .ocr_used = false,
+                .page_number = unit.page_number,
+                .page_label = unit.page_label,
+                .page_bbox = unit.page_bbox,
+                .page_rotation = unit.page_rotation,
+            },
         },
     }, .{});
 }
@@ -29060,6 +29072,12 @@ test "db document unit payload preserves pdf page provenance" {
     try std.testing.expectEqual(@as(usize, 4), page_bbox.len);
     try std.testing.expectEqual(@as(f64, 612), page_bbox[2].float);
     try std.testing.expectEqual(@as(i64, 90), provenance.get("page_rotation").?.integer);
+    const format_provenance = provenance.get("format_provenance").?.object;
+    try std.testing.expectEqualStrings("antfly.document_format_provenance.v1", format_provenance.get("schema").?.string);
+    try std.testing.expectEqualStrings("application/pdf", format_provenance.get("source_content_type").?.string);
+    try std.testing.expectEqualStrings("source_page_points", format_provenance.get("coordinate_system").?.string);
+    try std.testing.expectEqualStrings("pdf_text", format_provenance.get("extraction_method").?.string);
+    try std.testing.expect(!format_provenance.get("ocr_used").?.bool);
 }
 
 test "db document extraction asset materializes unit artifacts from data url" {

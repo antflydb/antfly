@@ -57,6 +57,7 @@ pub const ProvenanceOptions = struct {
     page_label: ?[]const u8 = null,
     page_bbox: ?[4]f64 = null,
     page_rotation: ?i32 = null,
+    extraction_method: ?[]const u8 = null,
 };
 
 pub fn appendArtifactFields(
@@ -128,6 +129,7 @@ fn appendProvenanceFields(
     if (options.page_label) |value| try putString(alloc, &provenance, "page_label", value);
     if (options.page_bbox) |bbox| try provenance.put(alloc, try alloc.dupe(u8, "page_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
     if (options.page_rotation) |value| try provenance.put(alloc, try alloc.dupe(u8, "page_rotation"), .{ .integer = value });
+    try appendFormatProvenance(alloc, &provenance, options);
 
     if (chunk.start_offset) |start| {
         try provenance.put(alloc, try alloc.dupe(u8, "char_start"), .{ .integer = start });
@@ -155,6 +157,35 @@ fn appendProvenanceFields(
     }
 
     try obj.put(alloc, try alloc.dupe(u8, "provenance"), .{ .object = provenance });
+}
+
+fn appendFormatProvenance(
+    alloc: Allocator,
+    provenance: *std.json.ObjectMap,
+    options: ProvenanceOptions,
+) !void {
+    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null) return;
+
+    var format = std.json.ObjectMap.empty;
+    errdefer {
+        var it = format.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            freeJsonValue(alloc, entry.value_ptr.*);
+        }
+        format.deinit(alloc);
+    }
+
+    try putString(alloc, &format, "schema", "antfly.document_format_provenance.v1");
+    try putString(alloc, &format, "coordinate_system", "source_page_points");
+    try putString(alloc, &format, "extraction_method", options.extraction_method orelse "mechanical_text");
+    try format.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = false });
+    if (options.page_number) |value| try format.put(alloc, try alloc.dupe(u8, "page_number"), .{ .integer = value });
+    if (options.page_label) |value| try putString(alloc, &format, "page_label", value);
+    if (options.page_bbox) |bbox| try format.put(alloc, try alloc.dupe(u8, "page_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
+    if (options.page_rotation) |value| try format.put(alloc, try alloc.dupe(u8, "page_rotation"), .{ .integer = value });
+
+    try provenance.put(alloc, try alloc.dupe(u8, "format_provenance"), .{ .object = format });
 }
 
 fn putString(alloc: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
@@ -246,6 +277,7 @@ test "append artifact fields stores unit-local and document-global provenance" {
         .page_label = "i",
         .page_bbox = .{ 0, 0, 612, 792 },
         .page_rotation = 90,
+        .extraction_method = "pdf_text",
     });
     const provenance = obj.get("provenance").?.object;
     try std.testing.expectEqualStrings("unit", provenance.get("offset_basis").?.string);
@@ -258,6 +290,11 @@ test "append artifact fields stores unit-local and document-global provenance" {
     try std.testing.expectEqual(@as(usize, 4), page_bbox.len);
     try std.testing.expectEqual(@as(f64, 612), page_bbox[2].float);
     try std.testing.expectEqual(@as(i64, 90), provenance.get("page_rotation").?.integer);
+    const format_provenance = provenance.get("format_provenance").?.object;
+    try std.testing.expectEqualStrings("antfly.document_format_provenance.v1", format_provenance.get("schema").?.string);
+    try std.testing.expectEqualStrings("source_page_points", format_provenance.get("coordinate_system").?.string);
+    try std.testing.expectEqualStrings("pdf_text", format_provenance.get("extraction_method").?.string);
+    try std.testing.expect(!format_provenance.get("ocr_used").?.bool);
     try std.testing.expectEqual(@as(i64, 5), provenance.get("unit_char_start").?.integer);
     try std.testing.expectEqual(@as(i64, 10), provenance.get("unit_char_end").?.integer);
     try std.testing.expectEqual(@as(i64, 105), provenance.get("document_char_start").?.integer);

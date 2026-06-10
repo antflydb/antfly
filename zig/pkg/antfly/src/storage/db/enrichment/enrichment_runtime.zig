@@ -2068,6 +2068,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .page_label = unit.page_label,
         .page_bbox = unit.page_bbox,
         .page_rotation = unit.page_rotation,
+        .extraction_method = unit.method,
     });
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
@@ -4081,6 +4082,17 @@ fn documentUnitPayloadAlloc(
             .char_start = unit.char_start,
             .char_end = unit.char_end,
             .source_content_type = content_type,
+            .format_provenance = .{
+                .schema = "antfly.document_format_provenance.v1",
+                .source_content_type = content_type,
+                .coordinate_system = "source_page_points",
+                .extraction_method = unit.method,
+                .ocr_used = false,
+                .page_number = unit.page_number,
+                .page_label = unit.page_label,
+                .page_bbox = unit.page_bbox,
+                .page_rotation = unit.page_rotation,
+            },
         },
     }, .{});
 }

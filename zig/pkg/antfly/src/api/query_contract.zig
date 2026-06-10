@@ -3310,6 +3310,7 @@ fn toOpenApiPatternMatches(
                 .path = binding.node.path,
                 .path_edges = try toOpenApiOptionalPathEdges(alloc, binding.node.path_edges),
                 .provenance = binding.node.provenance,
+                .evidence = try graphNodeEvidenceJsonValue(alloc, binding.node),
                 .edges = null,
             });
         }
@@ -3335,6 +3336,7 @@ fn toOpenApiGraphNodes(
             .path = node.path,
             .path_edges = try toOpenApiOptionalPathEdges(alloc, node.path_edges),
             .provenance = node.provenance,
+            .evidence = try graphNodeEvidenceJsonValue(alloc, node),
             .edges = null,
         };
     }
@@ -3393,6 +3395,97 @@ fn pathEdgeMetadataJsonValue(alloc: std.mem.Allocator, metadata: []const u8) !?s
     return std.json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{}) catch .{ .string = try alloc.dupe(u8, metadata) };
 }
 
+fn graphNodeEvidenceJsonValue(
+    alloc: std.mem.Allocator,
+    node: graph_query_mod.GraphResultNode,
+) !?std.json.Value {
+    const has_provenance = if (node.provenance) |items| items.len > 0 else false;
+    var has_edge_metadata = false;
+    if (node.path_edges) |edges| {
+        for (edges) |edge| {
+            if (edge.metadata.len > 0) {
+                has_edge_metadata = true;
+                break;
+            }
+        }
+    }
+    if (!has_provenance and !has_edge_metadata) return null;
+
+    var evidence = std.json.ObjectMap.empty;
+    errdefer evidence.deinit(alloc);
+
+    if (node.provenance) |items| {
+        if (items.len > 0) {
+            var provenance = std.json.Array.init(alloc);
+            errdefer provenance.deinit();
+            for (items) |item| try provenance.append(.{ .string = try alloc.dupe(u8, item) });
+            try evidence.put(alloc, try alloc.dupe(u8, "provenance"), .{ .array = provenance });
+        }
+    }
+
+    if (node.path_edges) |edges| {
+        var edge_values = std.json.Array.init(alloc);
+        errdefer edge_values.deinit();
+        var mention_artifact_keys = std.json.Array.init(alloc);
+        errdefer mention_artifact_keys.deinit();
+        var mention_count: i64 = 0;
+        var saw_rollup = false;
+
+        for (edges) |edge| {
+            const metadata_value = (try pathEdgeMetadataJsonValue(alloc, edge.metadata)) orelse continue;
+
+            var edge_obj = std.json.ObjectMap.empty;
+            errdefer edge_obj.deinit(alloc);
+            try edge_obj.put(alloc, try alloc.dupe(u8, "source"), .{ .string = try alloc.dupe(u8, edge.source) });
+            try edge_obj.put(alloc, try alloc.dupe(u8, "target"), .{ .string = try alloc.dupe(u8, edge.target) });
+            try edge_obj.put(alloc, try alloc.dupe(u8, "type"), .{ .string = try alloc.dupe(u8, edge.edge_type) });
+            try edge_obj.put(alloc, try alloc.dupe(u8, "weight"), .{ .float = edge.weight });
+            try edge_obj.put(alloc, try alloc.dupe(u8, "metadata"), metadata_value);
+            try edge_values.append(.{ .object = edge_obj });
+
+            if (metadata_value == .object) {
+                if (metadata_value.object.get("mention_count")) |value| {
+                    if (value == .integer) {
+                        mention_count += value.integer;
+                        saw_rollup = true;
+                    }
+                }
+                if (metadata_value.object.get("mention_artifact_keys")) |value| {
+                    if (value == .array) {
+                        for (value.array.items) |item| {
+                            if (item != .string) continue;
+                            try mention_artifact_keys.append(.{ .string = try alloc.dupe(u8, item.string) });
+                            saw_rollup = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (edge_values.items.len > 0) {
+            try evidence.put(alloc, try alloc.dupe(u8, "path_edges"), .{ .array = edge_values });
+        } else {
+            edge_values.deinit();
+        }
+
+        if (saw_rollup) {
+            var rollup = std.json.ObjectMap.empty;
+            errdefer rollup.deinit(alloc);
+            try rollup.put(alloc, try alloc.dupe(u8, "mention_count"), .{ .integer = mention_count });
+            if (mention_artifact_keys.items.len > 0) {
+                try rollup.put(alloc, try alloc.dupe(u8, "mention_artifact_keys"), .{ .array = mention_artifact_keys });
+            } else {
+                mention_artifact_keys.deinit();
+            }
+            try evidence.put(alloc, try alloc.dupe(u8, "mention_rollup"), .{ .object = rollup });
+        } else {
+            mention_artifact_keys.deinit();
+        }
+    }
+
+    return .{ .object = evidence };
+}
+
 fn toOpenApiOptionalPathEdges(
     alloc: std.mem.Allocator,
     edges: ?[]const graph_query_mod.PathEdgeInfo,
@@ -3402,10 +3495,12 @@ fn toOpenApiOptionalPathEdges(
 }
 
 test "api query contract preserves algebraic graph path provenance" {
-    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const alloc = arena_impl.allocator();
     const path_nodes: []const []const u8 = &.{ "A", "B", "C" };
     const path_edges: []const graph_query_mod.PathEdgeInfo = &.{
-        .{ .source = "A", .target = "B", .edge_type = "e", .weight = 2.0, .metadata = "{\"mention_count\":2}" },
+        .{ .source = "A", .target = "B", .edge_type = "e", .weight = 2.0, .metadata = "{\"mention_count\":2,\"mention_artifact_keys\":[\"m1\",\"m2\"]}" },
         .{ .source = "B", .target = "C", .edge_type = "e", .weight = 3.0 },
     };
     const provenance: []const []const u8 = &.{ "A\x1fe\x1fB", "B\x1fe\x1fC" };
@@ -3445,6 +3540,16 @@ test "api query contract preserves algebraic graph path provenance" {
     try std.testing.expectEqual(@as(usize, 2), encoded[0].provenance.?.len);
     try std.testing.expectEqualStrings("A\x1fe\x1fB", encoded[0].provenance.?[0]);
     try std.testing.expectEqualStrings("B\x1fe\x1fC", encoded[0].provenance.?[1]);
+    const evidence = encoded[0].evidence.?.object;
+    try std.testing.expectEqual(@as(usize, 2), evidence.get("provenance").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 1), evidence.get("path_edges").?.array.items.len);
+    const edge_evidence = evidence.get("path_edges").?.array.items[0].object;
+    try std.testing.expectEqualStrings("A", edge_evidence.get("source").?.string);
+    try std.testing.expectEqual(@as(i64, 2), edge_evidence.get("metadata").?.object.get("mention_count").?.integer);
+    const mention_rollup = evidence.get("mention_rollup").?.object;
+    try std.testing.expectEqual(@as(i64, 2), mention_rollup.get("mention_count").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), mention_rollup.get("mention_artifact_keys").?.array.items.len);
+    try std.testing.expectEqualStrings("m2", mention_rollup.get("mention_artifact_keys").?.array.items[1].string);
 }
 
 fn buildProfileValue(
