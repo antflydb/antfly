@@ -393,7 +393,8 @@ Current implementation status:
 - The producer is handled internally rather than by the external model-backed asset producer runtime.
 - The source field resolves to a URL, including `data:` URLs through the existing remote-content downloader path.
 - Extraction currently routes PDF mechanical text, text, JSON/CSV-like text, and simple HTML into canonical units.
-- The initial route config now supports ordered built-in routes for `pdf`, `html`, `text`, and `unsupported` extractors, matched by exact content type, content-type prefix, or filename/URL extension.
+- The initial route config now supports ordered built-in routes for `pdf`, `html`, `text`, and `unsupported` extractors, matched by exact content type, content-type prefix, filename/URL extension, or configured magic-byte prefix.
+- The default detector now sniffs PDF magic, common HTML prefixes, and valid UTF-8 plain text for missing or generic content-type metadata, so mixed-file tables can still produce canonical units when upstream file metadata is incomplete.
 - Route matching can hydrate effective filename and content type from per-row source metadata fields such as `source.filename_field` and `source.content_type_field`, so one mixed-file table can route documents without one enrichment per MIME type.
 - Unsupported content types now produce a structured `route_type: "unsupported"` manifest with `unsupported_reason`, zero units, and no searchable child documents instead of failing the enrichment.
 - Unit records are stored under the parent document's asset namespace with deterministic unit IDs such as `document:000001`, `article:000001`, and `page:000001`.

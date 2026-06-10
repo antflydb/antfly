@@ -121,12 +121,15 @@ const RouteMatch = struct {
     content_type: []const u8 = "",
     content_type_prefix: []const u8 = "",
     extensions: []const []const u8 = &.{},
+    magic_prefixes: []const []const u8 = &.{},
 
     fn deinit(self: *const RouteMatch, alloc: Allocator) void {
         if (self.content_type.len > 0) alloc.free(@constCast(self.content_type));
         if (self.content_type_prefix.len > 0) alloc.free(@constCast(self.content_type_prefix));
         for (self.extensions) |extension| alloc.free(@constCast(extension));
         if (self.extensions.len > 0) alloc.free(@constCast(self.extensions));
+        for (self.magic_prefixes) |prefix| alloc.free(@constCast(prefix));
+        if (self.magic_prefixes.len > 0) alloc.free(@constCast(self.magic_prefixes));
     }
 };
 
@@ -228,6 +231,7 @@ fn parseRouteMatchAlloc(alloc: Allocator, object: std.json.ObjectMap) !RouteMatc
         .content_type = try dupeStringField(alloc, object, "content_type"),
         .content_type_prefix = try dupeStringField(alloc, object, "content_type_prefix"),
         .extensions = try dupeStringArrayOrStringField(alloc, object, "extension"),
+        .magic_prefixes = try dupeStringArrayOrStringField(alloc, object, "magic_prefix"),
     };
 }
 
@@ -294,27 +298,30 @@ pub fn extractDownloadedAlloc(
 ) !Result {
     const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
     for (config.routes) |route| {
-        if (!routeMatches(route.match, content_type, config.filename, source_url)) continue;
+        if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
         return try extractWithRouteAlloc(alloc, downloaded.data, content_type, route, config.html_strip_tags);
     }
     if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractPdfAlloc(alloc, downloaded.data, content_type);
     }
-    if (isHtmlContent(content_type, config.filename, source_url)) {
+    if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitAlloc(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags);
     }
-    if (isTextContent(content_type, config.filename, source_url)) {
+    if (isTextContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitAlloc(alloc, downloaded.data, content_type, "document:000001", "document", "text", false);
     }
     return try unsupportedResultAlloc(alloc, content_type, "unsupported_content_type");
 }
 
-fn routeMatches(match: RouteMatch, content_type: []const u8, filename: []const u8, source_url: []const u8) bool {
-    if (match.content_type.len == 0 and match.content_type_prefix.len == 0 and match.extensions.len == 0) return true;
+fn routeMatches(match: RouteMatch, content_type: []const u8, filename: []const u8, source_url: []const u8, bytes: []const u8) bool {
+    if (match.content_type.len == 0 and match.content_type_prefix.len == 0 and match.extensions.len == 0 and match.magic_prefixes.len == 0) return true;
     if (match.content_type.len > 0 and contentTypeEquals(content_type, match.content_type)) return true;
     if (match.content_type_prefix.len > 0 and contentTypeStartsWith(content_type, match.content_type_prefix)) return true;
     for (match.extensions) |extension| {
         if (hasConfiguredExtension(filename, extension) or hasConfiguredExtension(source_url, extension)) return true;
+    }
+    for (match.magic_prefixes) |prefix| {
+        if (std.mem.startsWith(u8, bytes, prefix)) return true;
     }
     return false;
 }
@@ -484,18 +491,63 @@ fn isPdfContent(content_type: []const u8, filename: []const u8, source_url: []co
     return std.mem.startsWith(u8, bytes, "%PDF-");
 }
 
-fn isHtmlContent(content_type: []const u8, filename: []const u8, source_url: []const u8) bool {
+fn isHtmlContent(content_type: []const u8, filename: []const u8, source_url: []const u8, bytes: []const u8) bool {
     if (contentTypeEquals(content_type, "text/html")) return true;
-    return hasExtension(filename, ".html") or hasExtension(filename, ".htm") or
-        hasExtension(source_url, ".html") or hasExtension(source_url, ".htm");
+    if (hasExtension(filename, ".html") or hasExtension(filename, ".htm") or
+        hasExtension(source_url, ".html") or hasExtension(source_url, ".htm"))
+    {
+        return true;
+    }
+    return looksLikeHtml(bytes);
 }
 
-fn isTextContent(content_type: []const u8, filename: []const u8, source_url: []const u8) bool {
+fn isTextContent(content_type: []const u8, filename: []const u8, source_url: []const u8, bytes: []const u8) bool {
     if (contentTypeStartsWith(content_type, "text/")) return true;
     if (contentTypeEquals(content_type, "application/json")) return true;
-    return hasExtension(filename, ".txt") or hasExtension(source_url, ".txt") or
+    if (hasExtension(filename, ".txt") or hasExtension(source_url, ".txt") or
         hasExtension(filename, ".json") or hasExtension(source_url, ".json") or
-        hasExtension(filename, ".csv") or hasExtension(source_url, ".csv");
+        hasExtension(filename, ".csv") or hasExtension(source_url, ".csv"))
+    {
+        return true;
+    }
+    return contentTypeAllowsTextSniff(content_type) and looksLikePlainText(bytes);
+}
+
+fn looksLikeHtml(bytes: []const u8) bool {
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[0] != '<') return false;
+    return startsWithIgnoreCase(trimmed, "<!doctype html") or
+        startsWithIgnoreCase(trimmed, "<html") or
+        startsWithIgnoreCase(trimmed, "<head") or
+        startsWithIgnoreCase(trimmed, "<body") or
+        startsWithIgnoreCase(trimmed, "<title") or
+        startsWithIgnoreCase(trimmed, "<meta");
+}
+
+fn contentTypeAllowsTextSniff(content_type: []const u8) bool {
+    const base = contentTypeBase(content_type);
+    return base.len == 0 or
+        std.ascii.eqlIgnoreCase(base, "application/octet-stream") or
+        std.ascii.eqlIgnoreCase(base, "binary/octet-stream") or
+        std.ascii.eqlIgnoreCase(base, "application/x-unknown-content-type");
+}
+
+fn looksLikePlainText(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    _ = std.unicode.utf8CountCodepoints(bytes) catch return false;
+    var printable: usize = 0;
+    for (bytes) |byte| {
+        if (byte == 0) return false;
+        if (byte == '\n' or byte == '\r' or byte == '\t') continue;
+        if (byte < 0x20) return false;
+        printable += 1;
+    }
+    return printable > 0;
+}
+
+fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    if (value.len < prefix.len) return false;
+    return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
 fn hasExtension(value: []const u8, extension: []const u8) bool {
@@ -582,6 +634,59 @@ test "document extraction routes configured extensions into text units" {
     try std.testing.expectEqualStrings("note:000001", result.units[0].unit_id);
     try std.testing.expectEqualStrings("note", result.units[0].unit_type);
     try std.testing.expectEqualStrings("alpha beta", result.units[0].text);
+}
+
+test "document extraction routes configured magic prefixes into text units" {
+    const alloc = std.testing.allocator;
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "application/octet-stream"),
+        .data = try alloc.dupe(u8, "# title\nbody"),
+    };
+    defer downloaded.deinit(alloc);
+
+    var config = try parseConfig(alloc,
+        \\{"routes":[{"match":{"magic_prefix":"# "},"extractor":{"type":"text","unit":"markdown"}}]}
+    );
+    defer config.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/download", config);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("text", result.route_type);
+    try std.testing.expectEqualStrings("markdown:000001", result.units[0].unit_id);
+    try std.testing.expectEqualStrings("markdown", result.units[0].unit_type);
+    try std.testing.expectEqualStrings("# title\nbody", result.units[0].text);
+}
+
+test "document extraction sniffs html bytes without metadata" {
+    const alloc = std.testing.allocator;
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "application/octet-stream"),
+        .data = try alloc.dupe(u8, "  <!doctype html><html><body><h1>Alpha</h1></body></html>"),
+    };
+    defer downloaded.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/download", .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("html", result.route_type);
+    try std.testing.expectEqualStrings("article:000001", result.units[0].unit_id);
+    try std.testing.expectEqualStrings("article", result.units[0].unit_type);
+    try std.testing.expectEqualStrings("Alpha", result.units[0].text);
+}
+
+test "document extraction sniffs utf8 text bytes without metadata" {
+    const alloc = std.testing.allocator;
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "application/octet-stream"),
+        .data = try alloc.dupe(u8, "plain text\nsecond line"),
+    };
+    defer downloaded.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/download", .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("text", result.route_type);
+    try std.testing.expectEqualStrings("document:000001", result.units[0].unit_id);
+    try std.testing.expectEqualStrings("document", result.units[0].unit_type);
+    try std.testing.expectEqualStrings("plain text\nsecond line", result.units[0].text);
 }
 
 test "document extraction applies source metadata fields from row json" {
