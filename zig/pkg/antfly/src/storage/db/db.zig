@@ -19110,38 +19110,97 @@ fn mentionEdgeWritesFromResolutionAlloc(
         null;
     defer if (parsed_extraction) |*parsed| parsed.deinit();
 
-    var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
-    errdefer freeGraphWrites(alloc, writes.items);
+    var aggregates = std.ArrayListUnmanaged(MentionEdgeAggregate).empty;
+    defer {
+        for (aggregates.items) |*aggregate| aggregate.deinit(alloc);
+        aggregates.deinit(alloc);
+    }
     for (parsed_resolution.entities) |entity| {
         if (!resolutionDecisionCreatesCanonicalEdge(entity.decision)) continue;
         if (entity.doc_ref.key.len == 0) continue;
-        // One mention edge per distinct entity even if mentioned repeatedly.
-        var duplicate = false;
-        for (writes.items) |existing| {
-            if (std.mem.eql(u8, existing.target, entity.doc_ref.key)) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (duplicate) continue;
-        // Record the resolved DocRef target table so the endpoint can be
-        // hydrated cross-table; same-table hydration ignores it.
-        const metadata = try std.fmt.allocPrint(alloc, "{{\"target_table\":{f}}}", .{std.json.fmt(entity.doc_ref.table, .{})});
-        errdefer alloc.free(metadata);
         const mention_confidence = if (parsed_extraction) |parsed|
             extractionConfidenceForLocalId(parsed.entities, entity.local_id) orelse entity.confidence
         else
             entity.confidence;
+        const mention_artifact_key = try resolutionMentionArtifactKeyAlloc(alloc, doc_key, cfg.source_artifact, cfg.resolution_artifact, entity.local_id);
+        var mention_key_owned = true;
+        errdefer if (mention_key_owned) alloc.free(mention_artifact_key);
+        const aggregate = try findOrAppendMentionEdgeAggregate(alloc, &aggregates, entity.doc_ref.key, entity.doc_ref.table);
+        try aggregate.appendMentionArtifactKey(alloc, mention_artifact_key);
+        mention_key_owned = false;
+        aggregate.mention_confidence = @max(aggregate.mention_confidence, mention_confidence);
+    }
+
+    var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
+    errdefer freeGraphWrites(alloc, writes.items);
+    for (aggregates.items) |aggregate| {
+        const metadata = try mentionEdgeMetadataJsonAlloc(alloc, aggregate);
+        errdefer alloc.free(metadata);
         try writes.append(alloc, .{
             .index_name = try alloc.dupe(u8, index_name),
             .source = try alloc.dupe(u8, doc_key),
-            .target = try alloc.dupe(u8, entity.doc_ref.key),
+            .target = try alloc.dupe(u8, aggregate.target),
             .edge_type = try alloc.dupe(u8, mention_edge_type),
-            .weight = cfg.fusedMentionWeight(mention_confidence),
+            .weight = cfg.fusedMentionWeight(aggregate.mention_confidence),
             .metadata_json = metadata,
         });
     }
     return try writes.toOwnedSlice(alloc);
+}
+
+const MentionEdgeAggregate = struct {
+    target: []u8,
+    target_table: []u8,
+    mention_confidence: f64,
+    mention_artifact_keys: std.ArrayListUnmanaged([]u8) = .empty,
+
+    fn deinit(self: *MentionEdgeAggregate, alloc: Allocator) void {
+        alloc.free(self.target);
+        alloc.free(self.target_table);
+        for (self.mention_artifact_keys.items) |key| alloc.free(key);
+        self.mention_artifact_keys.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn appendMentionArtifactKey(self: *MentionEdgeAggregate, alloc: Allocator, key: []u8) !void {
+        try self.mention_artifact_keys.append(alloc, key);
+    }
+};
+
+fn findOrAppendMentionEdgeAggregate(
+    alloc: Allocator,
+    aggregates: *std.ArrayListUnmanaged(MentionEdgeAggregate),
+    target: []const u8,
+    target_table: []const u8,
+) !*MentionEdgeAggregate {
+    for (aggregates.items) |*existing| {
+        if (std.mem.eql(u8, existing.target, target)) return existing;
+    }
+    const target_owned = try alloc.dupe(u8, target);
+    var target_owned_live = true;
+    errdefer if (target_owned_live) alloc.free(target_owned);
+    const table_owned = try alloc.dupe(u8, target_table);
+    var table_owned_live = true;
+    errdefer if (table_owned_live) alloc.free(table_owned);
+    try aggregates.append(alloc, .{
+        .target = target_owned,
+        .target_table = table_owned,
+        .mention_confidence = 0,
+    });
+    target_owned_live = false;
+    table_owned_live = false;
+    return &aggregates.items[aggregates.items.len - 1];
+}
+
+fn mentionEdgeMetadataJsonAlloc(alloc: Allocator, aggregate: MentionEdgeAggregate) ![]u8 {
+    // Record the resolved DocRef target table so the endpoint can be hydrated
+    // cross-table; same-table hydration ignores it. The mention artifact keys
+    // are the durable evidence rollup behind the deduplicated entity edge.
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .target_table = aggregate.target_table,
+        .mention_count = aggregate.mention_artifact_keys.items.len,
+        .mention_artifact_keys = aggregate.mention_artifact_keys.items,
+    }, .{});
 }
 
 fn appendMentionEvidenceArtifactsFromResolution(
@@ -27367,7 +27426,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         .writes = &.{.{
             .key = "doc:a",
             .value =
-            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"person","text":"Ada Lovelace"}]}}
             ,
         }},
         .sync_level = .enrichments,
@@ -27399,10 +27458,26 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
     }
     const mention_artifact_key = try resolutionMentionArtifactKeyAlloc(alloc, "doc:a", "relations_v1", "resolution_v1", "e0");
     defer alloc.free(mention_artifact_key);
+    const second_mention_artifact_key = try resolutionMentionArtifactKeyAlloc(alloc, "doc:a", "relations_v1", "resolution_v1", "e1");
+    defer alloc.free(second_mention_artifact_key);
     {
         const raw = try db.core.store.get(alloc, mention_artifact_key);
         defer alloc.free(raw);
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"_artifact_kind\":\"resolution_mention\"") != null);
+    }
+    {
+        const raw = try db.core.store.get(alloc, second_mention_artifact_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"_artifact_kind\":\"resolution_mention\"") != null);
+    }
+    {
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 1), out.len);
+        try std.testing.expect(std.mem.indexOf(u8, out[0].metadata, "\"mention_count\":2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out[0].metadata, "\"mention_artifact_keys\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out[0].metadata, mention_artifact_key) != null);
+        try std.testing.expect(std.mem.indexOf(u8, out[0].metadata, second_mention_artifact_key) != null);
     }
     {
         const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
@@ -27422,6 +27497,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, graph_edge_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, mention_artifact_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, second_mention_artifact_key));
     {
         const raw = try db.core.store.get(alloc, asset_key);
         defer alloc.free(raw);

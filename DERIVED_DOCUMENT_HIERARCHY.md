@@ -443,7 +443,7 @@ Current implementation status:
 - Public query responses now emit a stable `hierarchy` envelope for derived unit/chunk/embedding hits and source-level rollups, including `level`, `parent_doc_key`, optional `parent_unit_id`, artifact identity, and nested child chunks.
 - Hierarchy responses now include a stable `ancestors` envelope. Source-level payloads carry `ancestors.source.document`, unit hits carry `ancestors.unit.document`, chunk hits expose unit ancestry fields and provenance recovered from the chunk payload, and direct chunk searches can hydrate DB-backed source/unit ancestor documents when `hierarchy.include` requests them.
 - Public artifact IDs now round-trip document-unit asset artifacts, so unit-level hits can be exposed as first-class derived hierarchy results instead of opaque internal keys.
-- Public hierarchy controls now accept `return_level: "unit"` and map it onto the existing derived-artifact return path while reserving mention-level responses for a later graph evidence schema.
+- Public hierarchy controls now accept `return_level: "unit"` and `return_level: "mention"`. Mention hits are recognized from `antfly.resolution_mention.v1` evidence artifacts and returned with a stable hierarchy evidence envelope.
 - Document units now carry source-document character spans where the extractor can compute them, and chunk artifacts now emit a `provenance` envelope with explicit `offset_basis`, chunk-local `char_start`/`char_end`, unit-local offsets for unit chunks, and document-global offsets when available.
 - Document extraction state records both `unit_keys` and `chunk_keys`, so source updates and source clearing delete stale units and stale unit-derived chunks.
 - Existing chunk-aware scans recognize both legacy whole-document chunk keys and the new unit-scoped chunk keys.
@@ -453,7 +453,7 @@ Current implementation status:
 Still remaining in Phase 2:
 
 - Public query requests now accept initial `hierarchy` controls that map `source`, `unit`, and `chunk` return levels plus source rollups onto the existing derived-artifact result modes.
-- Query results now expose matched chunks through existing chunk return modes and include a stable hierarchy envelope with response-local ancestor hydration plus DB-backed source/unit hydration for direct chunk hits when requested. First-class `mention` return levels still need a graph evidence response contract.
+- Query results now expose matched chunks through existing chunk return modes and include a stable hierarchy envelope with response-local ancestor hydration plus DB-backed source/unit hydration for direct chunk hits when requested. First-class `mention` return levels are backed by `antfly.resolution_mention.v1` artifacts and response evidence envelopes.
 - Chunk payloads preserve unit ancestry and explicit unit-local/document-global offset provenance; future extractor-specific offsets such as PDF bounding boxes and OCR coordinates still need a richer format-specific provenance contract.
 - Incremental chunk reuse is currently key-stable by unit id and chunk id and backed by parent-owned range/merge descriptors with per-unit fingerprints. The local execution path can skip stable artifact/vector-only unit subtrees when existing artifacts prove the subtree is already materialized.
 
@@ -495,11 +495,12 @@ Current implementation status:
 - Resolution replay now materializes first-class `antfly.resolution_mention.v1` evidence artifacts for canonical resolver decisions. Each artifact is keyed by source artifact, resolution artifact, and local mention ID, stores the resolver decision, canonical DocRef, mention text/label/confidence, and explicit mention/source/resolution artifact keys, and is retired through durable state alongside the existing doc-to-entity mention edges.
 - Resolver replay accepts unit asset artifacts and chunk artifacts as source artifacts and scopes their resolution artifacts under the source artifact key, so unit/chunk-level entity extraction can resolve without colliding at the parent document's resolution artifact key.
 - Public hierarchy controls now accept `return_level: "mention"`. Query responses recognize `antfly.resolution_mention.v1` artifact hits and emit `hierarchy.level: "mention"` plus an `evidence` envelope with mention, canonical, resolver, source artifact, and resolution artifact references.
+- Canonical mention provenance edges now roll up the durable evidence behind the edge in metadata: `target_table`, `mention_count`, and `mention_artifact_keys`. Multiple local mentions that resolve to the same canonical entity remain one graph edge, but the graph edge keeps links back to all underlying mention artifacts.
 
 Still remaining in Phase 4:
 
 - Extend the same resolver/source-artifact contract to dedicated mention artifacts.
-- Add graph-neighborhood evidence rollups from canonical entities/edges back to mention artifacts.
+- Extend graph-neighborhood evidence rollups beyond mention-edge metadata into richer neighborhood response shaping for canonical entities/edges.
 
 ### Phase 5: More file types and OCR fallback
 
