@@ -1967,6 +1967,10 @@ pub const AntflyApiHandler = struct {
         defer alloc.free(decoded_key);
         const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
         defer alloc.free(decoded_artifact_name);
+        if (!(try self.api_server.sourceDocumentVisibleToIdentity(table_name, decoded_key, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        }
         var resp = try public_table_http.handleDocumentArtifactManifest(alloc, table_name, decoded_key, decoded_artifact_name, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
     }
@@ -1978,6 +1982,10 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, key);
         defer alloc.free(decoded_key);
+        if (!(try self.api_server.sourceDocumentVisibleToIdentity(table_name, decoded_key, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        }
         var resp = try public_table_http.handleDocumentArtifactManifests(alloc, table_name, decoded_key, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
     }
@@ -1991,6 +1999,10 @@ pub const AntflyApiHandler = struct {
         defer alloc.free(decoded_key);
         const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
         defer alloc.free(decoded_artifact_name);
+        if (!(try self.api_server.sourceDocumentVisibleToIdentity(table_name, decoded_key, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        }
         var resp = try public_table_http.handleReprocessDocumentArtifact(alloc, table_name, decoded_key, decoded_artifact_name, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
     }

@@ -3124,7 +3124,7 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableDocumentArtifactReprocess(uri_parts.path)) |artifact_route| {
-                return try self.handlePublicReprocessDocumentArtifact(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name);
+                return try self.handlePublicReprocessDocumentArtifact(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name, authenticated_identity);
             }
         }
         if (req.method == .POST) {
@@ -3347,12 +3347,12 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableDocumentArtifacts(uri_parts.path)) |artifact_route| {
-                return try self.handlePublicDocumentArtifactManifests(artifact_route.table_name, artifact_route.key);
+                return try self.handlePublicDocumentArtifactManifests(artifact_route.table_name, artifact_route.key, authenticated_identity);
             }
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableDocumentArtifact(uri_parts.path)) |artifact_route| {
-                return try self.handlePublicDocumentArtifactManifest(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name);
+                return try self.handlePublicDocumentArtifactManifest(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name, authenticated_identity);
             }
         }
         if (req.method == .GET) {
@@ -3663,6 +3663,19 @@ pub const ApiHttpServer = struct {
         row_filter_json: []const u8,
     ) !bool {
         return try search_pattern_filter.storedDocMatchesPatternFilter(self.alloc, key, json, row_filter_json);
+    }
+
+    pub fn sourceDocumentVisibleToIdentity(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        key: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !bool {
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        const filter = row_filter_json orelse return true;
+        const source = self.table_reads orelse return false;
+        return try self.docMatchesRowFilter(source, table_name, key, filter);
     }
 
     pub fn filterScanResultByRowFilter(
@@ -5739,12 +5752,15 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn handlePublicDocumentArtifactManifest(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicDocumentArtifactManifest(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
         defer self.alloc.free(doc_key);
         const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
 
+        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
         var resp = try public_table_http.handleDocumentArtifactManifest(self.alloc, table_name, doc_key, artifact_name, self.tableApi());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
@@ -5753,10 +5769,13 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn handlePublicDocumentArtifactManifests(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicDocumentArtifactManifests(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
         defer self.alloc.free(doc_key);
 
+        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
         var resp = try public_table_http.handleDocumentArtifactManifests(self.alloc, table_name, doc_key, self.tableApi());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
@@ -5765,12 +5784,15 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn handlePublicReprocessDocumentArtifact(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicReprocessDocumentArtifact(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
         defer self.alloc.free(doc_key);
         const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
 
+        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
         var resp = try public_table_http.handleReprocessDocumentArtifact(self.alloc, table_name, doc_key, artifact_name, self.tableApi());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
@@ -7128,6 +7150,88 @@ test "effective resolved row filter prefers table filter before wildcard" {
     defer alloc.free(resolved);
 
     try std.testing.expectEqualStrings("{\"term\":{\"owner\":\"bob\"}}", resolved);
+}
+
+test "artifact operations apply source document row filter visibility" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+
+    const FakeReads = struct {
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            if (!std.mem.eql(u8, table_name, "docs")) return null;
+            const json = if (std.mem.eql(u8, key, "doc:public"))
+                "{\"tenant\":\"acme\"}"
+            else if (std.mem.eql(u8, key, "doc:private"))
+                "{\"tenant\":\"other\"}"
+            else
+                return null;
+            return .{
+                .json = try inner_alloc.dupe(u8, json),
+                .version = 1,
+            };
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.TestUnexpectedResult;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = FakeSource{};
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+
+    var row_filters = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"tenant\":\"acme\"}}"),
+    };
+    defer row_filters[0].deinit(alloc);
+    const identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "alice"),
+        .row_filter = row_filters[0..],
+    };
+    defer alloc.free(identity.username);
+
+    try std.testing.expect(try server.sourceDocumentVisibleToIdentity("docs", "doc:public", identity));
+    try std.testing.expect(!try server.sourceDocumentVisibleToIdentity("docs", "doc:private", identity));
+    try std.testing.expect(!try server.sourceDocumentVisibleToIdentity("docs", "doc:missing", identity));
+    try std.testing.expect(try server.sourceDocumentVisibleToIdentity("docs", "doc:private", null));
 }
 
 test "join auth applies read permission and row filters to joined tables" {

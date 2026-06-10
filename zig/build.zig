@@ -3325,6 +3325,7 @@ pub fn build(b: *std.Build) void {
             "auth row filter resolver rejects unsupported auth paths",
             "auth row filter validator rejects malformed auth node",
             "effective resolved row filter prefers table filter before wildcard",
+            "artifact operations apply source document row filter visibility",
         },
     });
     const run_lib_api_auth_tests = b.addRunArtifact(lib_api_auth_tests);
