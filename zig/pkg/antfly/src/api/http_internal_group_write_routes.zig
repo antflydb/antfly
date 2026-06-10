@@ -171,6 +171,28 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         };
         return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 201, response);
     }
+    if (routes.Routes.matchGroupDocumentArtifactReprocess(path)) |artifact_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.key);
+        defer ctx.alloc.free(decoded_key);
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.artifact_name);
+        defer ctx.alloc.free(decoded_artifact_name);
+        const handled = (writes.reprocessDocumentArtifactGroupLocal(
+            ctx.alloc,
+            artifact_route.group_id,
+            artifact_route.table_name,
+            decoded_key,
+            decoded_artifact_name,
+        ) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact reprocess request"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        if (!handled) return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        return try http_route_helpers.jsonResponse(ctx.alloc, .{ .reprocess = "triggered" });
+    }
     if (routes.Routes.matchGroupTxnBegin(path)) |txn_route| {
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         var txn_req = distributed_txn.parseTxnBeginRequest(ctx.alloc, req.body) catch {

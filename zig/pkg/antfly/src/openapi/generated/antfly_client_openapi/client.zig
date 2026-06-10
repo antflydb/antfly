@@ -543,6 +543,24 @@ pub const Client = struct {
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
+    /// Inspect a derived document artifact manifest
+    /// GET /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}
+    pub fn getDocumentArtifactManifest(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8) !ApiResponse(types.DocumentArtifactManifest) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}", .{ self.base_url, table_name, key, artifact_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.DocumentArtifactManifest).fromResponse(self.allocator, &resp);
+    }
+
+    /// Reprocess a derived document artifact
+    /// POST /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess
+    pub fn reprocessDocumentArtifact(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8) !ApiResponse(types.DocumentArtifactReprocessResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}:reprocess", .{ self.base_url, table_name, key, artifact_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.DocumentArtifactReprocessResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// List all indexes for a table
     /// GET /db/v1/tables/{tableName}/indexes
     pub fn listIndexes(self: *@This(), table_name: []const u8) !ApiResponse([]const types.IndexStatus) {

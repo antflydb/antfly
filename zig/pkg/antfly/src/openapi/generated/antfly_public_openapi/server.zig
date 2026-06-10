@@ -270,6 +270,26 @@ pub const LookupKeyParams = struct {
     fields: ?[]const u8 = null,
 };
 
+/// Inspect a derived document artifact manifest
+pub const GetDocumentArtifactManifestPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
+/// Reprocess a derived document artifact
+pub const ReprocessDocumentArtifactPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
 /// List all indexes for a table
 pub const ListIndexesPathParams = struct {
     /// Name of the table
@@ -538,6 +558,8 @@ pub const routes = [_]Route{
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema" },
     .{ .method = "POST", .path = "/tables/{tableName}/lookup", .operation_id = "scanKeys" },
     .{ .method = "GET", .path = "/tables/{tableName}/lookup/{key}", .operation_id = "lookupKey" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest" },
+    .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess", .operation_id = "reprocessDocumentArtifact" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex" },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex" },
@@ -608,6 +630,8 @@ pub const routes = [_]Route{
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
+//   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response

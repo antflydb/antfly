@@ -179,6 +179,22 @@ const SemanticStatusResolver = struct {
     }
 };
 
+const DocumentArtifactManifestResponse = struct {
+    document_id: []const u8,
+    artifact_name: []const u8,
+    artifact_id: []const u8,
+    generation: u64,
+    route_type: []const u8,
+    unsupported_reason: ?[]const u8,
+    unit_count: usize,
+    chunk_count: usize,
+    child_range_count: usize,
+    merge_status: []const u8,
+    merge_operation_count: usize,
+    manifest_json: []const u8,
+    state_json: ?[]const u8,
+};
+
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, query: []const u8) !?http_common.HttpResponse {
     const alloc = ctx.alloc;
     const source = ctx.reads;
@@ -208,6 +224,47 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                     .name = "X-Antfly-Version",
                     .value = try std.fmt.allocPrint(alloc, "{d}", .{result.version}),
                 },
+            });
+        }
+    }
+
+    if (req.method == .GET) {
+        if (routes.Routes.matchGroupDocumentArtifact(path)) |artifact_route| {
+            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_route.key);
+            defer alloc.free(decoded_key);
+            const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_route.artifact_name);
+            defer alloc.free(decoded_artifact_name);
+
+            var manifest = (reads.documentArtifactManifestGroupLocal(
+                alloc,
+                artifact_route.group_id,
+                artifact_route.table_name,
+                decoded_key,
+                decoded_artifact_name,
+                .read_index,
+            ) catch |err| switch (err) {
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
+                error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            defer manifest.deinit(alloc);
+
+            return try http_route_helpers.jsonResponse(alloc, DocumentArtifactManifestResponse{
+                .document_id = manifest.document_id,
+                .artifact_name = manifest.artifact_name,
+                .artifact_id = manifest.artifact_id,
+                .generation = manifest.generation,
+                .route_type = manifest.route_type,
+                .unsupported_reason = manifest.unsupported_reason,
+                .unit_count = manifest.unit_count,
+                .chunk_count = manifest.chunk_count,
+                .child_range_count = manifest.child_range_count,
+                .merge_status = manifest.merge_status,
+                .merge_operation_count = manifest.merge_operation_count,
+                .manifest_json = manifest.manifest_json,
+                .state_json = manifest.state_json,
             });
         }
     }

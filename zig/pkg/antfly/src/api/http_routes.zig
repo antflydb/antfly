@@ -250,6 +250,13 @@ pub const Routes = struct {
         table_name: []const u8,
     };
 
+    pub const GroupDocumentArtifact = struct {
+        group_id: u64,
+        table_name: []const u8,
+        key: []const u8,
+        artifact_name: []const u8,
+    };
+
     pub const GroupGraphExpand = struct {
         group_id: u64,
         table_name: []const u8,
@@ -667,6 +674,42 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupDocumentArtifact(path: []const u8) ?GroupDocumentArtifact {
+        return matchGroupDocumentArtifactWithReprocess(path, false);
+    }
+
+    pub fn matchGroupDocumentArtifactReprocess(path: []const u8) ?GroupDocumentArtifact {
+        return matchGroupDocumentArtifactWithReprocess(path, true);
+    }
+
+    fn matchGroupDocumentArtifactWithReprocess(path: []const u8, reprocess: bool) ?GroupDocumentArtifact {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        const table_rest = rest[tables_prefix.len..];
+        const documents_index = std.mem.indexOf(u8, table_rest, documents_marker) orelse return null;
+        if (documents_index == 0) return null;
+        const table_name = table_rest[0..documents_index];
+        const document_rest = table_rest[documents_index + documents_marker.len ..];
+        const artifacts_index = std.mem.indexOf(u8, document_rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const key = document_rest[0..artifacts_index];
+        var artifact_name = document_rest[artifacts_index + artifacts_marker.len ..];
+        if (reprocess) {
+            if (!std.mem.endsWith(u8, artifact_name, reprocess_suffix)) return null;
+            artifact_name = artifact_name[0 .. artifact_name.len - reprocess_suffix.len];
+        } else if (std.mem.endsWith(u8, artifact_name, reprocess_suffix)) {
+            return null;
+        }
+        if (key.len == 0 or artifact_name.len == 0) return null;
+        return .{
+            .group_id = group.group_id,
+            .table_name = table_name,
+            .key = key,
+            .artifact_name = artifact_name,
+        };
+    }
+
     pub fn matchInternalTableCorruptEmbeddingArtifact(path: []const u8) ?InternalTableCorruptEmbeddingArtifact {
         if (!std.mem.startsWith(u8, path, internal_tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, corrupt_embedding_artifact_suffix)) return null;
@@ -930,6 +973,15 @@ test "public api routes compile" {
     try std.testing.expectEqual(@as(u64, 7), group_query_preflight.group_id);
     const group_batch = Routes.matchGroupBatch("/internal/v1/groups/7/tables/docs/batch").?;
     try std.testing.expectEqual(@as(u64, 7), group_batch.group_id);
+    const group_artifact = Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1").?;
+    try std.testing.expectEqual(@as(u64, 7), group_artifact.group_id);
+    try std.testing.expectEqualStrings("docs", group_artifact.table_name);
+    try std.testing.expectEqualStrings("doc%2Fa", group_artifact.key);
+    try std.testing.expectEqualStrings("document_units_v1", group_artifact.artifact_name);
+    const group_reprocess = Routes.matchGroupDocumentArtifactReprocess("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:reprocess").?;
+    try std.testing.expectEqual(@as(u64, 7), group_reprocess.group_id);
+    try std.testing.expectEqualStrings("document_units_v1", group_reprocess.artifact_name);
+    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc:a/artifacts/document_units_v1:reprocess") == null);
     const group_graph_expand = Routes.matchGroupGraphExpand("/internal/v1/groups/7/tables/docs/graph-expand").?;
     try std.testing.expectEqual(@as(u64, 7), group_graph_expand.group_id);
     const group_graph_hydrate = Routes.matchGroupGraphHydrate("/internal/v1/groups/7/tables/docs/graph-hydrate").?;

@@ -3791,6 +3791,106 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: key
+        in: path
+        required: true
+        description: Percent-encoded source document key.
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+    get:
+      summary: Inspect a derived document artifact manifest
+      description: >
+        Returns manifest and processing state for a derived document artifact,
+
+        such as the document-unit hierarchy extracted from a PDF, HTML page, or
+
+        text field. The route is shard-aware; hosted deployments route the
+
+        request to the data group that owns the source document key.
+      tags:
+        - data_operations
+      operationId: getDocumentArtifactManifest
+      responses:
+        '200':
+          description: Artifact manifest found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactManifest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: key
+        in: path
+        required: true
+        description: Percent-encoded source document key.
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+    post:
+      summary: Reprocess a derived document artifact
+      description: >
+        Invalidates the current artifact state and requests the producer to
+
+        rebuild the derived document hierarchy for the source document.
+      tags:
+        - data_operations
+      operationId: reprocessDocumentArtifact
+      responses:
+        '202':
+          description: Reprocessing was accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactReprocessResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/indexes:
     parameters:
       - name: tableName
@@ -5795,6 +5895,83 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ClusterDataGroupStatus'
+    DocumentArtifactManifest:
+      type: object
+      description: >
+        Inspection view for a derived document artifact produced from a source
+
+        table row. The embedded manifest/state JSON fields are intentionally
+
+        opaque so producers can evolve their internal unit schema without
+
+        changing this route contract.
+      required:
+        - document_id
+        - artifact_name
+        - artifact_id
+        - generation
+        - route_type
+        - unit_count
+        - chunk_count
+        - child_range_count
+        - merge_status
+        - merge_operation_count
+        - manifest_json
+      properties:
+        document_id:
+          type: string
+          description: Stable identity of the source document.
+        artifact_name:
+          type: string
+          description: Name of the derived artifact.
+          example: document_units_v1
+        artifact_id:
+          type: string
+          description: Stable identity of this artifact under the document.
+        generation:
+          type: integer
+          format: uint64
+          description: Monotonic generation for the current artifact state.
+        route_type:
+          type: string
+          description: Producer route selected for the source content.
+          example: pdf
+        unsupported_reason:
+          type: string
+          nullable: true
+          description: Reason extraction was skipped, when the source type is unsupported.
+        unit_count:
+          type: integer
+          description: Number of extracted document units.
+        chunk_count:
+          type: integer
+          description: Number of indexable chunks derived from the units.
+        child_range_count:
+          type: integer
+          description: Number of storage child ranges used by this artifact.
+        merge_status:
+          type: string
+          description: Current materialization or merge status.
+        merge_operation_count:
+          type: integer
+          description: Number of merge operations recorded for this artifact.
+        manifest_json:
+          type: string
+          description: Opaque JSON manifest for the artifact units and provenance.
+        state_json:
+          type: string
+          nullable: true
+          description: Optional opaque JSON state for incremental processing.
+    DocumentArtifactReprocessResponse:
+      type: object
+      required:
+        - reprocess
+      properties:
+        reprocess:
+          type: string
+          enum:
+            - triggered
+          description: Indicates that reprocessing was accepted.
     ClusterDataNodeStatus:
       type: object
       required:
@@ -16812,6 +16989,18 @@ components:
             $ref: '#/components/schemas/Error'
     Conflict:
       description: Request conflicts with the current resource state
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    MethodNotAllowed:
+      description: Method not allowed for this resource
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServiceUnavailable:
+      description: Service is temporarily unavailable
       content:
         application/json:
           schema:

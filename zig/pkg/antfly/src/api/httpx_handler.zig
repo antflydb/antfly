@@ -1958,6 +1958,32 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    pub fn getDocumentArtifactManifest(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, key);
+        defer alloc.free(decoded_key);
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
+        defer alloc.free(decoded_artifact_name);
+        var resp = try public_table_http.handleDocumentArtifactManifest(alloc, table_name, decoded_key, decoded_artifact_name, self.api_server.tableApi());
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn reprocessDocumentArtifact(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, key);
+        defer alloc.free(decoded_key);
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
+        defer alloc.free(decoded_artifact_name);
+        var resp = try public_table_http.handleReprocessDocumentArtifact(alloc, table_name, decoded_key, decoded_artifact_name, self.api_server.tableApi());
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
     pub fn listIndexes(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);

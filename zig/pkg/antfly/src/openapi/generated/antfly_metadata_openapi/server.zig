@@ -271,6 +271,26 @@ pub const LookupKeyParams = struct {
     fields: ?[]const u8 = null,
 };
 
+/// Inspect a derived document artifact manifest
+pub const GetDocumentArtifactManifestPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
+/// Reprocess a derived document artifact
+pub const ReprocessDocumentArtifactPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
 /// List all indexes for a table
 pub const ListIndexesPathParams = struct {
     /// Name of the table
@@ -352,6 +372,8 @@ pub const routes = [_]Route{
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema" },
     .{ .method = "POST", .path = "/tables/{tableName}/lookup", .operation_id = "scanKeys" },
     .{ .method = "GET", .path = "/tables/{tableName}/lookup/{key}", .operation_id = "lookupKey" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest" },
+    .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess", .operation_id = "reprocessDocumentArtifact" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex" },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex" },
@@ -407,6 +429,8 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "updateSchema")) @compileError("ServerRouter: Impl missing required method 'updateSchema'");
         if (!@hasDecl(Impl, "scanKeys")) @compileError("ServerRouter: Impl missing required method 'scanKeys'");
         if (!@hasDecl(Impl, "lookupKey")) @compileError("ServerRouter: Impl missing required method 'lookupKey'");
+        if (!@hasDecl(Impl, "getDocumentArtifactManifest")) @compileError("ServerRouter: Impl missing required method 'getDocumentArtifactManifest'");
+        if (!@hasDecl(Impl, "reprocessDocumentArtifact")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifact'");
         if (!@hasDecl(Impl, "listIndexes")) @compileError("ServerRouter: Impl missing required method 'listIndexes'");
         if (!@hasDecl(Impl, "getIndex")) @compileError("ServerRouter: Impl missing required method 'getIndex'");
         if (!@hasDecl(Impl, "createIndex")) @compileError("ServerRouter: Impl missing required method 'createIndex'");
@@ -463,6 +487,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.put("/tables/:tableName/schema", updateSchema);
             try server.post("/tables/:tableName/lookup", scanKeys);
             try server.get("/tables/:tableName/lookup/:key", lookupKey);
+            try server.get("/tables/:tableName/documents/:key/artifacts/:artifactName", getDocumentArtifactManifest);
+            try server.post("/tables/:tableName/documents/:key/artifacts/:artifactName:reprocess", reprocessDocumentArtifact);
             try server.get("/tables/:tableName/indexes", listIndexes);
             try server.get("/tables/:tableName/indexes/:indexName", getIndex);
             try server.post("/tables/:tableName/indexes/:indexName", createIndex);
@@ -772,6 +798,26 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.lookupKey(ctx, table_name, key, query_params);
         }
 
+        /// Inspect a derived document artifact manifest
+        /// GET /tables/{tableName}/documents/{key}/artifacts/{artifactName}
+        fn getDocumentArtifactManifest(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
+            return impl.getDocumentArtifactManifest(ctx, table_name, key, artifact_name);
+        }
+
+        /// Reprocess a derived document artifact
+        /// POST /tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess
+        fn reprocessDocumentArtifact(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
+            return impl.reprocessDocumentArtifact(ctx, table_name, key, artifact_name);
+        }
+
         /// List all indexes for a table
         /// GET /tables/{tableName}/indexes
         fn listIndexes(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -849,6 +895,8 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
+//   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response

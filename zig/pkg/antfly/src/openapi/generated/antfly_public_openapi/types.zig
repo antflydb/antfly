@@ -52,6 +52,41 @@ pub const ClusterHealth = enum {
     }
 };
 
+/// Inspection view for a derived document artifact produced from a source table row. The embedded manifest/state JSON fields are intentionally opaque so producers can evolve their internal unit schema without changing this route contract.
+pub const DocumentArtifactManifest = struct {
+    /// Stable identity of the source document.
+    document_id: []const u8,
+    /// Name of the derived artifact.
+    artifact_name: []const u8,
+    /// Stable identity of this artifact under the document.
+    artifact_id: []const u8,
+    /// Monotonic generation for the current artifact state.
+    generation: i64,
+    /// Producer route selected for the source content.
+    route_type: []const u8,
+    /// Reason extraction was skipped, when the source type is unsupported.
+    unsupported_reason: ?[]const u8 = null,
+    /// Number of extracted document units.
+    unit_count: i64,
+    /// Number of indexable chunks derived from the units.
+    chunk_count: i64,
+    /// Number of storage child ranges used by this artifact.
+    child_range_count: i64,
+    /// Current materialization or merge status.
+    merge_status: []const u8,
+    /// Number of merge operations recorded for this artifact.
+    merge_operation_count: i64,
+    /// Opaque JSON manifest for the artifact units and provenance.
+    manifest_json: []const u8,
+    /// Optional opaque JSON state for incremental processing.
+    state_json: ?[]const u8 = null,
+};
+
+pub const DocumentArtifactReprocessResponse = struct {
+    /// Indicates that reprocessing was accepted.
+    reprocess: []const u8,
+};
+
 pub const ClusterDataNodeStatus = struct {
     data_id: i64,
     node_id: i64,

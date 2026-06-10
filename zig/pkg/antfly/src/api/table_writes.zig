@@ -1907,6 +1907,14 @@ pub const TableWriteSource = struct {
             doc_key: []const u8,
             artifact_name: []const u8,
         ) anyerror!?bool = null,
+        reprocess_document_artifact_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+        ) anyerror!?bool = null,
         local_runtime_statuses: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2118,6 +2126,18 @@ pub const TableWriteSource = struct {
     ) !?bool {
         const fn_ptr = self.vtable.reprocess_document_artifact orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name);
+    }
+
+    pub fn reprocessDocumentArtifactGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const fn_ptr = self.vtable.reprocess_document_artifact_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name);
     }
 
     pub fn localRuntimeStatuses(
@@ -5151,6 +5171,8 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
+                .reprocess_document_artifact = reprocessDocumentArtifact,
+                .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
@@ -6370,6 +6392,80 @@ pub const ProvisionedTableWriteSource = struct {
 
         return error.NotFound;
     }
+
+    fn reprocessDocumentArtifact(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+        return try reprocessDocumentArtifactGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name);
+    }
+
+    fn reprocessDocumentArtifactGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.beginTableRequest(table_name);
+        defer self.endTableRequest(table_name);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateReadCache(table_name);
+        self.markWriteCacheDirty(table_name);
+        self.local_db_mutex.unlock();
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const handled = if (self.write_cache) |cache| blk: {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+            defer cached.deinit(alloc);
+            break :blk try cached.db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
+        } else blk: {
+            const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
+            defer if (indexes_json) |value| alloc.free(value);
+            var db = if (indexes_json) |value|
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+                    alloc,
+                    path,
+                    value,
+                    null,
+                    null,
+                    self.visibleRootGeneration(group_id),
+                    null,
+                    .default,
+                    self.backend_runtime,
+                    self.antfly_provider,
+                    self.secret_store,
+                    self.remote_content,
+                    try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
+                )
+            else
+                try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+            defer db.close();
+            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            const result = try db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
+            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            break :blk result;
+        };
+        if (handled) {
+            lockAtomic(&self.local_db_mutex);
+            self.invalidateReadCache(table_name);
+            self.markWriteCacheDirty(table_name);
+            self.local_db_mutex.unlock();
+            self.notifyLocalChange(table_name, .data);
+        }
+        return handled;
+    }
 };
 
 pub const HostedProvisionedTableWriteSource = struct {
@@ -6634,6 +6730,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
+                .reprocess_document_artifact = reprocessDocumentArtifact,
+                .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
@@ -6964,6 +7062,57 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
 
         return error.NotFound;
+    }
+
+    fn reprocessDocumentArtifact(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            return switch (route.*) {
+                .local => try reprocessDocumentArtifactGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name),
+                .remote => |remote| blk: {
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var response = client.fetchGroupDocumentArtifactReprocess(remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
+                        error.NotFound, error.UnexpectedHttpStatus => break :blk null,
+                        else => return err,
+                    };
+                    defer response.deinit(alloc);
+                    break :blk true;
+                },
+            };
+        }
+        return try reprocessDocumentArtifactGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name);
+    }
+
+    fn reprocessDocumentArtifactGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.invalidateManagedCache(table_name);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        const handled = try cached.db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
+        if (handled) {
+            try drainManagedDbBeforeClose(cached.db);
+            self.invalidateManagedCache(table_name);
+        }
+        return handled;
     }
 };
 

@@ -1317,6 +1317,15 @@ pub const TableReadSource = struct {
             artifact_name: []const u8,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?db_mod.types.DocumentArtifactManifest = null,
+        document_artifact_manifest_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.DocumentArtifactManifest = null,
     };
 
     pub fn lookup(
@@ -1352,6 +1361,19 @@ pub const TableReadSource = struct {
     ) !?db_mod.types.DocumentArtifactManifest {
         const fn_ptr = self.vtable.document_artifact_manifest orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name, consistency);
+    }
+
+    pub fn documentArtifactManifestGroupLocal(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const fn_ptr = self.vtable.document_artifact_manifest_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency);
     }
 
     pub fn query(
@@ -2262,6 +2284,8 @@ pub const ProvisionedTableReadSource = struct {
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
                 .graph_edges_group_local = graphEdgesGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .document_artifact_manifest = documentArtifactManifest,
+                .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
             },
         };
     }
@@ -2303,6 +2327,20 @@ pub const ProvisionedTableReadSource = struct {
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse return null;
         return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
+    }
+
+    fn documentArtifactManifest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+        return try documentArtifactManifestProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency);
     }
 
     fn scan(
@@ -2442,6 +2480,20 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
+    }
+
+    fn documentArtifactManifestGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        return try documentArtifactManifestProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency);
     }
 
     fn preflightQueryGroupLocal(
@@ -2694,6 +2746,8 @@ pub const HostedProvisionedTableReadSource = struct {
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
                 .graph_edges_group_local = graphEdgesGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .document_artifact_manifest = documentArtifactManifest,
+                .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
             },
         };
     }
@@ -2717,6 +2771,39 @@ pub const HostedProvisionedTableReadSource = struct {
 
         if (try lookupViaRoute(self, alloc, route, group_id, table_name, key, opts, consistency)) |result| return result;
         return try lookupAcrossActivePlacements(self, alloc, group_id, table_name, key, opts, consistency, route);
+    }
+
+    fn documentArtifactManifest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+        return try documentArtifactManifestHostedRoute(self, alloc, group_id, table_name, doc_key, artifact_name, consistency);
+    }
+
+    fn documentArtifactManifestHostedRoute(
+        self: *HostedProvisionedTableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
+        defer route.deinit(alloc);
+        return switch (route) {
+            .local => try documentArtifactManifestProvisionedHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency),
+            .remote => |remote| documentArtifactManifestRemote(self.executor, alloc, remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
+                error.UnexpectedHttpStatus, error.NotFound => null,
+                else => err,
+            },
+        };
     }
 
     fn lookupViaRoute(
@@ -2960,6 +3047,19 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
+    }
+
+    fn documentArtifactManifestGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try documentArtifactManifestProvisionedHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency);
     }
 
     fn preflightQueryGroupLocal(
@@ -4496,6 +4596,55 @@ fn lookupProvisionedHostedLocal(
 ) !?LookupResponse {
     return lookupProvisionedLocal(primary_lookup_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, consistency) catch |err| switch (err) {
         error.NotLeader => if (consistency == .stale) err else try lookupProvisionedLocal(primary_lookup_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, .stale),
+        else => err,
+    };
+}
+
+fn documentArtifactManifestProvisionedLocal(
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.DocumentArtifactManifest {
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(path);
+    if (cache) |cached| {
+        var db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
+        defer db_lease.release();
+        var reads = raft_mod.FeatureDBReads.init(group_id, requester);
+        return try reads.documentArtifactManifestWithConsistency(alloc, db_lease.db, doc_key, artifact_name, consistency);
+    }
+
+    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog, table_name, group_id, lsm_root_generation, backend_runtime);
+    defer db.close();
+    var reads = raft_mod.FeatureDBReads.init(group_id, requester);
+    return try reads.documentArtifactManifestWithConsistency(alloc, &db, doc_key, artifact_name, consistency);
+}
+
+fn documentArtifactManifestProvisionedHostedLocal(
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.DocumentArtifactManifest {
+    return documentArtifactManifestProvisionedLocal(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, doc_key, artifact_name, consistency) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try documentArtifactManifestProvisionedLocal(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, doc_key, artifact_name, .stale),
         else => err,
     };
 }
@@ -11629,6 +11778,71 @@ fn lookupRemote(
         .json = try alloc.dupe(u8, result.body),
         .version = if (result.version) |version| try std.fmt.parseUnsigned(u64, version, 10) else 0,
     };
+}
+
+const RemoteDocumentArtifactManifest = struct {
+    document_id: []const u8,
+    artifact_name: []const u8,
+    artifact_id: []const u8,
+    generation: u64 = 0,
+    route_type: []const u8 = "",
+    unsupported_reason: ?[]const u8 = null,
+    unit_count: usize = 0,
+    chunk_count: usize = 0,
+    child_range_count: usize = 0,
+    merge_status: []const u8 = "",
+    merge_operation_count: usize = 0,
+    manifest_json: []const u8,
+    state_json: ?[]const u8 = null,
+};
+
+fn parseRemoteDocumentArtifactManifest(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactManifest {
+    var parsed = try std.json.parseFromSlice(RemoteDocumentArtifactManifest, alloc, body, .{});
+    defer parsed.deinit();
+
+    var manifest = blk: {
+        const document_id = try alloc.dupe(u8, parsed.value.document_id);
+        errdefer alloc.free(document_id);
+        const artifact_name = try alloc.dupe(u8, parsed.value.artifact_name);
+        errdefer alloc.free(artifact_name);
+        const artifact_id = try alloc.dupe(u8, parsed.value.artifact_id);
+        errdefer alloc.free(artifact_id);
+        const manifest_json = try alloc.dupe(u8, parsed.value.manifest_json);
+        errdefer alloc.free(manifest_json);
+        break :blk db_mod.types.DocumentArtifactManifest{
+            .document_id = document_id,
+            .artifact_name = artifact_name,
+            .artifact_id = artifact_id,
+            .manifest_json = manifest_json,
+            .generation = parsed.value.generation,
+            .unit_count = parsed.value.unit_count,
+            .chunk_count = parsed.value.chunk_count,
+            .child_range_count = parsed.value.child_range_count,
+            .merge_operation_count = parsed.value.merge_operation_count,
+        };
+    };
+    errdefer manifest.deinit(alloc);
+
+    manifest.state_json = if (parsed.value.state_json) |value| try alloc.dupe(u8, value) else null;
+    manifest.route_type = if (parsed.value.route_type.len > 0) try alloc.dupe(u8, parsed.value.route_type) else "";
+    manifest.unsupported_reason = if (parsed.value.unsupported_reason) |value| try alloc.dupe(u8, value) else null;
+    manifest.merge_status = if (parsed.value.merge_status.len > 0) try alloc.dupe(u8, parsed.value.merge_status) else "";
+    return manifest;
+}
+
+fn documentArtifactManifestRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) !?db_mod.types.DocumentArtifactManifest {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var result = try client.fetchGroupDocumentArtifactManifest(base_uri, group_id, table_name, doc_key, artifact_name);
+    defer result.deinit(alloc);
+    return try parseRemoteDocumentArtifactManifest(alloc, result.body);
 }
 
 fn scanRemote(
