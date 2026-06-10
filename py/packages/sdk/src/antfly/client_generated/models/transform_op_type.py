@@ -3,17 +3,18 @@ from enum import Enum
 
 class TransformOpType(str, Enum):
     VALUE_0 = "$set"
-    VALUE_1 = "$unset"
-    VALUE_10 = "$currentDate"
-    VALUE_11 = "$rename"
-    VALUE_2 = "$inc"
-    VALUE_3 = "$push"
-    VALUE_4 = "$pull"
-    VALUE_5 = "$addToSet"
-    VALUE_6 = "$pop"
-    VALUE_7 = "$mul"
-    VALUE_8 = "$min"
-    VALUE_9 = "$max"
+    VALUE_1 = "$setOnInsert"
+    VALUE_10 = "$max"
+    VALUE_11 = "$currentDate"
+    VALUE_12 = "$rename"
+    VALUE_2 = "$unset"
+    VALUE_3 = "$inc"
+    VALUE_4 = "$push"
+    VALUE_5 = "$pull"
+    VALUE_6 = "$addToSet"
+    VALUE_7 = "$pop"
+    VALUE_8 = "$mul"
+    VALUE_9 = "$min"
 
     def __str__(self) -> str:
         return str(self.value)

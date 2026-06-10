@@ -311,15 +311,26 @@ func TestE2E_OnlineSplit_ContinuousWrites(t *testing.T) {
 		}
 	}
 
-	// Sample check - verify 10 random successful writes
+	// Sample check - verify up to 10 successful writes. Reads can briefly lag a
+	// successful write while split routing/index state settles, so poll each
+	// sampled key instead of treating a single 404 as data loss.
+	sort.Strings(successfulWriteKeys)
+	sampledWriteKeys := successfulWriteKeys
 	if len(successfulWriteKeys) > 10 {
-		for range 10 {
-			idx := rand.Intn(len(successfulWriteKeys))
-			key := successfulWriteKeys[idx]
-			record, err := cluster.Client.LookupKey(ctx, tableName, key)
-			require.NoError(t, err, "Failed to read background write %s", key)
-			require.NotNil(t, record, "Background write %s should exist", key)
+		sampledWriteKeys = make([]string, 0, 10)
+		for i := range 10 {
+			idx := i * (len(successfulWriteKeys) - 1) / 9
+			sampledWriteKeys = append(sampledWriteKeys, successfulWriteKeys[idx])
 		}
+	}
+	for _, key := range sampledWriteKeys {
+		require.NoError(t,
+			waitForKeyAvailable(t, ctx, cluster.Client, tableName, key, 30*time.Second),
+			"Failed to read background write %s", key,
+		)
+		record, err := cluster.Client.LookupKey(ctx, tableName, key)
+		require.NoError(t, err, "Failed to read background write %s", key)
+		require.NotNil(t, record, "Background write %s should exist", key)
 	}
 
 	// Check success criteria

@@ -47,6 +47,7 @@ const CliConfig = struct {
     local_node_id: ?u64 = null,
     auth_enabled: ?bool = null,
     inference_models_dir: ?[]const u8 = null,
+    inference_ml_dir: ?[]const u8 = null,
     inference_host_budget_mb: usize = 0,
     inference_backend_budget_mb: usize = 0,
     inference_combined_budget_mb: usize = 0,
@@ -637,6 +638,8 @@ pub fn runFromIterator(
     var antfly_node_cfg = inference.server.NodeConfig{
         .models_dir = resolveInferenceModelsDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
             antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir),
+        .ml_dir = resolveInferenceMlDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
+            antfly.inference_runtime.defaultMlDirForDataDir(alloc, data_dir),
         .generation_budget_overrides = resolveInferenceBudgetOverrides(cli),
     };
     if (loaded_config) |*cfg| {
@@ -645,6 +648,7 @@ pub fn runFromIterator(
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
     defer antfly_node.deinit();
+    antfly_node.seedAndDiscoverPredictors(init.io);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -1651,6 +1655,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.inference_models_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ml-dir")) {
+            cfg.inference_ml_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--inference-host-budget-mb")) {
             cfg.inference_host_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
@@ -1870,6 +1878,12 @@ fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.C
     return null;
 }
 
+fn resolveInferenceMlDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
+    if (cli.inference_ml_dir) |value| return value;
+    if (cfg) |loaded| return loaded.inference.ml_dir;
+    return null;
+}
+
 fn resolveInferenceBudgetOverrides(cli: CliConfig) antfly.inference_runtime.ServerBudgetOverrides {
     return .{
         .host_limit_bytes = mbToBytes(cli.inference_host_budget_mb),
@@ -1896,7 +1910,8 @@ fn printUsage() void {
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
         \\  --tick-ms <ms>                        Sleep interval while serving (default: 25)
-        \\  --models-dir <path>                   Embedded inference models directory (default: ~/.antfly/inference/models)
+        \\  --models-dir <path>                   Embedded AI models directory (default: ~/.antfly/inference/models)
+        \\  --ml-dir <path>                       Embedded Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --inference-host-budget-mb <n>        Embedded inference native generation host budget override
         \\  --inference-backend-budget-mb <n>     Embedded inference native generation backend budget override
         \\  --inference-combined-budget-mb <n>    Embedded inference native generation combined budget override
@@ -2108,6 +2123,8 @@ test "parse cli accepts canonical host port and models dir flags" {
         "8080",
         "--models-dir",
         "/tmp/models",
+        "--ml-dir",
+        "/tmp/ml",
         "--data-dir",
         "/tmp/antfly-data",
     };
@@ -2116,6 +2133,7 @@ test "parse cli accepts canonical host port and models dir flags" {
     try std.testing.expectEqualStrings("127.0.0.1", cfg.bind_host.?);
     try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference_models_dir.?);
+    try std.testing.expectEqualStrings("/tmp/ml", cfg.inference_ml_dir.?);
     try std.testing.expectEqualStrings("/tmp/antfly-data", cfg.data_dir.?);
 }
 
@@ -2140,15 +2158,18 @@ test "antfly config uses cli override before common config" {
         .inference = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:9000"),
             .models_dir = try alloc.dupe(u8, "/tmp/from-config"),
+            .ml_dir = try alloc.dupe(u8, "/tmp/ml-from-config"),
         },
     };
     defer cfg.deinit();
 
     const cli = CliConfig{
         .inference_models_dir = "/tmp/from-cli",
+        .inference_ml_dir = "/tmp/ml-from-cli",
         .inference_backend_budget_mb = 8192,
     };
     try std.testing.expectEqualStrings("/tmp/from-cli", resolveInferenceModelsDir(cli, &cfg).?);
+    try std.testing.expectEqualStrings("/tmp/ml-from-cli", resolveInferenceMlDir(cli, &cfg).?);
     try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), resolveInferenceBudgetOverrides(cli).backend_limit_bytes);
 }
 
@@ -2200,11 +2221,13 @@ test "inference config falls back to common config" {
         .inference = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
+            .ml_dir = try alloc.dupe(u8, "/tmp/antfly-ml"),
         },
     };
     defer cfg.deinit();
 
     try std.testing.expectEqualStrings("/tmp/antfly-models", resolveInferenceModelsDir(.{}, &cfg).?);
+    try std.testing.expectEqualStrings("/tmp/antfly-ml", resolveInferenceMlDir(.{}, &cfg).?);
 }
 
 test "swarm runtime resolves paths from common storage base dir" {

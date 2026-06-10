@@ -1768,6 +1768,51 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ml/v1/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Traditional ML predictors
+         * @description Returns the Traditional ML predictor catalog for `/ml/v1/predict`.
+         *     Predictors are loaded from `<ml_dir>/<name>/` and exposed separately
+         *     from the AI model catalog.
+         */
+        get: operations["listPredictors"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ml/v1/predict": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a traditional ML predictor
+         * @description Run a tabular predictor (tree ensemble, linear, or SVM) on a batch of
+         *     feature vectors. Models are loaded from `<ml_dir>/<name>/` and
+         *     identified by name. Use `/ml/v1/models` for the list of available
+         *     predictors and their feature schemas.
+         */
+        post: operations["predict"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2329,7 +2374,7 @@ export interface components {
          * @description MongoDB-style update operator
          * @enum {string}
          */
-        TransformOpType: "$set" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$pop" | "$mul" | "$min" | "$max" | "$currentDate" | "$rename";
+        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$pop" | "$mul" | "$min" | "$max" | "$currentDate" | "$rename";
         TransformOp: {
             op: components["schemas"]["TransformOpType"];
             /**
@@ -2337,7 +2382,7 @@ export interface components {
              * @example $.views
              */
             path: string;
-            /** @description Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set, etc.) */
+            /** @description Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.) */
             value?: unknown;
         };
         /**
@@ -7879,6 +7924,49 @@ export interface components {
             /** @description Error message */
             error: string;
         };
+        InferencePredictRequest: {
+            /** @description Predictor name from the model catalog. */
+            model: string;
+            /** @description Batch of feature vectors. Max 10000 rows. */
+            input: number[][];
+        };
+        InferencePredictResponse: {
+            model: string;
+            task: components["schemas"]["InferencePredictorTask"];
+            /**
+             * @description Per-row prediction arrays. Length equals the model's `num_outputs`
+             *     (1 for regression / binary, `num_classes` for multiclass).
+             */
+            predictions: number[][];
+        };
+        /**
+         * @description Task type for tabular predictors.
+         * @enum {string}
+         */
+        InferencePredictorTask: "regression" | "binary_classification" | "multiclass" | "ranking";
+        /** @description Traditional ML predictor metadata. */
+        InferencePredictorInfo: {
+            task: components["schemas"]["InferencePredictorTask"];
+            /** @description Number of feature columns expected by the predictor. */
+            num_features: number;
+            /** @description Number of output values emitted per input row. */
+            num_outputs: number;
+            /** @description Optional feature names in input order. */
+            feature_names?: string[];
+            /** @description Source framework used to produce the predictor IR. */
+            source_framework?: string;
+        };
+        InferencePredictorsResponse: {
+            /**
+             * @description Response object type.
+             * @enum {string}
+             */
+            object: "list";
+            /** @description Traditional ML predictors keyed by predictor name. */
+            predictors: {
+                [key: string]: components["schemas"]["InferencePredictorInfo"];
+            };
+        };
         InferenceTextContentPart: components["schemas"]["TextContentPart"];
         InferenceImageURL: components["schemas"]["ImageURL"];
         InferenceImageURLContentPart: components["schemas"]["ImageURLContentPart"];
@@ -12313,6 +12401,86 @@ export interface operations {
             };
             /** @description Internal server error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    listPredictors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Predictors retrieved successfully */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferencePredictorsResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    predict: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferencePredictRequest"];
+            };
+        };
+        responses: {
+            /** @description Predictions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferencePredictResponse"];
+                };
+            };
+            /** @description Invalid request (malformed body, feature-count mismatch) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Predictor not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Batch too large (> 10000 rows) */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
