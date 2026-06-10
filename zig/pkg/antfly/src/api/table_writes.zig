@@ -7789,7 +7789,11 @@ fn catchUpManagedIndexCreate(
 ) !void {
     if (try db.core.indexRequiresEnrichmentReplay(index_name)) {
         if (db.enrichment_runtime != null) {
-            _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+            const scheduled = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+            if (scheduled > 0) {
+                try db.core.index_manager.syncAll(false);
+                return;
+            }
         } else {
             _ = try seedManagedIndexReplayFromStoredDocsIfNeeded(alloc, db, index_name);
         }
