@@ -418,7 +418,7 @@ Current implementation status:
 Still remaining in Phase 1:
 
 - Decide how much of the built-in route config should be exposed publicly versus wrapped in presets.
-- Add deeper PDF provenance such as rotation, extraction warnings, text-region bounding boxes, and OCR coordinates as the PDF reader and OCR pipelines expose them.
+- Add deeper PDF provenance such as rotation and text-region bounding boxes as the PDF reader exposes them.
 - Define the broader permission model for artifact inspection and reprocess controls, especially admin-only detail expansion and long-running/background table-wide operations.
 
 ### Phase 2: Unit-aware chunking and indexing
@@ -456,7 +456,7 @@ Current implementation status:
 
 Still remaining in Phase 2:
 
-- OCR fallback confidence and scanned-region coordinates belong to Phase 5, after the OCR producers exist.
+- OCR fallback confidence and scanned-region coordinates now flow from structured producer output; deeper PDF-reader-native text-region coordinates remain Phase 5 follow-up work.
 
 ### Phase 3: Distributed child ranges
 
@@ -523,6 +523,7 @@ Current implementation status:
 - Image files now route by `image/*`, common image extensions, magic bytes, or explicit `ocr`/`image` routes into a deterministic `image` unit. Without an OCR producer they carry empty searchable text, `method: "ocr_pending"`, `extraction_status: "pending_ocr"`, byte length, source SHA-256, and OCR/transcript flags in the payload, provenance, format provenance, and unit fingerprint. When the document extraction config enables `ocr` and the runtime has an asset `reader` producer, sync and async extraction complete those pending units into searchable `ocr_text` units with `extraction_status: "completed"` and `ocr_used: true`.
 - Scanned PDF fallback now uses the same pending-OCR contract at page granularity: pages with no mechanical text are kept in order as `page` units with `pdf_ocr_pending`, `pending_ocr`, page geometry, and source character spans, making later OCR completion an incremental unit update instead of a separate orphan artifact.
 - Audio files now route by `audio/*`, common audio extensions, audio magic bytes, or explicit `audio`/`transcript` routes into a deterministic audio/transcript unit with empty searchable text, `method: "transcript_pending"`, `extraction_status: "pending_transcription"`, byte length, source SHA-256, and transcript/OCR flags in the same provenance/fingerprint contract. When the document extraction config enables `transcription` and the runtime has an asset `transcriber` producer, sync and async extraction complete those units into searchable `transcript_text` units with `extraction_status: "completed"` and `transcript_used: true`.
+- OCR/transcription producers can return either raw text or structured JSON. Structured JSON with `text`, `confidence`, `bbox`/`ocr_bbox`/`coordinates`, and `warning`/`extraction_warning` is normalized into unit payloads, provenance, format provenance, unit fingerprints, generated-text request envelopes, and unit-derived chunk provenance as OCR/transcript confidence, scanned-region coordinates, and extraction warnings.
 
 ## Open Questions And Proposed Direction
 

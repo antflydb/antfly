@@ -54,8 +54,10 @@ pub const Unit = struct {
     byte_length: ?u64 = null,
     ocr_used: bool = false,
     ocr_confidence: ?f64 = null,
+    ocr_bbox: ?[4]f64 = null,
     transcript_used: bool = false,
     transcript_confidence: ?f64 = null,
+    extraction_warning: ?[]u8 = null,
     page_number: ?u32 = null,
     page_label: ?[]u8 = null,
     page_bbox: ?[4]f64 = null,
@@ -71,6 +73,7 @@ pub const Unit = struct {
         if (self.source_path) |value| alloc.free(value);
         if (self.extraction_status) |value| alloc.free(value);
         if (self.source_sha256) |value| alloc.free(value);
+        if (self.extraction_warning) |value| alloc.free(value);
         if (self.page_label) |value| alloc.free(value);
         self.* = undefined;
     }

@@ -13509,6 +13509,9 @@ fn applyGeneratedUnitText(
         alloc.free(produced);
         return;
     }
+    defer alloc.free(produced);
+    var parsed = try parseGeneratedUnitTextOutputAlloc(alloc, produced);
+    errdefer parsed.deinit(alloc);
     const owned_method = try alloc.dupe(u8, method);
     errdefer alloc.free(owned_method);
     const owned_status = try alloc.dupe(u8, status);
@@ -13517,16 +13520,87 @@ fn applyGeneratedUnitText(
     alloc.free(unit.text);
     alloc.free(unit.method);
     if (unit.extraction_status) |value| alloc.free(value);
-    unit.text = produced;
+    if (unit.extraction_warning) |value| alloc.free(value);
+    unit.text = parsed.text;
+    parsed.text = &.{};
     unit.method = owned_method;
     unit.extraction_status = owned_status;
     switch (kind) {
-        .ocr => unit.ocr_used = true,
-        .transcript => unit.transcript_used = true,
+        .ocr => {
+            unit.ocr_used = true;
+            unit.ocr_confidence = parsed.confidence;
+            unit.ocr_bbox = parsed.bbox;
+        },
+        .transcript => {
+            unit.transcript_used = true;
+            unit.transcript_confidence = parsed.confidence;
+        },
     }
+    unit.extraction_warning = parsed.warning;
+    parsed.warning = null;
     const start = unit.char_start orelse 0;
     unit.char_start = start;
     unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
+}
+
+const ParsedGeneratedUnitText = struct {
+    text: []u8,
+    confidence: ?f64 = null,
+    bbox: ?[4]f64 = null,
+    warning: ?[]u8 = null,
+
+    fn deinit(self: *ParsedGeneratedUnitText, alloc: Allocator) void {
+        if (self.text.len > 0) alloc.free(self.text);
+        if (self.warning) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+fn parseGeneratedUnitTextOutputAlloc(alloc: Allocator, produced: []const u8) !ParsedGeneratedUnitText {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, produced, .{}) catch {
+        return .{ .text = try alloc.dupe(u8, produced) };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .text = try alloc.dupe(u8, produced) };
+    const text_value = parsed.value.object.get("text") orelse return .{ .text = try alloc.dupe(u8, produced) };
+    if (text_value != .string) return .{ .text = try alloc.dupe(u8, produced) };
+
+    var out = ParsedGeneratedUnitText{ .text = try alloc.dupe(u8, text_value.string) };
+    errdefer out.deinit(alloc);
+    out.confidence = generatedTextJsonFloatField(parsed.value.object, "confidence");
+    out.bbox = generatedTextJsonBboxField(parsed.value.object, "ocr_bbox") orelse generatedTextJsonBboxField(parsed.value.object, "bbox") orelse generatedTextJsonBboxField(parsed.value.object, "coordinates");
+    if (generatedTextJsonStringField(parsed.value.object, "warning") orelse generatedTextJsonStringField(parsed.value.object, "extraction_warning")) |warning| {
+        out.warning = try alloc.dupe(u8, warning);
+    }
+    return out;
+}
+
+fn generatedTextJsonStringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = object.get(field) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn generatedTextJsonFloatField(object: std.json.ObjectMap, field: []const u8) ?f64 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .float => |v| v,
+        .integer => |v| @floatFromInt(v),
+        else => null,
+    };
+}
+
+fn generatedTextJsonBboxField(object: std.json.ObjectMap, field: []const u8) ?[4]f64 {
+    const value = object.get(field) orelse return null;
+    if (value != .array or value.array.items.len != 4) return null;
+    var out: [4]f64 = undefined;
+    for (value.array.items, 0..) |item, i| {
+        out[i] = switch (item) {
+            .float => |v| v,
+            .integer => |v| @floatFromInt(v),
+            else => return null,
+        };
+    }
+    return out;
 }
 
 fn documentGeneratedTextPartsJsonAlloc(
@@ -13550,6 +13624,10 @@ fn documentGeneratedTextPartsJsonAlloc(
         .page_rotation = unit.page_rotation,
         .byte_length = unit.byte_length,
         .source_sha256 = unit.source_sha256,
+        .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
+        .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
     }, .{});
 }
 
@@ -13987,8 +14065,10 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .extraction_status = unit.extraction_status,
         .ocr_used = unit.ocr_used,
         .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
         .transcript_used = unit.transcript_used,
         .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
     });
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
@@ -14033,11 +14113,18 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
         var value = confidence;
         hasher.update(std.mem.asBytes(&value));
     }
+    if (unit.ocr_bbox) |bbox| {
+        for (bbox) |coord| {
+            var value = coord;
+            hasher.update(std.mem.asBytes(&value));
+        }
+    }
     hasher.update(if (unit.transcript_used) "transcript:1" else "transcript:0");
     if (unit.transcript_confidence) |confidence| {
         var value = confidence;
         hasher.update(std.mem.asBytes(&value));
     }
+    if (unit.extraction_warning) |warning| hasher.update(warning);
     if (unit.page_number) |page_number| {
         var buf: [@sizeOf(u32)]u8 = undefined;
         std.mem.writeInt(u32, &buf, page_number, .big);
@@ -14218,6 +14305,10 @@ fn documentUnitPayloadAlloc(
         .extraction_status = unit.extraction_status,
         .source_sha256 = unit.source_sha256,
         .byte_length = unit.byte_length,
+        .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
+        .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
         .provenance = .{
             .source_url = source_url,
             .source_path = unit.source_path,
@@ -14227,8 +14318,10 @@ fn documentUnitPayloadAlloc(
             .byte_length = unit.byte_length,
             .ocr_used = unit.ocr_used,
             .ocr_confidence = unit.ocr_confidence,
+            .ocr_bbox = unit.ocr_bbox,
             .transcript_used = unit.transcript_used,
             .transcript_confidence = unit.transcript_confidence,
+            .extraction_warning = unit.extraction_warning,
             .page_number = unit.page_number,
             .page_label = unit.page_label,
             .page_bbox = unit.page_bbox,
@@ -14247,8 +14340,10 @@ fn documentUnitPayloadAlloc(
                 .byte_length = unit.byte_length,
                 .ocr_used = unit.ocr_used,
                 .ocr_confidence = unit.ocr_confidence,
+                .ocr_bbox = unit.ocr_bbox,
                 .transcript_used = unit.transcript_used,
                 .transcript_confidence = unit.transcript_confidence,
+                .extraction_warning = unit.extraction_warning,
                 .page_number = unit.page_number,
                 .page_label = unit.page_label,
                 .page_bbox = unit.page_bbox,
@@ -30032,6 +30127,8 @@ const TestAssetProducer = struct {
     reader_calls: usize = 0,
     transcriber_calls: usize = 0,
     extractor_calls: usize = 0,
+    reader_output: ?[]const u8 = null,
+    transcriber_output: ?[]const u8 = null,
     extractor_output: ?[]const u8 = null,
 
     fn producer(self: *@This()) asset_producer_mod.Producer {
@@ -30056,9 +30153,23 @@ const TestAssetProducer = struct {
             if (self.extractor_output) |output| return try alloc.dupe(u8, output);
             return try std.fmt.allocPrint(alloc, "{{\"relations\":[{{\"type\":\"mentions\",\"target\":{{\"document_id\":{f}}}}}]}}", .{std.json.fmt(request.source_text, .{})});
         }
+        if (request.producer_type == .reader) {
+            if (self.reader_output) |output| return try alloc.dupe(u8, output);
+        }
+        if (request.producer_type == .transcriber) {
+            if (self.transcriber_output) |output| return try alloc.dupe(u8, output);
+        }
         return try std.fmt.allocPrint(alloc, "{s}:{s}", .{ @tagName(request.producer_type), request.source_text });
     }
 };
+
+fn jsonTestNumber(value: std.json.Value) f64 {
+    return switch (value) {
+        .float => |v| v,
+        .integer => |v| @floatFromInt(v),
+        else => 0,
+    };
+}
 
 test "db asset producer enrichments execute fake providers and skip unchanged state" {
     const alloc = std.testing.allocator;
@@ -30553,6 +30664,60 @@ test "db document extraction completes image OCR with reader producer" {
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"reader:data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"") != null);
 }
 
+test "db document extraction stores structured OCR confidence and coordinates" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{
+        .reader_output = "{\"text\":\"invoice total\",\"confidence\":0.92,\"bbox\":[1,2,101,42],\"warning\":\"low contrast\"}",
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"mock-reader\"}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:image-ocr-structured",
+            .value = "{\"filename\":\"scan.png\",\"mime_type\":\"image/png\",\"url\":\"data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:image-ocr-structured", "document_units_v1", "image:000001");
+    defer alloc.free(unit_key);
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, unit_payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("invoice total", parsed.value.object.get("text").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.92), parsed.value.object.get("ocr_confidence").?.float, 0.0001);
+    const bbox = parsed.value.object.get("ocr_bbox").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), bbox.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), jsonTestNumber(bbox[0]), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 42), jsonTestNumber(bbox[3]), 0.0001);
+    try std.testing.expectEqualStrings("low contrast", parsed.value.object.get("extraction_warning").?.string);
+    const provenance = parsed.value.object.get("provenance").?.object;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.92), provenance.get("ocr_confidence").?.float, 0.0001);
+    try std.testing.expectEqualStrings("low contrast", provenance.get("extraction_warning").?.string);
+}
+
 test "db document extraction completes audio transcription with transcriber producer" {
     const alloc = std.testing.allocator;
 
@@ -30560,7 +30725,9 @@ test "db document extraction completes audio transcription with transcriber prod
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var fake = TestAssetProducer{};
+    var fake = TestAssetProducer{
+        .transcriber_output = "{\"text\":\"spoken words\",\"confidence\":0.81}",
+    };
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -30597,7 +30764,12 @@ test "db document extraction completes audio transcription with transcriber prod
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"transcript_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"completed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"transcript_used\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"transcriber:data:audio/mpeg;base64,SUQzYXVkaW8gYnl0ZXM=\"") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, unit_payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("spoken words", parsed.value.object.get("text").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.81), parsed.value.object.get("transcript_confidence").?.float, 0.0001);
+    const provenance = parsed.value.object.get("provenance").?.object;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.81), provenance.get("transcript_confidence").?.float, 0.0001);
 }
 
 test "db document extraction stores rfc822 email units" {

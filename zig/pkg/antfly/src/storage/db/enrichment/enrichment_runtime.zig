@@ -2012,6 +2012,9 @@ fn applyRuntimeGeneratedUnitText(
         alloc.free(produced);
         return;
     }
+    defer alloc.free(produced);
+    var parsed = try parseRuntimeGeneratedUnitTextOutputAlloc(alloc, produced);
+    errdefer parsed.deinit(alloc);
     const owned_method = try alloc.dupe(u8, method);
     errdefer alloc.free(owned_method);
     const owned_status = try alloc.dupe(u8, status);
@@ -2020,16 +2023,87 @@ fn applyRuntimeGeneratedUnitText(
     alloc.free(unit.text);
     alloc.free(unit.method);
     if (unit.extraction_status) |value| alloc.free(value);
-    unit.text = produced;
+    if (unit.extraction_warning) |value| alloc.free(value);
+    unit.text = parsed.text;
+    parsed.text = &.{};
     unit.method = owned_method;
     unit.extraction_status = owned_status;
     switch (kind) {
-        .ocr => unit.ocr_used = true,
-        .transcript => unit.transcript_used = true,
+        .ocr => {
+            unit.ocr_used = true;
+            unit.ocr_confidence = parsed.confidence;
+            unit.ocr_bbox = parsed.bbox;
+        },
+        .transcript => {
+            unit.transcript_used = true;
+            unit.transcript_confidence = parsed.confidence;
+        },
     }
+    unit.extraction_warning = parsed.warning;
+    parsed.warning = null;
     const start = unit.char_start orelse 0;
     unit.char_start = start;
     unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
+}
+
+const RuntimeParsedGeneratedUnitText = struct {
+    text: []u8,
+    confidence: ?f64 = null,
+    bbox: ?[4]f64 = null,
+    warning: ?[]u8 = null,
+
+    fn deinit(self: *RuntimeParsedGeneratedUnitText, alloc: Allocator) void {
+        if (self.text.len > 0) alloc.free(self.text);
+        if (self.warning) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+fn parseRuntimeGeneratedUnitTextOutputAlloc(alloc: Allocator, produced: []const u8) !RuntimeParsedGeneratedUnitText {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, produced, .{}) catch {
+        return .{ .text = try alloc.dupe(u8, produced) };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .text = try alloc.dupe(u8, produced) };
+    const text_value = parsed.value.object.get("text") orelse return .{ .text = try alloc.dupe(u8, produced) };
+    if (text_value != .string) return .{ .text = try alloc.dupe(u8, produced) };
+
+    var out = RuntimeParsedGeneratedUnitText{ .text = try alloc.dupe(u8, text_value.string) };
+    errdefer out.deinit(alloc);
+    out.confidence = runtimeGeneratedTextJsonFloatField(parsed.value.object, "confidence");
+    out.bbox = runtimeGeneratedTextJsonBboxField(parsed.value.object, "ocr_bbox") orelse runtimeGeneratedTextJsonBboxField(parsed.value.object, "bbox") orelse runtimeGeneratedTextJsonBboxField(parsed.value.object, "coordinates");
+    if (runtimeGeneratedTextJsonStringField(parsed.value.object, "warning") orelse runtimeGeneratedTextJsonStringField(parsed.value.object, "extraction_warning")) |warning| {
+        out.warning = try alloc.dupe(u8, warning);
+    }
+    return out;
+}
+
+fn runtimeGeneratedTextJsonStringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = object.get(field) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn runtimeGeneratedTextJsonFloatField(object: std.json.ObjectMap, field: []const u8) ?f64 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .float => |v| v,
+        .integer => |v| @floatFromInt(v),
+        else => null,
+    };
+}
+
+fn runtimeGeneratedTextJsonBboxField(object: std.json.ObjectMap, field: []const u8) ?[4]f64 {
+    const value = object.get(field) orelse return null;
+    if (value != .array or value.array.items.len != 4) return null;
+    var out: [4]f64 = undefined;
+    for (value.array.items, 0..) |item, i| {
+        out[i] = switch (item) {
+            .float => |v| v,
+            .integer => |v| @floatFromInt(v),
+            else => return null,
+        };
+    }
+    return out;
 }
 
 fn runtimeDocumentGeneratedTextPartsJsonAlloc(
@@ -2053,6 +2127,10 @@ fn runtimeDocumentGeneratedTextPartsJsonAlloc(
         .page_rotation = unit.page_rotation,
         .byte_length = unit.byte_length,
         .source_sha256 = unit.source_sha256,
+        .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
+        .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
     }, .{});
 }
 
@@ -2193,8 +2271,10 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .extraction_status = unit.extraction_status,
         .ocr_used = unit.ocr_used,
         .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
         .transcript_used = unit.transcript_used,
         .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
     });
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
@@ -4033,11 +4113,18 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
         var value = confidence;
         hasher.update(std.mem.asBytes(&value));
     }
+    if (unit.ocr_bbox) |bbox| {
+        for (bbox) |coord| {
+            var value = coord;
+            hasher.update(std.mem.asBytes(&value));
+        }
+    }
     hasher.update(if (unit.transcript_used) "transcript:1" else "transcript:0");
     if (unit.transcript_confidence) |confidence| {
         var value = confidence;
         hasher.update(std.mem.asBytes(&value));
     }
+    if (unit.extraction_warning) |warning| hasher.update(warning);
     if (unit.page_number) |page_number| {
         var buf: [@sizeOf(u32)]u8 = undefined;
         std.mem.writeInt(u32, &buf, page_number, .big);
@@ -4231,6 +4318,10 @@ fn documentUnitPayloadAlloc(
         .extraction_status = unit.extraction_status,
         .source_sha256 = unit.source_sha256,
         .byte_length = unit.byte_length,
+        .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
+        .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
         .provenance = .{
             .source_url = source_url,
             .source_path = unit.source_path,
@@ -4240,8 +4331,10 @@ fn documentUnitPayloadAlloc(
             .byte_length = unit.byte_length,
             .ocr_used = unit.ocr_used,
             .ocr_confidence = unit.ocr_confidence,
+            .ocr_bbox = unit.ocr_bbox,
             .transcript_used = unit.transcript_used,
             .transcript_confidence = unit.transcript_confidence,
+            .extraction_warning = unit.extraction_warning,
             .page_number = unit.page_number,
             .page_label = unit.page_label,
             .page_bbox = unit.page_bbox,
@@ -4260,8 +4353,10 @@ fn documentUnitPayloadAlloc(
                 .byte_length = unit.byte_length,
                 .ocr_used = unit.ocr_used,
                 .ocr_confidence = unit.ocr_confidence,
+                .ocr_bbox = unit.ocr_bbox,
                 .transcript_used = unit.transcript_used,
                 .transcript_confidence = unit.transcript_confidence,
+                .extraction_warning = unit.extraction_warning,
                 .page_number = unit.page_number,
                 .page_label = unit.page_label,
                 .page_bbox = unit.page_bbox,

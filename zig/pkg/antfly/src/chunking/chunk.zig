@@ -61,8 +61,10 @@ pub const ProvenanceOptions = struct {
     extraction_status: ?[]const u8 = null,
     ocr_used: bool = false,
     ocr_confidence: ?f64 = null,
+    ocr_bbox: ?[4]f64 = null,
     transcript_used: bool = false,
     transcript_confidence: ?f64 = null,
+    extraction_warning: ?[]const u8 = null,
 };
 
 pub fn appendArtifactFields(
@@ -137,8 +139,10 @@ fn appendProvenanceFields(
     if (options.extraction_status) |value| try putString(alloc, &provenance, "extraction_status", value);
     try provenance.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
     if (options.ocr_confidence) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_confidence"), .{ .float = value });
+    if (options.ocr_bbox) |bbox| try provenance.put(alloc, try alloc.dupe(u8, "ocr_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
     try provenance.put(alloc, try alloc.dupe(u8, "transcript_used"), .{ .bool = options.transcript_used });
     if (options.transcript_confidence) |value| try provenance.put(alloc, try alloc.dupe(u8, "transcript_confidence"), .{ .float = value });
+    if (options.extraction_warning) |value| try putString(alloc, &provenance, "extraction_warning", value);
     try appendFormatProvenance(alloc, &provenance, options);
 
     if (chunk.start_offset) |start| {
@@ -174,7 +178,7 @@ fn appendFormatProvenance(
     provenance: *std.json.ObjectMap,
     options: ProvenanceOptions,
 ) !void {
-    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and !options.ocr_used and options.ocr_confidence == null and !options.transcript_used and options.transcript_confidence == null) return;
+    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and !options.ocr_used and options.ocr_confidence == null and options.ocr_bbox == null and !options.transcript_used and options.transcript_confidence == null and options.extraction_warning == null) return;
 
     var format = std.json.ObjectMap.empty;
     errdefer {
@@ -192,8 +196,10 @@ fn appendFormatProvenance(
     if (options.extraction_status) |value| try putString(alloc, &format, "extraction_status", value);
     try format.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
     if (options.ocr_confidence) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_confidence"), .{ .float = value });
+    if (options.ocr_bbox) |bbox| try format.put(alloc, try alloc.dupe(u8, "ocr_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
     try format.put(alloc, try alloc.dupe(u8, "transcript_used"), .{ .bool = options.transcript_used });
     if (options.transcript_confidence) |value| try format.put(alloc, try alloc.dupe(u8, "transcript_confidence"), .{ .float = value });
+    if (options.extraction_warning) |value| try putString(alloc, &format, "extraction_warning", value);
     if (options.page_number) |value| try format.put(alloc, try alloc.dupe(u8, "page_number"), .{ .integer = value });
     if (options.page_label) |value| try putString(alloc, &format, "page_label", value);
     if (options.page_bbox) |bbox| try format.put(alloc, try alloc.dupe(u8, "page_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
