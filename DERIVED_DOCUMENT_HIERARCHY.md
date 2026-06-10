@@ -477,12 +477,12 @@ Current implementation status:
 - Asynchronous document extraction now durably writes an `in_progress` merge plan before child artifact writes and replaces it with the converged plan after the child range batch commits. The in-progress manifest keeps the last committed generation while its merge plan records the intended `to_generation`, so replay after a crash does not skip a generation.
 - Child range descriptors now carry additive route/ownership metadata (`owner_group_id`, `placement_generation`, `route_status`, `split_eligible`) through local manifest parsing, public manifest responses, internal group responses, and remote manifest fanout. Current writers mark ranges as `local_committed` and parent-owned, giving future split workers a stable field set to advance when a child range moves away from the parent shard.
 - Unit and chunk child artifact payloads now carry descriptor-derived range routing fields (`_artifact_range_id`, `_artifact_range_kind`, `_artifact_route_status`, `_artifact_owner_group_id`). Local writers derive those values from the same deterministic child range ordering as the manifest, so child records can be audited and replayed by artifact range rather than only by parent document key.
+- Manifests now include a durable `coverage_plan` stating that full-text replay remains `stored_artifact_required`, replay suppression is false, and coverage watermarks are required before any future suppression. This keeps stable-unit replay correctness explicit rather than relying on an implicit code-path convention.
 
 Still remaining in Phase 3:
 
 - Route child writes and deletes to remote child-range owners when descriptors no longer point at the parent shard.
 - Add ownership and placement updates when an artifact range actually splits away from the parent shard.
-- Add durable coverage/watermark checks if we want to suppress even the stored-artifact full-text replay for already-covered child documents.
 
 ### Phase 4: Graph extraction over units
 

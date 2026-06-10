@@ -4400,6 +4400,14 @@ fn documentExtractionManifestPayloadAlloc(
     try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "delete", "chunk", "derived_chunks", previous_chunk_keys, chunk_keys);
     try out.append(alloc, ']');
     try out.append(alloc, '}');
+    try appendJsonFieldName(alloc, &out, &first, "coverage_plan");
+    try out.append(alloc, '{');
+    var coverage_first = true;
+    try appendJsonFieldU64(alloc, &out, &coverage_first, "plan_version", 1);
+    try appendJsonFieldString(alloc, &out, &coverage_first, "full_text_replay", "stored_artifact_required");
+    try appendJsonFieldBool(alloc, &out, &coverage_first, "full_text_replay_suppressed", false);
+    try appendJsonFieldBool(alloc, &out, &coverage_first, "watermark_required_before_suppression", true);
+    try out.append(alloc, '}');
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
@@ -5202,6 +5210,9 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"placement_generation\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_status\":\"local_committed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"split_eligible\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"coverage_plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"full_text_replay\":\"stored_artifact_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"watermark_required_before_suppression\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"merge_plan\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"status\":\"converged\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"from_generation\":4") != null);
