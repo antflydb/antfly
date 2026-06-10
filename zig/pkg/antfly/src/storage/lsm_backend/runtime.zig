@@ -2455,8 +2455,8 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             errdefer deinitRunGroups(metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(metadata_allocator, runs);
             errdefer metadata_allocator.free(levels);
-            backend.retainReader();
-            errdefer releaseReadReader(BackendType, backend);
+            retainReadReader(BackendType, backend, .bound_read_txn);
+            errdefer releaseReadReader(BackendType, backend, .bound_read_txn);
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
@@ -2498,7 +2498,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            releaseReadReader(BackendType, backend);
+            releaseReadReader(BackendType, backend, .bound_read_txn);
             self.* = undefined;
         }
 
@@ -2538,11 +2538,41 @@ const MutableReadSnapshot = struct {
     owned: bool,
 };
 
-fn releaseReadReader(comptime BackendType: type, backend: *BackendType) void {
-    if (@hasDecl(BackendType, "finalizeReadReaderRelease")) {
+fn retainReadReader(comptime BackendType: type, backend: *BackendType, kind: anytype) void {
+    if (@hasDecl(BackendType, "retainReaderKind")) {
+        backend.retainReaderKind(kind);
+    } else {
+        backend.retainReader();
+    }
+}
+
+fn releaseReadReader(comptime BackendType: type, backend: *BackendType, kind: anytype) void {
+    if (@hasDecl(BackendType, "finalizeReadReaderReleaseKind")) {
+        backend.finalizeReadReaderReleaseKind(kind);
+    } else if (@hasDecl(BackendType, "finalizeReadReaderRelease")) {
         backend.finalizeReadReaderRelease();
+    } else if (@hasDecl(BackendType, "releaseReaderKind")) {
+        backend.releaseReaderKind(kind);
     } else {
         backend.releaseReader();
+    }
+}
+
+fn releaseWriteReader(comptime BackendType: type, backend: *BackendType, kind: anytype) void {
+    if (@hasDecl(BackendType, "releaseReaderKind")) {
+        backend.releaseReaderKind(kind);
+    } else {
+        backend.releaseReader();
+    }
+}
+
+fn finalizeWriteReader(comptime BackendType: type, backend: *BackendType, kind: anytype) !void {
+    if (@hasDecl(BackendType, "finalizeWriteReaderReleaseKind")) {
+        try backend.finalizeWriteReaderReleaseKind(kind);
+    } else if (@hasDecl(BackendType, "finalizeWriteReaderRelease")) {
+        try backend.finalizeWriteReaderRelease();
+    } else {
+        releaseWriteReader(BackendType, backend, kind);
     }
 }
 
@@ -2580,8 +2610,8 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            backend.retainReader();
-            errdefer releaseReadReader(BackendType, backend);
+            retainReadReader(BackendType, backend, .probe_txn);
+            errdefer releaseReadReader(BackendType, backend, .probe_txn);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             const stable_point_view = backend.mutable.entries.items.len == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
             const active_mutable_value_reader_retained = if (!stable_point_view and shouldRetainActiveMutableValueReader(backend)) retainActiveMutableValueReader(backend) else false;
@@ -2608,7 +2638,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             releaseActiveMutableValueReader(backend, self.active_mutable_value_reader_retained);
-            releaseReadReader(BackendType, backend);
+            releaseReadReader(BackendType, backend, .probe_txn);
             self.* = undefined;
         }
 
@@ -2869,8 +2899,8 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             errdefer deinitRunGroups(metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(metadata_allocator, runs);
             errdefer metadata_allocator.free(levels);
-            backend.retainReader();
-            errdefer releaseReadReader(BackendType, backend);
+            retainReadReader(BackendType, backend, .current_scan);
+            errdefer releaseReadReader(BackendType, backend, .current_scan);
             var mutable_snapshot: MutableSnapshot = .none;
             var mutable_snapshot_is_bulk_current_scan_clone = false;
             var bulk_current_scan_clone_denied = false;
@@ -2934,7 +2964,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 if (self.mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
                     if (self.mutable_snapshot.ownedPtr()) |snapshot| backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
                 }
-                releaseReadReader(BackendType, backend);
+                releaseReadReader(BackendType, backend, .current_scan);
             }
             self.mutable_snapshot.deinitOwned(self.allocator);
             self.* = undefined;
@@ -3086,8 +3116,8 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         pub fn openWithOptions(backend: *BackendType, namespace: backend_types.Namespace, options: backend_types.BatchOptions) !@This() {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            backend.retainReader();
-            errdefer backend.releaseReader();
+            retainReadReader(BackendType, backend, .write_txn);
+            errdefer releaseWriteReader(BackendType, backend, .write_txn);
             backend.beginBatchMode(options);
             errdefer backend.finishBatchMode(options);
             return .{
@@ -3110,7 +3140,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             backend.finishBatchMode(self.batch_options);
-            backend.releaseReader();
+            releaseWriteReader(BackendType, backend, .write_txn);
             self.* = undefined;
         }
 
@@ -3127,7 +3157,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.invalidateCursorSnapshot();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
-                self.backend.releaseReader();
+                releaseWriteReader(BackendType, self.backend, .write_txn);
                 self.closed = true;
             };
             const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
@@ -3164,7 +3194,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             self.invalidateCursorSnapshot();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
-            self.backend.finalizeWriteReaderRelease() catch |err| {
+            finalizeWriteReader(BackendType, self.backend, .write_txn) catch |err| {
                 finalize_err = err;
             };
             if (finalize_err) |err| return err;
@@ -3580,8 +3610,8 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             errdefer deinitRunGroups(metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(metadata_allocator, runs);
             errdefer metadata_allocator.free(levels);
-            backend.retainReader();
-            errdefer releaseReadReader(BackendType, backend);
+            retainReadReader(BackendType, backend, .namespace_read_txn);
+            errdefer releaseReadReader(BackendType, backend, .namespace_read_txn);
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
@@ -3623,7 +3653,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            releaseReadReader(BackendType, backend);
+            releaseReadReader(BackendType, backend, .namespace_read_txn);
             self.* = undefined;
         }
 
@@ -5676,8 +5706,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         pub fn openWithOptions(backend: *BackendType, options: backend_types.BatchOptions) !@This() {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            backend.retainReader();
-            errdefer backend.releaseReader();
+            retainReadReader(BackendType, backend, .write_txn);
+            errdefer releaseWriteReader(BackendType, backend, .write_txn);
             backend.beginBatchMode(options);
             errdefer backend.finishBatchMode(options);
             return .{
@@ -5699,7 +5729,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             backend.finishBatchMode(self.batch_options);
-            backend.releaseReader();
+            releaseWriteReader(BackendType, backend, .write_txn);
             self.* = undefined;
         }
 
@@ -5716,7 +5746,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.invalidateCursorSnapshot();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
-                self.backend.releaseReader();
+                releaseWriteReader(BackendType, self.backend, .write_txn);
                 self.closed = true;
             };
             const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
@@ -5753,7 +5783,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             self.invalidateCursorSnapshot();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
-            self.backend.finalizeWriteReaderRelease() catch |err| {
+            finalizeWriteReader(BackendType, self.backend, .write_txn) catch |err| {
                 finalize_err = err;
             };
             if (finalize_err) |err| return err;

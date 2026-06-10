@@ -604,7 +604,11 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
     backend.next_run_id +|= reserved_run_ids;
     const reserved_run_id_end = backend.next_run_id;
 
-    backend.retainReader();
+    if (@hasDecl(BackendType, "retainReaderKind")) {
+        backend.retainReaderKind(.compaction);
+    } else {
+        backend.retainReader();
+    }
     runtime_mod.unlockBackend(BackendType, backend, true);
 
     var build_result: std.ArrayListUnmanaged(Run) = .empty;
@@ -628,14 +632,14 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
     const relocked = runtime_mod.lockBackend(BackendType, backend);
     std.debug.assert(relocked);
     var reader_retained = true;
-    errdefer if (reader_retained) backend.releaseReader();
+    errdefer if (reader_retained) if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
     errdefer if (build_result_valid) discardOutputRuns(BackendType, backend, &build_result);
     if (build_err) |err| {
         return err;
     }
 
     if (!planRunIdsStillMatch(backend.runs.items, plan, selected_run_ids)) {
-        backend.releaseReader();
+        if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
         reader_retained = false;
         discardOutputRuns(BackendType, backend, &build_result);
         deinitRunList(backend.allocator, &selected_runs);
@@ -651,7 +655,7 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
         start_ns,
         &build_result,
     );
-    backend.releaseReader();
+    if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
     reader_retained = false;
     deinitRunList(backend.allocator, &selected_runs);
 }

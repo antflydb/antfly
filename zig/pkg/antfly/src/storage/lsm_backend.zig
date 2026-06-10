@@ -108,6 +108,34 @@ pub const MutableSnapshotReason = enum(u8) {
 
 pub const mutable_snapshot_reason_count = @typeInfo(MutableSnapshotReason).@"enum".fields.len;
 
+pub const ReaderPinKind = enum(u8) {
+    bound_read_txn,
+    namespace_read_txn,
+    probe_txn,
+    current_scan,
+    write_txn,
+    compaction,
+    other,
+};
+
+pub const reader_pin_kind_count = @typeInfo(ReaderPinKind).@"enum".fields.len;
+
+pub fn readerPinKindName(kind: ReaderPinKind) []const u8 {
+    return switch (kind) {
+        .bound_read_txn => "bound_read_txn",
+        .namespace_read_txn => "namespace_read_txn",
+        .probe_txn => "probe_txn",
+        .current_scan => "current_scan",
+        .write_txn => "write_txn",
+        .compaction => "compaction",
+        .other => "other",
+    };
+}
+
+fn readerPinKindIndex(kind: ReaderPinKind) usize {
+    return @intFromEnum(kind);
+}
+
 pub const MutableSnapshotCloneReasonStats = struct {
     calls: u64 = 0,
     bytes_total: u64 = 0,
@@ -134,6 +162,12 @@ pub fn mutableSnapshotReasonName(reason: MutableSnapshotReason) []const u8 {
 
 fn mutableSnapshotReasonIndex(reason: MutableSnapshotReason) usize {
     return @intFromEnum(reason);
+}
+
+fn activeReaderKindStats(active_readers_by_kind: [reader_pin_kind_count]usize) [reader_pin_kind_count]u64 {
+    var stats: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count;
+    for (active_readers_by_kind, 0..) |active, i| stats[i] = @intCast(active);
+    return stats;
 }
 
 fn atomicMaxCounter(counter: *CounterU64, candidate: u64) void {
@@ -421,6 +455,8 @@ pub const Backend = struct {
         obsolete_delete_failures: u64 = 0,
         obsolete_delete_retries: u64 = 0,
         active_readers: u64 = 0,
+        active_readers_by_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
+        obsolete_paths_pinned_by_reader_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
         active_bulk_ingest_batches: u64 = 0,
         wal_retained_segments: u64 = 0,
         wal_retained_bytes: u64 = 0,
@@ -511,6 +547,8 @@ pub const Backend = struct {
         dst.obsolete_delete_retries +|= src.obsolete_delete_retries;
         dst.current_manifest_bytes +|= src.current_manifest_bytes;
         dst.active_readers +|= src.active_readers;
+        for (&dst.active_readers_by_kind, src.active_readers_by_kind) |*dst_count, src_count| dst_count.* +|= src_count;
+        for (&dst.obsolete_paths_pinned_by_reader_kind, src.obsolete_paths_pinned_by_reader_kind) |*dst_count, src_count| dst_count.* +|= src_count;
         dst.active_bulk_ingest_batches +|= src.active_bulk_ingest_batches;
         dst.wal_retained_segments +|= src.wal_retained_segments;
         dst.wal_retained_bytes +|= src.wal_retained_bytes;
@@ -863,6 +901,7 @@ pub const Backend = struct {
     current_manifest_bytes: u64 = 0,
     next_run_id: u64 = 1,
     active_readers: usize = 0,
+    active_readers_by_kind: [reader_pin_kind_count]usize = [_]usize{0} ** reader_pin_kind_count,
     active_mutable_value_readers: usize = 0,
     manifest_dirty: bool = false,
     obsolete_paths: std.ArrayListUnmanaged(ObsoletePath) = .empty,
@@ -1089,7 +1128,8 @@ pub const Backend = struct {
             .total_runs = @intCast(self.runs.items.len),
             .obsolete_paths = @intCast(self.obsolete_paths.items.len),
             .current_manifest_bytes = self.current_manifest_bytes,
-            .active_readers = @intCast(self.active_readers),
+            .active_readers = (self.active_readers),
+            .active_readers_by_kind = activeReaderKindStats(self.active_readers_by_kind),
             .active_bulk_ingest_batches = @intCast(self.active_bulk_ingest_batches),
             .soft_limit_l0_runs = @intCast(self.effectiveL0SoftLimitRuns()),
             .hard_limit_l0_runs = @intCast(self.effectiveL0HardLimitRuns()),
@@ -1104,6 +1144,9 @@ pub const Backend = struct {
         for (self.obsolete_paths.items) |obsolete| {
             if (self.active_readers != 0) {
                 stats.obsolete_paths_pinned_by_readers +|= 1;
+                for (self.active_readers_by_kind, 0..) |active, kind_index| {
+                    if (active != 0) stats.obsolete_paths_pinned_by_reader_kind[kind_index] +|= 1;
+                }
             } else if (self.pathTrackedByActiveRunsLocked(obsolete.path) or self.obsoletePathPinnedByOpenVersion(obsolete.path)) {
                 stats.obsolete_paths_pinned_by_versions +|= 1;
             } else if (obsolete.delete_after_ns > obsolete_now_ns) {
@@ -2873,7 +2916,12 @@ pub const Backend = struct {
     }
 
     pub fn retainReader(self: *Backend) void {
+        self.retainReaderKind(.other);
+    }
+
+    pub fn retainReaderKind(self: *Backend, kind: ReaderPinKind) void {
         self.active_readers += 1;
+        self.active_readers_by_kind[readerPinKindIndex(kind)] += 1;
     }
 
     pub fn retainActiveMutableValueReader(self: *Backend) void {
@@ -3117,8 +3165,15 @@ pub const Backend = struct {
     }
 
     pub fn releaseReader(self: *Backend) void {
+        self.releaseReaderKind(.other);
+    }
+
+    pub fn releaseReaderKind(self: *Backend, kind: ReaderPinKind) void {
+        const index = readerPinKindIndex(kind);
         std.debug.assert(self.active_readers > 0);
+        std.debug.assert(self.active_readers_by_kind[index] > 0);
         self.active_readers -= 1;
+        self.active_readers_by_kind[index] -= 1;
         if (self.active_readers == 0) {
             self.drainObsoleteRuns();
             self.drainRetiredImmutableMemtables();
@@ -3381,7 +3436,11 @@ pub const Backend = struct {
     }
 
     pub fn finalizeWriteReaderRelease(self: *Backend) !void {
-        self.releaseReader();
+        try self.finalizeWriteReaderReleaseKind(.other);
+    }
+
+    pub fn finalizeWriteReaderReleaseKind(self: *Backend, kind: ReaderPinKind) !void {
+        self.releaseReaderKind(kind);
         const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
         if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
             self.active_readers != 0 or
@@ -3392,7 +3451,11 @@ pub const Backend = struct {
     }
 
     pub fn finalizeReadReaderRelease(self: *Backend) void {
-        self.releaseReader();
+        self.finalizeReadReaderReleaseKind(.other);
+    }
+
+    pub fn finalizeReadReaderReleaseKind(self: *Backend, kind: ReaderPinKind) void {
+        self.releaseReaderKind(kind);
         const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
         if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
             self.active_readers != 0 or
