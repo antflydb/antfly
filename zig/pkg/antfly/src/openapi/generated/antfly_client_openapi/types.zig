@@ -3226,6 +3226,13 @@ pub const ExtractionClassification = struct {
     score: ?f32 = null,
 };
 
+/// Available derived document artifact manifests for a source document.
+pub const DocumentArtifactManifestList = struct {
+    /// Stable identity of the source document.
+    document_id: []const u8,
+    artifacts: []const DocumentArtifactManifest,
+};
+
 /// Typed Zig status view for table data topology and range placement.
 pub const ClusterDataStatus = struct {
     nodes: ?[]const ClusterDataNodeStatus = null,

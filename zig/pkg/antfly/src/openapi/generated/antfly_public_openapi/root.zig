@@ -12,6 +12,7 @@ pub const ClusterStatus = types.ClusterStatus;
 pub const ClusterTopology = types.ClusterTopology;
 pub const ClusterDataStatus = types.ClusterDataStatus;
 pub const DocumentArtifactManifest = types.DocumentArtifactManifest;
+pub const DocumentArtifactManifestList = types.DocumentArtifactManifestList;
 pub const DocumentArtifactReprocessResponse = types.DocumentArtifactReprocessResponse;
 pub const ClusterDataNodeStatus = types.ClusterDataNodeStatus;
 pub const ClusterDataRangeStatus = types.ClusterDataRangeStatus;

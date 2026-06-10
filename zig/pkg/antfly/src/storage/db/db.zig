@@ -4688,6 +4688,54 @@ pub const DB = struct {
         return try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, manifest, state);
     }
 
+    pub fn listDocumentArtifactManifests(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+    ) !types.DocumentArtifactManifestList {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, "asset");
+        defer alloc.free(prefix);
+        const rows = try self.core.scanStorePrefix(alloc, prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+
+        var artifacts = std.ArrayListUnmanaged(types.DocumentArtifactManifest).empty;
+        errdefer {
+            for (artifacts.items) |*artifact| artifact.deinit(alloc);
+            artifacts.deinit(alloc);
+        }
+
+        for (rows) |row| {
+            var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, row.key)) orelse continue;
+            defer artifact_ref.deinit(alloc);
+            if (artifact_ref.kind != .asset) continue;
+            if (artifact_ref.unit_id != null) continue;
+            if (!std.mem.eql(u8, artifact_ref.document_id, doc_key)) continue;
+
+            const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_ref.name);
+            defer alloc.free(state_key);
+            const state = self.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            errdefer if (state) |value| alloc.free(value);
+
+            const manifest_json = try alloc.dupe(u8, row.value);
+            errdefer alloc.free(manifest_json);
+            try artifacts.append(
+                alloc,
+                try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_ref.name, manifest_json, state),
+            );
+        }
+
+        return .{
+            .document_id = try alloc.dupe(u8, doc_key),
+            .artifacts = try artifacts.toOwnedSlice(alloc),
+        };
+    }
+
     pub fn reprocessDocumentArtifact(
         self: *DB,
         alloc: Allocator,
@@ -28642,6 +28690,14 @@ test "db document extraction manifest inspection and reprocess API" {
     try std.testing.expect(inspected.merge_operation_count > 0);
     try std.testing.expect(inspected.state_json != null);
 
+    var artifact_list = try db.listDocumentArtifactManifests(alloc, "doc:a");
+    defer artifact_list.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a", artifact_list.document_id);
+    try std.testing.expectEqual(@as(usize, 1), artifact_list.artifacts.len);
+    try std.testing.expectEqualStrings("document_units_v1", artifact_list.artifacts[0].artifact_name);
+    try std.testing.expectEqual(@as(u64, 1), artifact_list.artifacts[0].generation);
+    try std.testing.expect(artifact_list.artifacts[0].state_json != null);
+
     try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
     try std.testing.expectEqual(first_calls, counting.calls);
 
@@ -28652,6 +28708,10 @@ test "db document extraction manifest inspection and reprocess API" {
 
     try std.testing.expect(!try db.reprocessDocumentArtifact(alloc, "doc:missing", "document_units_v1"));
     try std.testing.expect((try db.getDocumentArtifactManifest(alloc, "doc:missing", "document_units_v1")) == null);
+    var missing_list = try db.listDocumentArtifactManifests(alloc, "doc:missing");
+    defer missing_list.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:missing", missing_list.document_id);
+    try std.testing.expectEqual(@as(usize, 0), missing_list.artifacts.len);
 }
 
 test "db document extraction skips stable unit local rewrites while replaying full text from stored artifacts" {

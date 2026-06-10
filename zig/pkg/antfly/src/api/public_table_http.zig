@@ -96,6 +96,13 @@ pub const TableApi = struct {
         InternalFailure,
     };
 
+    pub const ExecuteDocumentArtifactManifestsError = error{
+        NotFound,
+        MethodNotAllowed,
+        DocIdentityUnavailable,
+        InternalFailure,
+    };
+
     pub const ExecuteReprocessDocumentArtifactError = error{
         NotFound,
         MethodNotAllowed,
@@ -175,6 +182,12 @@ pub const TableApi = struct {
             doc_key: []const u8,
             artifact_name: []const u8,
         ) ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest = null,
+        execute_document_artifact_manifests: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+        ) ExecuteDocumentArtifactManifestsError!db_mod.types.DocumentArtifactManifestList = null,
         execute_reprocess_document_artifact: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -278,6 +291,16 @@ pub const TableApi = struct {
     ) ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
         const fn_ptr = self.vtable.execute_document_artifact_manifest orelse return error.MethodNotAllowed;
         return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name);
+    }
+
+    pub fn executeDocumentArtifactManifests(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+    ) ExecuteDocumentArtifactManifestsError!db_mod.types.DocumentArtifactManifestList {
+        const fn_ptr = self.vtable.execute_document_artifact_manifests orelse return error.MethodNotAllowed;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key);
     }
 
     pub fn executeReprocessDocumentArtifact(
@@ -591,6 +614,69 @@ pub fn handleDocumentArtifactManifest(
             .merge_operation_count = manifest.merge_operation_count,
             .manifest_json = manifest.manifest_json,
             .state_json = manifest.state_json,
+        }, .{}),
+    };
+}
+
+pub fn handleDocumentArtifactManifests(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    doc_key: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    var list = api.executeDocumentArtifactManifests(alloc, table_name, doc_key) catch |err| switch (err) {
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact manifest list failed") },
+    };
+    defer list.deinit(alloc);
+
+    const ManifestResponse = struct {
+        document_id: []const u8,
+        artifact_name: []const u8,
+        artifact_id: []const u8,
+        generation: u64,
+        route_type: []const u8,
+        unsupported_reason: ?[]const u8,
+        unit_count: usize,
+        chunk_count: usize,
+        child_range_count: usize,
+        merge_status: []const u8,
+        merge_operation_count: usize,
+        manifest_json: []const u8,
+        state_json: ?[]const u8,
+    };
+    const Response = struct {
+        document_id: []const u8,
+        artifacts: []const ManifestResponse,
+    };
+
+    const artifacts = try alloc.alloc(ManifestResponse, list.artifacts.len);
+    defer alloc.free(artifacts);
+    for (list.artifacts, artifacts) |manifest, *out| {
+        out.* = .{
+            .document_id = manifest.document_id,
+            .artifact_name = manifest.artifact_name,
+            .artifact_id = manifest.artifact_id,
+            .generation = manifest.generation,
+            .route_type = manifest.route_type,
+            .unsupported_reason = manifest.unsupported_reason,
+            .unit_count = manifest.unit_count,
+            .chunk_count = manifest.chunk_count,
+            .child_range_count = manifest.child_range_count,
+            .merge_status = manifest.merge_status,
+            .merge_operation_count = manifest.merge_operation_count,
+            .manifest_json = manifest.manifest_json,
+            .state_json = manifest.state_json,
+        };
+    }
+
+    return .{
+        .status = 200,
+        .body = try std.json.Stringify.valueAlloc(alloc, Response{
+            .document_id = list.document_id,
+            .artifacts = artifacts,
         }, .{}),
     };
 }
@@ -1235,20 +1321,16 @@ test "public document artifact manifest handler returns summary and raw state" {
                     .execute_table_create_index = unsupportedCreateIndex,
                     .execute_table_delete_index = unsupportedDeleteIndex,
                     .execute_document_artifact_manifest = executeDocumentArtifactManifest,
+                    .execute_document_artifact_manifests = executeDocumentArtifactManifests,
                 },
             };
         }
 
-        fn executeDocumentArtifactManifest(
-            _: *anyopaque,
+        fn makeManifest(
             alloc: std.mem.Allocator,
-            table_name: []const u8,
             doc_key: []const u8,
             artifact_name: []const u8,
         ) TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
-            if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
-            if (!std.mem.eql(u8, doc_key, "doc:a")) return error.InternalFailure;
-            if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
             return .{
                 .document_id = alloc.dupe(u8, doc_key) catch return error.InternalFailure,
                 .artifact_name = alloc.dupe(u8, artifact_name) catch return error.InternalFailure,
@@ -1262,6 +1344,38 @@ test "public document artifact manifest handler returns summary and raw state" {
                 .child_range_count = 1,
                 .merge_status = alloc.dupe(u8, "converged") catch return error.InternalFailure,
                 .merge_operation_count = 4,
+            };
+        }
+
+        fn executeDocumentArtifactManifest(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+        ) TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
+            if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
+            if (!std.mem.eql(u8, doc_key, "doc:a")) return error.InternalFailure;
+            if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
+            return makeManifest(alloc, doc_key, artifact_name);
+        }
+
+        fn executeDocumentArtifactManifests(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+        ) TableApi.ExecuteDocumentArtifactManifestsError!db_mod.types.DocumentArtifactManifestList {
+            if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
+            if (!std.mem.eql(u8, doc_key, "doc:a")) return error.InternalFailure;
+            const document_id = alloc.dupe(u8, doc_key) catch return error.InternalFailure;
+            errdefer alloc.free(document_id);
+            var artifacts = alloc.alloc(db_mod.types.DocumentArtifactManifest, 1) catch return error.InternalFailure;
+            errdefer alloc.free(artifacts);
+            artifacts[0] = makeManifest(alloc, doc_key, "document_units_v1") catch return error.InternalFailure;
+            return .{
+                .document_id = document_id,
+                .artifacts = artifacts,
             };
         }
     };
@@ -1295,6 +1409,28 @@ test "public document artifact manifest handler returns summary and raw state" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.unit_count);
     try std.testing.expectEqualStrings("{\"manifest_version\":2}", parsed.value.manifest_json);
     try std.testing.expectEqualStrings("{\"kind\":\"document_extraction_state_v1\"}", parsed.value.state_json.?);
+
+    var list_resp = try handleDocumentArtifactManifests(
+        std.testing.allocator,
+        "docs",
+        "doc:a",
+        Backend.iface(),
+    );
+    defer list_resp.deinit(std.testing.allocator);
+    const ParsedList = struct {
+        document_id: []const u8,
+        artifacts: []const Parsed,
+    };
+    var parsed_list = try std.json.parseFromSlice(ParsedList, std.testing.allocator, list_resp.body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed_list.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), list_resp.status);
+    try std.testing.expectEqualStrings("doc:a", parsed_list.value.document_id);
+    try std.testing.expectEqual(@as(usize, 1), parsed_list.value.artifacts.len);
+    try std.testing.expectEqualStrings("doc:a", parsed_list.value.artifacts[0].document_id);
+    try std.testing.expectEqual(@as(u64, 7), parsed_list.value.artifacts[0].generation);
 }
 
 test "public document artifact reprocess handler returns accepted" {

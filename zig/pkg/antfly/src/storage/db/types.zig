@@ -427,6 +427,18 @@ pub const DocumentArtifactManifest = struct {
     }
 };
 
+pub const DocumentArtifactManifestList = struct {
+    document_id: []u8,
+    artifacts: []DocumentArtifactManifest,
+
+    pub fn deinit(self: *DocumentArtifactManifestList, alloc: Allocator) void {
+        alloc.free(self.document_id);
+        for (self.artifacts) |*artifact| artifact.deinit(alloc);
+        alloc.free(self.artifacts);
+        self.* = undefined;
+    }
+};
+
 pub const TextBoolQuery = struct {
     must: []const TextQuery = &.{},
     should: []const TextQuery = &.{},

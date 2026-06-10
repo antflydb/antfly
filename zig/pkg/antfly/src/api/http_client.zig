@@ -1468,6 +1468,41 @@ pub const ApiHttpClient = struct {
         }
     }
 
+    pub fn fetchGroupDocumentArtifactManifests(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+    ) !QueryResponse {
+        const escaped_key = try percentEncodePathComponent(self.alloc, doc_key);
+        defer self.alloc.free(escaped_key);
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.documents_marker,
+            escaped_key,
+            routes.Routes.artifacts_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .GET,
+            .uri = uri,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
+            404 => return error.NotFound,
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
     pub fn fetchGroupDocumentArtifactReprocess(
         self: *ApiHttpClient,
         base_uri: []const u8,

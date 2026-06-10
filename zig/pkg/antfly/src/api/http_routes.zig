@@ -86,6 +86,7 @@ pub const Routes = struct {
     pub const schema_suffix = "/schema";
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
+    pub const artifacts_suffix = "/artifacts";
     pub const documents_marker = "/documents/";
     pub const artifacts_marker = "/artifacts/";
     pub const reprocess_suffix = ":reprocess";
@@ -140,6 +141,11 @@ pub const Routes = struct {
         table_name: []const u8,
         key: []const u8,
         artifact_name: []const u8,
+    };
+
+    pub const TableDocumentArtifacts = struct {
+        table_name: []const u8,
+        key: []const u8,
     };
 
     pub const SecretPath = struct {
@@ -255,6 +261,12 @@ pub const Routes = struct {
         table_name: []const u8,
         key: []const u8,
         artifact_name: []const u8,
+    };
+
+    pub const GroupDocumentArtifacts = struct {
+        group_id: u64,
+        table_name: []const u8,
+        key: []const u8,
     };
 
     pub const GroupGraphExpand = struct {
@@ -419,6 +431,21 @@ pub const Routes = struct {
 
     pub fn matchTableDocumentArtifactReprocess(path: []const u8) ?TableDocumentArtifact {
         return matchTableDocumentArtifactWithReprocess(path, true);
+    }
+
+    pub fn matchTableDocumentArtifacts(path: []const u8) ?TableDocumentArtifacts {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, artifacts_suffix)) return null;
+        const rest = path[tables_prefix.len .. path.len - artifacts_suffix.len];
+        const documents_index = std.mem.indexOf(u8, rest, documents_marker) orelse return null;
+        if (documents_index == 0) return null;
+        const table_name = rest[0..documents_index];
+        const key = rest[documents_index + documents_marker.len ..];
+        if (key.len == 0) return null;
+        return .{
+            .table_name = table_name,
+            .key = key,
+        };
     }
 
     fn matchTableDocumentArtifactWithReprocess(path: []const u8, reprocess: bool) ?TableDocumentArtifact {
@@ -682,6 +709,24 @@ pub const Routes = struct {
         return matchGroupDocumentArtifactWithReprocess(path, true);
     }
 
+    pub fn matchGroupDocumentArtifacts(path: []const u8) ?GroupDocumentArtifacts {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, artifacts_suffix)) return null;
+        const table_rest = rest[tables_prefix.len .. rest.len - artifacts_suffix.len];
+        const documents_index = std.mem.indexOf(u8, table_rest, documents_marker) orelse return null;
+        if (documents_index == 0) return null;
+        const table_name = table_rest[0..documents_index];
+        const key = table_rest[documents_index + documents_marker.len ..];
+        if (key.len == 0) return null;
+        return .{
+            .group_id = group.group_id,
+            .table_name = table_name,
+            .key = key,
+        };
+    }
+
     fn matchGroupDocumentArtifactWithReprocess(path: []const u8, reprocess: bool) ?GroupDocumentArtifact {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -933,6 +978,10 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", artifact.table_name);
     try std.testing.expectEqualStrings("doc%2Fa", artifact.key);
     try std.testing.expectEqualStrings("document_units_v1", artifact.artifact_name);
+    const artifacts = Routes.matchTableDocumentArtifacts("/tables/docs/documents/doc%2Fa/artifacts").?;
+    try std.testing.expectEqualStrings("docs", artifacts.table_name);
+    try std.testing.expectEqualStrings("doc%2Fa", artifacts.key);
+    try std.testing.expect(Routes.matchTableDocumentArtifact("/tables/docs/documents/doc%2Fa/artifacts") == null);
     const reprocess = Routes.matchTableDocumentArtifactReprocess("/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:reprocess").?;
     try std.testing.expectEqualStrings("docs", reprocess.table_name);
     try std.testing.expectEqualStrings("doc%2Fa", reprocess.key);
@@ -982,6 +1031,11 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", group_artifact.table_name);
     try std.testing.expectEqualStrings("doc%2Fa", group_artifact.key);
     try std.testing.expectEqualStrings("document_units_v1", group_artifact.artifact_name);
+    const group_artifacts = Routes.matchGroupDocumentArtifacts("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts").?;
+    try std.testing.expectEqual(@as(u64, 7), group_artifacts.group_id);
+    try std.testing.expectEqualStrings("docs", group_artifacts.table_name);
+    try std.testing.expectEqualStrings("doc%2Fa", group_artifacts.key);
+    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts") == null);
     const group_reprocess = Routes.matchGroupDocumentArtifactReprocess("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:reprocess").?;
     try std.testing.expectEqual(@as(u64, 7), group_reprocess.group_id);
     try std.testing.expectEqualStrings("document_units_v1", group_reprocess.artifact_name);

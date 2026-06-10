@@ -195,6 +195,11 @@ const DocumentArtifactManifestResponse = struct {
     state_json: ?[]const u8,
 };
 
+const DocumentArtifactManifestsResponse = struct {
+    document_id: []const u8,
+    artifacts: []const DocumentArtifactManifestResponse,
+};
+
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, query: []const u8) !?http_common.HttpResponse {
     const alloc = ctx.alloc;
     const source = ctx.reads;
@@ -229,6 +234,51 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
     }
 
     if (req.method == .GET) {
+        if (routes.Routes.matchGroupDocumentArtifacts(path)) |artifact_route| {
+            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_route.key);
+            defer alloc.free(decoded_key);
+
+            var list = (reads.documentArtifactManifestsGroupLocal(
+                alloc,
+                artifact_route.group_id,
+                artifact_route.table_name,
+                decoded_key,
+                .read_index,
+            ) catch |err| switch (err) {
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
+                error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            defer list.deinit(alloc);
+
+            const artifacts = try alloc.alloc(DocumentArtifactManifestResponse, list.artifacts.len);
+            defer alloc.free(artifacts);
+            for (list.artifacts, artifacts) |manifest, *out| {
+                out.* = .{
+                    .document_id = manifest.document_id,
+                    .artifact_name = manifest.artifact_name,
+                    .artifact_id = manifest.artifact_id,
+                    .generation = manifest.generation,
+                    .route_type = manifest.route_type,
+                    .unsupported_reason = manifest.unsupported_reason,
+                    .unit_count = manifest.unit_count,
+                    .chunk_count = manifest.chunk_count,
+                    .child_range_count = manifest.child_range_count,
+                    .merge_status = manifest.merge_status,
+                    .merge_operation_count = manifest.merge_operation_count,
+                    .manifest_json = manifest.manifest_json,
+                    .state_json = manifest.state_json,
+                };
+            }
+
+            return try http_route_helpers.jsonResponse(alloc, DocumentArtifactManifestsResponse{
+                .document_id = list.document_id,
+                .artifacts = artifacts,
+            });
+        }
+
         if (routes.Routes.matchGroupDocumentArtifact(path)) |artifact_route| {
             const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_route.key);

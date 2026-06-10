@@ -543,6 +543,15 @@ pub const Client = struct {
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
+    /// List derived document artifact manifests
+    /// GET /db/v1/tables/{tableName}/documents/{key}/artifacts
+    pub fn listDocumentArtifactManifests(self: *@This(), table_name: []const u8, key: []const u8) !ApiResponse(types.DocumentArtifactManifestList) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts", .{ self.base_url, table_name, key });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.DocumentArtifactManifestList).fromResponse(self.allocator, &resp);
+    }
+
     /// Inspect a derived document artifact manifest
     /// GET /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}
     pub fn getDocumentArtifactManifest(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8) !ApiResponse(types.DocumentArtifactManifest) {

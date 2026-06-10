@@ -3346,6 +3346,11 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .GET) {
+            if (routes.Routes.matchTableDocumentArtifacts(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicDocumentArtifactManifests(artifact_route.table_name, artifact_route.key);
+            }
+        }
+        if (req.method == .GET) {
             if (routes.Routes.matchTableDocumentArtifact(uri_parts.path)) |artifact_route| {
                 return try self.handlePublicDocumentArtifactManifest(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name);
             }
@@ -4473,6 +4478,7 @@ pub const ApiHttpServer = struct {
                 .execute_table_create_index = executePublicTableCreateIndex,
                 .execute_table_delete_index = executePublicTableDeleteIndex,
                 .execute_document_artifact_manifest = executePublicDocumentArtifactManifest,
+                .execute_document_artifact_manifests = executePublicDocumentArtifactManifests,
                 .execute_reprocess_document_artifact = executePublicReprocessDocumentArtifact,
             },
         };
@@ -5298,6 +5304,24 @@ pub const ApiHttpServer = struct {
         }) orelse error.NotFound;
     }
 
+    fn executePublicDocumentArtifactManifests(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+    ) public_table_http.TableApi.ExecuteDocumentArtifactManifestsError!db_mod.types.DocumentArtifactManifestList {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_reads orelse return error.NotFound;
+        return (source.documentArtifactManifests(alloc, table_name, doc_key, .read_index) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.InvalidArgument => return error.NotFound,
+            else => {
+                std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
+                return error.InternalFailure;
+            },
+        }) orelse error.NotFound;
+    }
+
     fn executePublicReprocessDocumentArtifact(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5722,6 +5746,18 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(artifact_name);
 
         var resp = try public_table_http.handleDocumentArtifactManifest(self.alloc, table_name, doc_key, artifact_name, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicDocumentArtifactManifests(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8) !http_common.HttpResponse {
+        const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
+        defer self.alloc.free(doc_key);
+
+        var resp = try public_table_http.handleDocumentArtifactManifests(self.alloc, table_name, doc_key, self.tableApi());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
