@@ -2381,9 +2381,20 @@ pub const IndexManager = struct {
         boundary_reassignment_min_improvement: f32 = 0.0,
     };
 
+    // Node budget per tree-link repair sweep run from the dense maintenance
+    // lane. Repairs persist as the sweep goes, so an exhausted budget simply
+    // resumes on the next maintenance pass.
+    const dense_link_repair_max_nodes: usize = 4096;
+
     pub fn runDensePostingMaintenance(self: *IndexManager, options: DensePostingMaintenanceOptions) !usize {
         var total_steps: usize = 0;
         for (self.dense_indexes.items) |*entry| {
+            // A write path observed a tree-link inconsistency (stale parent
+            // pointer / dangling node reference): run a bounded repair sweep
+            // before posting maintenance so traversals stop tripping on it.
+            if (try entry.index.maybeRepairTreeLinks(dense_link_repair_max_nodes)) |link_repair| {
+                total_steps += @intCast(link_repair.repaired());
+            }
             const backlog = try entry.index.postingBacklogStats();
             if (!backlog.needsRepair()) continue;
 
