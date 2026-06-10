@@ -13311,6 +13311,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         },
     };
     defer extraction.deinit(alloc);
+    try completeDocumentExtractionGeneratedText(alloc, db.enrichment_runtime, config, source_url, extraction.content_type, &extraction);
 
     const source_fingerprint = try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data);
     defer alloc.free(source_fingerprint);
@@ -13451,6 +13452,105 @@ fn computeDocumentExtractionAssetRequestDerived(
         .key = try alloc.dupe(u8, state_key),
         .value = try alloc.dupe(u8, new_state),
     });
+}
+
+fn completeDocumentExtractionGeneratedText(
+    alloc: Allocator,
+    runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
+    config: document_extraction_mod.Config,
+    source_url: []const u8,
+    source_content_type: []const u8,
+    extraction: *document_extraction_mod.Result,
+) !void {
+    const active_runtime = runtime orelse return;
+    const producer = active_runtime.config.asset_producer orelse return;
+    for (extraction.units) |*unit| {
+        if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) {
+            const parts_json = try documentGeneratedTextPartsJsonAlloc(alloc, extraction.route_type, source_content_type, unit.*);
+            defer alloc.free(parts_json);
+            const produced = try producer.produce(alloc, .{
+                .producer_type = .reader,
+                .config_json = config.ocr_config_json,
+                .source_text = source_url,
+                .source_parts_json = parts_json,
+                .content_type = "text/plain",
+            });
+            errdefer alloc.free(produced);
+            try applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr);
+            continue;
+        }
+        if (config.transcription_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_transcription")) {
+            const parts_json = try documentGeneratedTextPartsJsonAlloc(alloc, extraction.route_type, source_content_type, unit.*);
+            defer alloc.free(parts_json);
+            const produced = try producer.produce(alloc, .{
+                .producer_type = .transcriber,
+                .config_json = config.transcription_config_json,
+                .source_text = source_url,
+                .source_parts_json = parts_json,
+                .content_type = "text/plain",
+            });
+            errdefer alloc.free(produced);
+            try applyGeneratedUnitText(alloc, unit, produced, "transcript_text", "completed", .transcript);
+        }
+    }
+}
+
+const GeneratedUnitTextKind = enum { ocr, transcript };
+
+fn applyGeneratedUnitText(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    produced: []u8,
+    method: []const u8,
+    status: []const u8,
+    kind: GeneratedUnitTextKind,
+) !void {
+    if (produced.len == 0) {
+        alloc.free(produced);
+        return;
+    }
+    const owned_method = try alloc.dupe(u8, method);
+    errdefer alloc.free(owned_method);
+    const owned_status = try alloc.dupe(u8, status);
+    errdefer alloc.free(owned_status);
+
+    alloc.free(unit.text);
+    alloc.free(unit.method);
+    if (unit.extraction_status) |value| alloc.free(value);
+    unit.text = produced;
+    unit.method = owned_method;
+    unit.extraction_status = owned_status;
+    switch (kind) {
+        .ocr => unit.ocr_used = true,
+        .transcript => unit.transcript_used = true,
+    }
+    const start = unit.char_start orelse 0;
+    unit.char_start = start;
+    unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
+}
+
+fn documentGeneratedTextPartsJsonAlloc(
+    alloc: Allocator,
+    route_type: []const u8,
+    source_content_type: []const u8,
+    unit: document_extraction_mod.Unit,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .schema = "antfly.document_generated_text_request.v1",
+        .route_type = route_type,
+        .source_content_type = source_content_type,
+        .unit_id = unit.unit_id,
+        .unit_type = unit.unit_type,
+        .method = unit.method,
+        .extraction_status = unit.extraction_status,
+        .source_path = unit.source_path,
+        .page_number = unit.page_number,
+        .page_label = unit.page_label,
+        .page_bbox = unit.page_bbox,
+        .page_rotation = unit.page_rotation,
+        .byte_length = unit.byte_length,
+        .source_sha256 = unit.source_sha256,
+    }, .{});
 }
 
 fn appendDocumentExtractionDeleteKeys(
@@ -30404,6 +30504,100 @@ test "db document extraction stores image pending OCR unit" {
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"ocr_used\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"transcript_used\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"source_content_type\":\"image/png\"") != null);
+}
+
+test "db document extraction completes image OCR with reader producer" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"mock-reader\"}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:image-ocr",
+            .value = "{\"filename\":\"scan.png\",\"mime_type\":\"image/png\",\"url\":\"data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:image-ocr", "document_units_v1", "image:000001");
+    defer alloc.free(unit_key);
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"ocr_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"ocr_used\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"reader:data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"") != null);
+}
+
+test "db document extraction completes audio transcription with transcriber producer" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"mock-transcriber\"}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:audio-transcript",
+            .value = "{\"filename\":\"audio.mp3\",\"mime_type\":\"audio/mpeg\",\"url\":\"data:audio/mpeg;base64,SUQzYXVkaW8gYnl0ZXM=\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.transcriber_calls);
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:audio-transcript", "document_units_v1", "audio:000001");
+    defer alloc.free(unit_key);
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"transcript_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"transcript_used\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"transcriber:data:audio/mpeg;base64,SUQzYXVkaW8gYnl0ZXM=\"") != null);
 }
 
 test "db document extraction stores rfc822 email units" {

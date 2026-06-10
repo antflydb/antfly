@@ -1719,6 +1719,7 @@ fn processDocumentExtractionAsset(
 
     var extraction = try document_extraction_mod.extractDownloadedAlloc(runtime.alloc, downloaded_mut, source_url, config);
     defer extraction.deinit(runtime.alloc);
+    try completeRuntimeDocumentExtractionGeneratedText(runtime, config, source_url, extraction.content_type, &extraction);
 
     const source_fingerprint = try documentExtractionFingerprintAlloc(runtime.alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data);
     defer runtime.alloc.free(source_fingerprint);
@@ -1956,6 +1957,103 @@ fn deleteDocumentExtractionForRuntime(
     }
 
     try storePutBatchWithRetry(runtime, &.{}, deletes.items);
+}
+
+fn completeRuntimeDocumentExtractionGeneratedText(
+    runtime: *EnrichmentRuntime,
+    config: document_extraction_mod.Config,
+    source_url: []const u8,
+    source_content_type: []const u8,
+    extraction: *document_extraction_mod.Result,
+) !void {
+    const producer = runtime.config.asset_producer orelse return;
+    for (extraction.units) |*unit| {
+        if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) {
+            const parts_json = try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, extraction.route_type, source_content_type, unit.*);
+            defer runtime.alloc.free(parts_json);
+            const produced = try producer.produce(runtime.alloc, .{
+                .producer_type = .reader,
+                .config_json = config.ocr_config_json,
+                .source_text = source_url,
+                .source_parts_json = parts_json,
+                .content_type = "text/plain",
+            });
+            errdefer runtime.alloc.free(produced);
+            try applyRuntimeGeneratedUnitText(runtime.alloc, unit, produced, "ocr_text", "completed", .ocr);
+            continue;
+        }
+        if (config.transcription_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_transcription")) {
+            const parts_json = try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, extraction.route_type, source_content_type, unit.*);
+            defer runtime.alloc.free(parts_json);
+            const produced = try producer.produce(runtime.alloc, .{
+                .producer_type = .transcriber,
+                .config_json = config.transcription_config_json,
+                .source_text = source_url,
+                .source_parts_json = parts_json,
+                .content_type = "text/plain",
+            });
+            errdefer runtime.alloc.free(produced);
+            try applyRuntimeGeneratedUnitText(runtime.alloc, unit, produced, "transcript_text", "completed", .transcript);
+        }
+    }
+}
+
+const RuntimeGeneratedUnitTextKind = enum { ocr, transcript };
+
+fn applyRuntimeGeneratedUnitText(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    produced: []u8,
+    method: []const u8,
+    status: []const u8,
+    kind: RuntimeGeneratedUnitTextKind,
+) !void {
+    if (produced.len == 0) {
+        alloc.free(produced);
+        return;
+    }
+    const owned_method = try alloc.dupe(u8, method);
+    errdefer alloc.free(owned_method);
+    const owned_status = try alloc.dupe(u8, status);
+    errdefer alloc.free(owned_status);
+
+    alloc.free(unit.text);
+    alloc.free(unit.method);
+    if (unit.extraction_status) |value| alloc.free(value);
+    unit.text = produced;
+    unit.method = owned_method;
+    unit.extraction_status = owned_status;
+    switch (kind) {
+        .ocr => unit.ocr_used = true,
+        .transcript => unit.transcript_used = true,
+    }
+    const start = unit.char_start orelse 0;
+    unit.char_start = start;
+    unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
+}
+
+fn runtimeDocumentGeneratedTextPartsJsonAlloc(
+    alloc: Allocator,
+    route_type: []const u8,
+    source_content_type: []const u8,
+    unit: document_extraction_mod.Unit,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .schema = "antfly.document_generated_text_request.v1",
+        .route_type = route_type,
+        .source_content_type = source_content_type,
+        .unit_id = unit.unit_id,
+        .unit_type = unit.unit_type,
+        .method = unit.method,
+        .extraction_status = unit.extraction_status,
+        .source_path = unit.source_path,
+        .page_number = unit.page_number,
+        .page_label = unit.page_label,
+        .page_bbox = unit.page_bbox,
+        .page_rotation = unit.page_rotation,
+        .byte_length = unit.byte_length,
+        .source_sha256 = unit.source_sha256,
+    }, .{});
 }
 
 fn collectRuntimeDocumentExtractionDesiredKeys(

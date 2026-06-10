@@ -99,6 +99,10 @@ pub const Config = struct {
     filename_field: []const u8 = "",
     content_type_field: []const u8 = "",
     html_strip_tags: bool = true,
+    ocr_enabled: bool = false,
+    ocr_config_json: []const u8 = "",
+    transcription_enabled: bool = false,
+    transcription_config_json: []const u8 = "",
     routes: []Route = &.{},
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
@@ -107,6 +111,8 @@ pub const Config = struct {
         if (self.credentials.len > 0) alloc.free(@constCast(self.credentials));
         if (self.filename_field.len > 0) alloc.free(@constCast(self.filename_field));
         if (self.content_type_field.len > 0) alloc.free(@constCast(self.content_type_field));
+        if (self.ocr_config_json.len > 0) alloc.free(@constCast(self.ocr_config_json));
+        if (self.transcription_config_json.len > 0) alloc.free(@constCast(self.transcription_config_json));
         for (self.routes) |*route| route.deinit(alloc);
         if (self.routes.len > 0) alloc.free(self.routes);
         self.* = undefined;
@@ -184,6 +190,10 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     config.filename_field = try dupeSourceStringField(alloc, object, "filename_field");
     config.content_type_field = try dupeSourceStringField(alloc, object, "content_type_field");
     config.html_strip_tags = boolField(object, "html_strip_tags") orelse true;
+    config.ocr_enabled = boolField(object, "ocr_fallback") orelse false;
+    config.ocr_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "ocr", &config.ocr_enabled);
+    config.transcription_enabled = boolField(object, "transcribe_audio") orelse false;
+    config.transcription_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "transcription", &config.transcription_enabled);
     config.routes = try parseRoutesAlloc(alloc, object);
     return config;
 }
@@ -211,6 +221,28 @@ fn boolField(object: std.json.ObjectMap, field: []const u8) ?bool {
         .bool => |v| v,
         else => null,
     };
+}
+
+fn parseOptionalProducerConfigJsonAlloc(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    field: []const u8,
+    enabled: *bool,
+) ![]const u8 {
+    const value = object.get(field) orelse return "";
+    switch (value) {
+        .bool => |flag| {
+            enabled.* = flag;
+            return "";
+        },
+        .object => |producer_object| {
+            enabled.* = boolField(producer_object, "enabled") orelse true;
+            const config_value = producer_object.get("config") orelse .null;
+            if (config_value == .null) return "";
+            return try std.json.Stringify.valueAlloc(alloc, config_value, .{});
+        },
+        else => return error.InvalidDocumentExtractionConfig,
+    }
 }
 
 fn parseRoutesAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]Route {
@@ -2192,6 +2224,23 @@ test "document extraction applies configured audio transcript route" {
     try std.testing.expectEqual(@as(usize, 64), result.units[0].source_sha256.?.len);
     try std.testing.expect(!result.units[0].ocr_used);
     try std.testing.expect(!result.units[0].transcript_used);
+}
+
+test "document extraction parses generated OCR and transcription config" {
+    const alloc = std.testing.allocator;
+    var config = try parseConfig(alloc,
+        \\{
+        \\  "ocr_fallback": true,
+        \\  "ocr": {"config": {"provider": "mock-reader"}},
+        \\  "transcription": {"enabled": true, "config": {"provider": "mock-transcriber"}}
+        \\}
+    );
+    defer config.deinit(alloc);
+
+    try std.testing.expect(config.ocr_enabled);
+    try std.testing.expect(config.transcription_enabled);
+    try std.testing.expect(std.mem.indexOf(u8, config.ocr_config_json, "mock-reader") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config.transcription_config_json, "mock-transcriber") != null);
 }
 
 test "document extraction applies source metadata fields from row json" {
