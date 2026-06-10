@@ -158,12 +158,26 @@ pub const ProvisionedTableReadCache = struct {
     miss_count: std.atomic.Value(u64) = .init(0),
     mutex: Io.Mutex = .init,
     ready: Io.Condition = .init,
-    epoch: u64 = 1,
+    // Invalidation epochs, bucketed by table-name hash. A single global
+    // epoch made every open of table A "stale" whenever table B was
+    // written — under continuous background writes (enrichment, status
+    // persistence) opens of an UNCHANGED table never looked fresh, which
+    // livelocked queries (pre-bounded-retry) or served permanently
+    // generation-stale DBs (post). Bucketing scopes staleness to the table
+    // actually invalidated; hash collisions only cause an occasional
+    // harmless extra retry. Allocation-free so invalidateTable stays
+    // infallible.
+    epoch_buckets: [epoch_bucket_count]u64 = @splat(1),
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     retired_entries: std.ArrayListUnmanaged(*Entry) = .empty,
     pending_opens: std.ArrayListUnmanaged(PendingOpen) = .empty,
 
     const max_cached_tables = 64;
+    const epoch_bucket_count = 64;
+
+    fn epochBucket(table_name: []const u8) usize {
+        return @intCast(std.hash.Wyhash.hash(0, table_name) & (epoch_bucket_count - 1));
+    }
 
     pub const CacheStats = struct {
         hit_count: u64 = 0,
@@ -254,9 +268,10 @@ pub const ProvisionedTableReadCache = struct {
         const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
         const io = self.threaded.io();
         var stale_epoch_retries: u8 = 0;
+        const epoch_bucket = epochBucket(table_name);
         while (true) {
             self.mutex.lockUncancelable(io);
-            const open_epoch = self.epoch;
+            const open_epoch = self.epoch_buckets[epoch_bucket];
             if (self.findEntryForNamespaceLocked(group_id, lsm_root_generation, identity_namespace, table_name)) |entry| {
                 entry.active_leases += 1;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
@@ -309,22 +324,27 @@ pub const ProvisionedTableReadCache = struct {
 
             self.mutex.lockUncancelable(io);
             self.removePendingOpenForNamespaceLocked(group_id, identity_namespace, table_name);
-            if (self.epoch != open_epoch and stale_epoch_retries < 2) {
-                // The cache was invalidated while we were opening (table
-                // dropped/recreated, or the writer published). Retry a
-                // bounded number of times — but only a bounded number:
-                // during startup catch-up or heal backfill the writer
-                // publishes after every batch, bumping the epoch faster
-                // than a fresh open can complete, and unbounded retry here
-                // livelocks every query behind this open until the churn
-                // pauses (observed in the field as ~100s of queries all
-                // timing out and then flushing at once). After the retries
-                // we serve the DB we just opened — it is a consistent
-                // snapshot at the requested generation, at worst slightly
-                // stale; a genuinely dropped table fails downstream with
-                // NotFound instead of stalling everyone here.
+            if (self.epoch_buckets[epoch_bucket] != open_epoch) {
+                // This table was invalidated while we were opening (dropped,
+                // recreated, or the writer published). Per-table epoch
+                // buckets keep unrelated tables' writes from tripping this,
+                // so it only fires under genuine same-table churn (catch-up,
+                // heal backfill). Retry a bounded number of times; if the
+                // table churns faster than an open completes, fail with
+                // EndOfStream — the transient-read error the query layer
+                // already retries with backoff — instead of either
+                // livelocking every query behind this open (observed in the
+                // field as ~100s of queries timing out and flushing at once)
+                // or serving/caching a stale-epoch DB (poisons identity
+                // read-generation checks and leaves the runtime-status cache
+                // empty, which hides index load errors from clients).
                 stale_epoch_retries += 1;
                 self.ready.broadcast(io);
+                if (stale_epoch_retries > 2) {
+                    self.mutex.unlock(io);
+                    // errdefer closes the just-opened db.
+                    return error.EndOfStream;
+                }
                 db.close();
                 self.mutex.unlock(io);
                 continue;
@@ -406,7 +426,7 @@ pub const ProvisionedTableReadCache = struct {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.epoch +%= 1;
+        self.epoch_buckets[epochBucket(table_name)] +%= 1;
         self.removeEntriesForTableLocked(table_name);
         self.ready.broadcast(io);
     }
@@ -426,7 +446,7 @@ pub const ProvisionedTableReadCache = struct {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.epoch +%= 1;
+        for (&self.epoch_buckets) |*bucket| bucket.* +%= 1;
         for (self.entries.items) |entry| self.retireEntryLocked(entry);
         self.entries.clearRetainingCapacity();
         self.ready.broadcast(io);
