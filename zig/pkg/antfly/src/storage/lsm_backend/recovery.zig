@@ -148,6 +148,12 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         const phase_start = beginOpenPhase(BackendType, backend, .mounting_runs);
         defer finishOpenPhase(BackendType, backend, .mounting_runs, phase_start);
         compaction_mod.sortRuns(backend.runs.items);
+        if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
+    }
+    if (@hasDecl(BackendType, "cleanupRecoveredRunFilesForManifest")) {
+        _ = backend.cleanupRecoveredRunFilesForManifest() catch |err| {
+            std.log.warn("lsm backend open skipped recovered run cleanup root={?s} err={}", .{ backend.root_dir, err });
+        };
     }
     if (@hasDecl(BackendType, "refreshMaintenanceDebtHint")) {
         backend.refreshMaintenanceDebtHint();
@@ -212,7 +218,10 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         }
         backend.retired_mutable_snapshots.deinit(backend.allocator);
     }
-    for (backend.runs.items) |*run| run.deinit(backend.allocator);
+    for (backend.runs.items) |*run| {
+        if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
+        run.deinit(backend.allocator);
+    }
     backend.runs.deinit(backend.allocator);
     if (@hasField(BackendType, "obsolete_paths")) {
         for (backend.obsolete_paths.items) |*obsolete| {
@@ -222,7 +231,10 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     }
     if (@hasField(BackendType, "obsolete_runs")) {
         for (backend.obsolete_runs.items) |*runs| {
-            for (runs.items) |*run| run.deinit(backend.allocator);
+            for (runs.items) |*run| {
+                if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
+                run.deinit(backend.allocator);
+            }
             runs.deinit(backend.allocator);
         }
         backend.obsolete_runs.deinit(backend.allocator);

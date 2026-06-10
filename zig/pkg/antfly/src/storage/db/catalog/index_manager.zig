@@ -1691,7 +1691,7 @@ pub const IndexManager = struct {
         return error.IndexNotFound;
     }
 
-    pub fn lsmMaintenanceScore(self: *const IndexManager) u64 {
+    fn lsmMaintenanceScoreUnlocked(self: *const IndexManager) u64 {
         var score: u64 = 0;
         for (self.text_indexes.items) |*entry| {
             score = @max(score, entry.persistent.lsmMaintenanceScore());
@@ -1700,6 +1700,13 @@ pub const IndexManager = struct {
             score = @max(score, entry.index.lsmMaintenanceScore());
         }
         return score;
+    }
+
+    pub fn lsmMaintenanceScore(self: *const IndexManager) u64 {
+        const mutable: *IndexManager = @constCast(self);
+        mutable.catalog_mutex.lockShared();
+        defer mutable.catalog_mutex.unlockShared();
+        return self.lsmMaintenanceScoreUnlocked();
     }
 
     fn lsmMaintenanceDebtHintUnlocked(self: *const IndexManager) u64 {
@@ -1719,7 +1726,27 @@ pub const IndexManager = struct {
         return self.lsmMaintenanceDebtHintUnlocked();
     }
 
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *IndexManager) ?u64 {
+        if (!self.catalog_mutex.tryLockShared()) return null;
+        defer self.catalog_mutex.unlockShared();
+
+        var delay_ns: ?u64 = null;
+        for (self.text_indexes.items) |*entry| {
+            if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+                delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+            }
+        }
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+                delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+            }
+        }
+        return delay_ns;
+    }
+
     pub fn refreshLsmMaintenanceDebtHint(self: *IndexManager) void {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
         for (self.text_indexes.items) |*entry| {
             entry.persistent.refreshLsmMaintenanceDebtHint();
         }
@@ -2078,7 +2105,48 @@ pub const IndexManager = struct {
         );
     }
 
+    fn runLsmObsoleteReclaimDueUnlocked(self: *IndexManager, comptime best_effort: bool) !bool {
+        for (self.text_indexes.items) |*entry| {
+            if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                if (delay_ns == 0) {
+                    const progressed = if (best_effort)
+                        try entry.persistent.runLsmMaintenanceStepBestEffort()
+                    else
+                        try entry.persistent.runLsmMaintenanceStep();
+                    if (progressed) return true;
+                }
+            }
+        }
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                if (delay_ns == 0) {
+                    const progressed = if (best_effort)
+                        try entry.index.runLsmMaintenanceStepBestEffort()
+                    else
+                        try entry.index.runLsmMaintenanceStep();
+                    if (progressed) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    pub fn runLsmObsoleteReclaimDue(self: *IndexManager) !bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return try self.runLsmObsoleteReclaimDueUnlocked(false);
+    }
+
+    pub fn runLsmObsoleteReclaimDueBestEffort(self: *IndexManager) !bool {
+        if (!self.catalog_mutex.tryLockShared()) return false;
+        defer self.catalog_mutex.unlockShared();
+        return try self.runLsmObsoleteReclaimDueUnlocked(true);
+    }
+
     pub fn runLsmMaintenanceStep(self: *IndexManager) !bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+
         var best_kind: enum { none, text, dense } = .none;
         var best_index: usize = 0;
         var best_score: u64 = 0;
@@ -2117,7 +2185,8 @@ pub const IndexManager = struct {
         var best_score: u64 = 0;
 
         for (self.text_indexes.items, 0..) |*entry, i| {
-            const score = entry.persistent.lsmMaintenanceDebtHint();
+            const raw_score = entry.persistent.lsmMaintenanceDebtHint();
+            const score = if (raw_score != 0) raw_score else if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| if (delay_ns == 0) @as(u64, 1) else @as(u64, 0) else @as(u64, 0);
             if (score > best_score) {
                 best_score = score;
                 best_kind = .text;
@@ -2125,7 +2194,8 @@ pub const IndexManager = struct {
             }
         }
         for (self.dense_indexes.items, 0..) |*entry, i| {
-            const score = entry.index.lsmMaintenanceDebtHint();
+            const raw_score = entry.index.lsmMaintenanceDebtHint();
+            const score = if (raw_score != 0) raw_score else if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| if (delay_ns == 0) @as(u64, 1) else @as(u64, 0) else @as(u64, 0);
             if (score > best_score) {
                 best_score = score;
                 best_kind = .dense;
@@ -9555,7 +9625,7 @@ pub const IndexManager = struct {
                 },
             );
             std.log.info(
-                "antfly_bench_hbc_lsm_pressure phase={s} index={s} compactable_l0_runs={d} soft_limit_l0_runs={d} hard_limit_l0_runs={d} write_stall_l0_run_debt={d} soft_limit_l0_bytes={d} hard_limit_l0_bytes={d} write_stall_l0_byte_debt={d} level_overflow_runs={d} level_overflow_bytes={d} obsolete_paths={d} active_readers={d} active_bulk_ingest_batches={d} manifest_dirty={any} obsolete_manifest_dirty={any}",
+                "antfly_bench_hbc_lsm_pressure phase={s} index={s} compactable_l0_runs={d} soft_limit_l0_runs={d} hard_limit_l0_runs={d} write_stall_l0_run_debt={d} soft_limit_l0_bytes={d} hard_limit_l0_bytes={d} write_stall_l0_byte_debt={d} level_overflow_runs={d} level_overflow_bytes={d} obsolete_paths={d} obsolete_paths_reclaimable={d} obsolete_paths_pinned_by_readers={d} obsolete_paths_pinned_by_versions={d} obsolete_paths_waiting_for_retry={d} obsolete_delete_failures={d} obsolete_delete_retries={d} active_readers={d} active_bulk_ingest_batches={d} manifest_dirty={any} obsolete_manifest_dirty={any}",
                 .{
                     phase,
                     entry.config.name,
@@ -9569,6 +9639,12 @@ pub const IndexManager = struct {
                     maintenance.level_overflow_runs,
                     maintenance.level_overflow_bytes,
                     maintenance.obsolete_paths,
+                    maintenance.obsolete_paths_reclaimable,
+                    maintenance.obsolete_paths_pinned_by_readers,
+                    maintenance.obsolete_paths_pinned_by_versions,
+                    maintenance.obsolete_paths_waiting_for_retry,
+                    maintenance.obsolete_delete_failures,
+                    maintenance.obsolete_delete_retries,
                     maintenance.active_readers,
                     maintenance.active_bulk_ingest_batches,
                     maintenance.manifest_dirty,

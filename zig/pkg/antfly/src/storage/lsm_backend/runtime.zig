@@ -34,6 +34,39 @@ const namespaceOf = state_mod.namespaceOf;
 const compareNamespace = state_mod.compareNamespace;
 const compareEntryTo = state_mod.compareEntryTo;
 
+fn hashBulkEntryKey(namespace: backend_types.Namespace, key: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    if (namespace.name) |name| hasher.update(name);
+    hasher.update(&.{0});
+    hasher.update(key);
+    return hasher.final();
+}
+
+fn bulkStateHasDuplicateKeys(allocator: Allocator, state: *const State) !bool {
+    var index: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(usize)) = .{};
+    defer {
+        var values = index.valueIterator();
+        while (values.next()) |bucket| bucket.deinit(allocator);
+        index.deinit(allocator);
+    }
+
+    for (state.entries.items, 0..) |entry, idx| {
+        const namespace = namespaceOf(entry);
+        const hash = hashBulkEntryKey(namespace, entry.key);
+        const gop = try index.getOrPut(allocator, hash);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = std.ArrayListUnmanaged(usize).empty;
+        } else {
+            for (gop.value_ptr.items) |existing_idx| {
+                const existing = state.entries.items[existing_idx];
+                if (compareEntryTo(existing, namespace, entry.key) == .eq) return true;
+            }
+        }
+        try gop.value_ptr.append(allocator, idx);
+    }
+    return false;
+}
+
 fn releaseHeldBlocks(held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle), allocator: Allocator) void {
     for (held_blocks.items) |*handle| handle.release();
     held_blocks.deinit(allocator);
@@ -107,8 +140,22 @@ fn canBorrowActiveMutableValues(backend: anytype) bool {
     return false;
 }
 
+fn shouldRetainActiveMutableValueReader(backend: anytype) bool {
+    if (@hasDecl(@TypeOf(backend.*), "bulkIngestActive") and backend.bulkIngestActive()) return false;
+    return true;
+}
+
 fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
+}
+
+fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
+    const BackendType = @TypeOf(backend.*);
+    if (@hasDecl(BackendType, "notePotentialMaintenanceDebtLocked")) {
+        backend.notePotentialMaintenanceDebtLocked();
+    } else if (@hasDecl(BackendType, "notePotentialMaintenanceDebt")) {
+        backend.notePotentialMaintenanceDebt();
+    }
 }
 
 fn recordCursorBlockReadahead(backend: anytype) void {
@@ -2408,8 +2455,8 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             errdefer deinitRunGroups(metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(metadata_allocator, runs);
             errdefer metadata_allocator.free(levels);
-            backend.retainReader();
-            errdefer releaseReadReader(BackendType, backend);
+            retainReadReader(BackendType, backend, .bound_read_txn);
+            errdefer releaseReadReader(BackendType, backend, .bound_read_txn);
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
@@ -2451,7 +2498,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            releaseReadReader(BackendType, backend);
+            releaseReadReader(BackendType, backend, .bound_read_txn);
             self.* = undefined;
         }
 
@@ -2491,11 +2538,41 @@ const MutableReadSnapshot = struct {
     owned: bool,
 };
 
-fn releaseReadReader(comptime BackendType: type, backend: *BackendType) void {
-    if (@hasDecl(BackendType, "finalizeReadReaderRelease")) {
+fn retainReadReader(comptime BackendType: type, backend: *BackendType, kind: anytype) void {
+    if (@hasDecl(BackendType, "retainReaderKind")) {
+        backend.retainReaderKind(kind);
+    } else {
+        backend.retainReader();
+    }
+}
+
+fn releaseReadReader(comptime BackendType: type, backend: *BackendType, kind: anytype) void {
+    if (@hasDecl(BackendType, "finalizeReadReaderReleaseKind")) {
+        backend.finalizeReadReaderReleaseKind(kind);
+    } else if (@hasDecl(BackendType, "finalizeReadReaderRelease")) {
         backend.finalizeReadReaderRelease();
+    } else if (@hasDecl(BackendType, "releaseReaderKind")) {
+        backend.releaseReaderKind(kind);
     } else {
         backend.releaseReader();
+    }
+}
+
+fn releaseWriteReader(comptime BackendType: type, backend: *BackendType, kind: anytype) void {
+    if (@hasDecl(BackendType, "releaseReaderKind")) {
+        backend.releaseReaderKind(kind);
+    } else {
+        backend.releaseReader();
+    }
+}
+
+fn finalizeWriteReader(comptime BackendType: type, backend: *BackendType, kind: anytype) !void {
+    if (@hasDecl(BackendType, "finalizeWriteReaderReleaseKind")) {
+        try backend.finalizeWriteReaderReleaseKind(kind);
+    } else if (@hasDecl(BackendType, "finalizeWriteReaderRelease")) {
+        try backend.finalizeWriteReaderRelease();
+    } else {
+        releaseWriteReader(BackendType, backend, kind);
     }
 }
 
@@ -2533,11 +2610,11 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            backend.retainReader();
-            errdefer releaseReadReader(BackendType, backend);
+            retainReadReader(BackendType, backend, .probe_txn);
+            errdefer releaseReadReader(BackendType, backend, .probe_txn);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             const stable_point_view = backend.mutable.entries.items.len == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
-            const active_mutable_value_reader_retained = if (!stable_point_view) retainActiveMutableValueReader(backend) else false;
+            const active_mutable_value_reader_retained = if (!stable_point_view and shouldRetainActiveMutableValueReader(backend)) retainActiveMutableValueReader(backend) else false;
             errdefer releaseActiveMutableValueReader(backend, active_mutable_value_reader_retained);
             return .{
                 .allocator = runtimeScratchAllocator(backend.allocator),
@@ -2561,7 +2638,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             releaseActiveMutableValueReader(backend, self.active_mutable_value_reader_retained);
-            releaseReadReader(BackendType, backend);
+            releaseReadReader(BackendType, backend, .probe_txn);
             self.* = undefined;
         }
 
@@ -2705,12 +2782,108 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
 }
 
 pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
-    const LocalCursor = MergeCursor(BackendType, ActiveMemTable);
+    const ActiveCursor = MergeCursor(BackendType, ActiveMemTable);
+    const SnapshotCursor = MergeCursor(BackendType, State);
+    const LocalCursor = union(enum) {
+        active: ActiveCursor,
+        snapshot: SnapshotCursor,
+
+        pub fn close(self: *@This()) void {
+            switch (self.*) {
+                .active => |*cursor| cursor.close(),
+                .snapshot => |*cursor| cursor.close(),
+            }
+            self.* = undefined;
+        }
+
+        pub fn first(self: *@This()) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.first(),
+                .snapshot => |*cursor| try cursor.first(),
+            };
+        }
+
+        pub fn setUpperBound(self: *@This(), upper: ?[]const u8) void {
+            switch (self.*) {
+                .active => |*cursor| cursor.setUpperBound(upper),
+                .snapshot => |*cursor| cursor.setUpperBound(upper),
+            }
+        }
+
+        pub fn last(self: *@This()) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.last(),
+                .snapshot => |*cursor| try cursor.last(),
+            };
+        }
+
+        pub fn next(self: *@This()) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.next(),
+                .snapshot => |*cursor| try cursor.next(),
+            };
+        }
+
+        pub fn prev(self: *@This()) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.prev(),
+                .snapshot => |*cursor| try cursor.prev(),
+            };
+        }
+
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.seekAtOrAfter(key),
+                .snapshot => |*cursor| try cursor.seekAtOrAfter(key),
+            };
+        }
+
+        pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.seekAtOrBefore(key),
+                .snapshot => |*cursor| try cursor.seekAtOrBefore(key),
+            };
+        }
+    };
+    const MutableSnapshot = union(enum) {
+        none,
+        borrowed: *const State,
+        owned: *State,
+
+        fn ptr(self: *@This()) ?*const State {
+            return switch (self.*) {
+                .none => null,
+                .borrowed => |state| state,
+                .owned => |state| state,
+            };
+        }
+
+        fn ownedPtr(self: *@This()) ?*State {
+            return switch (self.*) {
+                .owned => |state| state,
+                else => null,
+            };
+        }
+
+        fn deinitOwned(self: *@This(), allocator: Allocator) void {
+            switch (self.*) {
+                .owned => |state| {
+                    state.deinit(allocator);
+                    allocator.destroy(state);
+                },
+                else => {},
+            }
+            self.* = .none;
+        }
+    };
+
     return struct {
         allocator: Allocator,
         metadata_allocator: Allocator,
         backend: *BackendType,
         namespace: backend_types.Namespace,
+        mutable_snapshot: MutableSnapshot = .none,
+        mutable_snapshot_is_bulk_current_scan_clone: bool = false,
         immutable_memtables: []const *const State = &.{},
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
@@ -2726,12 +2899,39 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             errdefer deinitRunGroups(metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(metadata_allocator, runs);
             errdefer metadata_allocator.free(levels);
-            backend.retainReader();
-            errdefer releaseReadReader(BackendType, backend);
-            if (@hasDecl(BackendType, "prepareCurrentScanSnapshot")) {
-                try backend.prepareCurrentScanSnapshot();
-            } else if (@hasDecl(BackendType, "prepareReadSnapshot")) {
-                try backend.prepareReadSnapshot();
+            retainReadReader(BackendType, backend, .current_scan);
+            errdefer releaseReadReader(BackendType, backend, .current_scan);
+            var mutable_snapshot: MutableSnapshot = .none;
+            var mutable_snapshot_is_bulk_current_scan_clone = false;
+            var bulk_current_scan_clone_denied = false;
+            if (@hasDecl(BackendType, "cloneCurrentScanMutableStateForBulkIngest")) {
+                if (try backend.cloneCurrentScanMutableStateForBulkIngest()) |snapshot| {
+                    const owned = try backend.allocator.create(State);
+                    errdefer backend.allocator.destroy(owned);
+                    owned.* = snapshot;
+                    mutable_snapshot = .{ .owned = owned };
+                    mutable_snapshot_is_bulk_current_scan_clone = true;
+                } else if (@hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
+                    bulk_current_scan_clone_denied = true;
+                }
+            }
+            errdefer {
+                if (mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
+                    if (mutable_snapshot.ownedPtr()) |snapshot| backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
+                }
+                mutable_snapshot.deinitOwned(backend.allocator);
+            }
+            if (mutable_snapshot.ptr() == null) {
+                if (bulk_current_scan_clone_denied and @hasDecl(BackendType, "prepareCurrentScanSnapshot")) {
+                    try backend.prepareCurrentScanSnapshot();
+                } else if (@hasDecl(BackendType, "prepareReadSnapshot")) {
+                    try backend.prepareReadSnapshot();
+                }
+                const read_snapshot = try snapshotReadMutable(BackendType, backend, .current_scan);
+                mutable_snapshot = if (read_snapshot.owned)
+                    .{ .owned = @constCast(read_snapshot.state) }
+                else
+                    .{ .borrowed = read_snapshot.state };
             }
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
@@ -2743,6 +2943,8 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 .metadata_allocator = metadata_allocator,
                 .backend = backend,
                 .namespace = namespace,
+                .mutable_snapshot = mutable_snapshot,
+                .mutable_snapshot_is_bulk_current_scan_clone = mutable_snapshot_is_bulk_current_scan_clone,
                 .immutable_memtables = immutable_memtables,
                 .runs = runs,
                 .l0_groups = l0_groups,
@@ -2756,15 +2958,24 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             self.metadata_allocator.free(self.levels);
             freeRunSnapshotList(self.metadata_allocator, self.runs);
             if (self.immutable_memtables.len > 0) self.allocator.free(self.immutable_memtables);
-            const locked = lockBackend(BackendType, backend);
-            defer unlockBackend(BackendType, backend, locked);
-            releaseReadReader(BackendType, backend);
+            {
+                const locked = lockBackend(BackendType, backend);
+                defer unlockBackend(BackendType, backend, locked);
+                if (self.mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
+                    if (self.mutable_snapshot.ownedPtr()) |snapshot| backend.releaseCurrentScanMutableStateForBulkIngest(snapshot);
+                }
+                releaseReadReader(BackendType, backend, .current_scan);
+            }
+            self.mutable_snapshot.deinitOwned(self.allocator);
             self.* = undefined;
         }
 
         pub fn openCursor(self: *@This()) !LocalCursor {
             const cursor_alloc = runtimeScratchAllocator(self.allocator);
-            return try LocalCursor.init(cursor_alloc, self.backend, &self.backend.mutable, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.namespace, false);
+            if (self.mutable_snapshot.ptr()) |snapshot| {
+                return .{ .snapshot = try SnapshotCursor.init(cursor_alloc, self.backend, snapshot, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.namespace, false) };
+            }
+            return .{ .active = try ActiveCursor.init(cursor_alloc, self.backend, &self.backend.mutable, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.namespace, false) };
         }
     };
 }
@@ -2905,8 +3116,8 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         pub fn openWithOptions(backend: *BackendType, namespace: backend_types.Namespace, options: backend_types.BatchOptions) !@This() {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            backend.retainReader();
-            errdefer backend.releaseReader();
+            retainReadReader(BackendType, backend, .write_txn);
+            errdefer releaseWriteReader(BackendType, backend, .write_txn);
             backend.beginBatchMode(options);
             errdefer backend.finishBatchMode(options);
             return .{
@@ -2929,7 +3140,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             backend.finishBatchMode(self.batch_options);
-            backend.releaseReader();
+            releaseWriteReader(BackendType, backend, .write_txn);
             self.* = undefined;
         }
 
@@ -2946,7 +3157,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.invalidateCursorSnapshot();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
-                self.backend.releaseReader();
+                releaseWriteReader(BackendType, self.backend, .write_txn);
                 self.closed = true;
             };
             const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
@@ -2967,7 +3178,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
-                if ((mutated or direct_ingested_bulk_appends) and @hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
+                if (mutated or direct_ingested_bulk_appends) notePotentialMaintenanceDebtLocked(self.backend);
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 if (!self.batch_options.defer_commit_flush) {
                     try self.backend.maybeFlushMutable();
@@ -2983,58 +3194,66 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             self.invalidateCursorSnapshot();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
-            self.backend.finalizeWriteReaderRelease() catch |err| {
+            finalizeWriteReader(BackendType, self.backend, .write_txn) catch |err| {
                 finalize_err = err;
             };
             if (finalize_err) |err| return err;
         }
 
+        fn drainBulkAppendsToMutable(self: *@This()) !void {
+            if (self.bulk_appends.entries.items.len == 0) return;
+            try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+        }
+
         fn tryCommitDirectBulkAppends(self: *@This()) !bool {
-            var entries = self.bulk_appends.entries.items.len;
+            const entries = self.bulk_appends.entries.items.len;
             if (entries == 0) return false;
             if (self.batch_options.mode != .bulk_ingest) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackNonBulk")) self.backend.recordBulkAppendFallbackNonBulk(entries);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                try self.drainBulkAppendsToMutable();
                 return false;
             }
             if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackUnsupported")) self.backend.recordBulkAppendFallbackUnsupported(entries);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                try self.drainBulkAppendsToMutable();
                 return false;
             }
             if (self.backend.mutable.entries.items.len != 0 and @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest")) {
                 if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
                     if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                     if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
-                    try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                    try self.drainBulkAppendsToMutable();
                     return false;
                 }
             }
             if (self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                try self.drainBulkAppendsToMutable();
                 return false;
             }
             if (self.mutable.entries.items.len > 0) {
-                try state_mod.applyMutableMoveToMutable(&self.bulk_appends, self.allocator, &self.mutable);
-                entries = self.bulk_appends.entries.items.len;
+                try self.drainBulkAppendsToMutable();
+                return false;
             }
             if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+
+            const duplicate_check_start_ns = platform_time.monotonicNs();
+            if (try bulkStateHasDuplicateKeys(self.allocator, &self.bulk_appends)) {
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, elapsedNs(duplicate_check_start_ns));
+                try self.drainBulkAppendsToMutable();
+                return false;
+            }
 
             const sort_start_ns = platform_time.monotonicNs();
             state_mod.sortStateEntries(&self.bulk_appends);
             const sort_ns = elapsedNs(sort_start_ns);
-            if (!bulkStateEntriesAreUnique(&self.bulk_appends)) {
-                if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, sort_ns);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
-                return false;
-            }
+            std.debug.assert(bulkStateEntriesAreUnique(&self.bulk_appends));
             if (!self.backend.shouldDirectIngestBulkState(&self.bulk_appends)) {
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackBelowThreshold")) self.backend.recordBulkAppendFallbackBelowThreshold(entries, sort_ns);
-                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                try self.drainBulkAppendsToMutable();
                 return false;
             }
 
@@ -3068,6 +3287,16 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
                 if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackUnsupported")) self.backend.recordDirectBulkIngestFallbackUnsupported();
                 return false;
+            }
+            if (self.backend.mutable.entries.items.len != 0 and
+                @hasDecl(BackendType, "shouldDrainMutableBeforeDirectBulkIngest") and
+                self.backend.shouldDrainMutableBeforeDirectBulkIngest(&self.mutable) and
+                @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest"))
+            {
+                if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
+                    if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBackendMutable")) self.backend.recordDirectBulkIngestFallbackBackendMutable();
+                    return false;
+                }
             }
             if (self.backend.mutable.entries.items.len != 0) {
                 if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBackendMutable")) self.backend.recordDirectBulkIngestFallbackBackendMutable();
@@ -3111,7 +3340,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             }
             self.mutable.deinit(self.allocator);
             self.mutable = .{};
-            if (@hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
+            notePotentialMaintenanceDebtLocked(self.backend);
             return true;
         }
 
@@ -3256,12 +3485,13 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, self.namespace, key, value, false);
             self.invalidateCursorSnapshot();
         }
 
         pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
-            if (self.batch_options.mode == .bulk_ingest) {
+            if (self.batch_options.mode == .bulk_ingest and self.mutable.entries.items.len == 0) {
                 const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
                 try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, self.namespace, key, value, false));
                 self.invalidateCursorSnapshot();
@@ -3272,6 +3502,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn delete(self: *@This(), key: []const u8) !void {
+            try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, self.namespace, key, "", true);
             self.invalidateCursorSnapshot();
         }
@@ -3379,8 +3610,8 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             errdefer deinitRunGroups(metadata_allocator, l0_groups);
             const levels = try buildLowerLevels(metadata_allocator, runs);
             errdefer metadata_allocator.free(levels);
-            backend.retainReader();
-            errdefer releaseReadReader(BackendType, backend);
+            retainReadReader(BackendType, backend, .namespace_read_txn);
+            errdefer releaseReadReader(BackendType, backend, .namespace_read_txn);
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
@@ -3422,7 +3653,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            releaseReadReader(BackendType, backend);
+            releaseReadReader(BackendType, backend, .namespace_read_txn);
             self.* = undefined;
         }
 
@@ -5457,6 +5688,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         metadata_allocator: Allocator,
         backend: *BackendType,
         mutable: ActiveMemTable,
+        bulk_appends: State = .{},
         cursor_overlay: ?State = null,
         cursor_base_mutable: ?State = null,
         cursor_immutable_memtables: []const *const State = &.{},
@@ -5474,8 +5706,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         pub fn openWithOptions(backend: *BackendType, options: backend_types.BatchOptions) !@This() {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            backend.retainReader();
-            errdefer backend.releaseReader();
+            retainReadReader(BackendType, backend, .write_txn);
+            errdefer releaseWriteReader(BackendType, backend, .write_txn);
             backend.beginBatchMode(options);
             errdefer backend.finishBatchMode(options);
             return .{
@@ -5491,12 +5723,13 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             if (self.closed) return;
             const backend = self.backend;
             self.mutable.deinit(self.allocator);
+            self.bulk_appends.deinit(self.allocator);
             self.invalidateCursorSnapshot();
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             backend.finishBatchMode(self.batch_options);
-            backend.releaseReader();
+            releaseWriteReader(BackendType, backend, .write_txn);
             self.* = undefined;
         }
 
@@ -5508,12 +5741,15 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             errdefer if (release_on_error) {
                 self.mutable.deinit(self.allocator);
                 self.mutable = .{};
+                self.bulk_appends.deinit(self.allocator);
+                self.bulk_appends = .{};
                 self.invalidateCursorSnapshot();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
-                self.backend.releaseReader();
+                releaseWriteReader(BackendType, self.backend, .write_txn);
                 self.closed = true;
             };
+            const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
             if (!try self.tryCommitDirectBulkIngest()) {
                 const mutated = self.mutable.entries.items.len > 0;
                 if (mutated) try prepareMutableForWrite(self.backend);
@@ -5531,7 +5767,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
-                if (mutated and @hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
+                if (mutated or direct_ingested_bulk_appends) notePotentialMaintenanceDebtLocked(self.backend);
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 if (!self.batch_options.defer_commit_flush) {
                     try self.backend.maybeFlushMutable();
@@ -5547,10 +5783,89 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             self.invalidateCursorSnapshot();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
-            self.backend.finalizeWriteReaderRelease() catch |err| {
+            finalizeWriteReader(BackendType, self.backend, .write_txn) catch |err| {
                 finalize_err = err;
             };
             if (finalize_err) |err| return err;
+        }
+
+        fn drainBulkAppendsToMutable(self: *@This()) !void {
+            if (self.bulk_appends.entries.items.len == 0) return;
+            try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+        }
+
+        fn tryCommitDirectBulkAppends(self: *@This()) !bool {
+            const entries = self.bulk_appends.entries.items.len;
+            if (entries == 0) return false;
+            if (self.batch_options.mode != .bulk_ingest) {
+                if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackNonBulk")) self.backend.recordBulkAppendFallbackNonBulk(entries);
+                try self.drainBulkAppendsToMutable();
+                return false;
+            }
+            if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
+                if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackUnsupported")) self.backend.recordBulkAppendFallbackUnsupported(entries);
+                try self.drainBulkAppendsToMutable();
+                return false;
+            }
+            if (self.backend.mutable.entries.items.len != 0 and @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest")) {
+                if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
+                    if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+                    if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
+                    try self.drainBulkAppendsToMutable();
+                    return false;
+                }
+            }
+            if (self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) {
+                if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
+                try self.drainBulkAppendsToMutable();
+                return false;
+            }
+            if (self.mutable.entries.items.len > 0) {
+                try self.drainBulkAppendsToMutable();
+                return false;
+            }
+            if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+
+            const duplicate_check_start_ns = platform_time.monotonicNs();
+            if (try bulkStateHasDuplicateKeys(self.allocator, &self.bulk_appends)) {
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, elapsedNs(duplicate_check_start_ns));
+                try self.drainBulkAppendsToMutable();
+                return false;
+            }
+
+            const sort_start_ns = platform_time.monotonicNs();
+            state_mod.sortStateEntries(&self.bulk_appends);
+            const sort_ns = elapsedNs(sort_start_ns);
+            std.debug.assert(bulkStateEntriesAreUnique(&self.bulk_appends));
+            if (!self.backend.shouldDirectIngestBulkState(&self.bulk_appends)) {
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackBelowThreshold")) self.backend.recordBulkAppendFallbackBelowThreshold(entries, sort_ns);
+                try self.drainBulkAppendsToMutable();
+                return false;
+            }
+
+            if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&self.bulk_appends);
+            if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                try self.backend.ingestOwnedSortedState(&self.bulk_appends);
+            } else {
+                try self.backend.ingestSortedState(&self.bulk_appends);
+            }
+            if (@hasDecl(BackendType, "recordBulkAppendSuccess")) self.backend.recordBulkAppendSuccess(entries, sort_ns);
+            self.bulk_appends.deinit(self.allocator);
+            self.bulk_appends = .{};
+            return true;
+        }
+
+        fn bulkStateEntriesAreUnique(state: *const State) bool {
+            if (state.entries.items.len <= 1) return true;
+            var previous = state.entries.items[0];
+            for (state.entries.items[1..]) |entry| {
+                if (compareEntryTo(previous, state_mod.namespaceOf(entry), entry.key) == .eq) return false;
+                previous = entry;
+            }
+            return true;
         }
 
         fn tryCommitDirectBulkIngest(self: *@This()) !bool {
@@ -5561,6 +5876,16 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
                 if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackUnsupported")) self.backend.recordDirectBulkIngestFallbackUnsupported();
                 return false;
+            }
+            if (self.backend.mutable.entries.items.len != 0 and
+                @hasDecl(BackendType, "shouldDrainMutableBeforeDirectBulkIngest") and
+                self.backend.shouldDrainMutableBeforeDirectBulkIngest(&self.mutable) and
+                @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest"))
+            {
+                if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
+                    if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBackendMutable")) self.backend.recordDirectBulkIngestFallbackBackendMutable();
+                    return false;
+                }
             }
             if (self.backend.mutable.entries.items.len != 0) {
                 if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBackendMutable")) self.backend.recordDirectBulkIngestFallbackBackendMutable();
@@ -5604,11 +5929,20 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             }
             self.mutable.deinit(self.allocator);
             self.mutable = .{};
-            if (@hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
+            notePotentialMaintenanceDebtLocked(self.backend);
             return true;
         }
 
         pub fn get(self: *@This(), namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
+            var bulk_idx = self.bulk_appends.entries.items.len;
+            while (bulk_idx > 0) {
+                bulk_idx -= 1;
+                const entry = self.bulk_appends.entries.items[bulk_idx];
+                if (compareEntryTo(entry, namespace, key) == .eq) {
+                    if (entry.tombstone) return error.NotFound;
+                    return entry.value;
+                }
+            }
             if (self.mutable.findIndex(namespace, key)) |idx| {
                 const entry = self.mutable.entries.items[idx];
                 if (entry.tombstone) return error.NotFound;
@@ -5624,16 +5958,24 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn put(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
+            try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, namespace, key, value, false);
             self.invalidateCursorSnapshot();
         }
 
         pub fn appendPut(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
+            if (self.batch_options.mode == .bulk_ingest and self.mutable.entries.items.len == 0) {
+                const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
+                try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, namespace, key, value, false));
+                self.invalidateCursorSnapshot();
+                return;
+            }
             try self.mutable.appendUpsert(self.allocator, namespace, key, value, false);
             self.invalidateCursorSnapshot();
         }
 
         pub fn delete(self: *@This(), namespace: backend_types.Namespace, key: []const u8) !void {
+            try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, namespace, key, "", true);
             self.invalidateCursorSnapshot();
         }
@@ -5651,6 +5993,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
             var overlay = try self.mutable.clone(self.allocator);
             errdefer overlay.deinit(self.allocator);
+            try state_mod.applyState(&overlay, self.allocator, &self.bulk_appends);
 
             var base_mutable: State = .{};
             errdefer base_mutable.deinit(self.allocator);
