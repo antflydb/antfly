@@ -13000,9 +13000,12 @@ fn computeDocumentExtractionAssetRequestDerived(
         alloc.free(text_indexes);
     }
 
-    for (extraction.units, desired_unit_descriptors) |unit, unit_descriptor| {
+    const chunk_range_base_index = documentExtractionRangeCount(desired_unit_keys.items.len);
+    for (extraction.units, desired_unit_descriptors, 0..) |unit, unit_descriptor, unit_index| {
         const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, request.doc_key, artifact_name, unit.unit_id);
         defer alloc.free(unit_key);
+        const unit_range_id = try documentExtractionRangeIdAlloc(alloc, unit_index / document_extraction_range_target_children);
+        defer alloc.free(unit_range_id);
         const unit_unchanged = std.mem.eql(u8, unit_descriptor.key, unit_key) and
             unitDescriptorFingerprintMatches(previous_unit_descriptors, unit_key, unit_descriptor.fingerprint);
         if (unit_unchanged and
@@ -13011,7 +13014,7 @@ fn computeDocumentExtractionAssetRequestDerived(
             try appendDocumentUnitStoredFullTextDocuments(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes, documents);
             continue;
         }
-        const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type);
+        const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type, unit_range_id);
         defer alloc.free(payload);
         try artifact_writes.append(alloc, .{
             .key = try alloc.dupe(u8, unit_key),
@@ -13037,7 +13040,7 @@ fn computeDocumentExtractionAssetRequestDerived(
             });
         }
 
-        try appendDocumentUnitChunkWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, artifact_writes, documents, dense_embeddings, sparse_embeddings);
+        try appendDocumentUnitChunkWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, desired_chunk_keys.items, chunk_range_base_index, artifact_writes, documents, dense_embeddings, sparse_embeddings);
     }
 
     const manifest = try documentExtractionManifestPayloadAlloc(
@@ -13303,6 +13306,8 @@ fn appendDocumentUnitChunkWrites(
     source_artifact_name: []const u8,
     unit_key: []const u8,
     unit: document_extraction_mod.Unit,
+    desired_chunk_keys: []const []const u8,
+    chunk_range_base_index: usize,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
     dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
@@ -13332,7 +13337,9 @@ fn appendDocumentUnitChunkWrites(
             if (!chunk.isText()) continue;
             const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
             defer alloc.free(chunk_key);
-            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit, chunk, true);
+            const chunk_key_index = documentExtractionKeyIndex(desired_chunk_keys, chunk_key) orelse return error.DocumentExtractionChunkRangeMissing;
+            const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
+            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_range_id);
             try artifact_writes.append(alloc, .{
                 .key = try alloc.dupe(u8, chunk_key),
                 .value = try alloc.dupe(u8, payload),
@@ -13462,6 +13469,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
     unit: document_extraction_mod.Unit,
     chunk: chunker_mod.Chunk,
     include_payload: bool,
+    range_id: []const u8,
 ) ![]u8 {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, try alloc.dupe(u8, "_parent_doc_key"), .{ .string = try alloc.dupe(u8, doc_key) });
@@ -13470,6 +13478,10 @@ fn buildDocumentUnitChunkPayloadAlloc(
     try obj.put(alloc, try alloc.dupe(u8, "_artifact_name"), .{ .string = try alloc.dupe(u8, artifact_name) });
     try obj.put(alloc, try alloc.dupe(u8, "_source_artifact_name"), .{ .string = try alloc.dupe(u8, source_artifact_name) });
     try obj.put(alloc, try alloc.dupe(u8, "_source_field"), .{ .string = try alloc.dupe(u8, source_field) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_range_id"), .{ .string = try alloc.dupe(u8, range_id) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_range_kind"), .{ .string = try alloc.dupe(u8, "chunk") });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_route_status"), .{ .string = try alloc.dupe(u8, "local_committed") });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_owner_group_id"), .{ .integer = 0 });
     try chunk_artifact_mod.appendArtifactFieldsWithProvenance(alloc, &obj, source_field, chunk, include_payload, .{
         .scope = .unit,
         .parent_doc_key = doc_key,
@@ -13674,10 +13686,15 @@ fn documentUnitPayloadAlloc(
     unit: document_extraction_mod.Unit,
     source_url: []const u8,
     content_type: []const u8,
+    range_id: []const u8,
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, .{
         ._parent_doc_key = doc_key,
         ._artifact_name = artifact_name,
+        ._artifact_range_id = range_id,
+        ._artifact_range_kind = "unit",
+        ._artifact_route_status = "local_committed",
+        ._artifact_owner_group_id = 0,
         .unit_id = unit.unit_id,
         .unit_type = unit.unit_type,
         .text = unit.text,
@@ -13710,6 +13727,22 @@ fn documentUnitPayloadAlloc(
 }
 
 const document_extraction_range_target_children = 256;
+
+fn documentExtractionRangeCount(key_count: usize) usize {
+    if (key_count == 0) return 0;
+    return (key_count + document_extraction_range_target_children - 1) / document_extraction_range_target_children;
+}
+
+fn documentExtractionRangeIdAlloc(alloc: Allocator, range_index: usize) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "range:{d:0>6}", .{range_index});
+}
+
+fn documentExtractionKeyIndex(keys: []const []const u8, key: []const u8) ?usize {
+    for (keys, 0..) |candidate, i| {
+        if (std.mem.eql(u8, candidate, key)) return i;
+    }
+    return null;
+}
 
 fn documentExtractionManifestGeneration(alloc: Allocator, manifest: []const u8) !u64 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, manifest, .{}) catch return 0;
@@ -29080,12 +29113,16 @@ test "db document unit payload preserves pdf page provenance" {
         .char_end = 5,
     };
 
-    const payload = try documentUnitPayloadAlloc(alloc, "doc:a", "document_units_v1", unit, "data:application/pdf;base64,AA==", "application/pdf");
+    const payload = try documentUnitPayloadAlloc(alloc, "doc:a", "document_units_v1", unit, "data:application/pdf;base64,AA==", "application/pdf", "range:000000");
     defer alloc.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
     defer parsed.deinit();
     const provenance = parsed.value.object.get("provenance").?.object;
+    try std.testing.expectEqualStrings("range:000000", parsed.value.object.get("_artifact_range_id").?.string);
+    try std.testing.expectEqualStrings("unit", parsed.value.object.get("_artifact_range_kind").?.string);
+    try std.testing.expectEqualStrings("local_committed", parsed.value.object.get("_artifact_route_status").?.string);
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("_artifact_owner_group_id").?.integer);
     try std.testing.expectEqual(@as(i64, 1), provenance.get("page_number").?.integer);
     try std.testing.expectEqualStrings("i", provenance.get("page_label").?.string);
     const page_bbox = provenance.get("page_bbox").?.array.items;
@@ -29865,6 +29902,10 @@ test "db document extraction chunks units through source artifact enrichment" {
     try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"text\":\"alpha beta gamma\"") != null);
     var parsed_chunk_payload = try std.json.parseFromSlice(std.json.Value, alloc, chunk_payload, .{});
     defer parsed_chunk_payload.deinit();
+    try std.testing.expectEqualStrings("range:000001", parsed_chunk_payload.value.object.get("_artifact_range_id").?.string);
+    try std.testing.expectEqualStrings("chunk", parsed_chunk_payload.value.object.get("_artifact_range_kind").?.string);
+    try std.testing.expectEqualStrings("local_committed", parsed_chunk_payload.value.object.get("_artifact_route_status").?.string);
+    try std.testing.expectEqual(@as(i64, 0), parsed_chunk_payload.value.object.get("_artifact_owner_group_id").?.integer);
     const chunk_provenance = parsed_chunk_payload.value.object.get("provenance").?.object;
     try std.testing.expectEqualStrings("unit", chunk_provenance.get("offset_basis").?.string);
     try std.testing.expectEqualStrings("document:000001", chunk_provenance.get("parent_unit_id").?.string);
