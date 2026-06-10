@@ -416,7 +416,7 @@ describe("AntflyClient", () => {
 
       const result = await client.tables.lookup("users", "user:123");
       expect(result).toEqual(mockDocument);
-      expect(mockGet).toHaveBeenCalledWith("/db/v1/tables/{tableName}/lookup/{key}", {
+      expect(mockGet).toHaveBeenCalledWith("/db/v1/tables/{tableName}/documents/{key}", {
         params: {
           path: { tableName: "users", key: "user:123" },
           query: undefined,
@@ -440,7 +440,7 @@ describe("AntflyClient", () => {
         fields: "name,email",
       });
       expect(result).toEqual(mockDocument);
-      expect(mockGet).toHaveBeenCalledWith("/db/v1/tables/{tableName}/lookup/{key}", {
+      expect(mockGet).toHaveBeenCalledWith("/db/v1/tables/{tableName}/documents/{key}", {
         params: {
           path: { tableName: "users", key: "user:123" },
           query: { fields: "name,email" },

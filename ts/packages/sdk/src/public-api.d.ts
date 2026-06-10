@@ -937,7 +937,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/lookup/{key}": {
+    "/db/v1/tables/{tableName}/documents/{key}": {
         parameters: {
             query?: never;
             header?: never;

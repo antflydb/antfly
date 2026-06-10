@@ -3062,7 +3062,7 @@ test "httpx antfly lookup route preserves projection and headers" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
-    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/lookup/doc:a?fields=title", .{base_url});
+    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/documents/doc:a?fields=title", .{base_url});
     defer alloc.free(lookup_url);
 
     var resp = try getWithRetry(&client, client_io.io(), lookup_url, null, 20);
@@ -3118,7 +3118,7 @@ test "httpx antfly lookup decodes percent-encoded path keys" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
-    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/lookup/docs%2Fgetting-started.md?fields=title", .{base_url});
+    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/documents/docs%2Fgetting-started.md?fields=title", .{base_url});
     defer alloc.free(lookup_url);
 
     var resp = try getWithRetry(&client, client_io.io(), lookup_url, null, 20);

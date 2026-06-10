@@ -8837,7 +8837,7 @@ test "api http server serves table lookup with version header" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/lookup/doc:a?fields=title" });
+    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?fields=title" });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
@@ -8913,7 +8913,7 @@ test "api http server decodes percent-encoded lookup keys" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/lookup/docs%2Fgetting-started.md?fields=title" });
+    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/docs%2Fgetting-started.md?fields=title" });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     var parsed = try std.json.parseFromSlice(LookupResponse, std.testing.allocator, resp.body, .{});
@@ -12196,7 +12196,7 @@ test "api http server handleInternalRoute matches handle for internal group look
 
     const req: http_common.HttpRequest = .{
         .method = .GET,
-        .uri = "/internal/v1/groups/7/tables/docs/lookup/doc:a?fields=title",
+        .uri = "/internal/v1/groups/7/tables/docs/documents/doc:a?fields=title",
     };
 
     var via_handle = try server.handle(req);

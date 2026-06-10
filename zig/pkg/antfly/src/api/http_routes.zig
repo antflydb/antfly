@@ -82,7 +82,7 @@ pub const Routes = struct {
     pub const shard_ops_observe_merge_suffix = "/shard-ops/observe-merge";
     pub const shard_ops_execute_suffix = "/shard-ops/execute";
     pub const lookup_suffix = "/lookup";
-    pub const lookup_marker = "/lookup/";
+    pub const lookup_marker = "/documents/";
     pub const schema_suffix = "/schema";
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
@@ -321,7 +321,7 @@ pub const Routes = struct {
         if (marker_index == 0) return null;
         const table_name = rest[0..marker_index];
         const key = rest[marker_index + lookup_marker.len ..];
-        if (key.len == 0) return null;
+        if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return null;
         return .{
             .table_name = table_name,
             .key = key,
@@ -560,7 +560,7 @@ pub const Routes = struct {
         if (marker_index == 0) return null;
         const table_name = table_rest[0..marker_index];
         const key = table_rest[marker_index + lookup_marker.len ..];
-        if (key.len == 0) return null;
+        if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name, .key = key };
     }
 
@@ -906,9 +906,11 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("/backup", Routes.backup);
     try std.testing.expectEqualStrings("/restore", Routes.restore);
     try std.testing.expectEqualStrings("/backups", Routes.backups);
-    const lookup = Routes.matchTableLookup("/tables/docs/lookup/doc:a").?;
+    const lookup = Routes.matchTableLookup("/tables/docs/documents/doc:a").?;
     try std.testing.expectEqualStrings("docs", lookup.table_name);
     try std.testing.expectEqualStrings("doc:a", lookup.key);
+    try std.testing.expect(Routes.matchTableLookup("/tables/docs/lookup/doc:a") == null);
+    try std.testing.expect(Routes.matchTableLookup("/tables/docs/documents/doc:a/artifacts/document_units_v1") == null);
     const scan = Routes.matchTableScan("/tables/docs/lookup").?;
     try std.testing.expectEqualStrings("docs", scan.table_name);
     const query = Routes.matchTableQuery("/tables/docs/query").?;
@@ -964,9 +966,11 @@ test "public api routes compile" {
     const subject_row_filter = Routes.matchSubjectRowFilter("/auth/v1/subjects/group:eng/row-filters/docs").?;
     try std.testing.expectEqualStrings("group:eng", subject_row_filter.subject);
     try std.testing.expectEqualStrings("docs", subject_row_filter.table);
-    const group_lookup = Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/lookup/doc:a").?;
+    const group_lookup = Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/documents/doc:a").?;
     try std.testing.expectEqual(@as(u64, 7), group_lookup.group_id);
     try std.testing.expectEqualStrings("docs", group_lookup.table_name);
+    try std.testing.expect(Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/lookup/doc:a") == null);
+    try std.testing.expect(Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/documents/doc:a/artifacts/document_units_v1") == null);
     const group_query = Routes.matchGroupQuery("/internal/v1/groups/7/tables/docs/query").?;
     try std.testing.expectEqual(@as(u64, 7), group_query.group_id);
     const group_query_preflight = Routes.matchGroupQueryPreflight("/internal/v1/groups/7/tables/docs/query-preflight").?;

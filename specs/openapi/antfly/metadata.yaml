@@ -6921,7 +6921,7 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/lookup/{key}:
+  /tables/{tableName}/documents/{key}:
     parameters:
       - name: tableName
         in: path
@@ -6932,11 +6932,11 @@ paths:
       - name: key
         in: path
         required: true
-        description: Key of the record to lookup
+        description: Key of the document to retrieve
         schema:
           type: string
     get:
-      summary: Lookup a key in a table
+      summary: Retrieve a document by key
       tags:
         - data_operations
       operationId: lookupKey

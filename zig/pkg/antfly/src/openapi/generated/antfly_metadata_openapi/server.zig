@@ -258,11 +258,11 @@ pub fn parseScanKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.js
     return std.json.parseFromSlice(types.ScanKeysRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Lookup a key in a table
+/// Retrieve a document by key
 pub const LookupKeyPathParams = struct {
     /// Name of the table
     table_name: []const u8,
-    /// Key of the record to lookup
+    /// Key of the document to retrieve
     key: []const u8,
 };
 
@@ -371,7 +371,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable" },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema" },
     .{ .method = "POST", .path = "/tables/{tableName}/lookup", .operation_id = "scanKeys" },
-    .{ .method = "GET", .path = "/tables/{tableName}/lookup/{key}", .operation_id = "lookupKey" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest" },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess", .operation_id = "reprocessDocumentArtifact" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes" },
@@ -486,7 +486,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/restore", restoreTable);
             try server.put("/tables/:tableName/schema", updateSchema);
             try server.post("/tables/:tableName/lookup", scanKeys);
-            try server.get("/tables/:tableName/lookup/:key", lookupKey);
+            try server.get("/tables/:tableName/documents/:key", lookupKey);
             try server.get("/tables/:tableName/documents/:key/artifacts/:artifactName", getDocumentArtifactManifest);
             try server.post("/tables/:tableName/documents/:key/artifacts/:artifactName:reprocess", reprocessDocumentArtifact);
             try server.get("/tables/:tableName/indexes", listIndexes);
@@ -786,8 +786,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.scanKeys(ctx, table_name);
         }
 
-        /// Lookup a key in a table
-        /// GET /tables/{tableName}/lookup/{key}
+        /// Retrieve a document by key
+        /// GET /tables/{tableName}/documents/{key}
         fn lookupKey(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });

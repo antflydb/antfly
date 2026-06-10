@@ -520,10 +520,10 @@ pub const Client = struct {
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = resp.contentType(), .allocator = self.allocator };
     }
 
-    /// Lookup a key in a table
-    /// GET /db/v1/tables/{tableName}/lookup/{key}
+    /// Retrieve a document by key
+    /// GET /db/v1/tables/{tableName}/documents/{key}
     pub fn lookupKey(self: *@This(), table_name: []const u8, key: []const u8, params: LookupKeyParams) !ApiResponse(std.json.Value) {
-        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lookup/{s}", .{ self.base_url, table_name, key });
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}", .{ self.base_url, table_name, key });
         defer self.allocator.free(url);
         var query_buf = std.ArrayListUnmanaged(u8).empty;
         defer query_buf.deinit(self.allocator);
