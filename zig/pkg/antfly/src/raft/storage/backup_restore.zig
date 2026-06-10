@@ -203,6 +203,18 @@ fn restoreSnapshotDocCount(alloc: std.mem.Allocator, restore: RestoreSource) !u6
     var location = try backups_api.openBackupLocation(alloc, restore.location);
     defer location.deinit(alloc);
 
+    if (std.mem.endsWith(u8, restore.snapshot_path, ".afb")) {
+        const afb_path = try stageRestoreFile(alloc, "", &location, restore.snapshot_path);
+        defer switch (location) {
+            .file => alloc.free(afb_path),
+            .remote => {
+                if (std.fs.path.dirname(afb_path)) |staging_dir| destroyPathIfExists(staging_dir);
+                alloc.free(afb_path);
+            },
+        };
+        return try portableSnapshotDocCount(alloc, afb_path);
+    }
+
     const snapshot_root = try stageRestoreSnapshot(alloc, "", &location, restore.snapshot_path);
     defer switch (location) {
         .file => alloc.free(snapshot_root),
@@ -211,8 +223,6 @@ fn restoreSnapshotDocCount(alloc: std.mem.Allocator, restore: RestoreSource) !u6
             alloc.free(snapshot_root);
         },
     };
-
-    if (std.mem.endsWith(u8, restore.snapshot_path, ".afb")) return try portableSnapshotDocCount(alloc, snapshot_root);
 
     const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/store.bin", .{snapshot_root});
     defer alloc.free(snapshot_path);
