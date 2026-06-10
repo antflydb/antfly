@@ -106,6 +106,7 @@ pub const Config = struct {
     ocr_config_json: []const u8 = "",
     transcription_enabled: bool = false,
     transcription_config_json: []const u8 = "",
+    route_preset: RoutePreset = .mixed_files,
     routes: []Route = &.{},
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
@@ -119,6 +120,17 @@ pub const Config = struct {
         for (self.routes) |*route| route.deinit(alloc);
         if (self.routes.len > 0) alloc.free(self.routes);
         self.* = undefined;
+    }
+};
+
+const RoutePreset = enum {
+    mixed_files,
+    explicit_only,
+
+    fn parse(value: []const u8) ?RoutePreset {
+        if (std.mem.eql(u8, value, "mixed_files") or std.mem.eql(u8, value, "default")) return .mixed_files;
+        if (std.mem.eql(u8, value, "explicit_only") or std.mem.eql(u8, value, "none")) return .explicit_only;
+        return null;
     }
 };
 
@@ -197,8 +209,15 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     config.ocr_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "ocr", &config.ocr_enabled);
     config.transcription_enabled = boolField(object, "transcribe_audio") orelse false;
     config.transcription_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "transcription", &config.transcription_enabled);
+    config.route_preset = try parseRoutePreset(object);
     config.routes = try parseRoutesAlloc(alloc, object);
     return config;
+}
+
+fn parseRoutePreset(object: std.json.ObjectMap) !RoutePreset {
+    const value = object.get("route_preset") orelse object.get("routes_preset") orelse return .mixed_files;
+    if (value != .string) return error.InvalidDocumentExtractionConfig;
+    return RoutePreset.parse(value.string) orelse error.InvalidDocumentExtractionConfig;
 }
 
 fn dupeStringField(alloc: Allocator, object: std.json.ObjectMap, field: []const u8) ![]const u8 {
@@ -360,6 +379,9 @@ pub fn extractDownloadedAlloc(
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
         return try extractWithRouteAlloc(alloc, downloaded.data, content_type, route, config.html_strip_tags);
+    }
+    if (config.route_preset == .explicit_only) {
+        return try unsupportedResultAlloc(alloc, content_type, "no_configured_route_matched");
     }
     if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractPdfAlloc(alloc, downloaded.data, content_type);
@@ -1906,6 +1928,46 @@ test "document extraction routes configured extensions into text units" {
     try std.testing.expectEqualStrings("text", result.route_type);
     try std.testing.expectEqualStrings("note:000001", result.units[0].unit_id);
     try std.testing.expectEqualStrings("note", result.units[0].unit_type);
+    try std.testing.expectEqualStrings("alpha beta", result.units[0].text);
+}
+
+test "document extraction explicit-only route preset disables builtin fallback" {
+    const alloc = std.testing.allocator;
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "text/plain"),
+        .data = try alloc.dupe(u8, "alpha beta"),
+    };
+    defer downloaded.deinit(alloc);
+
+    var config = try parseConfig(alloc,
+        \\{"route_preset":"explicit_only","routes":[{"match":{"extension":"md"},"extractor":{"type":"text","unit":"note"}}]}
+    );
+    defer config.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/file.txt", config);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("unsupported", result.route_type);
+    try std.testing.expectEqualStrings("no_configured_route_matched", result.unsupported_reason);
+    try std.testing.expectEqual(@as(usize, 0), result.units.len);
+}
+
+test "document extraction explicit-only route preset still uses configured route matches" {
+    const alloc = std.testing.allocator;
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "application/octet-stream"),
+        .data = try alloc.dupe(u8, "alpha beta"),
+    };
+    defer downloaded.deinit(alloc);
+
+    var config = try parseConfig(alloc,
+        \\{"route_preset":"explicit_only","routes":[{"match":{"extension":"md"},"extractor":{"type":"text","unit":"note"}}]}
+    );
+    defer config.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/notes.md", config);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("text", result.route_type);
+    try std.testing.expectEqualStrings("note:000001", result.units[0].unit_id);
     try std.testing.expectEqualStrings("alpha beta", result.units[0].text);
 }
 

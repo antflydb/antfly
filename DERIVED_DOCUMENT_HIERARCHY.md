@@ -393,7 +393,7 @@ Current implementation status:
 - The producer is handled internally rather than by the external model-backed asset producer runtime.
 - The source field resolves to a URL, including `data:` URLs through the existing remote-content downloader path.
 - Extraction currently routes PDF mechanical text, text, JSON/CSV-like text, simple HTML, RFC 822 email, OOXML Office packages, ZIP archives, image media, and audio media into canonical units.
-- The route config supports ordered built-in routes for `pdf`, `html`, `text`, `email`, `docx`, `pptx`, `xlsx`, `archive`, `ocr`/`image`, `audio`/`transcript`, and `unsupported` extractors, matched by exact content type, content-type prefix, filename/URL extension, or configured magic-byte prefix.
+- The route config supports a public `route_preset` contract plus limited ordered overrides. `mixed_files` is the default preset and runs the built-in routes for `pdf`, `html`, `text`, `email`, `docx`, `pptx`, `xlsx`, `archive`, `ocr`/`image`, `audio`/`transcript`, and `unsupported` extractors after caller-provided overrides. `explicit_only` disables built-in fallback and fails closed with a structured unsupported route when no configured route matches. Overrides can match exact content type, content-type prefix, filename/URL extension, or configured magic-byte prefix.
 - The default detector now sniffs PDF magic, common HTML prefixes, and valid UTF-8 plain text for missing or generic content-type metadata, so mixed-file tables can still produce canonical units when upstream file metadata is incomplete.
 - Route matching can hydrate effective filename and content type from per-row source metadata fields such as `source.filename_field` and `source.content_type_field`, so one mixed-file table can route documents without one enrichment per MIME type.
 - Unsupported content types now produce a structured `route_type: "unsupported"` manifest with `unsupported_reason`, zero units, and no searchable child documents instead of failing the enrichment.
@@ -417,7 +417,6 @@ Current implementation status:
 
 Still remaining in Phase 1:
 
-- Decide how much of the built-in route config should be exposed publicly versus wrapped in presets.
 - Add deeper PDF provenance such as rotation and text-region bounding boxes as the PDF reader exposes them.
 - Define the broader permission model for artifact inspection and reprocess controls, especially admin-only detail expansion and long-running/background table-wide operations.
 
@@ -692,7 +691,7 @@ The high-level model is settled enough to start implementation. The pieces that 
 - Query response shape: exact request and response schema for hierarchy rollups, grouped hits, and hydrated ancestors.
 - Inspection API shape: admin-only versus public deep details, filter-aware/user-facing repair policy, per-shard cursors, and long-running table-wide reprocessing jobs. Collection listing, single-artifact manifest inspection, typed source/fingerprint/range/merge/error summaries, source-row row-filter enforcement for per-document operations, bounded table-range repair, and hosted/provisioned routing now exist.
 - Split thresholds: the first unit-level defaults are implemented and manifest-recorded as 256 units or 1 MiB of unit text per range; the remaining decision is the exceptional second-level split policy under a single huge unit.
-- File route config: the internal built-in route array shape and per-row metadata field hydration exist; the remaining decision is whether the first public version exposes them directly or wraps them in presets plus limited overrides.
+- File route config: the first public shape is `route_preset` plus limited ordered overrides, with `mixed_files` as the default built-in route preset and `explicit_only` as the fail-closed mode. Future design work can decide whether to expose named preset variants beyond those two.
 - Reprocessing semantics: background job scheduling, priority, concurrency, per-shard cursors, and durable progress reporting beyond the bounded synchronous table-range repair endpoint.
 - Entity resolver contract: how mention artifacts are subscribed into canonical graph/entity namespaces.
 
