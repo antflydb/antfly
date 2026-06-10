@@ -27,9 +27,21 @@ pub fn defaultModelsDir(allocator: std.mem.Allocator) []const u8 {
     return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "models" }) catch "./models";
 }
 
+/// Returns ~/.antfly/inference/ml if $HOME is set, otherwise falls back to ./ml.
+pub fn defaultMlDir(allocator: std.mem.Allocator) []const u8 {
+    if (platform.env.getenv("ANTFLY_INFERENCE_ML_DIR")) |value| return value;
+    const home = platform.env.getenv("HOME") orelse return "./ml";
+    return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "ml" }) catch "./ml";
+}
+
 pub fn defaultModelsDirForDataDir(allocator: std.mem.Allocator, data_dir: []const u8) []const u8 {
     if (platform.env.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value| return value;
     return std.fs.path.join(allocator, &.{ data_dir, "inference", "models" }) catch defaultModelsDir(allocator);
+}
+
+pub fn defaultMlDirForDataDir(allocator: std.mem.Allocator, data_dir: []const u8) []const u8 {
+    if (platform.env.getenv("ANTFLY_INFERENCE_ML_DIR")) |value| return value;
+    return std.fs.path.join(allocator, &.{ data_dir, "inference", "ml" }) catch defaultMlDir(allocator);
 }
 
 pub const SpawnedServer = struct {
@@ -52,6 +64,7 @@ pub const SpawnedServer = struct {
 const EmbeddedServerConfig = struct {
     api_url: []const u8,
     models_dir: ?[]const u8 = null,
+    ml_dir: ?[]const u8 = null,
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
     generation_budget_overrides: ServerBudgetOverrides = .{},
@@ -119,6 +132,8 @@ pub fn runFromIterator(
         return try listModels(alloc, io, args);
     } else if (std.mem.eql(u8, command, "pull")) {
         return try pullModel(alloc, io, args);
+    } else if (std.mem.eql(u8, command, "convert")) {
+        return try inference.tabular.cli.convertMain(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         printUsage();
     } else {
@@ -132,6 +147,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8090;
     var models_dir: []const u8 = defaultModelsDir(alloc);
+    var ml_dir: []const u8 = defaultMlDir(alloc);
     var budget_overrides_mb = BudgetOverridesMb{};
 
     while (args.next()) |arg| {
@@ -141,6 +157,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             if (args.next()) |p| port = std.fmt.parseInt(u16, p, 10) catch 8090;
         } else if (std.mem.eql(u8, arg, "--models-dir")) {
             models_dir = args.next() orelse models_dir;
+        } else if (std.mem.eql(u8, arg, "--ml-dir")) {
+            ml_dir = args.next() orelse ml_dir;
         } else if (std.mem.eql(u8, arg, "--host-budget-mb")) {
             budget_overrides_mb.host_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--backend-budget-mb")) {
@@ -155,14 +173,17 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     }
 
     std.debug.print("antfly inference\n", .{});
-    std.debug.print("models: {s}\n", .{models_dir});
+    std.debug.print("ai models: {s}\n", .{models_dir});
+    std.debug.print("ml models: {s}\n", .{ml_dir});
     std.debug.print("listening on {s}:{d}\n", .{ host, port });
 
     var node = try inference.server.Node.init(alloc, .{
         .models_dir = models_dir,
+        .ml_dir = ml_dir,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
     });
     defer node.deinit();
+    node.seedAndDiscoverPredictors(io);
 
     try node.serve(alloc, io, host, port);
 }
@@ -178,6 +199,7 @@ pub fn spawnServerProcess(
 
     var node_cfg = inference.server.NodeConfig{
         .models_dir = config.models_dir orelse defaultModelsDir(alloc),
+        .ml_dir = config.ml_dir orelse defaultMlDir(alloc),
         .generation_budget_overrides = config.generation_budget_overrides,
     };
     if (config.content_security) |sec| node_cfg.content_security = sec;
@@ -187,6 +209,11 @@ pub fn spawnServerProcess(
     errdefer alloc.destroy(node);
     node.* = try inference.server.Node.init(alloc, node_cfg);
     errdefer node.deinit();
+    // Seed builtin predictors + discover on-disk predictors before
+    // launching the server thread.
+    var seed_io_impl = std.Io.Threaded.init(alloc, .{});
+    defer seed_io_impl.deinit();
+    node.seedAndDiscoverPredictors(seed_io_impl.io());
 
     const host_dup = try alloc.dupe(u8, parsed.host);
     errdefer alloc.free(host_dup);
@@ -229,27 +256,48 @@ fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iter
 fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const ref = args.next() orelse {
         std.debug.print("usage: antfly inference pull <model-ref> [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>] [--projector <auto|none|Q8_0|filename>]\n", .{});
+        std.debug.print("       antfly inference pull hf:<owner>/<repo> --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{});
+        std.debug.print("       antfly inference pull <https-url-to-tabular-artifact> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{});
         std.debug.print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
         std.debug.print("CLIP/CLAP v0.2 example: antfly inference pull antflydb/clipclap:gguf:Q4_K\n", .{});
         return;
     };
+
+    var argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer argv.deinit(alloc);
+    try argv.append(alloc, ref);
+    while (args.next()) |arg| try argv.append(alloc, arg);
+
+    if (inference.tabular.cli.isHttpUrl(ref) or isPredictorPull(argv.items)) {
+        return try inference.tabular.cli.pullMain(alloc, io, argv.items, defaultMlDir(alloc));
+    }
 
     var token: ?[]const u8 = null;
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var tasks_csv: ?[]const u8 = null;
     var capabilities_csv: ?[]const u8 = null;
     var projector_selection: inference.registry.download.ProjectorSelection = .auto;
-    while (args.next()) |arg| {
+    var i: usize = 1;
+    while (i < argv.items.len) : (i += 1) {
+        const arg = argv.items[i];
         if (std.mem.eql(u8, arg, "--token")) {
-            token = args.next();
+            i += 1;
+            if (i < argv.items.len) token = argv.items[i];
         } else if (std.mem.eql(u8, arg, "--models-dir")) {
-            models_dir = args.next() orelse models_dir;
+            i += 1;
+            if (i < argv.items.len) models_dir = argv.items[i];
+        } else if (std.mem.eql(u8, arg, "--ml-dir")) {
+            // ML storage is only meaningful for URL predictor pulls.
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--tasks")) {
-            tasks_csv = args.next();
+            i += 1;
+            if (i < argv.items.len) tasks_csv = argv.items[i];
         } else if (std.mem.eql(u8, arg, "--capabilities")) {
-            capabilities_csv = args.next();
+            i += 1;
+            if (i < argv.items.len) capabilities_csv = argv.items[i];
         } else if (std.mem.eql(u8, arg, "--projector")) {
-            const value = args.next() orelse return error.InvalidArguments;
+            i += 1;
+            const value = if (i < argv.items.len) argv.items[i] else return error.InvalidArguments;
             projector_selection = inference.registry.download.parseProjectorSelection(value) orelse return error.InvalidArguments;
         }
     }
@@ -266,6 +314,17 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     try reg.pull(io, ref, token, tasks_csv, capabilities_csv, projector_selection);
 
     std.debug.print("done.\n", .{});
+}
+
+fn isPredictorPull(args: []const []const u8) bool {
+    if (args.len == 0 or !inference.tabular.cli.isHuggingFaceRef(args[0])) return false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--type") and i + 1 < args.len) {
+            return std.mem.eql(u8, args[i + 1], "predictor") or std.mem.eql(u8, args[i + 1], "predictors");
+        }
+    }
+    return false;
 }
 
 fn collectArgs(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) ![]const []const u8 {
@@ -325,12 +384,14 @@ fn printUsage() void {
         \\  finetune    Run LoRA finetuning
         \\  smoke       Run a model smoke test
         \\  list        List available models
-        \\  pull        Download a model from HuggingFace Hub
+        \\  pull        Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL
+        \\  convert     Convert a native ML model (XGBoost/LightGBM/ONNX) to the antfly tabular IR
         \\
         \\Run options:
         \\  --host <addr>    Listen address (default: 127.0.0.1)
         \\  --port <port>    Listen port (default: 8090)
-        \\  --models-dir <dir> Models directory (default: ~/.antfly/inference/models)
+        \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
+        \\  --ml-dir <dir>     Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --host-budget-mb <n>      Native generation host budget override
         \\  --backend-budget-mb <n>   Native generation backend budget override
         \\  --combined-budget-mb <n>  Native generation combined budget override
@@ -339,7 +400,12 @@ fn printUsage() void {
         \\
         \\Pull options:
         \\  --token <token>  HuggingFace API token (or set HF_TOKEN env var)
-        \\  --models-dir <dir> Models directory (default: ~/.antfly/inference/models)
+        \\  --name <name>    Local predictor name when pulling a tabular model URL
+        \\  --tasks <list>   Comma-separated task hints for the pulled model
+        \\  --capabilities <list> Comma-separated capability hints for the pulled model
+        \\  --projector <value> Projector sidecar selection for GGUF pulls: auto, none, quant suffix, or filename
+        \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
+        \\  --ml-dir <dir>     Traditional ML directory for URL pulls (default: ~/.antfly/inference/ml)
         \\
     , .{});
 }

@@ -3,7 +3,7 @@ info:
   title: Antfly Public API
   version: v1alpha1
   description: Joined public contract for the Antfly server. Antfly APIs are served under `/db/v1`, auth
-    APIs under `/auth/v1`, and inference APIs under `/ai/v1`.
+    APIs under `/auth/v1`, inference APIs under `/ai/v1`, and ML prediction APIs under `/ml/v1`.
 servers:
   - url: /
 tags:
@@ -5583,6 +5583,72 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ml/v1/models:
+    get:
+      summary: List Traditional ML predictors
+      description: >
+        Returns the Traditional ML predictor catalog for `/ml/v1/predict`.
+
+        Predictors are loaded from `<ml_dir>/<name>/` and exposed separately
+
+        from the AI model catalog.
+      operationId: listPredictors
+      responses:
+        '200':
+          description: Predictors retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferencePredictorsResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ml/v1/predict:
+    post:
+      summary: Run a traditional ML predictor
+      description: >
+        Run a tabular predictor (tree ensemble, linear, or SVM) on a batch of
+
+        feature vectors. Models are loaded from `<ml_dir>/<name>/` and
+
+        identified by name. Use `/ml/v1/models` for the list of available
+
+        predictors and their feature schemas.
+      operationId: predict
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferencePredictRequest'
+      responses:
+        '200':
+          description: Predictions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferencePredictResponse'
+        '400':
+          description: Invalid request (malformed body, feature-count mismatch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '404':
+          description: Predictor not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Batch too large (> 10000 rows)
           content:
             application/json:
               schema:
@@ -14849,6 +14915,99 @@ components:
         error:
           type: string
           description: Error message
+    InferencePredictRequest:
+      type: object
+      required:
+        - model
+        - input
+      properties:
+        model:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: ^[A-Za-z0-9_-]+$
+          description: Predictor name from the model catalog.
+        input:
+          type: array
+          maxItems: 10000
+          description: Batch of feature vectors. Max 10000 rows.
+          items:
+            type: array
+            items:
+              type: number
+              format: float
+    InferencePredictResponse:
+      type: object
+      required:
+        - model
+        - task
+        - predictions
+      properties:
+        model:
+          type: string
+        task:
+          $ref: '#/components/schemas/InferencePredictorTask'
+        predictions:
+          type: array
+          description: >
+            Per-row prediction arrays. Length equals the model's `num_outputs`
+
+            (1 for regression / binary, `num_classes` for multiclass).
+          items:
+            type: array
+            items:
+              type: number
+              format: float
+    InferencePredictorTask:
+      type: string
+      description: Task type for tabular predictors.
+      enum:
+        - regression
+        - binary_classification
+        - multiclass
+        - ranking
+    InferencePredictorInfo:
+      type: object
+      description: Traditional ML predictor metadata.
+      required:
+        - task
+        - num_features
+        - num_outputs
+      properties:
+        task:
+          $ref: '#/components/schemas/InferencePredictorTask'
+        num_features:
+          type: integer
+          minimum: 1
+          description: Number of feature columns expected by the predictor.
+        num_outputs:
+          type: integer
+          minimum: 1
+          description: Number of output values emitted per input row.
+        feature_names:
+          type: array
+          description: Optional feature names in input order.
+          items:
+            type: string
+        source_framework:
+          type: string
+          description: Source framework used to produce the predictor IR.
+    InferencePredictorsResponse:
+      type: object
+      required:
+        - object
+        - predictors
+      properties:
+        object:
+          type: string
+          enum:
+            - list
+          description: Response object type.
+        predictors:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/InferencePredictorInfo'
+          description: Traditional ML predictors keyed by predictor name.
     InferenceTextContentPart:
       $ref: '#/components/schemas/TextContentPart'
     InferenceImageURL:

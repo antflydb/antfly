@@ -1508,6 +1508,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const ml_tabular_mod = b.addModule("ml_tabular", .{
+        .root_source_file = b.path("lib/ml/tabular/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const termite_onnx_graph_mod = b.addModule("termite_onnx_graph", .{
         .root_source_file = b.path("lib/onnx/src/root.zig"),
         .target = target,
@@ -1575,6 +1580,7 @@ pub fn build(b: *std.Build) void {
             .protobuf = protobuf_mod,
             .sentencepiece_proto = sentencepiece_proto_mod,
             .ml = termite_ml_mod,
+            .ml_tabular = ml_tabular_mod,
             .onnx_graph = termite_onnx_graph_mod,
             .pjrt = termite_pjrt_mod,
             .generating_openapi = generating_openapi_mod,
@@ -2105,6 +2111,24 @@ pub fn build(b: *std.Build) void {
     const run_lib_json_tests = b.addRunArtifact(lib_json_tests);
     const lib_json_test_step = b.step("lib-json-test", "Run standalone lib/json tests");
     lib_json_test_step.dependOn(&run_lib_json_tests.step);
+
+    const lib_ml_tabular_tests = b.addTest(.{
+        .root_module = ml_tabular_mod,
+    });
+    const run_lib_ml_tabular_tests = b.addRunArtifact(lib_ml_tabular_tests);
+    const lib_ml_tabular_test_step = b.step("lib-ml-tabular-test", "Run standalone lib/ml/tabular tests");
+    lib_ml_tabular_test_step.dependOn(&run_lib_ml_tabular_tests.step);
+
+    const fuzz_tabular_loader = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/ml/tabular/src/fuzz_loader.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_fuzz_tabular_loader = b.addRunArtifact(fuzz_tabular_loader);
+    const fuzz_tabular_loader_step = b.step("fuzz-tabular-loader", "Fuzz the tabular_model.json loader (--fuzz to keep running)");
+    fuzz_tabular_loader_step.dependOn(&run_fuzz_tabular_loader.step);
 
     const lib_toon_tests = b.addTest(.{
         .root_module = toon_mod,
@@ -3957,13 +3981,14 @@ pub fn build(b: *std.Build) void {
             "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved",
             "swarm runtime registers internal group routes explicitly",
             "parse cli accepts config path",
+            "parse cli accepts secret store path",
             "parse cli accepts canonical host port and models dir flags",
-            "termite config uses cli override before common config",
+            "antfly config uses cli override before common config",
             "swarm public api caps keep alive request reuse",
             "swarm public api body limit matches common http listener",
             "swarm public HTTP server uses public API request body limit",
-            "parse cli accepts termite budget overrides",
-            "termite config falls back to common config",
+            "parse cli accepts inference budget overrides",
+            "inference config falls back to common config",
             "swarm runtime resolves paths from common storage base dir",
         },
     });

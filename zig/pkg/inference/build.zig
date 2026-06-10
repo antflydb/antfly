@@ -613,6 +613,7 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("antfly_scraping", antfly_scraping_mod);
     tests.root_module.addImport("antfly_image", antfly_image_mod);
     tests.root_module.addImport("ml", ml_mod);
+    tests.root_module.addImport("ml_tabular", runtime_graph.ml_tabular_mod);
     tests.root_module.addImport("onnx_graph", onnx_graph_mod);
     tests.root_module.addImport("pjrt", pjrt_mod);
     tests.root_module.addImport("prometheus", prometheus_mod);

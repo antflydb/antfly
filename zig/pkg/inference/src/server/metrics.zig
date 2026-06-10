@@ -53,6 +53,10 @@ pub const Metrics = struct {
     generate_requests: prometheus.Counter(u64),
     transcribe_requests: prometheus.Counter(u64),
     read_requests: prometheus.Counter(u64),
+    predict_requests: prometheus.Counter(u64),
+    predict_errors: prometheus.Counter(u64),
+    predictor_load: prometheus.Counter(u64),
+    predictor_evict: prometheus.Counter(u64),
 
     models_loaded: prometheus.Gauge(u64),
     cache_hits: prometheus.Counter(u64),
@@ -85,6 +89,10 @@ pub const Metrics = struct {
             .generate_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_generate", .{ .help = "Generate endpoint requests" }, .{}),
             .transcribe_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_transcribe", .{ .help = "Transcribe endpoint requests" }, .{}),
             .read_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_read", .{ .help = "Read endpoint requests" }, .{}),
+            .predict_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_predict", .{ .help = "Predict endpoint requests" }, .{}),
+            .predict_errors = prometheus.Counter(u64).init("antfly_inference_predict_errors_total", .{ .help = "Predict-handler errors" }, .{}),
+            .predictor_load = prometheus.Counter(u64).init("antfly_inference_predictor_load_total", .{ .help = "Predictor lazy-loads from disk" }, .{}),
+            .predictor_evict = prometheus.Counter(u64).init("antfly_inference_predictor_evict_total", .{ .help = "Predictor cache evictions" }, .{}),
             .models_loaded = prometheus.Gauge(u64).init("antfly_inference_models_loaded", .{ .help = "Number of loaded models" }, .{}),
             .cache_hits = prometheus.Counter(u64).init("antfly_inference_cache_hits_total", .{ .help = "Cache hits" }, .{}),
             .cache_misses = prometheus.Counter(u64).init("antfly_inference_cache_misses_total", .{ .help = "Cache misses" }, .{}),
@@ -116,7 +124,21 @@ pub const Metrics = struct {
             self.transcribe_requests.incr();
         } else if (std.mem.eql(u8, endpoint, "read")) {
             self.read_requests.incr();
+        } else if (std.mem.eql(u8, endpoint, "predict")) {
+            self.predict_requests.incr();
         }
+    }
+
+    pub fn incPredictError(self: *Metrics) void {
+        self.predict_errors.incr();
+    }
+
+    pub fn incPredictorLoad(self: *Metrics) void {
+        self.predictor_load.incr();
+    }
+
+    pub fn incPredictorEvict(self: *Metrics) void {
+        self.predictor_evict.incr();
     }
 
     pub fn decActive(self: *Metrics) void {
