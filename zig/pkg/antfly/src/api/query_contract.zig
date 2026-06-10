@@ -2248,20 +2248,30 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
 fn searchHitHierarchyJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !?std.json.Value {
     if (hit.artifact_ref == null and hit.chunk_hits.len == 0) return null;
 
+    var mention_payload = if (hit.stored_data) |raw| try parseMentionEvidencePayload(alloc, raw) else null;
+    defer if (mention_payload) |*parsed| parsed.deinit();
+
     var obj = std.json.ObjectMap.empty;
     errdefer obj.deinit(alloc);
 
     const level = if (hit.artifact_ref) |artifact_ref|
-        artifactRefLevel(artifact_ref)
+        if (mention_payload != null) "mention" else artifactRefLevel(artifact_ref)
     else
         "source";
     try putJsonString(alloc, &obj, "level", level);
 
     if (hit.artifact_ref) |artifact_ref| {
-        try putJsonString(alloc, &obj, "parent_doc_key", artifact_ref.document_id);
+        const parent_doc_key = if (mention_payload) |payload|
+            jsonObjectString(payload.value.object, "_parent_doc_key") orelse artifact_ref.document_id
+        else
+            artifact_ref.document_id;
+        try putJsonString(alloc, &obj, "parent_doc_key", parent_doc_key);
         try obj.put(alloc, try alloc.dupe(u8, "artifact"), try artifactRefJsonValue(alloc, artifact_ref));
         if (artifact_ref.unit_id) |unit_id| {
             try putJsonString(alloc, &obj, "parent_unit_id", unit_id);
+        }
+        if (mention_payload) |payload| {
+            try obj.put(alloc, try alloc.dupe(u8, "evidence"), try mentionEvidenceHierarchyJsonValue(alloc, payload.value.object));
         }
     } else {
         try putJsonString(alloc, &obj, "parent_doc_key", hit.id);
@@ -2281,6 +2291,43 @@ fn searchHitHierarchyJsonValue(alloc: std.mem.Allocator, req: db_mod.types.Searc
     }
 
     return .{ .object = obj };
+}
+
+fn parseMentionEvidencePayload(alloc: std.mem.Allocator, raw: []const u8) !?std.json.Parsed(std.json.Value) {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return null;
+    errdefer parsed.deinit();
+    if (parsed.value != .object) {
+        parsed.deinit();
+        return null;
+    }
+    const schema = jsonObjectString(parsed.value.object, "_schema") orelse {
+        parsed.deinit();
+        return null;
+    };
+    if (!std.mem.eql(u8, schema, "antfly.resolution_mention.v1")) {
+        parsed.deinit();
+        return null;
+    }
+    return parsed;
+}
+
+fn mentionEvidenceHierarchyJsonValue(alloc: std.mem.Allocator, payload: std.json.ObjectMap) !std.json.Value {
+    var evidence = std.json.ObjectMap.empty;
+    errdefer evidence.deinit(alloc);
+
+    try copyOptionalJsonField(alloc, &evidence, payload, "local_id", "local_id");
+    try copyOptionalJsonField(alloc, &evidence, payload, "decision", "decision");
+    try copyOptionalJsonField(alloc, &evidence, payload, "confidence", "confidence");
+    try copyOptionalJsonField(alloc, &evidence, payload, "source_artifact", "source_artifact");
+    try copyOptionalJsonField(alloc, &evidence, payload, "source_artifact_key", "source_artifact_key");
+    try copyOptionalJsonField(alloc, &evidence, payload, "resolution_artifact", "resolution_artifact");
+    try copyOptionalJsonField(alloc, &evidence, payload, "resolution_artifact_key", "resolution_artifact_key");
+    try copyOptionalJsonField(alloc, &evidence, payload, "resolver", "resolver");
+    try copyOptionalJsonField(alloc, &evidence, payload, "resolver_table", "resolver_table");
+    try copyOptionalJsonField(alloc, &evidence, payload, "mention", "mention");
+    try copyOptionalJsonField(alloc, &evidence, payload, "canonical", "canonical");
+
+    return .{ .object = evidence };
 }
 
 fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.ChunkHit) !std.json.Value {
@@ -2399,6 +2446,11 @@ fn copyOptionalJsonField(
     const value = source.get(source_key) orelse return;
     if (std.mem.eql(u8, dest_key, "id") and out.get("id") != null) return;
     try out.put(alloc, try alloc.dupe(u8, dest_key), try cloneJsonValueAlloc(alloc, value));
+}
+
+fn jsonObjectString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    return if (value == .string) value.string else null;
 }
 
 fn cloneJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
@@ -2626,6 +2678,66 @@ test "api query contract serializes db-backed ancestors for direct chunk hits" {
     const unit = ancestors.get("unit").?.object;
     try std.testing.expectEqualStrings("page:000001", unit.get("id").?.string);
     try std.testing.expectEqualStrings("unit doc", unit.get("document").?.object.get("text").?.string);
+}
+
+test "api query contract serializes mention evidence hierarchy" {
+    const alloc = std.testing.allocator;
+
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer result.deinit();
+
+    result.hits[0] = .{
+        .id = try alloc.dupe(u8, "af1:asset:ZG9jOmE:X3Jlc29sdXRpb25fbWVudGlvbg"),
+        .score = 0.95,
+        .stored_data = try alloc.dupe(u8,
+            \\{
+            \\  "_schema":"antfly.resolution_mention.v1",
+            \\  "_parent_doc_key":"doc:a",
+            \\  "_artifact_kind":"resolution_mention",
+            \\  "_artifact_key":"mention-key",
+            \\  "source_artifact":"relations_v1",
+            \\  "source_artifact_key":"source-key",
+            \\  "resolution_artifact":"resolution_v1",
+            \\  "resolution_artifact_key":"resolution-key",
+            \\  "resolver":"kg",
+            \\  "resolver_table":"entities",
+            \\  "local_id":"e0",
+            \\  "decision":"match",
+            \\  "confidence":0.87,
+            \\  "canonical":{"table":"entities","key":"person/ada_lovelace","name":"Ada Lovelace","label":"person"},
+            \\  "mention":{"text":"Ada Lovelace","label":"person","confidence":0.91}
+            \\}
+        ),
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "_resolution_mention"),
+            .kind = .asset,
+        },
+    };
+
+    var response = try encodeQueryResponses(alloc, "docs", .{
+        .return_mode = .chunk,
+        .include_stored = true,
+    }, .{}, result);
+    defer response.deinit(alloc);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+    defer parsed.deinit();
+    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+    const hierarchy = hit.object.get("hierarchy").?.object;
+    try std.testing.expectEqualStrings("mention", hierarchy.get("level").?.string);
+    try std.testing.expectEqualStrings("doc:a", hierarchy.get("parent_doc_key").?.string);
+    const evidence = hierarchy.get("evidence").?.object;
+    try std.testing.expectEqualStrings("e0", evidence.get("local_id").?.string);
+    try std.testing.expectEqualStrings("match", evidence.get("decision").?.string);
+    try std.testing.expectEqualStrings("source-key", evidence.get("source_artifact_key").?.string);
+    try std.testing.expectEqualStrings("resolution-key", evidence.get("resolution_artifact_key").?.string);
+    try std.testing.expectEqualStrings("Ada Lovelace", evidence.get("mention").?.object.get("text").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", evidence.get("canonical").?.object.get("key").?.string);
 }
 
 fn parseStoredSourceValue(alloc: std.mem.Allocator, stored_data: []const u8) !std.json.Value {
@@ -5020,10 +5132,8 @@ fn applyPublicHierarchyControls(
         const value = entry.value_ptr.*;
         if (std.mem.eql(u8, key, "return_level")) {
             if (value != .string) return error.InvalidQueryRequest;
-            if (std.mem.eql(u8, value.string, "source") or std.mem.eql(u8, value.string, "unit") or std.mem.eql(u8, value.string, "chunk")) {
+            if (std.mem.eql(u8, value.string, "source") or std.mem.eql(u8, value.string, "unit") or std.mem.eql(u8, value.string, "chunk") or std.mem.eql(u8, value.string, "mention")) {
                 return_level = value.string;
-            } else if (std.mem.eql(u8, value.string, "mention")) {
-                return error.UnsupportedQueryRequest;
             } else {
                 return error.InvalidQueryRequest;
             }
@@ -5047,7 +5157,8 @@ fn applyPublicHierarchyControls(
                 } else if (std.mem.eql(u8, item.string, "unit")) {
                     req.hierarchy_include_unit = true;
                 } else if (std.mem.eql(u8, item.string, "mention") or std.mem.eql(u8, item.string, "mentions")) {
-                    return error.UnsupportedQueryRequest;
+                    // Mention evidence is returned as the hit itself for now;
+                    // there is no descendant grouping knob to set here.
                 } else {
                     return error.InvalidQueryRequest;
                 }
@@ -5065,7 +5176,7 @@ fn applyPublicHierarchyControls(
     const wants_no_rollup = if (rollup) |value| std.mem.eql(u8, value, "none") else false;
 
     if (return_level) |level| {
-        if (std.mem.eql(u8, level, "chunk") or std.mem.eql(u8, level, "unit")) {
+        if (std.mem.eql(u8, level, "chunk") or std.mem.eql(u8, level, "unit") or std.mem.eql(u8, level, "mention")) {
             req.return_mode = if (wants_source_rollup or include_chunk or has_child_limit)
                 .parent_with_chunks
             else
@@ -5734,6 +5845,20 @@ test "api query contract parses public hierarchy controls" {
     try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, hydrate.req.return_mode);
     try std.testing.expect(hydrate.req.hierarchy_include_source);
     try std.testing.expect(hydrate.req.hierarchy_include_unit);
+
+    const mention_body =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {
+        \\    "return_level": "mention",
+        \\    "include": ["source", "mention"]
+        \\  }
+        \\}
+    ;
+    var mention = try parseQueryRequest(alloc, null, "docs", mention_body);
+    defer mention.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, mention.req.return_mode);
+    try std.testing.expect(mention.req.hierarchy_include_source);
 }
 
 test "api query contract rejects unsupported hierarchy levels" {
@@ -5741,7 +5866,7 @@ test "api query contract rejects unsupported hierarchy levels" {
     const body =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {"return_level":"mention"}
+        \\  "hierarchy": {"rollup":"mention"}
         \\}
     ;
     try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));

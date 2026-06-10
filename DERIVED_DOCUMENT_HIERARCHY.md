@@ -494,11 +494,12 @@ Current implementation status:
 - Graph source templates can use `_artifact.value...` paths, allowing unit/chunk payload ancestry such as `_parent_unit_key` and `_parent_unit_id` to become graph edge source IDs and evidence metadata.
 - Resolution replay now materializes first-class `antfly.resolution_mention.v1` evidence artifacts for canonical resolver decisions. Each artifact is keyed by source artifact, resolution artifact, and local mention ID, stores the resolver decision, canonical DocRef, mention text/label/confidence, and explicit mention/source/resolution artifact keys, and is retired through durable state alongside the existing doc-to-entity mention edges.
 - Resolver replay accepts unit asset artifacts and chunk artifacts as source artifacts and scopes their resolution artifacts under the source artifact key, so unit/chunk-level entity extraction can resolve without colliding at the parent document's resolution artifact key.
+- Public hierarchy controls now accept `return_level: "mention"`. Query responses recognize `antfly.resolution_mention.v1` artifact hits and emit `hierarchy.level: "mention"` plus an `evidence` envelope with mention, canonical, resolver, source artifact, and resolution artifact references.
 
 Still remaining in Phase 4:
 
-- Extend the same resolver/source-artifact contract to dedicated mention artifacts and add public query/result shaping for those mention records.
-- Add hierarchy-aware graph query result shaping for mention-level hits and evidence rollups.
+- Extend the same resolver/source-artifact contract to dedicated mention artifacts.
+- Add graph-neighborhood evidence rollups from canonical entities/edges back to mention artifacts.
 
 ### Phase 5: More file types and OCR fallback
 
