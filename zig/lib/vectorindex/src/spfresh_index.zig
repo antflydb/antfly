@@ -1017,28 +1017,20 @@ fn updatePostingTailBacklogStats(
     posting_id: u64,
     result: *posting.PostingBacklogStats,
 ) !void {
-    var base = posting.PostingStore.loadBase(self, txn, posting_id, isNotFoundGeneric) catch |err| {
+    const base_data = posting.PostingStore.loadBaseData(self, txn, posting_id, isNotFoundGeneric) catch |err| {
         if (isNotFoundGeneric(err)) {
             result.skipped_missing += 1;
             return;
         }
         return err;
     };
-    defer base.deinit(self.alloc);
-
-    const deltas = try posting.PostingStore.loadDeltaTail(self, txn, posting_id);
-    defer self.alloc.free(deltas);
-
-    var delta_records_after_base: u64 = 0;
-    var tombstone_records_after_base: u64 = 0;
-    for (deltas) |record| {
-        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base.generation) continue;
-        delta_records_after_base += 1;
-        if (record.op == .tombstone) tombstone_records_after_base += 1;
-    }
+    const base_header = try posting.PostingFormat.decodeBaseHeader(base_data);
+    const delta_stats = try posting.PostingStore.deltaTailStats(self, txn, posting_id, base_header.generation);
+    const delta_records_after_base: u64 = @intCast(delta_stats.records_after_generation);
+    const tombstone_records_after_base: u64 = @intCast(delta_stats.tombstones_after_generation);
     if (delta_records_after_base == 0) return;
 
-    const denominator: u64 = @max(@as(u64, @intCast(base.members.len)), 1);
+    const denominator: u64 = @max(@as(u64, @intCast(base_header.member_count)), 1);
     const ratio_bps = (delta_records_after_base * 10_000) / denominator;
     result.delta_tail_postings += 1;
     result.max_delta_tail_records = @max(result.max_delta_tail_records, delta_records_after_base);
@@ -1299,6 +1291,8 @@ fn foldPostingDeltaTailIfNeeded(
             .min_delta_records = min_delta_records,
             .min_tombstone_records = min_tombstone_records,
             .min_delta_to_base_ratio_bps = min_delta_to_base_ratio_bps,
+            .max_materialized_members = options.max_delta_fold_materialized_members,
+            .max_materialized_bytes = options.max_delta_fold_materialized_bytes,
         }) catch |err| {
             if (!isNotFoundGeneric(err)) return err;
             break :blk posting.FoldDeltaTailResult{};

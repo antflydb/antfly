@@ -708,7 +708,7 @@ pub fn endSearchEpoch(self: anytype) void {
 pub fn releaseSearchScratch(self: anytype, handle: *ScratchHandle) void {
     lockAtomic(&self.scratch_mu);
     defer self.scratch_mu.unlock();
-    if (self.cached_scratch == null) {
+    if (self.cached_scratch == null and handle.scratch.shouldRetain(@intCast(self.config.max_retained_search_scratch_bytes))) {
         self.cached_scratch = handle.scratch;
     } else {
         var scratch = handle.scratch;

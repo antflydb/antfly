@@ -240,6 +240,10 @@ pub const SearchScratch = struct {
             posting_member_cache_bytes;
     }
 
+    pub fn shouldRetain(self: *const SearchScratch, max_retained_bytes: u64) bool {
+        return max_retained_bytes == 0 or self.bytes() <= max_retained_bytes;
+    }
+
     pub fn deinit(self: *SearchScratch, alloc: Allocator) void {
         self.estimate.deinit(alloc);
         alloc.free(self.transformed_query);

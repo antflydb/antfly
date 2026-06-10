@@ -35,6 +35,8 @@ const MinSmartHbcCacheBytes: u64 = 128 * 1024 * 1024;
 const MaxSmartHbcCacheBytes: u64 = 2 * 1024 * 1024 * 1024;
 const MinSmartDenseApplyBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartDenseApplyBytes: u64 = 512 * 1024 * 1024;
+const MinSmartDensePostingMaintenanceBytes: u64 = 64 * 1024 * 1024;
+const MaxSmartDensePostingMaintenanceBytes: u64 = 512 * 1024 * 1024;
 const MinSmartReplayWindowBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartReplayWindowBytes: u64 = 256 * 1024 * 1024;
 const MinSmartFullTextPendingBytes: u64 = 64 * 1024 * 1024;
@@ -123,6 +125,7 @@ fn smartResourceBudgets() SmartResourceBudgets {
     const hbc_hard = adaptiveSliceHardLimit(total, 12, MinSmartHbcCacheBytes, MaxSmartHbcCacheBytes);
     const dense_search_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseApplyBytes, MaxSmartDenseApplyBytes);
     const dense_apply_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseApplyBytes, MaxSmartDenseApplyBytes);
+    const dense_posting_maintenance_hard = adaptiveSliceHardLimit(total, 24, MinSmartDensePostingMaintenanceBytes, MaxSmartDensePostingMaintenanceBytes);
     const replay_hard = adaptiveSliceHardLimit(total, 32, MinSmartReplayWindowBytes, MaxSmartReplayWindowBytes);
     const full_text_hard = adaptiveSliceHardLimit(total, 32, MinSmartFullTextPendingBytes, MaxSmartFullTextPendingBytes);
     const full_text_build_hard = adaptiveSliceHardLimit(total, 24, MinSmartFullTextBuildBytes, MaxSmartFullTextBuildBytes);
@@ -139,6 +142,7 @@ fn smartResourceBudgets() SmartResourceBudgets {
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = resourceBudget(3, dense_search_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)] = resourceBudget(3, dense_apply_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_routing_working_set)] = resourceBudget(3, dense_apply_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_posting_maintenance_working_set)] = resourceBudget(3, dense_posting_maintenance_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = resourceBudget(3, replay_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = resourceBudget(3, full_text_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)] = resourceBudget(2, full_text_build_hard);
@@ -324,6 +328,7 @@ test "provisioned group storage derives all resource budgets" {
         resource_manager_mod.Slice.dense_search_working_set,
         resource_manager_mod.Slice.dense_apply_working_set,
         resource_manager_mod.Slice.dense_routing_working_set,
+        resource_manager_mod.Slice.dense_posting_maintenance_working_set,
         resource_manager_mod.Slice.full_text_pending_segments,
         resource_manager_mod.Slice.derived_backlog,
         resource_manager_mod.Slice.text_merge_buffers,

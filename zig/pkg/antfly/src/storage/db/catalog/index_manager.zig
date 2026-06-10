@@ -1485,6 +1485,7 @@ pub const IndexManager = struct {
             .flat_centroid_block_probe_count = dense_cfg.flat_centroid_block_probe_count,
             .max_posting_overlay_cache_bytes = dense_cfg.max_posting_overlay_cache_bytes,
             .max_posting_overlay_cache_entry_bytes = dense_cfg.max_posting_overlay_cache_entry_bytes,
+            .max_retained_search_scratch_bytes = dense_cfg.max_retained_search_scratch_bytes,
             .no_sync = self.relaxed_split_durability,
             .no_meta_sync = self.relaxed_split_durability,
         }, .{
@@ -2253,6 +2254,8 @@ pub const IndexManager = struct {
         min_tombstone_records_to_fold: usize = 16,
         min_delta_to_base_ratio_bps: u32 = 2500,
         max_delta_tail_postings: usize = std.math.maxInt(usize) - 1,
+        max_delta_fold_materialized_members: usize = std.math.maxInt(usize),
+        max_delta_fold_materialized_bytes: usize = std.math.maxInt(usize),
         max_layout_changes_per_index: usize = 8,
         split_full_postings: bool = false,
         min_overfull_postings_to_run: usize = 1,
@@ -2397,6 +2400,15 @@ pub const IndexManager = struct {
                 break;
             };
             defer if (reservation) |*reserved| reserved.release();
+            const reserved_bytes = if (reservation) |reserved| reserved.bytes else 0;
+            const reservation_fold_bytes: usize = if (reserved_bytes == 0)
+                std.math.maxInt(usize)
+            else
+                @intCast(@min(reserved_bytes / 2, std.math.maxInt(usize)));
+            const max_delta_fold_materialized_bytes = @min(
+                options.max_delta_fold_materialized_bytes,
+                reservation_fold_bytes,
+            );
 
             result.attempted_indexes += 1;
             const repair_result = try entry.index.repairDirtyPostingsWithOptions(.{
@@ -2406,6 +2418,8 @@ pub const IndexManager = struct {
                 .min_tombstone_records_to_fold = options.min_tombstone_records_to_fold,
                 .min_delta_to_base_ratio_bps = options.min_delta_to_base_ratio_bps,
                 .max_delta_tail_postings = options.max_delta_tail_postings,
+                .max_delta_fold_materialized_members = options.max_delta_fold_materialized_members,
+                .max_delta_fold_materialized_bytes = max_delta_fold_materialized_bytes,
                 .rebalance_layout = true,
                 .split_full_postings = options.split_full_postings,
                 .max_layout_changes = options.max_layout_changes_per_index,
@@ -5900,6 +5914,7 @@ pub const IndexManager = struct {
                     .flat_centroid_block_probe_count = dense_cfg.flat_centroid_block_probe_count,
                     .max_posting_overlay_cache_bytes = dense_cfg.max_posting_overlay_cache_bytes,
                     .max_posting_overlay_cache_entry_bytes = dense_cfg.max_posting_overlay_cache_entry_bytes,
+                    .max_retained_search_scratch_bytes = dense_cfg.max_retained_search_scratch_bytes,
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                 }, .{
@@ -11534,6 +11549,7 @@ const DenseConfig = struct {
     flat_centroid_block_probe_count: usize = 0,
     max_posting_overlay_cache_bytes: usize = 8 * 1024 * 1024,
     max_posting_overlay_cache_entry_bytes: usize = 0,
+    max_retained_search_scratch_bytes: usize = 64 * 1024 * 1024,
 
     fn deinit(self: *const DenseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
@@ -11951,6 +11967,10 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
             std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
         else
             0,
+        .max_retained_search_scratch_bytes = if (root.object.get("max_retained_search_scratch_bytes")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            64 * 1024 * 1024,
     };
     errdefer cfg.deinit(alloc);
     if (cfg.auto_posting_maintenance_allow_overfull_reassignment and
@@ -14641,7 +14661,8 @@ test "parseDenseConfig accepts HBC tuning knobs" {
         \\  "flat_centroid_probe_count": 33,
         \\  "flat_centroid_block_probe_count": 5,
         \\  "max_posting_overlay_cache_bytes": 65536,
-        \\  "max_posting_overlay_cache_entry_bytes": 4096
+        \\  "max_posting_overlay_cache_entry_bytes": 4096,
+        \\  "max_retained_search_scratch_bytes": 131072
         \\}
     ;
 
@@ -14698,6 +14719,7 @@ test "parseDenseConfig accepts HBC tuning knobs" {
     try std.testing.expectEqual(@as(usize, 5), cfg.flat_centroid_block_probe_count);
     try std.testing.expectEqual(@as(usize, 65536), cfg.max_posting_overlay_cache_bytes);
     try std.testing.expectEqual(@as(usize, 4096), cfg.max_posting_overlay_cache_entry_bytes);
+    try std.testing.expectEqual(@as(usize, 131072), cfg.max_retained_search_scratch_bytes);
 }
 
 test "parseDenseConfig rejects unbounded overfull reassignment policy" {

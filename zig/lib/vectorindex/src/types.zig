@@ -106,6 +106,7 @@ pub const HBCConfig = struct {
     flat_centroid_block_probe_count: usize = 0,
     max_posting_overlay_cache_bytes: usize = 8 * 1024 * 1024,
     max_posting_overlay_cache_entry_bytes: usize = 0,
+    max_retained_search_scratch_bytes: usize = 64 * 1024 * 1024,
 };
 
 pub const StorageBackend = enum {

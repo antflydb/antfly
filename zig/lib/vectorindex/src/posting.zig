@@ -62,6 +62,12 @@ pub const OwnedPostingBase = struct {
     }
 };
 
+pub const PostingBaseHeader = struct {
+    posting_id: PostingId,
+    generation: u64,
+    member_count: usize,
+};
+
 pub const PostingDeltaOp = enum(u8) {
     insert = 1,
     tombstone = 2,
@@ -72,6 +78,12 @@ pub const PostingDeltaRecord = struct {
     sequence: u64,
     op: PostingDeltaOp,
     vector_id: VectorId,
+};
+
+pub const PostingDeltaTailStats = struct {
+    records: usize = 0,
+    records_after_generation: usize = 0,
+    tombstones_after_generation: usize = 0,
 };
 
 pub const FoldDeltaTailResult = struct {
@@ -97,6 +109,8 @@ pub const FoldDeltaTailOptions = struct {
     min_delta_records: usize = 1,
     min_tombstone_records: usize = 0,
     min_delta_to_base_ratio_bps: u32 = 0,
+    max_materialized_members: usize = std.math.maxInt(usize),
+    max_materialized_bytes: usize = std.math.maxInt(usize),
 };
 
 pub const CentroidDirectoryRecord = struct {
@@ -286,27 +300,50 @@ pub const PostingFormat = struct {
     }
 
     pub fn decodeBase(alloc: std.mem.Allocator, data: []const u8) !OwnedPostingBase {
+        const header = try decodeBaseHeader(data);
+        const members = try alloc.alloc(VectorId, header.member_count);
+        errdefer alloc.free(members);
+        _ = try decodeBaseMembersInto(data, members);
+        return .{
+            .posting_id = header.posting_id,
+            .generation = header.generation,
+            .members = members,
+        };
+    }
+
+    pub fn decodeBaseHeader(data: []const u8) !PostingBaseHeader {
         if (data.len < base_header_size) return error.Corrupted;
         if (!std.mem.eql(u8, data[0..4], &base_magic)) return error.BadPostingBaseMagic;
         if (data[4] != version) return error.UnsupportedPostingBaseVersion;
         const member_count = std.mem.readInt(u32, data[21..25], .little);
         const expected_len = base_header_size + @as(usize, member_count) * @sizeOf(u64);
         if (data.len != expected_len) return error.Corrupted;
-
-        const members = try alloc.alloc(VectorId, member_count);
-        errdefer alloc.free(members);
-
-        var pos: usize = base_header_size;
-        for (members) |*member_id| {
-            member_id.* = std.mem.readInt(u64, data[pos..][0..8], .little);
-            pos += 8;
-        }
-
         return .{
             .posting_id = std.mem.readInt(u64, data[5..13], .little),
             .generation = std.mem.readInt(u64, data[13..21], .little),
-            .members = members,
+            .member_count = member_count,
         };
+    }
+
+    pub fn decodeBaseMembersInto(data: []const u8, members: []VectorId) !PostingBaseHeader {
+        const header = try decodeBaseHeader(data);
+        if (members.len < header.member_count) return error.BufferTooSmall;
+        var pos: usize = base_header_size;
+        for (members[0..header.member_count]) |*member_id| {
+            member_id.* = std.mem.readInt(u64, data[pos..][0..8], .little);
+            pos += 8;
+        }
+        return header;
+    }
+
+    pub fn decodeBaseIntoScratch(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        data: []const u8,
+    ) !PostingBaseHeader {
+        const header = try decodeBaseHeader(data);
+        try scratch.ensureMemberIdCapacity(alloc, header.member_count);
+        return try decodeBaseMembersInto(data, scratch.member_ids[0..header.member_count]);
     }
 
     pub fn encodeDeltaTail(alloc: std.mem.Allocator, records: []const PostingDeltaRecord) ![]u8 {
@@ -406,6 +443,109 @@ pub const PostingFormat = struct {
         return records;
     }
 
+    const DeltaTailHeader = struct {
+        record_count: usize,
+        compact: bool,
+        base_sequence: u64 = 0,
+        records_offset: usize,
+    };
+
+    fn decodeDeltaTailHeader(data: []const u8) !DeltaTailHeader {
+        if (data.len < delta_header_size) return error.Corrupted;
+        if (!std.mem.eql(u8, data[0..4], &delta_magic)) return error.BadPostingDeltaMagic;
+        const record_count = std.mem.readInt(u32, data[5..9], .little);
+        if (data[4] == delta_compact_version) {
+            if (data.len < delta_compact_header_size) return error.Corrupted;
+            const expected_len = delta_compact_header_size + @as(usize, record_count) * delta_compact_record_size;
+            if (data.len != expected_len) return error.Corrupted;
+            return .{
+                .record_count = record_count,
+                .compact = true,
+                .base_sequence = std.mem.readInt(u64, data[9..17], .little),
+                .records_offset = delta_compact_header_size,
+            };
+        }
+        if (data[4] != version) return error.UnsupportedPostingDeltaVersion;
+        const expected_len = delta_header_size + @as(usize, record_count) * delta_record_size;
+        if (data.len != expected_len) return error.Corrupted;
+        return .{
+            .record_count = record_count,
+            .compact = false,
+            .records_offset = delta_header_size,
+        };
+    }
+
+    pub fn deltaTailRecordCount(data: []const u8) !usize {
+        return (try decodeDeltaTailHeader(data)).record_count;
+    }
+
+    fn decodeDeltaOp(raw: u8) !PostingDeltaOp {
+        return switch (raw) {
+            @intFromEnum(PostingDeltaOp.insert) => .insert,
+            @intFromEnum(PostingDeltaOp.tombstone) => .tombstone,
+            @intFromEnum(PostingDeltaOp.replace) => .replace,
+            else => error.UnsupportedPostingDeltaOp,
+        };
+    }
+
+    fn readDeltaRecord(data: []const u8, header: DeltaTailHeader, pos: *usize) !PostingDeltaRecord {
+        if (header.compact) {
+            const offset = std.mem.readInt(u32, data[pos.*..][0..4], .little);
+            pos.* += 4;
+            const op = try decodeDeltaOp(data[pos.*]);
+            pos.* += 1;
+            const vector_id = std.mem.readInt(u64, data[pos.*..][0..8], .little);
+            pos.* += 8;
+            return .{
+                .sequence = std.math.add(u64, header.base_sequence, @as(u64, offset)) catch return error.Corrupted,
+                .op = op,
+                .vector_id = vector_id,
+            };
+        }
+        const sequence = std.mem.readInt(u64, data[pos.*..][0..8], .little);
+        pos.* += 8;
+        const op = try decodeDeltaOp(data[pos.*]);
+        pos.* += 1;
+        const vector_id = std.mem.readInt(u64, data[pos.*..][0..8], .little);
+        pos.* += 8;
+        return .{ .sequence = sequence, .op = op, .vector_id = vector_id };
+    }
+
+    pub fn deltaTailStatsAfterGeneration(data: []const u8, base_generation: u64) !PostingDeltaTailStats {
+        const header = try decodeDeltaTailHeader(data);
+        var pos = header.records_offset;
+        var stats = PostingDeltaTailStats{ .records = header.record_count };
+        var i: usize = 0;
+        while (i < header.record_count) : (i += 1) {
+            const record = try readDeltaRecord(data, header, &pos);
+            if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            stats.records_after_generation += 1;
+            if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+        }
+        return stats;
+    }
+
+    pub fn applyDeltaTailAfterGenerationIntoScratch(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        member_count: *usize,
+        data: []const u8,
+        base_generation: u64,
+    ) !usize {
+        const header = try decodeDeltaTailHeader(data);
+        try scratch.ensureMemberIdCapacity(alloc, member_count.* + header.record_count);
+        var applied: usize = 0;
+        var pos = header.records_offset;
+        var i: usize = 0;
+        while (i < header.record_count) : (i += 1) {
+            const record = try readDeltaRecord(data, header, &pos);
+            if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            applyDeltaRecordToScratch(scratch, member_count, record);
+            applied += 1;
+        }
+        return applied;
+    }
+
     fn deltaTailCanUseCompactEncoding(records: []const PostingDeltaRecord) bool {
         if (records.len < 3) return false;
         const base_sequence = records[0].sequence;
@@ -482,6 +622,34 @@ pub const PostingFormat = struct {
             i += 1;
         }
     }
+
+    fn applyDeltaRecordToScratch(scratch: anytype, member_count: *usize, record: PostingDeltaRecord) void {
+        switch (record.op) {
+            .insert, .replace => {
+                removeMemberFromScratch(scratch, member_count, record.vector_id);
+                scratch.member_ids[member_count.*] = record.vector_id;
+                member_count.* += 1;
+            },
+            .tombstone => removeMemberFromScratch(scratch, member_count, record.vector_id),
+        }
+    }
+
+    fn removeMemberFromScratch(scratch: anytype, member_count: *usize, vector_id: VectorId) void {
+        var i: usize = 0;
+        while (i < member_count.*) : (i += 1) {
+            if (scratch.member_ids[i] == vector_id) {
+                if (i + 1 < member_count.*) {
+                    std.mem.copyForwards(
+                        VectorId,
+                        scratch.member_ids[i .. member_count.* - 1],
+                        scratch.member_ids[i + 1 .. member_count.*],
+                    );
+                }
+                member_count.* -= 1;
+                return;
+            }
+        }
+    }
 };
 
 pub const PostingMaintenanceOptions = struct {
@@ -493,6 +661,8 @@ pub const PostingMaintenanceOptions = struct {
     min_tombstone_records_to_fold: usize = 16,
     min_delta_to_base_ratio_bps: u32 = 0,
     max_delta_tail_postings: usize = std.math.maxInt(usize),
+    max_delta_fold_materialized_members: usize = std.math.maxInt(usize),
+    max_delta_fold_materialized_bytes: usize = std.math.maxInt(usize),
     rebalance_layout: bool = false,
     split_full_postings: bool = false,
     max_layout_changes: usize = std.math.maxInt(usize),
@@ -582,6 +752,19 @@ pub const PostingBacklogStats = struct {
 };
 
 pub const PostingStore = struct {
+    const OwnedMemberScratch = struct {
+        member_ids: []VectorId = &.{},
+
+        fn ensureMemberIdCapacity(self: *OwnedMemberScratch, alloc: std.mem.Allocator, needed: usize) !void {
+            if (self.member_ids.len < needed) self.member_ids = try alloc.realloc(self.member_ids, needed);
+        }
+
+        fn deinit(self: *OwnedMemberScratch, alloc: std.mem.Allocator) void {
+            alloc.free(self.member_ids);
+            self.member_ids = &.{};
+        }
+    };
+
     pub fn view(node: *const types.Node) !PostingView {
         if (!node.is_leaf) return error.ExpectedLeaf;
         return .{
@@ -629,46 +812,42 @@ pub const PostingStore = struct {
             notePostingOverlayCacheMiss(profile);
         }
 
-        var base = loadBase(index, txn, posting_view.id, isNotFound) catch |err| {
+        const base_data = loadBaseData(index, txn, posting_view.id, isNotFound) catch |err| {
             if (isNotFound(err)) {
                 notePostingOverlayFallback(profile);
                 return try copyMemberIds(alloc, scratch, posting_view);
             }
             return err;
         };
-        defer base.deinit(index.alloc);
-        if (!canonical_base_delta and base.generation < posting_view.state.mutation_version) {
+        const base_header = try PostingFormat.decodeBaseHeader(base_data);
+        if (!canonical_base_delta and base_header.generation < posting_view.state.mutation_version) {
             notePostingOverlayFallback(profile);
             return try copyMemberIds(alloc, scratch, posting_view);
         }
 
-        if (canonical_base_delta and base.generation >= posting_view.state.mutation_version) {
-            try scratch.ensureMemberIdCapacity(alloc, base.members.len);
-            const member_ids = scratch.member_ids[0..base.members.len];
-            @memcpy(member_ids, base.members);
-            try cachePostingMembersIfAvailable(scratch, alloc, posting_view, base.members, profile);
+        if (canonical_base_delta and base_header.generation >= posting_view.state.mutation_version) {
+            _ = try PostingFormat.decodeBaseIntoScratch(alloc, scratch, base_data);
+            const member_ids = scratch.member_ids[0..base_header.member_count];
+            try cachePostingMembersIfAvailable(scratch, alloc, posting_view, member_ids, profile);
             notePostingOverlayDeltaScanSkip(profile);
-            notePostingOverlay(profile, elapsed_fn(start), base.members.len, 0, base.members.len);
+            notePostingOverlay(profile, elapsed_fn(start), base_header.member_count, 0, base_header.member_count);
             return member_ids;
         }
 
-        const deltas = try loadDeltaTail(index, txn, posting_view.id);
-        defer index.alloc.free(deltas);
-        const materialized = try PostingFormat.materializeMembersAfterGeneration(index.alloc, base.members, deltas, base.generation);
-        defer index.alloc.free(materialized);
+        _ = try PostingFormat.decodeBaseIntoScratch(alloc, scratch, base_data);
+        var materialized_len = base_header.member_count;
+        const delta_records_after_base = try applyDeltaTailIntoScratch(index, txn, posting_view.id, alloc, scratch, &materialized_len, base_header.generation);
+        const materialized = scratch.member_ids[0..materialized_len];
         if (!canonical_base_delta and !std.mem.eql(VectorId, materialized, posting_view.members)) {
             notePostingOverlayFallback(profile);
             return try copyMemberIds(alloc, scratch, posting_view);
         }
 
-        try scratch.ensureMemberIdCapacity(alloc, materialized.len);
-        const member_ids = scratch.member_ids[0..materialized.len];
-        @memcpy(member_ids, materialized);
         if (canonical_base_delta) {
             try cachePostingMembersIfAvailable(scratch, alloc, posting_view, materialized, profile);
         }
-        notePostingOverlay(profile, elapsed_fn(start), base.members.len, PostingFormat.deltaRecordsAfterGeneration(deltas, base.generation), materialized.len);
-        return member_ids;
+        notePostingOverlay(profile, elapsed_fn(start), base_header.member_count, delta_records_after_base, materialized.len);
+        return materialized;
     }
 
     pub fn appendMember(
@@ -848,12 +1027,17 @@ pub const PostingStore = struct {
         return try out.toOwnedSlice(index.alloc);
     }
 
-    pub fn loadBase(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !OwnedPostingBase {
+    pub fn loadBaseData(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) ![]const u8 {
         var key_buf: [10]u8 = undefined;
         const data = index.getNamespaced(txn, .nodes, hbc.encodePostingBaseKey(&key_buf, posting_id)) catch |err| {
             if (is_not_found(err)) return error.NotFound;
             return err;
         };
+        return data;
+    }
+
+    pub fn loadBase(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !OwnedPostingBase {
+        const data = try loadBaseData(index, txn, posting_id, is_not_found);
         return try PostingFormat.decodeBase(index.alloc, data);
     }
 
@@ -912,29 +1096,86 @@ pub const PostingStore = struct {
         return try out.toOwnedSlice(index.alloc);
     }
 
-    pub fn materializeBaseDeltaMembers(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) ![]VectorId {
-        var base = try loadBase(index, txn, posting_id, is_not_found);
-        defer base.deinit(index.alloc);
-        const deltas = try loadDeltaTail(index, txn, posting_id);
-        defer index.alloc.free(deltas);
-        return try PostingFormat.materializeMembersAfterGeneration(index.alloc, base.members, deltas, base.generation);
+    pub fn deltaTailStats(index: anytype, txn: anytype, posting_id: PostingId, base_generation: u64) !PostingDeltaTailStats {
+        var cursor = try openNamespacedCursor(index, txn, .nodes);
+        defer cursor.close();
+
+        var prefix_buf: [10]u8 = undefined;
+        const prefix = hbc.encodePostingDeltaPrefix(&prefix_buf, posting_id);
+        var out = PostingDeltaTailStats{};
+
+        var maybe_entry = try cursor.seekAtOrAfter(prefix);
+        while (maybe_entry) |entry| {
+            if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
+            const stats = try PostingFormat.deltaTailStatsAfterGeneration(entry.value, base_generation);
+            out.records += stats.records;
+            out.records_after_generation += stats.records_after_generation;
+            out.tombstones_after_generation += stats.tombstones_after_generation;
+            maybe_entry = try cursor.next();
+        }
+        return out;
     }
 
-    fn deltaTailShouldFold(base_member_count: usize, deltas: []const PostingDeltaRecord, options: FoldDeltaTailOptions) bool {
-        if (deltas.len == 0) return true;
-        if (deltas.len >= options.min_delta_records) return true;
+    pub fn applyDeltaTailIntoScratch(
+        index: anytype,
+        txn: anytype,
+        posting_id: PostingId,
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        member_count: *usize,
+        base_generation: u64,
+    ) !usize {
+        var cursor = try openNamespacedCursor(index, txn, .nodes);
+        defer cursor.close();
 
-        var tombstones: usize = 0;
-        for (deltas) |record| {
-            if (record.op == .tombstone) tombstones += 1;
+        var prefix_buf: [10]u8 = undefined;
+        const prefix = hbc.encodePostingDeltaPrefix(&prefix_buf, posting_id);
+        var applied: usize = 0;
+
+        var maybe_entry = try cursor.seekAtOrAfter(prefix);
+        while (maybe_entry) |entry| {
+            if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
+            applied += try PostingFormat.applyDeltaTailAfterGenerationIntoScratch(
+                alloc,
+                scratch,
+                member_count,
+                entry.value,
+                base_generation,
+            );
+            maybe_entry = try cursor.next();
         }
-        if (options.min_tombstone_records != 0 and tombstones >= options.min_tombstone_records) return true;
+        return applied;
+    }
+
+    pub fn materializeBaseDeltaMembers(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) ![]VectorId {
+        const base_data = try loadBaseData(index, txn, posting_id, is_not_found);
+        var scratch = OwnedMemberScratch{};
+        defer scratch.deinit(index.alloc);
+        const base_header = try PostingFormat.decodeBaseIntoScratch(index.alloc, &scratch, base_data);
+        var materialized_len = base_header.member_count;
+        _ = try applyDeltaTailIntoScratch(index, txn, posting_id, index.alloc, &scratch, &materialized_len, base_header.generation);
+        return try index.alloc.dupe(VectorId, scratch.member_ids[0..materialized_len]);
+    }
+
+    fn deltaTailShouldFold(base_member_count: usize, stats: PostingDeltaTailStats, options: FoldDeltaTailOptions) bool {
+        if (stats.records == 0) return true;
+        if (stats.records_after_generation == 0) return true;
+        if (stats.records_after_generation >= options.min_delta_records) return true;
+
+        if (options.min_tombstone_records != 0 and stats.tombstones_after_generation >= options.min_tombstone_records) return true;
         if (options.min_delta_to_base_ratio_bps != 0) {
             const denominator = @max(base_member_count, @as(usize, 1));
-            const ratio_bps = (deltas.len * 10_000) / denominator;
+            const ratio_bps = (stats.records_after_generation * 10_000) / denominator;
             if (ratio_bps >= options.min_delta_to_base_ratio_bps) return true;
         }
         return false;
+    }
+
+    fn deltaTailExceedsMaterializedLimit(base_member_count: usize, stats: PostingDeltaTailStats, options: FoldDeltaTailOptions) bool {
+        const estimated_members = base_member_count +| stats.records_after_generation;
+        if (estimated_members > options.max_materialized_members) return true;
+        const estimated_bytes = std.math.mul(usize, estimated_members, @sizeOf(VectorId)) catch return true;
+        return estimated_bytes > options.max_materialized_bytes;
     }
 
     pub fn foldDeltaTailIntoBaseWithOptions(
@@ -944,30 +1185,41 @@ pub const PostingStore = struct {
         is_not_found: fn (anyerror) bool,
         options: FoldDeltaTailOptions,
     ) !FoldDeltaTailResult {
-        var base = try loadBase(index, txn, posting_id, is_not_found);
-        defer base.deinit(index.alloc);
-        const deltas = try loadDeltaTail(index, txn, posting_id);
-        defer index.alloc.free(deltas);
-        if (deltas.len == 0) {
+        const base_data = try loadBaseData(index, txn, posting_id, is_not_found);
+        var scratch = OwnedMemberScratch{};
+        defer scratch.deinit(index.alloc);
+        const base_header = try PostingFormat.decodeBaseIntoScratch(index.alloc, &scratch, base_data);
+        const stats = try deltaTailStats(index, txn, posting_id, base_header.generation);
+        if (stats.records == 0) {
             return .{
-                .base_member_count = base.members.len,
-                .materialized_member_count = base.members.len,
-                .next_generation = base.generation,
+                .base_member_count = base_header.member_count,
+                .materialized_member_count = base_header.member_count,
+                .next_generation = base_header.generation,
             };
         }
-        if (!deltaTailShouldFold(base.members.len, deltas, options)) {
+        if (!deltaTailShouldFold(base_header.member_count, stats, options)) {
             return .{
-                .delta_records = deltas.len,
-                .base_member_count = base.members.len,
-                .materialized_member_count = base.members.len,
-                .next_generation = base.generation,
+                .delta_records = stats.records,
+                .base_member_count = base_header.member_count,
+                .materialized_member_count = base_header.member_count,
+                .next_generation = base_header.generation,
+                .skipped = true,
+            };
+        }
+        if (deltaTailExceedsMaterializedLimit(base_header.member_count, stats, options)) {
+            return .{
+                .delta_records = stats.records,
+                .base_member_count = base_header.member_count,
+                .materialized_member_count = base_header.member_count,
+                .next_generation = base_header.generation,
                 .skipped = true,
             };
         }
 
-        const materialized = try PostingFormat.materializeMembersAfterGeneration(index.alloc, base.members, deltas, base.generation);
-        defer index.alloc.free(materialized);
-        const next_generation = base.generation +| 1;
+        var materialized_len = base_header.member_count;
+        _ = try applyDeltaTailIntoScratch(index, txn, posting_id, index.alloc, &scratch, &materialized_len, base_header.generation);
+        const materialized = scratch.member_ids[0..materialized_len];
+        const next_generation = base_header.generation +| 1;
         const folded_base = PostingBase{
             .posting_id = posting_id,
             .generation = next_generation,
@@ -978,10 +1230,10 @@ pub const PostingStore = struct {
         const written_base_value_bytes = try PostingFormat.encodedBaseSize(folded_base);
         try saveBase(index, txn, folded_base);
         const deleted_tail = try deleteDeltaTail(index, txn, posting_id);
-        notePostingDeltaFold(index, PostingFormat.deltaRecordsAfterGeneration(deltas, base.generation), base.members.len, materialized.len, deleted_tail, written_base_key_bytes, written_base_value_bytes);
+        notePostingDeltaFold(index, stats.records_after_generation, base_header.member_count, materialized.len, deleted_tail, written_base_key_bytes, written_base_value_bytes);
         return .{
-            .delta_records = deltas.len,
-            .base_member_count = base.members.len,
+            .delta_records = stats.records,
+            .base_member_count = base_header.member_count,
             .materialized_member_count = materialized.len,
             .deleted_tail_keys = deleted_tail.keys,
             .deleted_tail_key_bytes = deleted_tail.key_bytes,
@@ -2659,6 +2911,42 @@ test "posting store can defer delta fold until policy threshold is reached" {
     const deltas_after_fold = try PostingStore.loadDeltaTail(&index, &txn, 9);
     defer alloc.free(deltas_after_fold);
     try std.testing.expectEqual(@as(usize, 0), deltas_after_fold.len);
+}
+
+test "posting store skips delta fold when materialized member cap would be exceeded" {
+    const alloc = std.testing.allocator;
+    var index = PostingPersistenceTestIndex{ .alloc = alloc };
+    defer index.deinit();
+    var txn = struct {}{};
+
+    const members = [_]VectorId{ 100, 200, 300 };
+    try PostingStore.saveBase(&index, &txn, .{
+        .posting_id = 9,
+        .generation = 4,
+        .members = members[0..],
+    });
+    try PostingStore.appendDelta(&index, &txn, 9, .{
+        .sequence = (@as(u64, 5) << 32) | 1,
+        .op = .insert,
+        .vector_id = 400,
+    });
+
+    const skipped = try PostingStore.foldDeltaTailIntoBaseWithOptions(&index, &txn, 9, isNotFoundForPostingPersistenceTest, .{
+        .min_delta_records = 1,
+        .max_materialized_members = 3,
+    });
+    try std.testing.expect(skipped.skipped);
+    try std.testing.expectEqual(@as(usize, 1), skipped.delta_records);
+    try std.testing.expectEqual(@as(u64, 4), skipped.next_generation);
+
+    var base_after_skip = try PostingStore.loadBase(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
+    defer base_after_skip.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 4), base_after_skip.generation);
+    try std.testing.expectEqualSlices(VectorId, members[0..], base_after_skip.members);
+
+    const deltas_after_skip = try PostingStore.loadDeltaTail(&index, &txn, 9);
+    defer alloc.free(deltas_after_skip);
+    try std.testing.expectEqual(@as(usize, 1), deltas_after_skip.len);
 }
 
 test "posting store query member copy overlays base and delta tail in shadow mode" {
