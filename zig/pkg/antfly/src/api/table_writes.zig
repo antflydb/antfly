@@ -2428,54 +2428,36 @@ pub const BoundTableWriteSource = struct {
         table_name: []const u8,
         plan: backups_api.TableRestorePlan,
     ) !?void {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (plan.manifest.shards.len == 0) return error.UnsupportedBackupFormat;
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        if (plan.manifest.shards.len != 1) return error.UnsupportedBackupFormat;
 
-        const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
-        defer alloc.free(local_location);
+        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, plan.manifest.shards[0].snapshot_path });
+        defer alloc.free(snapshot_root);
 
-        self.beginLocalRestoreMutation(table_name);
-        errdefer self.abortLocalRestoreMutation(table_name);
-        var restore_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer restore_io_impl.deinit();
+        const db_path = try alloc.dupe(u8, self.db.core.path);
+        defer alloc.free(db_path);
+        const primary_backend = self.db.primary_backend;
+        var owned_backend_runtime = self.db.owned_backend_runtime;
+        self.db.owned_backend_runtime = null;
+        errdefer if (owned_backend_runtime) |*runtime| runtime.deinit();
+        const backend_runtime = if (owned_backend_runtime) |*runtime|
+            runtime.runtime
+        else
+            self.db.backend_runtime;
+        const identity_namespace = self.db.core.identity_namespace;
 
-        for (plan.manifest.shards) |shard| {
-            const group_id = shard.group_id;
-            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-            defer alloc.free(path);
-            const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
-
-            const ready_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
-            while (true) {
-                if (std.Io.Dir.cwd().statFile(restore_io_impl.io(), path, .{})) |_| break else |_| {}
-                if (platform_time.monotonicNs() >= ready_deadline_ns) break;
-                sleepNs(50 * std.time.ns_per_ms);
-            }
-
-            runTestBeforeRestoreWorkHook();
-            backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
-                .backup_id = plan.manifest.backup_id,
-                .location = local_location,
-                .snapshot_path = shard.snapshot_path,
-            }, .{
-                .expected_table_name = table_name,
-                .expected_identity_namespace = identity_namespace,
-            }) catch |err| {
-                std.log.err("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_path={s} err={}", .{
-                    table_name,
-                    group_id,
-                    path,
-                    shard.snapshot_path,
-                    err,
-                });
-                return err;
-            };
-            self.requestRestoreRepairCatchUp(table_name, group_id);
-        }
-
-        self.finishLocalRestoreMutation(table_name);
-        self.notifyLocalChange(table_name, .structural);
-        self.notifyLocalChange(table_name, .data);
+        self.db.close();
+        try db_mod.DB.restoreSnapshotTo(alloc, snapshot_root, db_path, .{
+            .primary_backend = primary_backend,
+            .identity_namespace = identity_namespace,
+        });
+        self.db.* = try db_mod.DB.open(alloc, db_path, .{
+            .primary_backend = primary_backend,
+            .backend_runtime = backend_runtime,
+        });
+        self.db.owned_backend_runtime = owned_backend_runtime;
+        owned_backend_runtime = null;
     }
 
     fn commitTransaction(
