@@ -63,6 +63,14 @@ pub const DocumentArtifactChildRange = struct {
     split_boundary: []const u8,
     /// Current placement summary for the range.
     placement: []const u8,
+    /// Owner group for this child artifact range, when assigned.
+    owner_group_id: ?i64 = null,
+    /// Placement generation for range ownership metadata.
+    placement_generation: ?i64 = null,
+    /// Current routing status for child writes in this range.
+    route_status: ?[]const u8 = null,
+    /// Whether this range may split at its configured split boundary.
+    split_eligible: ?bool = null,
     /// Inclusive first internal child key covered by this range.
     start_key: []const u8,
     /// Exclusive end internal child key, or empty for the final range.

@@ -405,6 +405,10 @@ pub const DocumentArtifactChildRange = struct {
     artifact_name: []u8,
     split_boundary: []u8,
     placement: []u8,
+    owner_group_id: ?u64 = null,
+    placement_generation: ?u64 = null,
+    route_status: ?[]u8 = null,
+    split_eligible: ?bool = null,
     start_key: []u8,
     end_key_exclusive: []u8,
     last_key: []u8,
@@ -417,6 +421,7 @@ pub const DocumentArtifactChildRange = struct {
         alloc.free(self.artifact_name);
         alloc.free(self.split_boundary);
         alloc.free(self.placement);
+        if (self.route_status) |value| alloc.free(value);
         alloc.free(self.start_key);
         alloc.free(self.end_key_exclusive);
         alloc.free(self.last_key);

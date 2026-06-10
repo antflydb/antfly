@@ -475,11 +475,12 @@ Current implementation status:
 - Full-text consumers for stable units are still routed through derived-document upserts that read from the stored unit/chunk artifacts. This avoids silent index holes without requiring the producer to prove every text shard already contains the child document.
 - The first implementation records range placement as `parent`; it establishes the parent-owned descriptor contract without moving child writes to separate shards yet.
 - Asynchronous document extraction now durably writes an `in_progress` merge plan before child artifact writes and replaces it with the converged plan after the child range batch commits. The in-progress manifest keeps the last committed generation while its merge plan records the intended `to_generation`, so replay after a crash does not skip a generation.
+- Child range descriptors now carry additive route/ownership metadata (`owner_group_id`, `placement_generation`, `route_status`, `split_eligible`) through local manifest parsing, public manifest responses, internal group responses, and remote manifest fanout. Current writers mark ranges as `local_committed` and parent-owned, giving future split workers a stable field set to advance when a child range moves away from the parent shard.
 
 Still remaining in Phase 3:
 
 - Route child writes and deletes through range descriptors instead of writing every child locally with the parent batch.
-- Add ownership and placement updates when an artifact range splits away from the parent shard.
+- Add ownership and placement updates when an artifact range actually splits away from the parent shard.
 - Add durable coverage/watermark checks if we want to suppress even the stored-artifact full-text replay for already-covered child documents.
 
 ### Phase 4: Graph extraction over units

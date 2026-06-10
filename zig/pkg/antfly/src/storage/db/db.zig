@@ -13754,6 +13754,18 @@ fn jsonObjectOptionalUsize(object: std.json.ObjectMap, field_name: []const u8) !
     return std.math.cast(usize, value.integer) orelse return error.InvalidDocumentExtractionManifest;
 }
 
+fn jsonObjectOptionalU64(object: std.json.ObjectMap, field_name: []const u8) !?u64 {
+    const value = object.get(field_name) orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(u64, value.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectOptionalBool(object: std.json.ObjectMap, field_name: []const u8) !?bool {
+    const value = object.get(field_name) orelse return null;
+    if (value != .bool) return error.InvalidDocumentExtractionManifest;
+    return value.bool;
+}
+
 fn documentArtifactChildRangesFromJsonAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]types.DocumentArtifactChildRange {
     const value = object.get("child_ranges") orelse return try alloc.alloc(types.DocumentArtifactChildRange, 0);
     if (value != .array) return try alloc.alloc(types.DocumentArtifactChildRange, 0);
@@ -13773,6 +13785,10 @@ fn documentArtifactChildRangesFromJsonAlloc(alloc: Allocator, object: std.json.O
             .artifact_name = try jsonObjectStringDup(alloc, item.object, "artifact_name"),
             .split_boundary = try jsonObjectStringDup(alloc, item.object, "split_boundary"),
             .placement = try jsonObjectStringDup(alloc, item.object, "placement"),
+            .owner_group_id = try jsonObjectOptionalU64(item.object, "owner_group_id"),
+            .placement_generation = try jsonObjectOptionalU64(item.object, "placement_generation"),
+            .route_status = try jsonObjectOptionalStringDup(alloc, item.object, "route_status"),
+            .split_eligible = try jsonObjectOptionalBool(item.object, "split_eligible"),
             .start_key = try jsonObjectStringDup(alloc, item.object, "start_key"),
             .end_key_exclusive = try jsonObjectStringDup(alloc, item.object, "end_key_exclusive"),
             .last_key = try jsonObjectStringDup(alloc, item.object, "last_key"),
@@ -13961,6 +13977,10 @@ fn appendDocumentExtractionKeyRanges(
         try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
         try appendJsonFieldString(alloc, out, &first, "split_boundary", "unit");
         try appendJsonFieldString(alloc, out, &first, "placement", "parent");
+        try appendJsonFieldU64(alloc, out, &first, "owner_group_id", 0);
+        try appendJsonFieldU64(alloc, out, &first, "placement_generation", 0);
+        try appendJsonFieldString(alloc, out, &first, "route_status", "local_committed");
+        try appendJsonFieldBool(alloc, out, &first, "split_eligible", end - start > 1);
         try appendJsonFieldString(alloc, out, &first, "start_key", keys[start]);
         try appendJsonFieldString(alloc, out, &first, "end_key_exclusive", if (end < keys.len) keys[end] else "");
         try appendJsonFieldString(alloc, out, &first, "last_key", keys[end - 1]);
@@ -29308,6 +29328,10 @@ test "db document extraction manifest classifies unit fingerprint keeps" {
 
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"operation_granularity\":\"unit_fingerprint\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"status\":\"converged\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"owner_group_id\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"placement_generation\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_status\":\"local_committed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"split_eligible\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"keep\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"upsert\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
@@ -29459,6 +29483,10 @@ test "db document extraction manifest inspection and reprocess API" {
     try std.testing.expectEqualStrings("range:000000", inspected.child_ranges[0].range_id);
     try std.testing.expectEqualStrings("unit", inspected.child_ranges[0].range_kind);
     try std.testing.expectEqualStrings("document_units_v1", inspected.child_ranges[0].artifact_name);
+    try std.testing.expectEqual(@as(?u64, 0), inspected.child_ranges[0].owner_group_id);
+    try std.testing.expectEqual(@as(?u64, 0), inspected.child_ranges[0].placement_generation);
+    try std.testing.expectEqualStrings("local_committed", inspected.child_ranges[0].route_status.?);
+    try std.testing.expectEqual(@as(?bool, false), inspected.child_ranges[0].split_eligible);
     try std.testing.expectEqual(@as(usize, 1), inspected.child_ranges[0].child_count);
     try std.testing.expect(inspected.child_ranges[0].text_bytes != null);
     try std.testing.expectEqualStrings("chunk", inspected.child_ranges[1].range_kind);
