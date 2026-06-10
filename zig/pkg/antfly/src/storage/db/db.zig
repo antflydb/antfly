@@ -13431,6 +13431,10 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .parent_unit_id = unit.unit_id,
         .source_artifact_name = source_artifact_name,
         .document_char_base = unit.char_start,
+        .page_number = unit.page_number,
+        .page_label = unit.page_label,
+        .page_bbox = unit.page_bbox,
+        .page_rotation = unit.page_rotation,
     });
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
@@ -13465,6 +13469,20 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
     if (unit.page_number) |page_number| {
         var buf: [@sizeOf(u32)]u8 = undefined;
         std.mem.writeInt(u32, &buf, page_number, .big);
+        hasher.update(&buf);
+    }
+    if (unit.page_label) |page_label| {
+        hasher.update(page_label);
+    }
+    if (unit.page_bbox) |bbox| {
+        for (bbox) |coord| {
+            var coord_value = coord;
+            hasher.update(std.mem.asBytes(&coord_value));
+        }
+    }
+    if (unit.page_rotation) |rotation| {
+        var buf: [@sizeOf(i32)]u8 = undefined;
+        std.mem.writeInt(i32, &buf, rotation, .big);
         hasher.update(&buf);
     }
     if (unit.char_start) |char_start| {
@@ -13623,6 +13641,9 @@ fn documentUnitPayloadAlloc(
             .method = unit.method,
             .ocr_used = false,
             .page_number = unit.page_number,
+            .page_label = unit.page_label,
+            .page_bbox = unit.page_bbox,
+            .page_rotation = unit.page_rotation,
             .char_start = unit.char_start,
             .char_end = unit.char_end,
             .source_content_type = content_type,
@@ -28566,6 +28587,35 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, asset_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
+}
+
+test "db document unit payload preserves pdf page provenance" {
+    const alloc = std.testing.allocator;
+    const unit = document_extraction_mod.Unit{
+        .unit_id = @constCast("page:000001"),
+        .unit_type = @constCast("page"),
+        .text = @constCast("hello"),
+        .method = @constCast("pdf_text"),
+        .page_number = 1,
+        .page_label = @constCast("i"),
+        .page_bbox = .{ 0, 0, 612, 792 },
+        .page_rotation = 90,
+        .char_start = 0,
+        .char_end = 5,
+    };
+
+    const payload = try documentUnitPayloadAlloc(alloc, "doc:a", "document_units_v1", unit, "data:application/pdf;base64,AA==", "application/pdf");
+    defer alloc.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+    const provenance = parsed.value.object.get("provenance").?.object;
+    try std.testing.expectEqual(@as(i64, 1), provenance.get("page_number").?.integer);
+    try std.testing.expectEqualStrings("i", provenance.get("page_label").?.string);
+    const page_bbox = provenance.get("page_bbox").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), page_bbox.len);
+    try std.testing.expectEqual(@as(f64, 612), page_bbox[2].float);
+    try std.testing.expectEqual(@as(i64, 90), provenance.get("page_rotation").?.integer);
 }
 
 test "db document extraction asset materializes unit artifacts from data url" {

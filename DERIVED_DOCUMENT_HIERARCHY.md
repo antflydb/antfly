@@ -410,13 +410,14 @@ Current implementation status:
 - Public artifact list, manifest inspection, and reprocess routes now apply the caller's effective source-row filter before exposing or mutating artifact control-plane state; hidden source documents return `404` to avoid leaking artifact existence.
 - Artifact inspection responses now expose typed source URL, source fingerprint, content type, manifest version, child range descriptors, and merge-plan generation/granularity summaries in addition to preserving raw manifest/state JSON.
 - Public/internal routing now includes a bounded operational table-range repair endpoint, `POST /db/v1/tables/{table}/artifacts/{artifact}:reprocess`, with `from_key`, `to_key`, and `limit` controls plus scanned/reprocessed/skipped/failed counts and per-key failure codes. Hosted/provisioned implementations fan this out to shard-local group handlers and aggregate the bounded pass response.
+- PDF mechanical extraction now emits page-level provenance on units and unit-derived chunks, including `page_number`, a stable `page_label`, `page_bbox`, and source-document character spans. `page_rotation` remains nullable until the PDF reader exposes rotation.
 - Unit payloads are emitted as derived documents for full-text indexes whose source artifact matches the document-unit artifact name.
 - The synchronous precompute path and async enrichment runtime path both use the same artifact key/state contract.
 
 Still remaining in Phase 1:
 
 - Decide how much of the built-in route config should be exposed publicly versus wrapped in presets.
-- Add deeper PDF provenance such as page labels, bounding boxes, rotations, and extraction warnings.
+- Add deeper PDF provenance such as rotation, extraction warnings, text-region bounding boxes, and OCR coordinates as the PDF reader and OCR pipelines expose them.
 - Define the broader permission model for artifact inspection and reprocess controls, especially admin-only detail expansion and long-running/background table-wide operations.
 
 ### Phase 2: Unit-aware chunking and indexing
@@ -627,6 +628,9 @@ Recommended standard fields:
 - `provenance.char_start`
 - `provenance.char_end`
 - `provenance.page_number`
+- `provenance.page_label`
+- `provenance.page_bbox`
+- `provenance.page_rotation`
 - `provenance.confidence`
 
 Extractor-specific fields should live under a namespaced object:
@@ -635,9 +639,10 @@ Extractor-specific fields should live under a namespaced object:
 {
   "extractor": {
     "pdf": {
-      "page_label": "xii",
-      "bbox": [0, 0, 612, 792],
-      "rotation": 0
+      "text_regions": [
+        { "span": [120, 164], "bbox": [72, 144, 240, 160] }
+      ],
+      "warnings": ["missing ToUnicode map"]
     }
   }
 }

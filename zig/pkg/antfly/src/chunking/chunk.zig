@@ -53,6 +53,10 @@ pub const ProvenanceOptions = struct {
     parent_unit_id: ?[]const u8 = null,
     source_artifact_name: ?[]const u8 = null,
     document_char_base: ?u32 = null,
+    page_number: ?u32 = null,
+    page_label: ?[]const u8 = null,
+    page_bbox: ?[4]f64 = null,
+    page_rotation: ?i32 = null,
 };
 
 pub fn appendArtifactFields(
@@ -120,6 +124,10 @@ fn appendProvenanceFields(
     if (options.parent_unit_key) |value| try putString(alloc, &provenance, "parent_unit_key", value);
     if (options.parent_unit_id) |value| try putString(alloc, &provenance, "parent_unit_id", value);
     if (options.source_artifact_name) |value| try putString(alloc, &provenance, "source_artifact_name", value);
+    if (options.page_number) |value| try provenance.put(alloc, try alloc.dupe(u8, "page_number"), .{ .integer = value });
+    if (options.page_label) |value| try putString(alloc, &provenance, "page_label", value);
+    if (options.page_bbox) |bbox| try provenance.put(alloc, try alloc.dupe(u8, "page_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
+    if (options.page_rotation) |value| try provenance.put(alloc, try alloc.dupe(u8, "page_rotation"), .{ .integer = value });
 
     if (chunk.start_offset) |start| {
         try provenance.put(alloc, try alloc.dupe(u8, "char_start"), .{ .integer = start });
@@ -151,6 +159,13 @@ fn appendProvenanceFields(
 
 fn putString(alloc: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
     try obj.put(alloc, try alloc.dupe(u8, key), .{ .string = try alloc.dupe(u8, value) });
+}
+
+fn jsonFloatArrayAlloc(alloc: Allocator, values: []const f64) !std.json.Array {
+    var array = std.json.Array.init(alloc);
+    errdefer array.deinit();
+    for (values) |value| try array.append(.{ .float = value });
+    return array;
 }
 
 fn base64EncodeAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
@@ -227,12 +242,22 @@ test "append artifact fields stores unit-local and document-global provenance" {
         .parent_unit_id = "page:000001",
         .source_artifact_name = "document_units_v1",
         .document_char_base = 100,
+        .page_number = 1,
+        .page_label = "i",
+        .page_bbox = .{ 0, 0, 612, 792 },
+        .page_rotation = 90,
     });
     const provenance = obj.get("provenance").?.object;
     try std.testing.expectEqualStrings("unit", provenance.get("offset_basis").?.string);
     try std.testing.expectEqualStrings("doc:a", provenance.get("parent_doc_key").?.string);
     try std.testing.expectEqualStrings("page:000001", provenance.get("parent_unit_id").?.string);
     try std.testing.expectEqualStrings("document_units_v1", provenance.get("source_artifact_name").?.string);
+    try std.testing.expectEqual(@as(i64, 1), provenance.get("page_number").?.integer);
+    try std.testing.expectEqualStrings("i", provenance.get("page_label").?.string);
+    const page_bbox = provenance.get("page_bbox").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), page_bbox.len);
+    try std.testing.expectEqual(@as(f64, 612), page_bbox[2].float);
+    try std.testing.expectEqual(@as(i64, 90), provenance.get("page_rotation").?.integer);
     try std.testing.expectEqual(@as(i64, 5), provenance.get("unit_char_start").?.integer);
     try std.testing.expectEqual(@as(i64, 10), provenance.get("unit_char_end").?.integer);
     try std.testing.expectEqual(@as(i64, 105), provenance.get("document_char_start").?.integer);

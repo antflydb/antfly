@@ -2003,6 +2003,10 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .parent_unit_id = unit.unit_id,
         .source_artifact_name = source_artifact_name,
         .document_char_base = unit.char_start,
+        .page_number = unit.page_number,
+        .page_label = unit.page_label,
+        .page_bbox = unit.page_bbox,
+        .page_rotation = unit.page_rotation,
     });
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
@@ -3889,6 +3893,9 @@ fn documentUnitPayloadAlloc(
             .method = unit.method,
             .ocr_used = false,
             .page_number = unit.page_number,
+            .page_label = unit.page_label,
+            .page_bbox = unit.page_bbox,
+            .page_rotation = unit.page_rotation,
             .char_start = unit.char_start,
             .char_end = unit.char_end,
             .source_content_type = content_type,
