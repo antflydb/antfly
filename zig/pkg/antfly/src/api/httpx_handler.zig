@@ -2007,6 +2007,18 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponse(ctx, &resp);
     }
 
+    pub fn reprocessDocumentArtifactRange(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
+        defer alloc.free(decoded_artifact_name);
+        const body_data = (try ctx.body()) orelse "";
+        var resp = try public_table_http.handleReprocessDocumentArtifactRange(alloc, table_name, decoded_artifact_name, body_data, self.api_server.tableApi());
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
     pub fn listIndexes(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);

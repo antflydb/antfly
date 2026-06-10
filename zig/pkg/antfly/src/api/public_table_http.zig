@@ -110,6 +110,14 @@ pub const TableApi = struct {
         InternalFailure,
     };
 
+    pub const ExecuteReprocessDocumentArtifactRangeError = error{
+        NotFound,
+        MethodNotAllowed,
+        InvalidRequest,
+        DocIdentityUnavailable,
+        InternalFailure,
+    };
+
     pub const TableQueryView = enum {
         default_view,
         published,
@@ -195,6 +203,13 @@ pub const TableApi = struct {
             doc_key: []const u8,
             artifact_name: []const u8,
         ) ExecuteReprocessDocumentArtifactError!void = null,
+        execute_reprocess_document_artifact_range: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+            req: db_mod.types.DocumentArtifactTableReprocessRequest,
+        ) ExecuteReprocessDocumentArtifactRangeError!db_mod.types.DocumentArtifactTableReprocessResult = null,
     };
 
     pub fn executeTableBatch(
@@ -312,6 +327,17 @@ pub const TableApi = struct {
     ) ExecuteReprocessDocumentArtifactError!void {
         const fn_ptr = self.vtable.execute_reprocess_document_artifact orelse return error.MethodNotAllowed;
         return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name);
+    }
+
+    pub fn executeReprocessDocumentArtifactRange(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        req: db_mod.types.DocumentArtifactTableReprocessRequest,
+    ) ExecuteReprocessDocumentArtifactRangeError!db_mod.types.DocumentArtifactTableReprocessResult {
+        const fn_ptr = self.vtable.execute_reprocess_document_artifact_range orelse return error.MethodNotAllowed;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, req);
     }
 };
 
@@ -799,6 +825,77 @@ pub fn handleReprocessDocumentArtifact(
     return .{
         .status = 202,
         .body = try alloc.dupe(u8, "{\"reprocess\":\"triggered\"}"),
+    };
+}
+
+pub fn handleReprocessDocumentArtifactRange(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    artifact_name: []const u8,
+    body: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    const Request = struct {
+        from_key: []const u8 = "",
+        to_key: []const u8 = "",
+        limit: u32 = 100,
+    };
+    const FailureResponse = struct {
+        key: []const u8,
+        error_code: []const u8,
+    };
+    const Response = struct {
+        reprocess: []const u8,
+        artifact_name: []const u8,
+        scanned: usize,
+        reprocessed: usize,
+        skipped: usize,
+        failed: usize,
+        limit: u32,
+        next_key: ?[]const u8,
+        failures: []const FailureResponse,
+    };
+
+    var parsed = std.json.parseFromSlice(Request, alloc, if (body.len > 0) body else "{}", .{}) catch {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "invalid request") };
+    };
+    defer parsed.deinit();
+
+    var result = api.executeReprocessDocumentArtifactRange(alloc, table_name, artifact_name, .{
+        .from_key = parsed.value.from_key,
+        .to_key = parsed.value.to_key,
+        .limit = parsed.value.limit,
+    }) catch |err| switch (err) {
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid request") },
+        error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact reprocess failed") },
+    };
+    defer result.deinit(alloc);
+
+    const failures = try alloc.alloc(FailureResponse, result.failures.len);
+    defer alloc.free(failures);
+    for (result.failures, failures) |failure, *out| {
+        out.* = .{
+            .key = failure.key,
+            .error_code = failure.error_code,
+        };
+    }
+
+    return .{
+        .status = 202,
+        .body = try std.json.Stringify.valueAlloc(alloc, Response{
+            .reprocess = "triggered",
+            .artifact_name = artifact_name,
+            .scanned = result.scanned,
+            .reprocessed = result.reprocessed,
+            .skipped = result.skipped,
+            .failed = result.failed,
+            .limit = result.limit,
+            .next_key = result.next_key,
+            .failures = failures,
+        }, .{}),
     };
 }
 
@@ -1579,4 +1676,90 @@ test "public document artifact reprocess handler returns accepted" {
 
     try std.testing.expectEqual(@as(u16, 202), resp.status);
     try std.testing.expectEqualStrings("{\"reprocess\":\"triggered\"}", resp.body);
+}
+
+test "public document artifact range reprocess handler returns bounded summary" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                    .execute_reprocess_document_artifact_range = executeReprocessDocumentArtifactRange,
+                },
+            };
+        }
+
+        fn executeReprocessDocumentArtifactRange(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+            req: db_mod.types.DocumentArtifactTableReprocessRequest,
+        ) TableApi.ExecuteReprocessDocumentArtifactRangeError!db_mod.types.DocumentArtifactTableReprocessResult {
+            if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
+            if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
+            if (!std.mem.eql(u8, req.from_key, "doc:a")) return error.InternalFailure;
+            if (req.limit != 10) return error.InternalFailure;
+            const failures = try alloc.alloc(db_mod.types.DocumentArtifactReprocessFailure, 1);
+            failures[0] = .{
+                .key = try alloc.dupe(u8, "doc:b"),
+                .error_code = try alloc.dupe(u8, "InvalidDataUri"),
+            };
+            return .{
+                .scanned = 2,
+                .reprocessed = 1,
+                .skipped = 0,
+                .failed = 1,
+                .limit = 10,
+                .next_key = try alloc.dupe(u8, "doc:b"),
+                .failures = failures,
+            };
+        }
+    };
+
+    var resp = try handleReprocessDocumentArtifactRange(
+        std.testing.allocator,
+        "docs",
+        "document_units_v1",
+        "{\"from_key\":\"doc:a\",\"limit\":10}",
+        Backend.iface(),
+    );
+    defer resp.deinit(std.testing.allocator);
+
+    const Parsed = struct {
+        reprocess: []const u8,
+        artifact_name: []const u8,
+        scanned: usize,
+        reprocessed: usize,
+        failed: usize,
+        next_key: ?[]const u8,
+        failures: []const struct {
+            key: []const u8,
+            error_code: []const u8,
+        },
+    };
+    var parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, resp.body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 202), resp.status);
+    try std.testing.expectEqualStrings("triggered", parsed.value.reprocess);
+    try std.testing.expectEqualStrings("document_units_v1", parsed.value.artifact_name);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.scanned);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.reprocessed);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.failed);
+    try std.testing.expectEqualStrings("doc:b", parsed.value.next_key.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.failures.len);
+    try std.testing.expectEqualStrings("doc:b", parsed.value.failures[0].key);
+    try std.testing.expectEqualStrings("InvalidDataUri", parsed.value.failures[0].error_code);
 }

@@ -278,6 +278,19 @@ pub const ListDocumentArtifactManifestsPathParams = struct {
     key: []const u8,
 };
 
+/// Reprocess a derived document artifact across a table range
+pub const ReprocessDocumentArtifactRangePathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
+/// Parse the JSON request body for reprocessDocumentArtifactRange.
+pub fn parseReprocessDocumentArtifactRangeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DocumentArtifactTableReprocessRequest) {
+    return std.json.parseFromSlice(types.DocumentArtifactTableReprocessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Inspect a derived document artifact manifest
 pub const GetDocumentArtifactManifestPathParams = struct {
     /// Name of the table
@@ -567,6 +580,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/lookup", .operation_id = "scanKeys" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}:reprocess", .operation_id = "reprocessDocumentArtifactRange" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest" },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess", .operation_id = "reprocessDocumentArtifact" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes" },
@@ -640,6 +654,7 @@ pub const routes = [_]Route{
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

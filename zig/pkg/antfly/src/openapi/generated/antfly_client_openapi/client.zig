@@ -552,6 +552,17 @@ pub const Client = struct {
         return ApiResponse(types.DocumentArtifactManifestList).fromResponse(self.allocator, &resp);
     }
 
+    /// Reprocess a derived document artifact across a table range
+    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}:reprocess
+    pub fn reprocessDocumentArtifactRange(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.DocumentArtifactTableReprocessRequest) !ApiResponse(types.DocumentArtifactTableReprocessResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}:reprocess", .{ self.base_url, table_name, artifact_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.DocumentArtifactTableReprocessResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Inspect a derived document artifact manifest
     /// GET /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}
     pub fn getDocumentArtifactManifest(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8) !ApiResponse(types.DocumentArtifactManifest) {

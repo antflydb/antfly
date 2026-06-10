@@ -3123,6 +3123,9 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST) {
+            if (routes.Routes.matchTableArtifactReprocess(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicReprocessDocumentArtifactRange(artifact_route.table_name, artifact_route.artifact_name, req.body);
+            }
             if (routes.Routes.matchTableDocumentArtifactReprocess(uri_parts.path)) |artifact_route| {
                 return try self.handlePublicReprocessDocumentArtifact(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name, authenticated_identity);
             }
@@ -4493,6 +4496,7 @@ pub const ApiHttpServer = struct {
                 .execute_document_artifact_manifest = executePublicDocumentArtifactManifest,
                 .execute_document_artifact_manifests = executePublicDocumentArtifactManifests,
                 .execute_reprocess_document_artifact = executePublicReprocessDocumentArtifact,
+                .execute_reprocess_document_artifact_range = executePublicReprocessDocumentArtifactRange,
             },
         };
     }
@@ -5356,6 +5360,26 @@ pub const ApiHttpServer = struct {
         if (!handled.?) return error.NotFound;
     }
 
+    fn executePublicReprocessDocumentArtifactRange(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        req: db_mod.types.DocumentArtifactTableReprocessRequest,
+    ) public_table_http.TableApi.ExecuteReprocessDocumentArtifactRangeError!db_mod.types.DocumentArtifactTableReprocessResult {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_writes orelse return error.NotFound;
+        return (source.reprocessDocumentArtifactRange(alloc, table_name, artifact_name, req) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.InvalidArgument => return error.InvalidRequest,
+            error.NotFound => return error.NotFound,
+            else => {
+                std.log.err("public document artifact range reprocess failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                return error.InternalFailure;
+            },
+        }) orelse error.MethodNotAllowed;
+    }
+
     fn executePublicClusterBackupList(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5794,6 +5818,18 @@ pub const ApiHttpServer = struct {
             return try textResponse(self.alloc, 404, "not found");
         }
         var resp = try public_table_http.handleReprocessDocumentArtifact(self.alloc, table_name, doc_key, artifact_name, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicReprocessDocumentArtifactRange(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+
+        var resp = try public_table_http.handleReprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, body, self.tableApi());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),

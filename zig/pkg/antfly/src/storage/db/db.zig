@@ -4762,6 +4762,65 @@ pub const DB = struct {
         return true;
     }
 
+    pub fn reprocessDocumentArtifactRange(
+        self: *DB,
+        alloc: Allocator,
+        artifact_name: []const u8,
+        req: types.DocumentArtifactTableReprocessRequest,
+    ) !types.DocumentArtifactTableReprocessResult {
+        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return error.NotFound;
+        defer cfg.deinit(alloc);
+        var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
+        defer producer_cfg.deinit(alloc);
+        if (producer_cfg.type != .document_extraction) return error.InvalidArgument;
+
+        const limit = if (req.limit == 0) @as(u32, 100) else req.limit;
+        const scan_limit = if (limit == std.math.maxInt(u32)) limit else limit + 1;
+        var scanned = try self.scan(alloc, req.from_key, req.to_key, .{
+            .include_documents = true,
+            .limit = scan_limit,
+        });
+        defer scanned.deinit(alloc);
+
+        var failures = std.ArrayListUnmanaged(types.DocumentArtifactReprocessFailure).empty;
+        errdefer {
+            for (failures.items) |*failure| failure.deinit(alloc);
+            failures.deinit(alloc);
+        }
+
+        var result = types.DocumentArtifactTableReprocessResult{
+            .limit = limit,
+        };
+        errdefer result.deinit(alloc);
+
+        const process_len = @min(scanned.documents.len, @as(usize, @intCast(limit)));
+        for (scanned.documents[0..process_len]) |doc| {
+            result.scanned += 1;
+            const handled = self.reprocessDocumentArtifact(alloc, doc.id, artifact_name) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    result.failed += 1;
+                    try failures.append(alloc, .{
+                        .key = try alloc.dupe(u8, doc.id),
+                        .error_code = try alloc.dupe(u8, @errorName(err)),
+                    });
+                    continue;
+                },
+            };
+            if (handled) {
+                result.reprocessed += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+
+        if (scanned.documents.len > process_len and process_len > 0) {
+            result.next_key = try alloc.dupe(u8, scanned.documents[process_len - 1].id);
+        }
+        result.failures = try failures.toOwnedSlice(alloc);
+        return result;
+    }
+
     pub fn getDocument(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         return try self.lookup(alloc, key, opts);
     }
@@ -28917,6 +28976,37 @@ test "db document extraction manifest inspection and reprocess API" {
     defer missing_list.deinit(alloc);
     try std.testing.expectEqualStrings("doc:missing", missing_list.document_id);
     try std.testing.expectEqual(@as(usize, 0), missing_list.artifacts.len);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:b",
+            .value = "{\"url\":\"data:text/plain;base64,ZGVsdGEgZXBzaWxvbg==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    var range_first = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .limit = 1 });
+    defer range_first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), range_first.scanned);
+    try std.testing.expectEqual(@as(usize, 1), range_first.reprocessed);
+    try std.testing.expectEqual(@as(usize, 0), range_first.failed);
+    try std.testing.expectEqual(@as(usize, 0), range_first.failures.len);
+    try std.testing.expect(range_first.next_key != null);
+    try std.testing.expectEqualStrings("doc:a", range_first.next_key.?);
+
+    var range_after_a = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer range_after_a.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), range_after_a.generation);
+
+    var range_second = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .from_key = range_first.next_key.? });
+    defer range_second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), range_second.scanned);
+    try std.testing.expectEqual(@as(usize, 1), range_second.reprocessed);
+    try std.testing.expect(range_second.next_key == null);
+
+    var range_after_b = (try db.getDocumentArtifactManifest(alloc, "doc:b", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer range_after_b.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), range_after_b.generation);
 }
 
 test "db document extraction failure records last error and clears stale children" {

@@ -171,6 +171,69 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         };
         return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 201, response);
     }
+    if (routes.Routes.matchGroupTableArtifactReprocess(path)) |artifact_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        const Request = struct {
+            from_key: []const u8 = "",
+            to_key: []const u8 = "",
+            limit: u32 = 100,
+        };
+        const FailureResponse = struct {
+            key: []const u8,
+            error_code: []const u8,
+        };
+        const Response = struct {
+            reprocess: []const u8,
+            artifact_name: []const u8,
+            scanned: usize,
+            reprocessed: usize,
+            skipped: usize,
+            failed: usize,
+            limit: u32,
+            next_key: ?[]const u8,
+            failures: []const FailureResponse,
+        };
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.artifact_name);
+        defer ctx.alloc.free(decoded_artifact_name);
+        var parsed = std.json.parseFromSlice(Request, ctx.alloc, if (req.body.len > 0) req.body else "{}", .{}) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact reprocess request");
+        };
+        defer parsed.deinit();
+        var result = (writes.reprocessDocumentArtifactRangeGroupLocal(
+            ctx.alloc,
+            artifact_route.group_id,
+            artifact_route.table_name,
+            decoded_artifact_name,
+            .{
+                .from_key = parsed.value.from_key,
+                .to_key = parsed.value.to_key,
+                .limit = parsed.value.limit,
+            },
+        ) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact reprocess request"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer result.deinit(ctx.alloc);
+        const failures = try ctx.alloc.alloc(FailureResponse, result.failures.len);
+        defer ctx.alloc.free(failures);
+        for (result.failures, failures) |failure, *out| {
+            out.* = .{ .key = failure.key, .error_code = failure.error_code };
+        }
+        return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 202, Response{
+            .reprocess = "triggered",
+            .artifact_name = decoded_artifact_name,
+            .scanned = result.scanned,
+            .reprocessed = result.reprocessed,
+            .skipped = result.skipped,
+            .failed = result.failed,
+            .limit = result.limit,
+            .next_key = result.next_key,
+            .failures = failures,
+        });
+    }
     if (routes.Routes.matchGroupDocumentArtifactReprocess(path)) |artifact_route| {
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.key);

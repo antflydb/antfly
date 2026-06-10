@@ -136,6 +136,11 @@ pub const Routes = struct {
         index_name: []const u8,
     };
 
+    pub const TableArtifact = struct {
+        table_name: []const u8,
+        artifact_name: []const u8,
+    };
+
     pub const TableDocumentArtifact = struct {
         table_name: []const u8,
         key: []const u8,
@@ -259,6 +264,12 @@ pub const Routes = struct {
         group_id: u64,
         table_name: []const u8,
         key: []const u8,
+        artifact_name: []const u8,
+    };
+
+    pub const GroupTableArtifact = struct {
+        group_id: u64,
+        table_name: []const u8,
         artifact_name: []const u8,
     };
 
@@ -430,6 +441,23 @@ pub const Routes = struct {
 
     pub fn matchTableDocumentArtifactReprocess(path: []const u8) ?TableDocumentArtifact {
         return matchTableDocumentArtifactWithReprocess(path, true);
+    }
+
+    pub fn matchTableArtifactReprocess(path: []const u8) ?TableArtifact {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, reprocess_suffix)) return null;
+        const effective_path = path[0 .. path.len - reprocess_suffix.len];
+        const rest = effective_path[tables_prefix.len..];
+        const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const table_name = rest[0..artifacts_index];
+        const artifact_name = rest[artifacts_index + artifacts_marker.len ..];
+        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
+        if (std.mem.indexOf(u8, rest, documents_marker) != null) return null;
+        return .{
+            .table_name = table_name,
+            .artifact_name = artifact_name,
+        };
     }
 
     pub fn matchTableDocumentArtifacts(path: []const u8) ?TableDocumentArtifacts {
@@ -706,6 +734,26 @@ pub const Routes = struct {
 
     pub fn matchGroupDocumentArtifactReprocess(path: []const u8) ?GroupDocumentArtifact {
         return matchGroupDocumentArtifactWithReprocess(path, true);
+    }
+
+    pub fn matchGroupTableArtifactReprocess(path: []const u8) ?GroupTableArtifact {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, reprocess_suffix)) return null;
+        const effective_rest = rest[0 .. rest.len - reprocess_suffix.len];
+        const table_rest = effective_rest[tables_prefix.len..];
+        const artifacts_index = std.mem.indexOf(u8, table_rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const table_name = table_rest[0..artifacts_index];
+        const artifact_name = table_rest[artifacts_index + artifacts_marker.len ..];
+        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
+        if (std.mem.indexOf(u8, table_rest, documents_marker) != null) return null;
+        return .{
+            .group_id = group.group_id,
+            .table_name = table_name,
+            .artifact_name = artifact_name,
+        };
     }
 
     pub fn matchGroupDocumentArtifacts(path: []const u8) ?GroupDocumentArtifacts {
@@ -985,6 +1033,9 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", reprocess.table_name);
     try std.testing.expectEqualStrings("doc%2Fa", reprocess.key);
     try std.testing.expectEqualStrings("document_units_v1", reprocess.artifact_name);
+    const table_reprocess = Routes.matchTableArtifactReprocess("/tables/docs/artifacts/document_units_v1:reprocess").?;
+    try std.testing.expectEqualStrings("docs", table_reprocess.table_name);
+    try std.testing.expectEqualStrings("document_units_v1", table_reprocess.artifact_name);
     try std.testing.expect(Routes.matchTableDocumentArtifact("/tables/docs/documents/doc:a/artifacts/document_units_v1:reprocess") == null);
     const algebraic_partials = Routes.matchGroupAlgebraicPartials("/internal/v1/groups/42/tables/docs/algebraic-partials").?;
     try std.testing.expectEqual(@as(u64, 42), algebraic_partials.group_id);
@@ -1038,6 +1089,9 @@ test "public api routes compile" {
     const group_reprocess = Routes.matchGroupDocumentArtifactReprocess("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:reprocess").?;
     try std.testing.expectEqual(@as(u64, 7), group_reprocess.group_id);
     try std.testing.expectEqualStrings("document_units_v1", group_reprocess.artifact_name);
+    const group_table_reprocess = Routes.matchGroupTableArtifactReprocess("/internal/v1/groups/7/tables/docs/artifacts/document_units_v1:reprocess").?;
+    try std.testing.expectEqual(@as(u64, 7), group_table_reprocess.group_id);
+    try std.testing.expectEqualStrings("document_units_v1", group_table_reprocess.artifact_name);
     try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc:a/artifacts/document_units_v1:reprocess") == null);
     const group_graph_expand = Routes.matchGroupGraphExpand("/internal/v1/groups/7/tables/docs/graph-expand").?;
     try std.testing.expectEqual(@as(u64, 7), group_graph_expand.group_id);

@@ -82,6 +82,23 @@ pub const DocumentArtifactReprocessResponse = struct {
     reprocess: []const u8,
 };
 
+/// Bounded request for reprocessing a derived artifact across source rows in key order.
+pub const DocumentArtifactTableReprocessRequest = struct {
+    /// Exclusive lower bound source document key. Use the prior response next_key to continue.
+    from_key: ?[]const u8 = null,
+    /// Inclusive upper bound source document key, or empty for the end of the table/range.
+    to_key: ?[]const u8 = null,
+    /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+    limit: ?i64 = null,
+};
+
+pub const DocumentArtifactReprocessFailure = struct {
+    /// Source document key that failed during reprocessing.
+    key: []const u8,
+    /// Stable error code for the failed document reprocess attempt.
+    error_code: []const u8,
+};
+
 pub const ClusterDataNodeStatus = struct {
     data_id: i64,
     node_id: i64,
@@ -3268,6 +3285,26 @@ pub const DocumentArtifactManifest = struct {
     manifest_json: []const u8,
     /// Optional opaque JSON state for incremental processing.
     state_json: ?[]const u8 = null,
+};
+
+pub const DocumentArtifactTableReprocessResponse = struct {
+    /// Indicates that reprocessing was accepted.
+    reprocess: []const u8,
+    /// Name of the derived artifact that was reprocessed.
+    artifact_name: []const u8,
+    /// Number of source rows scanned by this bounded pass.
+    scanned: i64,
+    /// Number of source rows whose artifact was reprocessed.
+    reprocessed: i64,
+    /// Number of scanned source rows that no longer had a reprocessable source document.
+    skipped: i64,
+    /// Number of scanned source rows that failed before recording a normal artifact manifest.
+    failed: i64,
+    /// Effective scan limit used by the bounded pass.
+    limit: i64,
+    /// Source key cursor for the next bounded pass, when more rows may remain.
+    next_key: ?[]const u8 = null,
+    failures: []const DocumentArtifactReprocessFailure,
 };
 
 /// Typed Zig status view for table data topology and range placement.

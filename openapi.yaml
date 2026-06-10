@@ -3835,6 +3835,58 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/artifacts/{artifactName}:reprocess:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+    post:
+      summary: Reprocess a derived document artifact across a table range
+      description: >
+        Runs a bounded operational repair pass for a derived document artifact
+
+        across source rows in key order. Use `next_key` from the response as
+
+        the next request's `from_key` to continue a large table repair.
+      tags:
+        - data_operations
+      operationId: reprocessDocumentArtifactRange
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentArtifactTableReprocessRequest'
+      responses:
+        '202':
+          description: Bounded reprocessing pass was accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactTableReprocessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}:
     parameters:
       - name: tableName
@@ -6121,6 +6173,79 @@ components:
           enum:
             - triggered
           description: Indicates that reprocessing was accepted.
+    DocumentArtifactTableReprocessRequest:
+      type: object
+      description: Bounded request for reprocessing a derived artifact across source rows in key order.
+      properties:
+        from_key:
+          type: string
+          description: Exclusive lower bound source document key. Use the prior response next_key to continue.
+          default: ''
+        to_key:
+          type: string
+          description: Inclusive upper bound source document key, or empty for the end of the table/range.
+          default: ''
+        limit:
+          type: integer
+          format: uint32
+          description: Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+          default: 100
+    DocumentArtifactReprocessFailure:
+      type: object
+      required:
+        - key
+        - error_code
+      properties:
+        key:
+          type: string
+          description: Source document key that failed during reprocessing.
+        error_code:
+          type: string
+          description: Stable error code for the failed document reprocess attempt.
+    DocumentArtifactTableReprocessResponse:
+      type: object
+      required:
+        - reprocess
+        - artifact_name
+        - scanned
+        - reprocessed
+        - skipped
+        - failed
+        - limit
+        - failures
+      properties:
+        reprocess:
+          type: string
+          enum:
+            - triggered
+          description: Indicates that reprocessing was accepted.
+        artifact_name:
+          type: string
+          description: Name of the derived artifact that was reprocessed.
+        scanned:
+          type: integer
+          description: Number of source rows scanned by this bounded pass.
+        reprocessed:
+          type: integer
+          description: Number of source rows whose artifact was reprocessed.
+        skipped:
+          type: integer
+          description: Number of scanned source rows that no longer had a reprocessable source document.
+        failed:
+          type: integer
+          description: Number of scanned source rows that failed before recording a normal artifact manifest.
+        limit:
+          type: integer
+          format: uint32
+          description: Effective scan limit used by the bounded pass.
+        next_key:
+          type: string
+          nullable: true
+          description: Source key cursor for the next bounded pass, when more rows may remain.
+        failures:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentArtifactReprocessFailure'
     ClusterDataNodeStatus:
       type: object
       required:

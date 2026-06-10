@@ -909,6 +909,40 @@ pub const ScanResult = struct {
     }
 };
 
+pub const DocumentArtifactTableReprocessRequest = struct {
+    from_key: []const u8 = "",
+    to_key: []const u8 = "",
+    limit: u32 = 100,
+};
+
+pub const DocumentArtifactReprocessFailure = struct {
+    key: []u8,
+    error_code: []u8,
+
+    pub fn deinit(self: *DocumentArtifactReprocessFailure, alloc: Allocator) void {
+        alloc.free(self.key);
+        alloc.free(self.error_code);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactTableReprocessResult = struct {
+    scanned: usize = 0,
+    reprocessed: usize = 0,
+    skipped: usize = 0,
+    failed: usize = 0,
+    limit: u32 = 0,
+    next_key: ?[]u8 = null,
+    failures: []DocumentArtifactReprocessFailure = &.{},
+
+    pub fn deinit(self: *DocumentArtifactTableReprocessResult, alloc: Allocator) void {
+        if (self.next_key) |value| alloc.free(value);
+        for (self.failures) |*failure| failure.deinit(alloc);
+        if (self.failures.len > 0) alloc.free(self.failures);
+        self.* = undefined;
+    }
+};
+
 pub const TxnId = transactions_mod.TxnId;
 pub const TxnStatus = transactions_mod.TxnStatus;
 pub const TxnRecoveryStats = transactions_mod.RecoveryStats;
