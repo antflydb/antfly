@@ -136,13 +136,13 @@ const ParsedSourceArtifactKey = struct {
 fn parseSourceArtifactKeyAlloc(alloc: std.mem.Allocator, key: []const u8) !?ParsedSourceArtifactKey {
     var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, key)) orelse return null;
     defer artifact_ref.deinit(alloc);
-    if (artifact_ref.kind != .asset) return null;
+    if (artifact_ref.kind != .asset and artifact_ref.kind != .chunk) return null;
 
     const doc_key = try alloc.dupe(u8, artifact_ref.document_id);
     errdefer alloc.free(doc_key);
     const artifact_name = try alloc.dupe(u8, artifact_ref.name);
     errdefer alloc.free(artifact_name);
-    const resolution_scope_key = if (artifact_ref.unit_id != null) try alloc.dupe(u8, key) else try alloc.dupe(u8, artifact_ref.document_id);
+    const resolution_scope_key = if (artifact_ref.kind == .chunk or artifact_ref.unit_id != null) try alloc.dupe(u8, key) else try alloc.dupe(u8, artifact_ref.document_id);
     errdefer alloc.free(resolution_scope_key);
 
     return .{
@@ -1989,6 +1989,38 @@ test "processChangedExtraction scopes unit asset resolution under the source art
     defer alloc.free(outcome.resolution_key);
 
     const expected_resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, unit_key, "unit_resolution_v1");
+    defer alloc.free(expected_resolution_key);
+    try testing.expectEqualStrings(expected_resolution_key, outcome.resolution_key);
+
+    const stored = (try map.store().get(alloc, expected_resolution_key)).?;
+    defer alloc.free(stored);
+    try testing.expect(std.mem.indexOf(u8, stored, "\"person/ada_lovelace\"") != null);
+}
+
+test "processChangedExtraction scopes chunk artifact resolution under the source artifact key" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "document_chunks_v1",
+        .resolution_artifact = "chunk_resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v1", "page:000001", 0);
+    defer alloc.free(chunk_key);
+    try map.store().put(chunk_key,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+
+    const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, chunk_key, null, null)).?;
+    defer alloc.free(outcome.resolution_key);
+
+    const expected_resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, chunk_key, "chunk_resolution_v1");
     defer alloc.free(expected_resolution_key);
     try testing.expectEqualStrings(expected_resolution_key, outcome.resolution_key);
 

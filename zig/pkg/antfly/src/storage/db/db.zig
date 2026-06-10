@@ -19047,7 +19047,7 @@ fn loadSourceExtractionForResolution(
 fn sourceArtifactKeyFromResolutionScopeAlloc(alloc: Allocator, doc_key: []const u8, source_artifact: []const u8) !?[]u8 {
     var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, doc_key)) orelse return null;
     defer artifact_ref.deinit(alloc);
-    if (artifact_ref.kind != .asset) return null;
+    if (artifact_ref.kind != .asset and artifact_ref.kind != .chunk) return null;
     if (!std.mem.eql(u8, artifact_ref.name, source_artifact)) return null;
     return try alloc.dupe(u8, doc_key);
 }
