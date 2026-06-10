@@ -12781,21 +12781,54 @@ fn computeDocumentExtractionAssetRequestDerived(
     defer config.deinit(alloc);
     try document_extraction_mod.applySourceMetadataFromJson(alloc, &config, doc_value);
 
-    const fetched = try template_remote.downloadRemoteContentOutcomeAllocWithConfig(
+    const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
+    defer alloc.free(state_key);
+    const existing_state = db.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (existing_state) |value| alloc.free(value);
+    const existing_manifest = db.core.getStoreValue(alloc, manifest_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (existing_manifest) |value| alloc.free(value);
+
+    const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(alloc, value) else 0;
+    const to_generation = from_generation + 1;
+
+    const fetched = template_remote.downloadRemoteContentOutcomeAllocWithConfig(
         alloc,
         db.remote_content,
         db.secret_store,
         source_url,
         if (config.credentials.len > 0) config.credentials else null,
-    );
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try appendDocumentExtractionFailureManifest(alloc, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "remote content download failed", artifact_writes, artifact_delete_keys);
+            return;
+        },
+    };
     const downloaded = switch (fetched) {
         .ok => |content| content,
-        .http_error => return error.RemoteDocumentFetchFailed,
+        .http_error => |http_error| {
+            const message = try std.fmt.allocPrint(alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
+            defer alloc.free(message);
+            try appendDocumentExtractionFailureManifest(alloc, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, "RemoteDocumentFetchFailed", message, artifact_writes, artifact_delete_keys);
+            return;
+        },
     };
     var downloaded_mut = downloaded;
     defer downloaded_mut.deinit(alloc);
 
-    var extraction = try document_extraction_mod.extractDownloadedAlloc(alloc, downloaded_mut, source_url, config);
+    var extraction = document_extraction_mod.extractDownloadedAlloc(alloc, downloaded_mut, source_url, config) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try appendDocumentExtractionFailureManifest(alloc, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "document extraction failed", artifact_writes, artifact_delete_keys);
+            return;
+        },
+    };
     defer extraction.deinit(alloc);
 
     const source_fingerprint = try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data);
@@ -12825,22 +12858,6 @@ fn computeDocumentExtractionAssetRequestDerived(
     const new_state = try documentExtractionStateValueAlloc(alloc, source_fingerprint, desired_unit_keys.items, desired_unit_descriptors, desired_chunk_keys.items);
     defer alloc.free(new_state);
 
-    const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
-    defer alloc.free(state_key);
-    const existing_state = db.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
-    defer if (existing_state) |value| alloc.free(value);
-    const existing_manifest = db.core.getStoreValue(alloc, manifest_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
-    defer if (existing_manifest) |value| alloc.free(value);
-
-    const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(alloc, value) else 0;
-    const to_generation = from_generation + 1;
-
     var previous_unit_keys: []const []const u8 = &.{};
     defer freeOwnedConstKeySlice(alloc, previous_unit_keys);
     var previous_unit_descriptors: []DocumentExtractionUnitDescriptor = &.{};
@@ -12851,11 +12868,13 @@ fn computeDocumentExtractionAssetRequestDerived(
     if (existing_state) |state| {
         if (!force_reprocess and std.mem.eql(u8, state, new_state)) {
             if (existing_manifest) |value| {
-                try artifact_writes.append(alloc, .{
-                    .key = try alloc.dupe(u8, manifest_key),
-                    .value = try alloc.dupe(u8, value),
-                });
-                return;
+                if (!(try documentExtractionManifestHasLastError(alloc, value))) {
+                    try artifact_writes.append(alloc, .{
+                        .key = try alloc.dupe(u8, manifest_key),
+                        .value = try alloc.dupe(u8, value),
+                    });
+                    return;
+                }
             }
         }
 
@@ -13575,6 +13594,12 @@ fn jsonObjectOptionalStringDup(alloc: Allocator, object: std.json.ObjectMap, fie
     return try alloc.dupe(u8, value.string);
 }
 
+fn jsonObjectOptionalNestedStringDup(alloc: Allocator, object: std.json.ObjectMap, object_field: []const u8, string_field: []const u8) !?[]u8 {
+    const value = object.get(object_field) orelse return null;
+    if (value != .object) return null;
+    return try jsonObjectOptionalStringDup(alloc, value.object, string_field);
+}
+
 fn jsonObjectU64(object: std.json.ObjectMap, field_name: []const u8) !u64 {
     const value = object.get(field_name) orelse return 0;
     if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
@@ -13654,6 +13679,10 @@ fn documentArtifactManifestFromJsonAlloc(
     errdefer if (route_type.len > 0) alloc.free(route_type);
     const unsupported_reason = try jsonObjectOptionalStringDup(alloc, object, "unsupported_reason");
     errdefer if (unsupported_reason) |value| alloc.free(value);
+    const last_error_code = try jsonObjectOptionalNestedStringDup(alloc, object, "last_error", "code");
+    errdefer if (last_error_code) |value| alloc.free(value);
+    const last_error_message = try jsonObjectOptionalNestedStringDup(alloc, object, "last_error", "message");
+    errdefer if (last_error_message) |value| alloc.free(value);
 
     const child_ranges = try documentArtifactChildRangesFromJsonAlloc(alloc, object);
     errdefer {
@@ -13707,7 +13736,16 @@ fn documentArtifactManifestFromJsonAlloc(
         .merge_to_generation = merge_to_generation,
         .merge_operation_granularity = merge_operation_granularity,
         .merge_operation_count = merge_operation_count,
+        .last_error_code = last_error_code,
+        .last_error_message = last_error_message,
     };
+}
+
+fn documentExtractionManifestHasLastError(alloc: Allocator, manifest_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return parsed.value.object.get("last_error") != null;
 }
 
 fn appendJsonFieldName(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8) !void {
@@ -13965,6 +14003,100 @@ fn documentExtractionManifestPayloadAlloc(
     try out.append(alloc, '}');
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn documentExtractionFailureManifestPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_url: []const u8,
+    from_generation: u64,
+    to_generation: u64,
+    error_code: []const u8,
+    error_message: []const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, &out, &first, "_parent_doc_key", doc_key);
+    try appendJsonFieldString(alloc, &out, &first, "_artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, &out, &first, "artifact_type", "document_units");
+    try appendJsonFieldU64(alloc, &out, &first, "manifest_version", 2);
+    try appendJsonFieldU64(alloc, &out, &first, "generation", to_generation);
+    try appendJsonFieldString(alloc, &out, &first, "source_url", source_url);
+    try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", "");
+    try appendJsonFieldString(alloc, &out, &first, "content_type", "");
+    try appendJsonFieldString(alloc, &out, &first, "route_type", "error");
+    try appendJsonFieldUsize(alloc, &out, &first, "unit_count", 0);
+    try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", 0);
+    try appendJsonFieldName(alloc, &out, &first, "child_ranges");
+    try out.appendSlice(alloc, "[]");
+    try appendJsonFieldName(alloc, &out, &first, "merge_plan");
+    try out.append(alloc, '{');
+    var merge_first = true;
+    try appendJsonFieldU64(alloc, &out, &merge_first, "plan_version", 1);
+    try appendJsonFieldU64(alloc, &out, &merge_first, "from_generation", from_generation);
+    try appendJsonFieldU64(alloc, &out, &merge_first, "to_generation", to_generation);
+    try appendJsonFieldString(alloc, &out, &merge_first, "status", "failed");
+    try appendJsonFieldString(alloc, &out, &merge_first, "operation_granularity", "unit_fingerprint");
+    try appendJsonFieldName(alloc, &out, &merge_first, "operations");
+    try out.appendSlice(alloc, "[]");
+    try out.append(alloc, '}');
+    try appendJsonFieldName(alloc, &out, &first, "last_error");
+    try out.append(alloc, '{');
+    var error_first = true;
+    try appendJsonFieldString(alloc, &out, &error_first, "code", error_code);
+    try appendJsonFieldString(alloc, &out, &error_first, "message", error_message);
+    try out.append(alloc, '}');
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendDocumentExtractionFailureManifest(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_url: []const u8,
+    manifest_key: []const u8,
+    state_key: []const u8,
+    existing_state: ?[]const u8,
+    from_generation: u64,
+    to_generation: u64,
+    error_code: []const u8,
+    error_message: []const u8,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    if (existing_state) |state| {
+        const previous_unit_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
+        defer freeOwnedConstKeySlice(alloc, previous_unit_keys);
+        for (previous_unit_keys) |previous_key| {
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+        const previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+        defer freeOwnedConstKeySlice(alloc, previous_chunk_keys);
+        for (previous_chunk_keys) |previous_key| {
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+        try artifact_delete_keys.append(alloc, try alloc.dupe(u8, state_key));
+    }
+
+    const manifest = try documentExtractionFailureManifestPayloadAlloc(
+        alloc,
+        doc_key,
+        artifact_name,
+        source_url,
+        from_generation,
+        to_generation,
+        error_code,
+        error_message,
+    );
+    defer alloc.free(manifest);
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, manifest_key),
+        .value = try alloc.dupe(u8, manifest),
+    });
 }
 
 fn extractAssetSourceValue(
@@ -28785,6 +28917,74 @@ test "db document extraction manifest inspection and reprocess API" {
     defer missing_list.deinit(alloc);
     try std.testing.expectEqualStrings("doc:missing", missing_list.document_id);
     try std.testing.expectEqual(@as(usize, 0), missing_list.artifacts.len);
+}
+
+test "db document extraction failure records last error and clears stale children" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    var before = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer before.deinit(alloc);
+    try std.testing.expectEqualStrings("text", before.route_type);
+    try std.testing.expect(before.last_error_code == null);
+    try std.testing.expectEqual(@as(usize, 1), before.child_ranges.len);
+    const stale_unit_key = try alloc.dupe(u8, before.child_ranges[0].start_key);
+    defer alloc.free(stale_unit_key);
+    {
+        const stale_unit = try db.core.store.get(alloc, stale_unit_key);
+        defer if (stale_unit) |value| alloc.free(value);
+        try std.testing.expect(stale_unit != null);
+    }
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    var after = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, before.generation + 1), after.generation);
+    try std.testing.expectEqualStrings("error", after.route_type);
+    try std.testing.expectEqualStrings("failed", after.merge_status);
+    try std.testing.expectEqual(@as(usize, 0), after.unit_count);
+    try std.testing.expectEqual(@as(usize, 0), after.child_range_count);
+    try std.testing.expect(after.state_json == null);
+    try std.testing.expect(after.last_error_code != null);
+    try std.testing.expectEqualStrings("InvalidDataUri", after.last_error_code.?);
+    try std.testing.expect(after.last_error_message != null);
+    try std.testing.expectEqualStrings("remote content download failed", after.last_error_message.?);
+    try std.testing.expect(std.mem.indexOf(u8, after.manifest_json, "\"last_error\"") != null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_unit_key));
+
+    var list = try db.listDocumentArtifactManifests(alloc, "doc:a");
+    defer list.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), list.artifacts.len);
+    try std.testing.expectEqualStrings("InvalidDataUri", list.artifacts[0].last_error_code.?);
 }
 
 test "db document extraction skips stable unit local rewrites while replaying full text from stored artifacts" {

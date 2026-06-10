@@ -1349,6 +1349,10 @@ pub const DocumentArtifactManifest = struct {
     merge_operation_granularity: []const u8,
     /// Number of merge operations recorded for this artifact.
     merge_operation_count: i64,
+    /// Last extraction or materialization error code, when the current artifact generation failed.
+    last_error_code: ?[]const u8 = null,
+    /// Human-readable last extraction or materialization error summary, when available.
+    last_error_message: ?[]const u8 = null,
     /// Opaque JSON manifest for the artifact units and provenance.
     manifest_json: []const u8,
     /// Optional opaque JSON state for incremental processing.

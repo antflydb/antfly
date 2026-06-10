@@ -11984,6 +11984,8 @@ const RemoteDocumentArtifactManifest = struct {
     merge_to_generation: u64 = 0,
     merge_operation_granularity: []const u8 = "",
     merge_operation_count: usize = 0,
+    last_error_code: ?[]const u8 = null,
+    last_error_message: ?[]const u8 = null,
     manifest_json: []const u8,
     state_json: ?[]const u8 = null,
 };
@@ -12049,6 +12051,10 @@ fn remoteDocumentArtifactManifestAlloc(alloc: std.mem.Allocator, remote: RemoteD
     errdefer if (merge_status.len > 0) alloc.free(merge_status);
     const merge_operation_granularity: []u8 = if (remote.merge_operation_granularity.len > 0) try alloc.dupe(u8, remote.merge_operation_granularity) else @constCast("");
     errdefer if (merge_operation_granularity.len > 0) alloc.free(merge_operation_granularity);
+    const last_error_code = if (remote.last_error_code) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (last_error_code) |value| alloc.free(value);
+    const last_error_message = if (remote.last_error_message) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (last_error_message) |value| alloc.free(value);
 
     return .{
         .document_id = document_id,
@@ -12072,6 +12078,8 @@ fn remoteDocumentArtifactManifestAlloc(alloc: std.mem.Allocator, remote: RemoteD
         .merge_to_generation = remote.merge_to_generation,
         .merge_operation_granularity = merge_operation_granularity,
         .merge_operation_count = remote.merge_operation_count,
+        .last_error_code = last_error_code,
+        .last_error_message = last_error_message,
     };
 }
 

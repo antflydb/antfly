@@ -1650,6 +1650,14 @@ components:
         merge_operation_count:
           type: integer
           description: Number of merge operations recorded for this artifact.
+        last_error_code:
+          type: string
+          nullable: true
+          description: Last extraction or materialization error code, when the current artifact generation failed.
+        last_error_message:
+          type: string
+          nullable: true
+          description: Human-readable last extraction or materialization error summary, when available.
         manifest_json:
           type: string
           description: Opaque JSON manifest for the artifact units and provenance.

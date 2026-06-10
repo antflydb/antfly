@@ -615,6 +615,8 @@ pub fn handleDocumentArtifactManifest(
         merge_to_generation: u64,
         merge_operation_granularity: []const u8,
         merge_operation_count: usize,
+        last_error_code: ?[]const u8,
+        last_error_message: ?[]const u8,
         manifest_json: []const u8,
         state_json: ?[]const u8,
     };
@@ -656,6 +658,8 @@ pub fn handleDocumentArtifactManifest(
             .merge_to_generation = manifest.merge_to_generation,
             .merge_operation_granularity = manifest.merge_operation_granularity,
             .merge_operation_count = manifest.merge_operation_count,
+            .last_error_code = manifest.last_error_code,
+            .last_error_message = manifest.last_error_message,
             .manifest_json = manifest.manifest_json,
             .state_json = manifest.state_json,
         }, .{}),
@@ -708,6 +712,8 @@ pub fn handleDocumentArtifactManifests(
         merge_to_generation: u64,
         merge_operation_granularity: []const u8,
         merge_operation_count: usize,
+        last_error_code: ?[]const u8,
+        last_error_message: ?[]const u8,
         manifest_json: []const u8,
         state_json: ?[]const u8,
     };
@@ -761,6 +767,8 @@ pub fn handleDocumentArtifactManifests(
             .merge_to_generation = manifest.merge_to_generation,
             .merge_operation_granularity = manifest.merge_operation_granularity,
             .merge_operation_count = manifest.merge_operation_count,
+            .last_error_code = manifest.last_error_code,
+            .last_error_message = manifest.last_error_message,
             .manifest_json = manifest.manifest_json,
             .state_json = manifest.state_json,
         };

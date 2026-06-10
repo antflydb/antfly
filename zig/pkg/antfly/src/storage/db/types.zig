@@ -446,6 +446,8 @@ pub const DocumentArtifactManifest = struct {
     merge_to_generation: u64 = 0,
     merge_operation_granularity: []u8 = "",
     merge_operation_count: usize = 0,
+    last_error_code: ?[]u8 = null,
+    last_error_message: ?[]u8 = null,
 
     pub fn deinit(self: *DocumentArtifactManifest, alloc: Allocator) void {
         alloc.free(self.document_id);
@@ -462,6 +464,8 @@ pub const DocumentArtifactManifest = struct {
         if (self.child_ranges.len > 0) alloc.free(self.child_ranges);
         if (self.merge_status.len > 0) alloc.free(self.merge_status);
         if (self.merge_operation_granularity.len > 0) alloc.free(self.merge_operation_granularity);
+        if (self.last_error_code) |value| alloc.free(value);
+        if (self.last_error_message) |value| alloc.free(value);
         self.* = undefined;
     }
 };

@@ -565,7 +565,7 @@ Recommended direction:
 - Add reprocess controls such as `POST /tables/{table}/documents/{key}/artifacts/{artifact}:reprocess`.
 - Add table-level repair/replay commands for an artifact across many source rows.
 
-Implementation note: the DB, bound table-source, local public HTTP, generated OpenAPI/httpx, and hosted/provisioned routing layers now expose per-document manifest listing, per-artifact manifest inspection, and forced reprocess for a specific artifact. These public routes enforce source-document row filters before exposing or mutating artifact control-plane state. Manifest inspection now has typed source/fingerprint/range/merge summaries as well as raw manifest/state JSON. The remaining API design work is table-wide repair/backfill controls, last-error reporting, and how much deeper detail should be public versus admin-only.
+Implementation note: the DB, bound table-source, local public HTTP, generated OpenAPI/httpx, and hosted/provisioned routing layers now expose per-document manifest listing, per-artifact manifest inspection, and forced reprocess for a specific artifact. These public routes enforce source-document row filters before exposing or mutating artifact control-plane state. Manifest inspection now has typed source/fingerprint/range/merge/error summaries as well as raw manifest/state JSON. Failed document extraction writes a failed artifact manifest generation with `route_type: "error"`, `merge_status: "failed"`, typed `last_error_code` / `last_error_message`, and no current child ranges. When a previously successful source is replaced by an unextractable source, stale unit/chunk artifacts and state are deleted; a later successful extraction advances the generation and clears the last error. The remaining API design work is table-wide repair/backfill controls and how much deeper detail should be public versus admin-only.
 
 The manifest should carry enough state to explain why extraction did or did not rerun.
 
@@ -649,7 +649,7 @@ This gives downstream systems a stable contract without blocking richer extracto
 The high-level model is settled enough to start implementation. The pieces that still need concrete product/API decisions are:
 
 - Query response shape: exact request and response schema for hierarchy rollups, grouped hits, and hydrated ancestors.
-- Inspection API shape: admin-only versus public deep details, last-error reporting, and table-wide reprocessing controls. Collection listing, single-artifact manifest inspection, typed source/fingerprint/range/merge summaries, source-row row-filter enforcement, and reprocess endpoints now exist and route through hosted/provisioned ownership.
+- Inspection API shape: admin-only versus public deep details and table-wide reprocessing controls. Collection listing, single-artifact manifest inspection, typed source/fingerprint/range/merge/error summaries, source-row row-filter enforcement, and reprocess endpoints now exist and route through hosted/provisioned ownership.
 - Split thresholds: initial default limits for unit count, bytes per range, and exceptional second-level splits under a huge unit.
 - File route config: the internal built-in route array shape and per-row metadata field hydration exist; the remaining decision is whether the first public version exposes them directly or wraps them in presets plus limited overrides.
 - Reprocessing semantics: table-wide backfill controls, priority, concurrency, and failure reporting.
