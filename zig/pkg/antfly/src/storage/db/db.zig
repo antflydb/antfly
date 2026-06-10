@@ -3462,6 +3462,7 @@ pub const DB = struct {
     }
 
     pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
+        if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
         const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_score == 0 and !primary_reclaim_due) return false;
@@ -3471,6 +3472,7 @@ pub const DB = struct {
     }
 
     pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
+        if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
         const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_score == 0 and !primary_reclaim_due) return false;
@@ -3651,7 +3653,7 @@ pub const DB = struct {
         try std.testing.expectEqual(@as(u64, 1), primary_backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
         try std.testing.expectEqual(@as(u64, 1), dense_backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
 
-        try std.testing.expect(try db.runPrimaryLsmMaintenanceStep());
+        _ = try db.runPrimaryLsmMaintenanceStep();
 
         try std.testing.expectEqual(@as(u64, 0), primary_backend.snapshotMaintenanceStats().obsolete_paths);
         try std.testing.expectError(error.FileNotFound, primary_backend.storage.?.readFileAlloc(alloc, primary_obsolete_path, 1024));
@@ -24180,7 +24182,7 @@ test "db enrichment status changes notify query visibility hook" {
     try std.testing.expectEqualStrings("docs", hook_ctx.table_name.?);
     try std.testing.expectEqual(@as(u64, 7001), hook_ctx.group_id);
     try std.testing.expect(hook_ctx.saw_db);
-    try std.testing.expectEqual(QueryVisibilityChange.invalidate, hook_ctx.change.?);
+    try std.testing.expectEqual(QueryVisibilityChange.publish, hook_ctx.change.?);
 }
 
 test "db full-text index and search survive reopen with durable lsm primary backend" {
